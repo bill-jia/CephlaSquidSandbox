@@ -1,3 +1,19 @@
+"""
+Utility functions for microscope control.
+
+This module provides helper functions for:
+- Image processing (cropping, focus measurement, filtering)
+- Laser autofocus spot detection
+- Focus map generation and application
+- File path management
+- Git repository state tracking
+
+Key functions:
+- calculate_focus_measure(): Computes focus quality metrics (Laplacian, GLVA, Tenengrad)
+- crop_image(): Crops images to specified dimensions
+- Laser spot detection functions for autofocus
+"""
+
 import collections
 import enum
 import inspect
@@ -34,6 +50,17 @@ _log = squid.logging.get_logger("control.utils")
 
 
 def crop_image(image, crop_width, crop_height):
+    """
+    Crop an image to specified dimensions, centered on the image.
+    
+    Args:
+        image: Input image (numpy array)
+        crop_width: Desired width (None = use full width)
+        crop_height: Desired height (None = use full height)
+        
+    Returns:
+        Cropped image centered on the original
+    """
     image_height = image.shape[0]
     image_width = image.shape[1]
     if crop_width is None:
@@ -49,6 +76,24 @@ def crop_image(image, crop_width, crop_height):
 
 
 def calculate_focus_measure(image, method=FocusMeasureOperator.LAPE):
+    """
+    Calculate a focus quality metric for an image.
+    
+    Focus measures quantify image sharpness. Higher values indicate better focus.
+    Used for autofocus algorithms to find the best focus position.
+    
+    Methods:
+    - LAPE: Laplacian variance (sum of squared Laplacian)
+    - GLVA: Gray-level variance (standard deviation of pixel values)
+    - TENENGRAD: Sum of squared Sobel gradients
+    
+    Args:
+        image: Input image (grayscale or color)
+        method: Focus measure operator to use
+        
+    Returns:
+        Focus measure value (higher = sharper)
+    """
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)  # optional
     if method == FocusMeasureOperator.LAPE:

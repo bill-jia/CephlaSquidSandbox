@@ -1,3 +1,32 @@
+"""
+Multi-point acquisition controller.
+
+This module handles automated multi-position image acquisition, which is the core
+functionality for high-content screening (HCS) applications. It coordinates:
+
+- Stage movement to multiple positions (X, Y grid, Z-stack, time-lapse)
+- Image acquisition at each position
+- Autofocus at each position (optional)
+- Channel switching (multiple wavelengths/filters)
+- Z-stack acquisition (3D imaging)
+- Time-lapse acquisition (4D imaging)
+- Focus map generation and application
+
+The controller manages the complete acquisition workflow:
+1. Generate scan coordinates (grid of positions)
+2. For each position:
+   a. Move stage to position
+   b. Perform autofocus (if enabled)
+   c. For each channel:
+      - Switch illumination/filters
+      - Acquire image(s)
+      - Save to disk
+   d. Move to next Z position (if Z-stack)
+3. Move to next time point (if time-lapse)
+
+All acquisition is performed in a background thread to keep the GUI responsive.
+"""
+
 import dataclasses
 import json
 import os
@@ -28,6 +57,7 @@ from squid.abc import CameraFrame, AbstractCamera, AbstractStage
 import squid.logging
 
 
+# No-op callbacks for cases where callbacks are not needed
 NoOpCallbacks = MultiPointControllerFunctions(
     signal_acquisition_start=lambda *a, **kw: None,
     signal_acquisition_finished=lambda *a, **kw: None,
@@ -40,6 +70,23 @@ NoOpCallbacks = MultiPointControllerFunctions(
 
 
 class MultiPointController:
+    """
+    Controller for automated multi-point image acquisition.
+    
+    This class orchestrates the complete acquisition workflow:
+    - Generates scan coordinates (grid of field-of-view positions)
+    - Moves stage to each position
+    - Performs autofocus (optional)
+    - Acquires images for each channel
+    - Saves images to disk with proper metadata
+    
+    Supports:
+    - 2D grids (X, Y)
+    - Z-stacks (3D imaging)
+    - Time-lapse (4D imaging)
+    - Multiple channels (wavelengths/filters)
+    - Focus maps (pre-computed focus positions)
+    """
     def __init__(
         self,
         microscope: Microscope,
@@ -68,36 +115,52 @@ class MultiPointController:
         self.fluidics: Optional[Any] = microscope.addons.fluidics
         self.thread: Optional[Thread] = None
 
-        self.NX = 1
-        self.deltaX = control._def.Acquisition.DX
-        self.NY = 1
-        self.deltaY = control._def.Acquisition.DY
-        self.NZ = 1
+        # Acquisition grid parameters
+        self.NX = 1  # Number of positions in X direction
+        self.deltaX = control._def.Acquisition.DX  # Spacing between positions in X (mm)
+        self.NY = 1  # Number of positions in Y direction
+        self.deltaY = control._def.Acquisition.DY  # Spacing between positions in Y (mm)
+        self.NZ = 1  # Number of Z positions (for Z-stacks)
         # TODO(imo): Switch all to consistent mm units
-        self.deltaZ = control._def.Acquisition.DZ / 1000
-        self.Nt = 1
-        self.deltat = 0
+        self.deltaZ = control._def.Acquisition.DZ / 1000  # Z step size (mm, converted from um)
+        self.Nt = 1  # Number of time points (for time-lapse)
+        self.deltat = 0  # Time interval between time points (seconds)
 
+        # Redundant assignments (kept for compatibility)
         self.deltaX = control._def.Acquisition.DX
         self.deltaY = control._def.Acquisition.DY
 
-        self.do_autofocus = False
-        self.do_reflection_af = False
-        self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
-        self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS
-        self.experiment_ID = None
-        self.use_manual_focus_map = False
-        self.base_path = None
-        self.use_fluidics = False
-
-        self.focus_map = None
-        self.gen_focus_map = False
-        self.focus_map_storage = []
-        self.already_using_fmap = False
-        self.selected_configurations = []
+        # Autofocus settings
+        self.do_autofocus = False  # Enable autofocus at each position
+        self.do_reflection_af = False  # Use reflection-based autofocus
+        self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR  # Image display scaling
+        
+        # Z-stack settings
+        self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS  # Use piezo for fine Z steps
+        self.z_range: Tuple[float, float] = None  # Z-stack range (min, max) in mm
+        
+        # Experiment settings
+        self.experiment_ID = None  # Unique identifier for this acquisition
+        self.base_path = None  # Base directory for saving images
+        self.use_fluidics = False  # Enable fluidics control during acquisition
+        
+        # Focus map settings
+        # Focus maps store pre-computed focus positions for each X,Y position
+        # This speeds up acquisition by avoiding autofocus at each position
+        self.focus_map = None  # Current focus map (2D array of Z positions)
+        self.gen_focus_map = False  # Generate focus map during acquisition
+        self.focus_map_storage = []  # Storage for focus map data
+        self.use_manual_focus_map = False  # Use manually provided focus map
+        self.already_using_fmap = False  # Track if focus map is in use
+        
+        # Channel selection
+        self.selected_configurations = []  # List of channel configurations to acquire
+        
+        # Scan coordinates (pre-computed positions)
         self.scanCoordinates = scan_coordinates
+        
+        # Display settings
         self.old_images_per_page = 1
-        self.z_range: Tuple[float, float] = None
         self.z_stacking_config = control._def.Z_STACKING_CONFIG
 
         self._start_position: Optional[squid.abc.Pos] = None

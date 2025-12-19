@@ -1,3 +1,22 @@
+"""
+Live image acquisition controller.
+
+This module handles continuous image acquisition (live view) with:
+- Software or hardware triggering
+- Automatic illumination control synchronized with camera exposure
+- Frame rate control
+- Channel switching with automatic filter wheel control
+
+The LiveController manages the timing and sequencing of:
+1. Illumination turn-on
+2. Camera trigger
+3. Image readout
+4. Illumination turn-off
+
+This ensures proper synchronization between illumination and camera exposure
+for both software-triggered and hardware-triggered acquisition modes.
+"""
+
 from __future__ import annotations
 
 import time
@@ -13,6 +32,22 @@ from control import utils_channel
 
 
 class LiveController:
+    """
+    Controller for live image acquisition.
+    
+    Manages continuous image streaming with proper illumination synchronization.
+    Supports both software and hardware trigger modes.
+    
+    Software trigger mode:
+    - Python code controls timing
+    - Manual illumination on/off
+    - Good for low frame rates (<10 fps)
+    
+    Hardware trigger mode:
+    - Microcontroller controls timing
+    - Synchronized illumination and camera trigger
+    - Good for high frame rates (>10 fps)
+    """
     def __init__(
         self,
         microscope: "Microscope",
@@ -22,62 +57,101 @@ class LiveController:
         use_internal_timer_for_hardware_trigger: bool = True,
         for_displacement_measurement: bool = False,
     ):
+        """
+        Initialize the live controller.
+        
+        Args:
+            microscope: Microscope instance (for stage, illumination, etc.)
+            camera: Camera to use for acquisition
+            control_illumination: If True, automatically control illumination during acquisition
+            use_internal_timer_for_hardware_trigger: Use Python timer vs microcontroller timer
+            for_displacement_measurement: If True, used for laser autofocus/displacement measurement
+        """
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.microscope = microscope
         self.camera: AbstractCamera = camera
-        self.currentConfiguration = None
+        self.currentConfiguration = None  # Current channel configuration (wavelength, exposure, etc.)
         self.trigger_mode: Optional[TriggerMode] = TriggerMode.SOFTWARE  # @@@ change to None
-        self.is_live = False
-        self.control_illumination = control_illumination
-        self.illumination_on = False
-        self.use_internal_timer_for_hardware_trigger = (
-            use_internal_timer_for_hardware_trigger  # use Timer vs timer in the MCU
-        )
-        self.for_displacement_measurement = for_displacement_measurement
+        self.is_live = False  # Whether live acquisition is currently running
+        self.control_illumination = control_illumination  # Auto-control illumination during acquisition
+        self.illumination_on = False  # Current illumination state
+        # Hardware trigger timing: use Python timer vs microcontroller timer
+        self.use_internal_timer_for_hardware_trigger = use_internal_timer_for_hardware_trigger
+        self.for_displacement_measurement = for_displacement_measurement  # Used for laser AF
 
-        self.fps_trigger = 1
-        self.timer_trigger_interval = (1.0 / self.fps_trigger) * 1000
-        self._trigger_skip_count = 0
-        self.timer_trigger: Optional[threading.Timer] = None
+        # Frame rate control for software trigger mode
+        self.fps_trigger = 1  # Target frames per second
+        self.timer_trigger_interval = (1.0 / self.fps_trigger) * 1000  # Interval in milliseconds
+        self._trigger_skip_count = 0  # Counter for skipped triggers (if camera is slow)
+        self.timer_trigger: Optional[threading.Timer] = None  # Timer for periodic triggering
 
-        self.trigger_ID = -1
+        self.trigger_ID = -1  # ID for tracking triggers
 
-        self.fps_real = 0
-        self.counter = 0
-        self.timestamp_last = 0
+        # Frame rate monitoring
+        self.fps_real = 0  # Actual measured frame rate
+        self.counter = 0  # Frame counter
+        self.timestamp_last = 0  # Timestamp of last frame
 
-        self.display_resolution_scaling = 1
+        self.display_resolution_scaling = 1  # Scaling factor for display (for performance)
 
+        # Automatic filter wheel switching when changing channels
         self.enable_channel_auto_filter_switching: bool = True
 
-    # illumination control
+    # Illumination control methods
     def turn_on_illumination(self):
+        """
+        Turn on illumination for the current channel.
+        
+        Handles different illumination types:
+        - Fluorescence LEDs/lasers (via IlluminationController)
+        - LED matrix for brightfield (via SciMicroscopyLEDArray or microcontroller)
+        """
         if not "LED matrix" in self.currentConfiguration.name:
-            self.microscope.illumination_controller.turn_on_illumination(
-                int(utils_channel.extract_wavelength_from_config_name(self.currentConfiguration.name))
-            )
+            # Fluorescence channel: use illumination controller
+            wavelength = int(utils_channel.extract_wavelength_from_config_name(self.currentConfiguration.name))
+            self.microscope.illumination_controller.turn_on_illumination(wavelength)
         elif self.microscope.addons.sci_microscopy_led_array and "LED matrix" in self.currentConfiguration.name:
+            # LED matrix via SciMicroscopyLEDArray addon
             self.microscope.addons.sci_microscopy_led_array.turn_on_illumination()
-        # LED matrix
         else:
-            self.microscope.low_level_drivers.microcontroller.turn_on_illumination()  # to wrap microcontroller in Squid_led_array
+            # LED matrix via microcontroller (built-in LED array)
+            self.microscope.low_level_drivers.microcontroller.turn_on_illumination()
         self.illumination_on = True
 
     def turn_off_illumination(self):
+        """
+        Turn off illumination for the current channel.
+        
+        Handles different illumination types (same as turn_on_illumination).
+        """
         if not "LED matrix" in self.currentConfiguration.name:
-            self.microscope.illumination_controller.turn_off_illumination(
-                int(utils_channel.extract_wavelength_from_config_name(self.currentConfiguration.name))
-            )
+            # Fluorescence channel
+            wavelength = int(utils_channel.extract_wavelength_from_config_name(self.currentConfiguration.name))
+            self.microscope.illumination_controller.turn_off_illumination(wavelength)
         elif self.microscope.addons.sci_microscopy_led_array and "LED matrix" in self.currentConfiguration.name:
+            # LED matrix via SciMicroscopyLEDArray
             self.microscope.addons.sci_microscopy_led_array.turn_off_illumination()
-        # LED matrix
         else:
-            self.microscope.low_level_drivers.microcontroller.turn_off_illumination()  # to wrap microcontroller in Squid_led_array
+            # LED matrix via microcontroller
+            self.microscope.low_level_drivers.microcontroller.turn_off_illumination()
         self.illumination_on = False
 
     def update_illumination(self):
+        """
+        Update illumination settings for the current channel.
+        
+        This method:
+        - Sets LED/laser intensity
+        - Configures LED matrix color and mode (brightfield, DPC, darkfield)
+        - Sets emission filter wheel position (for spinning disk confocal)
+        - Configures NL5 laser combiner if present
+        
+        Called when switching channels or changing intensity settings.
+        """
         illumination_source = self.currentConfiguration.illumination_source
         intensity = self.currentConfiguration.illumination_intensity
+        
+        # LED matrix channels (source < 10) vs fluorescence channels (source >= 10)
         if illumination_source < 10:  # LED matrix
             if self.microscope.addons.sci_microscopy_led_array:
                 # set color

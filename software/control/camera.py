@@ -1,3 +1,26 @@
+"""
+Default camera interface implementation using GXiPy (Daheng Imaging cameras).
+
+This module provides the DefaultCamera class, which implements the AbstractCamera
+interface for GXiPy-compatible cameras (typically Daheng Imaging cameras). The
+camera interface handles:
+
+- Image acquisition (single frames and streaming)
+- Hardware and software triggering
+- Exposure time control
+- ROI (Region of Interest) setting
+- Pixel format configuration
+- Gain and offset control
+- Frame callbacks for live viewing
+
+The camera can operate in two trigger modes:
+- SOFTWARE_TRIGGER: Camera waits for software command to capture
+- HARDWARE_TRIGGER: Camera responds to hardware trigger signal from microcontroller
+
+Hardware triggering provides better synchronization for fast acquisitions and
+precise timing control between illumination and image capture.
+"""
+
 import threading
 from typing import Optional, Tuple, Sequence, Callable
 import time

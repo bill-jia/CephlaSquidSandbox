@@ -1,3 +1,25 @@
+"""
+Microcontroller interface for hardware control.
+
+This module provides the interface to the Teensy microcontroller that controls:
+- Stage motors (X, Y, Z, Theta, W axes via stepper drivers)
+- DAC outputs (for illumination intensity and piezo control)
+- TTL I/O (for shutters, triggers, limit switches)
+- Hardware triggers (for synchronized camera/illumination control)
+
+Communication Protocol:
+- Commands are sent as byte arrays with CRC8 checksums
+- Microcontroller responds with status packets containing position, button states, etc.
+- All commands are non-blocking; use wait_till_operation_is_completed() to wait for completion
+- Background thread continuously reads status packets from microcontroller
+
+The microcontroller firmware runs a control loop that:
+- Executes motor movements
+- Updates DAC outputs
+- Monitors limit switches and buttons
+- Sends periodic status updates (~10ms intervals)
+"""
+
 import abc
 import enum
 import struct
@@ -16,13 +38,12 @@ import squid.logging
 from control._def import *
 
 
-# add user to the dialout group to avoid the need to use sudo
+# Note: User should be added to the dialout group to avoid needing sudo for serial access
 
-# done (7/20/2021) - remove the time.sleep in all functions (except for __init__) to
-# make all callable functions nonblocking, instead, user should check use is_busy() to
-# check if the microcontroller has finished executing the more recent command
+# Design note (7/20/2021): All functions (except __init__) are non-blocking.
+# Users should check is_busy() or use wait_till_operation_is_completed() to wait for completion.
 
-# We have a few top level functions here, so we have this module level log instance.  Classes should make their own!
+# Module-level logger for top-level functions
 _log = squid.logging.get_logger("microcontroller")
 
 
@@ -443,14 +464,41 @@ def get_microcontroller_serial_device(
 
 
 class Microcontroller:
-    LAST_COMMAND_ACK_TIMEOUT = 0.5
-    MAX_RETRY_COUNT = 5
-    MAX_RECONNECT_COUNT = 3
-    # The micro has an update time it tries to keep to.  This must be > that time.  As of 2025-04-28, it's 10ms
-    # on the micro.  So 0.1 is 10x that.
-    STALE_READ_TIMEOUT = 0.1
+    """
+    Interface to the Teensy microcontroller for hardware control.
+    
+    This class handles all low-level communication with the microcontroller:
+    - Sending commands (stage movement, DAC control, triggers, etc.)
+    - Receiving status updates (position, button states, etc.)
+    - Managing command acknowledgments and retries
+    - Monitoring communication health
+    
+    The microcontroller controls:
+    - Stepper motors for stage positioning (X, Y, Z, Theta, W)
+    - DAC80508 for analog outputs (illumination, piezo)
+    - TTL I/O for shutters, triggers, limit switches
+    - Hardware trigger generation for synchronized acquisition
+    
+    Communication is asynchronous: commands are sent immediately and a background
+    thread continuously reads status packets. Use wait_till_operation_is_completed()
+    to wait for command completion.
+    """
+    LAST_COMMAND_ACK_TIMEOUT = 0.5  # Timeout for command acknowledgment (seconds)
+    MAX_RETRY_COUNT = 5              # Maximum retries for failed commands
+    MAX_RECONNECT_COUNT = 3          # Maximum reconnection attempts
+    # The micro sends status packets every ~10ms. This timeout should be > that.
+    # As of 2025-04-28, it's 10ms on the micro. So 0.1s (10x) is a reasonable timeout.
+    STALE_READ_TIMEOUT = 0.1  # Warn if no status packets received for this long
 
     def __init__(self, serial_device: AbstractCephlaMicroSerial, reset_and_initialize=True):
+        """
+        Initialize the microcontroller interface.
+        
+        Args:
+            serial_device: Serial communication device (USB serial port)
+            reset_and_initialize: If True, reset and initialize the microcontroller on startup
+                                  (sets up drivers, configures actuators, etc.)
+        """
         self.log = squid.logging.get_logger(self.__class__.__name__)
 
         if not serial_device:
@@ -458,59 +506,68 @@ class Microcontroller:
 
         self._serial = serial_device
 
-        self.tx_buffer_length = MicrocontrollerDef.CMD_LENGTH
-        self.rx_buffer_length = MicrocontrollerDef.MSG_LENGTH
+        # Communication buffer sizes
+        self.tx_buffer_length = MicrocontrollerDef.CMD_LENGTH  # Command packet size
+        self.rx_buffer_length = MicrocontrollerDef.MSG_LENGTH  # Status packet size
 
-        self._cmd_id = 0
-        self._cmd_id_mcu = None  # command id of mcu's last received command
-        self._cmd_execution_status = None
-        self.mcu_cmd_execution_in_progress = False
+        # Command tracking
+        self._cmd_id = 0                    # Our command ID (increments with each command)
+        self._cmd_id_mcu = None             # Command ID from microcontroller's last response
+        self._cmd_execution_status = None   # Status of last command execution
+        self.mcu_cmd_execution_in_progress = False  # Whether a command is currently executing
 
-        # This is a sentinel/watchdog of sorts.  Every time we receive a valid packet from the micro, we update this.
-        # The micro should be sending packets once very ~10 ms, so if we go much longer than that without something
-        # is likely wrong.  See def _warn_if_reads_stale() and the read loop.
+        # Communication health monitoring
+        # Watchdog: tracks last successful status packet reception
+        # Microcontroller sends packets every ~10ms, so if we go much longer without
+        # receiving one, communication may be broken
         self._last_successful_read_time = time.time()
 
-        self.x_pos = 0  # unit: microstep or encoder resolution
-        self.y_pos = 0  # unit: microstep or encoder resolution
-        self.z_pos = 0  # unit: microstep or encoder resolution
-        self.w_pos = 0  # unit: microstep or encoder resolution
-        self.theta_pos = 0  # unit: microstep or encoder resolution
-        self.button_and_switch_state = 0
-        self.joystick_button_pressed = 0
-        # This is used to keep track of whether or not we should emit joystick events to the joystick listeners,
-        # and can be changed with enable_joystick(...)
-        self.joystick_listener_events_enabled = False
-        # This is a list of (id, functions) to call when we get a joystick event.  The functions are called
-        # with the new state of the button (True -> pressed, False -> not pressed).
-        #
-        # The id in the tuple is an internally defined unique ID that callers to add_joystick_button_listener() get back,
-        # and which can be used to remove the listener with remove_joystick_button_listener.
-        #
-        # These are called in our busy loop, and so should return immediately!
+        # Stage position tracking (updated from status packets)
+        # Units: microsteps or encoder counts (depending on configuration)
+        self.x_pos = 0
+        self.y_pos = 0
+        self.z_pos = 0
+        self.w_pos = 0      # W axis (if present, typically for additional positioning)
+        self.theta_pos = 0   # Theta axis (rotation)
+        
+        # Input state tracking (from status packets)
+        self.button_and_switch_state = 0    # Bitfield of button/switch states
+        self.joystick_button_pressed = 0    # Joystick button state
+        self.switch_state = 0              # Limit switch states
+        
+        # Joystick event handling
+        # Can register callbacks for joystick button presses
+        self.joystick_listener_events_enabled = False  # Enable/disable joystick events
+        # List of (id, callback_function) tuples
+        # Callbacks are called with button state (True=pressed, False=released)
+        # Callbacks should return immediately (called in read loop)
         self.joystick_event_listeners = []
-        self.switch_state = 0
 
-        self.last_command = None
+        # Command tracking for error handling
+        self.last_command = None                    # Last command sent
         self.last_command_send_timestamp = time.time()
-        self.last_command_aborted_error = None
+        self.last_command_aborted_error = None      # Error if last command was aborted
 
+        # CRC calculator for packet integrity checking
         self.crc_calculator = CrcCalculator(Crc8.CCITT, table_based=True)
-        self.retry = 0
+        self.retry = 0  # Retry counter for failed commands
 
+        # Background thread for reading status packets
         self.new_packet_callback_external = None
         self.terminate_reading_received_packet_thread = False
         self._received_packet_cv = threading.Condition()
         self.thread_read_received_packet = threading.Thread(target=self.read_received_packet, daemon=True)
         self.thread_read_received_packet.start()
 
+        # Initialize microcontroller if requested
         if reset_and_initialize:
             self.log.debug("Resetting and initializing microcontroller.")
-            self.reset()
+            self.reset()  # Reset microcontroller state
+            time.sleep(0.5)  # Wait for reset to complete
+            self.initialize_drivers()  # Initialize stepper drivers
             time.sleep(0.5)
-            self.initialize_drivers()
-            time.sleep(0.5)
-            self.configure_actuators()
+            self.configure_actuators()  # Configure motor parameters (velocities, accelerations, etc.)
+            # Set illumination intensity scaling factor (0-1, applied to all DAC outputs)
             self.set_dac80508_scaling_factor_for_illumination(ILLUMINATION_INTENSITY_FACTOR)
             time.sleep(0.5)
 
@@ -575,21 +632,44 @@ class Microcontroller:
         print("initialize filter wheel")  # debug
 
     def turn_on_illumination(self):
+        """
+        Turn on illumination via TTL shutter control.
+        
+        This opens the shutter for the currently selected illumination channel.
+        The channel and intensity should be set via set_illumination() before calling this.
+        """
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.TURN_ON_ILLUMINATION
         self.send_command(cmd)
 
     def turn_off_illumination(self):
+        """
+        Turn off illumination via TTL shutter control.
+        
+        This closes the shutter, stopping illumination.
+        """
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.TURN_OFF_ILLUMINATION
         self.send_command(cmd)
 
     def set_illumination(self, illumination_source, intensity):
+        """
+        Set illumination channel and intensity.
+        
+        This selects which LED/laser channel to use and sets its intensity.
+        The intensity is converted from percentage (0-100%) to 16-bit DAC value (0-65535).
+        
+        Args:
+            illumination_source: Channel number (maps to wavelength, e.g., 11=405nm, 12=488nm)
+            intensity: Intensity percentage (0-100%)
+        """
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.SET_ILLUMINATION
         cmd[2] = illumination_source
-        cmd[3] = int((intensity / 100) * 65535) >> 8
-        cmd[4] = int((intensity / 100) * 65535) & 0xFF
+        # Convert intensity percentage to 16-bit value and split into high/low bytes
+        intensity_16bit = int((intensity / 100) * 65535)
+        cmd[3] = intensity_16bit >> 8      # High byte
+        cmd[4] = intensity_16bit & 0xFF   # Low byte
         self.send_command(cmd)
 
     def set_illumination_led_matrix(self, illumination_source, r, g, b):
@@ -970,19 +1050,54 @@ class Microcontroller:
         self.send_command(cmd)
 
     def analog_write_onboard_DAC(self, dac, value):
+        """
+        Write a value directly to a DAC channel.
+        
+        Args:
+            dac: DAC channel number (0-7)
+            value: 16-bit value (0-65535) representing output voltage
+                   Actual voltage depends on reference and gain settings
+        """
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.ANALOG_WRITE_ONBOARD_DAC
         cmd[2] = dac
+        # Split 16-bit value into high/low bytes
         cmd[3] = (value >> 8) & 0xFF
         cmd[4] = value & 0xFF
         self.send_command(cmd)
 
     def set_piezo_um(self, z_piezo_um):
+        """
+        Set objective piezo position in micrometers.
+        
+        The piezo is typically mounted on the objective and provides fine Z positioning.
+        Channel 7 is typically used for objective piezo control.
+        
+        Args:
+            z_piezo_um: Desired position in micrometers (within piezo range)
+        """
+        # Convert position to DAC value (0-65535)
         dac = int(65535 * (z_piezo_um / OBJECTIVE_PIEZO_RANGE_UM))
+        # Flip direction if configured (some piezo stages have inverted response)
         dac = 65535 - dac if OBJECTIVE_PIEZO_FLIP_DIR else dac
+        # Write to DAC channel 7
         self.analog_write_onboard_DAC(7, dac)
 
     def configure_dac80508_refdiv_and_gain(self, div, gains):
+        """
+        Configure DAC80508 reference divider and channel gains.
+        
+        The DAC80508 has 8 channels. Each channel can have independent gain settings.
+        Reference divider affects all channels (divides reference voltage by 2 if enabled).
+        
+        Args:
+            div: Reference divider (0=no divide, 1=divide by 2)
+                 No divide: 2.5V reference -> 0-2.5V output
+                 Divide: 1.25V reference -> 0-1.25V output (or 0-2.5V with gain)
+            gains: Bitfield of gain settings for channels 0-7
+                   Bit 0 = channel 0 gain, bit 1 = channel 1 gain, etc.
+                   Gain = 0: no gain (1x), Gain = 1: 2x gain
+        """
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.SET_DAC80508_REFDIV_GAIN
         cmd[2] = div
@@ -1235,12 +1350,28 @@ class Microcontroller:
         return int(signed)
 
     def set_dac80508_scaling_factor_for_illumination(self, illumination_intensity_factor):
+        """
+        Set a global scaling factor for all illumination DAC outputs.
+        
+        This factor (0-1) is multiplied by all illumination intensity values before
+        being sent to the DAC. This allows global dimming/brightening of all LEDs
+        without changing individual channel settings.
+        
+        Useful for:
+        - Reducing overall illumination to prevent photobleaching
+        - Matching illumination levels between different objectives
+        - Fine-tuning system brightness
+        
+        Args:
+            illumination_intensity_factor: Scaling factor (0-1), where 1 = full intensity
+        """
+        # Clamp to valid range
         if illumination_intensity_factor > 1:
             illumination_intensity_factor = 1
-
         if illumination_intensity_factor < 0:
-            illumination_intensity_factor = 0.01
+            illumination_intensity_factor = 0.01  # Minimum 1% to avoid zero
 
+        # Convert to integer (0-100) for transmission
         factor = round(illumination_intensity_factor, 2) * 100
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.SET_ILLUMINATION_INTENSITY_FACTOR
