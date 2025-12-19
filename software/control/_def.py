@@ -463,6 +463,7 @@ CAMERA_PIXEL_SIZE_UM = {
     "IMX265": 3.45,
     "IMX571": 3.76,
     "PYTHON300": 4.8,
+    "ICX825": 6.45,  # Sony ICX-825 (Retiga Electro)
 }
 
 TUBE_LENS_MM = 50
@@ -677,6 +678,13 @@ NL5_USE_AOUT = False
 NL5_USE_DOUT = True
 NL5_TRIGGER_PIN = 2
 NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 638: 4, 640: 4}
+
+# National Instruments DAQ integration
+ENABLE_NI_DAQ = True
+NI_DAQ_BYPASS_SIMULATION = True
+NI_DAQ_DEVICE_NAME = "Dev1"
+NI_DAQ_DEFAULT_SAMPLE_RATE = 10000  # Hz
+NI_DAQ_DEFAULT_NUM_SAMPLES = 10000
 
 # Laser AF characterization mode
 LASER_AF_CHARACTERIZATION_MODE = False

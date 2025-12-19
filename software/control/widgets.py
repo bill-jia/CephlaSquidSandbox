@@ -10923,3 +10923,823 @@ class SurfacePlotWidget(QWidget):
         print(f"Clicked Point: x={self.x[idx]:.3f}, y={self.y[idx]:.3f}, z={self.z[idx]:.3f}")
         self.canvas.draw()
         self.signal_point_clicked.emit(self.x[idx], self.y[idx])
+
+
+class NIDAQWidget(QWidget):
+    """
+    Widget for controlling National Instruments DAQ devices.
+    
+    Provides a GUI for:
+    - Configuring sample rate and number of samples
+    - Setting up analog output waveforms
+    - Setting up digital output patterns
+    - Configuring analog input channels
+    - Arming, triggering, and viewing acquired data
+    """
+    
+    signal_acquisition_started = Signal()
+    signal_acquisition_finished = Signal()
+    
+    def __init__(self, ni_daq=None, is_simulation: bool = False, parent=None):
+        super().__init__(parent)
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        
+        # Import NI DAQ module
+        from control.ni_daq import (
+            AbstractNIDAQ, NIDAQConfig, WaveformData, AcquisitionResult,
+            TriggerSource, TriggerEdge, create_ni_daq,
+            generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
+        )
+        self._ni_daq_module = __import__('control.ni_daq', fromlist=[''])
+        
+        self.is_simulation = is_simulation
+        self._ni_daq = ni_daq
+        self._config = NIDAQConfig()
+        self._waveforms = WaveformData()
+        
+        # Waveform data storage
+        self._ao_waveforms: dict = {}  # channel -> np.ndarray
+        self._do_patterns: dict = {}   # line -> np.ndarray
+        
+        # Initialize UI
+        self.init_ui()
+        
+        # If no DAQ provided, create one
+        if self._ni_daq is None:
+            self._create_daq()
+        
+        # Update device list
+        self.refresh_devices()
+    
+    def init_ui(self):
+        """Initialize the user interface."""
+        main_layout = QHBoxLayout()
+        self.setLayout(main_layout)
+        
+        # Left panel - Configuration
+        left_panel = QVBoxLayout()
+        
+        # Device Selection Group
+        device_group = QGroupBox("Device Configuration")
+        device_layout = QVBoxLayout()
+        
+        # Device dropdown
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel("Device:"))
+        self.device_combo = QComboBox()
+        self.device_combo.currentTextChanged.connect(self.on_device_changed)
+        device_row.addWidget(self.device_combo)
+        self.refresh_btn = QPushButton("↻")
+        self.refresh_btn.setFixedWidth(30)
+        self.refresh_btn.clicked.connect(self.refresh_devices)
+        device_row.addWidget(self.refresh_btn)
+        device_layout.addLayout(device_row)
+        
+        # Sample rate
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(QLabel("Sample Rate (Hz):"))
+        self.sample_rate_spin = QDoubleSpinBox()
+        self.sample_rate_spin.setRange(1, 1000000)
+        self.sample_rate_spin.setValue(10000)
+        self.sample_rate_spin.setDecimals(0)
+        self.sample_rate_spin.valueChanged.connect(self.on_config_changed)
+        rate_row.addWidget(self.sample_rate_spin)
+        device_layout.addLayout(rate_row)
+        
+        # Number of samples
+        samples_row = QHBoxLayout()
+        samples_row.addWidget(QLabel("Samples per Channel:"))
+        self.num_samples_spin = QSpinBox()
+        self.num_samples_spin.setRange(2, 10000000)
+        self.num_samples_spin.setValue(10000)
+        self.num_samples_spin.valueChanged.connect(self.on_config_changed)
+        samples_row.addWidget(self.num_samples_spin)
+        device_layout.addLayout(samples_row)
+        
+        # Duration display
+        duration_row = QHBoxLayout()
+        duration_row.addWidget(QLabel("Duration (s):"))
+        self.duration_label = QLabel("1.000")
+        duration_row.addWidget(self.duration_label)
+        device_layout.addLayout(duration_row)
+        
+        # Continuous mode checkbox
+        self.continuous_checkbox = QCheckBox("Continuous Mode")
+        self.continuous_checkbox.stateChanged.connect(self.on_config_changed)
+        device_layout.addWidget(self.continuous_checkbox)
+        
+        device_group.setLayout(device_layout)
+        left_panel.addWidget(device_group)
+        
+        # Trigger Configuration Group
+        trigger_group = QGroupBox("Trigger Configuration")
+        trigger_layout = QVBoxLayout()
+        
+        trigger_source_row = QHBoxLayout()
+        trigger_source_row.addWidget(QLabel("Trigger Source:"))
+        self.trigger_source_combo = QComboBox()
+        self.trigger_source_combo.addItems(["Software", "External"])
+        self.trigger_source_combo.currentTextChanged.connect(self.on_config_changed)
+        trigger_source_row.addWidget(self.trigger_source_combo)
+        trigger_layout.addLayout(trigger_source_row)
+        
+        trigger_terminal_row = QHBoxLayout()
+        trigger_terminal_row.addWidget(QLabel("External Terminal:"))
+        self.trigger_terminal_edit = QLineEdit("/Dev1/PFI0")
+        self.trigger_terminal_edit.textChanged.connect(self.on_config_changed)
+        trigger_terminal_row.addWidget(self.trigger_terminal_edit)
+        trigger_layout.addLayout(trigger_terminal_row)
+        
+        trigger_edge_row = QHBoxLayout()
+        trigger_edge_row.addWidget(QLabel("Trigger Edge:"))
+        self.trigger_edge_combo = QComboBox()
+        self.trigger_edge_combo.addItems(["Rising", "Falling"])
+        self.trigger_edge_combo.currentTextChanged.connect(self.on_config_changed)
+        trigger_edge_row.addWidget(self.trigger_edge_combo)
+        trigger_layout.addLayout(trigger_edge_row)
+        
+        trigger_group.setLayout(trigger_layout)
+        left_panel.addWidget(trigger_group)
+        
+        # Analog Output Configuration Group
+        ao_group = QGroupBox("Analog Output Channels")
+        ao_layout = QVBoxLayout()
+        
+        self.ao_channels_list = QListWidget()
+        self.ao_channels_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        ao_layout.addWidget(self.ao_channels_list)
+        
+        ao_btn_row = QHBoxLayout()
+        self.add_ao_waveform_btn = QPushButton("Add Waveform")
+        self.add_ao_waveform_btn.clicked.connect(self.show_ao_waveform_dialog)
+        ao_btn_row.addWidget(self.add_ao_waveform_btn)
+        ao_layout.addLayout(ao_btn_row)
+        
+        ao_group.setLayout(ao_layout)
+        left_panel.addWidget(ao_group)
+        
+        # Digital Output Configuration Group
+        do_group = QGroupBox("Digital Output Lines")
+        do_layout = QVBoxLayout()
+        
+        do_port_row = QHBoxLayout()
+        do_port_row.addWidget(QLabel("Port:"))
+        self.do_port_combo = QComboBox()
+        self.do_port_combo.addItems(["port0", "port1", "port2"])
+        self.do_port_combo.currentTextChanged.connect(self.on_config_changed)
+        do_port_row.addWidget(self.do_port_combo)
+        do_layout.addLayout(do_port_row)
+        
+        self.do_lines_list = QListWidget()
+        self.do_lines_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        for i in range(8):
+            self.do_lines_list.addItem(f"Line {i}")
+        do_layout.addWidget(self.do_lines_list)
+        
+        do_btn_row = QHBoxLayout()
+        self.add_do_pattern_btn = QPushButton("Add Pattern")
+        self.add_do_pattern_btn.clicked.connect(self.show_do_pattern_dialog)
+        do_btn_row.addWidget(self.add_do_pattern_btn)
+        do_layout.addLayout(do_btn_row)
+        
+        do_group.setLayout(do_layout)
+        left_panel.addWidget(do_group)
+        
+        # Analog Input Configuration Group
+        ai_group = QGroupBox("Analog Input Channels")
+        ai_layout = QVBoxLayout()
+        
+        self.ai_channels_list = QListWidget()
+        self.ai_channels_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        ai_layout.addWidget(self.ai_channels_list)
+        
+        ai_terminal_row = QHBoxLayout()
+        ai_terminal_row.addWidget(QLabel("Terminal Config:"))
+        self.ai_terminal_combo = QComboBox()
+        self.ai_terminal_combo.addItems(["RSE", "NRSE", "Diff", "PseudoDiff"])
+        self.ai_terminal_combo.currentTextChanged.connect(self.on_config_changed)
+        ai_terminal_row.addWidget(self.ai_terminal_combo)
+        ai_layout.addLayout(ai_terminal_row)
+        
+        ai_group.setLayout(ai_layout)
+        left_panel.addWidget(ai_group)
+        
+        left_panel.addStretch()
+        main_layout.addLayout(left_panel, 1)
+        
+        # Right panel - Waveform display and controls
+        right_panel = QVBoxLayout()
+        
+        # Waveform Plot
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+        
+        self.fig = Figure(figsize=(8, 6))
+        self.canvas = FigureCanvas(self.fig)
+        self.ax_ao = self.fig.add_subplot(311)
+        self.ax_do = self.fig.add_subplot(312)
+        self.ax_ai = self.fig.add_subplot(313)
+        
+        self.ax_ao.set_title("Analog Output")
+        self.ax_ao.set_ylabel("Voltage (V)")
+        self.ax_do.set_title("Digital Output")
+        self.ax_do.set_ylabel("Level")
+        self.ax_ai.set_title("Analog Input (Acquired)")
+        self.ax_ai.set_xlabel("Time (s)")
+        self.ax_ai.set_ylabel("Voltage (V)")
+        
+        self.fig.tight_layout()
+        right_panel.addWidget(self.canvas)
+        
+        # Control buttons
+        control_row = QHBoxLayout()
+        
+        self.arm_btn = QPushButton("Arm")
+        self.arm_btn.clicked.connect(self.arm_tasks)
+        self.arm_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        control_row.addWidget(self.arm_btn)
+        
+        self.trigger_btn = QPushButton("Trigger")
+        self.trigger_btn.clicked.connect(self.send_trigger)
+        self.trigger_btn.setEnabled(False)
+        self.trigger_btn.setStyleSheet("background-color: #2196F3; color: white;")
+        control_row.addWidget(self.trigger_btn)
+        
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_tasks)
+        self.stop_btn.setStyleSheet("background-color: #f44336; color: white;")
+        control_row.addWidget(self.stop_btn)
+        
+        right_panel.addLayout(control_row)
+        
+        # Status display
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("Status:"))
+        self.status_label = QLabel("Not configured")
+        self.status_label.setStyleSheet("font-weight: bold;")
+        status_row.addWidget(self.status_label)
+        status_row.addStretch()
+        right_panel.addLayout(status_row)
+        
+        main_layout.addLayout(right_panel, 2)
+    
+    def _create_daq(self):
+        """Create DAQ instance based on current configuration."""
+        from control.ni_daq import create_ni_daq
+        self._update_config()
+        try:
+            self._ni_daq = create_ni_daq(self._config, simulation=self.is_simulation)
+            self._log.info(f"Created NI DAQ (simulation={self.is_simulation})")
+        except Exception as e:
+            self._log.error(f"Failed to create NI DAQ: {e}")
+            self.status_label.setText(f"Error: {e}")
+    
+    def refresh_devices(self):
+        """Refresh the list of available devices."""
+        self.device_combo.clear()
+        
+        if self._ni_daq is None:
+            self._create_daq()
+        
+        if self._ni_daq is not None:
+            devices = self._ni_daq.get_available_devices()
+            if devices:
+                self.device_combo.addItems(devices)
+                self.status_label.setText("Ready")
+            else:
+                self.device_combo.addItem("No devices found")
+                self.status_label.setText("No devices found")
+        else:
+            self.device_combo.addItem("DAQ not available")
+            self.status_label.setText("DAQ not available")
+    
+    def on_device_changed(self, device_name: str):
+        """Handle device selection change."""
+        if not device_name or device_name in ["No devices found", "DAQ not available"]:
+            return
+        
+        self._config.device_name = device_name
+        
+        # Get device info and update channel lists
+        if self._ni_daq is not None:
+            info = self._ni_daq.get_device_info(device_name)
+            
+            # Update AO channels
+            self.ao_channels_list.clear()
+            for ch in info.get("ao_channels", []):
+                # Extract just the channel part (e.g., "ao0" from "Dev1/ao0")
+                ch_name = ch.split("/")[-1] if "/" in ch else ch
+                self.ao_channels_list.addItem(ch_name)
+            
+            # Update AI channels  
+            self.ai_channels_list.clear()
+            for ch in info.get("ai_channels", []):
+                ch_name = ch.split("/")[-1] if "/" in ch else ch
+                self.ai_channels_list.addItem(ch_name)
+            
+            # Update trigger terminal default
+            self.trigger_terminal_edit.setText(f"/{device_name}/PFI0")
+    
+    def on_config_changed(self):
+        """Handle configuration changes."""
+        self._update_config()
+        self._update_duration_display()
+    
+    def _update_config(self):
+        """Update the configuration from UI values."""
+        from control.ni_daq import TriggerSource, TriggerEdge
+        
+        self._config.device_name = self.device_combo.currentText()
+        self._config.sample_rate_hz = self.sample_rate_spin.value()
+        self._config.samples_per_channel = self.num_samples_spin.value()
+        self._config.continuous = self.continuous_checkbox.isChecked()
+        self._config.do_port = self.do_port_combo.currentText()
+        self._config.ai_terminal_config = self.ai_terminal_combo.currentText()
+        self._config.external_trigger_terminal = self.trigger_terminal_edit.text()
+        
+        # Trigger source
+        if self.trigger_source_combo.currentText() == "Software":
+            self._config.trigger_source = TriggerSource.SOFTWARE
+        else:
+            self._config.trigger_source = TriggerSource.EXTERNAL
+        
+        # Trigger edge
+        if self.trigger_edge_combo.currentText() == "Rising":
+            self._config.trigger_edge = TriggerEdge.RISING
+        else:
+            self._config.trigger_edge = TriggerEdge.FALLING
+        
+        # Get selected AO channels
+        self._config.ao_channels = [
+            item.text() for item in self.ao_channels_list.selectedItems()
+        ]
+        
+        # Get selected AI channels
+        self._config.ai_channels = [
+            item.text() for item in self.ai_channels_list.selectedItems()
+        ]
+        
+        # Get selected DO lines
+        self._config.do_lines = []
+        for i in range(self.do_lines_list.count()):
+            item = self.do_lines_list.item(i)
+            if item.isSelected():
+                self._config.do_lines.append(i)
+    
+    def _update_duration_display(self):
+        """Update the duration display label."""
+        duration = self._config.samples_per_channel / self._config.sample_rate_hz
+        self.duration_label.setText(f"{duration:.3f}")
+    
+    def show_ao_waveform_dialog(self):
+        """Show dialog to configure analog output waveform."""
+        dialog = AOWaveformDialog(
+            self._config.sample_rate_hz,
+            self._config.samples_per_channel,
+            self._config.ao_channels,
+            self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            channel, waveform = dialog.get_waveform()
+            if channel and waveform is not None:
+                self._ao_waveforms[channel] = waveform
+                self._update_waveform_plot()
+    
+    def show_do_pattern_dialog(self):
+        """Show dialog to configure digital output pattern."""
+        dialog = DOPatternDialog(
+            self._config.sample_rate_hz,
+            self._config.samples_per_channel,
+            self._config.do_lines,
+            self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            line, pattern = dialog.get_pattern()
+            if line is not None and pattern is not None:
+                self._do_patterns[line] = pattern
+                self._update_waveform_plot()
+    
+    def _update_waveform_plot(self):
+        """Update the waveform display plot."""
+        # Clear all axes
+        self.ax_ao.clear()
+        self.ax_do.clear()
+        
+        t = np.arange(self._config.samples_per_channel) / self._config.sample_rate_hz
+        
+        # Plot AO waveforms
+        self.ax_ao.set_title("Analog Output")
+        self.ax_ao.set_ylabel("Voltage (V)")
+        for channel, data in self._ao_waveforms.items():
+            if len(data) == len(t):
+                self.ax_ao.plot(t, data, label=channel)
+        if self._ao_waveforms:
+            self.ax_ao.legend(loc='upper right')
+            self.ax_ao.grid(True, alpha=0.3)
+        
+        # Plot DO patterns
+        self.ax_do.set_title("Digital Output")
+        self.ax_do.set_ylabel("Level")
+        offset = 0
+        for line, data in self._do_patterns.items():
+            if len(data) == len(t):
+                self.ax_do.plot(t, data.astype(float) + offset * 1.2, label=f"Line {line}")
+                offset += 1
+        if self._do_patterns:
+            self.ax_do.legend(loc='upper right')
+            self.ax_do.grid(True, alpha=0.3)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def arm_tasks(self):
+        """Arm the DAQ tasks for triggered acquisition."""
+        if self._ni_daq is None:
+            self._create_daq()
+        
+        if self._ni_daq is None:
+            self.status_label.setText("No DAQ available")
+            return
+        
+        try:
+            # Update configuration
+            self._update_config()
+            self._ni_daq.configure(self._config)
+            
+            # Set waveforms
+            from control.ni_daq import WaveformData
+            waveforms = WaveformData(
+                analog_output=self._ao_waveforms.copy(),
+                digital_output=self._do_patterns.copy()
+            )
+            self._ni_daq.set_waveforms(waveforms)
+            
+            # Arm
+            self._ni_daq.arm()
+            
+            self.trigger_btn.setEnabled(True)
+            self.status_label.setText("Armed - waiting for trigger")
+            self._log.info("DAQ armed and ready")
+            
+        except Exception as e:
+            self._log.error(f"Failed to arm DAQ: {e}")
+            self.status_label.setText(f"Error: {e}")
+    
+    def send_trigger(self):
+        """Send software trigger to start acquisition."""
+        if self._ni_daq is None or not self._ni_daq.is_armed:
+            self.status_label.setText("Not armed")
+            return
+        
+        try:
+            self.signal_acquisition_started.emit()
+            self._ni_daq.start_trigger()
+            self.status_label.setText("Running...")
+            self.trigger_btn.setEnabled(False)
+            
+            # Wait for completion in a thread
+            import threading
+            thread = threading.Thread(target=self._wait_for_completion)
+            thread.daemon = True
+            thread.start()
+            
+        except Exception as e:
+            self._log.error(f"Failed to trigger: {e}")
+            self.status_label.setText(f"Error: {e}")
+    
+    def _wait_for_completion(self):
+        """Wait for acquisition to complete and update UI."""
+        if self._ni_daq is None:
+            return
+        
+        timeout = (self._config.samples_per_channel / self._config.sample_rate_hz) + 5.0
+        success = self._ni_daq.wait_until_done(timeout)
+        
+        if success:
+            # Get acquired data
+            result = self._ni_daq.get_acquired_data()
+            
+            # Update AI plot on main thread
+            QTimer.singleShot(0, lambda: self._update_ai_plot(result))
+            QTimer.singleShot(0, lambda: self.status_label.setText("Acquisition complete"))
+        else:
+            QTimer.singleShot(0, lambda: self.status_label.setText("Acquisition timeout"))
+        
+        QTimer.singleShot(0, lambda: self.signal_acquisition_finished.emit())
+    
+    def _update_ai_plot(self, result):
+        """Update the analog input plot with acquired data."""
+        from control.ni_daq import AcquisitionResult
+        
+        self.ax_ai.clear()
+        self.ax_ai.set_title("Analog Input (Acquired)")
+        self.ax_ai.set_xlabel("Time (s)")
+        self.ax_ai.set_ylabel("Voltage (V)")
+        
+        if result.timestamps is not None and len(result.analog_input) > 0:
+            for channel, data in result.analog_input.items():
+                self.ax_ai.plot(result.timestamps, data, label=channel)
+            self.ax_ai.legend(loc='upper right')
+            self.ax_ai.grid(True, alpha=0.3)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def stop_tasks(self):
+        """Stop all running tasks."""
+        if self._ni_daq is not None:
+            self._ni_daq.stop()
+        
+        self.trigger_btn.setEnabled(False)
+        self.status_label.setText("Stopped")
+    
+    def closeEvent(self, event):
+        """Handle widget close event."""
+        if self._ni_daq is not None:
+            self._ni_daq.close()
+        super().closeEvent(event)
+
+
+class AOWaveformDialog(QDialog):
+    """Dialog for configuring analog output waveforms."""
+    
+    def __init__(self, sample_rate: float, num_samples: int, channels: list, parent=None):
+        super().__init__(parent)
+        self.sample_rate = sample_rate
+        self.num_samples = num_samples
+        self.channels = channels
+        self._waveform = None
+        self._channel = None
+        
+        self.setWindowTitle("Configure Analog Output Waveform")
+        self.setMinimumSize(400, 300)
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Channel selection
+        channel_row = QHBoxLayout()
+        channel_row.addWidget(QLabel("Channel:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.addItems(self.channels if self.channels else ["ao0", "ao1", "ao2", "ao3"])
+        channel_row.addWidget(self.channel_combo)
+        layout.addLayout(channel_row)
+        
+        # Waveform type
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Waveform Type:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Sine", "Square", "Ramp", "DC", "Custom"])
+        self.type_combo.currentTextChanged.connect(self.on_type_changed)
+        type_row.addWidget(self.type_combo)
+        layout.addLayout(type_row)
+        
+        # Parameters group
+        self.params_group = QGroupBox("Parameters")
+        params_layout = QFormLayout()
+        
+        self.frequency_spin = QDoubleSpinBox()
+        self.frequency_spin.setRange(0.001, self.sample_rate / 2)
+        self.frequency_spin.setValue(100)
+        self.frequency_spin.setDecimals(3)
+        params_layout.addRow("Frequency (Hz):", self.frequency_spin)
+        
+        self.amplitude_spin = QDoubleSpinBox()
+        self.amplitude_spin.setRange(0, 10)
+        self.amplitude_spin.setValue(1.0)
+        self.amplitude_spin.setDecimals(3)
+        params_layout.addRow("Amplitude (V):", self.amplitude_spin)
+        
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-10, 10)
+        self.offset_spin.setValue(0)
+        self.offset_spin.setDecimals(3)
+        params_layout.addRow("Offset (V):", self.offset_spin)
+        
+        self.phase_spin = QDoubleSpinBox()
+        self.phase_spin.setRange(0, 360)
+        self.phase_spin.setValue(0)
+        self.phase_spin.setDecimals(1)
+        params_layout.addRow("Phase (deg):", self.phase_spin)
+        
+        self.duty_spin = QDoubleSpinBox()
+        self.duty_spin.setRange(0, 1)
+        self.duty_spin.setValue(0.5)
+        self.duty_spin.setDecimals(2)
+        params_layout.addRow("Duty Cycle:", self.duty_spin)
+        
+        self.params_group.setLayout(params_layout)
+        layout.addWidget(self.params_group)
+        
+        # Custom waveform text edit (hidden by default)
+        self.custom_label = QLabel("Enter values (comma-separated or one per line):")
+        self.custom_label.setVisible(False)
+        layout.addWidget(self.custom_label)
+        
+        self.custom_edit = QTextEdit()
+        self.custom_edit.setVisible(False)
+        self.custom_edit.setPlaceholderText("e.g., 0, 0.5, 1.0, 0.5, 0, -0.5, -1.0, -0.5")
+        layout.addWidget(self.custom_edit)
+        
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.ok_btn)
+        btn_row.addWidget(self.cancel_btn)
+        layout.addLayout(btn_row)
+        
+        self.on_type_changed(self.type_combo.currentText())
+    
+    def on_type_changed(self, waveform_type: str):
+        """Update UI based on waveform type selection."""
+        show_params = waveform_type not in ["Custom", "DC"]
+        show_custom = waveform_type == "Custom"
+        
+        self.frequency_spin.setEnabled(show_params)
+        self.phase_spin.setEnabled(show_params and waveform_type == "Sine")
+        self.duty_spin.setEnabled(waveform_type == "Square")
+        self.custom_label.setVisible(show_custom)
+        self.custom_edit.setVisible(show_custom)
+    
+    def get_waveform(self) -> tuple:
+        """Generate and return the configured waveform."""
+        from control.ni_daq import generate_sine_wave, generate_square_wave, generate_ramp_wave
+        
+        channel = self.channel_combo.currentText()
+        waveform_type = self.type_combo.currentText()
+        
+        freq = self.frequency_spin.value()
+        amp = self.amplitude_spin.value()
+        offset = self.offset_spin.value()
+        phase = np.radians(self.phase_spin.value())
+        duty = self.duty_spin.value()
+        
+        try:
+            if waveform_type == "Sine":
+                waveform = generate_sine_wave(freq, amp, self.sample_rate, self.num_samples, offset, phase)
+            elif waveform_type == "Square":
+                waveform = generate_square_wave(freq, amp, self.sample_rate, self.num_samples, offset, duty)
+            elif waveform_type == "Ramp":
+                waveform = generate_ramp_wave(freq, amp, self.sample_rate, self.num_samples, offset)
+            elif waveform_type == "DC":
+                waveform = np.full(self.num_samples, offset)
+            elif waveform_type == "Custom":
+                text = self.custom_edit.toPlainText()
+                values = [float(v.strip()) for v in text.replace('\n', ',').split(',') if v.strip()]
+                if len(values) != self.num_samples:
+                    # Interpolate to match sample count
+                    x_orig = np.linspace(0, 1, len(values))
+                    x_new = np.linspace(0, 1, self.num_samples)
+                    waveform = np.interp(x_new, x_orig, values)
+                else:
+                    waveform = np.array(values)
+            else:
+                waveform = np.zeros(self.num_samples)
+            
+            return channel, waveform
+        except Exception as e:
+            return channel, np.zeros(self.num_samples)
+
+
+class DOPatternDialog(QDialog):
+    """Dialog for configuring digital output patterns."""
+    
+    def __init__(self, sample_rate: float, num_samples: int, lines: list, parent=None):
+        super().__init__(parent)
+        self.sample_rate = sample_rate
+        self.num_samples = num_samples
+        self.lines = lines
+        self._pattern = None
+        self._line = None
+        
+        self.setWindowTitle("Configure Digital Output Pattern")
+        self.setMinimumSize(400, 250)
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Line selection
+        line_row = QHBoxLayout()
+        line_row.addWidget(QLabel("Line:"))
+        self.line_combo = QComboBox()
+        for line in (self.lines if self.lines else range(8)):
+            self.line_combo.addItem(f"Line {line}", line)
+        line_row.addWidget(self.line_combo)
+        layout.addLayout(line_row)
+        
+        # Pattern type
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Pattern Type:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Pulse Train", "Single Pulse", "Always High", "Always Low"])
+        self.type_combo.currentTextChanged.connect(self.on_type_changed)
+        type_row.addWidget(self.type_combo)
+        layout.addLayout(type_row)
+        
+        # Parameters group
+        self.params_group = QGroupBox("Parameters")
+        params_layout = QFormLayout()
+        
+        self.period_spin = QDoubleSpinBox()
+        self.period_spin.setRange(0.000001, self.num_samples / self.sample_rate)
+        self.period_spin.setValue(0.001)
+        self.period_spin.setDecimals(6)
+        self.period_spin.setSuffix(" s")
+        params_layout.addRow("Period:", self.period_spin)
+        
+        self.pulse_width_spin = QDoubleSpinBox()
+        self.pulse_width_spin.setRange(0.000001, self.num_samples / self.sample_rate)
+        self.pulse_width_spin.setValue(0.0005)
+        self.pulse_width_spin.setDecimals(6)
+        self.pulse_width_spin.setSuffix(" s")
+        params_layout.addRow("Pulse Width:", self.pulse_width_spin)
+        
+        self.delay_spin = QDoubleSpinBox()
+        self.delay_spin.setRange(0, self.num_samples / self.sample_rate)
+        self.delay_spin.setValue(0)
+        self.delay_spin.setDecimals(6)
+        self.delay_spin.setSuffix(" s")
+        params_layout.addRow("Initial Delay:", self.delay_spin)
+        
+        self.inverted_checkbox = QCheckBox()
+        params_layout.addRow("Inverted:", self.inverted_checkbox)
+        
+        self.params_group.setLayout(params_layout)
+        layout.addWidget(self.params_group)
+        
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.ok_btn)
+        btn_row.addWidget(self.cancel_btn)
+        layout.addLayout(btn_row)
+        
+        self.on_type_changed(self.type_combo.currentText())
+    
+    def on_type_changed(self, pattern_type: str):
+        """Update UI based on pattern type selection."""
+        show_params = pattern_type in ["Pulse Train", "Single Pulse"]
+        self.period_spin.setEnabled(pattern_type == "Pulse Train")
+        self.pulse_width_spin.setEnabled(show_params)
+        self.delay_spin.setEnabled(show_params)
+    
+    def get_pattern(self) -> tuple:
+        """Generate and return the configured pattern."""
+        from control.ni_daq import generate_pulse_train
+        
+        line = self.line_combo.currentData()
+        pattern_type = self.type_combo.currentText()
+        inverted = self.inverted_checkbox.isChecked()
+        
+        try:
+            if pattern_type == "Pulse Train":
+                period_samples = int(self.period_spin.value() * self.sample_rate)
+                width_samples = int(self.pulse_width_spin.value() * self.sample_rate)
+                delay_samples = int(self.delay_spin.value() * self.sample_rate)
+                
+                pattern = generate_pulse_train(width_samples, period_samples, self.num_samples, inverted)
+                # Apply delay by rolling
+                if delay_samples > 0:
+                    pattern = np.roll(pattern, delay_samples)
+                    pattern[:delay_samples] = inverted  # Fill delay with inverted state
+                    
+            elif pattern_type == "Single Pulse":
+                width_samples = int(self.pulse_width_spin.value() * self.sample_rate)
+                delay_samples = int(self.delay_spin.value() * self.sample_rate)
+                
+                pattern = np.zeros(self.num_samples, dtype=bool)
+                if not inverted:
+                    start = delay_samples
+                    end = min(start + width_samples, self.num_samples)
+                    pattern[start:end] = True
+                else:
+                    pattern[:] = True
+                    start = delay_samples
+                    end = min(start + width_samples, self.num_samples)
+                    pattern[start:end] = False
+                    
+            elif pattern_type == "Always High":
+                pattern = np.ones(self.num_samples, dtype=bool)
+                if inverted:
+                    pattern = ~pattern
+                    
+            elif pattern_type == "Always Low":
+                pattern = np.zeros(self.num_samples, dtype=bool)
+                if inverted:
+                    pattern = ~pattern
+            else:
+                pattern = np.zeros(self.num_samples, dtype=bool)
+            
+            return line, pattern
+        except Exception as e:
+            return line, np.zeros(self.num_samples, dtype=bool)

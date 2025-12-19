@@ -377,6 +377,7 @@ class HighContentScreeningGui(QMainWindow):
         self.napariMultiChannelWidget: Optional[widgets.NapariMultiChannelWidget] = None
         self.imageArrayDisplayWindow: Optional[core.ImageArrayDisplayWindow] = None
         self.zPlotWidget: Optional[widgets.SurfacePlotWidget] = None
+        self.niDAQWidget: Optional[widgets.NIDAQWidget] = None
 
         self.recordTabWidget: QTabWidget = QTabWidget()
         self.cameraTabWidget: QTabWidget = QTabWidget()
@@ -644,6 +645,12 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
 
+        if ENABLE_NI_DAQ:
+            if NI_DAQ_BYPASS_SIMULATION:
+                self.niDAQWidget = widgets.NIDAQWidget(is_simulation=False)
+            else:
+                self.niDAQWidget = widgets.NIDAQWidget(is_simulation=is_simulation)
+
         self.imageDisplayTabs = QTabWidget(parent=self)
         if self.live_only_mode:
             if ENABLE_TRACKING:
@@ -802,6 +809,9 @@ class HighContentScreeningGui(QMainWindow):
 
         if RUN_FLUIDICS:
             self.imageDisplayTabs.addTab(self.fluidicsWidget, "Fluidics")
+
+        if ENABLE_NI_DAQ:
+            self.imageDisplayTabs.addTab(self.niDAQWidget, "NI DAQ")
 
     def setupRecordTabWidget(self):
         if ENABLE_WELLPLATE_MULTIPOINT:
