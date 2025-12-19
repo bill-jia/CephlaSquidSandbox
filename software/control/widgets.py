@@ -11414,18 +11414,19 @@ class NIDAQWidget(QWidget):
         
         timeout = (self._config.samples_per_channel / self._config.sample_rate_hz) + 5.0
         success = self._ni_daq.wait_until_done(timeout)
+        self._log.info(f"Acquisition completed: {success}")
         
         if success:
             # Get acquired data
             result = self._ni_daq.get_acquired_data()
             
             # Update AI plot on main thread
-            QTimer.singleShot(0, lambda: self._update_ai_plot(result))
-            QTimer.singleShot(0, lambda: self.status_label.setText("Acquisition complete"))
+            self._update_ai_plot(result)
+            self.status_label.setText("Acquisition complete")
         else:
-            QTimer.singleShot(0, lambda: self.status_label.setText("Acquisition timeout"))
-        
-        QTimer.singleShot(0, lambda: self.signal_acquisition_finished.emit())
+            self.status_label.setText("Acquisition timeout")
+
+        self.signal_acquisition_finished.emit()
     
     def _update_ai_plot(self, result):
         """Update the analog input plot with acquired data."""
