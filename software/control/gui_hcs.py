@@ -520,6 +520,7 @@ class HighContentScreeningGui(QMainWindow):
             self.camera.set_acquisition_mode(squid.abc.CameraAcquisitionMode.CONTINUOUS)
         else:
             raise ValueError(f"Invalid trigger mode: {DEFAULT_TRIGGER_MODE}")
+        # Set up live acquisition to pull frames from background thread
         self.camera.add_frame_callback(self.streamHandler.get_frame_callback())
         self.camera.enable_callbacks(enabled=True)
 

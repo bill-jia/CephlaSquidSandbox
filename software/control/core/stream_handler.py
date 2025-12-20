@@ -73,6 +73,9 @@ class StreamHandler:
         self._fns = functions
 
     def on_new_frame(self, frame: CameraFrame):
+        """ Function to measure FPS and pass frame to display and save.
+        Called by camera when a new frame is received.
+        """
         if not self._fns.accept_new_frame():
             return
 
