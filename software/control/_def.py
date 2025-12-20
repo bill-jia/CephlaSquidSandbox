@@ -681,7 +681,6 @@ NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 6
 
 # National Instruments DAQ integration
 ENABLE_NI_DAQ = True
-NI_DAQ_BYPASS_SIMULATION = True
 NI_DAQ_DEVICE_NAME = "Dev1"
 NI_DAQ_DEFAULT_SAMPLE_RATE = 10000  # Hz
 NI_DAQ_DEFAULT_NUM_SAMPLES = 10000
@@ -876,6 +875,14 @@ USE_TEMPLATE_MULTIPOINT = False
 
 FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
 
+#######################################################
+#### Simulation bypasses for individual components ####
+#######################################################
+
+CAMERA_BYPASS_SIMULATION = True
+NI_DAQ_BYPASS_SIMULATION = True
+
+
 ##########################################################
 #### start of loading machine specific configurations ####
 ##########################################################
@@ -979,6 +986,7 @@ A1_X_MM = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_x_mm"]  # measured sta
 A1_Y_MM = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_y_mm"]  # measured stage position - to update
 A1_X_PIXEL = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_x_pixel"]  # coordinate on the png
 A1_Y_PIXEL = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_y_pixel"]  # coordinate on the png
+
 
 ##########################################################
 ##### end of loading machine specific configurations #####

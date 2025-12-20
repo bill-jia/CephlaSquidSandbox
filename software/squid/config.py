@@ -269,6 +269,7 @@ class CameraVariant(enum.Enum):
     TIS = "TIS"
     GXIPY = "GXIPY"
     ANDOR = "ANDOR"
+    RETIGA = "RETIGA"
 
     @staticmethod
     def from_string(cam_string: str) -> Optional["CameraVariant"]:
@@ -373,6 +374,22 @@ class AndorCameraModel(enum.Enum):
             return None
 
 
+class RetigaCameraModel(enum.Enum):
+    """Teledyne QImaging Retiga camera models."""
+    RETIGA_ELECTRO = "RETIGA-ELECTRO"  # Standard Retiga Electro
+    RETIGA_ELECTRO_SRV = "RETIGA-ELECTRO-SRV"  # Retiga Electro SRV (smaller pixel size)
+
+    @staticmethod
+    def from_string(cam_string: str) -> Optional["RetigaCameraModel"]:
+        """
+        Attempts to convert the given string to a Retiga camera model.  This ignores all letter cases.
+        """
+        try:
+            return RetigaCameraModel[cam_string.upper().replace("-", "_")]
+        except KeyError:
+            return None
+
+
 class CameraSensor(enum.Enum):
     """
     Some camera sensors may not be included here.
@@ -387,6 +404,7 @@ class CameraSensor(enum.Enum):
     IMX264 = "IMX264"
     IMX265 = "IMX265"
     IMX571 = "IMX571"
+    ICX825 = "ICX825"
     PYTHON300 = "PYTHON300"
 
 
@@ -451,6 +469,7 @@ class CameraConfig(pydantic.BaseModel):
             HamamatsuCameraModel,
             PhotometricsCameraModel,
             AndorCameraModel,
+            RetigaCameraModel,
         ]
     ] = None
 
@@ -496,6 +515,9 @@ class CameraConfig(pydantic.BaseModel):
     # After initialization, set the white balance gains to this once. Only valid for color cameras.
     default_white_balance_gains: Optional[RGBValue] = None
 
+    # Set the hardware trigger mode of the camera to this value once on initialization.
+    hardware_trigger_mode: Optional[bool] = None
+
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
     if old_string == "Toupcam":
@@ -514,6 +536,8 @@ def _old_camera_variant_to_enum(old_string) -> CameraVariant:
         return CameraVariant.PHOTOMETRICS
     elif old_string == "Andor":
         return CameraVariant.ANDOR
+    elif old_string == "Retiga":
+        return CameraVariant.RETIGA
     elif old_string == "Default":
         return CameraVariant.GXIPY
     raise ValueError(f"Unknown old camera type {old_string=}")
@@ -534,6 +558,7 @@ _camera_config = CameraConfig(
     flip=_def.CAMERA_CONFIG.FLIP_IMAGE,
     crop_width=_def.CAMERA_CONFIG.CROP_WIDTH_UNBINNED,
     crop_height=_def.CAMERA_CONFIG.CROP_HEIGHT_UNBINNED,
+    hardware_trigger_mode=_def.CAMERA_CONFIG.HARDWARE_TRIGGER_MODE,
     default_temperature=_def.CAMERA_CONFIG.TEMPERATURE_DEFAULT,
     default_fan_speed=_def.CAMERA_CONFIG.FAN_SPEED_DEFAULT,
     default_black_level=_def.CAMERA_CONFIG.BLACKLEVEL_VALUE_DEFAULT,

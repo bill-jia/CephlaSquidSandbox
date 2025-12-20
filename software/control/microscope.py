@@ -404,6 +404,9 @@ class Microscope:
 
         # Create camera with hardware trigger support
         # The camera will call hw_trigger_fn when it needs to start acquisition
+        if control._def.CAMERA_BYPASS_SIMULATION:
+            simulated = False
+        
         camera = squid.camera.utils.get_camera(
             config=squid.config.get_camera_config(),
             simulated=simulated,

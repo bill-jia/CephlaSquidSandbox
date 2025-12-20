@@ -46,6 +46,10 @@ def get_camera(
     if simulated:
         return SimulatedCamera(config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn)
 
+    if config.hardware_trigger_mode is None or config.hardware_trigger_mode is False:
+        hw_trigger_fn = None
+        hw_set_strobe_delay_ms_fn = None
+
     try:
         if config.camera_type == CameraVariant.TOUPCAM:
             import control.camera_toupcam
@@ -83,6 +87,12 @@ def get_camera(
             import control.camera_andor
 
             camera = control.camera_andor.AndorCamera(
+                config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn
+            )
+        elif config.camera_type == CameraVariant.RETIGA:
+            import control.camera_retiga
+
+            camera = control.camera_retiga.RetigaElectroCamera(
                 config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn
             )
         elif config.camera_type == CameraVariant.TIS:
