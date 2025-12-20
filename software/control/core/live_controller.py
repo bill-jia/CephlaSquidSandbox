@@ -71,7 +71,7 @@ class LiveController:
         self.microscope = microscope
         self.camera: AbstractCamera = camera
         self.currentConfiguration = None  # Current channel configuration (wavelength, exposure, etc.)
-        self.trigger_mode: Optional[TriggerMode] = TriggerMode.SOFTWARE  # @@@ change to None
+        self.trigger_mode: Optional[TriggerMode] = DEFAULT_TRIGGER_MODE  # @@@ change to None
         self.is_live = False  # Whether live acquisition is currently running
         self.control_illumination = control_illumination  # Auto-control illumination during acquisition
         self.illumination_on = False  # Current illumination state

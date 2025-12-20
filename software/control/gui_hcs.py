@@ -514,8 +514,12 @@ class HighContentScreeningGui(QMainWindow):
         if DEFAULT_TRIGGER_MODE == TriggerMode.HARDWARE:
             print("Setting acquisition mode to HARDWARE_TRIGGER")
             self.camera.set_acquisition_mode(squid.abc.CameraAcquisitionMode.HARDWARE_TRIGGER)
-        else:
+        elif DEFAULT_TRIGGER_MODE == TriggerMode.SOFTWARE:
             self.camera.set_acquisition_mode(squid.abc.CameraAcquisitionMode.SOFTWARE_TRIGGER)
+        elif DEFAULT_TRIGGER_MODE == TriggerMode.CONTINUOUS:
+            self.camera.set_acquisition_mode(squid.abc.CameraAcquisitionMode.CONTINUOUS)
+        else:
+            raise ValueError(f"Invalid trigger mode: {DEFAULT_TRIGGER_MODE}")
         self.camera.add_frame_callback(self.streamHandler.get_frame_callback())
         self.camera.enable_callbacks(enabled=True)
 

@@ -46,7 +46,7 @@ def get_camera(
     if simulated:
         return SimulatedCamera(config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn)
 
-    if config.hardware_trigger_mode is None or config.hardware_trigger_mode is False:
+    if config.hardware_triggering_enabled is None or config.hardware_triggering_enabled is False:
         hw_trigger_fn = None
         hw_set_strobe_delay_ms_fn = None
 

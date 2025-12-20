@@ -516,7 +516,7 @@ class CameraConfig(pydantic.BaseModel):
     default_white_balance_gains: Optional[RGBValue] = None
 
     # Set the hardware trigger mode of the camera to this value once on initialization.
-    hardware_trigger_mode: Optional[bool] = None
+    hardware_triggering_enabled: Optional[bool] = None
 
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
@@ -558,7 +558,7 @@ _camera_config = CameraConfig(
     flip=_def.CAMERA_CONFIG.FLIP_IMAGE,
     crop_width=_def.CAMERA_CONFIG.CROP_WIDTH_UNBINNED,
     crop_height=_def.CAMERA_CONFIG.CROP_HEIGHT_UNBINNED,
-    hardware_trigger_mode=_def.CAMERA_CONFIG.HARDWARE_TRIGGER_MODE,
+    hardware_triggering_enabled=_def.CAMERA_CONFIG.HARDWARE_TRIGGERING_ENABLED,
     default_temperature=_def.CAMERA_CONFIG.TEMPERATURE_DEFAULT,
     default_fan_speed=_def.CAMERA_CONFIG.FAN_SPEED_DEFAULT,
     default_black_level=_def.CAMERA_CONFIG.BLACKLEVEL_VALUE_DEFAULT,
