@@ -328,12 +328,11 @@ class AbstractStage(metaclass=abc.ABCMeta):
 class CameraAcquisitionMode(enum.Enum):
     SOFTWARE_TRIGGER = "Software Trigger"
     HARDWARE_TRIGGER = "Hardware Trigger"
+    HARDWARE_TRIGGER_FIRST = "Trigger First"
     CONTINUOUS = "Continuous Acquisition"
-    TIMED = "Timed"
     BULB = "Bulb"
-    STROBED = "Strobed"
-    TRIGGER_FIRST = "Trigger First"
     VARIABLE_TIMED = "Variable Timed"
+
 
 
 class CameraFrameFormat(enum.Enum):

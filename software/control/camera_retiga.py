@@ -523,13 +523,13 @@ class RetigaElectroCamera(AbstractCamera):
         """Set the acquisition/trigger mode."""
         with self._pause_streaming():
             try:
-                if acquisition_mode == CameraAcquisitionMode.TIMED or acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+                if acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
                     self._camera.exp_mode = "Timed"
-                elif acquisition_mode == CameraAcquisitionMode.STROBED:
+                elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
                     self._camera.exp_mode = "Strobed"
                 elif acquisition_mode == CameraAcquisitionMode.BULB:
                     self._camera.exp_mode = "Bulb"
-                elif acquisition_mode == CameraAcquisitionMode.TRIGGER_FIRST:
+                elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
                     self._camera.exp_mode = "Trigger First"
                 elif acquisition_mode == CameraAcquisitionMode.VARIABLE_TIMED:
                     self._camera.exp_mode = "Variable Timed"
@@ -558,21 +558,21 @@ class RetigaElectroCamera(AbstractCamera):
             exp_mode_name = self._TRIGGER_CODE_MAPPING.get(exp_mode_code, str(exp_mode_code))
         except:
             # If we can't read the mode, return the cached value
-            return getattr(self, '_acquisition_mode', CameraAcquisitionMode.TIMED)
+            return getattr(self, '_acquisition_mode', CameraAcquisitionMode.CONTINUOUS)
         
         if exp_mode_name == "Timed":
-            return CameraAcquisitionMode.TIMED
+            return CameraAcquisitionMode.CONTINUOUS
         elif exp_mode_name == "Strobed":
-            return CameraAcquisitionMode.STROBED
+            return CameraAcquisitionMode.HARDWARE_TRIGGER
         elif exp_mode_name == "Bulb":
             return CameraAcquisitionMode.BULB
         elif exp_mode_name == "Trigger First":
-            return CameraAcquisitionMode.TRIGGER_FIRST
+            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
         elif exp_mode_name == "Variable Timed":
             return CameraAcquisitionMode.VARIABLE_TIMED
         else:
             self._log.warning(f"Unknown acquisition mode: {exp_mode_name}")
-            return getattr(self, '_acquisition_mode', CameraAcquisitionMode.TIMED)
+            return getattr(self, '_acquisition_mode', CameraAcquisitionMode.CONTINUOUS)
 
     def send_trigger(self, illumination_time: Optional[float] = None):
         """Send a trigger to capture a frame."""

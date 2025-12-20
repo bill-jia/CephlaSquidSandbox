@@ -368,6 +368,8 @@ class PhotometricsCamera(AbstractCamera):
                     self._camera.exp_mode = "Software Trigger Edge"
                 elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
                     self._camera.exp_mode = "Edge Trigger"
+                elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
+                    self._camera.exp_mode = "Trigger First"
                 else:
                     raise ValueError(f"Unsupported acquisition mode: {acquisition_mode}")
 
@@ -394,6 +396,8 @@ class PhotometricsCamera(AbstractCamera):
             return CameraAcquisitionMode.SOFTWARE_TRIGGER
         elif PhotometricsCamera._TRIGGER_CODE_MAPPING_KINETIX[self._camera.exp_mode] == "Edge Trigger":
             return CameraAcquisitionMode.HARDWARE_TRIGGER
+        elif PhotometricsCamera._TRIGGER_CODE_MAPPING_KINETIX[self._camera.exp_mode] == "Trigger First":
+            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
         else:
             raise ValueError(
                 f"Unknown acquisition mode: {PhotometricsCamera._TRIGGER_CODE_MAPPING_KINETIX[self._camera.exp_mode]}"
