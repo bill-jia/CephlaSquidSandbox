@@ -1,4 +1,4 @@
-*.ini
+# *.ini
 *.txt
 *_configurations.xml
 cache/

@@ -462,6 +462,7 @@ CAMERA_PIXEL_SIZE_UM = {
     "IMX273": 3.45,
     "IMX264": 3.45,
     "IMX265": 3.45,
+    "IMX392": 3.45,
     "IMX571": 3.76,
     "PYTHON300": 4.8,
     "ICX825": 6.45,  # Sony ICX-825 (Retiga Electro)

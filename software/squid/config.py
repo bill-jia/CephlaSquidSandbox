@@ -389,6 +389,23 @@ class RetigaCameraModel(enum.Enum):
         except KeyError:
             return None
 
+class FLIRCameraModel(enum.Enum):
+    """Teledyne FLIR Blackfly S camera models."""
+    BFS_U3_23S3M = "BFS-U3-23S3M"
+    BFS_U3_23S4M = "BFS-U3-23S4M"
+    BFS_U3_23S5M = "BFS-U3-23S5M"
+    BFS_U3_23S6M = "BFS-U3-23S6M"
+
+    @staticmethod
+    def from_string(cam_string: str) -> Optional["FLIRCameraModel"]:
+        """
+        Attempts to convert the given string to a FLIR camera model.  This ignores all letter cases.
+        """
+        try:
+            return FLIRCameraModel[cam_string.upper().replace("-", "_")]
+        except KeyError:
+            return None
+
 
 class CameraSensor(enum.Enum):
     """
@@ -404,6 +421,7 @@ class CameraSensor(enum.Enum):
     IMX264 = "IMX264"
     IMX265 = "IMX265"
     IMX571 = "IMX571"
+    IMX392 = "IMX392"
     ICX825 = "ICX825"
     PYTHON300 = "PYTHON300"
 
@@ -470,6 +488,7 @@ class CameraConfig(pydantic.BaseModel):
             PhotometricsCameraModel,
             AndorCameraModel,
             RetigaCameraModel,
+            FLIRCameraModel,
         ]
     ] = None
 
