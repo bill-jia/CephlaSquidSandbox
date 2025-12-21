@@ -4,6 +4,7 @@ import time
 import numpy as np
 import PySpin
 from control._def import *
+import re
 
 from typing import Callable, Optional, Tuple, Sequence
 import threading
@@ -519,6 +520,7 @@ class FLIRCamera(AbstractCamera):
         self.is_color = None
         self._readout_mode = None
         self._exposure_time_ms = 20
+        self._sensor_type = None
 
         # many to be purged
         
@@ -612,6 +614,13 @@ class FLIRCamera(AbstractCamera):
         self.is_color = is_color
         if self.is_color:
             self.set_wb_ratios(2, 1, 2)
+
+        # Parse sensor type
+        sensor_description = get_node_ptr(self.nodemap.GetNode("SensorDescription"))[0].GetValue()
+        self._log.info(f"Sensor description: {sensor_description}")
+        # Parse sensor type from sensor description - find patterns that match "IMX"
+        self._sensor_type = re.search(r"IMX(\d+)", sensor_description).group(0)
+        
 
         # set to highest possible framerate
         PySpin.CBooleanPtr(self.nodemap.GetNode("AcquisitionFrameRateEnable")).SetValue(True)
@@ -1369,8 +1378,7 @@ class FLIRCamera(AbstractCamera):
 
     def get_pixel_size_binned_um(self) -> float:
         """Returns the pixel size after binning in microns."""
-        # TODO: Implement
-        raise NotImplementedError("get_pixel_size_binned_um not yet implemented")
+        return CAMERA_PIXEL_SIZE_UM[self._sensor_type]*self.get_binning()[0]
 
     def get_analog_gain(self) -> float:
         """Returns gain in the same units as set_analog_gain."""
