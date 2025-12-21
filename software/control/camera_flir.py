@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple, Sequence
 import threading
 
 import squid.logging
-from squid.config import CameraConfig, CameraPixelFormat
+from squid.config import CameraConfig, CameraPixelFormat, CameraReadoutMode
 from squid.abc import (
     AbstractCamera,
     CameraAcquisitionMode,
@@ -327,17 +327,18 @@ def get_category_node_and_all_features(node):
             elif CHOSEN_READ == ReadType.INDIVIDUAL:
                 node_name = ""
                 node_value = None
-                if node_feature.GetPrincipalInterfaceType() == PySpin.intfIString:
+                principal_interface_type = node_feature.GetPrincipalInterfaceType()
+                if principal_interface_type == PySpin.intfIString:
                     node_name, node_value = get_string_node(node_feature)
-                elif node_feature.GetPrincipalInterfaceType() == PySpin.intfIInteger:
+                elif principal_interface_type == PySpin.intfIInteger:
                     node_name, node_value = get_integer_node(node_feature)
-                elif node_feature.GetPrincipalInterfaceType() == PySpin.intfIFloat:
+                elif principal_interface_type == PySpin.intfIFloat:
                     node_name, node_value = get_float_node(node_feature)
-                elif node_feature.GetPrincipalInterfaceType() == PySpin.intfIBoolean:
+                elif principal_interface_type == PySpin.intfIBoolean:
                     node_name, node_value = get_boolean_node(node_feature)
-                elif node_feature.GetPrincipalInterfaceType() == PySpin.intfICommand:
+                elif principal_interface_type == PySpin.intfICommand:
                     node_name, node_value = get_command_node(node_feature)
-                elif node_feature.GetPrincipalInterfaceType() == PySpin.intfIEnumeration:
+                elif principal_interface_type == PySpin.intfIEnumeration:
                     node_name, node_value = get_enumeration_node_and_current_entry(node_feature)
                 return_dict[node_name] = node_value
 
@@ -346,6 +347,26 @@ def get_category_node_and_all_features(node):
 
     return return_dict
 
+def get_node_ptr(node):
+    if CHOSEN_READ == ReadType.VALUE:
+        return PySpin.CValuePtr(node), _
+    elif CHOSEN_READ == ReadType.INDIVIDUAL:
+        principal_interface_type = node.GetPrincipalInterfaceType()
+        if principal_interface_type == PySpin.intfIString:
+            ptr = PySpin.CStringPtr(node)
+        elif principal_interface_type == PySpin.intfIInteger:
+            ptr = PySpin.CIntegerPtr(node)
+        elif principal_interface_type == PySpin.intfIFloat:
+            ptr = PySpin.CFloatPtr(node)
+        elif principal_interface_type == PySpin.intfIBoolean:
+            ptr = PySpin.CBooleanPtr(node)
+        elif principal_interface_type == PySpin.intfICommand:
+            ptr = PySpin.CCommandPtr(node)
+        elif principal_interface_type == PySpin.intfIEnumeration:
+            ptr = PySpin.CEnumerationPtr(node)
+        else:
+            raise ValueError(f"Unknown node type: {principal_interface_type}")
+        return ptr, principal_interface_type
 
 def get_device_info(cam):
     nodemap_tldevice = cam.GetTLDeviceNodeMap()
@@ -410,6 +431,20 @@ def get_sn_by_model(model_name):
     system.ReleaseInstance()
     return sn_to_return
 
+def set_enum_node(node, proposed_value):
+    ptr, principal_interface_type = get_node_ptr(node)
+    if principal_interface_type != PySpin.intfIEnumeration:
+        raise ValueError(f"Node {node.GetName()} is not an enumeration node")
+    node_enum = PySpin.CEnumerationPtr(node)
+    valid_entry_names = [PySpin.CEnumEntryPtr(entry).GetSymbolic() for entry in node_enum.GetEntries()]
+    if proposed_value not in valid_entry_names:
+        raise ValueError(f"Proposed value {proposed_value} for node {ptr.GetName()} is not supported by this camera")
+    if not PySpin.IsAvailable(ptr) or not PySpin.IsWritable(ptr):
+        raise CameraError(f"Node {ptr.GetName()} is not available or writable")
+    new_entry = node_enum.GetEntryByName(proposed_value)
+    if not PySpin.IsAvailable(new_entry) or not PySpin.IsReadable(new_entry):
+        raise ValueError(f"Proposed value {proposed_value} for node {ptr.GetName()} is not supported by this camera")
+    ptr.SetIntValue(new_entry.GetValue())
 
 class ImageEventHandler(PySpin.ImageEventHandler):
     def __init__(self, parent):
@@ -482,9 +517,9 @@ class FLIRCamera(AbstractCamera):
         self.callback_is_enabled = False
         self.is_streaming = False
         self.is_color = None
+        self._readout_mode = None
 
         # many to be purged
-        # self.is_global_shutter = is_global_shutter
         
         # self.camera = None  # PySpin CameraPtr type
         # self.is_color = None
@@ -522,16 +557,23 @@ class FLIRCamera(AbstractCamera):
         # self.EXPOSURE_TIME_MS_MAX = 4000
 
         # self.trigger_mode = None
-        # self.pixel_size_byte = 1
+        self.pixel_size_byte = 1
 
-        # # below are values for IMX226 (MER2-1220-32U3M) - to make configurable
-        # self.row_period_us = 10
-        # self.row_numbers = 3036
-        # self.exposure_delay_us_8bit = 650
-        # self.exposure_delay_us = self.exposure_delay_us_8bit * self.pixel_size_byte
-        # self.strobe_delay_us = self.exposure_delay_us + self.row_period_us * self.pixel_size_byte * (
-        #     self.row_numbers - 1
-        # )
+        # # below are values for IMX226 (MER2-1220-32U3M)
+        if self._readout_mode == CameraReadoutMode.GLOBAL:
+            self.row_period_us = 0
+            self.exposure_delay_us_8bit = 100 # arbitrary value for global shutter
+            self.exposure_delay_us = self.exposure_delay_us_8bit * self.pixel_size_byte
+            self.strobe_delay_us = self.exposure_delay_us
+        else:
+            # Figure out how to standardize configuration of this later
+            self.row_period_us = 10
+            self.row_numbers = 3036
+            self.exposure_delay_us_8bit = 650
+            self.exposure_delay_us = self.exposure_delay_us_8bit * self.pixel_size_byte
+            self.strobe_delay_us = self.exposure_delay_us + self.row_period_us * self.pixel_size_byte * (
+                self.row_numbers - 1
+            )
 
         # self.pixel_format = None  # use the default pixel format
 
@@ -549,11 +591,10 @@ class FLIRCamera(AbstractCamera):
         except AttributeError as e:
             print(f"Error: {e}")
             pass
-        print(f"Opening camera with index {index} and is_color {is_color}")
+        self._log.info(f"Opening camera with index {index} and is_color {is_color}")
         self.camera_list.Clear()
         self.camera_list = self.py_spin_system.GetCameras()
         device_num = self.camera_list.GetSize()
-        print(self._config.serial_number)
         if device_num == 0:
             raise RuntimeError("Could not find any USB camera devices!")
         if self._config.serial_number is None:
@@ -678,6 +719,7 @@ class FLIRCamera(AbstractCamera):
         self.nodemap = self._camera.GetNodeMap()
         node_auto_exposure = PySpin.CEnumerationPtr(self.nodemap.GetNode("ExposureAuto"))
         node_auto_exposure_off = PySpin.CEnumEntryPtr(node_auto_exposure.GetEntryByName("Off"))
+        readout_mode = self.get_readout_mode()
         if not PySpin.IsReadable(node_auto_exposure_off) or not PySpin.IsWritable(node_auto_exposure):
             print("Unable to set exposure manually (cannot disable auto exposure)")
             return
@@ -691,7 +733,7 @@ class FLIRCamera(AbstractCamera):
         if not PySpin.IsWritable(node_exposure_time):
             print("Unable to set exposure manually after disabling auto exposure")
 
-        if use_strobe == False or self.is_global_shutter:
+        if use_strobe == False or self.get_readout_mode() == CameraReadoutMode.GLOBAL:
             self.exposure_time = exposure_time
             node_exposure_time.SetValue(exposure_time * 1000.0)
         else:
@@ -905,84 +947,98 @@ class FLIRCamera(AbstractCamera):
             was_streaming = False
         self.nodemap = self._camera.GetNodeMap()
 
-        node_pixel_format = PySpin.CEnumerationPtr(self.nodemap.GetNode("PixelFormat"))
-        node_adc_bit_depth = PySpin.CEnumerationPtr(self.nodemap.GetNode("AdcBitDepth"))
+        mode_mapping = {
+            CameraPixelFormat.MONO8: "Mono8",
+            CameraPixelFormat.MONO10: "Mono10",
+            CameraPixelFormat.MONO12: "Mono12",
+            CameraPixelFormat.MONO14: "Mono14",
+            CameraPixelFormat.MONO16: "Mono16",
+            CameraPixelFormat.BAYER_RG8: "BayerRG8",
+            CameraPixelFormat.BAYER_RG12: "BayerRG12"
+        }
+        if pixel_format not in mode_mapping:
+            raise ValueError(f"Pixel format {pixel_format} is not supported by this camera")
+        pixel_format_name = mode_mapping[pixel_format]  
+        set_enum_node(self.nodemap.GetNode("PixelFormat"), pixel_format_name)
 
-        if PySpin.IsWritable(node_pixel_format) and PySpin.IsWritable(node_adc_bit_depth):
-            pixel_selection = None
-            pixel_size_byte = None
-            adc_bit_depth = None
-            fallback_pixel_selection = None
-            conversion_pixel_format = None
-            if pixel_format == "MONO8":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono8"))
-                conversion_pixel_format = PySpin.PixelFormat_Mono8
-                pixel_size_byte = 1
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
-            if pixel_format == "MONO10":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono10"))
-                fallback_pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono10p"))
-                conversion_pixel_format = PySpin.PixelFormat_Mono8
-                pixel_size_byte = 1
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
-            if pixel_format == "MONO12":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono12"))
-                fallback_pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono12p"))
-                conversion_pixel_format = PySpin.PixelFormat_Mono16
-                pixel_size_byte = 2
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit12"))
-            if pixel_format == "MONO14":  # MONO14/16 are aliases of each other, since they both
-                # do ADC at bit depth 14
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono16"))
-                conversion_pixel_format = PySpin.PixelFormat_Mono16
-                pixel_size_byte = 2
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit14"))
-            if pixel_format == "MONO16":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono16"))
-                conversion_pixel_format = PySpin.PixelFormat_Mono16
-                pixel_size_byte = 2
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit14"))
-            if pixel_format == "BAYER_RG8":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("BayerRG8"))
-                conversion_pixel_format = PySpin.PixelFormat_BayerRG8
-                pixel_size_byte = 1
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
-            if pixel_format == "BAYER_RG12":
-                pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("BayerRG12"))
-                conversion_pixel_format = PySpin.PixelFormat_BayerRG12
-                pixel_size_byte = 2
-                adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit12"))
+        # Handle enforced relationships between pixel format and ADC bit depth? Maybe this is only on certain cameras?
 
-            if pixel_selection is not None and adc_bit_depth is not None:
-                if PySpin.IsReadable(pixel_selection):
-                    node_pixel_format.SetIntValue(pixel_selection.GetValue())
-                    self.pixel_size_byte = pixel_size_byte
-                    self.pixel_format = pixel_format
-                    self.convert_pixel_format = False
-                    if PySpin.IsReadable(adc_bit_depth):
-                        node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
-                elif PySpin.IsReadable(fallback_pixel_selection):
-                    node_pixel_format.SetIntValue(fallback_pixel_selection.GetValue())
-                    self.pixel_size_byte = pixel_size_byte
-                    self.pixel_format = pixel_format
-                    self.conversion_pixel_format = conversion_pixel_format
-                    self.convert_pixel_format = True
-                    if PySpin.IsReadable(adc_bit_depth):
-                        node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
-                else:
-                    self.convert_pixel_format = convert_if_not_native
-                    if convert_if_not_native:
-                        self.conversion_pixel_format = conversion_pixel_format
-                    print("Pixel format not available for this camera")
-                    if PySpin.IsReadable(adc_bit_depth):
-                        node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
-                        print("Still able to set ADC bit depth to " + adc_bit_depth.GetSymbolic())
+        # node_adc_bit_depth, _ = get_node_ptr(self.nodemap.GetNode("AdcBitDepth"))
+        # if PySpin.IsWritable(node_pixel_format) and PySpin.IsWritable(node_adc_bit_depth):
+        #     pixel_selection = None
+        #     pixel_size_byte = None
+        #     adc_bit_depth = None
+        #     fallback_pixel_selection = None
+        #     conversion_pixel_format = None
+        #     if pixel_format == "MONO8":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono8"))
+        #         conversion_pixel_format = PySpin.PixelFormat_Mono8
+        #         pixel_size_byte = 1
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
+        #     if pixel_format == "MONO10":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono10"))
+        #         fallback_pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono10p"))
+        #         conversion_pixel_format = PySpin.PixelFormat_Mono8
+        #         pixel_size_byte = 1
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
+        #     if pixel_format == "MONO12":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono12"))
+        #         fallback_pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono12p"))
+        #         conversion_pixel_format = PySpin.PixelFormat_Mono16
+        #         pixel_size_byte = 2
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit12"))
+        #     if pixel_format == "MONO14":  # MONO14/16 are aliases of each other, since they both
+        #         # do ADC at bit depth 14
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono16"))
+        #         conversion_pixel_format = PySpin.PixelFormat_Mono16
+        #         pixel_size_byte = 2
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit14"))
+        #     if pixel_format == "MONO16":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("Mono16"))
+        #         conversion_pixel_format = PySpin.PixelFormat_Mono16
+        #         pixel_size_byte = 2
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit14"))
+        #     if pixel_format == "BAYER_RG8":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("BayerRG8"))
+        #         conversion_pixel_format = PySpin.PixelFormat_BayerRG8
+        #         pixel_size_byte = 1
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit10"))
+        #     if pixel_format == "BAYER_RG12":
+        #         pixel_selection = PySpin.CEnumEntryPtr(node_pixel_format.GetEntryByName("BayerRG12"))
+        #         conversion_pixel_format = PySpin.PixelFormat_BayerRG12
+        #         pixel_size_byte = 2
+        #         adc_bit_depth = PySpin.CEnumEntryPtr(node_adc_bit_depth.GetEntryByName("Bit12"))
 
-            else:
-                print("Pixel format not implemented for Squid")
+        #     if pixel_selection is not None and adc_bit_depth is not None:
+        #         if PySpin.IsReadable(pixel_selection):
+        #             node_pixel_format.SetIntValue(pixel_selection.GetValue())
+        #             self.pixel_size_byte = pixel_size_byte
+        #             self.pixel_format = pixel_format
+        #             self.convert_pixel_format = False
+        #             if PySpin.IsReadable(adc_bit_depth):
+        #                 node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
+        #         elif PySpin.IsReadable(fallback_pixel_selection):
+        #             node_pixel_format.SetIntValue(fallback_pixel_selection.GetValue())
+        #             self.pixel_size_byte = pixel_size_byte
+        #             self.pixel_format = pixel_format
+        #             self.conversion_pixel_format = conversion_pixel_format
+        #             self.convert_pixel_format = True
+        #             if PySpin.IsReadable(adc_bit_depth):
+        #                 node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
+        #         else:
+        #             self.convert_pixel_format = convert_if_not_native
+        #             if convert_if_not_native:
+        #                 self.conversion_pixel_format = conversion_pixel_format
+        #             print("Pixel format not available for this camera")
+        #             if PySpin.IsReadable(adc_bit_depth):
+        #                 node_adc_bit_depth.SetIntValue(adc_bit_depth.GetValue())
+        #                 print("Still able to set ADC bit depth to " + adc_bit_depth.GetSymbolic())
 
-        else:
-            print("pixel format is not writable")
+        #     else:
+        #         print("Pixel format not implemented for Squid")
+
+        # else:
+        #     print("pixel format is not writable")
 
         if was_streaming:
             self.start_streaming()
@@ -1251,8 +1307,25 @@ class FLIRCamera(AbstractCamera):
 
     def get_pixel_format(self) -> CameraPixelFormat:
         """Returns the current pixel format."""
-        # TODO: Implement
-        raise NotImplementedError("get_pixel_format not yet implemented")
+        mode_mapping = {
+            "Mono8": CameraPixelFormat.MONO8,
+            "Mono10": CameraPixelFormat.MONO10,
+            "Mono12": CameraPixelFormat.MONO12,
+            "Mono14": CameraPixelFormat.MONO14,
+            "Mono16": CameraPixelFormat.MONO16,
+            "BayerRG8": CameraPixelFormat.BAYER_RG8,
+            "BayerRG12": CameraPixelFormat.BAYER_RG12,
+            "BayerRG14": CameraPixelFormat.BAYER_RG14,
+            "BayerRG16": CameraPixelFormat.BAYER_RG16,
+            "BayerRG24": CameraPixelFormat.BAYER_RG24,
+            "BayerRG32": CameraPixelFormat.BAYER_RG32,
+            "BayerRG48": CameraPixelFormat.BAYER_RG48,
+            "BayerRG64": CameraPixelFormat.BAYER_RG64,
+            "BayerRG128": CameraPixelFormat.BAYER_RG128,
+        }
+        node_pixel_format, _ = get_node_ptr(self.nodemap.GetNode("PixelFormat"))
+        pixel_format_name = node_pixel_format.GetCurrentEntry().GetSymbolic()
+        return mode_mapping[pixel_format_name]
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
         """Returns the list of pixel formats supported by the camera."""
@@ -1300,6 +1373,139 @@ class FLIRCamera(AbstractCamera):
         """Returns the gain range, and minimum gain step, for this camera."""
         # TODO: Implement
         raise NotImplementedError("get_gain_range not yet implemented")
+
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """
+        Set the readout mode of the camera using GenICam SensorShutterMode property.
+        
+        Args:
+            readout_mode: The desired readout mode (GLOBAL, ROLLING, or ROLLING_WITH_GLOBAL_RESET)
+            
+        Raises:
+            ValueError: If the camera does not support the requested readout mode
+            CameraError: If the camera property is not available or cannot be set
+        """
+        if not hasattr(self, '_camera') or self._camera is None:
+            raise CameraError("Camera not initialized")
+        
+        self.nodemap = self._camera.GetNodeMap()
+        
+        # Try to get the SensorShutterMode node
+        node_sensor_shutter_mode = self.nodemap.GetNode("SensorShutterMode")
+        ptr, principal_interface_type = get_node_ptr(node_sensor_shutter_mode)
+        if not PySpin.IsAvailable(node_sensor_shutter_mode):
+            raise NotImplementedError("SensorShutterMode property not available on this camera")
+        
+        if not PySpin.IsWritable(node_sensor_shutter_mode):
+            raise CameraError("SensorShutterMode property is not writable")
+        
+        # Map our enum to GenICam string values
+        mode_mapping = {
+            CameraReadoutMode.GLOBAL: "Global",
+            CameraReadoutMode.ROLLING: "Rolling",
+            CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET: "GlobalReset",
+        }
+        self._readout_mode = readout_mode
+        genicam_mode_name = mode_mapping.get(readout_mode)
+        if genicam_mode_name is None:
+            raise ValueError(f"Unknown readout mode: {readout_mode}")
+        
+        # Check if it's an enumeration node
+        if principal_interface_type == PySpin.intfIEnumeration:
+            set_enum_node(node_sensor_shutter_mode, genicam_mode_name)
+        else:
+            # If it's a string node, try to set it as a string
+            try:
+                ptr.SetValue(genicam_mode_name)
+            except:
+                raise CameraError(f"Could not set SensorShutterMode to {genicam_mode_name}")
+        self._log.info(f"Set readout mode to {readout_mode.value}")
+
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """
+        Get the current readout mode of the camera from GenICam SensorShutterMode property.
+        
+        Returns:
+            The current readout mode
+            
+        Raises:
+            NotImplementedError: If the camera does not support readout mode querying
+            CameraError: If the camera property is not available
+        """
+        if not hasattr(self, '_camera') or self._camera is None:
+            raise CameraError("Camera not initialized")
+        
+        self.nodemap = self._camera.GetNodeMap()
+        
+        # Try to get the SensorShutterMode node
+        node_sensor_shutter_mode = self.nodemap.GetNode("SensorShutterMode")
+        ptr, principal_interface_type = get_node_ptr(node_sensor_shutter_mode)
+        current_mode_str = ptr.GetCurrentEntry().GetSymbolic()
+        # Map GenICam string values to our enum
+        mode_mapping = {
+            "Global": CameraReadoutMode.GLOBAL,
+            "Rolling": CameraReadoutMode.ROLLING,
+            "GlobalReset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+            "RollingWithGlobalReset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+            "Rolling with Global Reset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+        }
+        
+        readout_mode = mode_mapping.get(current_mode_str)
+        if readout_mode is None:
+            # Default to GLOBAL if we can't map it
+            self._log.warning(f"Unknown SensorShutterMode value: {current_mode_str}, defaulting to GLOBAL")
+            return CameraReadoutMode.GLOBAL
+        if readout_mode != self._readout_mode:
+            self._log.warning(f"Readout mode mismatch (Hardware/software): {readout_mode} != {self._readout_mode}. Resetting")
+            self._readout_mode = readout_mode        
+        return readout_mode
+
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """
+        Get the list of readout modes supported by this camera by querying GenICam SensorShutterMode entries.
+        
+        Returns:
+            A sequence of supported readout modes. May be empty if the camera does not support
+            readout mode selection.
+        """
+        if not hasattr(self, '_camera') or self._camera is None:
+            return []
+        
+        self.nodemap = self._camera.GetNodeMap()
+        
+        # Try to get the SensorShutterMode node
+        node_sensor_shutter_mode = self.nodemap.GetNode("SensorShutterMode")
+        if not PySpin.IsAvailable(node_sensor_shutter_mode):
+            return []
+        
+        available_modes = []
+        
+        if PySpin.IsEnumeration(node_sensor_shutter_mode):
+            node_enum = PySpin.CEnumerationPtr(node_sensor_shutter_mode)
+            entries = node_enum.GetEntries()
+            
+            # Map GenICam string values to our enum
+            mode_mapping = {
+                "Global": CameraReadoutMode.GLOBAL,
+                "Rolling": CameraReadoutMode.ROLLING,
+                "RollingWithGlobalReset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+                "Rolling with Global Reset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+            }
+            
+            for entry in entries:
+                entry_ptr = PySpin.CEnumEntryPtr(entry)
+                if PySpin.IsReadable(entry_ptr):
+                    symbolic = entry_ptr.GetSymbolic()
+                    if symbolic in mode_mapping:
+                        mode = mode_mapping[symbolic]
+                        if mode not in available_modes:
+                            available_modes.append(mode)
+        
+        # If no modes found, default to GLOBAL (most cameras support at least this)
+        if not available_modes:
+            available_modes = [CameraReadoutMode.GLOBAL]
+        
+        return available_modes
 
     def get_is_streaming(self):
         """Returns True if the camera is currently streaming, False otherwise."""
@@ -1355,7 +1561,7 @@ class FLIRCamera(AbstractCamera):
         If things like setting a remote strobe, or other settings, are needed when you change the mode you must
         handle that here.
         """
-        # TODO: Implement
+        
         raise NotImplementedError("_set_acquisition_mode_imp not yet implemented")
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:

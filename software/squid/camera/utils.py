@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Sequence, Callable
 import numpy as np
 
 import squid.logging
-from squid.config import CameraConfig, CameraPixelFormat, CameraVariant
+from squid.config import CameraConfig, CameraPixelFormat, CameraVariant, CameraReadoutMode
 from squid.abc import (
     AbstractCamera,
     CameraAcquisitionMode,
@@ -17,6 +17,31 @@ from squid.abc import (
 )
 
 _log = squid.logging.get_logger("squid.camera.utils")
+
+
+def _initialize_camera_readout_mode(camera: AbstractCamera):
+    """
+    Initialize readout mode for a camera from config or _def.py default.
+    
+    Args:
+        camera: The camera instance to initialize
+    """
+    try:
+        import control._def as _def
+        default_readout_mode_str = getattr(_def.CAMERA_CONFIG, 'READOUT_MODE_DEFAULT', None)
+        default_readout_mode = None
+        if default_readout_mode_str:
+            try:
+                default_readout_mode = CameraReadoutMode[default_readout_mode_str.upper()]
+            except KeyError:
+                # Try matching by value
+                for mode in CameraReadoutMode:
+                    if mode.value.lower() == default_readout_mode_str.lower():
+                        default_readout_mode = mode
+                        break
+        camera._initialize_readout_mode(default_readout_mode=default_readout_mode)
+    except Exception as e:
+        _log.warning(f"Could not initialize readout mode: {e}")
 
 
 def get_camera(
@@ -41,7 +66,7 @@ def get_camera(
         try:
             camera.open()
         except AttributeError as e:
-            _log.error(f"Error opening camera: {e}")
+            _log.error(f"Error: {e}")
             pass
 
     if simulated:
@@ -111,6 +136,9 @@ def get_camera(
         # be removed once all the cameras conform to the AbstractCamera interface.
         open_if_needed(camera)
 
+        # Initialize readout mode from config or _def.py default
+        _initialize_camera_readout_mode(camera)
+
         return camera
     except ImportError as e:
         _log.warning(f"Camera of type: '{config.camera_type}' failed to import.  Falling back to default camera impl.")
@@ -118,9 +146,14 @@ def get_camera(
 
         import control.camera
 
-        return control.camera.DefaultCamera(
+        camera = control.camera.DefaultCamera(
             config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn
         )
+        
+        # Initialize readout mode from config or _def.py default
+        _initialize_camera_readout_mode(camera)
+        
+        return camera
 
 
 class SimulatedCamera(AbstractCamera):
@@ -169,6 +202,9 @@ class SimulatedCamera(AbstractCamera):
         self.set_black_level(0)
         self._acquisition_mode = None
         self.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
+        self._readout_mode = None
+        # Initialize readout mode from config or default to GLOBAL
+        self._initialize_readout_mode(default_readout_mode=CameraReadoutMode.GLOBAL)
         # Set the initial ROI based on 1x1 binning
         # Temporarily set binning to (1,1) to get the unbinned resolution
         temp_binning = self._binning
@@ -444,6 +480,21 @@ class SimulatedCamera(AbstractCamera):
 
     def get_frame_id(self) -> int:
         return self._frame_id
+
+    @debug_log
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """Set the readout mode of the simulated camera."""
+        self._readout_mode = readout_mode
+
+    @debug_log
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """Get the current readout mode of the simulated camera."""
+        return self._readout_mode if self._readout_mode is not None else CameraReadoutMode.GLOBAL
+
+    @debug_log
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """Get the list of readout modes supported by the simulated camera."""
+        return [CameraReadoutMode.GLOBAL, CameraReadoutMode.ROLLING, CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET]
 
     @debug_log
     def close(self):

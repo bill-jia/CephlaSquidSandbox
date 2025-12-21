@@ -11,7 +11,7 @@ import numpy as np
 from dataclasses import dataclass
 
 import squid.logging
-from squid.config import AxisConfig, StageConfig, CameraConfig, CameraPixelFormat
+from squid.config import AxisConfig, StageConfig, CameraConfig, CameraPixelFormat, CameraReadoutMode
 from squid.exceptions import SquidTimeout
 import control.utils
 
@@ -334,7 +334,6 @@ class CameraAcquisitionMode(enum.Enum):
     VARIABLE_TIMED = "Variable Timed"
 
 
-
 class CameraFrameFormat(enum.Enum):
     """
     This is all known camera frame formats in the Cephla world, but not all cameras will
@@ -428,6 +427,46 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         # Default is 1.0, which means no software crop.
         self._software_crop_width_ratio = 1.0
         self._software_crop_height_ratio = 1.0
+
+        # Set readout mode during initialization
+        self._initialize_readout_mode(default_readout_mode=CameraReadoutMode.GLOBAL)
+
+    def _initialize_readout_mode(self, default_readout_mode: Optional[CameraReadoutMode] = None):
+        """
+        Initialize the readout mode from config or provided default. This should be called after
+        the camera is fully initialized (e.g., after opening the camera).
+        
+        Args:
+            default_readout_mode: Optional readout mode to use if not specified in config.
+                If None and not in config, will attempt to use camera's current/default mode.
+        """
+        readout_mode = None
+        if hasattr(self._config, 'default_readout_mode') and self._config.default_readout_mode is not None:
+            # Convert string to enum if needed
+            if isinstance(self._config.default_readout_mode, str):
+                try:
+                    readout_mode = CameraReadoutMode[self._config.default_readout_mode.upper()]
+                except KeyError:
+                    # Try matching by value
+                    for mode in CameraReadoutMode:
+                        if mode.value.lower() == self._config.default_readout_mode.lower():
+                            readout_mode = mode
+                            break
+                    if readout_mode is None:
+                        self._log.warning(f"Unknown readout mode string: {self._config.default_readout_mode}")
+            else:
+                readout_mode = self._config.default_readout_mode
+        
+        if readout_mode is None:
+            readout_mode = default_readout_mode
+        
+        if readout_mode is not None:
+            try:
+                self._log.info(f"Setting readout mode to {readout_mode.value}")
+                self.set_readout_mode(readout_mode)
+                self._log.info(f"Initialized readout mode to {readout_mode.value}")
+            except (NotImplementedError, ValueError, CameraError) as e:
+                self._log.warning(f"Could not set readout mode to {readout_mode.value}: {e}. Using camera default.")
 
     @contextmanager
     def _pause_streaming(self):
@@ -806,6 +845,44 @@ class AbstractCamera(metaclass=abc.ABCMeta):
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
         """
         Returns the current acquisition mode.
+        """
+        pass
+
+    @abc.abstractmethod
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """
+        Set the readout mode of the camera. Not all cameras support all readout modes.
+        
+        Args:
+            readout_mode: The desired readout mode (GLOBAL, ROLLING, or ROLLING_WITH_GLOBAL_RESET)
+            
+        Raises:
+            ValueError: If the camera does not support the requested readout mode
+            NotImplementedError: If the camera does not support readout mode selection
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """
+        Get the current readout mode of the camera.
+        
+        Returns:
+            The current readout mode
+            
+        Raises:
+            NotImplementedError: If the camera does not support readout mode querying
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """
+        Get the list of readout modes supported by this camera.
+        
+        Returns:
+            A sequence of supported readout modes. May be empty if the camera does not support
+            readout mode selection.
         """
         pass
 

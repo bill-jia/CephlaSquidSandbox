@@ -458,6 +458,20 @@ class CameraPixelFormat(enum.Enum):
         return CameraPixelFormat[pixel_format_string]
 
 
+class CameraReadoutMode(enum.Enum):
+    """
+    Readout modes for scientific cameras. Different cameras may support different subsets of these modes.
+    
+    - GLOBAL: Global shutter mode where all pixels are exposed and read out simultaneously
+    - ROLLING: Rolling shutter mode where pixels are exposed and read out row by row
+    - ROLLING_WITH_GLOBAL_RESET: Rolling shutter with global reset, where all pixels start exposure
+      simultaneously but are read out row by row
+    """
+    GLOBAL = "GLOBAL"
+    ROLLING = "ROLLING"
+    ROLLING_WITH_GLOBAL_RESET = "ROLLING_WITH_GLOBAL_RESET"
+
+
 class RGBValue(pydantic.BaseModel):
     r: float
     g: float
@@ -536,6 +550,10 @@ class CameraConfig(pydantic.BaseModel):
 
     # Set the hardware trigger mode of the camera to this value once on initialization.
     hardware_triggering_enabled: Optional[bool] = None
+
+    # Set the readout mode of the camera to this value once on initialization.
+    # If None, the camera will use its default readout mode or the mode will be set from _def.py.
+    default_readout_mode: Optional[str] = None  # String representation to avoid circular imports
 
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
