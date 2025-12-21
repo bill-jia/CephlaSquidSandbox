@@ -40,7 +40,8 @@ def get_camera(
     def open_if_needed(camera):
         try:
             camera.open()
-        except AttributeError:
+        except AttributeError as e:
+            _log.error(f"Error opening camera: {e}")
             pass
 
     if simulated:
@@ -60,7 +61,7 @@ def get_camera(
         elif config.camera_type == CameraVariant.FLIR:
             import control.camera_flir
 
-            camera = control.camera_flir.Camera(config)
+            camera = control.camera_flir.FLIRCamera(config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn)
         elif config.camera_type == CameraVariant.HAMAMATSU:
             import control.camera_hamamatsu
 

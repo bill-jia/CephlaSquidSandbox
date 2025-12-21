@@ -1,0 +1,328 @@
+{
+  "GenICam": {
+    "AcquisitionControl": {
+      "AcquisitionBurstFrameCount": 1,
+      "AcquisitionFrameCount": 2,
+      "AcquisitionFrameRate": 158.7134308384005,
+      "AcquisitionFrameRateEnable": false,
+      "AcquisitionLineRate": 208073.2415730337,
+      "AcquisitionMode": "Continuous",
+      "AcquisitionResultingFrameRate": 66.03403413933155,
+      "ExposureAuto": "Continuous",
+      "ExposureMode": "Timed",
+      "ExposureTime": 15000.0,
+      "SensorShutterMode": "Global",
+      "TriggerDelay": 11.0,
+      "TriggerMode": "Off",
+      "TriggerOverlap": "Off",
+      "TriggerSelector": "FrameStart",
+      "TriggerSource": "Software"
+    },
+    "AnalogControl": {
+      "BlackLevel": 0.0,
+      "BlackLevelClampingEnable": true,
+      "BlackLevelSelector": "All",
+      "Gain": 17.897908896641724,
+      "GainAuto": "Continuous",
+      "GainSelector": "All",
+      "Gamma": 0.800048828125,
+      "GammaEnable": true
+    },
+    "AutoAlgorithmControl": {
+      "AutoAlgorithmSelector": "Awb",
+      "AutoExposureControlLoopDamping": 0.5,
+      "AutoExposureControlPriority": "Gain",
+      "AutoExposureEVCompensation": 0.0,
+      "AutoExposureExposureTimeLowerLimit": 100.0,
+      "AutoExposureExposureTimeUpperLimit": 15000.0,
+      "AutoExposureGainLowerLimit": 0.0,
+      "AutoExposureGainUpperLimit": 18.000065071923338,
+      "AutoExposureGreyValueLowerLimit": 3.9100684261974585,
+      "AutoExposureGreyValueUpperLimit": 93.841642228739,
+      "AutoExposureLightingMode": "Normal",
+      "AutoExposureMeteringMode": "Average",
+      "AutoExposureTargetGreyValueAuto": "Continuous"
+    },
+    "ChunkDataControl": {
+      "ChunkBlackLevelSelector": "All",
+      "ChunkEnable": false,
+      "ChunkGainSelector": "All",
+      "ChunkModeActive": false,
+      "ChunkSelector": "FrameID"
+    },
+    "ColorTransformationControl": {},
+    "CounterAndTimerControl": {
+      "CounterDelay": 0,
+      "CounterDuration": 1,
+      "CounterEventSource": "MHzTick",
+      "CounterSelector": "Counter0",
+      "CounterStatus": "CounterTriggerWait",
+      "CounterTriggerActivation": "RisingEdge",
+      "CounterTriggerSource": "ExposureStart",
+      "CounterValue": 1
+    },
+    "DefectivePixelCorrection": {
+      "DefectCorrectStaticEnable": true,
+      "DefectCorrectionMode": "Average",
+      "DefectTableApply": "Applies the current defect table, so that any changes made affect images captured by the camera.",
+      "DefectTableCoordinateX": 89,
+      "DefectTableCoordinateY": 83,
+      "DefectTableFactoryRestore": "Restores the factory default eeprom table.",
+      "DefectTableIndex": 0,
+      "DefectTablePixelCount": 6
+    },
+    "DeviceControl": {
+      "DeviceFirmwareVersion": "1809.2.8.0",
+      "DeviceGenCPVersionMajor": 1,
+      "DeviceGenCPVersionMinor": 0,
+      "DeviceID": "25441812",
+      "DeviceIndicatorMode": "Active",
+      "DeviceLinkBandwidthReserve": 0.0,
+      "DeviceLinkCurrentThroughput": 152148225,
+      "DeviceLinkSpeed": 500000000,
+      "DeviceLinkThroughputLimit": 380000000,
+      "DeviceManufacturerInfo": "Oct  2 2018 17:26:12",
+      "DeviceMaxThroughput": 383479840,
+      "DeviceModelName": "Blackfly S BFS-U3-23S3M",
+      "DevicePowerSupplySelector": "External",
+      "DeviceScanType": "Areascan",
+      "DeviceSensorChroma": "Mono",
+      "DeviceSerialNumber": "25441812",
+      "DeviceTLType": "USB3Vision",
+      "DeviceTemperature": 43.25,
+      "DeviceTemperatureSelector": "Sensor",
+      "DeviceUptime": 4911,
+      "DeviceUserID": "",
+      "DeviceVendorName": "FLIR",
+      "DeviceVersion": "1809.2.8.0",
+      "EnumerationCount": 2,
+      "LinkUptime": 4898,
+      "MaxDeviceResetTime": 30000,
+      "PowerSupplyCurrent": 0.52587890625,
+      "PowerSupplyVoltage": 4.167236328125,
+      "SensorDescription": "Sony IMX392 (1/2.3\" Mono CMOS)",
+      "TimestampIncrement": 1000,
+      "TimestampLatchValue": 0
+    },
+    "DigitalIOControl": {
+      "LineFilterWidth": 0.0,
+      "LineFormat": "OptoCoupled",
+      "LineInputFilterSelector": "Deglitch",
+      "LineInverter": false,
+      "LineMode": "Input",
+      "LineSelector": "Line0",
+      "LineSource": "Off",
+      "LineStatus": false,
+      "LineStatusAll": 14,
+      "UserOutputSelector": "UserOutput0",
+      "UserOutputValue": false,
+      "UserOutputValueAll": 0
+    },
+    "EventControl": {
+      "EventErrorData": {
+        "EventError": 40000
+      },
+      "EventExposureEndData": {
+        "EventExposureEnd": 40003
+      },
+      "EventNotification": "Off",
+      "EventSelector": "Error",
+      "EventSerialPortReceiveData": {
+        "EventSerialPortReceive": 40005
+      },
+      "EventTestData": {
+        "EventTest": 20479
+      }
+    },
+    "FileAccessControl": {
+      "": null,
+      "FileAccessLength": 1,
+      "FileAccessOffset": 0,
+      "FileOpenMode": "Read",
+      "FileOperationResult": 0,
+      "FileOperationSelector": "Open",
+      "FileOperationStatus": "Success",
+      "FileSelector": "UserSetDefault",
+      "FileSize": 1376
+    },
+    "FlatFieldCorrectionControl": {
+      "FfcUserTableControl": {}
+    },
+    "ImageFormatControl": {
+      "AdcBitDepth": "Bit10",
+      "BinningHorizontal": 1,
+      "BinningHorizontalMode": "Sum",
+      "BinningSelector": "All",
+      "BinningVertical": 1,
+      "BinningVerticalMode": "Sum",
+      "DecimationHorizontal": 1,
+      "DecimationHorizontalMode": "Discard",
+      "DecimationSelector": "All",
+      "DecimationVertical": 1,
+      "DecimationVerticalMode": "Discard",
+      "Height": 1200,
+      "HeightMax": 1200,
+      "IspEnable": false,
+      "OffsetX": 0,
+      "OffsetY": 0,
+      "PixelColorFilter": "None",
+      "PixelDynamicRangeMax": 255,
+      "PixelDynamicRangeMin": 0,
+      "PixelFormat": "Mono8",
+      "PixelSize": "Bpp8",
+      "ReverseX": false,
+      "ReverseY": false,
+      "SensorHeight": 1200,
+      "SensorWidth": 1920,
+      "TestPattern": "Off",
+      "TestPatternGeneratorSelector": "Sensor",
+      "Width": 1920,
+      "WidthMax": 1920
+    },
+    "LUTControl": {
+      "": null,
+      "LUTEnable": false,
+      "LUTIndex": 0,
+      "LUTSelector": "LUT1",
+      "LUTValue": 0
+    },
+    "LogicBlockControl": {
+      "LogicBlockLUTInputActivation": "LevelHigh",
+      "LogicBlockLUTInputSelector": "Input0",
+      "LogicBlockLUTInputSource": "Zero",
+      "LogicBlockLUTOutputValue": true,
+      "LogicBlockLUTOutputValueAll": 255,
+      "LogicBlockLUTRowIndex": 0,
+      "LogicBlockLUTSelector": "Value",
+      "LogicBlockSelector": "LogicBlock0"
+    },
+    "SequencerControl": {
+      "SequencerConfigurationMode": "Off",
+      "SequencerConfigurationReset": "Resets the sequencer configuration by erasing all saved sequencer sets.",
+      "SequencerConfigurationValid": "No",
+      "SequencerFeatureEnable": true,
+      "SequencerFeatureSelector": "ExposureTime",
+      "SequencerMode": "Off",
+      "SequencerPathSelector": 0,
+      "SequencerSetLoad": "Loads currently selected sequencer to the current device configuration.",
+      "SequencerSetSave": "Saves the current device configuration to the currently selected sequencer set.",
+      "SequencerSetSelector": 0,
+      "SequencerSetStart": 0,
+      "SequencerSetValid": "No",
+      "SequencerTriggerSource": "Off"
+    },
+    "SerialPortControl": {
+      "SerialPortBaudRate": "Baud57600",
+      "SerialPortDataBits": 8,
+      "SerialPortParity": "None",
+      "SerialPortSelector": "SerialPort0",
+      "SerialPortSource": "Off",
+      "SerialPortStopBits": "Bits1",
+      "SerialReceiveFramingErrorCount": 0,
+      "SerialReceiveParityErrorCount": 0,
+      "SerialReceiveQueueCurrentCharacterCount": 0,
+      "SerialReceiveQueueMaxCharacterCount": 4096,
+      "SerialTransmitQueueCurrentCharacterCount": 0,
+      "SerialTransmitQueueMaxCharacterCount": 4096
+    },
+    "TestControl": {
+      "GuiXmlManifestAddress": 4026535968,
+      "Test0001": 0,
+      "TestPendingAck": 0
+    },
+    "TransferControl": {
+      "TransferControlMode": "Basic",
+      "TransferQueueCurrentBlockCount": 23,
+      "TransferQueueMaxBlockCount": 24,
+      "TransferQueueOverflowCount": 148748
+    },
+    "TransportLayerControl": {
+      "LinkErrorCount": 2,
+      "LinkRecoveryCount": 2,
+      "PayloadSize": 2304000,
+      "TLParamsLocked": 0,
+      "USB3Vision": {
+        "U3VAccessPrivilege": 0,
+        "U3VCPCapability": 0,
+        "U3VCPEIRMAvailable": true,
+        "U3VCPIIDC2Available": false,
+        "U3VCPSIRMAvailable": true,
+        "U3VCurrentSpeed": "SuperSpeed",
+        "U3VMaxAcknowledgeTransferLength": 1024,
+        "U3VMaxCommandTransferLength": 1024,
+        "U3VMaxDeviceResponseTime": 200,
+        "U3VMessageChannelID": 0,
+        "U3VNumberOfStreamChannels": 1,
+        "U3VVersionMajor": 1,
+        "U3VVersionMinor": 0
+      }
+    },
+    "UserSetControl": {
+      "UserSetDefault": "Default",
+      "UserSetFeatureEnable": true,
+      "UserSetFeatureSelector": "AasRoiEnableAe",
+      "UserSetLoad": "Loads the User Set specified by UserSetSelector to the device and makes it active.",
+      "UserSetSave": "Saves the User Set specified by UserSetSelector to the non-volatile memory of the device.",
+      "UserSetSelector": "Default"
+    }
+  },
+  "TLDevice": {
+    "DeviceControl": {
+      "DeviceEndianessMechanism": "Standard",
+      "DeviceReset": "Resets and reboots the device."
+    },
+    "DeviceInformation": {
+      "DeviceAccessStatus": "OpenReadWrite",
+      "DeviceCurrentSpeed": "SuperSpeed",
+      "DeviceDisplayName": "FLIR Blackfly S BFS-U3-23S3M",
+      "DeviceDriverVersion": "PGRUSBCam3.sys : 2.7.3.640",
+      "DeviceID": "USB\\VID_1E10&PID_4000\\01843614_0",
+      "DeviceInstanceId": "USB\\VID_1E10&PID_4000\\01843614",
+      "DeviceIsUpdater": false,
+      "DeviceLocation": "Port_#0020.Hub_#0001",
+      "DeviceModelName": "Blackfly S BFS-U3-23S3M",
+      "DevicePortId": "",
+      "DeviceSerialNumber": "25441812",
+      "DeviceType": "USB3Vision",
+      "DeviceU3VProtocol": true,
+      "DeviceUserID": "",
+      "DeviceVendorName": "FLIR",
+      "DeviceVersion": "1809.2.8.0",
+      "GUIXMLLocation": "Device",
+      "GUIXMLPath": "Input.xml",
+      "GenICamXMLLocation": "Device",
+      "GenICamXMLPath": ""
+    },
+    "StreamEnumeration": {
+      "StreamID": "0",
+      "StreamSelector": 0
+    }
+  },
+  "TLStream": {
+    "BufferHandlingControl": {
+      "StreamAnnounceBufferMinimum": 1,
+      "StreamAnnouncedBufferCount": 0,
+      "StreamBlockTransferSize": 1048576,
+      "StreamBufferAlignment": 1,
+      "StreamBufferCountManual": 10,
+      "StreamBufferCountMax": 441,
+      "StreamBufferCountMode": "Manual",
+      "StreamBufferCountResult": 10,
+      "StreamBufferHandlingMode": "OldestFirst",
+      "StreamCRCCheckEnable": false,
+      "StreamChunkCountMaximum": 50,
+      "StreamDeliveredFrameCount": 0,
+      "StreamDroppedFrameCount": 0,
+      "StreamIncompleteFrameCount": 0,
+      "StreamInputBufferCount": 0,
+      "StreamIsGrabbing": false,
+      "StreamLostFrameCount": 0,
+      "StreamOutputBufferCount": 0,
+      "StreamStartedFrameCount": 0
+    },
+    "StreamInformation": {
+      "StreamID": "0",
+      "StreamType": "USB3Vision"
+    }
+  }
+}

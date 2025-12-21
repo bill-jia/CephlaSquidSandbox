@@ -881,8 +881,8 @@ FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
 #### Simulation bypasses for individual components ####
 #######################################################
 
-CAMERA_BYPASS_SIMULATION = True
-NI_DAQ_BYPASS_SIMULATION = True
+CAMERA_BYPASS_SIMULATION = False
+NI_DAQ_BYPASS_SIMULATION = False
 
 
 ##########################################################
