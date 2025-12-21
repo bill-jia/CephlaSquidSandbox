@@ -551,17 +551,12 @@ class Microscope:
 
         # Configure main camera
         # Set pixel format (MONO8, MONO16, etc.) from configuration
-        print(f"Camera exp mode during prepare for use: {self.camera._camera.exp_mode}")
-        self.camera._camera.exp_mode = 0
-        print(f"Camera exp mode after change during prepare for use: {self.camera._camera.exp_mode}")
+
         self.camera.set_pixel_format(
             squid.config.CameraPixelFormat.from_string(control._def.CAMERA_CONFIG.PIXEL_FORMAT_DEFAULT)
         )
-        print(f"Camera exp mode after set pixel format: {self.camera._camera.exp_mode}")
-        self.camera._camera.exp_mode = 0
-        print(f"Camera exp mode after change after set pixel format: {self.camera._camera.exp_mode}")
+
         # Start with software trigger mode (can be changed to hardware trigger later)
-        print(f"DEFAULT_TRIGGER_MODE: {control._def.DEFAULT_TRIGGER_MODE}")
         if control._def.DEFAULT_TRIGGER_MODE == TriggerMode.SOFTWARE:
             self.camera.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
         elif control._def.DEFAULT_TRIGGER_MODE == TriggerMode.HARDWARE:
@@ -570,8 +565,7 @@ class Microscope:
             self.camera.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
         else:
             raise ValueError(f"Invalid trigger mode: {control._def.DEFAULT_TRIGGER_MODE}")
-        
-        print(f"camera acquisition mode: {self.camera.get_acquisition_mode()}")
+
 
         # Configure focus camera if available
         if self.addons.camera_focus:

@@ -459,7 +459,7 @@ class RetigaElectroCamera(AbstractCamera):
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
         """Get the list of supported pixel formats."""
-        return [CameraPixelFormat.MONO8, CameraPixelFormat.MONO12, CameraPixelFormat.MONO16]
+        return [CameraPixelFormat.MONO14]
 
     def set_binning(self, binning_factor_x: int, binning_factor_y: int):
         """
