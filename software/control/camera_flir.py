@@ -1307,8 +1307,7 @@ class FLIRCamera(AbstractCamera):
 
     def get_exposure_limits(self) -> Tuple[float, float]:
         """Return the valid range of exposure times in inclusive milliseconds."""
-        # TODO: Implement
-        raise NotImplementedError("get_exposure_limits not yet implemented")
+        return 0.006, 30000 # from FLIR BFS-U3-23S3M manual
 
     def get_strobe_time(self) -> float:
         """Given the current exposure time we are using, what is the strobe time such that
@@ -1659,8 +1658,12 @@ class FLIRCamera(AbstractCamera):
 
     def get_region_of_interest(self) -> Tuple[int, int, int, int]:
         """Returns the region of interest as a tuple of (x corner, y corner, width, height)"""
-        # TODO: Implement
-        raise NotImplementedError("get_region_of_interest not yet implemented")
+        self.nodemap = self._camera.GetNodeMap()
+        node_width = PySpin.CIntegerPtr(self.nodemap.GetNode("Width"))
+        node_height = PySpin.CIntegerPtr(self.nodemap.GetNode("Height"))
+        node_offset_x = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetX"))
+        node_offset_y = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetY"))
+        return node_offset_x.GetValue(), node_offset_y.GetValue(), node_width.GetValue(), node_height.GetValue()
 
     def set_temperature(self, temperature_deg_c: Optional[float]):
         """Set the desired temperature of the camera in degrees C.  If None is given as input, use
