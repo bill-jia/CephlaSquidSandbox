@@ -42,6 +42,8 @@ class StreamHandler:
         self.display_resolution_scaling = display_resolution_scaling
 
         self.save_image_flag = False
+        self.send_image_to_display_flag = True
+
         self.handler_busy = False
 
         # for fps measurement
@@ -56,6 +58,12 @@ class StreamHandler:
 
     def stop_recording(self):
         self.save_image_flag = False
+
+    def enable_display(self):
+        self.send_image_to_display_flag = True
+
+    def disable_display(self):
+        self.send_image_to_display_flag = False
 
     def set_display_fps(self, fps):
         self.fps_display = fps
@@ -98,15 +106,16 @@ class StreamHandler:
 
         # send image to display
         time_now = time.time()
-        if time_now - self.timestamp_last_display >= 1 / self.fps_display:
-            self._fns.image_to_display(
-                utils.crop_image(
-                    image,
-                    round(image.shape[1] * self.display_resolution_scaling),
-                    round(image.shape[0] * self.display_resolution_scaling),
+        if self.send_image_to_display_flag:
+            if time_now - self.timestamp_last_display >= 1 / self.fps_display:
+                self._fns.image_to_display(
+                    utils.crop_image(
+                        image,
+                        round(image.shape[1] * self.display_resolution_scaling),
+                        round(image.shape[0] * self.display_resolution_scaling),
+                    )
                 )
-            )
-            self.timestamp_last_display = time_now
+                self.timestamp_last_display = time_now
 
         # send image to write
         if self.save_image_flag and time_now - self.timestamp_last_save >= 1 / self.fps_save:
