@@ -462,9 +462,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         
         if readout_mode is not None:
             try:
-                self._log.info(f"Setting readout mode to {readout_mode.value}")
                 self.set_readout_mode(readout_mode)
-                self._log.info(f"Initialized readout mode to {readout_mode.value}")
             except (NotImplementedError, ValueError, CameraError) as e:
                 self._log.warning(f"Could not set readout mode to {readout_mode.value}: {e}. Using camera default.")
 

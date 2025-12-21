@@ -518,6 +518,7 @@ class FLIRCamera(AbstractCamera):
         self.is_streaming = False
         self.is_color = None
         self._readout_mode = None
+        self._exposure_time_ms = 20
 
         # many to be purged
         
@@ -540,7 +541,7 @@ class FLIRCamera(AbstractCamera):
         # self.rotate_image_angle = rotate_image_angle
         # self.flip_image = flip_image
 
-        # self.exposure_time = 1  # unit: ms
+        # self._exposure_time_ms = 1  # unit: ms
         # self.analog_gain = 0
         # self.frame_ID = -1
         # self.frame_ID_software = -1
@@ -553,8 +554,8 @@ class FLIRCamera(AbstractCamera):
         # self.GAIN_MAX = 24
         # self.GAIN_MIN = 0
         # self.GAIN_STEP = 1
-        # self.EXPOSURE_TIME_MS_MIN = 0.01
-        # self.EXPOSURE_TIME_MS_MAX = 4000
+        # self._exposure_time_ms_MS_MIN = 0.01
+        # self._exposure_time_ms_MS_MAX = 4000
 
         # self.trigger_mode = None
         self.pixel_size_byte = 1
@@ -713,43 +714,44 @@ class FLIRCamera(AbstractCamera):
         self.last_raw_image = None
         self.last_converted_image = None
         self.last_numpy_image = None
-
-    def set_exposure_time(self, exposure_time):  ## NOTE: Disables auto-exposure
-        use_strobe = self.trigger_mode == TriggerMode.HARDWARE  # true if using hardware trigger
-        self.nodemap = self._camera.GetNodeMap()
-        node_auto_exposure = PySpin.CEnumerationPtr(self.nodemap.GetNode("ExposureAuto"))
-        node_auto_exposure_off = PySpin.CEnumEntryPtr(node_auto_exposure.GetEntryByName("Off"))
-        readout_mode = self.get_readout_mode()
-        if not PySpin.IsReadable(node_auto_exposure_off) or not PySpin.IsWritable(node_auto_exposure):
-            print("Unable to set exposure manually (cannot disable auto exposure)")
+    
+    def set_exposure_time(self, exposure_time_ms: float):
+        """Set the exposure time in milliseconds."""
+        if exposure_time_ms == self._exposure_time_ms:
             return
+        self._set_exposure_time_imp(exposure_time_ms)
 
-        if node_auto_exposure.GetIntValue() != node_auto_exposure_off.GetValue():
-            self.auto_exposure_mode = PySpin.CEnumEntryPtr(node_auto_exposure.GetCurrentEntry()).GetValue()
+    def _set_exposure_time_imp(self, exposure_time_ms):  ## NOTE: Disables auto-exposure
+        self.nodemap = self._camera.GetNodeMap()
+        node_auto_exposure = self.nodemap.GetNode("ExposureAuto")
+        set_enum_node(node_auto_exposure, "Off")
 
-        node_auto_exposure.SetIntValue(node_auto_exposure_off.GetValue())
+        readout_mode = self.get_readout_mode()
+        use_strobe = (self.trigger_mode == TriggerMode.HARDWARE and readout_mode == CameraReadoutMode.ROLLING)  # true if using hardware trigger and rolling readout mode
+
 
         node_exposure_time = PySpin.CFloatPtr(self.nodemap.GetNode("ExposureTime"))
         if not PySpin.IsWritable(node_exposure_time):
             print("Unable to set exposure manually after disabling auto exposure")
 
-        if use_strobe == False or self.get_readout_mode() == CameraReadoutMode.GLOBAL:
-            self.exposure_time = exposure_time
-            node_exposure_time.SetValue(exposure_time * 1000.0)
+        # FLIR cameras use microseconds for exposure time
+        if not use_strobe:
+            self._exposure_time_ms = exposure_time_ms
+            node_exposure_time.SetValue(exposure_time_ms * 1000.0)
         else:
             # set the camera exposure time such that the active exposure time (illumination on time) is the desired value
-            self.exposure_time = exposure_time
+            self._exposure_time_ms = exposure_time_ms
             # add an additional 500 us so that the illumination can fully turn off before rows start to end exposure
             camera_exposure_time = (
                 self.exposure_delay_us
-                + self.exposure_time * 1000
+                + self._exposure_time_ms * 1000
                 + self.row_period_us * self.pixel_size_byte * (self.row_numbers - 1)
                 + 500
             )  # add an additional 500 us so that the illumination can fully turn off before rows start to end exposure
             node_exposure_time.SetValue(camera_exposure_time)
 
     def update_camera_exposure_time(self):
-        self.set_exposure_time(self.exposure_time)
+        self.set_exposure_time(self._exposure_time_ms)
 
     def set_analog_gain(self, analog_gain):  ## NOTE: Disables auto-gain
         self.nodemap = self._camera.GetNodeMap()
@@ -1323,8 +1325,7 @@ class FLIRCamera(AbstractCamera):
             "BayerRG64": CameraPixelFormat.BAYER_RG64,
             "BayerRG128": CameraPixelFormat.BAYER_RG128,
         }
-        node_pixel_format, _ = get_node_ptr(self.nodemap.GetNode("PixelFormat"))
-        pixel_format_name = node_pixel_format.GetCurrentEntry().GetSymbolic()
+        _, pixel_format_name = get_enumeration_node_and_current_entry(self.nodemap.GetNode("PixelFormat"))
         return mode_mapping[pixel_format_name]
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
@@ -1341,7 +1342,6 @@ class FLIRCamera(AbstractCamera):
 
     def get_binning(self) -> Tuple[int, int]:
         """Return the (binning_factor_x, binning_factor_y) of the camera right now."""
-        # TODO: Implement
         raise NotImplementedError("get_binning not yet implemented")
 
     def get_binning_options(self) -> Sequence[Tuple[int, int]]:
@@ -1439,8 +1439,7 @@ class FLIRCamera(AbstractCamera):
         
         # Try to get the SensorShutterMode node
         node_sensor_shutter_mode = self.nodemap.GetNode("SensorShutterMode")
-        ptr, principal_interface_type = get_node_ptr(node_sensor_shutter_mode)
-        current_mode_str = ptr.GetCurrentEntry().GetSymbolic()
+        _, current_mode_str = get_enumeration_node_and_current_entry(node_sensor_shutter_mode)
         # Map GenICam string values to our enum
         mode_mapping = {
             "Global": CameraReadoutMode.GLOBAL,
@@ -1561,13 +1560,79 @@ class FLIRCamera(AbstractCamera):
         If things like setting a remote strobe, or other settings, are needed when you change the mode you must
         handle that here.
         """
-        
-        raise NotImplementedError("_set_acquisition_mode_imp not yet implemented")
+        self.nodemap = self._camera.GetNodeMap()
+        # Get necessary acquisition mode and trigger nodes (need to make sure they match)
+        acq_node = self.nodemap.GetNode("AcquisitionMode")
+        trigger_on_node = self.nodemap.GetNode("TriggerMode")
+        trigger_selector_node = self.nodemap.GetNode("TriggerSelector")
+        trigger_source_node = self.nodemap.GetNode("TriggerSource")
+
+        # try:
+        if acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
+            set_enum_node(acq_node, "Continuous")
+            set_enum_node(trigger_on_node, "Off")
+            set_enum_node(trigger_source_node, "Software")
+            self.trigger_mode = TriggerMode.CONTINUOUS
+        elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            set_enum_node(acq_node, "SingleFrame")
+            set_enum_node(trigger_on_node, "On")
+            set_enum_node(trigger_selector_node, "FrameStart")
+            set_enum_node(trigger_source_node, "Software")
+            self.trigger_mode = TriggerMode.SOFTWARE
+        elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
+            set_enum_node(acq_node, "SingleFrame")
+            set_enum_node(trigger_on_node, "On")
+            set_enum_node(trigger_selector_node, "FrameStart")
+            set_enum_node(trigger_source_node, "Line3")
+            self.trigger_mode = TriggerMode.HARDWARE
+        elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
+            set_enum_node(acq_node, "MultiFrame")
+            set_enum_node(trigger_on_node, "On")
+            set_enum_node(trigger_selector_node, "AcquisitionStart")
+            set_enum_node(trigger_source_node, "Line3")
+            # Not sure if this should be HARDWARE or CONTINUOUS currently
+            self.trigger_mode = TriggerMode.HARDWARE
+        else:
+            raise ValueError(f"Unsupported acquisition mode: {acquisition_mode}")
+
+        self._acquisition_mode = acquisition_mode
+        self._set_exposure_time_imp(self._exposure_time_ms)
+
+        # except Exception as e:
+        #     raise CameraError(f"Failed to set acquisition mode: {e}")
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
-        """Returns the current acquisition mode."""
-        # TODO: Implement
-        raise NotImplementedError("get_acquisition_mode not yet implemented")
+        """
+        Get the current acquisition mode of the camera from acquisition mode and trigger mode nodes.
+        
+        Returns:
+            The current acquisition mode
+            
+        Raises:
+            CameraError: If the camera property is not available or cannot be set
+        """
+        acq_node = self.nodemap.GetNode("AcquisitionMode")
+        _, acq_mode_str = get_enumeration_node_and_current_entry(acq_node)
+        trigger_on_node = self.nodemap.GetNode("TriggerMode")
+        _, trigger_on_str = get_enumeration_node_and_current_entry(trigger_on_node)
+        trigger_selector_node = self.nodemap.GetNode("TriggerSelector")
+        _, trigger_selector_str = get_enumeration_node_and_current_entry(trigger_selector_node)
+        trigger_source_node = self.nodemap.GetNode("TriggerSource")
+        _, trigger_source_str = get_enumeration_node_and_current_entry(trigger_source_node)
+
+        if acq_mode_str == "Continuous":
+            return CameraAcquisitionMode.CONTINUOUS
+        elif acq_mode_str == "SingleFrame":
+            if trigger_on_str == "On" and trigger_selector_str == "FrameStart" and trigger_source_str == "Software":
+                return CameraAcquisitionMode.SOFTWARE_TRIGGER
+            elif trigger_on_str == "On" and trigger_selector_str == "FrameStart" and trigger_source_str == "Line3":
+                return CameraAcquisitionMode.HARDWARE_TRIGGER
+            else:
+                raise ValueError(f"Unknown acquisition mode: {acq_mode_str}")
+        elif acq_mode_str == "MultiFrame" and trigger_on_str == "On" and trigger_selector_str == "AcquisitionStart" and trigger_source_str == "Line3":
+            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+        else:
+            raise ValueError(f"Unknown acquisition mode: {acq_mode_str}")
 
     def get_ready_for_trigger(self) -> bool:
         """Returns true if the camera is ready for another trigger, false otherwise.  Calling
