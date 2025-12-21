@@ -105,6 +105,10 @@ def get_camera(
             camera = control.camera.DefaultCamera(
                 config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn
             )
+        
+        print(f"Camera exp mode during get camera: {camera._camera.exp_mode}")
+        camera._camera.exp_mode = 0
+        print(f"Camera exp mode after change during get camera: {camera._camera.exp_mode}")
 
         # NOTE(imo): All of these things are hacks before complete migration to AbstractCamera impls.  They can
         # be removed once all the cameras conform to the AbstractCamera interface.

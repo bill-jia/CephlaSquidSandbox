@@ -63,6 +63,7 @@ def populate_class_from_dict(myclass, options):
         setattr(myclass, actualkey, actualvalue)
 
 
+HARDWARE_TRIGGERING_ENABLED = True
 class TriggerMode:
     SOFTWARE = "Software Trigger"
     HARDWARE = "Hardware Trigger"

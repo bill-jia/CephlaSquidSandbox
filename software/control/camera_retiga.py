@@ -49,7 +49,7 @@ class RetigaElectroCamera(AbstractCamera):
     PIXEL_SIZE_UM_SRV = 4.54       # Retiga Electro SRV
     
     # Default sensor dimensions (can be overridden based on actual camera)
-    DEFAULT_WIDTH = 1360
+    DEFAULT_WIDTH = 1376
     DEFAULT_HEIGHT = 1024
     
     # Temperature limits in Celsius
@@ -164,11 +164,22 @@ class RetigaElectroCamera(AbstractCamera):
         self._pixel_format = CameraPixelFormat.MONO14  # Default to 16-bit
         self._crop_roi = (0, 0, self._sensor_width, self._sensor_height)
         self._binning = (1, 1)  # Default no binning
+
+
         
         self._configure_camera()
 
     def _configure_camera(self):
         """Configure camera with default settings from config."""
+        # Set exposure mode to 0 (Timed) early to prevent it from being reset by other operations
+        # This will be set again later in _prepare_for_use() based on DEFAULT_TRIGGER_MODE,
+        # but setting it here ensures it doesn't get changed to an unexpected value during configuration
+        try:
+            self._camera.exp_mode = 0  # 0 = Timed mode (used for CONTINUOUS and SOFTWARE_TRIGGER)
+            self._log.info(f"Set exp_mode to 0 in _configure_camera: {self._camera.exp_mode}")
+        except Exception as e:
+            self._log.warning(f"Could not set exposure mode: {e}")
+        
         # Set exposure resolution to milliseconds
         try:
             self._camera.exp_res = 0  # 0 = milliseconds
@@ -182,11 +193,7 @@ class RetigaElectroCamera(AbstractCamera):
             self._log.warning(f"Could not set speed table index: {e}")
         
         # Configure readout mode (if available)
-        try:
-            # exp_out_mode: 0=First Row, 1=All Rows, 2=Any Row, 3=Rolling Shutter
-            self._camera.exp_out_mode = 3  # Rolling shutter for faster readout
-        except Exception as e:
-            self._log.warning(f"Could not set exposure output mode: {e}")
+        self._log.warning(f"Retiga Electro camera only supports global shutter mode, no alternative exp_out_mode available")
         
         # Set default ROI if specified in config
         if self._config.default_roi is not None:
@@ -194,7 +201,7 @@ class RetigaElectroCamera(AbstractCamera):
                 self.set_region_of_interest(*self._config.default_roi)
             except Exception as e:
                 self._log.error(f"Failed to set default ROI: {e}")
-        
+
         # Query the current shape after ROI setting
         try:
             current_shape = self._camera.shape(0)
@@ -208,6 +215,20 @@ class RetigaElectroCamera(AbstractCamera):
         # Set temperature if specified
         if self._config.default_temperature is not None:
             self.set_temperature(self._config.default_temperature)
+        
+        # Verify and reset exp_mode if it was changed by any of the above operations
+        # Some PyVCAM operations (like set_roi) may reset exp_mode to a default value
+        try:
+            current_exp_mode = self._camera.exp_mode
+            self.camera.exp_mode = 0
+            if current_exp_mode != 0:
+                self._log.warning(f"exp_mode was changed to {current_exp_mode} during configuration, resetting to 0")
+                self._camera.exp_mode = 0
+                # Verify it was set correctly
+                if self._camera.exp_mode != 0:
+                    self._log.error(f"Failed to reset exp_mode to 0, current value: {self._camera.exp_mode}")
+        except Exception as e:
+            self._log.warning(f"Could not verify/reset exp_mode: {e}")
         
         # Calculate strobe delay
         self._calculate_strobe_delay()
@@ -312,6 +333,7 @@ class RetigaElectroCamera(AbstractCamera):
 
                 raw_data = frame["pixel_data"]
                 processed_frame = self._process_raw_frame(raw_data)
+                print(f"processed_frame mean: {np.mean(processed_frame)}")
 
                 with self._frame_lock:
                     camera_frame = CameraFrame(
@@ -524,15 +546,15 @@ class RetigaElectroCamera(AbstractCamera):
         with self._pause_streaming():
             try:
                 if acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
-                    self._camera.exp_mode = "Timed"
+                    self._camera.exp_mode = 0
                 elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
-                    self._camera.exp_mode = "Strobed"
+                    self._camera.exp_mode = 1
                 elif acquisition_mode == CameraAcquisitionMode.BULB:
-                    self._camera.exp_mode = "Bulb"
+                    self._camera.exp_mode = 2
                 elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
-                    self._camera.exp_mode = "Trigger First"
+                    self._camera.exp_mode = 3
                 elif acquisition_mode == CameraAcquisitionMode.VARIABLE_TIMED:
-                    self._camera.exp_mode = "Variable Timed"
+                    self._camera.exp_mode = 5
                 else:
                     raise ValueError(f"Unsupported acquisition mode: {acquisition_mode}")
 
@@ -560,6 +582,8 @@ class RetigaElectroCamera(AbstractCamera):
             # If we can't read the mode, return the cached value
             return getattr(self, '_acquisition_mode', CameraAcquisitionMode.CONTINUOUS)
         
+        # For exp_mode 0 (Timed), we need to check the cached value to distinguish
+        # between CONTINUOUS and SOFTWARE_TRIGGER since they both use exp_mode 0
         if exp_mode_name == "Timed":
             return CameraAcquisitionMode.CONTINUOUS
         elif exp_mode_name == "Strobed":
