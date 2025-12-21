@@ -604,7 +604,7 @@ class HighContentScreeningGui(QMainWindow):
                 self.emission_filter_wheel, self.liveController
             )
 
-        self.recordingControlWidget = widgets.RecordingWidget(self.streamHandler, self.imageSaver)
+        self.recordingControlWidget = widgets.RecordingWidget(self.streamHandler, self.imageSaver, self.liveController)
         self.wellplateFormatWidget = widgets.WellplateFormatWidget(
             self.stage, self.navigationViewer, self.streamHandler, self.liveController
         )
@@ -965,6 +965,8 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.multiPointWithFluidicsWidget.signal_acquisition_started.connect(self.toggleAcquisitionStart)
             self.fluidicsWidget.fluidics_initialized_signal.connect(self.multiPointWithFluidicsWidget.init_fluidics)
+
+        self.recordingControlWidget.signal_acquisition_started.connect(self.toggleAcquisitionStart)
 
         self.profileWidget.signal_profile_changed.connect(self.liveControlWidget.refresh_mode_list)
 

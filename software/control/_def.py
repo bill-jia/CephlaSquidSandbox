@@ -1003,5 +1003,5 @@ FOCUS_MEASURE_OPERATOR = FocusMeasureOperator.convert_to_enum(FOCUS_MEASURE_OPER
 DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)
 
 # saving path
-if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))):
+if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))) and not (DEFAULT_SAVING_PATH[1:].startswith(":\\")):
     DEFAULT_SAVING_PATH = str(Path.home()) + "/" + DEFAULT_SAVING_PATH.strip("/")

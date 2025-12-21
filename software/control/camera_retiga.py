@@ -333,7 +333,6 @@ class RetigaElectroCamera(AbstractCamera):
 
                 raw_data = frame["pixel_data"]
                 processed_frame = self._process_raw_frame(raw_data)
-                print(f"processed_frame mean: {np.mean(processed_frame)}")
 
                 with self._frame_lock:
                     camera_frame = CameraFrame(

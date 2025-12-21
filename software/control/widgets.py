@@ -2038,11 +2038,18 @@ class PiezoWidget(QFrame):
 
 
 class RecordingWidget(QFrame):
-    def __init__(self, streamHandler, imageSaver, main=None, *args, **kwargs):
+
+    signal_acquisition_started = Signal(bool)  # true = started, false = finished
+    signal_acquisition_channels = Signal(list)  # list channels
+    signal_acquisition_shape = Signal(int, float)  # Nz, dz
+
+    def __init__(self, streamHandler, imageSaver, liveController=None, main=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.imageSaver = imageSaver  # for saving path control
         self.streamHandler = streamHandler
+        self.liveController = liveController
         self.base_path_is_set = False
+        self._was_live_before_recording = False  # Track if live was running before recording
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
@@ -2057,6 +2064,7 @@ class RecordingWidget(QFrame):
 
         self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
         self.imageSaver.set_base_path(DEFAULT_SAVING_PATH)
+        self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
 
@@ -2114,10 +2122,14 @@ class RecordingWidget(QFrame):
 
     def set_saving_dir(self):
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
-        self.imageSaver.set_base_path(save_dir_base)
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
+        if save_dir_base is None or save_dir_base == "":
+            self.base_path_is_set = True
+            return
         self.lineEdit_savingDir.setText(save_dir_base)
+        self.imageSaver.set_base_path(save_dir_base)
         self.base_path_is_set = True
+
 
     def toggle_recording(self, pressed):
         if self.base_path_is_set == False:
@@ -2127,14 +2139,30 @@ class RecordingWidget(QFrame):
             msg.exec_()
             return
         if pressed:
+            # Ensure camera is streaming - frames won't be captured if camera isn't streaming
+            if self.liveController is not None:
+                self._was_live_before_recording = self.liveController.is_live
+                if not self.liveController.is_live:
+                    self.liveController.start_live()
+            else:
+                self._log.error("Live controller is not set for RecordingWidget")
+                return
+            
             self.lineEdit_experimentID.setEnabled(False)
             self.btn_setSavingDir.setEnabled(False)
+            self.imageSaver.set_base_path(self.lineEdit_savingDir.text())
             self.imageSaver.start_new_experiment(self.lineEdit_experimentID.text())
             self.streamHandler.start_recording()
+            self.signal_acquisition_started.emit(True)
         else:
             self.streamHandler.stop_recording()
+            # Optionally stop live if it wasn't running before recording started
+            # (commented out - user might want to keep viewing)
+            if self.liveController is not None and not self._was_live_before_recording:
+                self.liveController.stop_live()
             self.lineEdit_experimentID.setEnabled(True)
             self.btn_setSavingDir.setEnabled(True)
+            self.signal_acquisition_started.emit(False)
 
     # stop_recording can be called by imageSaver
     def stop_recording(self):
@@ -2142,6 +2170,17 @@ class RecordingWidget(QFrame):
         self.btn_record.setChecked(False)
         self.streamHandler.stop_recording()
         self.btn_setSavingDir.setEnabled(True)
+        self.signal_acquisition_started.emit(False)
+
+    def emit_selected_channels(self):
+        """Emit selected channels signal. RecordingWidget doesn't use channel configurations,
+        so this emits an empty list to maintain consistency with other acquisition widgets."""
+        self.signal_acquisition_channels.emit([])
+
+    def display_progress_bar(self, show):
+        """Display progress bar. RecordingWidget doesn't have progress bars,
+        so this is a no-op to maintain consistency with other acquisition widgets."""
+        pass
 
 
 class NavigationWidget(QFrame):
@@ -3530,7 +3569,10 @@ class FlexibleMultiPointWidget(QFrame):
 
     def set_saving_dir(self):
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
+        if save_dir_base is None or save_dir_base == "":
+            self.base_path_is_set = True
+            return
         self.multipointController.set_base_path(save_dir_base)
         self.lineEdit_savingDir.setText(save_dir_base)
         self.base_path_is_set = True
