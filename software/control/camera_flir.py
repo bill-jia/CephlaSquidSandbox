@@ -648,6 +648,20 @@ class FLIRCamera(AbstractCamera):
         # disable gamma
         PySpin.CBooleanPtr(self.nodemap.GetNode("GammaEnable")).SetValue(False)
 
+        # Configure trigger lines
+        line_selector = self.nodemap.GetNode("LineSelector")
+        set_enum_node(line_selector, "Line3") # line 3 is control trigger to camera
+        line_mode = self.nodemap.GetNode("LineMode")
+        set_enum_node(line_mode, "Input")
+
+        set_enum_node(line_selector, "Line2") # line 2 sends out trigger from camera to other devices - use this as a frame counter
+        line_mode = self.nodemap.GetNode("LineMode")
+        set_enum_node(line_mode, "Output")
+        line_source = self.nodemap.GetNode("LineSource")
+        set_enum_node(line_source, "ExposureActive")
+
+
+
     def set_callback(self, function):
         self.new_image_callback_external = function
 
