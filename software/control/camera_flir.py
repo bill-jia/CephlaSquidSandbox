@@ -642,13 +642,11 @@ class FLIRCamera(AbstractCamera):
         self.WidthMaxAbsolute = PySpin.CIntegerPtr(self.nodemap.GetNode("SensorWidth")).GetValue()
         self.HeightMaxAbsolute = PySpin.CIntegerPtr(self.nodemap.GetNode("SensorHeight")).GetValue()
 
-        self.set_region_of_interest(0, 0)
+        self._log.info(f"Setting region of interest to {self._config.default_roi[0]}, {self._config.default_roi[1]}, {self._config.default_roi[2]}, {self._config.default_roi[3]}")
+        self.set_region_of_interest(self._config.default_roi[0], self._config.default_roi[1], self._config.default_roi[2], self._config.default_roi[3])
 
         self.WidthMaxAbsolute = PySpin.CIntegerPtr(self.nodemap.GetNode("WidthMax")).GetValue()
         self.HeightMaxAbsolute = PySpin.CIntegerPtr(self.nodemap.GetNode("HeightMax")).GetValue()
-
-        self.set_region_of_interest(0, 0, self.WidthMaxAbsolute, self.HeightMaxAbsolute)
-
         self.WidthMax = self.WidthMaxAbsolute
         self.HeightMax = self.HeightMaxAbsolute
         self.OffsetX = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetX")).GetValue()
@@ -1355,25 +1353,27 @@ class FLIRCamera(AbstractCamera):
         raise NotImplementedError("set_binning not yet implemented")
 
     def get_binning(self) -> Tuple[int, int]:
-        nodemap = self._camera.GetNodeMap()
-        _, binning_x = get_integer_node(nodemap.GetNode("BinningHorizontal"))
-        _, binning_y = get_integer_node(nodemap.GetNode("BinningVertical"))
+        self.nodemap = self._camera.GetNodeMap()
+        _, binning_x = get_integer_node(self.nodemap.GetNode("BinningHorizontal"))
+        _, binning_y = get_integer_node(self.nodemap.GetNode("BinningVertical"))
         return (binning_x, binning_y)
 
     def get_binning_options(self) -> Sequence[Tuple[int, int]]:
         """Return the list of binning options supported by the camera."""
-        # TODO: Implement
-        raise NotImplementedError("get_binning_options not yet implemented")
+        return [(1, 1), (2, 2), (3,3), (4, 4)] # Manual entries for BFS-U3-23S3M
 
     def get_resolution(self) -> Tuple[int, int]:
         """Returns the maximum resolution of the camera under the current binning setting."""
-        # TODO: Implement
-        raise NotImplementedError("get_resolution not yet implemented")
+        self.nodemap = self._camera.GetNodeMap()
+        _, binning_x = get_integer_node(self.nodemap.GetNode("BinningHorizontal"))
+        _, binning_y = get_integer_node(self.nodemap.GetNode("BinningVertical"))
+        _, max_width = get_integer_node(self.nodemap.GetNode("WidthMax"))
+        _, max_height = get_integer_node(self.nodemap.GetNode("HeightMax"))
+        return (int(max_width/binning_x), int(max_height/binning_y))
 
     def get_pixel_size_unbinned_um(self) -> float:
         """Returns the pixel size without binning in microns."""
-        # TODO: Implement
-        raise NotImplementedError("get_pixel_size_unbinned_um not yet implemented")
+        return CAMERA_PIXEL_SIZE_UM[self._sensor_type]
 
     def get_pixel_size_binned_um(self) -> float:
         """Returns the pixel size after binning in microns."""
