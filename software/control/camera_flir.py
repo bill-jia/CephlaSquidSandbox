@@ -1315,15 +1315,7 @@ class FLIRCamera(AbstractCamera):
             "Mono12": CameraPixelFormat.MONO12,
             "Mono14": CameraPixelFormat.MONO14,
             "Mono16": CameraPixelFormat.MONO16,
-            "BayerRG8": CameraPixelFormat.BAYER_RG8,
-            "BayerRG12": CameraPixelFormat.BAYER_RG12,
-            "BayerRG14": CameraPixelFormat.BAYER_RG14,
-            "BayerRG16": CameraPixelFormat.BAYER_RG16,
-            "BayerRG24": CameraPixelFormat.BAYER_RG24,
-            "BayerRG32": CameraPixelFormat.BAYER_RG32,
-            "BayerRG48": CameraPixelFormat.BAYER_RG48,
-            "BayerRG64": CameraPixelFormat.BAYER_RG64,
-            "BayerRG128": CameraPixelFormat.BAYER_RG128,
+            "BayerRG8": CameraPixelFormat.BAYER_RG8
         }
         _, pixel_format_name = get_enumeration_node_and_current_entry(self.nodemap.GetNode("PixelFormat"))
         return mode_mapping[pixel_format_name]
@@ -1341,8 +1333,10 @@ class FLIRCamera(AbstractCamera):
         raise NotImplementedError("set_binning not yet implemented")
 
     def get_binning(self) -> Tuple[int, int]:
-        """Return the (binning_factor_x, binning_factor_y) of the camera right now."""
-        raise NotImplementedError("get_binning not yet implemented")
+        nodemap = self._camera.GetNodeMap()
+        _, binning_x = get_integer_node(nodemap.GetNode("BinningHorizontal"))
+        _, binning_y = get_integer_node(nodemap.GetNode("BinningVertical"))
+        return (binning_x, binning_y)
 
     def get_binning_options(self) -> Sequence[Tuple[int, int]]:
         """Return the list of binning options supported by the camera."""
