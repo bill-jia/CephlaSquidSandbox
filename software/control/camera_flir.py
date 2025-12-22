@@ -350,7 +350,7 @@ def get_category_node_and_all_features(node):
 
 def get_node_ptr(node):
     if CHOSEN_READ == ReadType.VALUE:
-        return PySpin.CValuePtr(node), _
+        return PySpin.CValuePtr(node), None
     elif CHOSEN_READ == ReadType.INDIVIDUAL:
         principal_interface_type = node.GetPrincipalInterfaceType()
         if principal_interface_type == PySpin.intfIString:
@@ -509,6 +509,22 @@ class FLIRCamera(AbstractCamera):
 
         super().__init__(camera_config, hw_trigger_fn, hw_set_strobe_delay_ms_fn)
 
+        # Threading for frame reading
+        self._read_thread_lock = threading.Lock()
+        self._read_thread: Optional[threading.Thread] = None
+        self._read_thread_keep_running = threading.Event()
+        self._read_thread_keep_running.clear()
+        self._read_thread_wait_period_s = 1.0
+        self._read_thread_running = threading.Event()
+        self._read_thread_running.clear()
+
+        # Frame management
+        self._frame_lock = threading.Lock()
+        self._current_frame: Optional[CameraFrame] = None
+        self._last_trigger_timestamp = 0
+        self._trigger_sent = threading.Event()
+        self._is_streaming = threading.Event()
+
         self.py_spin_system = PySpin.System.GetInstance()
         self.camera_list = self.py_spin_system.GetCameras()
         self._camera = None  # PySpin CameraPtr type
@@ -516,11 +532,15 @@ class FLIRCamera(AbstractCamera):
         self.device_info_dict = None
         self.device_index = 0
         self.callback_is_enabled = False
-        self.is_streaming = False
         self.is_color = None
         self._readout_mode = None
         self._exposure_time_ms = 20
         self._sensor_type = None
+        self._pixel_format = None
+
+        
+        self.processor = PySpin.ImageProcessor()
+        self.processor.SetColorProcessing(PySpin.SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR)
 
         # many to be purged
         
@@ -673,9 +693,10 @@ class FLIRCamera(AbstractCamera):
         self.new_image_callback_external = function
 
     def enable_callback(self):
+        """Enable event handler callback (legacy method, callbacks now handled via _propogate_frame)."""
         if self.callback_is_enabled == False:
             # stop streaming
-            if self.is_streaming:
+            if self._is_streaming.is_set():
                 was_streaming = True
                 self.stop_streaming()
             else:
@@ -685,7 +706,7 @@ class FLIRCamera(AbstractCamera):
                 self._camera.RegisterEventHandler(self.image_event_handler)
                 self.callback_is_enabled = True
             except PySpin.SpinnakerException as ex:
-                print("Error: %s" % ex)
+                self._log.warning(f"Error registering event handler: {ex}")
             # resume streaming if it was on
             if was_streaming:
                 self.start_streaming()
@@ -694,9 +715,10 @@ class FLIRCamera(AbstractCamera):
             pass
 
     def disable_callback(self):
+        """Disable event handler callback (legacy method, callbacks now handled via _propogate_frame)."""
         if self.callback_is_enabled == True:
             # stop streaming
-            if self.is_streaming:
+            if self._is_streaming.is_set():
                 was_streaming = True
                 self.stop_streaming()
             else:
@@ -705,7 +727,7 @@ class FLIRCamera(AbstractCamera):
                 self._camera.UnregisterEventHandler(self.image_event_handler)
                 self.callback_is_enabled = False
             except PySpin.SpinnakerException as ex:
-                print("Error: %s" % ex)
+                self._log.warning(f"Error unregistering event handler: {ex}")
             # resume streaming if it was on
             if was_streaming:
                 self.start_streaming()
@@ -941,29 +963,158 @@ class FLIRCamera(AbstractCamera):
             node_reverse_y.SetValue(bool(value))
 
     def start_streaming(self):
-        self._camera.Init()
+        if self._is_streaming.is_set():
+            self._log.debug("Already streaming, start_streaming is noop")
+            return
 
-        if not self.is_streaming:
-            try:
-                self._camera.BeginAcquisition()
-            except PySpin.SpinnakerException as ex:
-                print("Spinnaker exception: " + str(ex))
-        if self._camera.IsStreaming():
-            print("Camera is streaming")
-            self.is_streaming = True
+        try:
+            if not self._camera.IsInitialized():
+                self._camera.Init()
+            self._camera.BeginAcquisition()
+            self._ensure_read_thread_running()
+            self._trigger_sent.clear()
+            self._is_streaming.set()
+            self._log.info(f"FLIR camera started streaming in mode: {self.get_acquisition_mode()}")
+        except Exception as e:
+            raise CameraError(f"Failed to start streaming: {e}")
 
     def stop_streaming(self):
-        if self.is_streaming:
+        if not self._is_streaming.is_set():
+            self._log.debug("Already stopped, stop_streaming is noop")
+            return
+
+        # try:
+        self._cleanup_read_thread()
+        self._trigger_sent.clear()
+        self._is_streaming.clear()
+        self._log.info("FLIR camera streaming stopped")
+        # except Exception as e:
+        #     raise CameraError(f"Failed to stop streaming: {e}")
+
+    def _ensure_read_thread_running(self):
+        """Start the frame reading thread if not already running."""
+        with self._read_thread_lock:
+            if self._read_thread is not None and self._read_thread_running.is_set():
+                self._log.info("Read thread exists and is running.")
+                return True
+
+            elif self._read_thread is not None:
+                self._log.warning("Read thread exists but not running. Attempting restart.")
+
+            self._read_thread = threading.Thread(target=self._wait_for_frame, daemon=True)
+            self._read_thread_keep_running.set()
+            self._read_thread.start()
+
+    def _cleanup_read_thread(self):
+        """Stop and clean up the frame reading thread."""
+        self._log.debug("Cleaning up read thread.")
+        with self._read_thread_lock:
+            if self._read_thread is None:
+                self._log.warning("No read thread to clean up.")
+                return True
+
+            self._read_thread_keep_running.clear()
+
             try:
-                self._camera.EndAcquisition()
-            except PySpin.SpinnakerException as ex:
-                print("Spinnaker exception: " + str(ex))
-        if not self._camera.IsStreaming():
-            print("Camera is not streaming")
-            self.is_streaming = False
+                # Abort acquisition to wake up GetNextImage if it's blocking
+                if self._camera.IsStreaming():
+                    self._camera.EndAcquisition()
+            except Exception as e:
+                self._log.warning(f"Failed to abort camera: {e}")
+
+            self._read_thread.join(1.1 * self._read_thread_wait_period_s)
+
+            if self._read_thread.is_alive():
+                self._log.warning("Read thread refused to exit!")
+
+            self._read_thread = None
+            self._read_thread_running.clear()
+
+    def _wait_for_frame(self):
+        """Thread function to wait for and process frames."""
+        self._log.info("Starting FLIR read thread.")
+        self._read_thread_running.set()
+        # self._log.info(f"Read thread keep running: {self._read_thread_keep_running.is_set()}")
+        while self._read_thread_keep_running.is_set():
+            # try:
+                # Check if camera is still streaming
+                if not self._camera.IsStreaming():
+                    self._log.warning("Camera is not streaming, sleeping for 1ms")
+                    time.sleep(0.001)
+                    continue
+
+                # Get next image with timeout
+                try:
+                    raw_image = self._camera.GetNextImage(int(np.round(self._exposure_time_ms*1.1)))
+                except PySpin.SpinnakerException as e:
+                    self._log.warning(f"Error getting next image: {e}, continuing...")
+                    time.sleep((self._exposure_time_ms*1.1)/1000)
+                    continue
+
+                if raw_image is None:
+                    time.sleep(0.001)
+                    self._log.warning("Raw image is None, sleeping for 1ms")
+                    continue
+
+                if raw_image.IsIncomplete():
+                    self._log.debug(f"Image incomplete with image status {raw_image.GetImageStatus()}")
+                    raw_image.Release()
+                    continue
+
+                # Convert image to numpy array
+                try:
+                    if self.is_color:
+                        pixel_format = self.get_pixel_format()
+                        if pixel_format in [CameraPixelFormat.MONO10, CameraPixelFormat.MONO12, 
+                                          CameraPixelFormat.MONO14, CameraPixelFormat.MONO16]:
+                            rgb_image = self.processor.Convert(raw_image, PySpin.PixelFormat_RGB16)
+                        else:
+                            rgb_image = self.processor.Convert(raw_image, PySpin.PixelFormat_RGB8)
+                        numpy_image = rgb_image.GetNDArray()
+                    else:
+                        numpy_image = raw_image.GetNDArray()
+                        if self.get_pixel_format() == CameraPixelFormat.MONO12:
+                            numpy_image = numpy_image << 4
+                except PySpin.SpinnakerException as e:
+                    self._log.warning(f"Error converting image: {e}, trying fallback")
+                    converted_image = self.processor.Convert(raw_image, PySpin.PixelFormat_Mono8)
+                    numpy_image = converted_image.GetNDArray()
+
+                raw_image.Release()
+
+                # Process the raw frame
+                processed_frame = self._process_raw_frame(numpy_image)
+
+                # Create CameraFrame
+                with self._frame_lock:
+                    camera_frame = CameraFrame(
+                        frame_id=self._current_frame.frame_id + 1 if self._current_frame else 1,
+                        timestamp=time.time(),
+                        frame=processed_frame,
+                        frame_format=self.get_frame_format(),
+                        frame_pixel_format=self.get_pixel_format(),
+                    )
+                    self._current_frame = camera_frame
+
+                # Propagate frame to callbacks
+                self._propogate_frame(camera_frame)
+                self._trigger_sent.clear()
+
+                time.sleep(0.001)
+
+            # except PySpin.SpinnakerException as e:
+            #     if self._read_thread_keep_running.is_set():
+            #         self._log.debug(f"Exception in read loop: {e}, continuing...")
+            #     time.sleep(0.001)
+            # except Exception as e:
+            #     if self._read_thread_keep_running.is_set():
+            #         self._log.debug(f"Exception in read loop: {e}, continuing...")
+            #     time.sleep(0.001)
+
+        self._read_thread_running.clear()
 
     def set_pixel_format(self, pixel_format, convert_if_not_native=False):
-        if self.is_streaming == True:
+        if self._is_streaming.is_set():
             was_streaming = True
             self.stop_streaming()
         else:
@@ -983,7 +1134,8 @@ class FLIRCamera(AbstractCamera):
             raise ValueError(f"Pixel format {pixel_format} is not supported by this camera")
         pixel_format_name = mode_mapping[pixel_format]  
         set_enum_node(self.nodemap.GetNode("PixelFormat"), pixel_format_name)
-
+        self._pixel_format = pixel_format
+        self.is_color = "mono" not in pixel_format_name.lower()
         # Handle enforced relationships between pixel format and ADC bit depth? Maybe this is only on certain cameras?
 
         # node_adc_bit_depth, _ = get_node_ptr(self.nodemap.GetNode("AdcBitDepth"))
@@ -1124,16 +1276,31 @@ class FLIRCamera(AbstractCamera):
         self.trigger_mode = TriggerMode.HARDWARE
         self.update_camera_exposure_time()
 
-    def send_trigger(self):
-        if self.is_streaming:
-            self.nodemap = self._camera.GetNodeMap()
-            node_trigger = PySpin.CCommandPtr(self.nodemap.GetNode("TriggerSoftware"))
-            if not PySpin.IsWritable(node_trigger):
-                print("Trigger node not writable")
-                return
-            node_trigger.Execute()
-        else:
-            print("trigger not sent - camera is not streaming")
+    def send_trigger(self, illumination_time: Optional[float] = None):
+        if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
+            raise CameraError("In HARDWARE_TRIGGER mode, but no hw trigger function given.")
+
+        if not self.get_is_streaming():
+            raise CameraError("Camera is not streaming, cannot send trigger.")
+
+        if not self.get_ready_for_trigger():
+            raise CameraError(
+                f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
+            )
+
+        if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER:
+            self._hw_trigger_fn(illumination_time)
+        elif self.get_acquisition_mode() == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            try:
+                self.nodemap = self._camera.GetNodeMap()
+                node_trigger = PySpin.CCommandPtr(self.nodemap.GetNode("TriggerSoftware"))
+                if not PySpin.IsWritable(node_trigger):
+                    raise CameraError("Trigger node not writable")
+                node_trigger.Execute()
+                self._last_trigger_timestamp = time.time()
+                self._trigger_sent.set()
+            except Exception as e:
+                raise CameraError(f"Failed to send software trigger: {e}")
 
     def read_frame(self):
         if not self._camera.IsStreaming():
@@ -1143,7 +1310,7 @@ class FLIRCamera(AbstractCamera):
         if self.callback_is_enabled:  # need to disable callback to read stream manually
             callback_was_enabled = True
             self.disable_callback()
-        raw_image = self._camera.GetNextImage(1000)
+        raw_image = self._camera.GetNextImage(int(np.round(self._exposure_time_ms*1.1)))
         if raw_image.IsIncomplete():
             print("Image incomplete with image status %d ..." % raw_image.GetImageStatus())
             raw_image.Release()
@@ -1186,7 +1353,7 @@ class FLIRCamera(AbstractCamera):
     def set_region_of_interest(self, offset_x=None, offset_y=None, width=None, height=None):
 
         # stop streaming if streaming is on
-        if self.is_streaming == True:
+        if self._is_streaming.is_set():
             was_streaming = True
             self.stop_streaming()
         else:
@@ -1320,12 +1487,13 @@ class FLIRCamera(AbstractCamera):
         If not, throw a ValueError.
         """
         # TODO: Implement
-        raise NotImplementedError("set_frame_format not yet implemented")
+        if frame_format != CameraFrameFormat.RAW:
+            raise ValueError("Only RAW frame format is supported by Retiga Electro.")
 
     def get_frame_format(self) -> CameraFrameFormat:
         """Returns the current frame format."""
         # TODO: Implement
-        raise NotImplementedError("get_frame_format not yet implemented")
+        return CameraFrameFormat.RAW # TODO: Implement
 
     def get_pixel_format(self) -> CameraPixelFormat:
         """Returns the current pixel format."""
@@ -1523,8 +1691,7 @@ class FLIRCamera(AbstractCamera):
 
     def get_is_streaming(self):
         """Returns True if the camera is currently streaming, False otherwise."""
-        # TODO: Implement
-        raise NotImplementedError("get_is_streaming not yet implemented")
+        return self._is_streaming.is_set()
 
     def read_camera_frame(self) -> Optional[CameraFrame]:
         """This calls read_frame, but also fills in all the information such that you get a CameraFrame.  The
@@ -1532,15 +1699,35 @@ class FLIRCamera(AbstractCamera):
 
         Might return None if getting a frame timed out, or another error occurred.
         """
-        # TODO: Implement
-        raise NotImplementedError("read_camera_frame not yet implemented")
+        if not self.get_is_streaming():
+            self._log.error("Cannot read camera frame when not streaming.")
+            return None
+
+        if not self._read_thread_running.is_set():
+            self._log.error("Fatal camera error: read thread not running!")
+            return None
+
+        starting_id = self.get_frame_id()
+        timeout_s = (1.04 * self.get_total_frame_time() + 1000) / 1000.0
+        timeout_time_s = time.time() + timeout_s
+
+        while self.get_frame_id() == starting_id:
+            if time.time() > timeout_time_s:
+                self._log.warning(
+                    f"Timed out after waiting {timeout_s=}[s] for frame ({starting_id=}), total_frame_time={self.get_total_frame_time()}."
+                )
+                return None
+            time.sleep(0.001)
+
+        with self._frame_lock:
+            return self._current_frame
 
     def get_frame_id(self) -> int:
         """Returns the frame id of the current frame.  This should increase by 1 with every frame received
         from the camera
         """
-        # TODO: Implement
-        raise NotImplementedError("get_frame_id not yet implemented")
+        with self._frame_lock:
+            return self._current_frame.frame_id if self._current_frame else -1
 
     def get_white_balance_gains(self) -> Tuple[float, float, float]:
         """Returns the (R, G, B) white balance gains"""
@@ -1653,8 +1840,9 @@ class FLIRCamera(AbstractCamera):
         """Returns true if the camera is ready for another trigger, false otherwise.  Calling
         send_trigger when this is False will result in an exception from send_trigger.
         """
-        # TODO: Implement
-        raise NotImplementedError("get_ready_for_trigger not yet implemented")
+        if time.time() - self._last_trigger_timestamp > 1.5 * ((self.get_total_frame_time() + 4) / 1000.0):
+            self._trigger_sent.clear()
+        return not self._trigger_sent.is_set()
 
     def get_region_of_interest(self) -> Tuple[int, int, int, int]:
         """Returns the region of interest as a tuple of (x corner, y corner, width, height)"""
