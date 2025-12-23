@@ -66,6 +66,10 @@ class NIDAQConfig:
     do_port: str = "port0"  # e.g., "port0"
     do_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
     
+    # Digital input configuration
+    di_port: str = "port0"  # e.g., "port0"
+    di_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
+    
     # Analog input configuration
     ai_channels: List[str] = field(default_factory=list)  # e.g., ["ai0", "ai1"]
     ai_min_voltage: float = -10.0
@@ -98,6 +102,15 @@ class AcquisitionResult:
     
     # Analog input data: dict mapping channel name to numpy array
     analog_input: Dict[str, np.ndarray] = field(default_factory=dict)
+    
+    # Digital input data: dict mapping line index to numpy array of bool
+    digital_input: Dict[int, np.ndarray] = field(default_factory=dict)
+
+    # Analog output data: dict mapping channel name to numpy array
+    analog_output: Dict[str, np.ndarray] = field(default_factory=dict)
+    
+    # Digital output data: dict mapping line index to numpy array of bool
+    digital_output: Dict[int, np.ndarray] = field(default_factory=dict)
     
     # Timestamps for the samples (seconds from start)
     timestamps: Optional[np.ndarray] = None
@@ -238,10 +251,12 @@ class NIDAQ(AbstractNIDAQ):
         
         self._ao_task = None
         self._do_task = None
+        self._di_task = None
         self._ai_task = None
         
         self._waveforms: Optional[WaveformData] = None
         self._acquired_data: Optional[np.ndarray] = None
+        self._acquired_di_data: Optional[np.ndarray] = None
         
         self._lock = threading.Lock()
     
@@ -302,9 +317,11 @@ class NIDAQ(AbstractNIDAQ):
                     "software trigger may not work as expected"
                 )
             
-            # Start tasks in order: AI first (if slave), then DO, then AO (master)
+            # Start tasks in order: AI/DI first (if slaves), then DO, then AO (master)
             if self._ai_task is not None:
                 self._ai_task.start()
+            if self._di_task is not None:
+                self._di_task.start()
             if self._do_task is not None:
                 self._do_task.start()
             if self._ao_task is not None:
@@ -320,11 +337,13 @@ class NIDAQ(AbstractNIDAQ):
                 return True
             
             try:
-                # Wait for AO task (master) to complete
+                # Wait for master task to complete
                 if self._ao_task is not None:
                     self._ao_task.wait_until_done(timeout=timeout_s)
                 elif self._do_task is not None:
                     self._do_task.wait_until_done(timeout=timeout_s)
+                elif self._di_task is not None:
+                    self._di_task.wait_until_done(timeout=timeout_s)
                 
                 # Read AI data if configured
                 if self._ai_task is not None:
@@ -332,6 +351,18 @@ class NIDAQ(AbstractNIDAQ):
                         number_of_samples_per_channel=self._config.samples_per_channel,
                         timeout=timeout_s
                     )
+                
+                # Read DI data if configured
+                if self._di_task is not None:
+                    di_data = self._di_task.read(
+                        number_of_samples_per_channel=self._config.samples_per_channel,
+                        timeout=timeout_s
+                    )
+                    # Convert to numpy array
+                    if isinstance(di_data, (list, tuple)):
+                        self._acquired_di_data = np.array(di_data)
+                    else:
+                        self._acquired_di_data = np.array(di_data)
                 
                 self._is_running = False
                 self._is_armed = False
@@ -364,13 +395,18 @@ class NIDAQ(AbstractNIDAQ):
                 self._ai_task.stop()
             except Exception:
                 pass
+        if self._di_task is not None:
+            try:
+                self._di_task.stop()
+            except Exception:
+                pass
         
         self._is_running = False
         self._is_armed = False
         self._log.info("Tasks stopped")
     
     def get_acquired_data(self) -> AcquisitionResult:
-        """Get the acquired analog input data."""
+        """Get the acquired analog and digital input data."""
         result = AcquisitionResult(
             sample_rate_hz=self._config.sample_rate_hz,
             samples_acquired=self._config.samples_per_channel
@@ -385,8 +421,25 @@ class NIDAQ(AbstractNIDAQ):
                 # Multiple channels returns 2D array [channels x samples]
                 for i, channel in enumerate(self._config.ai_channels):
                     result.analog_input[channel] = np.array(self._acquired_data[i])
-            
-            # Generate timestamps
+        
+        if self._acquired_di_data is not None and len(self._config.di_lines) > 0:
+            # Convert digital input data to dict format
+            if len(self._config.di_lines) == 1:
+                # Single line returns 1D array
+                result.digital_input[self._config.di_lines[0]] = np.array(self._acquired_di_data, dtype=bool)
+            else:
+                # Multiple lines returns 2D array [lines x samples]
+                for i, line in enumerate(self._config.di_lines):
+                    result.digital_input[line] = np.array(self._acquired_di_data[i], dtype=bool)
+
+        if self._waveforms is not None:
+            result.analog_output = self._waveforms.analog_output.copy()
+            result.digital_output = self._waveforms.digital_output.copy()
+            result.analog_output_channels = list(self._waveforms.analog_output.keys())
+            result.digital_output_lines = list(self._waveforms.digital_output.keys())
+        
+        # Generate timestamps if we have any data
+        if len(result.analog_input) > 0 or len(result.digital_input) > 0:
             result.timestamps = np.arange(self._config.samples_per_channel) / self._config.sample_rate_hz
         
         return result
@@ -450,6 +503,13 @@ class NIDAQ(AbstractNIDAQ):
             except Exception:
                 pass
             self._ai_task = None
+        
+        if self._di_task is not None:
+            try:
+                self._di_task.close()
+            except Exception:
+                pass
+            self._di_task = None
     
     def _setup_tasks(self) -> None:
         """Set up all configured tasks."""
@@ -560,6 +620,49 @@ class NIDAQ(AbstractNIDAQ):
             else:
                 self._do_task.write(do_data, auto_start=False)
         
+        # Set up Digital Input task
+        if len(self._config.di_lines) > 0:
+            self._di_task = nidaqmx.Task("di_task")
+            
+            # Add all DI lines
+            for line in self._config.di_lines:
+                physical_line = f"{device}/{self._config.di_port}/line{line}"
+                self._di_task.di_channels.add_di_chan(physical_line)
+            
+            # Configure timing - use AO clock if available, otherwise DO clock
+            if self._ao_task is not None:
+                self._di_task.timing.cfg_samp_clk_timing(
+                    rate=sample_rate,
+                    source=ao_clock_terminal,
+                    sample_mode=sample_mode,
+                    samps_per_chan=num_samples
+                )
+            elif self._do_task is not None:
+                do_clock_terminal = f"/{device}/do/SampleClock"
+                self._di_task.timing.cfg_samp_clk_timing(
+                    rate=sample_rate,
+                    source=do_clock_terminal,
+                    sample_mode=sample_mode,
+                    samps_per_chan=num_samples
+                )
+            else:
+                # DI only mode
+                self._di_task.timing.cfg_samp_clk_timing(
+                    rate=sample_rate,
+                    sample_mode=sample_mode,
+                    samps_per_chan=num_samples
+                )
+                
+                # Configure trigger if external
+                if self._config.trigger_source == TriggerSource.EXTERNAL:
+                    edge = (constants.Edge.RISING 
+                           if self._config.trigger_edge == TriggerEdge.RISING 
+                           else constants.Edge.FALLING)
+                    self._di_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                        trigger_source=self._config.external_trigger_terminal,
+                        trigger_edge=edge
+                    )
+        
         # Set up Analog Input task
         if len(self._config.ai_channels) > 0:
             self._ai_task = nidaqmx.Task("ai_task")
@@ -585,7 +688,7 @@ class NIDAQ(AbstractNIDAQ):
                     terminal_config=terminal_config
                 )
             
-            # Configure timing - use AO clock if available
+            # Configure timing - use AO clock if available, otherwise DO or DI clock
             if self._ao_task is not None:
                 self._ai_task.timing.cfg_samp_clk_timing(
                     rate=sample_rate,
@@ -594,9 +697,18 @@ class NIDAQ(AbstractNIDAQ):
                     samps_per_chan=num_samples
                 )
             elif self._do_task is not None:
-                # Use internal clock but sync with DO start
+                do_clock_terminal = f"/{device}/do/SampleClock"
                 self._ai_task.timing.cfg_samp_clk_timing(
                     rate=sample_rate,
+                    source=do_clock_terminal,
+                    sample_mode=sample_mode,
+                    samps_per_chan=num_samples
+                )
+            elif self._di_task is not None:
+                di_clock_terminal = f"/{device}/di/SampleClock"
+                self._ai_task.timing.cfg_samp_clk_timing(
+                    rate=sample_rate,
+                    source=di_clock_terminal,
                     sample_mode=sample_mode,
                     samps_per_chan=num_samples
                 )
@@ -632,6 +744,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         
         self._waveforms: Optional[WaveformData] = None
         self._acquired_data: Dict[str, np.ndarray] = {}
+        self._acquired_di_data: Optional[np.ndarray] = None
         
         self._lock = threading.Lock()
         self._completion_event = threading.Event()
@@ -715,14 +828,22 @@ class SimulatedNIDAQ(AbstractNIDAQ):
             self._log.info("[SIM] Tasks stopped")
     
     def get_acquired_data(self) -> AcquisitionResult:
-        """Get the acquired analog input data."""
+        """Get the acquired analog and digital input data."""
         result = AcquisitionResult(
             analog_input=self._acquired_data.copy(),
             sample_rate_hz=self._config.sample_rate_hz,
             samples_acquired=self._config.samples_per_channel
         )
         
-        if len(self._acquired_data) > 0:
+        # Add digital input data if available
+        if self._acquired_di_data is not None and len(self._config.di_lines) > 0:
+            if len(self._config.di_lines) == 1:
+                result.digital_input[self._config.di_lines[0]] = np.array(self._acquired_di_data, dtype=bool)
+            else:
+                for i, line in enumerate(self._config.di_lines):
+                    result.digital_input[line] = np.array(self._acquired_di_data[i], dtype=bool)
+        
+        if len(self._acquired_data) > 0 or len(result.digital_input) > 0:
             result.timestamps = np.arange(self._config.samples_per_channel) / self._config.sample_rate_hz
         
         return result
@@ -746,7 +867,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
                 "ao_channels": [f"{device_name}/ao{i}" for i in range(4)],
                 "ai_channels": [f"{device_name}/ai{i}" for i in range(8)],
                 "do_lines": [f"{device_name}/port0/line{i}" for i in range(8)],
-                "di_lines": [f"{device_name}/port1/line{i}" for i in range(8)],
+                "di_lines": [f"{device_name}/port0/line{i}" for i in range(8)],
                 "terminals": [f"/{device_name}/PFI{i}" for i in range(8)],
             }
         return {}
@@ -819,6 +940,7 @@ def generate_pulse_train(
     pulse_width_samples: int,
     period_samples: int,
     num_samples: int,
+    n_samples_offset: int = 0,
     inverted: bool = False
 ) -> np.ndarray:
     """
@@ -835,7 +957,7 @@ def generate_pulse_train(
     """
     pattern = np.zeros(num_samples, dtype=bool)
     
-    for start in range(0, num_samples, period_samples):
+    for start in range(n_samples_offset, num_samples, period_samples):
         end = min(start + pulse_width_samples, num_samples)
         pattern[start:end] = True
     

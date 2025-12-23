@@ -3,15 +3,17 @@ import json
 import yaml
 import logging
 import sys
+import threading
 from typing import Optional
 
 import squid.logging
 from control.core.core import TrackingController, LiveController
+from control.core.fast_acquisition_controller import FastAcquisitionController
 from control.core.multi_point_controller import MultiPointController
 from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 import control.utils as utils
-from squid.abc import AbstractStage, AbstractCamera, AbstractFilterWheelController
+from squid.abc import AbstractStage, AbstractCamera, AbstractFilterWheelController, CameraAcquisitionMode
 from squid.stage.utils import move_to_loading_position, move_to_scanning_position, move_z_axis_to_safety_position
 from squid.config import CameraPixelFormat
 
@@ -11444,17 +11446,18 @@ class NIDAQWidget(QWidget):
             self._ni_daq.start_trigger()
             self.status_label.setText("Running...")
             self.trigger_btn.setEnabled(False)
-            
-            # Wait for completion in a thread
-            import threading
-            thread = threading.Thread(target=self._wait_for_completion)
-            thread.daemon = True
-            thread.start()
+            self.start_completion_listener()
             
         except Exception as e:
             self._log.error(f"Failed to trigger: {e}")
             self.status_label.setText(f"Error: {e}")
     
+    def start_completion_listener(self):
+        """Start the completion listener thread."""
+        self._completion_thread = threading.Thread(target=self._wait_for_completion)
+        self._completion_thread.daemon = True
+        self._completion_thread.start()
+
     def _wait_for_completion(self):
         """Wait for acquisition to complete and update UI."""
         if self._ni_daq is None:
@@ -11792,3 +11795,378 @@ class DOPatternDialog(QDialog):
             return line, pattern
         except Exception as e:
             return line, np.zeros(self.num_samples, dtype=bool)
+
+
+class FastAcquisitionWidget(QWidget):
+    """
+    Widget for controlling fast acquisition mode.
+    
+    Features:
+    - Trigger source selection (TI Microcontroller / NI DAQ)
+    - Frame rate and exposure time settings
+    - Buffer size configuration
+    - File format selection (TIFF / Zarr / HDF5)
+    - Output directory selection
+    - Start/Stop acquisition controls
+    - Real-time statistics (FPS, buffer fill, write speed)
+    - DAQ channel configuration
+    """
+    
+    signal_acquisition_started = Signal()
+    signal_acquisition_finished = Signal()
+    
+    def __init__(self, microscope, ni_daq_widget: Optional['NIDAQWidget'] = None, 
+                 live_controller: Optional[LiveController] = None,
+                 live_control_widget: Optional['LiveControlWidget'] = None,
+                 parent=None):
+        super().__init__(parent)
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        
+        self.microscope = microscope
+        self.camera = microscope.camera
+        self.microcontroller = microscope.low_level_drivers.microcontroller
+        self.ni_daq_widget = ni_daq_widget
+        self.live_controller = live_controller
+        self.live_control_widget = live_control_widget
+        
+        # Controller instance (created when starting acquisition)
+        self._controller: Optional[FastAcquisitionController] = None
+        
+        # State
+        self._is_acquiring = False
+        
+        # Initialize UI
+        self.init_ui()
+        
+        # Statistics update timer
+        self._stats_timer = QTimer()
+        self._stats_timer.timeout.connect(self.update_statistics)
+        self._stats_timer.setInterval(500)  # Update every 500ms
+    
+    def init_ui(self):
+        """Initialize UI components."""
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
+        
+        # Note: Hardware triggering is done via NI DAQ waveforms only
+        info_label = QLabel(
+            "Hardware triggering uses preloaded NI DAQ waveforms.\n"
+            "Trigger waveform is generated on DIO 1 (default)."
+        )
+        info_label.setWordWrap(True)
+        main_layout.addWidget(info_label)
+        
+        # Acquisition parameters
+        acq_group = QGroupBox("Acquisition Parameters")
+        acq_layout = QGridLayout()
+        
+        acq_layout.addWidget(QLabel("Frame Rate (Hz):"), 0, 0)
+        self.frame_rate_spinbox = QDoubleSpinBox()
+        self.frame_rate_spinbox.setRange(0.1, 1000.0)
+        self.frame_rate_spinbox.setValue(10.0)
+        self.frame_rate_spinbox.setDecimals(1)
+        acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
+        
+        acq_layout.addWidget(QLabel("Exposure Time (ms):"), 1, 0)
+        self.exposure_time_spinbox = QDoubleSpinBox()
+        self.exposure_time_spinbox.setRange(0.1, 10000.0)
+        self.exposure_time_spinbox.setValue(20.0)
+        self.exposure_time_spinbox.setDecimals(1)
+        acq_layout.addWidget(self.exposure_time_spinbox, 1, 1)
+        
+        acq_layout.addWidget(QLabel("Number of Frames:"), 2, 0)
+        self.num_frames_spinbox = QSpinBox()
+        self.num_frames_spinbox.setRange(1, 1000000)
+        self.num_frames_spinbox.setValue(100)
+        self.num_frames_spinbox.setSpecialValueText("Continuous")
+        acq_layout.addWidget(self.num_frames_spinbox, 2, 1)
+        
+        acq_group.setLayout(acq_layout)
+        main_layout.addWidget(acq_group)
+        
+        # Buffer settings
+        buffer_group = QGroupBox("Buffer Settings")
+        buffer_layout = QGridLayout()
+        
+        buffer_layout.addWidget(QLabel("Buffer Size:"), 0, 0)
+        self.buffer_size_spinbox = QSpinBox()
+        self.buffer_size_spinbox.setRange(10, 10000)
+        self.buffer_size_spinbox.setValue(500)
+        buffer_layout.addWidget(self.buffer_size_spinbox, 0, 1)
+        
+        buffer_layout.addWidget(QLabel("File Format:"), 1, 0)
+        self.file_format_combo = QComboBox()
+        self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5"])
+        buffer_layout.addWidget(self.file_format_combo, 1, 1)
+        
+        buffer_group.setLayout(buffer_layout)
+        main_layout.addWidget(buffer_group)
+        
+        # Output directory (matching RecordingWidget style)
+        output_group = QGroupBox("Output")
+        output_layout = QVBoxLayout()
+        
+        # Saving path (like RecordingWidget)
+        path_layout = QGridLayout()
+        path_layout.addWidget(QLabel("Saving Path"), 0, 0)
+        self.lineEdit_savingDir = QLineEdit()
+        self.lineEdit_savingDir.setReadOnly(True)
+        self.lineEdit_savingDir.setText("Choose a base saving directory")
+        from control._def import DEFAULT_SAVING_PATH
+        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
+        self.output_path = DEFAULT_SAVING_PATH
+        self.base_path_is_set = True
+        path_layout.addWidget(self.lineEdit_savingDir, 0, 1)
+        self.btn_setSavingDir = QPushButton("Browse")
+        self.btn_setSavingDir.setDefault(False)
+        try:
+            self.btn_setSavingDir.setIcon(QIcon("icon/folder.png"))
+        except:
+            pass  # Icon file may not exist
+        self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
+        path_layout.addWidget(self.btn_setSavingDir, 0, 2)
+        
+        # Experiment ID (like RecordingWidget)
+        exp_layout = QGridLayout()
+        exp_layout.addWidget(QLabel("Experiment ID"), 0, 0)
+        self.lineEdit_experimentID = QLineEdit()
+        exp_layout.addWidget(self.lineEdit_experimentID, 0, 1)
+        
+        output_layout.addLayout(path_layout)
+        output_layout.addLayout(exp_layout)
+        output_group.setLayout(output_layout)
+        main_layout.addWidget(output_group)
+        
+        # Trigger mode selection
+        trigger_group = QGroupBox("Trigger Configuration")
+        trigger_layout = QGridLayout()
+        
+        trigger_layout.addWidget(QLabel("Trigger Mode:"), 0, 0)
+        self.trigger_mode_combo = QComboBox()
+        self.trigger_mode_combo.addItems(["Frame Start", "Acquisition Start"])
+        self.trigger_mode_combo.setToolTip(
+            "Frame Start: Trigger each frame individually\n"
+            "Acquisition Start: Single trigger to start continuous acquisition"
+        )
+        trigger_layout.addWidget(self.trigger_mode_combo, 0, 1)
+        
+        trigger_group.setLayout(trigger_layout)
+        main_layout.addWidget(trigger_group)
+        
+        # DAQ configuration
+        daq_group = QGroupBox("DAQ Configuration")
+        daq_layout = QGridLayout()
+        
+        daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 0)
+        self.trigger_dio_line_spinbox = QSpinBox()
+        self.trigger_dio_line_spinbox.setRange(0, 31)
+        self.trigger_dio_line_spinbox.setValue(1)
+        self.trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
+        daq_layout.addWidget(self.trigger_dio_line_spinbox, 0, 1)
+        
+        daq_layout.addWidget(QLabel("Camera Frame DIO Line:"), 1, 0)
+        self.camera_dio_line_spinbox = QSpinBox()
+        self.camera_dio_line_spinbox.setRange(0, 31)
+        self.camera_dio_line_spinbox.setValue(0)
+        self.camera_dio_line_spinbox.setToolTip("NI DAQ digital input line connected to camera frame signal (default: 0)")
+        daq_layout.addWidget(self.camera_dio_line_spinbox, 1, 1)
+        
+        daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 2, 0)
+        self.daq_sample_rate_spinbox = QDoubleSpinBox()
+        self.daq_sample_rate_spinbox.setRange(100.0, 1000000.0)
+        self.daq_sample_rate_spinbox.setValue(10000.0)
+        self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
+        daq_layout.addWidget(self.daq_sample_rate_spinbox, 2, 1)
+        
+        self.enable_daq_checkbox = QCheckBox("Record analog input waveforms")
+        self.enable_daq_checkbox.setEnabled(self.ni_daq_widget is not None)
+        self.enable_daq_checkbox.setToolTip("Record analog input channels (configure in NI DAQ widget)")
+        daq_layout.addWidget(self.enable_daq_checkbox, 3, 0, 1, 2)
+        
+        daq_group.setLayout(daq_layout)
+        main_layout.addWidget(daq_group)
+        
+        # Control buttons
+        control_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Acquisition")
+        self.start_button.clicked.connect(self.start_acquisition)
+        control_layout.addWidget(self.start_button)
+        
+        self.stop_button = QPushButton("Stop Acquisition")
+        self.stop_button.clicked.connect(self.stop_acquisition)
+        self.stop_button.setEnabled(False)
+        control_layout.addWidget(self.stop_button)
+        
+        main_layout.addLayout(control_layout)
+        
+        # Statistics display
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout()
+        
+        self.stats_label = QLabel("Not acquiring")
+        stats_layout.addWidget(self.stats_label)
+        
+        self.buffer_progress_bar = QProgressBar()
+        self.buffer_progress_bar.setRange(0, 100)
+        stats_layout.addWidget(QLabel("Buffer Fill:"))
+        stats_layout.addWidget(self.buffer_progress_bar)
+        
+        stats_group.setLayout(stats_layout)
+        main_layout.addWidget(stats_group)
+        
+        main_layout.addStretch()
+    
+    
+    def set_saving_dir(self):
+        """Set saving directory (matching RecordingWidget style)."""
+        dialog = QFileDialog()
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
+        if save_dir_base is None or save_dir_base == "":
+            self.base_path_is_set = True
+            return
+        self.lineEdit_savingDir.setText(save_dir_base)
+        self.output_path = save_dir_base
+        self.base_path_is_set = True
+    
+    def start_acquisition(self):
+        """Start fast acquisition."""
+        if self._is_acquiring:
+            self._log.warning("Acquisition already running")
+            return
+        
+        # Stop live view if running
+        if self.live_controller and self.live_controller.is_live:
+            self._log.info("Stopping live view for fast acquisition")
+            self.live_controller.stop_live()
+            # Update live control widget button state
+            if self.live_control_widget:
+                self.live_control_widget.btn_live.setChecked(False)
+                self.live_control_widget.btn_live.setText("Start Live")
+        
+        # Validate output directory
+        if not self.base_path_is_set or not self.output_path:
+            error_dialog("Please choose base saving directory first", "Configuration Error")
+            return
+        
+        # Create full output path with experiment ID
+        experiment_id = self.lineEdit_experimentID.text().strip()
+        if experiment_id:
+            # Prepend timestamp to experiment ID: YYYY-MM-DD_HH-MM-SS_experiment_id
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            experiment_id_with_timestamp = f"{timestamp}_{experiment_id}"
+            full_output_path = os.path.join(self.output_path, experiment_id_with_timestamp)
+        else:
+            # Use timestamp if no experiment ID
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            full_output_path = os.path.join(self.output_path, f"{timestamp}_fast_acquisition")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(full_output_path, exist_ok=True)
+        
+        # Validate NI DAQ availability
+        if not self.ni_daq_widget or not self.ni_daq_widget._ni_daq:
+            error_dialog("NI DAQ not available. Please configure NI DAQ first.", "Configuration Error")
+            return
+        
+        try:
+            ni_daq = self.ni_daq_widget._ni_daq
+            
+            # Get analog input channels from NI DAQ widget if enabled
+            ai_channels = None
+            if self.enable_daq_checkbox.isChecked():
+                # Try to get AI channels from NI DAQ widget config
+                if hasattr(self.ni_daq_widget, '_config'):
+                    ai_channels = self.ni_daq_widget._config.ai_channels
+            
+            # Determine acquisition mode
+            trigger_mode_text = self.trigger_mode_combo.currentText()
+            if trigger_mode_text == "Frame Start":
+                acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER
+            else:  # "Acquisition Start"
+                acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+            
+            # Create main controller
+            file_format_map = {
+                "TIFF": "tiff",
+                "Zarr": "zarr",
+                "HDF5": "hdf5"
+            }
+            self._controller = FastAcquisitionController(
+                camera=self.camera,
+                ni_daq=ni_daq,
+                output_path=full_output_path,
+                buffer_size=self.buffer_size_spinbox.value(),
+                file_format=file_format_map[self.file_format_combo.currentText()],
+                trigger_dio_line=self.trigger_dio_line_spinbox.value(),
+                camera_frame_dio_line=self.camera_dio_line_spinbox.value()
+            )
+            
+            # Start acquisition
+            num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
+            self._controller.start_acquisition(
+                num_frames=num_frames,
+                frame_rate_hz=self.frame_rate_spinbox.value(),
+                exposure_time_ms=self.exposure_time_spinbox.value(),
+                sample_rate_hz=self.daq_sample_rate_spinbox.value(),
+                ai_channels=ai_channels,
+                acquisition_mode=acquisition_mode
+            )
+            self.ni_daq_widget.start_completion_listener()
+            
+            # Update UI
+            self._is_acquiring = True
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self._stats_timer.start()
+            self.signal_acquisition_started.emit()
+            
+            self._log.info("Fast acquisition started")
+        
+        except Exception as e:
+            self._log.error(f"Error starting acquisition: {e}", exc_info=True)
+            error_dialog(f"Failed to start acquisition: {e}", "Error")
+    
+    def stop_acquisition(self):
+        """Stop fast acquisition."""
+        if not self._is_acquiring:
+            return
+        
+        try:
+            if self._controller:
+                self._controller.stop_acquisition()
+            
+            # Update UI
+            self._is_acquiring = False
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self._stats_timer.stop()
+            self.signal_acquisition_finished.emit()
+            
+            self._log.info("Fast acquisition stopped")
+        
+        except Exception as e:
+            self._log.error(f"Error stopping acquisition: {e}", exc_info=True)
+            error_dialog(f"Failed to stop acquisition: {e}", "Error")
+    
+    def update_statistics(self):
+        """Update real-time statistics display."""
+        if not self._is_acquiring or not self._controller:
+            self.stats_label.setText("Not acquiring")
+            self.buffer_progress_bar.setValue(0)
+            return
+        
+        try:
+            stats = self._controller.get_statistics()
+            
+            stats_text = (
+                f"Frames: {stats['frame_count']} | "
+                f"Rate: {stats['frame_rate']:.1f} fps | "
+                f"Written: {stats['frames_written']} | "
+                f"Write Rate: {stats['write_rate']:.1f} fps"
+            )
+            self.stats_label.setText(stats_text)
+            
+            self.buffer_progress_bar.setValue(stats['buffer_fill_percent'])
+        
+        except Exception as e:
+            self._log.warning(f"Error updating statistics: {e}")

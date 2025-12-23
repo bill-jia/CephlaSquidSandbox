@@ -378,6 +378,7 @@ class HighContentScreeningGui(QMainWindow):
         self.imageArrayDisplayWindow: Optional[core.ImageArrayDisplayWindow] = None
         self.zPlotWidget: Optional[widgets.SurfacePlotWidget] = None
         self.niDAQWidget: Optional[widgets.NIDAQWidget] = None
+        self.fastAcquisitionWidget: Optional[widgets.FastAcquisitionWidget] = None
 
         self.recordTabWidget: QTabWidget = QTabWidget()
         self.cameraTabWidget: QTabWidget = QTabWidget()
@@ -655,6 +656,15 @@ class HighContentScreeningGui(QMainWindow):
                 self.niDAQWidget = widgets.NIDAQWidget(is_simulation=False)
             else:
                 self.niDAQWidget = widgets.NIDAQWidget(is_simulation=is_simulation)
+        
+        # Fast acquisition widget
+        if ENABLE_FAST_ACQUISITION:
+            self.fastAcquisitionWidget = widgets.FastAcquisitionWidget(
+                self.microscope,
+                ni_daq_widget=self.niDAQWidget if ENABLE_NI_DAQ else None,
+                live_controller=self.liveController,
+                live_control_widget=self.liveControlWidget
+            )
 
         self.imageDisplayTabs = QTabWidget(parent=self)
         if self.live_only_mode:
@@ -831,6 +841,8 @@ class HighContentScreeningGui(QMainWindow):
             self.recordTabWidget.addTab(self.trackingControlWidget, "Tracking")
         if ENABLE_RECORDING:
             self.recordTabWidget.addTab(self.recordingControlWidget, "Simple Recording")
+        if ENABLE_FAST_ACQUISITION:
+            self.recordTabWidget.addTab(self.fastAcquisitionWidget, "Fast Acquisition")
         self.recordTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.recordTabWidget))
         self.resizeCurrentTab(self.recordTabWidget)
 

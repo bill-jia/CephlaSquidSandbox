@@ -524,6 +524,13 @@ class FLIRCamera(AbstractCamera):
         self._last_trigger_timestamp = 0
         self._trigger_sent = threading.Event()
         self._is_streaming = threading.Event()
+        
+        # Fast acquisition support
+        self._fast_acquisition_buffer = None  # Will be set by fast acquisition controller
+        self._fast_acquisition_thread: Optional[threading.Thread] = None
+        self._fast_acquisition_thread_keep_running = threading.Event()
+        self._fast_acquisition_callback: Optional[Callable[[CameraFrame], None]] = None
+        self.fast_acquisition_timeout_ms = None
 
         self.py_spin_system = PySpin.System.GetInstance()
         self.camera_list = self.py_spin_system.GetCameras()
@@ -681,12 +688,16 @@ class FLIRCamera(AbstractCamera):
         line_mode = self.nodemap.GetNode("LineMode")
         set_enum_node(line_mode, "Input")
 
+
+        
+
         set_enum_node(line_selector, "Line2") # line 2 sends out trigger from camera to other devices - use this as a frame counter
         line_mode = self.nodemap.GetNode("LineMode")
         set_enum_node(line_mode, "Output")
         line_source = self.nodemap.GetNode("LineSource")
         set_enum_node(line_source, "ExposureActive")
-
+        v33_enable = PySpin.CBooleanPtr(self.nodemap.GetNode("V3_3Enable"))
+        v33_enable.SetValue(False)
 
 
     def set_callback(self, function):
@@ -1045,7 +1056,10 @@ class FLIRCamera(AbstractCamera):
 
                 # Get next image with timeout
                 try:
-                    raw_image = self._camera.GetNextImage(int(np.round(self._exposure_time_ms*1.1)))
+                    # Use exposure-time-based timeout for normal operation
+                    timeout_ms = int(np.round(self._exposure_time_ms*1.1))
+                    
+                    raw_image = self._camera.GetNextImage(timeout_ms)
                 except PySpin.SpinnakerException as e:
                     self._log.warning(f"Error getting next image: {e}, continuing...")
                     time.sleep((self._exposure_time_ms*1.1)/1000)
@@ -1112,6 +1126,157 @@ class FLIRCamera(AbstractCamera):
             #     time.sleep(0.001)
 
         self._read_thread_running.clear()
+
+    def start_fast_acquisition_frame_grabbing(self, frame_callback: Optional[Callable[[np.ndarray], None]] = None):
+        """
+        Start dedicated fast acquisition frame grabbing thread.
+        
+        This method should be called after:
+        1. Setting camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode
+        2. Starting camera acquisition (BeginAcquisition)
+        3. Before Firing DAQ waveforms
+        
+        The frame grabbing thread will continuously read frames from the camera
+        using GetNextImage with minimal timeout for non-blocking operation.
+        
+        Args:
+            frame_callback: Optional callback function to receive raw frame data (numpy array).
+                           Frame IDs and timestamps will be determined from DAQ synchronization.
+                           If None, frames are stored in self._current_frame only.
+        """
+        if self._is_streaming.is_set():
+            self._log.warning("Camera is already streaming. Stop streaming before starting fast acquisition.")
+            return
+        # Only allow this for mono frames
+        if self.is_color:
+            raise CameraError("Fast acquisition is only supported for mono cameras")
+
+        # Check that the acquisition mode is HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST
+        acquisition_mode = self.get_acquisition_mode()
+        self._log.info(f"Acquisition mode: {acquisition_mode}")
+        if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
+            raise CameraError("Fast acquisition is only supported for hardware triggering mode")
+        
+        if not self._camera.IsInitialized():
+            self._camera.Init()
+        
+        # Start acquisition without starting the normal streaming thread
+        try:
+            self._camera.BeginAcquisition()
+            self._log.info("Camera acquisition started for fast mode")
+        except Exception as e:
+            raise CameraError(f"Failed to start camera acquisition: {e}")
+        
+        # Start dedicated fast acquisition frame grabbing thread
+        self._fast_acquisition_callback = frame_callback
+        self._fast_acquisition_thread_keep_running = threading.Event()
+        self._fast_acquisition_thread_keep_running.set()
+        
+        self._fast_acquisition_thread = threading.Thread(
+            target=self._grab_frames_fast_acquisition,
+            daemon=True
+        )
+        self._fast_acquisition_thread.start()
+        self._log.info("Fast acquisition frame grabbing thread started")
+    
+    def stop_fast_acquisition_frame_grabbing(self):
+        """Stop the fast acquisition frame grabbing thread and end camera acquisition."""
+        if not hasattr(self, '_fast_acquisition_thread') or self._fast_acquisition_thread is None:
+            return
+        
+        self._log.info("Stopping fast acquisition frame grabbing...")
+        
+        # Signal thread to stop
+        self._fast_acquisition_thread_keep_running.clear()
+        self._log.info("Fast acquisition thread keep running signal cleared")
+        
+        # Wait for thread to finish
+        if self._fast_acquisition_thread.is_alive():
+            # Abort acquisition to wake up GetNextImage if it's blocking
+            self._log.info("Aborting camera acquisition...")
+            try:
+                if self._camera.IsStreaming():
+                    self._camera.EndAcquisition()
+                    self._log.info("Camera acquisition aborted")
+            except Exception as e:
+                self._log.warning(f"Failed to abort camera: {e}")
+            
+            self._fast_acquisition_thread.join(timeout=2.0)
+            self._log.info("Fast acquisition thread joined")
+            if self._fast_acquisition_thread.is_alive():
+                self._log.warning("Fast acquisition thread refused to exit!")
+        
+        # End acquisition
+        try:
+            if self._camera.IsStreaming():
+                self._camera.EndAcquisition()
+        except Exception as e:
+            self._log.warning(f"Failed to end acquisition: {e}")
+        
+        self._fast_acquisition_thread = None
+        self._log.info("Fast acquisition frame grabbing stopped")
+    
+    def _grab_frames_fast_acquisition(self):
+        """
+        Dedicated thread function for fast acquisition frame grabbing.
+        
+        Uses GetNextImage with minimal timeout (1ms) for non-blocking operation.
+        Frames are written directly to the provided callback or stored in _current_frame.
+        """
+        self._log.info("Starting fast acquisition frame grabbing thread.")
+        
+        while self._fast_acquisition_thread_keep_running.is_set():
+            try:
+                # Check if camera is still acquiring
+                # if not self._camera.IsStreaming():
+                #     time.sleep(0.001)
+                #     continue
+                
+                # Get next image with minimal timeout for non-blocking operation
+                try:
+                    raw_image = self._camera.GetNextImage(self.fast_acquisition_timeout_ms)  # 1ms timeout
+                except PySpin.SpinnakerException as e:
+                    # Timeout is expected and normal - don't log it
+                    # self._log.warning(f"GetNextImage error: {e}")
+                    if "failed waiting" not in str(e).lower():
+                        self._log.debug(f"GetNextImage error: {e}")
+                    continue
+                
+                if raw_image is None:
+                    continue
+                
+                if raw_image.IsIncomplete():
+                    self._log.debug(f"Image incomplete with image status {raw_image.GetImageStatus()}")
+                    raw_image.Release()
+                    continue
+                
+                # Convert image to numpy array
+                try:
+                    numpy_image = raw_image.GetNDArray()
+                    if self.get_pixel_format() == CameraPixelFormat.MONO12:
+                        numpy_image = numpy_image << 4
+                except PySpin.SpinnakerException as e:
+                    self._log.warning(f"Error converting image: {e}, trying fallback")
+                    converted_image = self.processor.Convert(raw_image, PySpin.PixelFormat_Mono8)
+                    numpy_image = converted_image.GetNDArray()
+                
+                raw_image.Release()
+                
+                # Process the raw frame
+                processed_frame = self._process_raw_frame(numpy_image)
+                # Call callback if provided (for fast acquisition buffer)
+                # Pass only the raw frame data - IDs and timestamps come from DAQ
+                if self._fast_acquisition_callback is not None:
+                    try:
+                        self._fast_acquisition_callback(processed_frame)
+                    except Exception as e:
+                        self._log.error(f"Error in fast acquisition callback: {e}")
+            
+            except Exception as e:
+                if self._fast_acquisition_thread_keep_running.is_set():
+                    self._log.debug(f"Exception in fast acquisition loop: {e}")
+        
+        self._log.info("Fast acquisition frame grabbing thread stopped")
 
     def set_pixel_format(self, pixel_format, convert_if_not_native=False):
         if self._is_streaming.is_set():
@@ -1367,32 +1532,6 @@ class FLIRCamera(AbstractCamera):
         node_offset_x = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetX"))
         node_offset_y = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetY"))
 
-        if width is not None:
-            # update the camera setting
-            if PySpin.IsWritable(node_width):
-                node_min = node_width.GetMin()
-                node_inc = node_width.GetInc()
-                diff = width - node_min
-                num_incs = diff // node_inc
-                width = node_min + num_incs * node_inc
-                self.Width = width
-                node_width.SetValue(min(max(int(width), 0), node_width_max.GetValue()))
-            else:
-                print("Width is not implemented or not writable")
-
-        if height is not None:
-            # update the camera setting
-            if PySpin.IsWritable(node_height):
-                node_min = node_height.GetMin()
-                node_inc = node_height.GetInc()
-                diff = height - node_min
-                num_incs = diff // node_inc
-                height = node_min + num_incs * node_inc
-
-                self.Height = height
-                node_height.SetValue(min(max(int(height), 0), node_height_max.GetValue()))
-            else:
-                print("Height is not implemented or not writable")
 
         if offset_x is not None:
             # update the camera setting
@@ -1423,6 +1562,33 @@ class FLIRCamera(AbstractCamera):
                 node_offset_y.SetValue(min(int(offset_y), node_max))
             else:
                 print("OffsetY is not implemented or not writable")
+        
+        if width is not None:
+            # update the camera setting
+            if PySpin.IsWritable(node_width):
+                node_min = node_width.GetMin()
+                node_inc = node_width.GetInc()
+                diff = width - node_min
+                num_incs = diff // node_inc
+                width = node_min + num_incs * node_inc
+                self.Width = width
+                node_width.SetValue(min(max(int(width), 0), node_width_max.GetValue()))
+            else:
+                print("Width is not implemented or not writable")
+
+        if height is not None:
+            # update the camera setting
+            if PySpin.IsWritable(node_height):
+                node_min = node_height.GetMin()
+                node_inc = node_height.GetInc()
+                diff = height - node_min
+                num_incs = diff // node_inc
+                height = node_min + num_incs * node_inc
+
+                self.Height = height
+                node_height.SetValue(min(max(int(height), 0), node_height_max.GetValue()))
+            else:
+                print("Height is not implemented or not writable")
 
         # restart streaming if it was previously on
         if was_streaming == True:
@@ -1467,8 +1633,9 @@ class FLIRCamera(AbstractCamera):
     # AbstractCamera method implementations - minimal templates
     def get_exposure_time(self) -> float:
         """Returns the current exposure time in milliseconds."""
-        # TODO: Implement
-        raise NotImplementedError("get_exposure_time not yet implemented")
+        self.nodemap = self._camera.GetNodeMap()
+        _, exposure_time = get_float_node(self.nodemap.GetNode("ExposureTime"))
+        return exposure_time / 1000.0
 
     def get_exposure_limits(self) -> Tuple[float, float]:
         """Return the valid range of exposure times in inclusive milliseconds."""
@@ -1768,30 +1935,39 @@ class FLIRCamera(AbstractCamera):
         trigger_on_node = self.nodemap.GetNode("TriggerMode")
         trigger_selector_node = self.nodemap.GetNode("TriggerSelector")
         trigger_source_node = self.nodemap.GetNode("TriggerSource")
+        trigger_activation_node = self.nodemap.GetNode("TriggerActivation")
+        trigger_overlap_node = self.nodemap.GetNode("TriggerOverlap")
 
         # try:
         if acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
             set_enum_node(acq_node, "Continuous")
             set_enum_node(trigger_on_node, "Off")
             set_enum_node(trigger_source_node, "Software")
+            set_enum_node(trigger_overlap_node, "Off")
             self.trigger_mode = TriggerMode.CONTINUOUS
         elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
-            set_enum_node(acq_node, "SingleFrame")
+            set_enum_node(acq_node, "Continuous")
             set_enum_node(trigger_on_node, "On")
             set_enum_node(trigger_selector_node, "FrameStart")
             set_enum_node(trigger_source_node, "Software")
+            set_enum_node(trigger_activation_node, "RisingEdge")
+            set_enum_node(trigger_overlap_node, "ReadOut")
             self.trigger_mode = TriggerMode.SOFTWARE
         elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
-            set_enum_node(acq_node, "SingleFrame")
+            set_enum_node(acq_node, "Continuous")
             set_enum_node(trigger_on_node, "On")
             set_enum_node(trigger_selector_node, "FrameStart")
             set_enum_node(trigger_source_node, "Line3")
+            set_enum_node(trigger_activation_node, "RisingEdge")
+            set_enum_node(trigger_overlap_node, "ReadOut")
             self.trigger_mode = TriggerMode.HARDWARE
         elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
-            set_enum_node(acq_node, "MultiFrame")
+            set_enum_node(acq_node, "Continuous")
             set_enum_node(trigger_on_node, "On")
             set_enum_node(trigger_selector_node, "AcquisitionStart")
             set_enum_node(trigger_source_node, "Line3")
+            set_enum_node(trigger_activation_node, "RisingEdge")
+            set_enum_node(trigger_overlap_node, "Off")
             # Not sure if this should be HARDWARE or CONTINUOUS currently
             self.trigger_mode = TriggerMode.HARDWARE
         else:
@@ -1822,19 +1998,19 @@ class FLIRCamera(AbstractCamera):
         trigger_source_node = self.nodemap.GetNode("TriggerSource")
         _, trigger_source_str = get_enumeration_node_and_current_entry(trigger_source_node)
 
-        if acq_mode_str == "Continuous":
+        if acq_mode_str == "Continuous" and trigger_on_str == "Off":
             return CameraAcquisitionMode.CONTINUOUS
-        elif acq_mode_str == "SingleFrame":
-            if trigger_on_str == "On" and trigger_selector_str == "FrameStart" and trigger_source_str == "Software":
+        elif trigger_on_str == "On":
+            if trigger_selector_str == "FrameStart" and trigger_source_str == "Software":
                 return CameraAcquisitionMode.SOFTWARE_TRIGGER
-            elif trigger_on_str == "On" and trigger_selector_str == "FrameStart" and trigger_source_str == "Line3":
+            elif trigger_selector_str == "FrameStart" and trigger_source_str == "Line3":
                 return CameraAcquisitionMode.HARDWARE_TRIGGER
+            elif trigger_selector_str == "AcquisitionStart" and trigger_source_str == "Line3":
+                return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
             else:
-                raise ValueError(f"Unknown acquisition mode: {acq_mode_str}")
-        elif acq_mode_str == "MultiFrame" and trigger_on_str == "On" and trigger_selector_str == "AcquisitionStart" and trigger_source_str == "Line3":
-            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+                raise ValueError(f"Unknown acquisition mode: Acquisition mode: {acq_mode_str}, Trigger on: {trigger_on_str}, Trigger selector: {trigger_selector_str}, Trigger source: {trigger_source_str}")
         else:
-            raise ValueError(f"Unknown acquisition mode: {acq_mode_str}")
+            raise ValueError(f"Unknown acquisition mode: Acquisition mode: {acq_mode_str}, Trigger on: {trigger_on_str}, Trigger selector: {trigger_selector_str}, Trigger source: {trigger_source_str}")
 
     def get_ready_for_trigger(self) -> bool:
         """Returns true if the camera is ready for another trigger, false otherwise.  Calling
