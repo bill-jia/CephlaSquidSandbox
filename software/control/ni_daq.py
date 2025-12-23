@@ -885,7 +885,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         result = AcquisitionResult(
             analog_input=self._acquired_data.copy(),
             sample_rate_hz=self._config.sample_rate_hz,
-            samples_acquired=self._config.samples_per_channel
+            samples_acquired=self._config.samples_per_channel,
         )
         
         # Add digital input data if available
@@ -895,6 +895,13 @@ class SimulatedNIDAQ(AbstractNIDAQ):
             else:
                 for i, line in enumerate(self._config.di_lines):
                     result.digital_input[line] = np.array(self._acquired_di_data[i], dtype=bool)
+
+        # For simulation, propagate configured output waveforms as "acquired" output
+        if self._waveforms is not None:
+            result.analog_output = self._waveforms.analog_output.copy()
+            result.digital_output = self._waveforms.digital_output.copy()
+            result.analog_output_channels = list(self._waveforms.analog_output.keys())
+            result.digital_output_lines = list(self._waveforms.digital_output.keys())
         
         if len(self._acquired_data) > 0 or len(result.digital_input) > 0:
             result.timestamps = np.arange(self._config.samples_per_channel) / self._config.sample_rate_hz

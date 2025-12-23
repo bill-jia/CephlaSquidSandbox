@@ -540,6 +540,12 @@ class FastAcquisitionController:
                 # Save frame sample indices
                 if self._frame_sample_indices:
                     f.create_dataset('frame_sample_indices', data=np.array(self._frame_sample_indices))
+
+                for channel, data in self._daq_result.analog_output.items():
+                    f.create_dataset(f'analog_output/{channel}', data=data)
+
+                for line, data in self._daq_result.digital_output.items():
+                    f.create_dataset(f'digital_output/line{line}', data=data)
                 
                 # Save metadata
                 f.attrs['sample_rate_hz'] = self._daq_result.sample_rate_hz
