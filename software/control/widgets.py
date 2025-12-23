@@ -11834,6 +11834,7 @@ class FastAcquisitionWidget(QWidget):
         
         # State
         self._is_acquiring = False
+        self._updating_acquisition_params = False  # Flag to prevent circular updates
         
         # Initialize UI
         self.init_ui()
@@ -11866,6 +11867,7 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.setValue(10.0)
         self.frame_rate_spinbox.setDecimals(1)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
+        self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
         acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
         
         acq_layout.addWidget(QLabel("Exposure Time (ms):"), 1, 0)
@@ -11880,13 +11882,26 @@ class FastAcquisitionWidget(QWidget):
         
         acq_layout.addWidget(QLabel("Number of Frames:"), 2, 0)
         self.num_frames_spinbox = QSpinBox()
-        self.num_frames_spinbox.setRange(1, 1000000)
+        self.num_frames_spinbox.setRange(0, 1000000)
         self.num_frames_spinbox.setValue(100)
         self.num_frames_spinbox.setSpecialValueText("Continuous")
+        self.num_frames_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
         acq_layout.addWidget(self.num_frames_spinbox, 2, 1)
+        
+        acq_layout.addWidget(QLabel("Total Acquisition Time (s):"), 3, 0)
+        self.total_time_spinbox = QDoubleSpinBox()
+        self.total_time_spinbox.setRange(0.001, 3600.0)  # 1 ms to 1 hour
+        self.total_time_spinbox.setValue(10.0)  # Default: 10 seconds
+        self.total_time_spinbox.setDecimals(3)
+        self.total_time_spinbox.setSuffix(" s")
+        self.total_time_spinbox.valueChanged.connect(self._update_frames_from_acquisition_time)
+        acq_layout.addWidget(self.total_time_spinbox, 3, 1)
         
         acq_group.setLayout(acq_layout)
         main_layout.addWidget(acq_group)
+        
+        # Initialize total time based on initial frame count
+        self._update_acquisition_time_from_frames()
         
         # Buffer settings
         buffer_group = QGroupBox("Buffer Settings")
@@ -12105,6 +12120,63 @@ class FastAcquisitionWidget(QWidget):
             # Fallback: keep original maximum
             self.exposure_time_spinbox.setMaximum(10000.0)
     
+    def _update_acquisition_time_from_frames(self):
+        """
+        Update total acquisition time based on number of frames and frame rate.
+        Called when number of frames or frame rate changes.
+        """
+        if self._updating_acquisition_params:
+            return
+        
+        try:
+            self._updating_acquisition_params = True
+            
+            num_frames = self.num_frames_spinbox.value()
+            frame_rate_hz = self.frame_rate_spinbox.value()
+            
+            if num_frames == 0:
+                # Continuous mode - don't update total time
+                # User can still set time manually if needed
+                return
+            
+            # Calculate total time: frames / frame_rate
+            total_time_s = num_frames / frame_rate_hz
+            self.total_time_spinbox.setValue(total_time_s)
+            
+        except Exception as e:
+            self._log.warning(f"Failed to update acquisition time from frames: {e}")
+        finally:
+            self._updating_acquisition_params = False
+    
+    def _update_frames_from_acquisition_time(self):
+        """
+        Update number of frames based on total acquisition time and frame rate.
+        Called when total acquisition time changes.
+        """
+        if self._updating_acquisition_params:
+            return
+        
+        try:
+            self._updating_acquisition_params = True
+            
+            total_time_s = self.total_time_spinbox.value()
+            frame_rate_hz = self.frame_rate_spinbox.value()
+            
+            # Calculate number of frames: time * frame_rate
+            num_frames = int(total_time_s * frame_rate_hz)
+            
+            # Ensure minimum of 1 frame (0 is reserved for "Continuous")
+            if num_frames < 1:
+                num_frames = 1
+            
+            # Update the spinbox
+            self.num_frames_spinbox.setValue(num_frames)
+            
+        except Exception as e:
+            self._log.warning(f"Failed to update frames from acquisition time: {e}")
+        finally:
+            self._updating_acquisition_params = False
+    
     def start_acquisition(self):
         """Start fast acquisition."""
         if self._is_acquiring:
@@ -12178,6 +12250,15 @@ class FastAcquisitionWidget(QWidget):
                 camera_frame_dio_line=self.camera_dio_line_spinbox.value()
             )
             
+            # Set completion callback to handle acquisition completion
+            from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+            def on_acquisition_completed(status: AcquisitionCompletionStatus, error_message: Optional[str]):
+                """Handle acquisition completion from controller."""
+                # Use QTimer.singleShot to ensure this runs on the main thread
+                QTimer.singleShot(0, lambda: self._on_acquisition_completed_from_controller(status, error_message))
+            
+            self._controller.set_completion_callback(on_acquisition_completed)
+            
             # Start acquisition
             num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
             self._controller.start_acquisition(
@@ -12204,33 +12285,108 @@ class FastAcquisitionWidget(QWidget):
             error_dialog(f"Failed to start acquisition: {e}", "Error")
     
     def stop_acquisition(self):
-        """Stop fast acquisition."""
+        """Stop fast acquisition (manual stop by user)."""
         if not self._is_acquiring:
             return
         
         try:
             if self._controller:
-                self._controller.stop_acquisition()
+                # Stop with manual_stop=True - completion callback will handle UI update
+                self._controller.stop_acquisition(manual_stop=True)
             
-            # Update UI
-            self._is_acquiring = False
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self._stats_timer.stop()
-            self.signal_acquisition_finished.emit()
-            
-            self._log.info("Fast acquisition stopped")
+            self._log.info("Fast acquisition stop requested")
         
         except Exception as e:
             self._log.error(f"Error stopping acquisition: {e}", exc_info=True)
+            # Update UI on error
+            self._on_acquisition_completed(success=False, error_message=str(e))
             error_dialog(f"Failed to stop acquisition: {e}", "Error")
+    
+    def _on_acquisition_completed_from_controller(self, status, error_message: Optional[str] = None):
+        """
+        Handle acquisition completion from controller callback.
+        
+        Args:
+            status: AcquisitionCompletionStatus enum value
+            error_message: Optional error message
+        """
+        from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+        
+        # Update state
+        self._is_acquiring = False
+        
+        # Stop statistics timer
+        self._stats_timer.stop()
+        
+        # Update button states
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        
+        # Update status label based on completion status
+        if status == AcquisitionCompletionStatus.COMPLETED_SUCCESS:
+            completion_text = "Acquisition completed, " + self.stats_label.text()
+            self.stats_label.setText(completion_text)
+            self.stats_label.setStyleSheet("")
+        elif status == AcquisitionCompletionStatus.STOPPED_MANUAL:
+            completion_text = "Acquisition stopped, " + self.stats_label.text()
+            self.stats_label.setText(completion_text)
+            self.stats_label.setStyleSheet("")
+        elif status == AcquisitionCompletionStatus.COMPLETED_ERROR:
+            error_text = "Error in acquisition"
+            if error_message:
+                error_text += f": {error_message}"
+            self.stats_label.setText(error_text)
+            self.stats_label.setStyleSheet("color: red;")
+        else:
+            self.stats_label.setText("Acquisition ended")
+            self.stats_label.setStyleSheet("")
+        
+        # Reset buffer progress bar
+        self.buffer_progress_bar.setValue(0)
+        
+        # Emit signal
+        self.signal_acquisition_finished.emit()
+    
+    def _on_acquisition_completed(self, success: bool = True, error_message: Optional[str] = None):
+        """
+        Handle acquisition completion (legacy method for direct calls).
+        
+        Args:
+            success: True if acquisition completed successfully, False if there was an error
+            error_message: Optional error message to display
+        """
+        from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+        
+        # Convert to status enum
+        if success:
+            status = AcquisitionCompletionStatus.COMPLETED_SUCCESS
+        else:
+            status = AcquisitionCompletionStatus.COMPLETED_ERROR
+        
+        self._on_acquisition_completed_from_controller(status, error_message)
     
     def update_statistics(self):
         """Update real-time statistics display."""
-        if not self._is_acquiring or not self._controller:
-            self.stats_label.setText("Not acquiring")
-            self.buffer_progress_bar.setValue(0)
+        # Only update if acquisition is active - stop updating when acquisition ends
+        if not self._is_acquiring:
             return
+        
+        if not self._controller:
+            return
+        
+        # Check completion status - if not in progress, acquisition has ended
+        # The callback should handle UI updates, but we check here as a safety net
+        try:
+            from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+            status = self._controller.completion_status
+            if status not in [AcquisitionCompletionStatus.IN_PROGRESS, AcquisitionCompletionStatus.NOT_STARTED]:
+                # Acquisition has completed - callback should have been called, but ensure UI is updated
+                if self._is_acquiring:  # Only update if we haven't already
+                    error_msg = self._controller.last_completion_error
+                    self._on_acquisition_completed_from_controller(status, error_msg)
+                return
+        except Exception:
+            pass  # Ignore errors checking controller state
         
         try:
             stats = self._controller.get_statistics()
@@ -12247,3 +12403,5 @@ class FastAcquisitionWidget(QWidget):
         
         except Exception as e:
             self._log.warning(f"Error updating statistics: {e}")
+            # On error, stop updating and show error message
+            self._on_acquisition_completed(success=False, error_message=f"Statistics error: {e}")

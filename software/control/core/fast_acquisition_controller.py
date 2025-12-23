@@ -12,7 +12,8 @@ This module coordinates all components of fast acquisition:
 import os
 import threading
 import time
-from typing import Optional, Dict
+from enum import Enum
+from typing import Optional, Dict, Callable
 import numpy as np
 from scipy import ndimage
 import squid.logging
@@ -23,6 +24,15 @@ from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.ni_daq import AbstractNIDAQ, NIDAQConfig, WaveformData, TriggerSource
 from control.ni_daq import generate_pulse_train
+
+
+class AcquisitionCompletionStatus(Enum):
+    """Status of acquisition completion."""
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED_SUCCESS = "completed_success"
+    COMPLETED_ERROR = "completed_error"
+    STOPPED_MANUAL = "stopped_manual"
 
 
 class FastAcquisitionController:
@@ -97,6 +107,11 @@ class FastAcquisitionController:
         self._frame_count = 0
         self._start_time = None
         self._stop_event = threading.Event()
+        
+        # Completion tracking
+        self._completion_status = AcquisitionCompletionStatus.NOT_STARTED
+        self._completion_error_message: Optional[str] = None
+        self._completion_callback: Optional[Callable[[AcquisitionCompletionStatus, Optional[str]], None]] = None
         
         # Statistics
         self._stats_lock = threading.Lock()
@@ -238,6 +253,8 @@ class FastAcquisitionController:
         self._frame_count = 0
         self._start_time = time.time()
         self._stop_event.clear()
+        self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
+        self._completion_error_message = None
         
         # Define frame callback for fast acquisition
         # Frame IDs and timestamps will be determined from DAQ synchronization
@@ -286,45 +303,76 @@ class FastAcquisitionController:
         self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
         self._log.info("Fast acquisition started with NI DAQ waveforms")
     
-    def stop_acquisition(self):
-        """Stop fast acquisition."""
+    def stop_acquisition(self, manual_stop: bool = False, error_message: Optional[str] = None):
+        """
+        Stop fast acquisition.
+        
+        Args:
+            manual_stop: If True, indicates this is a manual stop by user.
+                        If False, indicates automatic completion (e.g., frame limit reached).
+            error_message: Optional error message if stopping due to an error.
+        """
         if not self._is_acquiring:
             self._log.warning("Acquisition not running")
             return
         
-        self._log.info("Stopping fast acquisition...")
+        self._log.info(f"Stopping fast acquisition (manual={manual_stop}, error={error_message is not None})...")
         
         # Signal stop
         self._stop_event.set()
         self._is_acquiring = False
         
-        # Stop NI DAQ
-        self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
-        if self._ni_daq:
-            # Wait for completion and get data
-            self._ni_daq.wait_until_done(timeout_s=10.0)
-            self._daq_result = self._ni_daq.get_acquired_data()
+        completion_status = None
+        completion_error = error_message
+        
+        try:
+            # Stop NI DAQ
+            self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
+            if self._ni_daq:
+                # Wait for completion and get data
+                daq_success = self._ni_daq.wait_until_done(timeout_s=10.0)
+                if not daq_success and error_message is None:
+                    completion_error = "DAQ did not complete within timeout"
+                
+                self._daq_result = self._ni_daq.get_acquired_data()
 
-            self._log.info(f"DAQ result: {self._daq_result}")
-            # Detect frame edges from camera frame signal
-            if self._daq_result and len(self._daq_result.digital_input) > 0:
-                camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
-                if camera_signal is not None:
-                    self._frame_sample_indices = self._detect_frame_edges(camera_signal)
-                    self._log.info(f"Detected {len(self._frame_sample_indices)} frames from camera signal")
+                self._log.info(f"DAQ result: {self._daq_result}")
+                # Detect frame edges from camera frame signal
+                if self._daq_result and len(self._daq_result.digital_input) > 0:
+                    camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
+                    if camera_signal is not None:
+                        self._frame_sample_indices = self._detect_frame_edges(camera_signal)
+                        self._log.info(f"Detected {len(self._frame_sample_indices)} frames from camera signal")
+            
+            # Stop fast acquisition frame grabbing
+            if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'): 
+                self._camera.stop_fast_acquisition_frame_grabbing()
+            
+            # Stop frame writer (will flush remaining frames)
+            self._frame_writer.stop()
+            
+            # Save DAQ data and metadata
+            self._save_daq_data()
+            self._save_metadata()
+            
+            # Determine completion status
+            if completion_error:
+                completion_status = AcquisitionCompletionStatus.COMPLETED_ERROR
+            elif manual_stop:
+                completion_status = AcquisitionCompletionStatus.STOPPED_MANUAL
+            else:
+                completion_status = AcquisitionCompletionStatus.COMPLETED_SUCCESS
+            
+            self._log.info(f"Fast acquisition stopped: {completion_status.value}")
+            
+        except Exception as e:
+            self._log.error(f"Error during acquisition stop: {e}", exc_info=True)
+            completion_status = AcquisitionCompletionStatus.COMPLETED_ERROR
+            if not completion_error:
+                completion_error = str(e)
         
-        # Stop fast acquisition frame grabbing
-        if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'): 
-            self._camera.stop_fast_acquisition_frame_grabbing()
-        
-        # Stop frame writer (will flush remaining frames)
-        self._frame_writer.stop()
-        
-        # Save DAQ data and metadata
-        self._save_daq_data()
-        self._save_metadata()
-        
-        self._log.info("Fast acquisition stopped")
+        # Notify completion
+        self._notify_completion(completion_status, completion_error)
     
     def _detect_frame_edges(self, digital_signal: np.ndarray, edge_type: str = "rising") -> list:
         """
@@ -367,10 +415,19 @@ class FastAcquisitionController:
                 time.sleep(1)  # Check every 1 s
         except Exception as e:
             self._log.error(f"Error in monitor thread: {e}", exc_info=True)
+            # Stop with error
+            self._stop_event.set()
+            threading.Thread(
+                target=lambda: self.stop_acquisition(manual_stop=False, error_message=f"Monitor thread error: {e}"),
+                daemon=True
+            ).start()
         finally:
-            if self._stop_event.is_set():
-                # Stop acquisition on main thread
-                threading.Thread(target=self.stop_acquisition, daemon=True).start()
+            if self._stop_event.is_set() and self._is_acquiring:
+                # Stop acquisition automatically (not manual stop)
+                threading.Thread(
+                    target=lambda: self.stop_acquisition(manual_stop=False),
+                    daemon=True
+                ).start()
     
     def _save_daq_data(self):
         """Save DAQ waveform data to file."""
@@ -474,3 +531,59 @@ class FastAcquisitionController:
     def is_acquiring(self) -> bool:
         """Check if acquisition is running."""
         return self._is_acquiring
+    
+    def set_completion_callback(self, callback: Optional[Callable[[AcquisitionCompletionStatus, Optional[str]], None]]):
+        """
+        Set callback function to be called when acquisition completes.
+        
+        Args:
+            callback: Function that takes (status: AcquisitionCompletionStatus, error_message: Optional[str])
+                     Called when acquisition completes (success, error, or manual stop)
+        """
+        self._completion_callback = callback
+    
+    @property
+    def completion_status(self) -> AcquisitionCompletionStatus:
+        """
+        Get the completion status of the last acquisition.
+        
+        Returns:
+            AcquisitionCompletionStatus enum value indicating the status
+        """
+        return self._completion_status
+    
+    @property
+    def last_completion_error(self) -> Optional[str]:
+        """
+        Get the error message from the last acquisition, if any.
+        
+        Returns:
+            Error message string if last acquisition failed, None otherwise
+        """
+        return self._completion_error_message
+    
+    def was_last_acquisition_successful(self) -> bool:
+        """
+        Check if the last acquisition completed successfully.
+        
+        Returns:
+            True if last acquisition completed successfully, False otherwise
+        """
+        return self._completion_status == AcquisitionCompletionStatus.COMPLETED_SUCCESS
+    
+    def _notify_completion(self, status: AcquisitionCompletionStatus, error_message: Optional[str] = None):
+        """
+        Notify that acquisition has completed.
+        
+        Args:
+            status: Completion status
+            error_message: Optional error message if status indicates an error
+        """
+        self._completion_status = status
+        self._completion_error_message = error_message
+        
+        if self._completion_callback:
+            try:
+                self._completion_callback(status, error_message)
+            except Exception as e:
+                self._log.error(f"Error in completion callback: {e}", exc_info=True)
