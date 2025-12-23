@@ -107,6 +107,9 @@ class FastAcquisitionController:
         self._frame_count = 0
         self._start_time = None
         self._stop_event = threading.Event()
+        self._expected_duration_s: Optional[float] = None
+        self._timeout_s: Optional[float] = None
+        self._stop_called = False  # Flag to prevent duplicate stop_acquisition calls
         
         # Completion tracking
         self._completion_status = AcquisitionCompletionStatus.NOT_STARTED
@@ -135,7 +138,10 @@ class FastAcquisitionController:
                          sample_rate_hz: float = 10000.0,
                          ai_channels: Optional[list] = None,
                          di_lines: Optional[list] = None,
-                         acquisition_mode: Optional[CameraAcquisitionMode] = None):
+                         acquisition_mode: Optional[CameraAcquisitionMode] = None,
+                         waveforms: Optional[WaveformData] = None,
+                         trigger_dio_line: Optional[int] = None,
+                         camera_frame_dio_line: Optional[int] = None):
         """
         Start fast acquisition with preloaded NI DAQ waveforms.
         
@@ -148,6 +154,11 @@ class FastAcquisitionController:
             di_lines: Optional additional digital input lines to record
             acquisition_mode: Camera acquisition mode (HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST).
                             If None, defaults to HARDWARE_TRIGGER.
+            waveforms: Optional WaveformData from NIDAQWidget. If provided, uses these waveforms
+                      instead of generating a trigger pattern. Trigger pattern will be added if
+                      not already present in waveforms.
+            trigger_dio_line: Optional trigger line number (overrides default)
+            camera_frame_dio_line: Optional camera frame counter line number (overrides default)
         """
         if self._is_acquiring:
             self._log.warning("Acquisition already running")
@@ -170,33 +181,67 @@ class FastAcquisitionController:
             duration_s = num_frames / frame_rate_hz
             num_frames_estimate = num_frames
         
+        # Store expected duration and calculate timeout (expected duration + 10 seconds)
+        self._expected_duration_s = duration_s
+        self._timeout_s = duration_s + 10
+        self._log.info(f"Expected acquisition duration: {duration_s:.2f}s, timeout: {self._timeout_s:.2f}s")
+        
+        # Use provided trigger and camera frame lines, or fall back to defaults
+        if trigger_dio_line is not None:
+            self._trigger_dio_line = trigger_dio_line
+        if camera_frame_dio_line is not None:
+            self._camera_frame_dio_line = camera_frame_dio_line
+        
         n_samples_offset = 5
         samples_per_channel = int(sample_rate_hz * duration_s) + n_samples_offset
         
-        # Generate trigger waveform (pulse train on DIO 1)
-        frame_period_samples = int(sample_rate_hz / frame_rate_hz)
-        pulse_width_samples = 4
+        # Get waveforms from widget or generate trigger pattern
+        if waveforms is None:
+            # Generate trigger waveform (pulse train on DIO 1) - fallback for backward compatibility
+            frame_period_samples = int(sample_rate_hz / frame_rate_hz)
+            pulse_width_samples = 4
+            
+            trigger_pattern = generate_pulse_train(
+                pulse_width_samples=pulse_width_samples,
+                period_samples=frame_period_samples,
+                num_samples=samples_per_channel,
+                n_samples_offset=n_samples_offset,
+                inverted=False
+            )
+            
+            waveforms = WaveformData(
+                digital_output={self._trigger_dio_line: trigger_pattern}
+            )
+        else:
+            # Use waveforms from widget, but ensure trigger and camera frame lines are configured
+            # Add trigger pattern if not already present
         
-        trigger_pattern = generate_pulse_train(
-            pulse_width_samples=pulse_width_samples,
-            period_samples=frame_period_samples,
-            num_samples=samples_per_channel,
-            n_samples_offset=n_samples_offset,
-            inverted=False
-        )
-        
+            frame_period_samples = int(sample_rate_hz / frame_rate_hz)
+            pulse_width_samples = 4
+            trigger_pattern = generate_pulse_train(
+                pulse_width_samples=pulse_width_samples,
+                period_samples=frame_period_samples,
+                num_samples=samples_per_channel,
+                n_samples_offset=n_samples_offset,
+                inverted=False
+            )
+            waveforms.digital_output[self._trigger_dio_line] = trigger_pattern
+    
         # Set up NI DAQ configuration
         di_lines_to_record = [self._camera_frame_dio_line]
         if di_lines:
             di_lines_to_record.extend(di_lines)
         di_lines_to_record = list(set(di_lines_to_record))  # Remove duplicates
         
+        # Get DO lines from waveforms
+        do_lines_from_waveforms = list(waveforms.digital_output.keys())
+        
         config = NIDAQConfig(
             device_name=self._ni_daq.config.device_name,
             sample_rate_hz=sample_rate_hz,
             samples_per_channel=samples_per_channel,
             do_port="port0",
-            do_lines=[self._trigger_dio_line],
+            do_lines=do_lines_from_waveforms,
             di_port="port0",
             di_lines=di_lines_to_record,
             ai_channels=ai_channels or [],
@@ -204,13 +249,9 @@ class FastAcquisitionController:
             continuous=False,
         )
         
-        # Create waveform data
-        waveforms = WaveformData(
-            digital_output={self._trigger_dio_line: trigger_pattern}
-        )
-        
         # Configure and arm NI DAQ
         self._ni_daq.configure(config)
+        # Set waveforms (includes both user-configured and trigger patterns)
         self._ni_daq.set_waveforms(waveforms)
         self._ni_daq.arm()
         
@@ -253,6 +294,7 @@ class FastAcquisitionController:
         self._frame_count = 0
         self._start_time = time.time()
         self._stop_event.clear()
+        self._stop_called = False
         self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
         self._completion_error_message = None
         
@@ -316,6 +358,13 @@ class FastAcquisitionController:
             self._log.warning("Acquisition not running")
             return
         
+        # Prevent duplicate calls
+        if self._stop_called:
+            self._log.debug("stop_acquisition already called, ignoring duplicate call")
+            return
+        
+        self._stop_called = True
+        
         self._log.info(f"Stopping fast acquisition (manual={manual_stop}, error={error_message is not None})...")
         
         # Signal stop
@@ -327,16 +376,16 @@ class FastAcquisitionController:
         
         try:
             # Stop NI DAQ
-            self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
             if self._ni_daq:
                 # Wait for completion and get data
-                daq_success = self._ni_daq.wait_until_done(timeout_s=10.0)
+                # Use expected duration + buffer for timeout (same as acquisition timeout)
+                timeout_s = self._timeout_s if self._timeout_s is not None else 10.0
+                daq_success = self._ni_daq.wait_until_done(timeout_s=timeout_s)
                 if not daq_success and error_message is None:
-                    completion_error = "DAQ did not complete within timeout"
+                    completion_error = f"DAQ did not complete within timeout ({timeout_s:.2f}s)"
                 
                 self._daq_result = self._ni_daq.get_acquired_data()
 
-                self._log.info(f"DAQ result: {self._daq_result}")
                 # Detect frame edges from camera frame signal
                 if self._daq_result and len(self._daq_result.digital_input) > 0:
                     camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
@@ -403,9 +452,24 @@ class FastAcquisitionController:
         return edges.tolist()
     
     def _monitor_acquisition(self, num_frames: Optional[int]):
-        """Monitor acquisition and stop when frame limit is reached or stop event is set."""
+        """Monitor acquisition and stop when frame limit is reached, timeout occurs, or stop event is set."""
         try:
             while not self._stop_event.is_set() and self._is_acquiring:
+                # Check timeout
+                if self._timeout_s is not None and self._start_time is not None:
+                    elapsed_time = time.time() - self._start_time
+                    if elapsed_time >= self._timeout_s:
+                        timeout_message = (
+                            f"Acquisition timeout reached: {elapsed_time:.2f}s >= {self._timeout_s:.2f}s "
+                            f"(expected duration: {self._expected_duration_s:.2f}s + 15s buffer). "
+                            f"Frames acquired: {self._frame_count}"
+                        )
+                        self._log.error(timeout_message)
+                        self._stop_event.set()
+                        # Stop with error
+                        self.stop_acquisition(manual_stop=False, error_message=timeout_message)
+                        break
+                
                 # Check frame limit
                 if num_frames is not None and self._frame_count >= num_frames:
                     self._log.info(f"Reached frame limit ({num_frames}), stopping acquisition")
@@ -417,17 +481,15 @@ class FastAcquisitionController:
             self._log.error(f"Error in monitor thread: {e}", exc_info=True)
             # Stop with error
             self._stop_event.set()
-            threading.Thread(
-                target=lambda: self.stop_acquisition(manual_stop=False, error_message=f"Monitor thread error: {e}"),
-                daemon=True
-            ).start()
+            self.stop_acquisition(manual_stop=False, error_message=f"Monitor thread error: {e}")
         finally:
-            if self._stop_event.is_set() and self._is_acquiring:
-                # Stop acquisition automatically (not manual stop)
-                threading.Thread(
-                    target=lambda: self.stop_acquisition(manual_stop=False),
-                    daemon=True
-                ).start()
+            # Only call stop_acquisition if stop event is set but stop hasn't been called yet
+            # This handles the normal completion case (frame limit reached)
+            # Note: If timeout or error occurred, stop_acquisition was already called above,
+            # which sets _stop_called = True, so this condition will be False
+            if self._stop_event.is_set() and not self._stop_called:
+                # Stop acquisition automatically (not manual stop) - normal completion
+                self.stop_acquisition(manual_stop=False)
     
     def _save_daq_data(self):
         """Save DAQ waveform data to file."""

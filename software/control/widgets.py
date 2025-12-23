@@ -11402,6 +11402,94 @@ class NIDAQWidget(QWidget):
         self.fig.tight_layout()
         self.canvas.draw()
     
+    def get_waveforms(self) -> 'WaveformData':
+        """
+        Get current waveforms configured in the widget.
+        
+        Returns:
+            WaveformData object with analog_output and digital_output dictionaries
+        """
+        from control.ni_daq import WaveformData
+        return WaveformData(
+            analog_output=self._ao_waveforms.copy(),
+            digital_output=self._do_patterns.copy()
+        )
+    
+    def get_config(self) -> 'NIDAQConfig':
+        """
+        Get current configuration from the widget.
+        
+        Returns:
+            NIDAQConfig object with current settings
+        """
+        self._update_config()
+        return self._config
+    
+    def update_waveforms_for_duration(self, new_duration_s: float, sample_rate_hz: float):
+        """
+        Update all waveforms to match a new duration by cropping or extending with zeros.
+        
+        Args:
+            new_duration_s: New duration in seconds
+            sample_rate_hz: Sample rate in Hz
+        """
+        new_num_samples = int(sample_rate_hz * new_duration_s)
+        
+        # Update analog output waveforms
+        for channel in list(self._ao_waveforms.keys()):
+            old_waveform = self._ao_waveforms[channel]
+            if len(old_waveform) > new_num_samples:
+                # Crop
+                self._ao_waveforms[channel] = old_waveform[:new_num_samples]
+            elif len(old_waveform) < new_num_samples:
+                # Extend with zeros
+                extended = np.zeros(new_num_samples, dtype=old_waveform.dtype)
+                extended[:len(old_waveform)] = old_waveform
+                self._ao_waveforms[channel] = extended
+        
+        # Update digital output patterns
+        for line in list(self._do_patterns.keys()):
+            old_pattern = self._do_patterns[line]
+            if len(old_pattern) > new_num_samples:
+                # Crop
+                self._do_patterns[line] = old_pattern[:new_num_samples]
+            elif len(old_pattern) < new_num_samples:
+                # Extend with zeros
+                extended = np.zeros(new_num_samples, dtype=old_pattern.dtype)
+                extended[:len(old_pattern)] = old_pattern
+                self._do_patterns[line] = extended
+        
+        # Update config samples_per_channel
+        self._config.samples_per_channel = new_num_samples
+        
+        # Update waveform plot
+        self._update_waveform_plot()
+    
+    def is_line_configured(self, line: int, is_digital: bool = True) -> bool:
+        """
+        Check if an output or input line has a configured pattern.
+        
+        Args:
+            line: Line number to check
+            is_digital: If True, check digital output and input; if False, check analog output (by channel name)
+            
+        Returns:
+            True if line/channel has a configured waveform/pattern or is configured as an input
+        """
+        if is_digital:
+            # Check if line is configured as digital output (has a pattern)
+            if line in self._do_patterns:
+                return True
+            # Check if line is configured as digital input
+            # Update config first to ensure di_lines is current
+            self._update_config()
+            if line in self._config.di_lines:
+                return True
+            return False
+        else:
+            # For analog, line is actually a channel name string
+            return str(line) in self._ao_waveforms
+    
     def arm_tasks(self):
         """Arm the DAQ tasks for triggered acquisition."""
         if self._ni_daq is None:
@@ -11464,6 +11552,7 @@ class NIDAQWidget(QWidget):
             return
         
         timeout = (self._config.samples_per_channel / self._config.sample_rate_hz) + 5.0
+        self._log.info(f"Waiting for tasks to complete (timeout={timeout}s)...")
         success = self._ni_daq.wait_until_done(timeout)
         self._log.info(f"Acquisition completed: {success}")
         
@@ -11997,10 +12086,7 @@ class FastAcquisitionWidget(QWidget):
         self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
         daq_layout.addWidget(self.daq_sample_rate_spinbox, 2, 1)
         
-        self.enable_daq_checkbox = QCheckBox("Record analog input waveforms")
-        self.enable_daq_checkbox.setEnabled(self.ni_daq_widget is not None)
-        self.enable_daq_checkbox.setToolTip("Record analog input channels (configure in NI DAQ widget)")
-        daq_layout.addWidget(self.enable_daq_checkbox, 3, 0, 1, 2)
+        # Note: Analog input configuration is done in the NI DAQ tab
         
         daq_group.setLayout(daq_layout)
         main_layout.addWidget(daq_group)
@@ -12143,6 +12229,14 @@ class FastAcquisitionWidget(QWidget):
             total_time_s = num_frames / frame_rate_hz
             self.total_time_spinbox.setValue(total_time_s)
             
+            # Update waveforms in NI DAQ widget if available
+            if self.ni_daq_widget and not self._is_acquiring:
+                try:
+                    sample_rate_hz = self.daq_sample_rate_spinbox.value()
+                    self.ni_daq_widget.update_waveforms_for_duration(total_time_s, sample_rate_hz)
+                except Exception as e:
+                    self._log.warning(f"Failed to update NI DAQ waveforms: {e}")
+            
         except Exception as e:
             self._log.warning(f"Failed to update acquisition time from frames: {e}")
         finally:
@@ -12171,6 +12265,14 @@ class FastAcquisitionWidget(QWidget):
             
             # Update the spinbox
             self.num_frames_spinbox.setValue(num_frames)
+            
+            # Update waveforms in NI DAQ widget if available
+            if self.ni_daq_widget and not self._is_acquiring:
+                try:
+                    sample_rate_hz = self.daq_sample_rate_spinbox.value()
+                    self.ni_daq_widget.update_waveforms_for_duration(total_time_s, sample_rate_hz)
+                except Exception as e:
+                    self._log.warning(f"Failed to update NI DAQ waveforms: {e}")
             
         except Exception as e:
             self._log.warning(f"Failed to update frames from acquisition time: {e}")
@@ -12217,15 +12319,62 @@ class FastAcquisitionWidget(QWidget):
             error_dialog("NI DAQ not available. Please configure NI DAQ first.", "Configuration Error")
             return
         
+        # Get trigger and camera frame lines
+        trigger_dio_line = self.trigger_dio_line_spinbox.value()
+        camera_frame_dio_line = self.camera_dio_line_spinbox.value()
+        
+        # Check for line conflicts - this must be done FIRST before any other changes
+        ni_daq_widget = self.ni_daq_widget
+        conflicts = []
+        if ni_daq_widget.is_line_configured(trigger_dio_line, is_digital=True):
+            conflicts.append(f"Digital output line {trigger_dio_line} (trigger)")
+        if ni_daq_widget.is_line_configured(camera_frame_dio_line, is_digital=True):
+            conflicts.append(f"Digital input line {camera_frame_dio_line} (camera frame counter)")
+        
+        if conflicts:
+            conflict_msg = (
+                f"The following lines are already configured in the NI DAQ tab:\n\n"
+                + "\n".join(f"  - {c}" for c in conflicts)
+                + "\n\n"
+                f"Fast acquisition will overwrite these configurations.\n"
+                f"Continue anyway?"
+            )
+            reply = QMessageBox.warning(
+                self,
+                "Line Configuration Conflict",
+                conflict_msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+        
         try:
             ni_daq = self.ni_daq_widget._ni_daq
             
-            # Get analog input channels from NI DAQ widget if enabled
-            ai_channels = None
-            if self.enable_daq_checkbox.isChecked():
-                # Try to get AI channels from NI DAQ widget config
-                if hasattr(self.ni_daq_widget, '_config'):
-                    ai_channels = self.ni_daq_widget._config.ai_channels
+            # Get configuration and waveforms from NI DAQ widget
+            ni_daq_config = ni_daq_widget.get_config()
+            ni_daq_waveforms = ni_daq_widget.get_waveforms()
+            
+            # Get analog input channels from NI DAQ widget config
+            ai_channels = ni_daq_config.ai_channels if ni_daq_config.ai_channels else None
+            
+            # Calculate acquisition duration
+            num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
+            frame_rate_hz = self.frame_rate_spinbox.value()
+            sample_rate_hz = self.daq_sample_rate_spinbox.value()
+            
+            if num_frames is None:
+                duration_s = 1  # Continuous mode
+            else:
+                duration_s = num_frames / frame_rate_hz
+            
+            # Update waveforms in NI DAQ widget to match acquisition duration
+            # This will crop/extend waveforms and update the display
+            ni_daq_widget.update_waveforms_for_duration(duration_s, sample_rate_hz)
+            
+            # Get updated waveforms after duration update
+            ni_daq_waveforms = ni_daq_widget.get_waveforms()
             
             # Determine acquisition mode
             trigger_mode_text = self.trigger_mode_combo.currentText()
@@ -12260,16 +12409,17 @@ class FastAcquisitionWidget(QWidget):
             self._controller.set_completion_callback(on_acquisition_completed)
             
             # Start acquisition
-            num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
             self._controller.start_acquisition(
                 num_frames=num_frames,
-                frame_rate_hz=self.frame_rate_spinbox.value(),
+                frame_rate_hz=frame_rate_hz,
                 exposure_time_ms=self.exposure_time_spinbox.value(),
-                sample_rate_hz=self.daq_sample_rate_spinbox.value(),
+                sample_rate_hz=sample_rate_hz,
                 ai_channels=ai_channels,
-                acquisition_mode=acquisition_mode
+                acquisition_mode=acquisition_mode,
+                waveforms=ni_daq_waveforms,
+                trigger_dio_line=trigger_dio_line,
+                camera_frame_dio_line=camera_frame_dio_line
             )
-            self.ni_daq_widget.start_completion_listener()
             
             # Update UI
             self._is_acquiring = True

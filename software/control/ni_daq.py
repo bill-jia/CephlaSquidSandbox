@@ -335,7 +335,7 @@ class NIDAQ(AbstractNIDAQ):
         with self._lock:
             if not self._is_running:
                 return True
-            
+            self._log.info(f"Waiting for tasks to complete (timeout={timeout_s}s)...")
             try:
                 # Wait for master task to complete
                 if self._ao_task is not None:

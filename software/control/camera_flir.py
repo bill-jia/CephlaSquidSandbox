@@ -1188,12 +1188,9 @@ class FLIRCamera(AbstractCamera):
         
         # Signal thread to stop
         self._fast_acquisition_thread_keep_running.clear()
-        self._log.info("Fast acquisition thread keep running signal cleared")
-        
         # Wait for thread to finish
         if self._fast_acquisition_thread.is_alive():
             # Abort acquisition to wake up GetNextImage if it's blocking
-            self._log.info("Aborting camera acquisition...")
             try:
                 if self._camera.IsStreaming():
                     self._camera.EndAcquisition()
@@ -1202,7 +1199,6 @@ class FLIRCamera(AbstractCamera):
                 self._log.warning(f"Failed to abort camera: {e}")
             
             self._fast_acquisition_thread.join(timeout=2.0)
-            self._log.info("Fast acquisition thread joined")
             if self._fast_acquisition_thread.is_alive():
                 self._log.warning("Fast acquisition thread refused to exit!")
         
