@@ -245,7 +245,7 @@ class FastAcquisitionController:
             di_port="port0",
             di_lines=di_lines_to_record,
             ai_channels=ai_channels or [],
-            trigger_source=TriggerSource.SOFTWARE,
+            trigger_source=self._ni_daq.config.trigger_source,
             continuous=False,
         )
         

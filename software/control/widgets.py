@@ -4,7 +4,8 @@ import yaml
 import logging
 import sys
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+from dataclasses import dataclass
 
 import squid.logging
 from control.core.core import TrackingController, LiveController
@@ -11088,14 +11089,15 @@ class NIDAQWidget(QWidget):
         trigger_source_row = QHBoxLayout()
         trigger_source_row.addWidget(QLabel("Trigger Source:"))
         self.trigger_source_combo = QComboBox()
-        self.trigger_source_combo.addItems(["Software", "External"])
+        # Support Software, External (PFI), and Internal (from master task start trigger)
+        self.trigger_source_combo.addItems(["Internal", "External", "Software"])
         self.trigger_source_combo.currentTextChanged.connect(self.on_config_changed)
         trigger_source_row.addWidget(self.trigger_source_combo)
         trigger_layout.addLayout(trigger_source_row)
         
         trigger_terminal_row = QHBoxLayout()
         trigger_terminal_row.addWidget(QLabel("External Terminal:"))
-        self.trigger_terminal_edit = QLineEdit("/Dev1/PFI0")
+        self.trigger_terminal_edit = QLineEdit("/Dev1/PFI2")
         self.trigger_terminal_edit.textChanged.connect(self.on_config_changed)
         trigger_terminal_row.addWidget(self.trigger_terminal_edit)
         trigger_layout.addLayout(trigger_terminal_row)
@@ -11288,7 +11290,7 @@ class NIDAQWidget(QWidget):
                 self.ai_channels_list.addItem(ch_name)
             
             # Update trigger terminal default
-            self.trigger_terminal_edit.setText(f"/{device_name}/PFI0")
+            self.trigger_terminal_edit.setText(f"/{device_name}/PFI2")
     
     def on_config_changed(self):
         """Handle configuration changes."""
@@ -11308,10 +11310,20 @@ class NIDAQWidget(QWidget):
         self._config.external_trigger_terminal = self.trigger_terminal_edit.text()
         
         # Trigger source
-        if self.trigger_source_combo.currentText() == "Software":
+        src_text = self.trigger_source_combo.currentText()
+        if src_text == "Software":
             self._config.trigger_source = TriggerSource.SOFTWARE
-        else:
+        elif src_text == "External":
             self._config.trigger_source = TriggerSource.EXTERNAL
+            # If terminal is empty, default to PFI2 on the selected device
+            if not self._config.external_trigger_terminal:
+                device = self._config.device_name or self.device_combo.currentText()
+                if device:
+                    self._config.external_trigger_terminal = f"/{device}/PFI2"
+                    self.trigger_terminal_edit.setText(self._config.external_trigger_terminal)
+        else:
+            # "Internal" option: use internal start trigger routing (master AO/DO/DI)
+            self._config.trigger_source = TriggerSource.INTERNAL
         
         # Trigger edge
         if self.trigger_edge_combo.currentText() == "Rising":
@@ -11886,6 +11898,20 @@ class DOPatternDialog(QDialog):
             return line, np.zeros(self.num_samples, dtype=bool)
 
 
+@dataclass
+class CameraState:
+    """Stores camera state for restoration after fast acquisition."""
+    acquisition_mode: CameraAcquisitionMode
+    exposure_time_ms: float
+    pixel_format: CameraPixelFormat
+    binning_x: int
+    binning_y: int
+    roi_offset_x: int
+    roi_offset_y: int
+    roi_width: int
+    roi_height: int
+
+
 class FastAcquisitionWidget(QWidget):
     """
     Widget for controlling fast acquisition mode.
@@ -11924,6 +11950,7 @@ class FastAcquisitionWidget(QWidget):
         # State
         self._is_acquiring = False
         self._updating_acquisition_params = False  # Flag to prevent circular updates
+        self._camera_state_before_acquisition: Optional[CameraState] = None  # Store camera state before fast acquisition
         
         # Initialize UI
         self.init_ui()
@@ -12285,6 +12312,33 @@ class FastAcquisitionWidget(QWidget):
             self._log.warning("Acquisition already running")
             return
         
+        # Store camera state before fast acquisition
+        try:
+            acquisition_mode = self.camera.get_acquisition_mode()
+            exposure_time_ms = self.camera.get_exposure_time()
+            pixel_format = self.camera.get_pixel_format()
+            binning_x, binning_y = self.camera.get_binning()
+            roi_offset_x, roi_offset_y, roi_width, roi_height = self.camera.get_region_of_interest()
+            
+            self._camera_state_before_acquisition = CameraState(
+                acquisition_mode=acquisition_mode,
+                exposure_time_ms=exposure_time_ms,
+                pixel_format=pixel_format,
+                binning_x=binning_x,
+                binning_y=binning_y,
+                roi_offset_x=roi_offset_x,
+                roi_offset_y=roi_offset_y,
+                roi_width=roi_width,
+                roi_height=roi_height
+            )
+            self._log.info(f"Stored camera state before fast acquisition: "
+                          f"mode={acquisition_mode.value}, exposure={exposure_time_ms}ms, "
+                          f"pixel_format={pixel_format.value}, binning=({binning_x},{binning_y}), "
+                          f"roi=({roi_offset_x},{roi_offset_y},{roi_width},{roi_height})")
+        except Exception as e:
+            self._log.warning(f"Could not store camera state before fast acquisition: {e}", exc_info=True)
+            self._camera_state_before_acquisition = None
+        
         # Stop live view if running
         if self.live_controller and self.live_controller.is_live:
             self._log.info("Stopping live view for fast acquisition")
@@ -12494,8 +12548,93 @@ class FastAcquisitionWidget(QWidget):
         # Reset buffer progress bar
         self.buffer_progress_bar.setValue(0)
         
+        # Restore camera state to original configuration
+        self._restore_camera_state()
+        
         # Emit signal
         self.signal_acquisition_finished.emit()
+    
+    def _restore_camera_state(self):
+        """
+        Restore camera state to original configuration before fast acquisition.
+        
+        Restores:
+        - Acquisition mode
+        - Exposure time
+        - Pixel format
+        - Binning
+        - ROI
+        """
+        if not self._camera_state_before_acquisition:
+            self._log.warning("No camera state saved, cannot restore")
+            return
+        
+        state = self._camera_state_before_acquisition
+        self._log.info("Restoring camera state to original configuration")
+        
+        try:
+            # Restore acquisition mode
+            try:
+                current_mode = self.camera.get_acquisition_mode()
+                if current_mode != state.acquisition_mode:
+                    self._log.info(f"Restoring acquisition mode from {current_mode.value} to {state.acquisition_mode.value}")
+                    self.camera.set_acquisition_mode(state.acquisition_mode)
+                else:
+                    self._log.debug(f"Acquisition mode already correct: {state.acquisition_mode.value}")
+            except Exception as e:
+                self._log.error(f"Failed to restore acquisition mode: {e}", exc_info=True)
+            
+            # Restore exposure time
+            try:
+                current_exposure = self.camera.get_exposure_time()
+                if abs(current_exposure - state.exposure_time_ms) > 0.01:  # Tolerance for floating point
+                    self._log.info(f"Restoring exposure time from {current_exposure}ms to {state.exposure_time_ms}ms")
+                    self.camera.set_exposure_time(state.exposure_time_ms)
+                else:
+                    self._log.debug(f"Exposure time already correct: {state.exposure_time_ms}ms")
+            except Exception as e:
+                self._log.error(f"Failed to restore exposure time: {e}", exc_info=True)
+            
+            # Restore pixel format
+            try:
+                current_pixel_format = self.camera.get_pixel_format()
+                if current_pixel_format != state.pixel_format:
+                    self._log.info(f"Restoring pixel format from {current_pixel_format.value} to {state.pixel_format.value}")
+                    self.camera.set_pixel_format(state.pixel_format)
+                else:
+                    self._log.debug(f"Pixel format already correct: {state.pixel_format.value}")
+            except Exception as e:
+                self._log.error(f"Failed to restore pixel format: {e}", exc_info=True)
+            
+            # Restore binning
+            try:
+                current_binning_x, current_binning_y = self.camera.get_binning()
+                if current_binning_x != state.binning_x or current_binning_y != state.binning_y:
+                    self._log.info(f"Restoring binning from ({current_binning_x},{current_binning_y}) to ({state.binning_x},{state.binning_y})")
+                    self.camera.set_binning(state.binning_x, state.binning_y)
+                else:
+                    self._log.debug(f"Binning already correct: ({state.binning_x},{state.binning_y})")
+            except Exception as e:
+                self._log.error(f"Failed to restore binning: {e}", exc_info=True)
+            
+            # Restore ROI
+            try:
+                current_roi = self.camera.get_region_of_interest()
+                if (current_roi[0] != state.roi_offset_x or current_roi[1] != state.roi_offset_y or
+                    current_roi[2] != state.roi_width or current_roi[3] != state.roi_height):
+                    self._log.info(f"Restoring ROI from ({current_roi[0]},{current_roi[1]},{current_roi[2]},{current_roi[3]}) "
+                                 f"to ({state.roi_offset_x},{state.roi_offset_y},{state.roi_width},{state.roi_height})")
+                    self.camera.set_region_of_interest(state.roi_offset_x, state.roi_offset_y, 
+                                                      state.roi_width, state.roi_height)
+                else:
+                    self._log.debug(f"ROI already correct: ({state.roi_offset_x},{state.roi_offset_y},{state.roi_width},{state.roi_height})")
+            except Exception as e:
+                self._log.error(f"Failed to restore ROI: {e}", exc_info=True)
+            
+            self._log.info("Camera state restoration completed successfully")
+            
+        except Exception as e:
+            self._log.error(f"Error during camera state restoration: {e}", exc_info=True)
     
     def _on_acquisition_completed(self, success: bool = True, error_message: Optional[str] = None):
         """

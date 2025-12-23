@@ -310,12 +310,11 @@ class NIDAQ(AbstractNIDAQ):
         with self._lock:
             if not self._is_armed:
                 raise RuntimeError("Tasks must be armed before triggering")
-            
-            if self._config.trigger_source != TriggerSource.SOFTWARE:
-                self._log.warning(
-                    f"Trigger source is {self._config.trigger_source}, "
-                    "software trigger may not work as expected"
-                )
+            if self._config.trigger_source == TriggerSource.INTERNAL:
+                master_task = self._ao_task if self._ao_task is not None else self._do_task if self._do_task is not None else self._di_task
+                self._log.info(f"Using internal start trigger from {master_task.name}")
+            else:
+                self._log.info(f"Starting trigger with source {self._config.trigger_source}")
             
             # Start tasks in order: AI/DI first (if slaves), then DO, then AO (master)
             if self._ai_task is not None:
@@ -526,9 +525,10 @@ class NIDAQ(AbstractNIDAQ):
         else:
             sample_mode = constants.AcquisitionType.FINITE
         
-        # Determine the master task clock source
-        # AO will be master, others will use AO's sample clock
+        # Determine the master task clock and start trigger sources
+        # AO will be master, others will use AO's sample clock and (optionally) AO's start trigger
         ao_clock_terminal = f"/{device}/ao/SampleClock"
+        ao_start_terminal = f"/{device}/ao/StartTrigger"
         
         # Set up Analog Output task (master clock source)
         if len(self._config.ao_channels) > 0 and self._waveforms is not None:
@@ -596,16 +596,26 @@ class NIDAQ(AbstractNIDAQ):
                     sample_mode=sample_mode,
                     samps_per_chan=num_samples
                 )
-                
-                # Configure trigger if external and no AO task
-                if self._config.trigger_source == TriggerSource.EXTERNAL:
-                    edge = (constants.Edge.RISING 
-                           if self._config.trigger_edge == TriggerEdge.RISING 
-                           else constants.Edge.FALLING)
-                    self._do_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-                        trigger_source=self._config.external_trigger_terminal,
-                        trigger_edge=edge
-                    )
+
+            # Configure start trigger behavior
+            # - EXTERNAL: start from external terminal (when there is no AO master)
+            # - INTERNAL: optionally start from AO start trigger when AO is master
+            if self._config.trigger_source == TriggerSource.EXTERNAL and self._ao_task is None:
+                edge = (
+                    constants.Edge.RISING
+                    if self._config.trigger_edge == TriggerEdge.RISING
+                    else constants.Edge.FALLING
+                )
+                self._do_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source=self._config.external_trigger_terminal,
+                    trigger_edge=edge,
+                )
+            elif self._config.trigger_source == TriggerSource.INTERNAL and self._ao_task is not None:
+                # Use AO start trigger as internal start trigger for DO
+                self._do_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source=ao_start_terminal,
+                    trigger_edge=constants.Edge.RISING,
+                )
             
             # Build DO data array
             do_data = []
@@ -652,15 +662,33 @@ class NIDAQ(AbstractNIDAQ):
                     sample_mode=sample_mode,
                     samps_per_chan=num_samples
                 )
-                
-                # Configure trigger if external
-                if self._config.trigger_source == TriggerSource.EXTERNAL:
-                    edge = (constants.Edge.RISING 
-                           if self._config.trigger_edge == TriggerEdge.RISING 
-                           else constants.Edge.FALLING)
+
+            # Configure start trigger behavior
+            # - EXTERNAL: DI-only or DI+AI only case, use external terminal
+            # - INTERNAL: when AO (preferred) or DO exists, use its start trigger
+            if self._config.trigger_source == TriggerSource.EXTERNAL and self._ao_task is None and self._do_task is None:
+                edge = (
+                    constants.Edge.RISING
+                    if self._config.trigger_edge == TriggerEdge.RISING
+                    else constants.Edge.FALLING
+                )
+                self._di_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source=self._config.external_trigger_terminal,
+                    trigger_edge=edge,
+                )
+            elif self._config.trigger_source == TriggerSource.INTERNAL:
+                if self._ao_task is not None:
+                    # Use AO start trigger as internal start trigger for DI
                     self._di_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-                        trigger_source=self._config.external_trigger_terminal,
-                        trigger_edge=edge
+                        trigger_source=ao_start_terminal,
+                        trigger_edge=constants.Edge.RISING,
+                    )
+                elif self._do_task is not None:
+                    # Fall back to DO start trigger if AO is not present
+                    do_start_terminal = f"/{device}/do/StartTrigger"
+                    self._di_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                        trigger_source=do_start_terminal,
+                        trigger_edge=constants.Edge.RISING,
                     )
         
         # Set up Analog Input task
@@ -719,15 +747,40 @@ class NIDAQ(AbstractNIDAQ):
                     sample_mode=sample_mode,
                     samps_per_chan=num_samples
                 )
-                
-                # Configure trigger if external
-                if self._config.trigger_source == TriggerSource.EXTERNAL:
-                    edge = (constants.Edge.RISING 
-                           if self._config.trigger_edge == TriggerEdge.RISING 
-                           else constants.Edge.FALLING)
+
+            # Configure start trigger behavior
+            # - EXTERNAL: AI-only or AI+DI only case, use external terminal
+            # - INTERNAL: when AO (preferred), DO, or DI exists, use its start trigger
+            if self._config.trigger_source == TriggerSource.EXTERNAL and self._ao_task is None and self._do_task is None and self._di_task is None:
+                edge = (
+                    constants.Edge.RISING
+                    if self._config.trigger_edge == TriggerEdge.RISING
+                    else constants.Edge.FALLING
+                )
+                self._ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                    trigger_source=self._config.external_trigger_terminal,
+                    trigger_edge=edge,
+                )
+            elif self._config.trigger_source == TriggerSource.INTERNAL:
+                if self._ao_task is not None:
+                    # Use AO start trigger as internal start trigger for AI
                     self._ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
-                        trigger_source=self._config.external_trigger_terminal,
-                        trigger_edge=edge
+                        trigger_source=ao_start_terminal,
+                        trigger_edge=constants.Edge.RISING,
+                    )
+                elif self._do_task is not None:
+                    # Fall back to DO start trigger if AO is not present
+                    do_start_terminal = f"/{device}/do/StartTrigger"
+                    self._ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                        trigger_source=do_start_terminal,
+                        trigger_edge=constants.Edge.RISING,
+                    )
+                elif self._di_task is not None:
+                    # Fall back to DI start trigger if AO/DO are not present
+                    di_start_terminal = f"/{device}/di/StartTrigger"
+                    self._ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                        trigger_source=di_start_terminal,
+                        trigger_edge=constants.Edge.RISING,
                     )
 
 
