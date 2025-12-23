@@ -76,7 +76,7 @@ class FastAcquisitionController:
         roi = camera.get_region_of_interest()
         frame_shape = (roi[3], roi[2])  # (height, width)
         pixel_format = camera.get_pixel_format()
-        
+
         # Determine dtype from pixel format
         dtype_map = {
             "MONO8": np.uint8,
@@ -86,7 +86,11 @@ class FastAcquisitionController:
             "MONO16": np.uint16,
         }
         dtype = dtype_map.get(pixel_format.name, np.uint16)
-        
+
+        # Store imaging geometry and dtype for later use (e.g. raw->TIFF stack)
+        self._frame_shape = frame_shape
+        self._dtype = dtype
+
         # Initialize frame buffer
         self._frame_buffer = FastAcquisitionFrameBuffer(
             buffer_size=buffer_size,
@@ -403,6 +407,12 @@ class FastAcquisitionController:
             # Save DAQ data and metadata
             self._save_daq_data()
             self._save_metadata()
+
+            # For TIFF mode, kick off a background conversion that turns the
+            # raw bytestream written by the frame writer into a 3D TIFF stack.
+            # This runs after acquisition so it doesn't block frame capture.
+            if getattr(self._frame_writer, "_file_format", "").lower() == "tiff":
+                self._start_tiff_stack_conversion_thread()
             
             # Determine completion status
             if completion_error:
@@ -545,6 +555,8 @@ class FastAcquisitionController:
             "camera_frame_dio_line": self._camera_frame_dio_line,
             "buffer_size": self._frame_buffer.get_buffer_status()["buffer_size"],
             "file_format": self._frame_writer._file_format,
+            "frame_shape_hw": list(self._frame_shape) if hasattr(self, "_frame_shape") else None,
+            "dtype": str(self._dtype) if hasattr(self, "_dtype") else None,
         }
         
         # Add camera settings
@@ -570,6 +582,112 @@ class FastAcquisitionController:
             json.dump(metadata, f, indent=2)
         
         self._log.info(f"Saved metadata to {metadata_path}")
+
+    def _start_tiff_stack_conversion_thread(self):
+        """
+        Start a background thread that converts the raw bytestream written
+        during acquisition into a 3D TIFF stack.
+
+        This is intentionally decoupled from the acquisition so that heavy I/O
+        and compression do not interfere with frame capture.
+        """
+
+        def _worker():
+            try:
+                self._convert_raw_to_tiff_stack()
+            except Exception as e:
+                self._log.error(f"Error converting raw frames to TIFF stack: {e}", exc_info=True)
+
+        t = threading.Thread(target=_worker, name="FastAcq-TIFF-Conversion", daemon=True)
+        t.start()
+
+    def _convert_raw_to_tiff_stack(self):
+        """
+        Convert the raw bytestream file produced by FastAcquisitionWriter
+        (TIFF mode) into a single 3D TIFF stack.
+        """
+        import os
+        import imageio as iio
+
+        # Raw file is written by FastAcquisitionWriter in frames/frames.raw
+        raw_path = os.path.join(self._output_path, "frames", "frames.raw")
+        if not os.path.exists(raw_path):
+            self._log.warning(f"Raw frame file not found at {raw_path}, skipping TIFF stack conversion")
+            return
+
+        if not hasattr(self, "_frame_shape") or not hasattr(self, "_dtype"):
+            self._log.error("Frame shape or dtype not available, cannot convert raw data to TIFF stack")
+            return
+
+        height, width = self._frame_shape
+        dtype = self._dtype
+
+        # Compute expected bytes per frame
+        pixels_per_frame = int(height * width)
+        bytes_per_pixel = np.dtype(dtype).itemsize
+        bytes_per_frame = pixels_per_frame * bytes_per_pixel
+
+        file_size = os.path.getsize(raw_path)
+        if bytes_per_frame == 0:
+            self._log.error("Computed bytes per frame is zero, cannot convert raw data")
+            return
+
+        # Use the smaller of: frame_count and file_size-derived frame count
+        max_frames_from_file = file_size // bytes_per_frame
+        n_frames = min(self._frame_count, max_frames_from_file)
+
+        if n_frames <= 0:
+            self._log.warning(
+                f"No frames to convert (frame_count={self._frame_count}, "
+                f"file_size={file_size}, bytes_per_frame={bytes_per_frame})"
+            )
+            return
+
+        if self._frame_count != max_frames_from_file:
+            self._log.warning(
+                "Mismatch between recorded frame_count and raw file size: "
+                f"frame_count={self._frame_count}, "
+                f"file_size={file_size}, "
+                f"bytes_per_frame={bytes_per_frame}, "
+                f"frames_from_file={max_frames_from_file}. "
+                f"Using n_frames={n_frames}."
+            )
+
+        self._log.info(
+            f"Converting raw frames to 3D TIFF stack: {n_frames} frames, "
+            f"shape=({height},{width}), dtype={dtype}, raw_path={raw_path}"
+        )
+
+        # Read raw data and reshape into (n_frames, height, width)
+        with open(raw_path, "rb") as f:
+            raw = np.fromfile(f, dtype=dtype, count=n_frames * pixels_per_frame)
+
+        if raw.size != n_frames * pixels_per_frame:
+            self._log.warning(
+                f"Read {raw.size} pixels, expected {n_frames * pixels_per_frame}; "
+                "resulting stack may be truncated."
+            )
+            n_frames = raw.size // pixels_per_frame
+            raw = raw[: n_frames * pixels_per_frame]
+
+        volume = raw.reshape((n_frames, height, width))
+
+        # Write 3D TIFF stack next to raw file
+        stack_path = os.path.join(self._output_path, "frames", "frames_stack.tiff")
+        try:
+            iio.mimwrite(stack_path, volume, format="tiff")
+            self._log.info(f"Wrote 3D TIFF stack to {stack_path}")
+            
+            # Delete raw file after successful conversion to save disk space
+            try:
+                os.remove(raw_path)
+                self._log.info(f"Deleted raw frame file {raw_path} after successful TIFF stack conversion")
+            except Exception as e:
+                self._log.warning(f"Failed to delete raw file {raw_path}: {e}", exc_info=True)
+                # Non-fatal: conversion succeeded, just couldn't clean up raw file
+        except Exception as e:
+            self._log.error(f"Failed to write TIFF stack to {stack_path}: {e}", exc_info=True)
+            # Don't delete raw file if conversion failed - user may want to retry
     
     def get_statistics(self) -> Dict:
         """Get acquisition statistics."""

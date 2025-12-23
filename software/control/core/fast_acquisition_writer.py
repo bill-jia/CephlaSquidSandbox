@@ -59,6 +59,13 @@ class FastAcquisitionWriter(threading.Thread):
         os.makedirs(output_path, exist_ok=True)
         self._frames_dir = os.path.join(output_path, "frames")
         os.makedirs(self._frames_dir, exist_ok=True)
+
+        # For TIFF mode, we now write a single raw bytestream that will be
+        # converted to a 3D TIFF stack after acquisition completes.
+        self._raw_file = None
+        self._raw_file_path: Optional[str] = None
+        if self._file_format == "tiff":
+            self._raw_file_path = os.path.join(self._frames_dir, "frames.raw")
         
         # File format specific initialization
         if self._file_format == "zarr":
@@ -88,12 +95,22 @@ class FastAcquisitionWriter(threading.Thread):
         self._running = True
         self._start_time = time.time()
         self._log.info("Frame writer thread started")
-        
+
         # Initialize file format specific resources
         if self._file_format == "zarr":
             self._init_zarr()
         elif self._file_format == "hdf5":
             self._init_hdf5()
+        elif self._file_format == "tiff":
+            # Open raw bytestream file once; frames will be appended sequentially
+            try:
+                if self._raw_file_path is None:
+                    raise RuntimeError("Raw file path not initialized for TIFF writer")
+                self._raw_file = open(self._raw_file_path, "wb")
+                self._log.info(f"Opened raw frame file at {self._raw_file_path}")
+            except Exception as e:
+                self._log.error(f"Failed to open raw frame file: {e}", exc_info=True)
+                self._stop_event.set()
         
         try:
             while not self._stop_event.is_set():
@@ -131,6 +148,14 @@ class FastAcquisitionWriter(threading.Thread):
                 self._close_zarr()
             elif self._file_format == "hdf5":
                 self._close_hdf5()
+            elif self._file_format == "tiff":
+                # Close raw file if open
+                try:
+                    if self._raw_file is not None:
+                        self._raw_file.close()
+                        self._log.info(f"Closed raw frame file {self._raw_file_path}")
+                except Exception as e:
+                    self._log.warning(f"Error closing raw frame file: {e}", exc_info=True)
             
             self._running = False
             self._log.info("Frame writer thread stopped")
@@ -149,7 +174,8 @@ class FastAcquisitionWriter(threading.Thread):
         """Write a single frame to disk."""
         try:
             if self._file_format == "tiff":
-                return self._write_tiff(frame, frame_id, timestamp)
+                # In TIFF mode we now stream raw bytes; 3D stack is created later
+                return self._write_raw_frame(frame, frame_id, timestamp)
             elif self._file_format == "zarr":
                 return self._write_zarr(frame, frame_id, timestamp)
             elif self._file_format == "hdf5":
@@ -161,31 +187,24 @@ class FastAcquisitionWriter(threading.Thread):
             self._log.error(f"Error writing frame {frame_id}: {e}")
             return False
     
-    def _write_tiff(self, frame: np.ndarray, frame_id: int, 
-                   timestamp: float) -> bool:
-        """Write frame as TIFF file."""
+    def _write_raw_frame(self, frame: np.ndarray, frame_id: int,
+                         timestamp: float) -> bool:
+        """
+        Append a single frame to the raw bytestream file.
+
+        The raw file is later converted into a 3D TIFF stack once acquisition
+        has completed, using the known frame shape, dtype, and frame count.
+        """
         try:
-            import imageio as iio
-            
-            # Determine folder based on frame count
-            folder_id = self._frames_written // self._frames_per_file
-            folder_path = os.path.join(self._frames_dir, str(folder_id))
-            os.makedirs(folder_path, exist_ok=True)
-            
-            # Determine file extension based on dtype
-            if frame.dtype == np.uint16:
-                ext = ".tiff"
-            else:
-                ext = ".tiff"  # Default to TIFF
-            
-            # Write file
-            filename = f"frame_{frame_id:06d}{ext}"
-            filepath = os.path.join(folder_path, filename)
-            iio.imwrite(filepath, frame)
-            
+            if self._raw_file is None:
+                raise RuntimeError("Raw file handle is not open for TIFF writer")
+
+            # Ensure contiguous C-order bytes for predictable layout
+            frame_bytes = np.ascontiguousarray(frame).tobytes()
+            self._raw_file.write(frame_bytes)
             return True
         except Exception as e:
-            self._log.error(f"Error writing TIFF: {e}")
+            self._log.error(f"Error writing raw frame {frame_id}: {e}", exc_info=True)
             return False
     
     def _init_zarr(self):
