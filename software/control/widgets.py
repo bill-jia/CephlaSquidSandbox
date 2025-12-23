@@ -1293,7 +1293,7 @@ class CameraSettingsWidget(QFrame):
         roi_info = self.camera.get_region_of_interest()
         print(f"ROI for camera {self.camera.__class__.__name__}: {roi_info}")
         (max_x, max_y) = self.camera.get_resolution()
-        
+
         self.entry_ROI_offset_x = QSpinBox()
         self.entry_ROI_offset_x.setSingleStep(8)
         self.entry_ROI_offset_x.setFixedWidth(60)
@@ -1309,7 +1309,7 @@ class CameraSettingsWidget(QFrame):
         self.entry_ROI_offset_y.setMaximum(max_y)
         self.entry_ROI_offset_y.setKeyboardTracking(False)
         self.entry_ROI_offset_y.setValue(roi_info[1])
-        
+
         self.entry_ROI_width = QSpinBox()
         self.entry_ROI_width.setMinimum(16)
         self.entry_ROI_width.setMaximum(max_x)
@@ -1325,6 +1325,10 @@ class CameraSettingsWidget(QFrame):
         self.entry_ROI_height.setFixedWidth(60)
         self.entry_ROI_height.setKeyboardTracking(False)
         self.entry_ROI_height.setValue(roi_info[3])
+
+        # checkbox to control automatic centering of ROI
+        self.checkbox_ROI_centered = QCheckBox("Centered")
+        self.checkbox_ROI_centered.setChecked(True)
 
         self.entry_temperature = QDoubleSpinBox()
         self.entry_temperature.setKeyboardTracking(False)
@@ -1345,6 +1349,10 @@ class CameraSettingsWidget(QFrame):
         self.entry_ROI_offset_y.valueChanged.connect(self.set_ROI_offset)
         self.entry_ROI_height.valueChanged.connect(self.set_Height)
         self.entry_ROI_width.valueChanged.connect(self.set_Width)
+        self.checkbox_ROI_centered.toggled.connect(self.on_centered_toggled)
+
+        # ensure initial enabled/disabled state of offsets matches checkbox state
+        self.on_centered_toggled(self.checkbox_ROI_centered.isChecked())
 
         # layout
         self.camera_layout = QVBoxLayout()
@@ -1404,6 +1412,8 @@ class CameraSettingsWidget(QFrame):
         roi_line.addStretch()
         roi_line.addWidget(QLabel("X-offset"))
         roi_line.addWidget(self.entry_ROI_offset_x)
+        roi_line.addStretch()
+        roi_line.addWidget(self.checkbox_ROI_centered)
         self.camera_layout.addLayout(roi_line)
 
         if DISPLAY_TOUPCAMER_BLACKLEVEL_SETTINGS is True:
@@ -1455,38 +1465,36 @@ class CameraSettingsWidget(QFrame):
         self.entry_analogGain.setValue(analog_gain)
 
     def set_Width(self):
-        width = int(self.entry_ROI_width.value() // 8) * 8
+        # round width to an even number so centering works cleanly
+        width = int(self.entry_ROI_width.value() // 2) * 2
         self.entry_ROI_width.blockSignals(True)
         self.entry_ROI_width.setValue(width)
         self.entry_ROI_width.blockSignals(False)
-        offset_x = (self.camera.get_resolution()[0] - self.entry_ROI_width.value()) / 2
-        offset_x = int(offset_x // 8) * 8
-        self.entry_ROI_offset_x.blockSignals(True)
-        self.entry_ROI_offset_x.setValue(offset_x)
-        self.entry_ROI_offset_x.blockSignals(False)
-        self.camera.set_region_of_interest(
-            self.entry_ROI_offset_x.value(),
-            self.entry_ROI_offset_y.value(),
-            self.entry_ROI_width.value(),
-            self.entry_ROI_height.value(),
-        )
+        if getattr(self, "checkbox_ROI_centered", None) is not None and self.checkbox_ROI_centered.isChecked():
+            self.update_centered_roi()
+        else:
+            self.camera.set_region_of_interest(
+                self.entry_ROI_offset_x.value(),
+                self.entry_ROI_offset_y.value(),
+                self.entry_ROI_width.value(),
+                self.entry_ROI_height.value(),
+            )
 
     def set_Height(self):
-        height = int(self.entry_ROI_height.value() // 8) * 8
+        # round height to an even number so centering works cleanly
+        height = int(self.entry_ROI_height.value() // 2) * 2
         self.entry_ROI_height.blockSignals(True)
         self.entry_ROI_height.setValue(height)
         self.entry_ROI_height.blockSignals(False)
-        offset_y = (self.camera.get_resolution()[1] - self.entry_ROI_height.value()) / 2
-        offset_y = int(offset_y // 8) * 8
-        self.entry_ROI_offset_y.blockSignals(True)
-        self.entry_ROI_offset_y.setValue(offset_y)
-        self.entry_ROI_offset_y.blockSignals(False)
-        self.camera.set_region_of_interest(
-            self.entry_ROI_offset_x.value(),
-            self.entry_ROI_offset_y.value(),
-            self.entry_ROI_width.value(),
-            self.entry_ROI_height.value(),
-        )
+        if getattr(self, "checkbox_ROI_centered", None) is not None and self.checkbox_ROI_centered.isChecked():
+            self.update_centered_roi()
+        else:
+            self.camera.set_region_of_interest(
+                self.entry_ROI_offset_x.value(),
+                self.entry_ROI_offset_y.value(),
+                self.entry_ROI_width.value(),
+                self.entry_ROI_height.value(),
+            )
 
     def set_ROI_offset(self):
         self.camera.set_region_of_interest(
@@ -1495,6 +1503,58 @@ class CameraSettingsWidget(QFrame):
             self.entry_ROI_width.value(),
             self.entry_ROI_height.value(),
         )
+
+    def update_centered_roi(self):
+        """
+        Center the ROI based on the current width/height and full sensor resolution.
+        Offsets and dimensions are rounded to even numbers so centering works cleanly.
+        """
+        max_x, max_y = self.camera.get_resolution()
+
+        # ensure even dimensions
+        width = int(self.entry_ROI_width.value() // 2) * 2
+        height = int(self.entry_ROI_height.value() // 2) * 2
+
+        self.entry_ROI_width.blockSignals(True)
+        self.entry_ROI_width.setValue(width)
+        self.entry_ROI_width.blockSignals(False)
+
+        self.entry_ROI_height.blockSignals(True)
+        self.entry_ROI_height.setValue(height)
+        self.entry_ROI_height.blockSignals(False)
+
+        # compute even offsets for centering
+        offset_x = (max_x - width) / 2
+        offset_y = (max_y - height) / 2
+
+        offset_x = int(offset_x // 2) * 2
+        offset_y = int(offset_y // 2) * 2
+
+        self.entry_ROI_offset_x.blockSignals(True)
+        self.entry_ROI_offset_x.setValue(offset_x)
+        self.entry_ROI_offset_x.blockSignals(False)
+
+        self.entry_ROI_offset_y.blockSignals(True)
+        self.entry_ROI_offset_y.setValue(offset_y)
+        self.entry_ROI_offset_y.blockSignals(False)
+
+        self.camera.set_region_of_interest(
+            self.entry_ROI_offset_x.value(),
+            self.entry_ROI_offset_y.value(),
+            self.entry_ROI_width.value(),
+            self.entry_ROI_height.value(),
+        )
+
+    def on_centered_toggled(self, checked: bool):
+        """
+        When centered is enabled, disable manual editing of offsets and
+        automatically compute centered ROI from width/height.
+        """
+        self.entry_ROI_offset_x.setEnabled(not checked)
+        self.entry_ROI_offset_y.setEnabled(not checked)
+
+        if checked:
+            self.update_centered_roi()
 
     def set_temperature(self):
         try:

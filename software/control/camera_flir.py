@@ -1526,8 +1526,53 @@ class FLIRCamera(AbstractCamera):
         node_height_max = PySpin.CIntegerPtr(self.nodemap.GetNode("HeightMax"))
         node_offset_x = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetX"))
         node_offset_y = PySpin.CIntegerPtr(self.nodemap.GetNode("OffsetY"))
+        
+        # Step 1: Reset to full field of view first to avoid invalid ROI combinations
+        # This prevents crashes from ROI exceeding sensor bounds
+        if PySpin.IsWritable(node_offset_x):
+            node_offset_x.SetValue(0)
+            self.OffsetX = 0
+        if PySpin.IsWritable(node_offset_y):
+            node_offset_y.SetValue(0)
+            self.OffsetY = 0
+        if PySpin.IsWritable(node_width):
+            max_width_val = node_width_max.GetValue()
+            node_width.SetValue(max_width_val)
+            self.Width = max_width_val
+        if PySpin.IsWritable(node_height):
+            max_height_val = node_height_max.GetValue()
+            node_height.SetValue(max_height_val)
+            self.Height = max_height_val
 
+        # Step 2: Set width and height (if provided)
+        if width is not None:
+            # update the camera setting
+            if PySpin.IsWritable(node_width):
+                node_min = node_width.GetMin()
+                node_inc = node_width.GetInc()
+                diff = width - node_min
+                num_incs = diff // node_inc
+                width = node_min + num_incs * node_inc
+                self.Width = width
+                node_width.SetValue(min(max(int(width), 0), node_width_max.GetValue()))
+            else:
+                print("Width is not implemented or not writable")
 
+        if height is not None:
+            # update the camera setting
+            if PySpin.IsWritable(node_height):
+                node_min = node_height.GetMin()
+                node_inc = node_height.GetInc()
+                diff = height - node_min
+                num_incs = diff // node_inc
+                height = node_min + num_incs * node_inc
+
+                self.Height = height
+                node_height.SetValue(min(max(int(height), 0), node_height_max.GetValue()))
+            else:
+                print("Height is not implemented or not writable")
+
+        # Step 3: Set offsets (if provided) - do this last after width/height are set
         if offset_x is not None:
             # update the camera setting
             if PySpin.IsWritable(node_offset_x):
@@ -1557,34 +1602,7 @@ class FLIRCamera(AbstractCamera):
                 node_offset_y.SetValue(min(int(offset_y), node_max))
             else:
                 print("OffsetY is not implemented or not writable")
-        
-        if width is not None:
-            # update the camera setting
-            if PySpin.IsWritable(node_width):
-                node_min = node_width.GetMin()
-                node_inc = node_width.GetInc()
-                diff = width - node_min
-                num_incs = diff // node_inc
-                width = node_min + num_incs * node_inc
-                self.Width = width
-                node_width.SetValue(min(max(int(width), 0), node_width_max.GetValue()))
-            else:
-                print("Width is not implemented or not writable")
-
-        if height is not None:
-            # update the camera setting
-            if PySpin.IsWritable(node_height):
-                node_min = node_height.GetMin()
-                node_inc = node_height.GetInc()
-                diff = height - node_min
-                num_incs = diff // node_inc
-                height = node_min + num_incs * node_inc
-
-                self.Height = height
-                node_height.SetValue(min(max(int(height), 0), node_height_max.GetValue()))
-            else:
-                print("Height is not implemented or not writable")
-
+                
         # restart streaming if it was previously on
         if was_streaming == True:
             self.start_streaming()
