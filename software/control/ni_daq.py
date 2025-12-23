@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
+from nidaqmx.constants import LogicFamily
+from nidaqmx.system.physical_channel import PhysicalChannel
 
 import numpy as np
 
@@ -259,7 +261,11 @@ class NIDAQ(AbstractNIDAQ):
         self._acquired_di_data: Optional[np.ndarray] = None
         
         self._lock = threading.Lock()
-    
+
+        port_name = "Dev1/port0"
+        phys_channel = PhysicalChannel(port_name)
+        phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
+
     def configure(self, config: NIDAQConfig) -> None:
         """Update the configuration."""
         with self._lock:
@@ -580,7 +586,11 @@ class NIDAQ(AbstractNIDAQ):
             # Add all DO lines
             for line in self._config.do_lines:
                 physical_line = f"{device}/{self._config.do_port}/line{line}"
-                self._do_task.do_channels.add_do_chan(physical_line)
+                do_chan = self._do_task.do_channels.add_do_chan(physical_line)
+                # Hard coded for FlIR Blackfly TTL lines
+                # if line == 1:
+                #     phys_channel = do_chan.physical_channel
+                #     phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
             
             # Configure timing - use AO clock if available, otherwise internal
             if self._ao_task is not None:
@@ -637,7 +647,11 @@ class NIDAQ(AbstractNIDAQ):
             # Add all DI lines
             for line in self._config.di_lines:
                 physical_line = f"{device}/{self._config.di_port}/line{line}"
-                self._di_task.di_channels.add_di_chan(physical_line)
+                di_chan = self._di_task.di_channels.add_di_chan(physical_line)
+                # if line == 0:
+                #     phys_channel = di_chan.physical_channel
+                #     phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
+                # Hard coded for FlIR Blackfly TTL lines
             
             # Configure timing - use AO clock if available, otherwise DO clock
             if self._ao_task is not None:

@@ -650,14 +650,14 @@ class FLIRCamera(AbstractCamera):
         
 
         # set to highest possible framerate
-        PySpin.CBooleanPtr(self.nodemap.GetNode("AcquisitionFrameRateEnable")).SetValue(True)
-        target_rate = 1000
-        for decrement in range(0, 1000):
-            try:
-                PySpin.CFloatPtr(self.nodemap.GetNode("AcquisitionFrameRate")).SetValue(target_rate - decrement)
-                break
-            except PySpin.SpinnakerException as ex:
-                pass
+        PySpin.CBooleanPtr(self.nodemap.GetNode("AcquisitionFrameRateEnable")).SetValue(False)
+        # target_rate = 1000
+        # for decrement in range(0, 1000):
+        #     try:
+        #         PySpin.CFloatPtr(self.nodemap.GetNode("AcquisitionFrameRate")).SetValue(target_rate - decrement)
+        #         break
+        #     except PySpin.SpinnakerException as ex:
+        #         pass
 
         # turn off device throughput limit
         node_throughput_limit = PySpin.CIntegerPtr(self.nodemap.GetNode("DeviceLinkThroughputLimit"))
@@ -687,6 +687,10 @@ class FLIRCamera(AbstractCamera):
         set_enum_node(line_selector, "Line3") # line 3 is control trigger to camera
         line_mode = self.nodemap.GetNode("LineMode")
         set_enum_node(line_mode, "Input")
+        line_input_filter_selector = self.nodemap.GetNode("LineInputFilterSelector")
+        set_enum_node(line_input_filter_selector, "Deglitch")
+        line_filter_width = PySpin.CFloatPtr(self.nodemap.GetNode("LineFilterWidth"))
+        line_filter_width.SetValue(0.0)
 
 
         
@@ -774,6 +778,7 @@ class FLIRCamera(AbstractCamera):
         if exposure_time_ms == self._exposure_time_ms:
             return
         self._set_exposure_time_imp(exposure_time_ms)
+        # self.set_acquisition_frame_rate((1/exposure_time_ms*1000)*1.1)
 
     def _set_exposure_time_imp(self, exposure_time_ms):  ## NOTE: Disables auto-exposure
         self.nodemap = self._camera.GetNodeMap()
@@ -1159,6 +1164,12 @@ class FLIRCamera(AbstractCamera):
         
         if not self._camera.IsInitialized():
             self._camera.Init()
+        
+        # Get acquisition frame rate parameters
+        acquisition_frame_rate = self.nodemap.GetNode("AcquisitionFrameRate")
+        self._log.info(f"Acquisition frame rate: {get_float_node(acquisition_frame_rate)}")
+        acquisition_frame_rate_enable = self.nodemap.GetNode("AcquisitionFrameRateEnable")
+        self._log.info(f"Acquisition frame rate enable: {get_boolean_node(acquisition_frame_rate_enable)}")
         
         # Start acquisition without starting the normal streaming thread
         try:
@@ -2058,6 +2069,13 @@ class FLIRCamera(AbstractCamera):
         """Set the callback to be called when the temperature reading changes."""
         # TODO: Implement
         raise NotImplementedError("set_temperature_reading_callback not yet implemented")
+    
+    def set_acquisition_frame_rate(self, frame_rate: float):
+        """Set the acquisition frame rate of the camera."""
+        self.nodemap = self._camera.GetNodeMap()
+        acquisition_frame_rate = self.nodemap.GetNode("AcquisitionFrameRate")
+        ptr = PySpin.CFloatPtr(acquisition_frame_rate)
+        ptr.SetValue(frame_rate)
 
     def __del__(self):
         try:

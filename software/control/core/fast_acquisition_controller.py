@@ -279,7 +279,7 @@ class FastAcquisitionController:
             self._log.error(f"Camera does not support {acquisition_mode.value} mode: {e}")
             raise
         
-        # Set exposure time
+        # Set exposure time and frame rate
         self._camera.set_exposure_time(exposure_time_ms)
         self._camera.fast_acquisition_timeout_ms = int(np.ceil(1/frame_rate_hz*1000*1.1))
         
@@ -485,7 +485,7 @@ class FastAcquisitionController:
                     if elapsed_time >= self._timeout_s:
                         timeout_message = (
                             f"Acquisition timeout reached: {elapsed_time:.2f}s >= {self._timeout_s:.2f}s "
-                            f"(expected duration: {self._expected_duration_s:.2f}s + 15s buffer). "
+                            f"(expected duration: {self._expected_duration_s:.2f}s + 10s buffer). "
                             f"Frames acquired: {self._frame_count}"
                         )
                         self._log.error(timeout_message)
