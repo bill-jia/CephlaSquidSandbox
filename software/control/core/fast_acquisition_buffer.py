@@ -137,7 +137,7 @@ class FastAcquisitionFrameBuffer:
             - fill_percent: Percentage of buffer filled
         """
         with self._lock:
-            fill_percent = int((self._available_frames / self._buffer_size) * 100)
+            fill_percent = int((float(self._available_frames) / float(self._buffer_size)) * 100)
             return {
                 "available_frames": self._available_frames,
                 "total_frames": self._frame_count,

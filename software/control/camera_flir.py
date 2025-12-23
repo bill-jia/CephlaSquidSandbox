@@ -1219,7 +1219,6 @@ class FLIRCamera(AbstractCamera):
         Uses GetNextImage with minimal timeout (1ms) for non-blocking operation.
         Frames are written directly to the provided callback or stored in _current_frame.
         """
-        self._log.info("Starting fast acquisition frame grabbing thread.")
         
         while self._fast_acquisition_thread_keep_running.is_set():
             try:

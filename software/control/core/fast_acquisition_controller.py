@@ -403,6 +403,20 @@ class FastAcquisitionController:
             
             # Stop frame writer (will flush remaining frames)
             self._frame_writer.stop()
+
+            # Compute and log dropped frames based on writer statistics
+            try:
+                writer_stats = self._frame_writer.get_write_statistics()
+                frames_written = int(writer_stats.get("frames_written", 0))
+                expected_frames = int(self._frame_count)
+                dropped_frames = max(expected_frames - frames_written, 0)
+                self._log.info(
+                    f"Fast acquisition frame summary: "
+                    f"expected={expected_frames}, written={frames_written}, "
+                    f"dropped={dropped_frames}"
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to compute dropped frame statistics: {e}", exc_info=True)
             
             # Save DAQ data and metadata
             self._save_daq_data()
@@ -546,8 +560,21 @@ class FastAcquisitionController:
         """Save acquisition metadata."""
         import json
         
+        # Derive writer statistics for dropped/expected frames
+        frames_written = None
+        dropped_frames = None
+        try:
+            writer_stats = self._frame_writer.get_write_statistics()
+            frames_written = int(writer_stats.get("frames_written", 0))
+            expected_frames = int(self._frame_count)
+            dropped_frames = max(expected_frames - frames_written, 0)
+        except Exception as e:
+            self._log.warning(f"Could not compute writer statistics for metadata: {e}", exc_info=True)
+        
         metadata = {
             "frame_count": self._frame_count,
+            "frames_written": frames_written,
+            "frames_dropped": dropped_frames,
             "start_time": self._start_time,
             "duration": time.time() - self._start_time if self._start_time else 0,
             "trigger_source": "NI_DAQ",

@@ -12534,11 +12534,11 @@ class FastAcquisitionWidget(QWidget):
         
         # Update status label based on completion status
         if status == AcquisitionCompletionStatus.COMPLETED_SUCCESS:
-            completion_text = "Acquisition completed, " + self.stats_label.text()
+            completion_text = "Done: " + self.stats_label.text()
             self.stats_label.setText(completion_text)
             self.stats_label.setStyleSheet("")
         elif status == AcquisitionCompletionStatus.STOPPED_MANUAL:
-            completion_text = "Acquisition stopped, " + self.stats_label.text()
+            completion_text = "Stopped: " + self.stats_label.text()
             self.stats_label.setText(completion_text)
             self.stats_label.setStyleSheet("")
         elif status == AcquisitionCompletionStatus.COMPLETED_ERROR:
