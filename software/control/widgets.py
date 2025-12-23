@@ -11951,6 +11951,7 @@ class FastAcquisitionWidget(QWidget):
         self._is_acquiring = False
         self._updating_acquisition_params = False  # Flag to prevent circular updates
         self._camera_state_before_acquisition: Optional[CameraState] = None  # Store camera state before fast acquisition
+        self._was_live_before_fast_acquisition: bool = False  # Track live state to restore after acquisition
         
         # Initialize UI
         self.init_ui()
@@ -12339,7 +12340,12 @@ class FastAcquisitionWidget(QWidget):
             self._log.warning(f"Could not store camera state before fast acquisition: {e}", exc_info=True)
             self._camera_state_before_acquisition = None
         
-        # Stop live view if running
+        # Stop live view if running (and remember we did so)
+        if self.live_controller:
+            self._was_live_before_fast_acquisition = self.live_controller.is_live
+        else:
+            self._was_live_before_fast_acquisition = False
+
         if self.live_controller and self.live_controller.is_live:
             self._log.info("Stopping live view for fast acquisition")
             self.live_controller.stop_live()
@@ -12550,6 +12556,23 @@ class FastAcquisitionWidget(QWidget):
         
         # Restore camera state to original configuration
         self._restore_camera_state()
+
+        # Restart live view if it was running before fast acquisition
+        if self.live_controller and self._was_live_before_fast_acquisition:
+            try:
+                self._log.info("Restarting live view after fast acquisition")
+                self.live_controller.start_live()
+                if self.live_control_widget:
+                    self.live_control_widget.btn_live.setChecked(True)
+                    self.live_control_widget.btn_live.setText("Stop Live")
+            except Exception as e:
+                self._log.error(f"Failed to restart live view after fast acquisition: {e}", exc_info=True)
+            finally:
+                # Reset flag regardless of success
+                self._was_live_before_fast_acquisition = False
+        else:
+            # Ensure flag does not leak into subsequent acquisitions
+            self._was_live_before_fast_acquisition = False
         
         # Emit signal
         self.signal_acquisition_finished.emit()
