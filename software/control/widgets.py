@@ -11865,6 +11865,7 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.setRange(0.1, 1000.0)
         self.frame_rate_spinbox.setValue(10.0)
         self.frame_rate_spinbox.setDecimals(1)
+        self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
         acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
         
         acq_layout.addWidget(QLabel("Exposure Time (ms):"), 1, 0)
@@ -11873,6 +11874,9 @@ class FastAcquisitionWidget(QWidget):
         self.exposure_time_spinbox.setValue(20.0)
         self.exposure_time_spinbox.setDecimals(1)
         acq_layout.addWidget(self.exposure_time_spinbox, 1, 1)
+        
+        # Initialize max exposure time based on frame rate and readout time
+        self._update_max_exposure_time()
         
         acq_layout.addWidget(QLabel("Number of Frames:"), 2, 0)
         self.num_frames_spinbox = QSpinBox()
@@ -12027,6 +12031,79 @@ class FastAcquisitionWidget(QWidget):
         self.lineEdit_savingDir.setText(save_dir_base)
         self.output_path = save_dir_base
         self.base_path_is_set = True
+    
+    def _update_max_exposure_time(self):
+        """
+        Update maximum exposure time based on frame rate and camera readout time.
+        
+        Maximum exposure time = (1 / frame_rate) - readout_time
+        This ensures exposure + readout fits within one frame period.
+        
+        If readout time is per-row, it's multiplied by the ROI height.
+        """
+        try:
+            # Get readout time from camera config (in microseconds)
+            readout_time_us = CAMERA_CONFIG.READOUT_TIME_US
+            readout_time_type = CAMERA_CONFIG.READOUT_TIME_TYPE
+            
+            # Adjust readout time based on type
+            if readout_time_type.upper() == "ROW":
+                # For per-row readout, multiply by number of rows in ROI
+                try:
+                    roi = self.camera.get_region_of_interest()
+                    roi_height = roi[3]  # (offset_x, offset_y, width, height)
+                    readout_time_us = readout_time_us * roi_height
+                    self._log.debug(
+                        f"Per-row readout: {CAMERA_CONFIG.READOUT_TIME_US} us/row × {roi_height} rows = {readout_time_us} us"
+                    )
+                except Exception as e:
+                    self._log.warning(f"Failed to get ROI for readout time calculation: {e}, using global readout")
+                    # Fall back to global readout if we can't get ROI
+                    readout_time_type = "GLOBAL"
+            
+            # Convert to milliseconds
+            readout_time_ms = readout_time_us / 1000.0
+            
+            # Get current frame rate
+            frame_rate_hz = self.frame_rate_spinbox.value()
+            
+            # Calculate frame period in milliseconds
+            frame_period_ms = (1.0 / frame_rate_hz) * 1000.0
+            
+            # Maximum exposure time = frame period - readout time
+            # Add a small safety margin (1% of frame period) to account for timing variations
+            max_exposure_time_ms = frame_period_ms - readout_time_ms - (frame_period_ms * 0.01)
+            
+            # Ensure minimum value
+            min_exposure_ms = 0.1
+            if max_exposure_time_ms < min_exposure_ms:
+                max_exposure_time_ms = min_exposure_ms
+                self._log.warning(
+                    f"Frame rate {frame_rate_hz} Hz is too high for readout time {readout_time_us:.2f} us ({readout_time_type}). "
+                    f"Maximum exposure time limited to {min_exposure_ms} ms."
+                )
+            
+            # Update the maximum value
+            self.exposure_time_spinbox.setMaximum(max_exposure_time_ms)
+            
+            # If current exposure time exceeds new maximum, clamp it
+            current_exposure = self.exposure_time_spinbox.value()
+            if current_exposure > max_exposure_time_ms:
+                self.exposure_time_spinbox.setValue(max_exposure_time_ms)
+                self._log.info(
+                    f"Exposure time clamped to {max_exposure_time_ms:.2f} ms "
+                    f"(max for {frame_rate_hz} Hz frame rate with {readout_time_us:.2f} us {readout_time_type} readout)"
+                )
+            
+            self._log.debug(
+                f"Updated max exposure time: {max_exposure_time_ms:.2f} ms "
+                f"(frame rate: {frame_rate_hz} Hz, readout: {readout_time_us:.2f} us {readout_time_type})"
+            )
+            
+        except Exception as e:
+            self._log.warning(f"Failed to update max exposure time: {e}")
+            # Fallback: keep original maximum
+            self.exposure_time_spinbox.setMaximum(10000.0)
     
     def start_acquisition(self):
         """Start fast acquisition."""
