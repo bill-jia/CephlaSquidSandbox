@@ -1009,6 +1009,38 @@ def generate_ramp_wave(
     t = np.arange(num_samples) / sample_rate_hz
     return amplitude * scipy_signal.sawtooth(2 * np.pi * frequency_hz * t) + offset
 
+def generate_staircase_ramp(
+    amplitude: float,
+    ramp_duration_s: float,
+    delay_start_s: float,
+    delay_ramp_s: float,
+    n_staircase_steps: int,
+    sample_rate_hz: float,
+    num_samples: int,
+) -> np.ndarray:
+    """Generate a step and ramp."""
+    n_staircase_steps = int(n_staircase_steps)
+    delay1 = np.zeros(int(np.ceil(delay_start_s * sample_rate_hz)))
+    delay2 = np.zeros(int(np.ceil(delay_ramp_s * sample_rate_hz)))
+
+    ramp_duration_samples = int(np.ceil(ramp_duration_s * sample_rate_hz))
+    ramp_up = np.linspace(0, 1, ramp_duration_samples)
+    ramp_down = np.linspace(1, 0, ramp_duration_samples)
+    
+    staircase_increment_samples = int(np.ceil(ramp_duration_s * sample_rate_hz / n_staircase_steps))
+    staircase_ramp_up = np.zeros(ramp_duration_samples)
+    for i in range(n_staircase_steps):
+        staircase_ramp_up[i * staircase_increment_samples:(i + 1) * staircase_increment_samples] = (i+1)/n_staircase_steps
+    staircase_ramp_down = np.flip(staircase_ramp_up)
+
+    waveform = np.concatenate([delay1, staircase_ramp_up, staircase_ramp_down, delay2, ramp_up, ramp_down])
+    if num_samples - len(waveform) < 0:
+        waveform = waveform[:num_samples]
+    else:
+        trailing_zeros = np.zeros(num_samples - len(waveform))
+        waveform = np.concatenate([waveform, trailing_zeros])
+    waveform = waveform * amplitude
+    return waveform
 
 def generate_pulse_train(
     pulse_width_samples: int,

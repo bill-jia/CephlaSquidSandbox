@@ -11683,6 +11683,7 @@ class AOWaveformDialog(QDialog):
         self.channels = channels
         self._waveform = None
         self._channel = None
+        self.log = squid.logging.get_logger(self.__class__.__name__)
         
         self.setWindowTitle("Configure Analog Output Waveform")
         self.setMinimumSize(400, 300)
@@ -11704,7 +11705,7 @@ class AOWaveformDialog(QDialog):
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Waveform Type:"))
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["Sine", "Square", "Ramp", "DC", "Custom"])
+        self.type_combo.addItems(["Sine", "Square", "Ramp", "DC", "Staircase Ramp", "Custom"])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         type_row.addWidget(self.type_combo)
         layout.addLayout(type_row)
@@ -11770,21 +11771,25 @@ class AOWaveformDialog(QDialog):
     
     def on_type_changed(self, waveform_type: str):
         """Update UI based on waveform type selection."""
-        show_params = waveform_type not in ["Custom", "DC"]
-        show_custom = waveform_type == "Custom"
-        
+        show_params = waveform_type not in ["Custom", "DC", "Staircase Ramp"]
+        show_custom = waveform_type in ["Custom", "Staircase Ramp"]
         self.frequency_spin.setEnabled(show_params)
         self.phase_spin.setEnabled(show_params and waveform_type == "Sine")
         self.duty_spin.setEnabled(waveform_type == "Square")
         self.custom_label.setVisible(show_custom)
         self.custom_edit.setVisible(show_custom)
+        if waveform_type == "Custom":
+            self.custom_edit.setPlaceholderText("e.g., 0, 0.5, 1.0, 0.5, 0, -0.5, -1.0, -0.5")
+        elif waveform_type == "Staircase Ramp":
+            self.custom_edit.setPlaceholderText("amplitude, ramp_duration_s, delay_start_s, delay_ramp_s, n_staircase_steps")
     
     def get_waveform(self) -> tuple:
         """Generate and return the configured waveform."""
-        from control.ni_daq import generate_sine_wave, generate_square_wave, generate_ramp_wave
+        from control.ni_daq import generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_staircase_ramp
         
         channel = self.channel_combo.currentText()
         waveform_type = self.type_combo.currentText()
+        self.log.info(f"Waveform generation request type: {waveform_type}")
         
         freq = self.frequency_spin.value()
         amp = self.amplitude_spin.value()
@@ -11792,31 +11797,45 @@ class AOWaveformDialog(QDialog):
         phase = np.radians(self.phase_spin.value())
         duty = self.duty_spin.value()
         
-        try:
-            if waveform_type == "Sine":
-                waveform = generate_sine_wave(freq, amp, self.sample_rate, self.num_samples, offset, phase)
-            elif waveform_type == "Square":
-                waveform = generate_square_wave(freq, amp, self.sample_rate, self.num_samples, offset, duty)
-            elif waveform_type == "Ramp":
-                waveform = generate_ramp_wave(freq, amp, self.sample_rate, self.num_samples, offset)
-            elif waveform_type == "DC":
-                waveform = np.full(self.num_samples, offset)
-            elif waveform_type == "Custom":
-                text = self.custom_edit.toPlainText()
-                values = [float(v.strip()) for v in text.replace('\n', ',').split(',') if v.strip()]
-                if len(values) != self.num_samples:
-                    # Interpolate to match sample count
-                    x_orig = np.linspace(0, 1, len(values))
-                    x_new = np.linspace(0, 1, self.num_samples)
-                    waveform = np.interp(x_new, x_orig, values)
-                else:
-                    waveform = np.array(values)
+        # try:
+        if waveform_type == "Sine":
+            waveform = generate_sine_wave(freq, amp, self.sample_rate, self.num_samples, offset, phase)
+        elif waveform_type == "Square":
+            waveform = generate_square_wave(freq, amp, self.sample_rate, self.num_samples, offset, duty)
+        elif waveform_type == "Ramp":
+            waveform = generate_ramp_wave(freq, amp, self.sample_rate, self.num_samples, offset)
+        elif waveform_type == "DC":
+            waveform = np.full(self.num_samples, offset)
+        elif waveform_type == "Staircase Ramp":
+            self.log.info(f"Generating staircase ramp")
+            text = self.custom_edit.toPlainText()
+            values = [float(v.strip()) for v in text.replace('\n', ',').split(',') if v.strip()]
+            if len(values) != 5:
+                raise ValueError("Staircase Ramp requires 5 values: amplitude, ramp_duration_s, delay_start_s, delay_ramp_s, n_staircase_steps")
+            self.log.info(f"Values: {values}")
+            amplitude = values[0]
+            ramp_duration_s = values[1]
+            delay_start_s = values[2]
+            delay_ramp_s = values[3]
+            n_staircase_steps = values[4]
+            waveform = generate_staircase_ramp(amplitude, ramp_duration_s, delay_start_s, delay_ramp_s, n_staircase_steps, self.sample_rate, self.num_samples)
+            self.log.info(f"{np.min(waveform)}, {np.max(waveform)}, {np.mean(waveform)}, {np.std(waveform)}")
+        elif waveform_type == "Custom":
+            text = self.custom_edit.toPlainText()
+            values = [float(v.strip()) for v in text.replace('\n', ',').split(',') if v.strip()]
+            if len(values) != self.num_samples:
+                # Interpolate to match sample count
+                x_orig = np.linspace(0, 1, len(values))
+                x_new = np.linspace(0, 1, self.num_samples)
+                waveform = np.interp(x_new, x_orig, values)
             else:
-                waveform = np.zeros(self.num_samples)
-            
-            return channel, waveform
-        except Exception as e:
-            return channel, np.zeros(self.num_samples)
+                waveform = np.array(values)
+        else:
+            waveform = np.zeros(self.num_samples)
+        
+        return channel, waveform
+        # except Exception as e:
+        #     return channel, np.zeros(self.num_samples)
 
 
 class DOPatternDialog(QDialog):
@@ -12478,6 +12497,8 @@ class FastAcquisitionWidget(QWidget):
             
             # Get analog input channels from NI DAQ widget config
             ai_channels = ni_daq_config.ai_channels if ni_daq_config.ai_channels else None
+            ao_channels = ni_daq_config.ao_channels if ni_daq_config.ao_channels else None
+            self._log.info(f"AO channels: {ao_channels}")
             
             # Calculate acquisition duration
             num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
@@ -12535,6 +12556,7 @@ class FastAcquisitionWidget(QWidget):
                 exposure_time_ms=self.exposure_time_spinbox.value(),
                 sample_rate_hz=sample_rate_hz,
                 ai_channels=ai_channels,
+                ao_channels=ao_channels,
                 acquisition_mode=acquisition_mode,
                 waveforms=ni_daq_waveforms,
                 trigger_dio_line=trigger_dio_line,

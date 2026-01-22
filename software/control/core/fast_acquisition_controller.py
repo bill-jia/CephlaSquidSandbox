@@ -141,6 +141,7 @@ class FastAcquisitionController:
                          exposure_time_ms: float = 20.0,
                          sample_rate_hz: float = 10000.0,
                          ai_channels: Optional[list] = None,
+                         ao_channels: Optional[list] = None,
                          di_lines: Optional[list] = None,
                          acquisition_mode: Optional[CameraAcquisitionMode] = None,
                          waveforms: Optional[WaveformData] = None,
@@ -196,7 +197,7 @@ class FastAcquisitionController:
         if camera_frame_dio_line is not None:
             self._camera_frame_dio_line = camera_frame_dio_line
         
-        n_samples_offset = 5
+        n_samples_offset = 0 # TBD fix this used to be 5
         samples_per_channel = int(sample_rate_hz * duration_s) + n_samples_offset
         
         # Get waveforms from widget or generate trigger pattern
@@ -249,6 +250,7 @@ class FastAcquisitionController:
             di_port="port0",
             di_lines=di_lines_to_record,
             ai_channels=ai_channels or [],
+            ao_channels=ao_channels or [],
             trigger_source=self._ni_daq.config.trigger_source,
             continuous=False,
         )
