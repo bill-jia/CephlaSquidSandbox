@@ -1492,6 +1492,7 @@ class CameraSettingsWidget(QFrame):
                 self.entry_ROI_width.value(),
                 self.entry_ROI_height.value(),
             )
+        self._log.info(f"Current camera ROI: {self.camera.get_region_of_interest()}")
 
     def set_ROI_offset(self):
         self.camera.set_region_of_interest(
@@ -11096,6 +11097,7 @@ class NIDAQWidget(QWidget):
         device_row.addWidget(self.device_combo)
         self.refresh_btn = QPushButton("↻")
         self.refresh_btn.setFixedWidth(30) ## TBD: update to use the NIDAQ device list
+        self.refresh_btn.clicked.connect(self.on_refresh)
         device_row.addWidget(self.refresh_btn)
         device_layout.addLayout(device_row)
         
@@ -11287,8 +11289,26 @@ class NIDAQWidget(QWidget):
         right_panel.addLayout(status_row)
         
         main_layout.addLayout(right_panel, 2)
+        self.on_device_changed(self.device_combo.currentText())
 
     
+    def on_refresh(self):
+        """Refresh the list of available devices."""
+        self.device_combo.clear()
+        
+        if self._ni_daq is not None:
+            devices = self._ni_daq.get_available_devices()
+            if devices:
+                self.device_combo.addItems(devices)
+                self.status_label.setText("Ready")
+                self.on_device_changed(self.device_combo.currentText())
+            else:
+                self.device_combo.addItem("No devices found")
+                self.status_label.setText("No devices found")
+        else:
+            self.device_combo.addItem("DAQ not available")
+            self.status_label.setText("DAQ not available")
+
     def on_device_changed(self, device_name: str):
         """Handle device selection change."""
         self._log.info(f"DAQ Device changed to: {device_name}")
@@ -11501,11 +11521,186 @@ class NIDAQWidget(QWidget):
                 extended[:len(old_pattern)] = old_pattern
                 self._do_patterns[line] = extended
         
-        # Update config samples_per_channel
+        # Update config samples_per_channel and sample_rate_hz
         self._config.samples_per_channel = new_num_samples
+        self._config.sample_rate_hz = sample_rate_hz
+        
+        # Update UI to reflect new sample rate
+        self.sample_rate_spin.blockSignals(True)
+        self.sample_rate_spin.setValue(sample_rate_hz)
+        self.sample_rate_spin.blockSignals(False)
+        
+        # Update num_samples_spin to reflect new number of samples
+        self.num_samples_spin.blockSignals(True)
+        self.num_samples_spin.setValue(new_num_samples)
+        self.num_samples_spin.blockSignals(False)
+        
+        # Update duration display
+        self._update_duration_display()
         
         # Update waveform plot
         self._update_waveform_plot()
+    
+    def update_waveforms_for_sample_rate(self, new_sample_rate_hz: float, duration_s: float):
+        """
+        Update all waveforms to match a new sample rate by resampling (dilating/contracting).
+        
+        Args:
+            new_sample_rate_hz: New sample rate in Hz
+            duration_s: Duration in seconds (to calculate new number of samples)
+        """
+        from scipy import signal
+        
+        new_num_samples = int(new_sample_rate_hz * duration_s)
+        old_sample_rate_hz = self._config.sample_rate_hz
+        
+        # If sample rate hasn't changed, just update duration
+        if abs(old_sample_rate_hz - new_sample_rate_hz) < 1e-6:
+            self.update_waveforms_for_duration(duration_s, new_sample_rate_hz)
+            return
+        
+        # Update analog output waveforms by resampling
+        for channel in list(self._ao_waveforms.keys()):
+            old_waveform = self._ao_waveforms[channel]
+            old_num_samples = len(old_waveform)
+            
+            if old_num_samples == 0:
+                # Empty waveform, just create zeros
+                self._ao_waveforms[channel] = np.zeros(new_num_samples, dtype=old_waveform.dtype)
+            elif old_num_samples == new_num_samples:
+                # Same number of samples, no resampling needed
+                pass
+            else:
+                # Resample using scipy.signal.resample (preserves signal shape)
+                resampled = signal.resample(old_waveform, new_num_samples)
+                # Preserve dtype
+                self._ao_waveforms[channel] = resampled.astype(old_waveform.dtype)
+        
+        # Update digital output patterns by resampling
+        for line in list(self._do_patterns.keys()):
+            old_pattern = self._do_patterns[line]
+            old_num_samples = len(old_pattern)
+            
+            if old_num_samples == 0:
+                # Empty pattern, just create zeros
+                self._do_patterns[line] = np.zeros(new_num_samples, dtype=old_pattern.dtype)
+            elif old_num_samples == new_num_samples:
+                # Same number of samples, no resampling needed
+                pass
+            else:
+                # For digital signals, we need to preserve boolean nature
+                # Resample as float first, then threshold at 0.5
+                resampled_float = signal.resample(old_pattern.astype(float), new_num_samples)
+                # Convert back to boolean by thresholding
+                self._do_patterns[line] = (resampled_float >= 0.5).astype(old_pattern.dtype)
+        
+        # Update config
+        self._config.samples_per_channel = new_num_samples
+        self._config.sample_rate_hz = new_sample_rate_hz
+        
+        # Update UI to reflect new sample rate
+        self.sample_rate_spin.blockSignals(True)
+        self.sample_rate_spin.setValue(new_sample_rate_hz)
+        self.sample_rate_spin.blockSignals(False)
+        
+        # Update num_samples_spin to reflect new number of samples
+        self.num_samples_spin.blockSignals(True)
+        self.num_samples_spin.setValue(new_num_samples)
+        self.num_samples_spin.blockSignals(False)
+        
+        # Update duration display
+        self._update_duration_display()
+        
+        # Update waveform plot
+        self._update_waveform_plot()
+    
+    def zero_all_outputs(self):
+        """
+        Set all configured analog and digital outputs to zero.
+        This is called after acquisition completes to ensure outputs are safe.
+        """
+        if self._ni_daq is None:
+            self._log.warning("Cannot zero outputs: No DAQ available")
+            return
+        
+        try:
+            # Get all configured output channels and lines
+            ao_channels = list(self._ao_waveforms.keys())
+            do_lines = list(self._do_patterns.keys())
+            
+            if not ao_channels and not do_lines:
+                self._log.debug("No outputs configured, nothing to zero")
+                return
+            
+            # Create zero waveforms for all configured outputs
+            # Use current config to determine number of samples
+            num_samples = self._config.samples_per_channel
+            if num_samples == 0:
+                num_samples = 1  # At least one sample needed
+            
+            zero_ao_waveforms = {}
+            zero_do_patterns = {}
+            
+            # Create zero waveforms for analog outputs
+            for channel in ao_channels:
+                zero_ao_waveforms[channel] = np.zeros(num_samples, dtype=np.float64)
+            
+            # Create zero patterns for digital outputs
+            for line in do_lines:
+                zero_do_patterns[line] = np.zeros(num_samples, dtype=bool)
+            
+            # Create a minimal config for writing zeros
+            from control.ni_daq import WaveformData, NIDAQ_CONFIG, TriggerSource
+            zero_waveforms = WaveformData(
+                analog_output=zero_ao_waveforms,
+                digital_output=zero_do_patterns
+            )
+            
+            # Configure DAQ with minimal settings for writing zeros
+            zero_config = NIDAQ_CONFIG(
+                device_name=self._config.device_name,
+                sample_rate_hz=1000.0,  # Low rate for quick write
+                samples_per_channel=num_samples,
+                ao_channels=ao_channels,
+                do_port=self._config.do_port,
+                do_lines=do_lines,
+                trigger_source=TriggerSource.SOFTWARE,
+                continuous=False,
+                do_logic_family=self._config.do_logic_family,
+            )
+            
+            # Stop any running tasks first
+            try:
+                self._ni_daq.stop()
+            except:
+                pass
+            
+            # Configure and set zero waveforms
+            self._ni_daq.configure(zero_config)
+            self._ni_daq.set_waveforms(zero_waveforms)
+            
+            # Arm and trigger to write zeros
+            self._ni_daq.arm()
+            self._ni_daq.start_trigger()
+            
+            # Wait briefly for the write to complete
+            import time
+            time.sleep(0.1)
+            
+            # Stop the task
+            self._ni_daq.stop()
+            
+            # Update internal waveforms to zeros
+            self._ao_waveforms.update(zero_ao_waveforms)
+            self._do_patterns.update(zero_do_patterns)
+            
+            # Update plot
+            self._update_waveform_plot()
+            
+            self._log.info(f"Zeroed all outputs: {len(ao_channels)} AO channels, {len(do_lines)} DO lines")
+            
+        except Exception as e:
+            self._log.error(f"Failed to zero outputs: {e}", exc_info=True)
     
     def is_line_configured(self, line: int, is_digital: bool = True) -> bool:
         """
@@ -12005,6 +12200,9 @@ class FastAcquisitionWidget(QWidget):
         # Initialize UI
         self.init_ui()
         
+        # Connect signals to update NIDAQWidget when parameters change
+        self._connect_ni_daq_signals()
+        
         # Statistics update timer
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self.update_statistics)
@@ -12198,6 +12396,38 @@ class FastAcquisitionWidget(QWidget):
         main_layout.addWidget(stats_group)
         main_layout.addStretch()
     
+    
+    def _connect_ni_daq_signals(self):
+        """Connect signals to update NIDAQWidget when acquisition parameters change."""
+        if self.ni_daq_widget is None:
+            return
+        
+        # Connect DAQ sample rate changes
+        self.daq_sample_rate_spinbox.valueChanged.connect(self._on_daq_sample_rate_changed)
+        
+        # Note: Total acquisition time changes are already handled in 
+        # _update_acquisition_time_from_frames and _update_frames_from_acquisition_time
+    
+    def _on_daq_sample_rate_changed(self, new_sample_rate_hz: float):
+        """
+        Handle DAQ sample rate changes from FastAcquisitionWidget.
+        Updates NIDAQWidget waveforms by resampling.
+        """
+        if self._updating_acquisition_params or self._is_acquiring:
+            return
+        
+        if self.ni_daq_widget is None:
+            return
+        
+        try:
+            # Get current total acquisition time
+            total_time_s = self.total_time_spinbox.value()
+            
+            # Update waveforms in NI DAQ widget by resampling
+            self.ni_daq_widget.update_waveforms_for_sample_rate(new_sample_rate_hz, total_time_s)
+            
+        except Exception as e:
+            self._log.warning(f"Failed to update NI DAQ waveforms for sample rate change: {e}")
     
     def set_saving_dir(self):
         """Set saving directory (matching RecordingWidget style)."""
@@ -12592,6 +12822,14 @@ class FastAcquisitionWidget(QWidget):
         
         # Restore camera state to original configuration
         self._restore_camera_state()
+        
+        # Zero out all DAQ outputs (analog and digital) after acquisition completes
+        if self.ni_daq_widget:
+            try:
+                self._log.info("Zeroing all DAQ outputs after acquisition completion")
+                self.ni_daq_widget.zero_all_outputs()
+            except Exception as e:
+                self._log.error(f"Failed to zero DAQ outputs after acquisition: {e}", exc_info=True)
 
         # Restart live view if it was running before fast acquisition
         if self.live_controller and self._was_live_before_fast_acquisition:
