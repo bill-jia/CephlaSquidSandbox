@@ -9,6 +9,10 @@ import csv
 import squid.logging
 from enum import Enum, auto
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
 log = squid.logging.get_logger(__name__)
 
 
@@ -498,6 +502,47 @@ class CAMERA_CONFIG:
     READOUT_TIME_US = 5.84
     READOUT_TIME_TYPE = "GLOBAL" # Options: "GLOBAL", "ROW"
 
+@dataclass
+class NIDAQ_CONFIG:
+    """Configuration for NI DAQ operation."""
+    # Device identifier (e.g., "Dev1")
+    device_name: str = "Dev1"
+    # Sample clock configuration
+    sample_rate_hz: float = 10000.0  # Samples per second
+    samples_per_channel: int = 1000  # Number of samples per waveform cycle
+    
+    # Analog output configuration
+    ao_channels: List[str] = field(default_factory=list)  # e.g., ["ao0", "ao1"]
+    ao_min_voltage: float = -10.0
+    ao_max_voltage: float = 10.0
+    
+    # Digital output configuration  
+    do_port: str = "port0"  # e.g., "port0"
+    do_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
+    
+    # Digital input configuration
+    di_port: str = "port0"  # e.g., "port0"
+    di_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
+    
+    # Analog input configuration
+    ai_channels: List[str] = field(default_factory=list)  # e.g., ["ai0", "ai1"]
+    ai_min_voltage: float = -10.0
+    ai_max_voltage: float = 10.0
+    ai_terminal_config: str = "RSE"  # RSE, NRSE, Diff, PseudoDiff
+    
+    # Trigger configuration
+    trigger_source: str = "SOFTWARE"
+    external_trigger_terminal: str = "/Dev1/PFI0"  # For external trigger
+    trigger_edge: str = "RISING"
+    
+    # Continuous vs finite operation
+    continuous: bool = False  # If True, waveforms repeat continuously
+    
+    # Digital I/O logic family configuration
+    # "THREE_POINT_THREE_V" for FLIR cameras (3.3V TTL)
+    # "FIVE_V" for Photometrics and most other cameras (5V TTL, default)
+    do_logic_family: str = "FIVE_V"
+
 
 class AF:
     STOP_THRESHOLD = 0.85
@@ -686,10 +731,15 @@ NL5_TRIGGER_PIN = 2
 NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 638: 4, 640: 4}
 
 # National Instruments DAQ integration
-ENABLE_NI_DAQ = True
-NI_DAQ_DEVICE_NAME = "Dev1"
-NI_DAQ_DEFAULT_SAMPLE_RATE = 10000  # Hz
-NI_DAQ_DEFAULT_NUM_SAMPLES = 10000
+ENABLE_NIDAQ = False
+NI_DAQ_BYPASS_SIMULATION = True
+
+# NI DAQ Digital I/O logic family configuration
+# This setting determines the voltage levels used for digital I/O:
+# - "THREE_POINT_THREE_V" for FLIR cameras (3.3V TTL logic)
+# - "FIVE_V" for Photometrics and most other cameras (5V TTL logic, default)
+# This is automatically set based on CAMERA_TYPE during config loading
+NI_DAQ_LOGIC_FAMILY = "FIVE_V"
 
 # Laser AF characterization mode
 LASER_AF_CHARACTERIZATION_MODE = False
@@ -997,6 +1047,15 @@ A1_Y_PIXEL = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_y_pixel"]  # coordi
 ##########################################################
 ##### end of loading machine specific configurations #####
 ##########################################################
+
+# Set NI DAQ logic family based on camera type
+# FLIR cameras require 3.3V TTL, most others use 5V TTL
+if CAMERA_TYPE == "FLIR":
+    NI_DAQ_LOGIC_FAMILY = "THREE_POINT_THREE_V"
+    log.info("NI DAQ logic family set to 3.3V (FLIR camera detected)")
+else:
+    NI_DAQ_LOGIC_FAMILY = "FIVE_V"
+    log.debug(f"NI DAQ logic family set to 5V ({CAMERA_TYPE} camera)")
 
 # objective piezo
 HAS_OBJECTIVE_PIEZO = "PIEZO" in Z_MOTOR_CONFIG

@@ -21,7 +21,7 @@ import serial
 from typing import Optional, TypeVar
 
 import control._def
-from control._def import TriggerMode
+from control._def import TriggerMode, NIDAQ_CONFIG
 from control.core.channel_configuration_mananger import ChannelConfigurationManager
 from control.core.configuration_mananger import ConfigurationManager
 from control.core.contrast_manager import ContrastManager
@@ -48,6 +48,7 @@ import squid.filter_wheel_controller.utils
 import squid.logging
 import squid.stage.cephla
 import squid.stage.utils
+from control.ni_daq import AbstractNIDAQ, NIDAQ
 
 if control._def.USE_XERYON:
     from control.objective_changer_2_pos_controller import (
@@ -83,6 +84,7 @@ class MicroscopeAddons:
     - Fluidics: For automated sample handling
     - Piezo stage: For fine Z positioning
     - SciMicroscopy LED array: For brightfield illumination
+    - NIDAQ: For hardware triggering
     """
     @staticmethod
     def build_from_global_config(
@@ -190,6 +192,11 @@ class MicroscopeAddons:
             )
             sci_microscopy_led_array.set_NA(control._def.SCIMICROSCOPY_LED_ARRAY_DEFAULT_NA)
 
+        # NIDAQ: For hardware triggering
+        nidaq = None
+        if control._def.ENABLE_NIDAQ and ((not simulated) or control._def.NI_DAQ_BYPASS_SIMULATION):
+            nidaq = NIDAQ(config=NIDAQ_CONFIG())
+
         return MicroscopeAddons(
             xlight,
             dragonfly,
@@ -201,6 +208,7 @@ class MicroscopeAddons:
             fluidics,
             piezo_stage,
             sci_microscopy_led_array,
+            nidaq
         )
 
     def __init__(
@@ -215,6 +223,7 @@ class MicroscopeAddons:
         fluidics: Optional[Fluidics] = None,
         piezo_stage: Optional[PiezoStage] = None,
         sci_microscopy_led_array: Optional[SciMicroscopyLEDArray] = None,
+        nidaq: Optional[AbstractNIDAQ] = None,
     ):
         self.xlight: Optional[serial_peripherals.XLight] = xlight
         self.dragonfly: Optional[serial_peripherals.Dragonfly] = dragonfly
@@ -226,6 +235,7 @@ class MicroscopeAddons:
         self.fluidics = fluidics
         self.piezo_stage = piezo_stage
         self.sci_microscopy_led_array = sci_microscopy_led_array
+        self.nidaq = nidaq
 
     def prepare_for_use(self):
         """

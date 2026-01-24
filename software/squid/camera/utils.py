@@ -481,6 +481,15 @@ class SimulatedCamera(AbstractCamera):
     def get_frame_id(self) -> int:
         return self._frame_id
 
+    def get_camera_mode(self):
+        return "SIMULATED"
+
+    def get_available_camera_modes(self):
+        return ["SIMULATED"]
+    
+    def set_camera_mode(self, camera_mode: str):
+        pass
+
     @debug_log
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
         """Set the readout mode of the simulated camera."""

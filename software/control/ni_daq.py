@@ -27,7 +27,7 @@ from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 from nidaqmx.constants import LogicFamily
 from nidaqmx.system.physical_channel import PhysicalChannel
-
+from control._def import NIDAQ_CONFIG
 import numpy as np
 
 import squid.logging
@@ -47,44 +47,6 @@ class TriggerSource(Enum):
     SOFTWARE = auto()  # Software-initiated start
     EXTERNAL = auto()  # External digital trigger input
     INTERNAL = auto()  # Internal trigger from another task
-
-
-@dataclass
-class NIDAQConfig:
-    """Configuration for NI DAQ operation."""
-    
-    # Device identifier (e.g., "Dev1")
-    device_name: str = "Dev1"
-    # Sample clock configuration
-    sample_rate_hz: float = 10000.0  # Samples per second
-    samples_per_channel: int = 1000  # Number of samples per waveform cycle
-    
-    # Analog output configuration
-    ao_channels: List[str] = field(default_factory=list)  # e.g., ["ao0", "ao1"]
-    ao_min_voltage: float = -10.0
-    ao_max_voltage: float = 10.0
-    
-    # Digital output configuration  
-    do_port: str = "port0"  # e.g., "port0"
-    do_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
-    
-    # Digital input configuration
-    di_port: str = "port0"  # e.g., "port0"
-    di_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
-    
-    # Analog input configuration
-    ai_channels: List[str] = field(default_factory=list)  # e.g., ["ai0", "ai1"]
-    ai_min_voltage: float = -10.0
-    ai_max_voltage: float = 10.0
-    ai_terminal_config: str = "RSE"  # RSE, NRSE, Diff, PseudoDiff
-    
-    # Trigger configuration
-    trigger_source: TriggerSource = TriggerSource.SOFTWARE
-    external_trigger_terminal: str = "/Dev1/PFI0"  # For external trigger
-    trigger_edge: TriggerEdge = TriggerEdge.RISING
-    
-    # Continuous vs finite operation
-    continuous: bool = False  # If True, waveforms repeat continuously
 
 
 @dataclass
@@ -127,14 +89,17 @@ class AcquisitionResult:
 class AbstractNIDAQ(abc.ABC):
     """Abstract base class for NI DAQ interface."""
     
-    def __init__(self, config: NIDAQConfig):
+    def __init__(self, config: NIDAQ_CONFIG):
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._config = config
+        # Map config trigger source and edge to TriggerSource and TriggerEdge enums
+        self._config.trigger_source = TriggerSource[self._config.trigger_source]
+        self._config.trigger_edge = TriggerEdge[self._config.trigger_edge]
         self._is_armed = False
         self._is_running = False
         
     @property
-    def config(self) -> NIDAQConfig:
+    def config(self) -> NIDAQ_CONFIG:
         """Get the current configuration."""
         return self._config
     
@@ -149,7 +114,7 @@ class AbstractNIDAQ(abc.ABC):
         return self._is_running
     
     @abc.abstractmethod
-    def configure(self, config: NIDAQConfig) -> None:
+    def configure(self, config: NIDAQ_CONFIG) -> None:
         """Update the configuration."""
         pass
     
@@ -235,7 +200,7 @@ class NIDAQ(AbstractNIDAQ):
     tasks that share a common sample clock and start trigger.
     """
     
-    def __init__(self, config: NIDAQConfig):
+    def __init__(self, config: NIDAQ_CONFIG):
         super().__init__(config)
         
         try:
@@ -262,11 +227,53 @@ class NIDAQ(AbstractNIDAQ):
         
         self._lock = threading.Lock()
 
-        port_name = "Dev1/port0"
-        phys_channel = PhysicalChannel(port_name)
-        phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
+        # Configure digital port logic family ONCE at initialization
+        # This must be done before any tasks are created
+        self._configure_digital_port_logic_family()
+        self._log.info(f"Initialized NI DAQ for device {self._config.device_name}")
+    
+    def _configure_digital_port_logic_family(self):
+        """
+        Configure the digital port logic family based on camera type.
+        
+        This should be called ONCE during initialization before any tasks are created.
+        - FLIR cameras require 3.3V TTL logic (THREE_POINT_THREE_V)
+        - Photometrics and most other cameras use 5V TTL logic (FIVE_V, default)
+        
+        The logic family setting affects the voltage levels used for digital I/O:
+        - 3.3V: Logic high = 3.3V, compatible with FLIR Blackfly cameras
+        - 5V: Logic high = 5V, compatible with most industrial cameras
+        """
+        device = self._config.device_name
+        
+        # Configure DO port logic family
+        if self._config.do_port:
+            do_port_name = f"{device}/{self._config.do_port}"
+            # try:
+            phys_channel = PhysicalChannel(do_port_name)
+            if self._config.do_logic_family == "THREE_POINT_THREE_V":
+                phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
+                self._log.info(f"Set {do_port_name} logic family to 3.3V (FLIR compatible)")
+            else:
+                # Default to 5V - standard for most cameras including Photometrics
+                phys_channel.dig_port_logic_family = LogicFamily.FIVE_V
+                self._log.info(f"Set {do_port_name} logic family to 5V (default)")
+            # except Exception as e:
+                # self._log.warning(f"Could not set DO port logic family for {do_port_name}: {e}")
+        
+        # Configure DI port logic family (if different from DO port)
+        if self._config.di_port and self._config.di_port != self._config.do_port:
+            di_port_name = f"{device}/{self._config.di_port}"
+            try:
+                phys_channel = PhysicalChannel(di_port_name)
+                if self._config.do_logic_family == "THREE_POINT_THREE_V":
+                    phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
+                else:
+                    phys_channel.dig_port_logic_family = LogicFamily.FIVE_V
+            except Exception as e:
+                self._log.warning(f"Could not set DI port logic family for {di_port_name}: {e}")
 
-    def configure(self, config: NIDAQConfig) -> None:
+    def configure(self, config: NIDAQ_CONFIG) -> None:
         """Update the configuration."""
         with self._lock:
             if self._is_running:
@@ -586,11 +593,8 @@ class NIDAQ(AbstractNIDAQ):
             # Add all DO lines
             for line in self._config.do_lines:
                 physical_line = f"{device}/{self._config.do_port}/line{line}"
+                self._log.info(f"Adding DO channel: {physical_line}")
                 do_chan = self._do_task.do_channels.add_do_chan(physical_line)
-                # Hard coded for FlIR Blackfly TTL lines
-                # if line == 1:
-                #     phys_channel = do_chan.physical_channel
-                #     phys_channel.dig_port_logic_family = LogicFamily.THREE_POINT_THREE_V
             
             # Configure timing - use AO clock if available, otherwise internal
             if self._ao_task is not None:
@@ -806,7 +810,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
     synthetic input data based on the output waveforms.
     """
     
-    def __init__(self, config: NIDAQConfig):
+    def __init__(self, config: NIDAQ_CONFIG):
         super().__init__(config)
         
         self._waveforms: Optional[WaveformData] = None
@@ -815,8 +819,9 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         
         self._lock = threading.Lock()
         self._completion_event = threading.Event()
+        self.configure(config)
     
-    def configure(self, config: NIDAQConfig) -> None:
+    def configure(self, config: NIDAQ_CONFIG) -> None:
         """Update the configuration."""
         with self._lock:
             if self._is_running:
@@ -947,7 +952,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         return {}
 
 
-def create_ni_daq(config: NIDAQConfig, simulation: bool = False) -> AbstractNIDAQ:
+def create_ni_daq(config: NIDAQ_CONFIG, simulation: bool = False) -> AbstractNIDAQ:
     """
     Factory function to create an NI DAQ instance.
     

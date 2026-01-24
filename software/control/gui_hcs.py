@@ -287,6 +287,7 @@ class HighContentScreeningGui(QMainWindow):
         self.camera_focus: Optional[AbstractCamera] = microscope.addons.camera_focus
         self.fluidics: Optional[Fluidics] = microscope.addons.fluidics
         self.piezo: Optional[PiezoStage] = microscope.addons.piezo_stage
+        self.nidaq: Optional[AbstractNIDAQ] = microscope.addons.nidaq
 
         self.channelConfigurationManager: ChannelConfigurationManager = microscope.channel_configuration_manager
         self.laserAFSettingManager: LaserAFSettingManager = microscope.laser_af_settings_manager
@@ -651,17 +652,17 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
 
-        if ENABLE_NI_DAQ:
+        if ENABLE_NIDAQ:
             if NI_DAQ_BYPASS_SIMULATION:
-                self.niDAQWidget = widgets.NIDAQWidget(is_simulation=False)
+                self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=False)
             else:
-                self.niDAQWidget = widgets.NIDAQWidget(is_simulation=is_simulation)
+                self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=is_simulation)
         
         # Fast acquisition widget
         if ENABLE_FAST_ACQUISITION:
             self.fastAcquisitionWidget = widgets.FastAcquisitionWidget(
                 self.microscope,
-                ni_daq_widget=self.niDAQWidget if ENABLE_NI_DAQ else None,
+                ni_daq_widget=self.niDAQWidget if ENABLE_NIDAQ else None,
                 live_controller=self.liveController,
                 live_control_widget=self.liveControlWidget
             )
@@ -825,7 +826,7 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.imageDisplayTabs.addTab(self.fluidicsWidget, "Fluidics")
 
-        if ENABLE_NI_DAQ:
+        if ENABLE_NIDAQ:
             self.imageDisplayTabs.addTab(self.niDAQWidget, "NI DAQ")
 
     def setupRecordTabWidget(self):

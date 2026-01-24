@@ -63,6 +63,12 @@ def main():
 
     h5f, h5_path = load_daq_file(args.folder)
     print(f"Loaded DAQ data from {h5_path}")
+    if "frame_timestamps_ms.npy" in os.listdir(args.folder):
+        frame_timestamps_ms = np.load(os.path.join(args.folder, "frame_timestamps_ms.npy"))
+        frame_timestamps_ms -= frame_timestamps_ms[0]
+        print(f"Loaded frame timestamps from {os.path.join(args.folder, 'frame_timestamps_ms.npy')}")
+    else:
+        frame_timestamps_ms = None
 
     # Read metadata for timing
     sample_rate = h5f.attrs.get("sample_rate_hz", None)
@@ -96,14 +102,25 @@ def main():
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
 
+    print(frame_timestamps_ms)
+    if frame_timestamps_ms is not None:
+        ax.vlines(frame_timestamps_ms/1000, ymin=0, ymax=1.1, color="red", label="Frame timestamps")
+
     plt.tight_layout()
+
 
     if args.save:
         out_path = os.path.join(args.folder, "waveforms", "daq_waveforms.png")
         plt.savefig(out_path, dpi=150)
         print(f"Saved plot to {out_path}")
-    else:
-        plt.show()
+    if frame_timestamps_ms is not None:
+        fig2, ax2 = plt.subplots(figsize=(4,4))
+        ax2.hist(np.diff(frame_timestamps_ms), bins=100, color="red", label="Frame timestamps")
+        ax2.set_title("Frame timing distribution (ms)")
+        plt.tight_layout()
+    
+    plt.show()
+    
 
     h5f.close()
 

@@ -42,6 +42,7 @@ class FastAcquisitionWriter(threading.Thread):
         self._frame_buffer = frame_buffer
         self._output_path = output_path
         self._file_format = file_format.lower()
+        self._frame_timestamps_ms = []
         self._frames_per_file = frames_per_file
         
         # Thread control
@@ -158,6 +159,8 @@ class FastAcquisitionWriter(threading.Thread):
                     self._log.warning(f"Error closing raw frame file: {e}", exc_info=True)
             
             self._running = False
+            self._frame_timestamps_ms = np.array(self._frame_timestamps_ms)
+            np.save(os.path.join(self._output_path, "frame_timestamps_ms.npy"), self._frame_timestamps_ms)
             self._log.info("Frame writer thread stopped")
     
     def stop(self):
@@ -173,6 +176,7 @@ class FastAcquisitionWriter(threading.Thread):
                     timestamp: float) -> bool:
         """Write a single frame to disk."""
         try:
+            self._frame_timestamps_ms.append(timestamp)
             if self._file_format == "tiff":
                 # In TIFF mode we now stream raw bytes; 3D stack is created later
                 return self._write_raw_frame(frame, frame_id, timestamp)

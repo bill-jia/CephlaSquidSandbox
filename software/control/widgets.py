@@ -1274,20 +1274,17 @@ class CameraSettingsWidget(QFrame):
             self.entry_analogGain.setValue(0)
             self.entry_analogGain.setEnabled(False)
 
-        self.dropdown_pixelFormat = QComboBox()
+        self.dropdown_cameraMode = QComboBox()
         try:
-            pixel_formats = self.camera.get_available_pixel_formats()
-            pixel_formats = [pf.name for pf in pixel_formats]
+            camera_modes = self.camera.get_available_camera_modes()
         except NotImplementedError:
-            pixel_formats = ["MONO8", "MONO12", "MONO14", "MONO16", "BAYER_RG8", "BAYER_RG12"]
-        self.dropdown_pixelFormat.addItems(pixel_formats)
-        if self.camera.get_pixel_format() is not None:
-            self.dropdown_pixelFormat.setCurrentText(self.camera.get_pixel_format().name)
-        else:
-            print("setting camera's default pixel format")
-            self.camera.set_pixel_format(CameraPixelFormat.from_string(CAMERA_CONFIG.PIXEL_FORMAT_DEFAULT))
-            self.dropdown_pixelFormat.setCurrentText(CAMERA_CONFIG.PIXEL_FORMAT_DEFAULT)
-        self.dropdown_pixelFormat.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
+            camera_modes = ["FULL"]
+        self.dropdown_cameraMode.addItems(camera_modes)
+        if self.camera.get_camera_mode() is not None:
+            self.dropdown_cameraMode.setCurrentText(self.camera.get_camera_mode())
+        self.dropdown_cameraMode.setToolTip("Select camera mode (may be pixel format, well depth, etc.)")
+        # self.dropdown_cameraMode.currentTextChanged.connect(self.set_camera_mode)
+        self.dropdown_cameraMode.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
         # to do: load and save pixel format in configurations
 
         roi_info = self.camera.get_region_of_interest()
@@ -1342,8 +1339,8 @@ class CameraSettingsWidget(QFrame):
         # connection
         self.entry_exposureTime.valueChanged.connect(self.camera.set_exposure_time)
         self.entry_analogGain.valueChanged.connect(self.set_analog_gain_if_supported)
-        self.dropdown_pixelFormat.currentTextChanged.connect(
-            lambda s: self.camera.set_pixel_format(CameraPixelFormat.from_string(s))
+        self.dropdown_cameraMode.currentTextChanged.connect(
+            lambda s: self.camera.set_camera_mode(s)
         )
         self.entry_ROI_offset_x.valueChanged.connect(self.set_ROI_offset)
         self.entry_ROI_offset_y.valueChanged.connect(self.set_ROI_offset)
@@ -1367,8 +1364,8 @@ class CameraSettingsWidget(QFrame):
             self.camera_layout.addLayout(gain_line)
 
         format_line = QHBoxLayout()
-        format_line.addWidget(QLabel("Pixel Format"))
-        format_line.addWidget(self.dropdown_pixelFormat)
+        format_line.addWidget(QLabel("Camera Mode"))
+        format_line.addWidget(self.dropdown_cameraMode)
         try:
             current_binning = self.camera.get_binning()
             current_binning_string = "x".join([str(current_binning[0]), str(current_binning[1])])
@@ -11035,6 +11032,12 @@ class SurfacePlotWidget(QWidget):
         self.canvas.draw()
         self.signal_point_clicked.emit(self.x[idx], self.y[idx])
 
+from control.ni_daq import (
+    AbstractNIDAQ, WaveformData, AcquisitionResult,
+    TriggerSource, TriggerEdge, create_ni_daq,
+    generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
+)
+from control._def import NIDAQ_CONFIG
 
 class NIDAQWidget(QWidget):
     """
@@ -11051,21 +11054,18 @@ class NIDAQWidget(QWidget):
     signal_acquisition_started = Signal()
     signal_acquisition_finished = Signal()
     
-    def __init__(self, ni_daq=None, is_simulation: bool = False, parent=None):
+    def __init__(self, ni_daq: AbstractNIDAQ, is_simulation: bool = False, parent=None):
         super().__init__(parent)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         
         # Import NI DAQ module
-        from control.ni_daq import (
-            AbstractNIDAQ, NIDAQConfig, WaveformData, AcquisitionResult,
-            TriggerSource, TriggerEdge, create_ni_daq,
-            generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
-        )
+
         self._ni_daq_module = __import__('control.ni_daq', fromlist=[''])
         
         self.is_simulation = is_simulation
         self._ni_daq = ni_daq
-        self._config = NIDAQConfig()
+        self._config = self._ni_daq._config
+        self._log.info(f"NIDAQWidget initialized with NI DAQ: {self._ni_daq}")
         self._waveforms = WaveformData()
         
         # Waveform data storage
@@ -11074,13 +11074,6 @@ class NIDAQWidget(QWidget):
         
         # Initialize UI
         self.init_ui()
-        
-        # If no DAQ provided, create one
-        if self._ni_daq is None:
-            self._create_daq()
-        
-        # Update device list
-        self.refresh_devices()
     
     def init_ui(self):
         """Initialize the user interface."""
@@ -11098,11 +11091,11 @@ class NIDAQWidget(QWidget):
         device_row = QHBoxLayout()
         device_row.addWidget(QLabel("Device:"))
         self.device_combo = QComboBox()
+        self.device_combo.addItems(self._ni_daq.get_available_devices()) # Need to update configuration formats to take into account multiple devices
         self.device_combo.currentTextChanged.connect(self.on_device_changed)
         device_row.addWidget(self.device_combo)
         self.refresh_btn = QPushButton("↻")
-        self.refresh_btn.setFixedWidth(30)
-        self.refresh_btn.clicked.connect(self.refresh_devices)
+        self.refresh_btn.setFixedWidth(30) ## TBD: update to use the NIDAQ device list
         device_row.addWidget(self.refresh_btn)
         device_layout.addLayout(device_row)
         
@@ -11294,39 +11287,11 @@ class NIDAQWidget(QWidget):
         right_panel.addLayout(status_row)
         
         main_layout.addLayout(right_panel, 2)
-    
-    def _create_daq(self):
-        """Create DAQ instance based on current configuration."""
-        from control.ni_daq import create_ni_daq
-        self._update_config()
-        try:
-            self._ni_daq = create_ni_daq(self._config, simulation=self.is_simulation)
-            self._log.info(f"Created NI DAQ (simulation={self.is_simulation})")
-        except Exception as e:
-            self._log.error(f"Failed to create NI DAQ: {e}")
-            self.status_label.setText(f"Error: {e}")
-    
-    def refresh_devices(self):
-        """Refresh the list of available devices."""
-        self.device_combo.clear()
-        
-        if self._ni_daq is None:
-            self._create_daq()
-        
-        if self._ni_daq is not None:
-            devices = self._ni_daq.get_available_devices()
-            if devices:
-                self.device_combo.addItems(devices)
-                self.status_label.setText("Ready")
-            else:
-                self.device_combo.addItem("No devices found")
-                self.status_label.setText("No devices found")
-        else:
-            self.device_combo.addItem("DAQ not available")
-            self.status_label.setText("DAQ not available")
+
     
     def on_device_changed(self, device_name: str):
         """Handle device selection change."""
+        self._log.info(f"DAQ Device changed to: {device_name}")
         if not device_name or device_name in ["No devices found", "DAQ not available"]:
             return
         
@@ -11407,6 +11372,11 @@ class NIDAQWidget(QWidget):
             item = self.do_lines_list.item(i)
             if item.isSelected():
                 self._config.do_lines.append(i)
+        
+        # Set digital I/O logic family from global config
+        # FLIR cameras require 3.3V TTL, Photometrics and others use 5V TTL
+        from control._def import NI_DAQ_LOGIC_FAMILY
+        self._config.do_logic_family = NI_DAQ_LOGIC_FAMILY
     
     def _update_duration_display(self):
         """Update the duration display label."""
@@ -11487,12 +11457,12 @@ class NIDAQWidget(QWidget):
             digital_output=self._do_patterns.copy()
         )
     
-    def get_config(self) -> 'NIDAQConfig':
+    def get_config(self) -> 'NIDAQ_CONFIG':
         """
         Get current configuration from the widget.
         
         Returns:
-            NIDAQConfig object with current settings
+            NIDAQ_CONFIG object with current settings
         """
         self._update_config()
         return self._config
@@ -12042,16 +12012,13 @@ class FastAcquisitionWidget(QWidget):
     
     def init_ui(self):
         """Initialize UI components."""
-        main_layout = QVBoxLayout()
-        self.setLayout(main_layout)
-        
         # Note: Hardware triggering is done via NI DAQ waveforms only
-        info_label = QLabel(
-            "Hardware triggering uses preloaded NI DAQ waveforms.\n"
-            "Trigger waveform is generated on DIO 1 (default)."
-        )
-        info_label.setWordWrap(True)
-        main_layout.addWidget(info_label)
+        # info_label = QLabel(
+        #     "Hardware triggering uses preloaded NI DAQ waveforms.\n"
+        #     "Trigger waveform is generated on DIO 1 (default)."
+        # )
+        # info_label.setWordWrap(True)
+        # main_layout.addWidget(info_label)
         
         # Acquisition parameters
         acq_group = QGroupBox("Acquisition Parameters")
@@ -12061,7 +12028,7 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox = QDoubleSpinBox()
         self.frame_rate_spinbox.setRange(0.1, 1000.0)
         self.frame_rate_spinbox.setValue(10.0)
-        self.frame_rate_spinbox.setDecimals(1)
+        self.frame_rate_spinbox.setDecimals(2)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
         self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
         acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
@@ -12070,7 +12037,7 @@ class FastAcquisitionWidget(QWidget):
         self.exposure_time_spinbox = QDoubleSpinBox()
         self.exposure_time_spinbox.setRange(0.1, 10000.0)
         self.exposure_time_spinbox.setValue(20.0)
-        self.exposure_time_spinbox.setDecimals(1)
+        self.exposure_time_spinbox.setDecimals(2)
         acq_layout.addWidget(self.exposure_time_spinbox, 1, 1)
         
         # Initialize max exposure time based on frame rate and readout time
@@ -12092,9 +12059,9 @@ class FastAcquisitionWidget(QWidget):
         self.total_time_spinbox.setSuffix(" s")
         self.total_time_spinbox.valueChanged.connect(self._update_frames_from_acquisition_time)
         acq_layout.addWidget(self.total_time_spinbox, 3, 1)
-        
+        acq_layout.setContentsMargins(8, 8, 8, 8)
         acq_group.setLayout(acq_layout)
-        main_layout.addWidget(acq_group)
+        
         
         # Initialize total time based on initial frame count
         self._update_acquisition_time_from_frames()
@@ -12109,13 +12076,14 @@ class FastAcquisitionWidget(QWidget):
         self.buffer_size_spinbox.setValue(500)
         buffer_layout.addWidget(self.buffer_size_spinbox, 0, 1)
         
-        buffer_layout.addWidget(QLabel("File Format:"), 1, 0)
+        buffer_layout.addWidget(QLabel("File Format:"), 0, 2)
         self.file_format_combo = QComboBox()
         self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5"])
-        buffer_layout.addWidget(self.file_format_combo, 1, 1)
-        
+        buffer_layout.addWidget(self.file_format_combo, 0, 3)
+
+        buffer_layout.setContentsMargins(8, 8, 8, 8)       
         buffer_group.setLayout(buffer_layout)
-        main_layout.addWidget(buffer_group)
+        
         
         # Output directory (matching RecordingWidget style)
         output_group = QGroupBox("Output")
@@ -12149,54 +12117,47 @@ class FastAcquisitionWidget(QWidget):
         
         output_layout.addLayout(path_layout)
         output_layout.addLayout(exp_layout)
+        output_layout.setContentsMargins(8, 8, 8, 8)
         output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
         
-        # Trigger mode selection
-        trigger_group = QGroupBox("Trigger Configuration")
-        trigger_layout = QGridLayout()
+        # DAQ configuration
+        daq_group = QGroupBox("DAQ Configuration")
+        daq_layout = QGridLayout()
         
-        trigger_layout.addWidget(QLabel("Trigger Mode:"), 0, 0)
+        daq_layout.addWidget(QLabel("Trigger Mode:"), 0, 0)
         self.trigger_mode_combo = QComboBox()
         self.trigger_mode_combo.addItems(["Frame Start", "Acquisition Start"])
         self.trigger_mode_combo.setToolTip(
             "Frame Start: Trigger each frame individually\n"
             "Acquisition Start: Single trigger to start continuous acquisition"
         )
-        trigger_layout.addWidget(self.trigger_mode_combo, 0, 1)
-        
-        trigger_group.setLayout(trigger_layout)
-        main_layout.addWidget(trigger_group)
-        
-        # DAQ configuration
-        daq_group = QGroupBox("DAQ Configuration")
-        daq_layout = QGridLayout()
-        
-        daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 0)
+        daq_layout.addWidget(self.trigger_mode_combo, 0, 1)
+
+        daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 2)
         self.trigger_dio_line_spinbox = QSpinBox()
         self.trigger_dio_line_spinbox.setRange(0, 31)
-        self.trigger_dio_line_spinbox.setValue(1)
+        self.trigger_dio_line_spinbox.setValue(6)
         self.trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
-        daq_layout.addWidget(self.trigger_dio_line_spinbox, 0, 1)
+        daq_layout.addWidget(self.trigger_dio_line_spinbox, 0, 3)
         
         daq_layout.addWidget(QLabel("Camera Frame DIO Line:"), 1, 0)
         self.camera_dio_line_spinbox = QSpinBox()
         self.camera_dio_line_spinbox.setRange(0, 31)
-        self.camera_dio_line_spinbox.setValue(0)
+        self.camera_dio_line_spinbox.setValue(7)
         self.camera_dio_line_spinbox.setToolTip("NI DAQ digital input line connected to camera frame signal (default: 0)")
         daq_layout.addWidget(self.camera_dio_line_spinbox, 1, 1)
         
-        daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 2, 0)
+        daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 1, 2)
         self.daq_sample_rate_spinbox = QDoubleSpinBox()
         self.daq_sample_rate_spinbox.setRange(100.0, 1000000.0)
         self.daq_sample_rate_spinbox.setValue(10000.0)
         self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
-        daq_layout.addWidget(self.daq_sample_rate_spinbox, 2, 1)
-        
+        daq_layout.addWidget(self.daq_sample_rate_spinbox, 1, 3)
+
         # Note: Analog input configuration is done in the NI DAQ tab
-        
+        daq_layout.setContentsMargins(8, 8, 8, 8)
         daq_group.setLayout(daq_layout)
-        main_layout.addWidget(daq_group)
+        
         
         # Control buttons
         control_layout = QHBoxLayout()
@@ -12209,23 +12170,32 @@ class FastAcquisitionWidget(QWidget):
         self.stop_button.setEnabled(False)
         control_layout.addWidget(self.stop_button)
         
-        main_layout.addLayout(control_layout)
-        
         # Statistics display
         stats_group = QGroupBox("Statistics")
-        stats_layout = QVBoxLayout()
+        stats_layout = QGridLayout()
         
+        
+        stats_layout.addWidget(QLabel("Buffer Fill:"), 0, 0)
         self.stats_label = QLabel("Not acquiring")
-        stats_layout.addWidget(self.stats_label)
+        stats_layout.addWidget(self.stats_label, 0, 1)
         
         self.buffer_progress_bar = QProgressBar()
         self.buffer_progress_bar.setRange(0, 100)
-        stats_layout.addWidget(QLabel("Buffer Fill:"))
-        stats_layout.addWidget(self.buffer_progress_bar)
-        
+        stats_layout.addWidget(self.buffer_progress_bar, 1, 0)
+
+        stats_layout.setRowStretch(0,2)
+        stats_layout.setRowStretch(1,1)
+        stats_layout.setContentsMargins(8, 8, 8, 8)
         stats_group.setLayout(stats_layout)
-        main_layout.addWidget(stats_group)
         
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
+        main_layout.addWidget(acq_group)
+        main_layout.addWidget(buffer_group)
+        main_layout.addWidget(output_group)
+        main_layout.addWidget(daq_group)
+        main_layout.addLayout(control_layout)
+        main_layout.addWidget(stats_group)
         main_layout.addStretch()
     
     
@@ -12250,29 +12220,7 @@ class FastAcquisitionWidget(QWidget):
         If readout time is per-row, it's multiplied by the ROI height.
         """
         try:
-            # Get readout time from camera config (in microseconds)
-            readout_time_us = CAMERA_CONFIG.READOUT_TIME_US
-            readout_time_type = CAMERA_CONFIG.READOUT_TIME_TYPE
-            
-            # Adjust readout time based on type
-            if readout_time_type.upper() == "ROW":
-                # For per-row readout, multiply by number of rows in ROI
-                try:
-                    roi = self.camera.get_region_of_interest()
-                    roi_height = roi[3]  # (offset_x, offset_y, width, height)
-                    readout_time_us = readout_time_us * roi_height
-                    self._log.debug(
-                        f"Per-row readout: {CAMERA_CONFIG.READOUT_TIME_US} us/row × {roi_height} rows = {readout_time_us} us"
-                    )
-                except Exception as e:
-                    self._log.warning(f"Failed to get ROI for readout time calculation: {e}, using global readout")
-                    # Fall back to global readout if we can't get ROI
-                    readout_time_type = "GLOBAL"
-            
-            # Convert to milliseconds
-            readout_time_ms = readout_time_us / 1000.0
-            
-            # Get current frame rate
+            readout_time_ms = self.camera.get_readout_time()
             frame_rate_hz = self.frame_rate_spinbox.value()
             
             # Calculate frame period in milliseconds
@@ -12280,7 +12228,9 @@ class FastAcquisitionWidget(QWidget):
             
             # Maximum exposure time = frame period - readout time
             # Add a small safety margin (1% of frame period) to account for timing variations
-            max_exposure_time_ms = frame_period_ms - readout_time_ms - (frame_period_ms * 0.01)
+            max_exposure_time_ms = max(frame_period_ms, readout_time_ms)-0.04
+
+            self._log.info(f"Current frame rate: {frame_rate_hz} Hz, frame period: {frame_period_ms:.2f} ms, readout time: {readout_time_ms:.2f} ms, max exposure time: {max_exposure_time_ms:.2f} ms")
             
             # Ensure minimum value
             min_exposure_ms = 0.1
@@ -12385,6 +12335,10 @@ class FastAcquisitionWidget(QWidget):
             self._log.warning(f"Failed to update frames from acquisition time: {e}")
         finally:
             self._updating_acquisition_params = False
+
+    def emit_selected_channels(self):
+        # TBD: implement this
+        pass
     
     def start_acquisition(self):
         """Start fast acquisition."""

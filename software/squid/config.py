@@ -347,15 +347,30 @@ class HamamatsuCameraModel(enum.Enum):
 
 
 class PhotometricsCameraModel(enum.Enum):
+    """Photometrics camera models supported by the system."""
     KINETIX = "KINETIX"
+    KINETIX_22 = "KINETIX_22"  # Alias for KINETIX
+    PRIME_BSI_EXPRESS = "PRIME_BSI_EXPRESS"
 
     @staticmethod
     def from_string(cam_string: str) -> Optional["PhotometricsCameraModel"]:
         """
-        Attempts to convert the given string to a Photometrics camera model.  This ignores all letter cases.
+        Attempts to convert the given string to a Photometrics camera model.
+        This ignores letter cases and handles common naming variations.
         """
+        if cam_string is None:
+            return None
         try:
-            return PhotometricsCameraModel[cam_string.upper()]
+            # Normalize the string: uppercase, replace hyphens/spaces with underscores
+            normalized = cam_string.upper().replace("-", "_").replace(" ", "_")
+            # Handle common aliases
+            if normalized in ("PRIME_BSI_EXPRESS", "BSIEXPRESS", "BSI_EXPRESS", "PRIMEBSIEXPRESS"):
+                normalized = "PRIME_BSI_EXPRESS"
+            elif normalized in ("KINETIX22", "KINETIX_22"):
+                normalized = "KINETIX_22"  # Map to base KINETIX
+            elif normalized in ("KINETIX"):
+                normalized = "KINETIX"
+            return PhotometricsCameraModel[normalized]
         except KeyError:
             return None
 

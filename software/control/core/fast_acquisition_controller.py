@@ -22,8 +22,9 @@ import matplotlib.pyplot as plt
 from squid.abc import AbstractCamera, CameraAcquisitionMode, CameraFrame
 from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
-from control.ni_daq import AbstractNIDAQ, NIDAQConfig, WaveformData, TriggerSource
+from control.ni_daq import AbstractNIDAQ, WaveformData, TriggerSource
 from control.ni_daq import generate_pulse_train
+from control._def import NIDAQ_CONFIG
 
 
 class AcquisitionCompletionStatus(Enum):
@@ -197,8 +198,8 @@ class FastAcquisitionController:
         if camera_frame_dio_line is not None:
             self._camera_frame_dio_line = camera_frame_dio_line
         
-        n_samples_offset = 0 # TBD fix this used to be 5
-        samples_per_channel = int(sample_rate_hz * duration_s) + n_samples_offset
+        n_samples_offset = 1 # TBD fix this used to be 5
+        samples_per_channel = int(sample_rate_hz * duration_s)
         
         # Get waveforms from widget or generate trigger pattern
         if waveforms is None:
@@ -241,7 +242,7 @@ class FastAcquisitionController:
         # Get DO lines from waveforms
         do_lines_from_waveforms = list(waveforms.digital_output.keys())
         
-        config = NIDAQConfig(
+        config = NIDAQ_CONFIG(
             device_name=self._ni_daq.config.device_name,
             sample_rate_hz=sample_rate_hz,
             samples_per_channel=samples_per_channel,
@@ -253,6 +254,7 @@ class FastAcquisitionController:
             ao_channels=ao_channels or [],
             trigger_source=self._ni_daq.config.trigger_source,
             continuous=False,
+            do_logic_family=self._ni_daq.config.do_logic_family,  # Preserve camera-specific logic family
         )
         
         # Configure and arm NI DAQ
@@ -306,20 +308,25 @@ class FastAcquisitionController:
         
         # Define frame callback for fast acquisition
         # Frame IDs and timestamps will be determined from DAQ synchronization
-        def frame_callback(frame: np.ndarray):
+        def frame_callback(frame: np.ndarray, metadata: dict = None):
             """Callback to write frames to buffer as they arrive.
             
-            Frame IDs and timestamps are not tracked here - they will be determined
+            If metadata is not provided here, frame timings and IDs will be determined
             from DAQ digital input synchronization after acquisition completes.
             """
             # Use sequential buffer index as placeholder frame_id
             # Real frame mapping will come from DAQ edge detection
             placeholder_frame_id = self._frame_count
+
+            if metadata is None:
+                timestamp = time.time()
+            else:
+                timestamp = float(metadata["frame_header"]["timestampEofPs"])/1e9
             
             success = self._frame_buffer.write_frame(
                 frame,
                 placeholder_frame_id,
-                time.time()
+                timestamp
             )
             
             if success:
@@ -331,7 +338,7 @@ class FastAcquisitionController:
         
         # Start fast acquisition frame grabbing (this starts camera acquisition)
         if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
-            self._camera.start_fast_acquisition_frame_grabbing(frame_callback=frame_callback)
+            self._camera.start_fast_acquisition_frame_grabbing(frame_rate_hz, frame_callback=frame_callback)
         else:
             raise NotImplementedError(
                 "Camera does not support fast acquisition frame grabbing. "

@@ -2077,6 +2077,29 @@ class FLIRCamera(AbstractCamera):
         ptr = PySpin.CFloatPtr(acquisition_frame_rate)
         ptr.SetValue(frame_rate)
 
+    def get_readout_time(self) -> float:
+        """Get the readout time of the camera in milliseconds."""
+        readout_time_us = CAMERA_CONFIG.READOUT_TIME_US
+        readout_time_type = CAMERA_CONFIG.READOUT_TIME_TYPE
+        
+        # Adjust readout time based on type
+        if readout_time_type.upper() == "ROW":
+            # For per-row readout, multiply by number of rows in ROI
+            try:
+                roi = self.camera.get_region_of_interest()
+                roi_height = roi[3]  # (offset_x, offset_y, width, height)
+                readout_time_us = readout_time_us * roi_height
+                self._log.debug(
+                    f"Per-row readout: {CAMERA_CONFIG.READOUT_TIME_US} us/row × {roi_height} rows = {readout_time_us} us"
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to get ROI for readout time calculation: {e}, using global readout")
+                # Fall back to global readout if we can't get ROI
+                readout_time_type = "GLOBAL"
+        
+        # Convert to milliseconds
+        readout_time_ms = readout_time_us / 1000.0
+
     def __del__(self):
         try:
             self.stop_streaming()

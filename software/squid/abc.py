@@ -429,7 +429,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         self._software_crop_height_ratio = 1.0
 
         # Set readout mode during initialization
-        self._initialize_readout_mode(default_readout_mode=CameraReadoutMode.GLOBAL)
+        # self._initialize_readout_mode(default_readout_mode=CameraReadoutMode.GLOBAL)
 
     def _initialize_readout_mode(self, default_readout_mode: Optional[CameraReadoutMode] = None):
         """
@@ -442,6 +442,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         readout_mode = None
         if hasattr(self._config, 'default_readout_mode') and self._config.default_readout_mode is not None:
+            self._log.info(f"Setting default readout mode to {self._config.default_readout_mode}")
             # Convert string to enum if needed
             if isinstance(self._config.default_readout_mode, str):
                 try:
@@ -462,6 +463,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         
         if readout_mode is not None:
             try:
+                self._log.info(f"Setting readout mode to {readout_mode}")
                 self.set_readout_mode(readout_mode)
             except (NotImplementedError, ValueError, CameraError) as e:
                 self._log.warning(f"Could not set readout mode to {readout_mode.value}: {e}. Using camera default.")
@@ -803,6 +805,27 @@ class AbstractCamera(metaclass=abc.ABCMeta):
     def get_black_level(self) -> float:
         """
         Gets the black level set on the camera.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_camera_mode(self) -> str:
+        """
+        Returns the current camera mode.
+        """
+        pass
+
+    @abc.abstractmethod
+    def get_available_camera_modes(self) -> List[str]:
+        """
+        Returns the list of available camera modes.
+        """
+        pass
+
+    @abc.abstractmethod
+    def set_camera_mode(self, camera_mode: str):
+        """
+        Sets the camera mode.
         """
         pass
 
