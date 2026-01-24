@@ -237,7 +237,7 @@ PRIME_BSI_EXPRESS_SPEC = PhotometricsCameraSpec(
         "sensitivity_11bit": CameraModeSpec(
             name="Sensitivity",
             bit_depth=11,
-            port_value=2,  # Same port as speed, different gain
+            port_value=0,  # Same port as speed, different gain
             speed_index=0,
             gain_index=3,
             line_time_us=5.14,  # 200 MHz clock
