@@ -1828,6 +1828,29 @@ class LiveControlWidget(QFrame):
         self.entry_illuminationIntensity.setFixedWidth(max_width)
         self.btn_autolevel.setFixedWidth(max_width)
 
+        # Snap frame grabber UI (similar to FastAcquisitionWidget Output box)
+        from control._def import DEFAULT_SAVING_PATH
+        self.lineEdit_snapSavingDir = QLineEdit()
+        self.lineEdit_snapSavingDir.setReadOnly(True)
+        self.lineEdit_snapSavingDir.setText(DEFAULT_SAVING_PATH)
+        self.snap_saving_path = DEFAULT_SAVING_PATH
+        
+        self.btn_setSnapSavingDir = QPushButton("Browse")
+        self.btn_setSnapSavingDir.setDefault(False)
+        try:
+            self.btn_setSnapSavingDir.setIcon(QIcon("icon/folder.png"))
+        except:
+            pass  # Icon file may not exist
+        self.btn_setSnapSavingDir.clicked.connect(self.set_snap_saving_dir)
+        
+        self.lineEdit_snapTag = QLineEdit()
+        self.lineEdit_snapTag.setPlaceholderText("Enter tag (optional)")
+        
+        self.btn_snap = QPushButton("Snap")
+        self.btn_snap.setDefault(False)
+        self.btn_snap.setStyleSheet("background-color: #FFC2C2")
+        self.btn_snap.clicked.connect(self.snap_frame)
+
         # connections
         self.entry_triggerFPS.valueChanged.connect(self.liveController.set_trigger_fps)
         self.entry_displayFPS.valueChanged.connect(self.streamHandler.set_display_fps)
@@ -1886,6 +1909,29 @@ class LiveControlWidget(QFrame):
             else:
                 grid_line05.addWidget(self.label_resolutionScaling)
 
+        # Snap frame grabber layout
+        snap_group = QGroupBox("Snap")
+        snap_layout = QVBoxLayout()
+        
+        snap_path_layout = QGridLayout()
+        snap_path_layout.addWidget(QLabel("Saving Path"), 0, 0)
+        snap_path_layout.addWidget(self.lineEdit_snapSavingDir, 0, 1)
+        snap_path_layout.addWidget(self.btn_setSnapSavingDir, 0, 2)
+        
+        snap_tag_layout = QGridLayout()
+        snap_tag_layout.addWidget(QLabel("Tag"), 0, 0)
+        snap_tag_layout.addWidget(self.lineEdit_snapTag, 0, 1)
+        
+        snap_button_layout = QHBoxLayout()
+        snap_button_layout.addWidget(self.btn_snap)
+        snap_button_layout.addStretch()
+        
+        snap_layout.addLayout(snap_path_layout)
+        snap_layout.addLayout(snap_tag_layout)
+        snap_layout.addLayout(snap_button_layout)
+        snap_layout.setContentsMargins(8, 8, 8, 8)
+        snap_group.setLayout(snap_layout)
+
         self.grid = QVBoxLayout()
         if show_trigger_options:
             self.grid.addLayout(grid_line0)
@@ -1894,6 +1940,7 @@ class LiveControlWidget(QFrame):
         self.grid.addLayout(grid_line4)
         if show_display_options:
             self.grid.addLayout(grid_line05)
+        self.grid.addWidget(snap_group)
         if not stretch:
             self.grid.addStretch()
         self.setLayout(self.grid)
@@ -1906,6 +1953,73 @@ class LiveControlWidget(QFrame):
         else:
             self.liveController.stop_live()
             self.btn_live.setText("Start Live")
+
+    def set_snap_saving_dir(self):
+        """Set saving directory for snap frames."""
+        dialog = QFileDialog()
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_snapSavingDir.text())
+        if save_dir_base:
+            self.lineEdit_snapSavingDir.setText(save_dir_base)
+            self.snap_saving_path = save_dir_base
+
+    def snap_frame(self):
+        """Capture and save the most recent frame from Live View."""
+        import imageio
+        from datetime import datetime
+        
+        was_live_before_snap = self.liveController.is_live
+        
+        try:
+            # If not live, start it
+            if not was_live_before_snap:
+                self.liveController.start_live()
+                # Wait for camera to start and capture at least one frame
+                # Wait for exposure time + some buffer
+                exposure_time_ms = self.entry_exposureTime.value()
+                wait_time_s = max(0.5, (exposure_time_ms / 1000.0) * 2)
+                time.sleep(wait_time_s)
+            
+            # Get the most recent frame
+            frame = self.camera.read_camera_frame()
+            if frame is None:
+                self._log.warning("Failed to capture frame for snap")
+                msg = QMessageBox()
+                msg.setText("Failed to capture frame. Please ensure the camera is streaming.")
+                msg.exec_()
+                return
+            
+            # Extract image data
+            image = np.squeeze(frame.frame)
+            
+            # Display the frame if streamHandler has display function
+            if hasattr(self.streamHandler, '_fns') and hasattr(self.streamHandler._fns, 'image_to_display'):
+                self.streamHandler._fns.image_to_display(image)
+            
+            # Generate filename with tag and timestamp
+            tag = self.lineEdit_snapTag.text().strip()
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            
+            if tag:
+                filename = f"{timestamp}_{tag}.tif"
+            else:
+                filename = f"{timestamp}_snap.tif"
+            
+            filepath = os.path.join(self.snap_saving_path, filename)
+            
+            # Save as TIFF
+            imageio.imwrite(filepath, image)
+            
+            self._log.info(f"Snap frame saved to: {filepath}")
+            
+        except Exception as e:
+            self._log.error(f"Error during snap: {e}")
+            msg = QMessageBox()
+            msg.setText(f"Error saving snap frame: {str(e)}")
+            msg.exec_()
+        finally:
+            # Stop live if it wasn't running before
+            if not was_live_before_snap:
+                self.liveController.stop_live()
 
     def toggle_autolevel(self, autolevel_on):
         self.btn_autolevel.setChecked(autolevel_on)
@@ -11690,12 +11804,9 @@ class NIDAQWidget(QWidget):
             # Stop the task
             self._ni_daq.stop()
             
-            # Update internal waveforms to zeros
-            self._ao_waveforms.update(zero_ao_waveforms)
-            self._do_patterns.update(zero_do_patterns)
-            
-            # Update plot
-            self._update_waveform_plot()
+            # Note: We do NOT update self._ao_waveforms or self._do_patterns here
+            # to preserve the user's configured waveforms. Only the hardware outputs
+            # are zeroed, not the stored waveform data.
             
             self._log.info(f"Zeroed all outputs: {len(ao_channels)} AO channels, {len(do_lines)} DO lines")
             
