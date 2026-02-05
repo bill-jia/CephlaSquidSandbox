@@ -11248,6 +11248,16 @@ class NIDAQWidget(QWidget):
         self.continuous_checkbox.stateChanged.connect(self.on_config_changed)
         device_layout.addWidget(self.continuous_checkbox)
         
+        # Link to Fast Acquisition: when enabled, changing total time or DAQ sample rate
+        # in Fast Acquisition widget will update this widget's waveforms.
+        self.link_to_fast_acquisition_checkbox = QCheckBox("Link to Fast Acquisition")
+        self.link_to_fast_acquisition_checkbox.setChecked(True)
+        self.link_to_fast_acquisition_checkbox.setToolTip(
+            "When enabled, changing total acquisition time or DAQ sample rate in Fast Acquisition "
+            "will update this widget's waveforms and sample rate."
+        )
+        device_layout.addWidget(self.link_to_fast_acquisition_checkbox)
+        
         device_group.setLayout(device_layout)
         left_panel.addWidget(device_group)
         
@@ -11455,6 +11465,10 @@ class NIDAQWidget(QWidget):
         """Handle configuration changes."""
         self._update_config()
         self._update_duration_display()
+    
+    def is_linked_to_fast_acquisition(self) -> bool:
+        """Return True if this widget should be updated when Fast Acquisition parameters change."""
+        return self.link_to_fast_acquisition_checkbox.isChecked()
     
     def _update_config(self):
         """Update the configuration from UI values."""
@@ -12527,7 +12541,7 @@ class FastAcquisitionWidget(QWidget):
         if self._updating_acquisition_params or self._is_acquiring:
             return
         
-        if self.ni_daq_widget is None:
+        if self.ni_daq_widget is None or not self.ni_daq_widget.is_linked_to_fast_acquisition():
             return
         
         try:
@@ -12627,8 +12641,9 @@ class FastAcquisitionWidget(QWidget):
             total_time_s = num_frames / frame_rate_hz
             self.total_time_spinbox.setValue(total_time_s)
             
-            # Update waveforms in NI DAQ widget if available
-            if self.ni_daq_widget and not self._is_acquiring:
+            # Update waveforms in NI DAQ widget if available and linking is enabled
+            if (self.ni_daq_widget and not self._is_acquiring
+                    and self.ni_daq_widget.is_linked_to_fast_acquisition()):
                 try:
                     sample_rate_hz = self.daq_sample_rate_spinbox.value()
                     self.ni_daq_widget.update_waveforms_for_duration(total_time_s, sample_rate_hz)
@@ -12664,8 +12679,9 @@ class FastAcquisitionWidget(QWidget):
             # Update the spinbox
             self.num_frames_spinbox.setValue(num_frames)
             
-            # Update waveforms in NI DAQ widget if available
-            if self.ni_daq_widget and not self._is_acquiring:
+            # Update waveforms in NI DAQ widget if available and linking is enabled
+            if (self.ni_daq_widget and not self._is_acquiring
+                    and self.ni_daq_widget.is_linked_to_fast_acquisition()):
                 try:
                     sample_rate_hz = self.daq_sample_rate_spinbox.value()
                     self.ni_daq_widget.update_waveforms_for_duration(total_time_s, sample_rate_hz)
