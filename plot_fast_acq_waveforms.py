@@ -36,7 +36,9 @@ def list_available_lines(h5f: h5py.File) -> Tuple[list, list]:
         do_lines = [int(name.replace("line", "")) for name in h5f["digital_output"].keys()]
     if "digital_input" in h5f:
         di_lines = [int(name.replace("line", "")) for name in h5f["digital_input"].keys()]
-    return sorted(do_lines), sorted(di_lines)
+    if "analog_input" in h5f:
+        ai_lines = [int(name.replace("ai", "")) for name in h5f["analog_input"].keys()]
+    return sorted(do_lines), sorted(di_lines), sorted(ai_lines)
 
 
 def pick_line(requested: Optional[int], available: list, kind: str) -> int:
@@ -58,6 +60,7 @@ def main():
     parser.add_argument("--folder", required=True, help="Fast acquisition output folder (contains waveforms/daq_data.h5)")
     parser.add_argument("--trigger-line", type=int, default=None, help="Digital output line for camera trigger (e.g., 1)")
     parser.add_argument("--exposure-line", type=int, default=None, help="Digital input line for camera exposure/frames (e.g., 0)")
+    parser.add_argument("--ai-line", type=int, default=None, help="Analog input lines for acquired data")
     parser.add_argument("--save", action="store_true", help="Save plot as PNG in the same folder")
     args = parser.parse_args()
 
@@ -82,12 +85,14 @@ def main():
             h5f.close()
             raise RuntimeError(f"Sample rate / samples acquired not found in {h5_path}: {e}")
 
-    do_lines, di_lines = list_available_lines(h5f)
+    do_lines, di_lines, ai_lines = list_available_lines(h5f)
     trigger_line = pick_line(args.trigger_line, do_lines, "trigger (DO)")
     exposure_line = pick_line(args.exposure_line, di_lines, "exposure (DI)")
+    ai_line = pick_line(args.ai_line, ai_lines, "analog input (AI)")
 
     trigger_ds = h5f["digital_output"][f"line{trigger_line}"][:]
     exposure_ds = h5f["digital_input"][f"line{exposure_line}"][:]
+    ai_ds = h5f["analog_input"][f"ai{ai_line}"][:]
 
     n_samples = len(trigger_ds)
     t = np.arange(n_samples) / sample_rate
@@ -118,7 +123,16 @@ def main():
         ax2.hist(np.diff(frame_timestamps_ms), bins=100, color="red", label="Frame timestamps")
         ax2.set_title("Frame timing distribution (ms)")
         plt.tight_layout()
-    
+
+
+    fig2, ax2 = plt.subplots(figsize=(10, 5), sharex=True)
+    ax2.plot(t, ai_ds.astype(float), label=f"Analog input AI line {ai_line}")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Voltage (V)")
+    ax2.set_title("Fast Acquisition: Analog Input Waveform")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="upper right")
+
     plt.show()
     
 

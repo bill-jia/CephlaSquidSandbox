@@ -631,7 +631,10 @@ class NIDAQ(AbstractNIDAQ):
                     trigger_edge=constants.Edge.RISING,
                 )
             
-            # Build DO data array
+            # Build DO data array.
+            # nidaqmx accepts boolean only when there is a single channel; for multiple
+            # lines we must pass a 2D array of shape (num_channels, num_samples) with
+            # integer dtype (e.g. uint8), not bool.
             do_data = []
             for line in self._config.do_lines:
                 if line in self._waveforms.digital_output:
@@ -640,9 +643,13 @@ class NIDAQ(AbstractNIDAQ):
                     do_data.append(np.zeros(num_samples, dtype=bool))
             
             if len(self._config.do_lines) == 1:
+                self._log.info(f"Writing single line DO data: {do_data[0].shape}")
                 self._do_task.write(do_data[0], auto_start=False)
             else:
-                self._do_task.write(do_data, auto_start=False)
+                # Stack into (num_channels, num_samples) and use uint8 so multi-line write accepts it
+                # do_array = np.array(do_data, dtype=np.uint8)
+                do_array = np.array(do_data, dtype=np.bool)
+                self._do_task.write(do_array, auto_start=False)
         
         # Set up Digital Input task
         if len(self._config.di_lines) > 0:
