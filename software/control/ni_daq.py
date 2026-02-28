@@ -191,6 +191,22 @@ class AbstractNIDAQ(abc.ABC):
         """Get information about a specific device."""
         pass
 
+    def start_live_output(
+        self,
+        ao_values: Optional[Dict[str, float]] = None,
+        do_values: Optional[Dict[int, bool]] = None,
+    ) -> None:
+        """Output constant values for debugging. Override in hardware implementation."""
+        pass
+
+    def stop_live_output(self) -> None:
+        """Stop constant live output. Override in hardware implementation."""
+        pass
+
+    def release_tasks(self) -> None:
+        """Stop and close all tasks so the device is free for new tasks (e.g. live output or re-arm)."""
+        pass
+
 
 class NIDAQ(AbstractNIDAQ):
     """
@@ -220,6 +236,8 @@ class NIDAQ(AbstractNIDAQ):
         self._do_task = None
         self._di_task = None
         self._ai_task = None
+        self._live_ao_task = None
+        self._live_do_task = None
         
         self._waveforms: Optional[WaveformData] = None
         self._acquired_data: Optional[np.ndarray] = None
@@ -279,6 +297,7 @@ class NIDAQ(AbstractNIDAQ):
             if self._is_running:
                 raise RuntimeError("Cannot configure while tasks are running")
             self._config = config
+            self._stop_live_output()
             self._cleanup_tasks()
     
     def set_waveforms(self, waveforms: WaveformData) -> None:
@@ -312,7 +331,7 @@ class NIDAQ(AbstractNIDAQ):
             if self._is_armed:
                 self._log.warning("Tasks already armed, stopping first")
                 self._stop_internal()
-            
+            self._stop_live_output()
             self._cleanup_tasks()
             self._setup_tasks()
             self._is_armed = True
@@ -530,6 +549,118 @@ class NIDAQ(AbstractNIDAQ):
             except Exception:
                 pass
             self._di_task = None
+        self._stop_live_output()
+    
+    def _stop_live_output(self) -> None:
+        """Stop and close live output tasks (constant DC output for debugging)."""
+        if self._live_ao_task is not None:
+            try:
+                self._live_ao_task.stop()
+            except Exception:
+                pass
+            try:
+                self._live_ao_task.close()
+            except Exception:
+                pass
+            self._live_ao_task = None
+        if self._live_do_task is not None:
+            try:
+                self._live_do_task.stop()
+            except Exception:
+                pass
+            try:
+                self._live_do_task.close()
+            except Exception:
+                pass
+            self._live_do_task = None
+    
+    def start_live_output(
+        self,
+        ao_values: Optional[Dict[str, float]] = None,
+        do_values: Optional[Dict[int, bool]] = None,
+    ) -> None:
+        """
+        Output constant values to AO/DO channels for debugging. Does not modify
+        waveform/pattern data. Use stop_live_output() or arm() to clear.
+        """
+        if ao_values is None:
+            ao_values = {}
+        if do_values is None:
+            do_values = {}
+        with self._lock:
+            self._stop_live_output()
+            if not ao_values and not do_values:
+                return
+            device = self._config.device_name
+            nidaqmx = self._nidaqmx
+            constants = self._constants
+            # Many devices require samps_per_chan >= 2; use 2 samples and repeat the value
+            LIVE_SAMPS = 2
+            try:
+                if ao_values:
+                    self._live_ao_task = nidaqmx.Task("live_ao")
+                    for ch in ao_values:
+                        phys = f"{device}/{ch}"
+                        self._live_ao_task.ao_channels.add_ao_voltage_chan(
+                            phys,
+                            min_val=self._config.ao_min_voltage,
+                            max_val=self._config.ao_max_voltage,
+                        )
+                    self._live_ao_task.timing.cfg_samp_clk_timing(
+                        rate=1000.0,
+                        sample_mode=constants.AcquisitionType.FINITE,
+                        samps_per_chan=LIVE_SAMPS,
+                    )
+                    vals = [ao_values[ch] for ch in ao_values]
+                    if len(vals) == 1:
+                        self._live_ao_task.write(
+                            np.full(LIVE_SAMPS, vals[0], dtype=np.float64),
+                            auto_start=False,
+                        )
+                    else:
+                        self._live_ao_task.write(
+                            [np.full(LIVE_SAMPS, v, dtype=np.float64) for v in vals],
+                            auto_start=False,
+                        )
+                    self._live_ao_task.start()
+                if do_values:
+                    self._live_do_task = nidaqmx.Task("live_do")
+                    for line in do_values:
+                        phys = f"{device}/{self._config.do_port}/line{line}"
+                        self._live_do_task.do_channels.add_do_chan(phys)
+                    self._live_do_task.timing.cfg_samp_clk_timing(
+                        rate=1000.0,
+                        sample_mode=constants.AcquisitionType.FINITE,
+                        samps_per_chan=LIVE_SAMPS,
+                    )
+                    vals = [do_values[line] for line in do_values]
+                    if len(vals) == 1:
+                        self._live_do_task.write(
+                            np.full(LIVE_SAMPS, bool(vals[0])),
+                            auto_start=False,
+                        )
+                    else:
+                        arr = np.array(
+                            [[bool(v)] * LIVE_SAMPS for v in vals],
+                            dtype=np.uint8,
+                        )
+                        self._live_do_task.write(arr, auto_start=False)
+                    self._live_do_task.start()
+            except Exception as e:
+                self._log.error(f"Failed to start live output: {e}", exc_info=True)
+                self._stop_live_output()
+    
+    def stop_live_output(self) -> None:
+        """Stop constant live output (same as _stop_live_output but acquires lock)."""
+        with self._lock:
+            self._stop_live_output()
+
+    def release_tasks(self) -> None:
+        """Stop and close all tasks so the device is free for new tasks (e.g. live output or re-arm)."""
+        with self._lock:
+            self._stop_internal()
+            self._cleanup_tasks()
+            self._log.info("Tasks released; device free for new tasks")
     
     def _setup_tasks(self) -> None:
         """Set up all configured tasks."""

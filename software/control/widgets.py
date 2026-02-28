@@ -11339,6 +11339,22 @@ class NIDAQWidget(QWidget):
         do_group.setLayout(do_layout)
         left_panel.addWidget(do_group)
         
+        # Live output (constant values for debugging; does not overwrite waveform/pattern data)
+        live_group = QGroupBox("Live Output")
+        live_group.setToolTip(
+            "Send constant values to outputs for debugging. Only channels/lines with a "
+            "pattern or waveform appear. Does not change your acquisition data."
+        )
+        live_layout = QVBoxLayout()
+        self._live_output_container = QWidget()
+        self._live_output_layout = QVBoxLayout(self._live_output_container)
+        self._live_output_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.addWidget(self._live_output_container)
+        self._live_ao_controls = {}  # channel -> {live_cb, slider, value_label}
+        self._live_do_controls = {}  # line -> {live_cb, high_cb}
+        live_group.setLayout(live_layout)
+        left_panel.addWidget(live_group)
+        
         # Analog Input Configuration Group
         ai_group = QGroupBox("Analog Input Channels")
         ai_layout = QVBoxLayout()
@@ -11493,6 +11509,7 @@ class NIDAQWidget(QWidget):
         
         main_layout.addLayout(right_panel, 2)
         self.on_device_changed(self.device_combo.currentText())
+        self._rebuild_live_output_controls()
 
     
     def on_refresh(self):
@@ -11623,6 +11640,7 @@ class NIDAQWidget(QWidget):
             if channel and waveform is not None:
                 self._ao_waveforms[channel] = waveform
                 self._update_waveform_plot()
+                self._rebuild_live_output_controls()
     
     def show_do_pattern_dialog(self):
         """Show dialog to configure digital output pattern."""
@@ -11637,6 +11655,7 @@ class NIDAQWidget(QWidget):
             if line is not None and pattern is not None:
                 self._do_patterns[line] = pattern
                 self._update_waveform_plot()
+                self._rebuild_live_output_controls()
     
     def _update_waveform_plot(self):
         """Update the waveform display plot."""
@@ -11820,6 +11839,85 @@ class NIDAQWidget(QWidget):
         
         # Update waveform plot
         self._update_waveform_plot()
+    
+    def _rebuild_live_output_controls(self):
+        """Rebuild the Live output panel from current _ao_waveforms and _do_patterns."""
+        # Clear existing
+        while self._live_output_layout.count():
+            item = self._live_output_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._live_ao_controls.clear()
+        self._live_do_controls.clear()
+        if self._ni_daq is None:
+            return
+        self._update_config()
+        v_min = getattr(self._config, 'ao_min_voltage', -10.0)
+        v_max = getattr(self._config, 'ao_max_voltage', 10.0)
+        for channel in sorted(self._ao_waveforms.keys()):
+            row = QHBoxLayout()
+            live_cb = QCheckBox("Live")
+            live_cb.setToolTip("Output constant voltage to this channel for debugging")
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 1000)
+            slider.setValue(500)
+            slider.setToolTip(f"Voltage: {v_min} to {v_max} V")
+            value_label = QLabel("0.00 V")
+            value_label.setMinimumWidth(48)
+            def _make_ao_sync(ch, sl, lab):
+                def _sync():
+                    v = v_min + (v_max - v_min) * (sl.value() / 1000.0)
+                    lab.setText(f"{v:.2f} V")
+                    self._apply_live_output()
+                return _sync
+            live_cb.stateChanged.connect(lambda checked, c=channel: self._apply_live_output())
+            slider.valueChanged.connect(_make_ao_sync(channel, slider, value_label))
+            _make_ao_sync(channel, slider, value_label)()
+            row.addWidget(QLabel(channel))
+            row.addWidget(live_cb)
+            row.addWidget(slider)
+            row.addWidget(value_label)
+            self._live_output_layout.addLayout(row)
+            self._live_ao_controls[channel] = {"live_cb": live_cb, "slider": slider, "value_label": value_label}
+        for line in sorted(self._do_patterns.keys()):
+            row = QHBoxLayout()
+            live_cb = QCheckBox("Live")
+            live_cb.setToolTip("Output constant level to this line for debugging")
+            high_cb = QCheckBox("High")
+            high_cb.setToolTip("When Live is on: checked = high, unchecked = low")
+            live_cb.stateChanged.connect(lambda: self._apply_live_output())
+            high_cb.stateChanged.connect(lambda: self._apply_live_output())
+            row.addWidget(QLabel(f"Line {line}"))
+            row.addWidget(live_cb)
+            row.addWidget(high_cb)
+            self._live_output_layout.addLayout(row)
+            self._live_do_controls[line] = {"live_cb": live_cb, "high_cb": high_cb}
+        if not self._live_ao_controls and not self._live_do_controls:
+            self._live_output_layout.addWidget(QLabel("Add a waveform or pattern above to enable live control."))
+    
+    def _apply_live_output(self):
+        """Send current live output values to the DAQ (does not overwrite waveform/pattern data)."""
+        if self._ni_daq is None:
+            return
+        self._update_config()
+        v_min = getattr(self._config, 'ao_min_voltage', -10.0)
+        v_max = getattr(self._config, 'ao_max_voltage', 10.0)
+        ao_values = {}
+        for channel, ctrl in self._live_ao_controls.items():
+            if ctrl["live_cb"].isChecked():
+                v = v_min + (v_max - v_min) * (ctrl["slider"].value() / 1000.0)
+                ao_values[channel] = float(v)
+        do_values = {}
+        for line, ctrl in self._live_do_controls.items():
+            if ctrl["live_cb"].isChecked():
+                do_values[line] = ctrl["high_cb"].isChecked()
+        try:
+            if ao_values or do_values:
+                self._ni_daq.start_live_output(ao_values=ao_values, do_values=do_values)
+            else:
+                self._ni_daq.stop_live_output()
+        except Exception as e:
+            self._log.error(f"Live output failed: {e}", exc_info=True)
     
     def _on_daq_only_duration_changed(self, duration_s: float):
         """Sync Device Configuration from DAQ-only Duration: set samples = duration * rate, update waveforms."""
@@ -12040,8 +12138,9 @@ class NIDAQWidget(QWidget):
             import time
             time.sleep(0.1)
             
-            # Stop the task
+            # Stop and release tasks so the device is free for live output or next acquisition
             self._ni_daq.stop()
+            self._ni_daq.release_tasks()
             
             # Note: We do NOT update self._ao_waveforms or self._do_patterns here
             # to preserve the user's configured waveforms. Only the hardware outputs
