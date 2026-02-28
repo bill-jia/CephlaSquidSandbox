@@ -86,13 +86,25 @@ def main():
             raise RuntimeError(f"Sample rate / samples acquired not found in {h5_path}: {e}")
 
     do_lines, di_lines, ai_lines = list_available_lines(h5f)
+    
     trigger_line = pick_line(args.trigger_line, do_lines, "trigger (DO)")
-    exposure_line = pick_line(args.exposure_line, di_lines, "exposure (DI)")
-    ai_line = pick_line(args.ai_line, ai_lines, "analog input (AI)")
-
     trigger_ds = h5f["digital_output"][f"line{trigger_line}"][:]
-    exposure_ds = h5f["digital_input"][f"line{exposure_line}"][:]
-    ai_ds = h5f["analog_input"][f"ai{ai_line}"][:]
+    
+
+    try:
+        exposure_line = pick_line(args.exposure_line, di_lines, "exposure (DI)")
+        exposure_ds = h5f["digital_input"][f"line{exposure_line}"][:]
+    except:
+        exposure_line = "N/A"
+        exposure_ds = np.zeros_like(trigger_ds)
+
+    try:
+        ai_line = pick_line(args.ai_line, ai_lines, "analog input (AI)")
+        ai_ds = h5f["analog_input"][f"ai{ai_line}"][:]
+    except:
+        ai_line = "N/A"
+        ai_ds = np.zeros_like(trigger_ds)
+    
 
     n_samples = len(trigger_ds)
     t = np.arange(n_samples) / sample_rate
@@ -132,6 +144,12 @@ def main():
     ax2.set_title("Fast Acquisition: Analog Input Waveform")
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc="upper right")
+
+
+    if args.save:
+        out_path = os.path.join(args.folder, "waveforms", f"daq_ai_{ai_line}.svg")
+        plt.savefig(out_path)
+        print(f"Saved plot to {out_path}")
 
     plt.show()
     

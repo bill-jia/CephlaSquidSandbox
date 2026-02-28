@@ -324,8 +324,16 @@ class NIDAQ(AbstractNIDAQ):
             if not self._is_armed:
                 raise RuntimeError("Tasks must be armed before triggering")
             if self._config.trigger_source == TriggerSource.INTERNAL:
-                master_task = self._ao_task if self._ao_task is not None else self._do_task if self._do_task is not None else self._di_task
-                self._log.info(f"Using internal start trigger from {master_task.name}")
+                master_task = (
+                    self._ao_task if self._ao_task is not None
+                    else self._do_task if self._do_task is not None
+                    else self._di_task if self._di_task is not None
+                    else self._ai_task
+                )
+                if master_task is not None:
+                    self._log.info(f"Using internal start trigger from {master_task.name}")
+                else:
+                    self._log.info("Using internal start trigger (no output/input tasks configured)")
             else:
                 self._log.info(f"Starting trigger with source {self._config.trigger_source}")
             

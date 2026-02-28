@@ -11168,6 +11168,8 @@ class NIDAQWidget(QWidget):
     
     signal_acquisition_started = Signal()
     signal_acquisition_finished = Signal()
+    # Emitted when DAQ-only acquisition completes (status, error_message); use so main thread updates UI
+    signal_daq_only_completed = Signal(object, object)
     
     def __init__(self, ni_daq: AbstractNIDAQ, is_simulation: bool = False, parent=None):
         super().__init__(parent)
@@ -11186,6 +11188,9 @@ class NIDAQWidget(QWidget):
         # Waveform data storage
         self._ao_waveforms: dict = {}  # channel -> np.ndarray
         self._do_patterns: dict = {}   # line -> np.ndarray
+        
+        # DAQ-only completion: signal ensures slot runs on main thread when callback is from worker thread
+        self.signal_daq_only_completed.connect(self._on_daq_only_acquisition_completed)
         
         # Initialize UI
         self.init_ui()
@@ -11222,7 +11227,6 @@ class NIDAQWidget(QWidget):
         self.sample_rate_spin.setRange(1, 1000000)
         self.sample_rate_spin.setValue(10000)
         self.sample_rate_spin.setDecimals(0)
-        self.sample_rate_spin.valueChanged.connect(self.on_config_changed)
         rate_row.addWidget(self.sample_rate_spin)
         device_layout.addLayout(rate_row)
         
@@ -11232,7 +11236,6 @@ class NIDAQWidget(QWidget):
         self.num_samples_spin = QSpinBox()
         self.num_samples_spin.setRange(2, 10000000)
         self.num_samples_spin.setValue(10000)
-        self.num_samples_spin.valueChanged.connect(self.on_config_changed)
         samples_row.addWidget(self.num_samples_spin)
         device_layout.addLayout(samples_row)
         
@@ -11354,6 +11357,82 @@ class NIDAQWidget(QWidget):
         
         ai_group.setLayout(ai_layout)
         left_panel.addWidget(ai_group)
+        
+        # DAQ-only Fast Acquisition (no camera, waveform output + recording only)
+        daq_acq_group = QGroupBox("DAQ-only Fast Acquisition")
+        daq_acq_group.setToolTip(
+            "Run a timed waveform experiment: output AO/DO waveforms and record AI/DI. "
+            "No camera or frame recording."
+        )
+        daq_acq_layout = QVBoxLayout()
+        
+        daq_path_row = QHBoxLayout()
+        daq_path_row.addWidget(QLabel("Saving Path:"))
+        self.daq_only_saving_dir_edit = QLineEdit()
+        self.daq_only_saving_dir_edit.setReadOnly(True)
+        from control._def import DEFAULT_SAVING_PATH
+        self.daq_only_saving_dir_edit.setText(DEFAULT_SAVING_PATH)
+        self._daq_only_output_path = DEFAULT_SAVING_PATH
+        daq_path_row.addWidget(self.daq_only_saving_dir_edit)
+        self.daq_only_browse_btn = QPushButton("Browse")
+        self.daq_only_browse_btn.clicked.connect(self._daq_only_set_saving_dir)
+        daq_path_row.addWidget(self.daq_only_browse_btn)
+        daq_acq_layout.addLayout(daq_path_row)
+        
+        daq_exp_row = QHBoxLayout()
+        daq_exp_row.addWidget(QLabel("Experiment ID:"))
+        self.daq_only_experiment_id_edit = QLineEdit()
+        self.daq_only_experiment_id_edit.setPlaceholderText("Optional name for this run")
+        daq_exp_row.addWidget(self.daq_only_experiment_id_edit)
+        daq_acq_layout.addLayout(daq_exp_row)
+        
+        daq_dur_row = QHBoxLayout()
+        daq_dur_row.addWidget(QLabel("Duration (s):"))
+        self.daq_only_duration_spin = QDoubleSpinBox()
+        self.daq_only_duration_spin.setRange(0.001, 86400.0)
+        self.daq_only_duration_spin.setValue(10.0)
+        self.daq_only_duration_spin.setDecimals(3)
+        self.daq_only_duration_spin.setSuffix(" s")
+        daq_dur_row.addWidget(self.daq_only_duration_spin)
+        daq_acq_layout.addLayout(daq_dur_row)
+        
+        daq_btn_row = QHBoxLayout()
+        self.daq_only_start_btn = QPushButton("Start DAQ Experiment")
+        self.daq_only_start_btn.clicked.connect(self._start_daq_only_acquisition)
+        self.daq_only_start_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        daq_btn_row.addWidget(self.daq_only_start_btn)
+        self.daq_only_stop_btn = QPushButton("Stop")
+        self.daq_only_stop_btn.clicked.connect(self._stop_daq_only_acquisition)
+        self.daq_only_stop_btn.setEnabled(False)
+        self.daq_only_stop_btn.setStyleSheet("background-color: #f44336; color: white;")
+        daq_btn_row.addWidget(self.daq_only_stop_btn)
+        daq_acq_layout.addLayout(daq_btn_row)
+        
+        daq_status_row = QHBoxLayout()
+        daq_status_row.addWidget(QLabel("Status:"))
+        self.daq_only_status_label = QLabel("Ready")
+        self.daq_only_status_label.setStyleSheet("font-weight: bold;")
+        daq_status_row.addWidget(self.daq_only_status_label)
+        daq_status_row.addStretch()
+        daq_acq_layout.addLayout(daq_status_row)
+        
+        daq_acq_group.setLayout(daq_acq_layout)
+        left_panel.addWidget(daq_acq_group)
+        
+        self._daq_only_controller: Optional[FastAcquisitionController] = None
+        self._daq_only_acquiring = False
+        self._updating_daq_duration_sync = False  # prevent re-entrancy when syncing duration <-> samples
+        
+        # Sync Device Configuration with DAQ-only Duration: connect after both panels exist
+        self.sample_rate_spin.valueChanged.connect(self._on_device_sample_rate_changed)
+        self.num_samples_spin.valueChanged.connect(self._on_device_samples_changed)
+        self.daq_only_duration_spin.valueChanged.connect(self._on_daq_only_duration_changed)
+        # Initial sync: set duration to match device (samples/rate)
+        self.daq_only_duration_spin.blockSignals(True)
+        self.daq_only_duration_spin.setValue(
+            self.num_samples_spin.value() / max(1.0, self.sample_rate_spin.value())
+        )
+        self.daq_only_duration_spin.blockSignals(False)
         
         left_panel.addStretch()
         main_layout.addLayout(left_panel, 1)
@@ -11741,6 +11820,152 @@ class NIDAQWidget(QWidget):
         
         # Update waveform plot
         self._update_waveform_plot()
+    
+    def _on_daq_only_duration_changed(self, duration_s: float):
+        """Sync Device Configuration from DAQ-only Duration: set samples = duration * rate, update waveforms."""
+        if self._updating_daq_duration_sync:
+            return
+        self._updating_daq_duration_sync = True
+        try:
+            rate = self.sample_rate_spin.value()
+            self.update_waveforms_for_duration(duration_s, rate)
+            self._update_duration_display()
+        finally:
+            self._updating_daq_duration_sync = False
+    
+    def _on_device_samples_changed(self):
+        """Sync DAQ-only Duration from Device Configuration samples: duration = samples / rate, update waveforms."""
+        if self._updating_daq_duration_sync:
+            return
+        self.on_config_changed()
+        self._updating_daq_duration_sync = True
+        try:
+            samples = self.num_samples_spin.value()
+            rate = self.sample_rate_spin.value()
+            if rate <= 0:
+                rate = 1.0
+            duration_s = samples / rate
+            self.daq_only_duration_spin.blockSignals(True)
+            self.daq_only_duration_spin.setValue(duration_s)
+            self.daq_only_duration_spin.blockSignals(False)
+            self.update_waveforms_for_duration(duration_s, rate)
+        finally:
+            self._updating_daq_duration_sync = False
+    
+    def _on_device_sample_rate_changed(self):
+        """Hold duration constant: set samples = duration * new_rate, resample waveforms."""
+        if self._updating_daq_duration_sync:
+            return
+        self._updating_daq_duration_sync = True
+        try:
+            duration_s = self.daq_only_duration_spin.value()
+            new_rate = self.sample_rate_spin.value()
+            self.update_waveforms_for_sample_rate(new_rate, duration_s)
+            self._update_config()
+        finally:
+            self._updating_daq_duration_sync = False
+    
+    def _daq_only_set_saving_dir(self):
+        """Set saving directory for DAQ-only fast acquisition."""
+        dialog = QFileDialog()
+        save_dir = dialog.getExistingDirectory(None, "Select Folder", self.daq_only_saving_dir_edit.text())
+        if save_dir:
+            self.daq_only_saving_dir_edit.setText(save_dir)
+            self._daq_only_output_path = save_dir
+    
+    def _start_daq_only_acquisition(self):
+        """Start DAQ-only fast acquisition (waveform output + recording, no camera)."""
+        if self._daq_only_acquiring:
+            self._log.warning("DAQ-only acquisition already running")
+            return
+        if self._ni_daq is None:
+            self._log.error("NI DAQ not available")
+            error_dialog("NI DAQ not available.", "Configuration Error")
+            return
+        
+        output_path_base = self.daq_only_saving_dir_edit.text().strip() or self._daq_only_output_path
+        if not output_path_base:
+            error_dialog("Please set saving path for DAQ-only experiment.", "Configuration Error")
+            return
+        
+        experiment_id = self.daq_only_experiment_id_edit.text().strip()
+        if experiment_id:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            full_output_path = os.path.join(output_path_base, f"{timestamp}_{experiment_id}")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            full_output_path = os.path.join(output_path_base, f"{timestamp}_daq_only_experiment")
+        os.makedirs(full_output_path, exist_ok=True)
+        
+        duration_s = self.daq_only_duration_spin.value()
+        sample_rate_hz = self.sample_rate_spin.value()
+        self.update_waveforms_for_duration(duration_s, sample_rate_hz)
+        waveforms = self.get_waveforms()
+        self._update_config()
+        
+        ai_channels = self._config.ai_channels or None
+        ao_channels = self._config.ao_channels or None
+        di_lines = None  # Optional: list of digital input line indices to record; None or [] records no DI
+        
+        from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+        
+        try:
+            self._daq_only_controller = FastAcquisitionController(
+                camera=None,
+                ni_daq=self._ni_daq,
+                output_path=full_output_path,
+            )
+            def on_done(status: AcquisitionCompletionStatus, error_message: Optional[str]):
+                # Emit signal so UI update runs on main thread (callback runs in controller's monitor thread)
+                self.signal_daq_only_completed.emit(status, error_message or "")
+            self._daq_only_controller.set_completion_callback(on_done)
+            self._daq_only_controller.start_acquisition(
+                sample_rate_hz=sample_rate_hz,
+                ai_channels=ai_channels,
+                ao_channels=ao_channels,
+                di_lines=di_lines,
+                waveforms=waveforms,
+                duration_s=duration_s,
+            )
+            self._daq_only_acquiring = True
+            self.daq_only_start_btn.setEnabled(False)
+            self.daq_only_stop_btn.setEnabled(True)
+            self.daq_only_status_label.setText("Acquiring...")
+            self.signal_acquisition_started.emit()
+        except Exception as e:
+            self._log.error(f"Failed to start DAQ-only acquisition: {e}", exc_info=True)
+            error_dialog(f"Failed to start DAQ-only acquisition: {e}", "Error")
+    
+    def _stop_daq_only_acquisition(self):
+        """Stop DAQ-only fast acquisition."""
+        if not self._daq_only_acquiring or self._daq_only_controller is None:
+            return
+        try:
+            self._daq_only_controller.stop_acquisition(manual_stop=True)
+        except Exception as e:
+            self._log.error(f"Error stopping DAQ-only acquisition: {e}", exc_info=True)
+    
+    def _on_daq_only_acquisition_completed(self, status, error_message: Optional[str] = None):
+        """Handle DAQ-only acquisition completion (called on main thread)."""
+        from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
+        self._daq_only_acquiring = False
+        self._daq_only_controller = None
+        self.daq_only_start_btn.setEnabled(True)
+        self.daq_only_stop_btn.setEnabled(False)
+        if status == AcquisitionCompletionStatus.COMPLETED_SUCCESS:
+            self.daq_only_status_label.setText("Completed")
+        elif status == AcquisitionCompletionStatus.STOPPED_MANUAL:
+            self.daq_only_status_label.setText("Stopped")
+        elif status == AcquisitionCompletionStatus.COMPLETED_ERROR:
+            self.daq_only_status_label.setText("Error" + (f": {error_message}" if error_message else ""))
+        else:
+            self.daq_only_status_label.setText("Ready")
+        # Set all analog and digital outputs to zero after acquisition
+        try:
+            self.zero_all_outputs()
+        except Exception as e:
+            self._log.error(f"Failed to zero DAQ outputs after acquisition: {e}", exc_info=True)
+        self.signal_acquisition_finished.emit()
     
     def zero_all_outputs(self):
         """
