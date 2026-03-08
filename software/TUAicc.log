@@ -1,0 +1,207 @@
+[2026-03-06 19:35:38] [INFO]:  ==========S=========
+[2026-03-06 19:35:38] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 19:35:38] [INFO]:  device_id: -1
+[2026-03-06 19:35:38] [INFO]:  Inference device - CPU.
+[2026-03-06 19:35:38] [EROR]:  The model file does not exist!
+[2026-03-06 19:35:38] [EROR]:  Model initialization error !
+[2026-03-06 19:35:38] [INFO]:  ==========E=========
+
+
+[2026-03-06 19:53:04] [INFO]:  ==========S=========
+[2026-03-06 19:53:04] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 19:53:04] [INFO]:  device_id: -1
+[2026-03-06 19:53:04] [INFO]:  Inference device - CPU.
+[2026-03-06 19:53:04] [EROR]:  The model file does not exist!
+[2026-03-06 19:53:04] [EROR]:  Model initialization error !
+[2026-03-06 19:53:04] [INFO]:  ==========E=========
+
+
+[2026-03-06 19:59:55] [INFO]:  ==========S=========
+[2026-03-06 19:59:55] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 19:59:55] [INFO]:  device_id: -1
+[2026-03-06 19:59:55] [INFO]:  Inference device - CPU.
+[2026-03-06 19:59:55] [EROR]:  The model file does not exist!
+[2026-03-06 19:59:55] [EROR]:  Model initialization error !
+[2026-03-06 19:59:55] [INFO]:  ==========E=========
+
+
+[2026-03-06 20:08:48] [INFO]:  ==========S=========
+[2026-03-06 20:08:48] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 20:08:48] [INFO]:  device_id: -1
+[2026-03-06 20:08:48] [INFO]:  Inference device - CPU.
+[2026-03-06 20:08:48] [EROR]:  The model file does not exist!
+[2026-03-06 20:08:48] [EROR]:  Model initialization error !
+[2026-03-06 20:08:48] [INFO]:  ==========E=========
+
+
+[2026-03-06 20:19:50] [INFO]:  ==========S=========
+[2026-03-06 20:19:50] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 20:19:50] [INFO]:  device_id: -1
+[2026-03-06 20:19:50] [INFO]:  Inference device - CPU.
+[2026-03-06 20:19:50] [EROR]:  The model file does not exist!
+[2026-03-06 20:19:50] [EROR]:  Model initialization error !
+[2026-03-06 20:19:50] [INFO]:  ==========E=========
+
+
+[2026-03-06 20:28:14] [INFO]:  ==========S=========
+[2026-03-06 20:28:14] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-06 20:28:14] [INFO]:  device_id: -1
+[2026-03-06 20:28:14] [INFO]:  Inference device - CPU.
+[2026-03-06 20:28:14] [EROR]:  The model file does not exist!
+[2026-03-06 20:28:14] [EROR]:  Model initialization error !
+[2026-03-06 20:28:14] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:31:08] [INFO]:  ==========S=========
+[2026-03-08 10:31:08] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:31:08] [INFO]:  device_id: -1
+[2026-03-08 10:31:08] [INFO]:  Inference device - CPU.
+[2026-03-08 10:31:08] [EROR]:  The model file does not exist!
+[2026-03-08 10:31:08] [EROR]:  Model initialization error !
+[2026-03-08 10:31:08] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:33:04] [INFO]:  ==========S=========
+[2026-03-08 10:33:04] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:33:04] [INFO]:  device_id: -1
+[2026-03-08 10:33:04] [INFO]:  Inference device - CPU.
+[2026-03-08 10:33:04] [EROR]:  The model file does not exist!
+[2026-03-08 10:33:04] [EROR]:  Model initialization error !
+[2026-03-08 10:33:04] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:34:50] [INFO]:  ==========S=========
+[2026-03-08 10:34:50] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:34:50] [INFO]:  device_id: -1
+[2026-03-08 10:34:50] [INFO]:  Inference device - CPU.
+[2026-03-08 10:34:50] [EROR]:  The model file does not exist!
+[2026-03-08 10:34:50] [EROR]:  Model initialization error !
+[2026-03-08 10:34:50] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:36:12] [INFO]:  ==========S=========
+[2026-03-08 10:36:12] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:36:12] [INFO]:  device_id: -1
+[2026-03-08 10:36:12] [INFO]:  Inference device - CPU.
+[2026-03-08 10:36:12] [EROR]:  The model file does not exist!
+[2026-03-08 10:36:12] [EROR]:  Model initialization error !
+[2026-03-08 10:36:12] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:38:35] [INFO]:  ==========S=========
+[2026-03-08 10:38:35] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:38:35] [INFO]:  device_id: -1
+[2026-03-08 10:38:35] [INFO]:  Inference device - CPU.
+[2026-03-08 10:38:35] [EROR]:  The model file does not exist!
+[2026-03-08 10:38:35] [EROR]:  Model initialization error !
+[2026-03-08 10:38:35] [INFO]:  ==========E=========
+
+
+[2026-03-08 10:42:31] [INFO]:  ==========S=========
+[2026-03-08 10:42:31] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 10:42:31] [INFO]:  device_id: -1
+[2026-03-08 10:42:31] [INFO]:  Inference device - CPU.
+[2026-03-08 10:42:31] [EROR]:  The model file does not exist!
+[2026-03-08 10:42:31] [EROR]:  Model initialization error !
+[2026-03-08 10:42:31] [INFO]:  ==========E=========
+
+
+[2026-03-08 13:45:47] [INFO]:  ==========S=========
+[2026-03-08 13:45:47] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 13:45:47] [INFO]:  device_id: -1
+[2026-03-08 13:45:47] [INFO]:  Inference device - CPU.
+[2026-03-08 13:45:47] [EROR]:  The model file does not exist!
+[2026-03-08 13:45:47] [EROR]:  Model initialization error !
+[2026-03-08 13:45:47] [INFO]:  ==========E=========
+
+
+[2026-03-08 13:49:59] [INFO]:  ==========S=========
+[2026-03-08 13:49:59] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 13:49:59] [INFO]:  device_id: -1
+[2026-03-08 13:49:59] [INFO]:  Inference device - CPU.
+[2026-03-08 13:49:59] [EROR]:  The model file does not exist!
+[2026-03-08 13:49:59] [EROR]:  Model initialization error !
+[2026-03-08 13:49:59] [INFO]:  ==========E=========
+
+
+[2026-03-08 14:03:32] [INFO]:  ==========S=========
+[2026-03-08 14:03:32] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 14:03:32] [INFO]:  device_id: -1
+[2026-03-08 14:03:32] [INFO]:  Inference device - CPU.
+[2026-03-08 14:03:32] [EROR]:  The model file does not exist!
+[2026-03-08 14:03:32] [EROR]:  Model initialization error !
+[2026-03-08 14:03:32] [INFO]:  ==========E=========
+
+
+[2026-03-08 14:10:39] [INFO]:  ==========S=========
+[2026-03-08 14:10:39] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 14:10:39] [INFO]:  device_id: -1
+[2026-03-08 14:10:39] [INFO]:  Inference device - CPU.
+[2026-03-08 14:10:39] [EROR]:  The model file does not exist!
+[2026-03-08 14:10:39] [EROR]:  Model initialization error !
+[2026-03-08 14:10:39] [INFO]:  ==========E=========
+
+
+[2026-03-08 14:13:48] [INFO]:  ==========S=========
+[2026-03-08 14:13:48] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 14:13:48] [INFO]:  device_id: -1
+[2026-03-08 14:13:48] [INFO]:  Inference device - CPU.
+[2026-03-08 14:13:48] [EROR]:  The model file does not exist!
+[2026-03-08 14:13:48] [EROR]:  Model initialization error !
+[2026-03-08 14:13:48] [INFO]:  ==========E=========
+
+
+[2026-03-08 14:38:09] [INFO]:  ==========S=========
+[2026-03-08 14:38:09] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 14:38:09] [INFO]:  device_id: -1
+[2026-03-08 14:38:09] [INFO]:  Inference device - CPU.
+[2026-03-08 14:38:09] [EROR]:  The model file does not exist!
+[2026-03-08 14:38:09] [EROR]:  Model initialization error !
+[2026-03-08 14:38:09] [INFO]:  ==========E=========
+
+
+[2026-03-08 14:47:07] [INFO]:  ==========S=========
+[2026-03-08 14:47:07] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 14:47:07] [INFO]:  device_id: -1
+[2026-03-08 14:47:07] [INFO]:  Inference device - CPU.
+[2026-03-08 14:47:07] [EROR]:  The model file does not exist!
+[2026-03-08 14:47:07] [EROR]:  Model initialization error !
+[2026-03-08 14:47:07] [INFO]:  ==========E=========
+
+
+[2026-03-08 15:00:10] [INFO]:  ==========S=========
+[2026-03-08 15:00:10] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 15:00:10] [INFO]:  device_id: -1
+[2026-03-08 15:00:10] [INFO]:  Inference device - CPU.
+[2026-03-08 15:00:10] [EROR]:  The model file does not exist!
+[2026-03-08 15:00:10] [EROR]:  Model initialization error !
+[2026-03-08 15:00:10] [INFO]:  ==========E=========
+
+
+[2026-03-08 15:04:18] [INFO]:  ==========S=========
+[2026-03-08 15:04:18] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 15:04:18] [INFO]:  device_id: -1
+[2026-03-08 15:04:18] [INFO]:  Inference device - CPU.
+[2026-03-08 15:04:18] [EROR]:  The model file does not exist!
+[2026-03-08 15:04:18] [EROR]:  Model initialization error !
+[2026-03-08 15:04:18] [INFO]:  ==========E=========
+
+
+[2026-03-08 15:07:17] [INFO]:  ==========S=========
+[2026-03-08 15:07:17] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 15:07:17] [INFO]:  device_id: -1
+[2026-03-08 15:07:17] [INFO]:  Inference device - CPU.
+[2026-03-08 15:07:17] [EROR]:  The model file does not exist!
+[2026-03-08 15:07:17] [EROR]:  Model initialization error !
+[2026-03-08 15:07:17] [INFO]:  ==========E=========
+
+
+[2026-03-08 15:51:42] [INFO]:  ==========S=========
+[2026-03-08 15:51:42] [INFO]:  model path: C:\Users\jialab\.conda\envs\squid\engine\Aries 6506.dat
+[2026-03-08 15:51:42] [INFO]:  device_id: -1
+[2026-03-08 15:51:42] [INFO]:  Inference device - CPU.
+[2026-03-08 15:51:42] [EROR]:  The model file does not exist!
+[2026-03-08 15:51:42] [EROR]:  Model initialization error !
+[2026-03-08 15:51:42] [INFO]:  ==========E=========
+
+

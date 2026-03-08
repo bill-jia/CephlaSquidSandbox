@@ -1,19 +1,43 @@
+"""
+Tucsen Camera Driver
+
+Supports:
+- DHYANA 400BSI V3 (2048x2048, 6.5µm pixels)
+- FL26 BW (6240x4168, 3.76µm pixels)
+- Aries 6506 (2400x2400) and Aries 6510 (3200x3200), 6.5µm pixels
+
+Uses the TUCam SDK (TUCam.py) with model-specific properties for resolution,
+readout modes, and triggering. GenICam-based models (Aries) use a different
+parameter interface than native TUCam models.
+"""
+
 from ctypes import *
 import numpy as np
 import threading
 import time
-from typing import Optional, Callable, Sequence, Tuple, Dict
+from dataclasses import dataclass
+from typing import Optional, Callable, Sequence, Tuple, Dict, List, Union
 
 import pydantic
 
-from squid.abc import AbstractCamera, CameraError
-from squid.config import CameraConfig, CameraPixelFormat, TucsenCameraModel
-from squid.abc import CameraFrame, CameraFrameFormat, CameraAcquisitionMode, CameraGainRange
+from squid.abc import (
+    AbstractCamera,
+    CameraAcquisitionMode,
+    CameraFrameFormat,
+    CameraFrame,
+    CameraGainRange,
+    CameraError,
+)
+from squid.config import CameraConfig, CameraPixelFormat, CameraReadoutMode, TucsenCameraModel
 import squid.logging
 from control.TUCam import *
 import control.utils
 from control._def import *
 
+
+# ============================================================================
+# Camera mode enums (model-specific)
+# ============================================================================
 
 class Mode400BSIV3(Enum):
     """
@@ -40,13 +64,21 @@ class ModeFL26BW(Enum):
 
 class ModeAries(Enum):
     """
-    Aries modes values are a combination of image mode and binning.
-    Store setting values for (TUCIDC_IMGMODESELECT, TUIDC_RESOLUTION) here
+    Aries modes. Values used for GenICam or TUCam image mode when supported.
     """
 
     HDR = 0
     SPEED = 1
     SENSITIVITY = 2
+
+
+@dataclass
+class TucsenCameraModeSpec:
+    """Specification for a single camera readout mode (Tucsen)."""
+    name: str
+    bit_depth: int
+    line_time_us: float
+    display_name: str = ""
 
 
 class TucsenModelProperties(pydantic.BaseModel):
@@ -57,6 +89,71 @@ class TucsenModelProperties(pydantic.BaseModel):
     has_temperature_control: bool
     is_genicam: bool
 
+
+# Mode name -> (enum member, spec) per model. Used by set_camera_mode / get_camera_mode_spec.
+TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3, ModeFL26BW, ModeAries], TucsenCameraModeSpec]]] = {
+    TucsenCameraModel.DHYANA_400BSI_V3: {
+        "hdr": (
+            Mode400BSIV3.HDR,
+            TucsenCameraModeSpec(name="hdr", bit_depth=16, line_time_us=11.2, display_name="HDR (16-bit)"),
+        ),
+        "cms": (
+            Mode400BSIV3.CMS,
+            TucsenCameraModeSpec(name="cms", bit_depth=12, line_time_us=11.2, display_name="CMS (12-bit)"),
+        ),
+        "high_speed": (
+            Mode400BSIV3.HIGH_SPEED,
+            TucsenCameraModeSpec(name="high_speed", bit_depth=11, line_time_us=7.2, display_name="High Speed (11-bit)"),
+        ),
+    },
+    TucsenCameraModel.FL26_BW: {
+        "standard": (
+            ModeFL26BW.STANDARD,
+            TucsenCameraModeSpec(name="standard", bit_depth=16, line_time_us=34.67, display_name="Standard"),
+        ),
+        "low_noise": (
+            ModeFL26BW.LOW_NOISE,
+            TucsenCameraModeSpec(name="low_noise", bit_depth=16, line_time_us=69.3, display_name="Low Noise"),
+        ),
+        "senbin": (
+            ModeFL26BW.SENBIN,
+            TucsenCameraModeSpec(name="senbin", bit_depth=16, line_time_us=12.58, display_name="SenBin"),
+        ),
+    },
+    TucsenCameraModel.ARIES_6506: {
+        "hdr": (
+            ModeAries.HDR,
+            TucsenCameraModeSpec(name="hdr", bit_depth=16, line_time_us=11.2, display_name="HDR"),
+        ),
+        "speed": (
+            ModeAries.SPEED,
+            TucsenCameraModeSpec(name="speed", bit_depth=16, line_time_us=7.2, display_name="Speed"),
+        ),
+        "sensitivity": (
+            ModeAries.SENSITIVITY,
+            TucsenCameraModeSpec(name="sensitivity", bit_depth=16, line_time_us=11.2, display_name="Sensitivity"),
+        ),
+    },
+    TucsenCameraModel.ARIES_6510: {
+        "hdr": (
+            ModeAries.HDR,
+            TucsenCameraModeSpec(name="hdr", bit_depth=16, line_time_us=11.2, display_name="HDR"),
+        ),
+        "speed": (
+            ModeAries.SPEED,
+            TucsenCameraModeSpec(name="speed", bit_depth=16, line_time_us=7.2, display_name="Speed"),
+        ),
+        "sensitivity": (
+            ModeAries.SENSITIVITY,
+            TucsenCameraModeSpec(name="sensitivity", bit_depth=16, line_time_us=11.2, display_name="Sensitivity"),
+        ),
+    },
+}
+
+
+# ============================================================================
+# TucsenCamera Class
+# ============================================================================
 
 class TucsenCamera(AbstractCamera):
     @staticmethod
@@ -153,6 +250,12 @@ class TucsenCamera(AbstractCamera):
         self._trigger_sent = threading.Event()
         self._is_streaming = threading.Event()
 
+        # Fast acquisition support
+        self._fast_acquisition_callback: Optional[Callable[[np.ndarray], None]] = None
+        self._fast_acquisition_thread: Optional[threading.Thread] = None
+        self._fast_acquisition_thread_keep_running = threading.Event()
+        self.fast_acquisition_timeout_ms: Optional[int] = None
+
         self._camera = TucsenCamera._open(index=0)
         self._model_properties = self._get_model_properties(self._config.camera_model)
 
@@ -169,17 +272,14 @@ class TucsenCamera(AbstractCamera):
             self._camera_mode = ModeAries.HDR  # HDR as default
 
         self._m_frame = None  # image buffer
+        self.frames_polled = 0 # number of frames polled from camera during fast acquisition
         # We need to keep trigger attribute for starting and stopping streaming
         self._trigger_attr = TUCAM_TRIGGER_ATTR()
         self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
 
         self._configure_camera()
 
-        # We store exposure time so we don't need to worry about backing out strobe time from the
-        # time stored on the camera.
-        #
-        # We just set it to some sane value to start.
-        self._exposure_time_ms: int = 20
+        self._exposure_time_ms: float = 20.0
 
         self.temperature_reading_callback = None
         self._terminate_temperature_event = threading.Event()
@@ -273,6 +373,10 @@ class TucsenCamera(AbstractCamera):
         self.set_binning(*self._config.default_binning)
         # TODO: Set default roi
 
+    # =========================================================================
+    # Streaming Control
+    # =========================================================================
+
     def start_streaming(self):
         if self._is_streaming.is_set():
             self._log.debug("Already streaming, start_streaming is noop")
@@ -318,7 +422,129 @@ class TucsenCamera(AbstractCamera):
     def get_is_streaming(self):
         return self._is_streaming.is_set()
 
+    # =========================================================================
+    # Fast Acquisition Support
+    # =========================================================================
+
+    def start_fast_acquisition_frame_grabbing(
+        self,
+        frame_rate_hz: float,
+        frame_callback: Optional[Callable[[np.ndarray], None]] = None,
+    ):
+        """
+        Start dedicated fast acquisition frame grabbing thread.
+
+        Call after setting camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode
+        and before firing DAQ waveforms. The grab thread reads frames with a short
+        timeout and passes raw numpy arrays to the callback.
+
+        Args:
+            frame_rate_hz: Expected frame rate (used for buffer sizing).
+            frame_callback: Optional callback(raw_data, metadata). Tucsen passes metadata=None.
+        """
+        if self._is_streaming.is_set():
+            self._log.warning("Camera is already streaming. Stop streaming before starting fast acquisition.")
+            return
+
+        acquisition_mode = self.get_acquisition_mode()
+        self._log.info(f"Starting fast acquisition with mode: {acquisition_mode}")
+
+        if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
+            raise CameraError("Fast acquisition requires HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode")
+
+        if self._m_frame is None:
+            self._allocate_buffer()
+
+        # Use a larger buffer for fast acquisition
+        # TBD: why is this valid or not valid for GenICam
+        # if not self._model_properties.is_genicam:
+            
+            # TBD: understand what the correct value should be for number of frames to buffer.
+        # self._trigger_attr.nBufFrames = 16
+        self._trigger_attr.nBufFrames = min(max(2, int(frame_rate_hz * 2)), 1000)
+        if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) == TUCAMRET.TUCAMRET_SUCCESS:
+            self._log.info(f"Trigger buffer set to {self._trigger_attr.nBufFrames}")
+        else:
+            raise CameraError("Failed to set trigger buffer for fast acquisition")
+            self._log.info(f"Trigger buffer set to {self._trigger_attr.nBufFrames}")
+
+        trigger_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+        if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to start capture for fast acquisition")
+
+        self._fast_acquisition_callback = frame_callback
+        self._fast_acquisition_thread_keep_running.set()
+        self._fast_acquisition_thread = threading.Thread(
+            target=self._grab_frames_fast_acquisition,
+            daemon=True,
+        )
+        # Reset frames polled counter
+        self.frames_polled = 0
+        # Start fast acquisition thread
+        self._fast_acquisition_thread.start()
+        self._log.info("Fast acquisition frame grabbing thread started")
+
+    def stop_fast_acquisition_frame_grabbing(self):
+        """Stop the fast acquisition frame grabbing thread and end camera capture."""
+        if not hasattr(self, "_fast_acquisition_thread") or self._fast_acquisition_thread is None:
+            return
+
+        self._log.info("Stopping fast acquisition frame grabbing...")
+        self._fast_acquisition_thread_keep_running.clear()
+
+        if TUCAM_Buf_AbortWait(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            self._log.debug("TUCAM_Buf_AbortWait failed or not needed")
+        if self._fast_acquisition_thread.is_alive():
+            self._fast_acquisition_thread.join(timeout=2.0)
+            if self._fast_acquisition_thread.is_alive():
+                self._log.warning("Fast acquisition thread did not exit in time")
+
+        try:
+            TUCAM_Cap_Stop(self._camera)
+        except Exception as e:
+            self._log.warning(f"TUCAM_Cap_Stop during fast acq cleanup: {e}")
+
+        if not self._model_properties.is_genicam:
+            self._trigger_attr.nBufFrames = 1
+            TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr)
+
+        self._fast_acquisition_thread = None
+        self._fast_acquisition_callback = None
+        self._log.info(f"Fast acquisition frame grabbing stopped, {self.frames_polled} frames polled")
+
+    def _grab_frames_fast_acquisition(self):
+        """Thread function: poll for frames and pass raw data to the fast acquisition callback."""
+        self._log.debug("Fast acquisition grab thread running")
+
+        while self._fast_acquisition_thread_keep_running.is_set():
+            try:
+                wait_ms = self.fast_acquisition_timeout_ms if self.fast_acquisition_timeout_ms is not None else 100
+                ret = TUCAM_Buf_WaitForFrame(self._camera, pointer(self._m_frame), c_int32(wait_ms))
+                if ret != TUCAMRET.TUCAMRET_SUCCESS or self._m_frame.pBuffer is None or self._m_frame.pBuffer == 0:
+                    continue
+                else:
+                    self.frames_polled += 1
+                raw_data = self._convert_frame_to_numpy(self._m_frame).copy()
+                if self._fast_acquisition_callback is not None:
+                    try:
+                        self._fast_acquisition_callback(raw_data, None)
+                    except Exception as e:
+                        self._log.error(f"Fast acquisition callback error: {e}")
+            except Exception as e:
+                if self._fast_acquisition_thread_keep_running.is_set():
+                    self._log.debug(f"Fast acquisition loop: {e}")
+
+        self._log.debug("Fast acquisition grab thread stopped")
+
+    # =========================================================================
+    # Thread Management
+    # =========================================================================
+
     def close(self):
+        try:
+            self.stop_fast_acquisition_frame_grabbing()
+        except Exception:
+            pass
         if self.temperature_reading_thread is not None:
             self._terminate_temperature_event.set()
             self.temperature_reading_thread.join()
@@ -439,15 +665,23 @@ class TucsenCamera(AbstractCamera):
         with self._frame_lock:
             return self._current_frame.frame_id if self._current_frame else -1
 
+    # =========================================================================
+    # Exposure and Timing
+    # =========================================================================
+
     def set_exposure_time(self, exposure_time_ms: float):
-        if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER:
-            strobe_time_ms = self.get_strobe_time()
-            adjusted_exposure_time = exposure_time_ms + strobe_time_ms
-            if self._hw_set_strobe_delay_ms_fn:
-                self._log.debug(f"Setting hw strobe time to {strobe_time_ms} [ms]")
-                self._hw_set_strobe_delay_ms_fn(strobe_time_ms)
-        else:
-            adjusted_exposure_time = exposure_time_ms
+        # TBD: properly handle hardware strobing, for now just asusme that user is giving some buffer time for strobing.
+        # if self.get_acquisition_mode() in (
+        #     CameraAcquisitionMode.HARDWARE_TRIGGER,
+        #     CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST,
+        # ):
+        #     strobe_time_ms = self.get_strobe_time()
+        #     adjusted_exposure_time = exposure_time_ms + strobe_time_ms
+        #     if self._hw_set_strobe_delay_ms_fn:
+        #         self._log.debug(f"Setting hw strobe time to {strobe_time_ms} [ms]")
+        #         self._hw_set_strobe_delay_ms_fn(strobe_time_ms)
+        # else:
+        adjusted_exposure_time = exposure_time_ms
 
         if self._model_properties.is_genicam:
             self._set_genicam_parameter(
@@ -494,6 +728,7 @@ class TucsenCamera(AbstractCamera):
         if self._model_properties.is_genicam:
             param_info = self._get_genicam_parameter("TriggerInputDelay")
             trigger_delay_ms = param_info["value"] / 1000.0  # read in us, convert to ms
+            self._log.info(f"Trigger delay: {trigger_delay_ms} ms")
         else:
             trigger_attr = TUCAM_TRIGGER_ATTR()
             if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
@@ -523,6 +758,112 @@ class TucsenCamera(AbstractCamera):
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
         return [CameraPixelFormat.MONO16]
+
+    # =========================================================================
+    # Readout Mode (AbstractCamera interface)
+    # =========================================================================
+
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """Set readout mode. Tucsen cameras support GLOBAL only."""
+        if readout_mode != CameraReadoutMode.GLOBAL:
+            raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
+
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """Get current readout mode."""
+        return CameraReadoutMode.GLOBAL
+
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """Get available readout modes."""
+        return [CameraReadoutMode.GLOBAL]
+
+    # =========================================================================
+    # Camera Mode API (model-specific, TUCam low-level)
+    # =========================================================================
+
+    def get_available_camera_modes(self) -> List[str]:
+        """Get list of available camera readout mode names for this model."""
+        modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
+        if modes is None:
+            return []
+        return list(modes.keys())
+
+    def get_camera_mode(self) -> Optional[str]:
+        """Get the current camera readout mode name."""
+        if self._config.camera_model == TucsenCameraModel.DHYANA_400BSI_V3:
+            for name, (enum_val, _) in TUCSEN_CAMERA_MODES[TucsenCameraModel.DHYANA_400BSI_V3].items():
+                if enum_val == self._camera_mode:
+                    return name
+        elif self._config.camera_model == TucsenCameraModel.FL26_BW:
+            for name, (enum_val, _) in TUCSEN_CAMERA_MODES[TucsenCameraModel.FL26_BW].items():
+                if enum_val == self._camera_mode:
+                    return name
+        elif self._config.camera_model in (TucsenCameraModel.ARIES_6506, TucsenCameraModel.ARIES_6510):
+            for name, (enum_val, _) in TUCSEN_CAMERA_MODES[self._config.camera_model].items():
+                if enum_val == self._camera_mode:
+                    return name
+        return None
+
+    def set_camera_mode(self, mode_name: str):
+        """
+        Set the camera readout mode by name (Tucsen model-specific).
+
+        Uses TUCam TUIDC_IMGMODESELECT (capability) and TUIDP_GLOBALGAIN (property)
+        for native models; GenICam parameters for Aries.
+
+        Args:
+            mode_name: One of the mode names from get_available_camera_modes(),
+                       e.g. "hdr", "cms", "high_speed" (400BSI V3); "standard", "low_noise", "senbin" (FL26);
+                       "hdr", "speed", "sensitivity" (Aries).
+        """
+        modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
+        if modes is None:
+            raise ValueError(f"No camera modes defined for model {self._config.camera_model}")
+        if mode_name not in modes:
+            raise ValueError(
+                f"Unknown camera mode '{mode_name}' for this model. "
+                f"Available: {list(modes.keys())}"
+            )
+        enum_member, spec = modes[mode_name]
+        with self._pause_streaming():
+            if self._config.camera_model == TucsenCameraModel.DHYANA_400BSI_V3:
+                img_mode, gain = enum_member.value
+                if TUCAM_Capa_SetValue(
+                    self._camera, TUCAM_IDCAPA.TUIDC_IMGMODESELECT.value, img_mode
+                ) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to set image mode (TUIDC_IMGMODESELECT)")
+                if TUCAM_Prop_SetValue(
+                    self._camera, TUCAM_IDPROP.TUIDP_GLOBALGAIN.value, c_double(gain), 0
+                ) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to set global gain (TUIDP_GLOBALGAIN)")
+            elif self._config.camera_model == TucsenCameraModel.FL26_BW:
+                img_mode, res_value = enum_member.value
+                if TUCAM_Capa_SetValue(
+                    self._camera, TUCAM_IDCAPA.TUIDC_IMGMODESELECT.value, img_mode
+                ) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to set image mode (TUIDC_IMGMODESELECT)")
+                if TUCAM_Capa_SetValue(
+                    self._camera, TUCAM_IDCAPA.TUIDC_RESOLUTION.value, res_value
+                ) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to set resolution (TUIDC_RESOLUTION)")
+                self._binning = (2, 2) if res_value != 0 else (1, 1)
+            else:
+                # Aries: try GenICam ImageMode if available, else only update internal state
+                try:
+                    self._set_genicam_parameter(
+                        "ImageMode", enum_member.value, TUELEM_TYPE.TU_ElemEnumeration.value
+                    )
+                except (CameraError, Exception):
+                    pass
+            self._camera_mode = enum_member
+            self._update_internal_settings()
+        self._log.info(f"Set camera mode to '{spec.display_name or mode_name}' ({spec.bit_depth}-bit)")
+
+    def get_camera_mode_spec(self, mode_name: str) -> Optional[TucsenCameraModeSpec]:
+        """Get the specification for a camera mode by name."""
+        modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
+        if modes is None or mode_name not in modes:
+            return None
+        return modes[mode_name][1]
 
     def _update_internal_settings(self):
         if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
@@ -609,9 +950,6 @@ class TucsenCamera(AbstractCamera):
     def set_white_balance_gains(self, red_gain: float, green_gain: float, blue_gain: float):
         raise NotImplementedError("White Balance Gains not implemented for the Tucsen driver.")
 
-    def set_auto_white_balance_gains(self) -> Tuple[float, float, float]:
-        raise NotImplementedError("White Balance Gains not implemented for the Tucsen driver.")
-
     def set_black_level(self, black_level: float):
         raise NotImplementedError("Black levels are not implemented for the Tucsen driver.")
 
@@ -660,6 +998,10 @@ class TucsenCamera(AbstractCamera):
                 raise CameraError("Failed to get ROI")
             return (roi_attr.nHOffset, roi_attr.nVOffset, roi_attr.nWidth, roi_attr.nHeight)
 
+    # =========================================================================
+    # Acquisition Mode
+    # =========================================================================
+
     def _set_acquisition_mode_imp(self, acquisition_mode: CameraAcquisitionMode):
         self._log.debug(f"Setting acquisition mode to {acquisition_mode}")
         with self._pause_streaming():
@@ -683,6 +1025,11 @@ class TucsenCamera(AbstractCamera):
                     self._set_genicam_parameter("TriggerMode", 1, TUELEM_TYPE.TU_ElemEnumeration.value)
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
+            elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
+                if self._model_properties.is_genicam:
+                    self._set_genicam_parameter("TriggerMode", 1, TUELEM_TYPE.TU_ElemEnumeration.value)
+                else:
+                    self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value
             else:
                 raise ValueError(f"Unhandled {acquisition_mode=}")
             if not self._model_properties.is_genicam:
@@ -694,26 +1041,26 @@ class TucsenCamera(AbstractCamera):
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
         if self._model_properties.is_genicam:
-            if self._get_genicam_parameter("TriggerMode")["value"] == "Software":
+            trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
+            if trigger_value == "Software":
                 return CameraAcquisitionMode.SOFTWARE_TRIGGER
-            elif self._get_genicam_parameter("TriggerMode")["value"] == "FreeRunning":
+            if trigger_value == "FreeRunning":
                 return CameraAcquisitionMode.CONTINUOUS
-            elif self._get_genicam_parameter("TriggerMode")["value"] == "Standard":
+            if trigger_value == "Standard":
                 return CameraAcquisitionMode.HARDWARE_TRIGGER
-            else:
-                raise ValueError(f"Unknown tucsen trigger source mode {trigger_value}")
-        else:
-            trigger_attr = TUCAM_TRIGGER_ATTR()
-            if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
-                raise CameraError("Failed to get acquisition mode")
-            if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
-                return CameraAcquisitionMode.SOFTWARE_TRIGGER
-            elif trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
-                return CameraAcquisitionMode.CONTINUOUS
-            elif trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
-                return CameraAcquisitionMode.HARDWARE_TRIGGER
-            else:
-                raise ValueError(f"Unknown tucsen trigger source mode {trigger_attr.nTgrMode=}")
+            raise ValueError(f"Unknown Tucsen GenICam trigger mode: {trigger_value}")
+        trigger_attr = TUCAM_TRIGGER_ATTR()
+        if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to get acquisition mode")
+        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
+            return CameraAcquisitionMode.SOFTWARE_TRIGGER
+        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
+            return CameraAcquisitionMode.CONTINUOUS
+        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
+            return CameraAcquisitionMode.HARDWARE_TRIGGER
+        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value:
+            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+        raise ValueError(f"Unknown Tucsen trigger mode: {trigger_attr.nTgrMode=}")
 
     def set_temperature_reading_callback(self, func: Callable):
         self.temperature_reading_callback = func
@@ -781,7 +1128,7 @@ class TucsenCamera(AbstractCamera):
             self._trigger_sent.clear()
         return not self._trigger_sent.is_set()
 
-    def set_auto_exposure(self, enable=False):
+    def set_auto_exposure(self, enable: bool = False):
         value = 1 if enable else 0
         if self._model_properties.is_genicam:
             self._set_genicam_parameter("ExposureAuto", value, TUELEM_TYPE.TU_ElemEnumeration.value)
@@ -791,11 +1138,10 @@ class TucsenCamera(AbstractCamera):
                 != TUCAMRET.TUCAMRET_SUCCESS
             ):
                 raise CameraError("Failed to set auto exposure")
+        self._log.info("Auto exposure " + ("enabled" if enable else "disabled"))
 
-        if enable:
-            self.log.info("Auto exposure enabled")
-        else:
-            self.log.info("Auto exposure disabled")
+    def set_auto_white_balance_gains(self, on: bool = False):
+        raise NotImplementedError("White Balance Gains not implemented for the Tucsen driver.")
 
     def _raw_set_analog_gain_fl26bw(self, gain: float):
         # For FL26BW model
@@ -1007,6 +1353,7 @@ class TucsenCamera(AbstractCamera):
 
             # Integer type
             elif node.Type == elemtype.TU_ElemInteger.value:
+                self._log.info(f"Setting integer parameter '{param_name}' to {value}")
                 node.uValue.Int64.nVal = int(value)
 
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)

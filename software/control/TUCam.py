@@ -14,7 +14,9 @@ import time
 # 32bit
 #TUSDKdll = OleDLL("./lib/x86/TUCam.dll")
 # 64bit
-TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
+# TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
+TUSDKdll = OleDLL("./drivers and libraries/tucsen/lib/x64/TUCam.dll")
+
 
 #  class typedef enum TUCAM status:
 class TUCAMRET(Enum):

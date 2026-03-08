@@ -31,7 +31,7 @@ def load_daq_file(folder: str) -> Tuple[h5py.File, str]:
 
 def list_available_lines(h5f: h5py.File) -> Tuple[list, list]:
     """Return (digital_output_lines, digital_input_lines) present in the file."""
-    do_lines, di_lines = [], []
+    do_lines, di_lines, ai_lines = [], [], []
     if "digital_output" in h5f:
         do_lines = [int(name.replace("line", "")) for name in h5f["digital_output"].keys()]
     if "digital_input" in h5f:
@@ -94,6 +94,8 @@ def main():
     try:
         exposure_line = pick_line(args.exposure_line, di_lines, "exposure (DI)")
         exposure_ds = h5f["digital_input"][f"line{exposure_line}"][:]
+        print(exposure_line)
+        print(exposure_ds.max())
     except:
         exposure_line = "N/A"
         exposure_ds = np.zeros_like(trigger_ds)

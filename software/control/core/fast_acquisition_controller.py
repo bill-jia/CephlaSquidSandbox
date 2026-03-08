@@ -386,6 +386,7 @@ class FastAcquisitionController:
                     camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
                     if camera_signal is not None:
                         self._frame_sample_indices = self._detect_frame_edges(camera_signal)
+                        self._frame_count = len(self._frame_sample_indices)
                         self._log.info(f"Detected {len(self._frame_sample_indices)} frames from camera signal")
 
             if not self._daq_only:

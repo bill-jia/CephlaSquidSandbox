@@ -502,48 +502,6 @@ class CAMERA_CONFIG:
     READOUT_TIME_US = 5.84
     READOUT_TIME_TYPE = "GLOBAL" # Options: "GLOBAL", "ROW"
 
-@dataclass
-class NIDAQ_CONFIG:
-    """Configuration for NI DAQ operation."""
-    # Device identifier (e.g., "Dev1")
-    device_name: str = "Dev1"
-    # Sample clock configuration
-    sample_rate_hz: float = 10000.0  # Samples per second
-    samples_per_channel: int = 1000  # Number of samples per waveform cycle
-    
-    # Analog output configuration
-    ao_channels: List[str] = field(default_factory=list)  # e.g., ["ao0", "ao1"]
-    ao_min_voltage: float = -10.0
-    ao_max_voltage: float = 10.0
-    
-    # Digital output configuration  
-    do_port: str = "port0"  # e.g., "port0"
-    do_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
-    
-    # Digital input configuration
-    di_port: str = "port0"  # e.g., "port0"
-    di_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
-    
-    # Analog input configuration
-    ai_channels: List[str] = field(default_factory=list)  # e.g., ["ai0", "ai1"]
-    ai_min_voltage: float = -10.0
-    ai_max_voltage: float = 10.0
-    ai_terminal_config: str = "RSE"  # RSE, NRSE, Diff, PseudoDiff
-    
-    # Trigger configuration
-    trigger_source: str = "SOFTWARE"
-    external_trigger_terminal: str = "/Dev1/PFI0"  # For external trigger
-    trigger_edge: str = "RISING"
-    
-    # Continuous vs finite operation
-    continuous: bool = False  # If True, waveforms repeat continuously
-    
-    # Digital I/O logic family configuration
-    # "THREE_POINT_THREE_V" for FLIR cameras (3.3V TTL)
-    # "FIVE_V" for Photometrics and most other cameras (5V TTL, default)
-    do_logic_family: str = "FIVE_V"
-
-
 class AF:
     STOP_THRESHOLD = 0.85
     CROP_WIDTH = 800
@@ -1043,19 +1001,20 @@ A1_Y_MM = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_y_mm"]  # measured sta
 A1_X_PIXEL = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_x_pixel"]  # coordinate on the png
 A1_Y_PIXEL = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT]["a1_y_pixel"]  # coordinate on the png
 
+# Set NI DAQ logic family based on camera type
+# FLIR cameras require 3.3V TTL, most others use 5V TTL
+if CAMERA_TYPE == "FLIR" or CAMERA_TYPE == "Tucsen":
+    NI_DAQ_LOGIC_FAMILY = "THREE_POINT_THREE_V"
+    log.info("NI DAQ logic family set to 3.3V (FLIR or Tucsen camera detected)")
+else:
+    NI_DAQ_LOGIC_FAMILY = "FIVE_V"
+    log.debug(f"NI DAQ logic family set to 5V ({CAMERA_TYPE} camera)")
 
 ##########################################################
 ##### end of loading machine specific configurations #####
 ##########################################################
 
-# Set NI DAQ logic family based on camera type
-# FLIR cameras require 3.3V TTL, most others use 5V TTL
-if CAMERA_TYPE == "FLIR":
-    NI_DAQ_LOGIC_FAMILY = "THREE_POINT_THREE_V"
-    log.info("NI DAQ logic family set to 3.3V (FLIR camera detected)")
-else:
-    NI_DAQ_LOGIC_FAMILY = "FIVE_V"
-    log.debug(f"NI DAQ logic family set to 5V ({CAMERA_TYPE} camera)")
+
 
 # objective piezo
 HAS_OBJECTIVE_PIEZO = "PIEZO" in Z_MOTOR_CONFIG
@@ -1069,3 +1028,44 @@ DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)
 # saving path
 if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))) and not (DEFAULT_SAVING_PATH[1:].startswith(":\\")):
     DEFAULT_SAVING_PATH = str(Path.home()) + "/" + DEFAULT_SAVING_PATH.strip("/")
+
+@dataclass
+class NIDAQ_CONFIG:
+    """Configuration for NI DAQ operation."""
+    # Device identifier (e.g., "Dev1")
+    device_name: str = "Dev1"
+    # Sample clock configuration
+    sample_rate_hz: float = 10000.0  # Samples per second
+    samples_per_channel: int = 1000  # Number of samples per waveform cycle
+    
+    # Analog output configuration
+    ao_channels: List[str] = field(default_factory=list)  # e.g., ["ao0", "ao1"]
+    ao_min_voltage: float = -10.0
+    ao_max_voltage: float = 10.0
+    
+    # Digital output configuration  
+    do_port: str = "port0"  # e.g., "port0"
+    do_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
+    
+    # Digital input configuration
+    di_port: str = "port0"  # e.g., "port0"
+    di_lines: List[int] = field(default_factory=list)  # e.g., [0, 1, 2, 3]
+    
+    # Analog input configuration
+    ai_channels: List[str] = field(default_factory=list)  # e.g., ["ai0", "ai1"]
+    ai_min_voltage: float = -10.0
+    ai_max_voltage: float = 10.0
+    ai_terminal_config: str = "RSE"  # RSE, NRSE, Diff, PseudoDiff
+    
+    # Trigger configuration
+    trigger_source: str = "SOFTWARE"
+    external_trigger_terminal: str = "/Dev1/PFI0"  # For external trigger
+    trigger_edge: str = "RISING"
+    
+    # Continuous vs finite operation
+    continuous: bool = False  # If True, waveforms repeat continuously
+    
+    # Digital I/O logic family configuration
+    # "THREE_POINT_THREE_V" for FLIR cameras (3.3V TTL)
+    # "FIVE_V" for Photometrics and most other cameras (5V TTL, default)
+    do_logic_family: str = NI_DAQ_LOGIC_FAMILY

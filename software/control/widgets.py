@@ -11180,8 +11180,13 @@ class NIDAQWidget(QWidget):
         self._ni_daq_module = __import__('control.ni_daq', fromlist=[''])
         
         self.is_simulation = is_simulation
-        self._ni_daq = ni_daq
-        self._config = self._ni_daq._config
+
+        if self.is_simulation:
+            self._ni_daq = None
+            self._config = NIDAQ_CONFIG()
+        else:
+            self._ni_daq = ni_daq
+            self._config = self._ni_daq._config
         self._log.info(f"NIDAQWidget initialized with NI DAQ: {self._ni_daq}")
         self._waveforms = WaveformData()
         
@@ -11211,7 +11216,10 @@ class NIDAQWidget(QWidget):
         device_row = QHBoxLayout()
         device_row.addWidget(QLabel("Device:"))
         self.device_combo = QComboBox()
-        self.device_combo.addItems(self._ni_daq.get_available_devices()) # Need to update configuration formats to take into account multiple devices
+        if self.is_simulation:
+            self.device_combo.addItems(["Simulation"])
+        else:
+            self.device_combo.addItems(self._ni_daq.get_available_devices()) # Need to update configuration formats to take into account multiple devices
         self.device_combo.currentTextChanged.connect(self.on_device_changed)
         device_row.addWidget(self.device_combo)
         self.refresh_btn = QPushButton("↻")
@@ -13184,6 +13192,8 @@ class FastAcquisitionWidget(QWidget):
             
             self._controller.set_completion_callback(on_acquisition_completed)
             
+            self._log.info(f"Setting exposure time to {self.exposure_time_spinbox.value()} ms")
+            self._log.info(f"Setting frame rate to {frame_rate_hz} Hz")
             # Start acquisition
             self._controller.start_acquisition(
                 num_frames=num_frames,

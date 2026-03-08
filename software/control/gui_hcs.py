@@ -383,7 +383,7 @@ class HighContentScreeningGui(QMainWindow):
 
         self.recordTabWidget: QTabWidget = QTabWidget()
         self.cameraTabWidget: QTabWidget = QTabWidget()
-        self.load_widgets()
+        self.load_widgets(is_simulation=is_simulation)
         self.setup_layout()
         self.make_connections()
 
@@ -549,7 +549,7 @@ class HighContentScreeningGui(QMainWindow):
             self.log.error(error_message or "Microcontroller operation timed out!")
             raise e
 
-    def load_widgets(self):
+    def load_widgets(self, is_simulation=False):
         # Initialize all GUI widgets
         if ENABLE_SPINNING_DISK_CONFOCAL:
             # TODO: For user compatibility, when ENABLE_SPINNING_DISK_CONFOCAL is True, we use XLight/Cicero on default.
