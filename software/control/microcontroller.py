@@ -37,14 +37,64 @@ from serial.serialutil import SerialException
 import squid.logging
 from control._def import *
 
-
-# Note: User should be added to the dialout group to avoid needing sudo for serial access
+# Add user to the dialout group to avoid the need to use sudo for serial access
 
 # Design note (7/20/2021): All functions (except __init__) are non-blocking.
 # Users should check is_busy() or use wait_till_operation_is_completed() to wait for completion.
 
 # Module-level logger for top-level functions
 _log = squid.logging.get_logger("microcontroller")
+
+# Mapping of command type bytes to human-readable names for logging
+_CMD_NAMES = {
+    CMD_SET.MOVE_X: "MOVE_X",
+    CMD_SET.MOVE_Y: "MOVE_Y",
+    CMD_SET.MOVE_Z: "MOVE_Z",
+    CMD_SET.MOVE_THETA: "MOVE_THETA",
+    CMD_SET.MOVE_W: "MOVE_W",
+    CMD_SET.MOVE_W2: "MOVE_W2",
+    CMD_SET.HOME_OR_ZERO: "HOME_OR_ZERO",
+    CMD_SET.MOVETO_X: "MOVETO_X",
+    CMD_SET.MOVETO_Y: "MOVETO_Y",
+    CMD_SET.MOVETO_Z: "MOVETO_Z",
+    CMD_SET.SET_LIM: "SET_LIM",
+    CMD_SET.TURN_ON_ILLUMINATION: "TURN_ON_ILLUMINATION",
+    CMD_SET.TURN_OFF_ILLUMINATION: "TURN_OFF_ILLUMINATION",
+    CMD_SET.SET_ILLUMINATION: "SET_ILLUMINATION",
+    CMD_SET.SET_ILLUMINATION_LED_MATRIX: "SET_ILLUMINATION_LED_MATRIX",
+    CMD_SET.ACK_JOYSTICK_BUTTON_PRESSED: "ACK_JOYSTICK_BUTTON_PRESSED",
+    CMD_SET.ANALOG_WRITE_ONBOARD_DAC: "ANALOG_WRITE_ONBOARD_DAC",
+    CMD_SET.SET_DAC80508_REFDIV_GAIN: "SET_DAC80508_REFDIV_GAIN",
+    CMD_SET.SET_ILLUMINATION_INTENSITY_FACTOR: "SET_ILLUMINATION_INTENSITY_FACTOR",
+    CMD_SET.MOVETO_W: "MOVETO_W",
+    CMD_SET.SET_LIM_SWITCH_POLARITY: "SET_LIM_SWITCH_POLARITY",
+    CMD_SET.CONFIGURE_STEPPER_DRIVER: "CONFIGURE_STEPPER_DRIVER",
+    CMD_SET.SET_MAX_VELOCITY_ACCELERATION: "SET_MAX_VELOCITY_ACCELERATION",
+    CMD_SET.SET_LEAD_SCREW_PITCH: "SET_LEAD_SCREW_PITCH",
+    CMD_SET.SET_OFFSET_VELOCITY: "SET_OFFSET_VELOCITY",
+    CMD_SET.CONFIGURE_STAGE_PID: "CONFIGURE_STAGE_PID",
+    CMD_SET.ENABLE_STAGE_PID: "ENABLE_STAGE_PID",
+    CMD_SET.DISABLE_STAGE_PID: "DISABLE_STAGE_PID",
+    CMD_SET.SET_HOME_SAFETY_MERGIN: "SET_HOME_SAFETY_MERGIN",
+    CMD_SET.SET_PID_ARGUMENTS: "SET_PID_ARGUMENTS",
+    CMD_SET.SEND_HARDWARE_TRIGGER: "SEND_HARDWARE_TRIGGER",
+    CMD_SET.SET_STROBE_DELAY: "SET_STROBE_DELAY",
+    CMD_SET.SET_AXIS_DISABLE_ENABLE: "SET_AXIS_DISABLE_ENABLE",
+    CMD_SET.SET_PIN_LEVEL: "SET_PIN_LEVEL",
+    # Multi-port illumination commands (firmware v1.0+)
+    CMD_SET.SET_PORT_INTENSITY: "SET_PORT_INTENSITY",
+    CMD_SET.TURN_ON_PORT: "TURN_ON_PORT",
+    CMD_SET.TURN_OFF_PORT: "TURN_OFF_PORT",
+    CMD_SET.SET_PORT_ILLUMINATION: "SET_PORT_ILLUMINATION",
+    CMD_SET.SET_MULTI_PORT_MASK: "SET_MULTI_PORT_MASK",
+    CMD_SET.TURN_OFF_ALL_PORTS: "TURN_OFF_ALL_PORTS",
+    CMD_SET.SET_WATCHDOG_TIMEOUT: "SET_WATCHDOG_TIMEOUT",
+    CMD_SET.HEARTBEAT: "HEARTBEAT",
+    CMD_SET.INITFILTERWHEEL: "INITFILTERWHEEL",
+    CMD_SET.INITFILTERWHEEL_W2: "INITFILTERWHEEL_W2",
+    CMD_SET.INITIALIZE: "INITIALIZE",
+    CMD_SET.RESET: "RESET",
+}
 
 
 # "move backward" if SIGN is 1, "move forward" if SIGN is -1
@@ -64,6 +114,7 @@ _default_y_homing_direction = movement_sign_to_homing_direction(STAGE_MOVEMENT_S
 _default_z_homing_direction = movement_sign_to_homing_direction(STAGE_MOVEMENT_SIGN_Z)
 _default_theta_homing_direction = movement_sign_to_homing_direction(STAGE_MOVEMENT_SIGN_THETA)
 _default_w_homing_direction = movement_sign_to_homing_direction(STAGE_MOVEMENT_SIGN_W)
+_default_w2_homing_direction = movement_sign_to_homing_direction(STAGE_MOVEMENT_SIGN_W)  # W2 uses same sign as W
 
 
 # to do (7/28/2021) - add functions for configuring the stepper motors
@@ -150,23 +201,37 @@ class AbstractCephlaMicroSerial(abc.ABC):
 
 
 class SimSerial(AbstractCephlaMicroSerial):
+    # Number of illumination ports for simulation
+    NUM_ILLUMINATION_PORTS = 16
+    # Simulated firmware version
+    # v1.0: multi-port illumination support
+    # v1.1: serial watchdog for illumination auto-shutoff
+    FIRMWARE_VERSION_MAJOR = 1
+    FIRMWARE_VERSION_MINOR = 1
+
     @staticmethod
-    def response_bytes_for(command_id, execution_status, x, y, z, theta, joystick_button, switch) -> bytes:
+    def response_bytes_for(
+        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 1)
+    ) -> bytes:
         """
-        - command ID (1 byte)
-        - execution status (1 byte)
-        - X pos (4 bytes)
-        - Y pos (4 bytes)
-        - Z pos (4 bytes)
-        - Theta (4 bytes)
-        - buttons and switches (1 byte)
-        - reserved (4 bytes)
-        - CRC (1 byte)
+        - byte 0: command ID (1 byte)
+        - byte 1: execution status (1 byte)
+        - bytes 2-5: X pos (4 bytes)
+        - bytes 6-9: Y pos (4 bytes)
+        - bytes 10-13: Z pos (4 bytes)
+        - bytes 14-17: Theta (4 bytes)
+        - byte 18: buttons and switches (1 byte)
+        - bytes 19-21: reserved (3 bytes)
+        - byte 22: firmware version, nibble-encoded (1 byte)
+        - byte 23: CRC (1 byte)
         """
         crc_calculator = CrcCalculator(Crc8.CCITT, table_based=True)
 
         button_state = joystick_button << BIT_POS_JOYSTICK_BUTTON | switch << BIT_POS_SWITCH
-        reserved_state = 0  # This is just filler for the 4 reserved bytes.
+        # Firmware version is nibble-encoded in byte 22 (last byte of reserved section)
+        # High nibble = major version, low nibble = minor version
+        version_byte = (firmware_version[0] << 4) | (firmware_version[1] & 0x0F)
+        reserved_state = version_byte  # Byte 22 = version_byte when packed as big-endian int
         response = bytearray(
             struct.pack(">BBiiiiBi", command_id, execution_status, x, y, z, theta, button_state, reserved_state)
         )
@@ -185,8 +250,22 @@ class SimSerial(AbstractCephlaMicroSerial):
         self.y = 0
         self.z = 0
         self.theta = 0
+        self.w = 0
+        self.w2 = 0
         self.joystick_button = False
         self.switch = False
+
+        # Multi-port illumination state for simulation
+        self.port_is_on = [False] * SimSerial.NUM_ILLUMINATION_PORTS
+        self.port_intensity = [0] * SimSerial.NUM_ILLUMINATION_PORTS
+
+        # Serial watchdog (firmware v1.1+)
+        self.watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS
+
+        # Legacy illumination state tracking (for backward compatibility)
+        # Maps legacy source codes (11-15) to port indices (0-4)
+        self._illumination_source = None  # Currently selected legacy source
+        self._illumination_is_on = False  # Legacy global on/off state
 
         self._closed = False
 
@@ -209,6 +288,10 @@ class SimSerial(AbstractCephlaMicroSerial):
             self.z += self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.MOVE_THETA:
             self.theta += self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVE_W:
+            self.w += self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVE_W2:
+            self.w2 += self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.MOVETO_X:
             self.x = self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.MOVETO_Y:
@@ -232,6 +315,70 @@ class SimSerial(AbstractCephlaMicroSerial):
             elif axis == AXIS.XY:
                 self.x = 0
                 self.y = 0
+            elif axis == AXIS.W:
+                self.w = 0
+            elif axis == AXIS.W2:
+                self.w2 = 0
+        # Multi-port illumination commands
+        elif command_byte == CMD_SET.SET_PORT_INTENSITY:
+            port_index = write_bytes[2]
+            if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                intensity = (write_bytes[3] << 8) | write_bytes[4]
+                self.port_intensity[port_index] = intensity
+        elif command_byte == CMD_SET.TURN_ON_PORT:
+            port_index = write_bytes[2]
+            if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                self.port_is_on[port_index] = True
+        elif command_byte == CMD_SET.TURN_OFF_PORT:
+            port_index = write_bytes[2]
+            if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                self.port_is_on[port_index] = False
+        elif command_byte == CMD_SET.SET_PORT_ILLUMINATION:
+            port_index = write_bytes[2]
+            if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                intensity = (write_bytes[3] << 8) | write_bytes[4]
+                turn_on = write_bytes[5] != 0
+                self.port_intensity[port_index] = intensity
+                self.port_is_on[port_index] = turn_on
+        elif command_byte == CMD_SET.SET_MULTI_PORT_MASK:
+            port_mask = (write_bytes[2] << 8) | write_bytes[3]
+            on_mask = (write_bytes[4] << 8) | write_bytes[5]
+            for i in range(SimSerial.NUM_ILLUMINATION_PORTS):
+                if port_mask & (1 << i):
+                    self.port_is_on[i] = bool(on_mask & (1 << i))
+        elif command_byte == CMD_SET.TURN_OFF_ALL_PORTS:
+            for i in range(SimSerial.NUM_ILLUMINATION_PORTS):
+                self.port_is_on[i] = False
+        elif command_byte == CMD_SET.SET_WATCHDOG_TIMEOUT:
+            requested_timeout = (write_bytes[2] << 24) | (write_bytes[3] << 16) | (write_bytes[4] << 8) | write_bytes[5]
+            if requested_timeout > MAX_WATCHDOG_TIMEOUT_MS:
+                requested_timeout = MAX_WATCHDOG_TIMEOUT_MS
+            if requested_timeout == 0:
+                requested_timeout = DEFAULT_WATCHDOG_TIMEOUT_MS
+            self.watchdog_timeout_ms = requested_timeout
+        elif command_byte == CMD_SET.HEARTBEAT:
+            pass  # No-op, just triggers a response
+        # Legacy illumination commands - sync with multi-port state
+        elif command_byte == CMD_SET.SET_ILLUMINATION:
+            source = write_bytes[2]
+            intensity = (write_bytes[3] << 8) | write_bytes[4]
+            self._illumination_source = source
+            # Update port intensity for the corresponding port
+            port_index = source_code_to_port_index(source)
+            if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                self.port_intensity[port_index] = intensity
+        elif command_byte == CMD_SET.TURN_ON_ILLUMINATION:
+            self._illumination_is_on = True
+            # Turn on the currently selected source's port
+            if self._illumination_source is not None:
+                port_index = source_code_to_port_index(self._illumination_source)
+                if 0 <= port_index < SimSerial.NUM_ILLUMINATION_PORTS:
+                    self.port_is_on[port_index] = True
+        elif command_byte == CMD_SET.TURN_OFF_ILLUMINATION:
+            self._illumination_is_on = False
+            # Turn off all ports (matches firmware behavior)
+            for i in range(SimSerial.NUM_ILLUMINATION_PORTS):
+                self.port_is_on[i] = False
 
         self.response_buffer.extend(
             SimSerial.response_bytes_for(
@@ -243,6 +390,7 @@ class SimSerial(AbstractCephlaMicroSerial):
                 self.theta,
                 self.joystick_button,
                 self.switch,
+                firmware_version=(SimSerial.FIRMWARE_VERSION_MAJOR, SimSerial.FIRMWARE_VERSION_MINOR),
             )
         )
 
@@ -505,6 +653,7 @@ class Microcontroller:
             raise ValueError("You must pass in an AbstractCephlaSerial device for the microcontroller instance to use.")
 
         self._serial = serial_device
+        self._is_simulated = isinstance(serial_device, SimSerial)
 
         # Communication buffer sizes
         self.tx_buffer_length = MicrocontrollerDef.CMD_LENGTH  # Command packet size
@@ -543,8 +692,19 @@ class Microcontroller:
         # Callbacks should return immediately (called in read loop)
         self.joystick_event_listeners = []
 
+        # Firmware version (major, minor) - detected from response byte 22
+        # (0, 0) indicates legacy firmware without version reporting
+        self.firmware_version = (0, 0)
+
+        # Heartbeat thread for serial watchdog keepalive
+        self._heartbeat_thread = None
+        self._heartbeat_stop_event = threading.Event()
+
+        # Lock to serialize all outgoing serial commands (heartbeat thread + main thread)
+        self._cmd_lock = threading.Lock()
+
         # Command tracking for error handling
-        self.last_command = None                    # Last command sent
+        self.last_command = None
         self.last_command_send_timestamp = time.time()
         self.last_command_aborted_error = None      # Error if last command was aborted
 
@@ -571,7 +731,13 @@ class Microcontroller:
             self.set_dac80508_scaling_factor_for_illumination(ILLUMINATION_INTENSITY_FACTOR)
             time.sleep(0.5)
 
+        # Detect firmware version early by sending a harmless command
+        # This ensures supports_multi_port() returns accurate results immediately
+        self._detect_firmware_version()
+
     def _warn_if_reads_stale(self):
+        if self._is_simulated:
+            return
         now = time.time()
         last_read = float(
             self._last_successful_read_time
@@ -582,6 +748,7 @@ class Microcontroller:
             )
 
     def close(self):
+        self.stop_heartbeat()
         self.terminate_reading_received_packet_thread = True
         self.thread_read_received_packet.join()
         self._serial.close()
@@ -624,45 +791,37 @@ class Microcontroller:
         self.send_command(cmd)
         self.log.debug("initialize the drivers")
 
-    def init_filter_wheel(self):
+    def init_filter_wheel(self, axis=AXIS.W):
+        """Initialize a filter wheel axis.
+
+        Args:
+            axis: The axis to initialize (AXIS.W or AXIS.W2). Defaults to AXIS.W.
+        """
+        cmd_map = {AXIS.W: CMD_SET.INITFILTERWHEEL, AXIS.W2: CMD_SET.INITFILTERWHEEL_W2}
+        if axis not in cmd_map:
+            raise ValueError(f"Unsupported filter wheel axis: {axis}. Expected AXIS.W or AXIS.W2.")
         self._cmd_id = 0
         cmd = bytearray(self.tx_buffer_length)
-        cmd[1] = CMD_SET.INITFILTERWHEEL
+        cmd[1] = cmd_map[axis]
         self.send_command(cmd)
-        print("initialize filter wheel")  # debug
 
     def turn_on_illumination(self):
-        """
-        Turn on illumination via TTL shutter control.
-        
-        This opens the shutter for the currently selected illumination channel.
-        The channel and intensity should be set via set_illumination() before calling this.
-        """
+        """Turn on illumination via TTL shutter control (opens shutter for current channel)."""
+        self.log.debug("[MCU] turn_on_illumination")
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.TURN_ON_ILLUMINATION
         self.send_command(cmd)
 
     def turn_off_illumination(self):
-        """
-        Turn off illumination via TTL shutter control.
-        
-        This closes the shutter, stopping illumination.
-        """
+        """Turn off illumination via TTL shutter control."""
+        self.log.debug("[MCU] turn_off_illumination")
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.TURN_OFF_ILLUMINATION
         self.send_command(cmd)
 
     def set_illumination(self, illumination_source, intensity):
-        """
-        Set illumination channel and intensity.
-        
-        This selects which LED/laser channel to use and sets its intensity.
-        The intensity is converted from percentage (0-100%) to 16-bit DAC value (0-65535).
-        
-        Args:
-            illumination_source: Channel number (maps to wavelength, e.g., 11=405nm, 12=488nm)
-            intensity: Intensity percentage (0-100%)
-        """
+        """Set illumination channel and intensity (percentage to 16-bit DAC)."""
+        self.log.debug(f"[MCU] set_illumination: source={illumination_source}, intensity={intensity}")
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.SET_ILLUMINATION
         cmd[2] = illumination_source
@@ -680,6 +839,235 @@ class Microcontroller:
         cmd[4] = min(int(r * 255), 255)
         cmd[5] = min(int(b * 255), 255)
         self.send_command(cmd)
+
+    # Multi-port illumination commands (firmware v1.0+)
+    # These allow multiple ports to be ON simultaneously with independent intensities
+    # Maximum number of ports supported by firmware
+    _MAX_ILLUMINATION_PORTS = 16
+
+    def _validate_port_index(self, port_index: int):
+        """Validate port index is in valid range (0-15)."""
+        if not isinstance(port_index, int):
+            raise TypeError(f"port_index must be an integer, got {type(port_index).__name__}")
+        if port_index < 0 or port_index >= self._MAX_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port_index {port_index}, must be 0-{self._MAX_ILLUMINATION_PORTS - 1}")
+
+    def set_port_intensity(self, port_index: int, intensity: float):
+        """Set DAC intensity for a specific port without changing on/off state.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100), clamped to valid range
+
+        Raises:
+            ValueError: If port_index is out of range (0-15)
+            TypeError: If port_index is not an integer
+        """
+        self._validate_port_index(port_index)
+        self.log.debug(f"[MCU] set_port_intensity: port={port_index}, intensity={intensity}")
+        # Clamp intensity to valid range
+        intensity = max(0, min(100, intensity))
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.SET_PORT_INTENSITY
+        cmd[2] = port_index
+        intensity_value = int((intensity / 100) * 65535)
+        cmd[3] = intensity_value >> 8
+        cmd[4] = intensity_value & 0xFF
+        self.send_command(cmd)
+
+    def turn_on_port(self, port_index: int):
+        """Turn on a specific illumination port.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+
+        Raises:
+            ValueError: If port_index is out of range (0-15)
+            TypeError: If port_index is not an integer
+        """
+        self._validate_port_index(port_index)
+        self.log.debug(f"[MCU] turn_on_port: port={port_index}")
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.TURN_ON_PORT
+        cmd[2] = port_index
+        self.send_command(cmd)
+
+    def turn_off_port(self, port_index: int):
+        """Turn off a specific illumination port.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+
+        Raises:
+            ValueError: If port_index is out of range (0-15)
+            TypeError: If port_index is not an integer
+        """
+        self._validate_port_index(port_index)
+        self.log.debug(f"[MCU] turn_off_port: port={port_index}")
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.TURN_OFF_PORT
+        cmd[2] = port_index
+        self.send_command(cmd)
+
+    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool):
+        """Set intensity and on/off state for a specific port in one command.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100), clamped to valid range
+            turn_on: Whether to turn the port on
+
+        Raises:
+            ValueError: If port_index is out of range (0-15)
+            TypeError: If port_index is not an integer
+        """
+        self._validate_port_index(port_index)
+        self.log.debug(f"[MCU] set_port_illumination: port={port_index}, intensity={intensity}, on={turn_on}")
+        # Clamp intensity to valid range
+        intensity = max(0, min(100, intensity))
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.SET_PORT_ILLUMINATION
+        cmd[2] = port_index
+        intensity_value = int((intensity / 100) * 65535)
+        cmd[3] = intensity_value >> 8
+        cmd[4] = intensity_value & 0xFF
+        cmd[5] = 1 if turn_on else 0
+        self.send_command(cmd)
+
+    def set_multi_port_mask(self, port_mask: int, on_mask: int):
+        """Set on/off state for multiple ports using masks.
+
+        This allows turning multiple ports on/off in a single command while
+        leaving other ports unchanged.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            port_mask: 16-bit mask of which ports to update (bit 0=D1, bit 15=D16)
+            on_mask: 16-bit mask of on/off state for selected ports (1=on, 0=off)
+
+        Example:
+            # Turn on D1 and D2, turn off D3, leave others unchanged
+            set_multi_port_mask(0x0007, 0x0003)  # port_mask=D1|D2|D3, on_mask=D1|D2
+        """
+        self.log.debug(f"[MCU] set_multi_port_mask: port_mask=0x{port_mask:04X}, on_mask=0x{on_mask:04X}")
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.SET_MULTI_PORT_MASK
+        cmd[2] = (port_mask >> 8) & 0xFF
+        cmd[3] = port_mask & 0xFF
+        cmd[4] = (on_mask >> 8) & 0xFF
+        cmd[5] = on_mask & 0xFF
+        self.send_command(cmd)
+
+    def turn_off_all_ports(self):
+        """Turn off all illumination ports.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+        """
+        self.log.debug("[MCU] turn_off_all_ports")
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.TURN_OFF_ALL_PORTS
+        self.send_command(cmd)
+
+    def set_watchdog_timeout(self, timeout_s: float) -> None:
+        """Set firmware serial watchdog timeout and enable the watchdog.
+
+        The firmware will automatically turn off all illumination if it stops
+        receiving serial messages for longer than this timeout. This is a safety
+        feature to protect against software crashes or USB disconnects.
+
+        Note: Non-blocking. Call wait_till_operation_is_completed() before
+        sending another command if ordering matters.
+
+        Args:
+            timeout_s: Timeout in seconds. Valid range is 0 to 3600 (1 hour).
+                Values below 0 are clamped to 0. Values above 3600 are clamped to 3600.
+                A value of 0 tells the firmware to use its default timeout (5s).
+        """
+        timeout_ms = int(max(0, min(timeout_s * 1000, MAX_WATCHDOG_TIMEOUT_MS)))
+        if timeout_ms != int(timeout_s * 1000):
+            max_s = MAX_WATCHDOG_TIMEOUT_MS / 1000.0
+            self.log.warning(
+                f"[MCU] set_watchdog_timeout: requested {timeout_s}s clamped to "
+                f"{timeout_ms / 1000.0}s (valid range: 0-{max_s}s)"
+            )
+        self.log.debug(f"[MCU] set_watchdog_timeout: {timeout_s}s ({timeout_ms}ms)")
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.SET_WATCHDOG_TIMEOUT
+        cmd[2] = (timeout_ms >> 24) & 0xFF
+        cmd[3] = (timeout_ms >> 16) & 0xFF
+        cmd[4] = (timeout_ms >> 8) & 0xFF
+        cmd[5] = timeout_ms & 0xFF
+        self.send_command(cmd)
+
+    def send_heartbeat(self) -> None:
+        """Send a no-op heartbeat command to reset the firmware watchdog timer."""
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.HEARTBEAT
+        self.send_command(cmd)
+
+    def start_heartbeat(self, interval_s: float = None) -> None:
+        """Start a daemon thread that sends periodic heartbeat commands.
+
+        Args:
+            interval_s: Seconds between heartbeats. Defaults to WATCHDOG_TIMEOUT_S / 2.
+        """
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            self.log.warning("[MCU] Heartbeat already running, stopping before restart")
+            self.stop_heartbeat()
+        if interval_s is None:
+            interval_s = WATCHDOG_TIMEOUT_S / 2
+        self._heartbeat_stop_event.clear()
+
+        def _heartbeat_loop():
+            consecutive_failures = 0
+            while not self._heartbeat_stop_event.wait(interval_s):
+                try:
+                    self.send_heartbeat()
+                    if consecutive_failures > 0:
+                        self.log.info(f"[MCU] Heartbeat recovered after {consecutive_failures} failures")
+                    consecutive_failures = 0
+                except Exception as e:
+                    consecutive_failures += 1
+                    if consecutive_failures == 1:
+                        self.log.warning(f"[MCU] Heartbeat send failed: {e}")
+                    elif consecutive_failures == 5:
+                        self.log.error(
+                            f"[MCU] Heartbeat has failed {consecutive_failures} times consecutively. "
+                            "Firmware watchdog may fire and disable illumination."
+                        )
+                    elif consecutive_failures % 50 == 0:
+                        self.log.error(f"[MCU] Heartbeat still failing: {consecutive_failures} consecutive failures")
+
+        self._heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        self.log.debug(f"[MCU] Heartbeat started: interval={interval_s}s")
+
+    def stop_heartbeat(self) -> None:
+        """Stop the heartbeat thread."""
+        self._heartbeat_stop_event.set()
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2.0)
+            if self._heartbeat_thread.is_alive():
+                self.log.warning("[MCU] Heartbeat thread did not stop within 2s timeout")
+                self._heartbeat_thread = None
+                return
+        self._heartbeat_thread = None
+        self.log.debug("[MCU] Heartbeat stopped")
 
     def send_hardware_trigger(self, control_illumination=False, illumination_on_time_us=0, trigger_output_ch=0):
         illumination_on_time_us = int(illumination_on_time_us)
@@ -707,6 +1095,12 @@ class Microcontroller:
         cmd[1] = CMD_SET.SET_AXIS_DISABLE_ENABLE
         cmd[2] = axis
         cmd[3] = status
+        self.send_command(cmd)
+
+    def set_trigger_mode(self, mode):
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.SET_TRIGGER_MODE
+        cmd[2] = mode
         self.send_command(cmd)
 
     def _move_axis_usteps(self, usteps, axis_command_code):
@@ -782,6 +1176,9 @@ class Microcontroller:
     def move_w_usteps(self, usteps):
         self._move_axis_usteps(usteps, CMD_SET.MOVE_W)
 
+    def move_w2_usteps(self, usteps):
+        self._move_axis_usteps(usteps, CMD_SET.MOVE_W2)
+
     def set_off_set_velocity_x(self, off_set_velocity):
         # off_set_velocity is in mm/s
         cmd = bytearray(self.tx_buffer_length)
@@ -854,6 +1251,13 @@ class Microcontroller:
         cmd[3] = homing_direction.value
         self.send_command(cmd)
 
+    def home_w2(self, homing_direction: HomingDirection = _default_w2_homing_direction):
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.HOME_OR_ZERO
+        cmd[2] = AXIS.W2
+        cmd[3] = homing_direction.value
+        self.send_command(cmd)
+
     def zero_x(self):
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.HOME_OR_ZERO
@@ -879,6 +1283,13 @@ class Microcontroller:
         cmd = bytearray(self.tx_buffer_length)
         cmd[1] = CMD_SET.HOME_OR_ZERO
         cmd[2] = AXIS.W
+        cmd[3] = HOME_OR_ZERO.ZERO
+        self.send_command(cmd)
+
+    def zero_w2(self):
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = CMD_SET.HOME_OR_ZERO
+        cmd[2] = AXIS.W2
         cmd[3] = HOME_OR_ZERO.ZERO
         self.send_command(cmd)
 
@@ -1036,12 +1447,19 @@ class Microcontroller:
         self.set_home_safety_margin(AXIS.Z, int(Z_HOME_SAFETY_MARGIN_UM))
         self.wait_till_operation_is_completed()
 
-    def configure_squidfilter(self):
-        self.set_leadscrew_pitch(AXIS.W, SCREW_PITCH_W_MM)
+    def configure_squidfilter(self, axis=AXIS.W):
+        """Configure a filter wheel motor.
+
+        Args:
+            axis: The axis to configure (AXIS.W or AXIS.W2). Defaults to AXIS.W.
+        """
+        if axis not in (AXIS.W, AXIS.W2):
+            raise ValueError(f"Unsupported filter wheel axis: {axis}. Expected AXIS.W or AXIS.W2.")
+        self.set_leadscrew_pitch(axis, SCREW_PITCH_W_MM)
         self.wait_till_operation_is_completed()
-        self.configure_motor_driver(AXIS.W, MICROSTEPPING_DEFAULT_W, W_MOTOR_RMS_CURRENT_mA, W_MOTOR_I_HOLD)
+        self.configure_motor_driver(axis, MICROSTEPPING_DEFAULT_W, W_MOTOR_RMS_CURRENT_mA, W_MOTOR_I_HOLD)
         self.wait_till_operation_is_completed()
-        self.set_max_velocity_acceleration(AXIS.W, MAX_VELOCITY_W_mm, MAX_ACCELERATION_W_mm)
+        self.set_max_velocity_acceleration(axis, MAX_VELOCITY_W_mm, MAX_ACCELERATION_W_mm)
         self.wait_till_operation_is_completed()
 
     def ack_joystick_button_pressed(self):
@@ -1118,25 +1536,31 @@ class Microcontroller:
         self.set_pin_level(MCU_PINS.AF_LASER, 0)
 
     def send_command(self, command):
-        self._cmd_id = (self._cmd_id + 1) % 256
-        command[0] = self._cmd_id
-        command[-1] = self.crc_calculator.calculate_checksum(command[:-1])
-        self._serial.write(command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
-        self.mcu_cmd_execution_in_progress = True
-        self.last_command = command
-        self.last_command_send_timestamp = time.time()
-        self.retry = 0
+        with self._cmd_lock:
+            self._cmd_id = (self._cmd_id + 1) % 256
+            command[0] = self._cmd_id
+            command[-1] = self.crc_calculator.calculate_checksum(command[:-1])
+            cmd_type = command[1]
+            cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
+            self.log.debug(f"[MCU] >>> sending command {self._cmd_id}, type={cmd_name}")
+            self._serial.write(command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
+            self.mcu_cmd_execution_in_progress = True
+            self.last_command = command
+            self.last_command_send_timestamp = time.time()
+            self.retry = 0
 
-        if self.last_command_aborted_error is not None:
-            self.log.warning(
-                "Last command aborted and not cleared before new command sent!", self.last_command_aborted_error
-            )
-        self.last_command_aborted_error = None
+            if self.last_command_aborted_error is not None:
+                self.log.warning(
+                    "Last command aborted and not cleared before new command sent!", self.last_command_aborted_error
+                )
+            self.last_command_aborted_error = None
 
-        self._warn_if_reads_stale()
+            self._warn_if_reads_stale()
 
     def abort_current_command(self, reason):
-        self.log.error(f"Command id={self._cmd_id} aborted for reason='{reason}'")
+        cmd_type = self.last_command[1] if self.last_command is not None else -1
+        cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
+        self.log.error(f"[MCU] !!! Command {self._cmd_id} ({cmd_name}) ABORTED: {reason}")
         self.last_command_aborted_error = CommandAborted(reason=reason, command_id=self._cmd_id)
         self.mcu_cmd_execution_in_progress = False
 
@@ -1147,16 +1571,17 @@ class Microcontroller:
         self.last_command_aborted_error = None
 
     def resend_last_command(self):
-        if self.last_command is not None:
-            self._serial.write(self.last_command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
-            self.mcu_cmd_execution_in_progress = True
-            # We use the retry count for both checksum errors, and to keep track of
-            # timeout re-attempts.
-            self.last_command_send_timestamp = time.time()
-            self.retry = self.retry + 1
-        else:
-            self.log.warning("resend requested with no last_command, something is wrong!")
-            self.abort_current_command("Resend last requested with no last command")
+        with self._cmd_lock:
+            if self.last_command is not None:
+                self._serial.write(self.last_command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
+                self.mcu_cmd_execution_in_progress = True
+                # We use the retry count for both checksum errors, and to keep track of
+                # timeout re-attempts.
+                self.last_command_send_timestamp = time.time()
+                self.retry = self.retry + 1
+            else:
+                self.log.warning("resend requested with no last_command, something is wrong!")
+                self.abort_current_command("Resend last requested with no last command")
 
     def read_received_packet(self):
         crc_calculator = CrcCalculator(Crc8.CCITT, table_based=True)
@@ -1217,15 +1642,16 @@ class Microcontroller:
 
                 # parse the message
                 """
-                - command ID (1 byte)
-                - execution status (1 byte)
-                - X pos (4 bytes)
-                - Y pos (4 bytes)
-                - Z pos (4 bytes)
-                - Theta (4 bytes)
-                - buttons and switches (1 byte)
-                - reserved (4 bytes)
-                - CRC (1 byte)
+                - byte 0: command ID (1 byte)
+                - byte 1: execution status (1 byte)
+                - bytes 2-5: X pos (4 bytes)
+                - bytes 6-9: Y pos (4 bytes)
+                - bytes 10-13: Z pos (4 bytes)
+                - bytes 14-17: Theta (4 bytes)
+                - byte 18: buttons and switches (1 byte)
+                - bytes 19-21: reserved (3 bytes)
+                - byte 22: firmware version, nibble-encoded (1 byte)
+                - byte 23: CRC (1 byte)
                 """
                 self._last_successful_read_time = time.time()
                 self._cmd_id_mcu = msg[0]
@@ -1235,7 +1661,12 @@ class Microcontroller:
                 ):
                     if self.mcu_cmd_execution_in_progress:
                         self.mcu_cmd_execution_in_progress = False
-                        self.log.debug("mcu command " + str(self._cmd_id) + " complete")
+                        elapsed_ms = (time.time() - self.last_command_send_timestamp) * 1000
+                        cmd_type = self.last_command[1] if self.last_command is not None else -1
+                        cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
+                        self.log.debug(
+                            f"[MCU] <<< command {self._cmd_id} ({cmd_name}) complete (took {elapsed_ms:.1f}ms)"
+                        )
                 elif (
                     self.mcu_cmd_execution_in_progress
                     and self._cmd_id_mcu != self._cmd_id
@@ -1248,7 +1679,7 @@ class Microcontroller:
                         )
                     else:
                         self.log.debug(
-                            f"command timed out without an ack after {self.LAST_COMMAND_ACK_TIMEOUT} [s], resending command"
+                            f"[MCU] !!! command timed out without ack after {self.LAST_COMMAND_ACK_TIMEOUT}s, resending command"
                         )
                         self.resend_last_command()
                 elif (
@@ -1258,8 +1689,17 @@ class Microcontroller:
                     if self.retry > self.MAX_RETRY_COUNT:
                         self.abort_current_command(reason=f"Checksum error and 10 retries for {self._cmd_id}")
                     else:
-                        self.log.error("cmd checksum error, resending command")
+                        self.log.error("[MCU] !!! checksum error, resending command")
                         self.resend_last_command()
+                elif (
+                    self.mcu_cmd_execution_in_progress
+                    and self._cmd_id_mcu != self._cmd_id
+                    and self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
+                ):
+                    # Log when we receive an ACK for a different command than we're waiting for
+                    self.log.debug(
+                        f"[MCU] !!! received ack for command {self._cmd_id_mcu}, but waiting for command {self._cmd_id}"
+                    )
 
                 self.x_pos = self._payload_to_int(
                     msg[2:6], MicrocontrollerDef.N_BYTES_POS
@@ -1293,6 +1733,11 @@ class Microcontroller:
                 tmp = self.button_and_switch_state & (1 << BIT_POS_SWITCH)
                 self.switch_state = tmp > 0
 
+                # Firmware version from byte 22: high nibble = major, low nibble = minor
+                # Legacy firmware (pre-v1.0) sends 0x00, which gives version (0, 0)
+                version_byte = msg[RESPONSE_BYTE_FIRMWARE_VERSION]
+                self.firmware_version = (version_byte >> 4, version_byte & 0x0F)
+
                 with self._received_packet_cv:
                     self._received_packet_cv.notify_all()
 
@@ -1303,6 +1748,29 @@ class Microcontroller:
 
     def get_pos(self):
         return self.x_pos, self.y_pos, self.z_pos, self.theta_pos
+
+    def _detect_firmware_version(self):
+        """Detect firmware version by sending a harmless command.
+
+        Sends TURN_OFF_ALL_PORTS (a safe no-op if ports are already off)
+        to trigger a response from which we can read the firmware version.
+        This ensures supports_multi_port() returns accurate results immediately
+        after Microcontroller initialization.
+        """
+        self.turn_off_all_ports()
+        self.wait_till_operation_is_completed()
+        self.log.debug(f"Detected firmware version: {self.firmware_version}")
+
+    def supports_multi_port(self) -> bool:
+        """Check if firmware supports multi-port illumination commands.
+
+        Multi-port illumination was added in firmware version 1.0.
+        Legacy firmware (version 0.0) only supports single-source illumination.
+
+        Returns:
+            True if firmware version >= 1.0, False otherwise.
+        """
+        return self.firmware_version >= (1, 0)
 
     def get_button_and_switch_state(self):
         return self.button_and_switch_state
@@ -1350,22 +1818,19 @@ class Microcontroller:
         return int(signed)
 
     def set_dac80508_scaling_factor_for_illumination(self, illumination_intensity_factor):
-        """
-        Set a global scaling factor for all illumination DAC outputs.
-        
-        This factor (0-1) is multiplied by all illumination intensity values before
-        being sent to the DAC. This allows global dimming/brightening of all LEDs
-        without changing individual channel settings.
-        
-        Useful for:
-        - Reducing overall illumination to prevent photobleaching
-        - Matching illumination levels between different objectives
-        - Fine-tuning system brightness
-        
+        """Set the illumination intensity scaling factor on the MCU.
+
+        This factor scales the DAC output voltage for ALL illumination commands
+        (both legacy single-source and new multi-port commands).
+
+        Recommended values for different hardware:
+            0.6 = Squid LEDs (0-1.5V output range)
+            0.8 = Squid laser engine (0-2V output range)
+            1.0 = Full range (0-2.5V output, when DAC gain is 1 instead of 2)
+
         Args:
-            illumination_intensity_factor: Scaling factor (0-1), where 1 = full intensity
+            illumination_intensity_factor: Scaling factor (0.01-1.0, clamped)
         """
-        # Clamp to valid range
         if illumination_intensity_factor > 1:
             illumination_intensity_factor = 1
         if illumination_intensity_factor < 0:

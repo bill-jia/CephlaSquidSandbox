@@ -14,13 +14,17 @@ to DAC values for accurate intensity control.
 """
 
 from enum import Enum
-import json
-import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from typing import Dict, List
 
 from control.microcontroller import Microcontroller
+from control.core.config import ConfigRepository
+from control._def import ILLUMINATION_CODE
+
+# Number of illumination ports supported (matches firmware)
+NUM_ILLUMINATION_PORTS = 16
 
 
 class LightSourceType(Enum):
@@ -47,6 +51,43 @@ class ShutterControlMode(Enum):
 
 
 class IlluminationController:
+    """Controls microscope illumination (LEDs, lasers, LED matrix).
+
+    Two API styles are available:
+
+    **Legacy API (single-channel, any firmware):**
+        Use when only ONE illumination source is needed at a time.
+        This is the standard acquisition workflow.
+
+        - set_intensity(wavelength, intensity) - Set intensity by wavelength
+        - turn_on_illumination() / turn_off_illumination() - Control current source
+
+        Example:
+            controller.set_intensity(488, 50)  # 488nm at 50%
+            controller.turn_on_illumination()
+            # ... acquire image ...
+            controller.turn_off_illumination()
+
+    **Multi-port API (firmware v1.0+):**
+        Use when MULTIPLE illumination sources must be ON simultaneously.
+        Requires firmware v1.0 or later (checked automatically).
+
+        - set_port_intensity(port_index, intensity) - Set intensity by port (0=D1, 1=D2, ...)
+        - turn_on_port(port_index) / turn_off_port(port_index) - Control specific port
+        - turn_on_multiple_ports([port_indices]) - Turn on multiple ports at once
+        - turn_off_all_ports() - Turn off all ports
+
+        Example:
+            controller.set_port_intensity(0, 50)  # D1 at 50%
+            controller.set_port_intensity(1, 30)  # D2 at 30%
+            controller.turn_on_multiple_ports([0, 1])  # Both ON simultaneously
+            # ... acquire image ...
+            controller.turn_off_all_ports()
+
+    Note: The two APIs share underlying hardware state. Using legacy commands
+    will update the corresponding port state, and vice versa.
+    """
+
     def __init__(
         self,
         microcontroller: Microcontroller,
@@ -57,16 +98,15 @@ class IlluminationController:
         disable_intensity_calibration=False,
     ):
         """
-        Initialize the illumination controller.
-        
+    Initialize the illumination controller.
+    
         Args:
-            microcontroller: Microcontroller instance for hardware communication
-            intensity_control_mode: How to control intensity (DAC or software)
-            shutter_control_mode: How to control shutters (TTL or software)
-            light_source_type: Type of light source if using external device
-            light_source: Light source object if using external device
-            disable_intensity_calibration: If True, control LED/laser current directly
-                                          without applying calibration LUTs
+            microcontroller: MCU interface for hardware communication
+            intensity_control_mode: How intensity is controlled (DAC or software)
+            shutter_control_mode: How shutter is controlled (TTL or software)
+            light_source_type: Type of light source (SquidLED, SquidLaser, etc.)
+            light_source: External light source object (for software control)
+            disable_intensity_calibration: Set True to control LED/laser current directly
         """
         self.microcontroller = microcontroller
         self.intensity_control_mode = intensity_control_mode
@@ -74,22 +114,22 @@ class IlluminationController:
         self.light_source_type = light_source_type
         self.light_source = light_source
         self.disable_intensity_calibration = disable_intensity_calibration
-        
-        # Default channel mappings: wavelength (nm) -> TTL channel number
-        # These map fluorescence excitation wavelengths to hardware control channels
+        # Default wavelength -> source code mappings
+        # Maps common wavelengths to their corresponding laser port source codes
+        # Multiple wavelengths can map to the same port (e.g., 470nm and 488nm both to D2)
         default_mappings = {
-            405: 11,  # UV/violet LED
-            470: 12,  # Blue LED
-            488: 12,  # Blue laser (same channel as 470nm)
-            545: 14,  # Green LED
-            550: 14,  # Green LED
-            555: 14,  # Green LED
-            561: 14,  # Green laser (same channel as 555nm)
-            638: 13,  # Red LED
-            640: 13,  # Red LED
-            730: 15,  # Far-red LED
-            735: 15,  # Far-red LED
-            750: 15,  # Far-red LED
+            405: ILLUMINATION_CODE.ILLUMINATION_D1,
+            470: ILLUMINATION_CODE.ILLUMINATION_D2,
+            488: ILLUMINATION_CODE.ILLUMINATION_D2,
+            545: ILLUMINATION_CODE.ILLUMINATION_D3,
+            550: ILLUMINATION_CODE.ILLUMINATION_D3,
+            555: ILLUMINATION_CODE.ILLUMINATION_D3,
+            561: ILLUMINATION_CODE.ILLUMINATION_D3,
+            638: ILLUMINATION_CODE.ILLUMINATION_D4,
+            640: ILLUMINATION_CODE.ILLUMINATION_D4,
+            730: ILLUMINATION_CODE.ILLUMINATION_D5,
+            735: ILLUMINATION_CODE.ILLUMINATION_D5,
+            750: ILLUMINATION_CODE.ILLUMINATION_D5,
         }
 
         # Try to load custom channel mappings from file, fallback to defaults
@@ -103,7 +143,10 @@ class IlluminationController:
         self.intensity_luts = {}            # Lookup tables for each wavelength (power -> DAC)
         self.max_power = {}                  # Maximum measured power for each wavelength
 
-        # Configure external light source if provided
+        # Multi-port illumination state tracking (16 ports max)
+        self.port_is_on = {i: False for i in range(NUM_ILLUMINATION_PORTS)}
+        self.port_intensity = {i: 0.0 for i in range(NUM_ILLUMINATION_PORTS)}
+
         if self.light_source_type is not None:
             self._configure_light_source()
 
@@ -113,25 +156,29 @@ class IlluminationController:
         if self.light_source_type is None and self.disable_intensity_calibration is False:
             self._load_intensity_calibrations()
 
-    def _load_channel_mappings(self, default_mappings):
-        """
-        Load channel mappings from JSON file, fallback to default if file not found.
-        
-        Channel mappings define which hardware TTL channel controls each wavelength.
-        This allows customization of the illumination setup without code changes.
+    def _load_channel_mappings(self, default_mappings: Dict[int, int]) -> Dict[int, int]:
+        """Load channel mappings from illumination_channel_config.yaml, fallback to default if not found.
+
+        Returns:
+            Dict mapping wavelength (nm) to source_code for TTL control.
         """
         try:
-            # Get the parent directory of the current file
-            current_dir = Path(__file__).parent.parent
-            mapping_file = current_dir / "channel_mappings.json"
+            config_repo = ConfigRepository()
+            illumination_config = config_repo.get_illumination_config()
 
-            if mapping_file.exists():
-                with open(mapping_file, "r") as f:
-                    mappings = json.load(f)
-                    # Convert string keys to integers
-                    return {int(k): v for k, v in mappings["Illumination Code Map"].items()}
-            return default_mappings
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
+            if illumination_config is None:
+                return default_mappings
+
+            # Build wavelength -> source_code mapping from YAML config
+            mappings = {}
+            for channel in illumination_config.channels:
+                if channel.wavelength_nm is not None:
+                    # Use get_source_code to resolve from controller_port_mapping
+                    source_code = illumination_config.get_source_code(channel)
+                    mappings[channel.wavelength_nm] = source_code
+
+            return mappings if mappings else default_mappings
+        except Exception:
             return default_mappings
 
     def _configure_light_source(self):
@@ -179,6 +226,7 @@ class IlluminationController:
             # Control shutter via TTL signal from microcontroller
             # Note: Intensity should already be set via set_intensity() before turning on
             self.microcontroller.turn_on_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
 
         self.is_on[channel] = True
 
@@ -197,22 +245,13 @@ class IlluminationController:
         elif self.shutter_control_mode == ShutterControlMode.TTL:
             # Send TTL signal to close shutter
             self.microcontroller.turn_off_illumination()
+            self.microcontroller.wait_till_operation_is_completed()
 
         self.is_on[channel] = False
 
     def _load_intensity_calibrations(self):
-        """
-        Load intensity calibration files for all available wavelengths.
-        
-        Calibration files are CSV files named by wavelength (e.g., "405.csv", "488.csv")
-        containing columns:
-        - "DAC Percent": DAC setting (0-100%)
-        - "Optical Power (mW)": Measured optical power at that DAC setting
-        
-        These calibrations create lookup tables that convert desired power percentage
-        to the required DAC percentage, accounting for non-linear LED/laser responses.
-        """
-        calibrations_dir = Path(__file__).parent.parent / "intensity_calibrations"
+        """Load intensity calibrations for all available wavelengths."""
+        calibrations_dir = Path(__file__).parent.parent / "machine_configs" / "intensity_calibrations"
         if not calibrations_dir.exists():
             return
 
@@ -294,6 +333,113 @@ class IlluminationController:
 
     def get_shutter_state(self):
         return self.is_on
+
+    # Multi-port illumination methods (firmware v1.0+)
+    # These allow multiple ports to be ON simultaneously with independent intensities
+
+    def _check_multi_port_support(self):
+        """Check if firmware supports multi-port commands, raise if not."""
+        if not self.microcontroller.supports_multi_port():
+            raise RuntimeError(
+                "Firmware does not support multi-port illumination commands. "
+                "Update firmware to version 1.0 or later."
+            )
+
+    def set_port_intensity(self, port_index: int, intensity: float):
+        """Set intensity for a specific port without changing on/off state.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.set_port_intensity(port_index, intensity)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_intensity[port_index] = intensity
+
+    def turn_on_port(self, port_index: int):
+        """Turn on a specific illumination port.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.turn_on_port(port_index)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_is_on[port_index] = True
+
+    def turn_off_port(self, port_index: int):
+        """Turn off a specific illumination port.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.turn_off_port(port_index)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_is_on[port_index] = False
+
+    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool):
+        """Set intensity and on/off state for a specific port in one command.
+
+        Args:
+            port_index: Port index (0=D1, 1=D2, etc.)
+            intensity: Intensity percentage (0-100)
+            turn_on: Whether to turn the port on
+        """
+        self._check_multi_port_support()
+        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self.microcontroller.set_port_illumination(port_index, intensity, turn_on)
+        self.microcontroller.wait_till_operation_is_completed()
+        self.port_intensity[port_index] = intensity
+        self.port_is_on[port_index] = turn_on
+
+    def turn_on_multiple_ports(self, port_indices: List[int]):
+        """Turn on multiple ports simultaneously.
+
+        Args:
+            port_indices: List of port indices to turn on (0=D1, 1=D2, etc.)
+        """
+        if not port_indices:
+            return
+
+        self._check_multi_port_support()
+        # Build port mask and on mask
+        port_mask = 0
+        on_mask = 0
+        for port_index in port_indices:
+            if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
+                raise ValueError(f"Invalid port index: {port_index}")
+            port_mask |= 1 << port_index
+            on_mask |= 1 << port_index
+
+        self.microcontroller.set_multi_port_mask(port_mask, on_mask)
+        self.microcontroller.wait_till_operation_is_completed()
+        for port_index in port_indices:
+            self.port_is_on[port_index] = True
+
+    def turn_off_all_ports(self):
+        """Turn off all illumination ports."""
+        self._check_multi_port_support()
+        self.microcontroller.turn_off_all_ports()
+        self.microcontroller.wait_till_operation_is_completed()
+        for i in range(NUM_ILLUMINATION_PORTS):
+            self.port_is_on[i] = False
+
+    def get_active_ports(self) -> List[int]:
+        """Get list of currently active (on) port indices.
+
+        Returns:
+            List of port indices that are currently on.
+        """
+        return [i for i in range(NUM_ILLUMINATION_PORTS) if self.port_is_on[i]]
 
     def close(self):
         if self.light_source is not None:

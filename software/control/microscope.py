@@ -1,31 +1,12 @@
-"""
-Core microscope control module.
+from pathlib import Path
+from typing import Optional
 
-This module provides the main Microscope class that coordinates all microscope components:
-- Stage positioning (X, Y, Z, Theta)
-- Camera acquisition (main and focus cameras)
-- Illumination control
-- Optional addons (filter wheels, piezo stages, fluidics, etc.)
-
-The Microscope class acts as the central coordinator, providing a unified interface
-for high-level operations like image acquisition, stage movement, and illumination control.
-It manages the lifecycle of all hardware components and handles their initialization.
-
-Architecture:
-- Microscope: Main class that coordinates all components
-- MicroscopeAddons: Optional hardware components (filter wheels, piezo, etc.)
-- LowLevelDrivers: Direct hardware interfaces (microcontroller, stage drivers)
-"""
-
-import serial
-from typing import Optional, TypeVar
+import numpy as np
 
 import control._def
 from control._def import TriggerMode, NIDAQ_CONFIG
-from control.core.channel_configuration_mananger import ChannelConfigurationManager
-from control.core.configuration_mananger import ConfigurationManager
+from control.core.config import ConfigRepository
 from control.core.contrast_manager import ContrastManager
-from control.core.laser_af_settings_manager import LaserAFSettingManager
 from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, NoOpStreamHandlerFunctions
@@ -35,7 +16,6 @@ from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
 from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController
-from squid.stage.utils import move_z_axis_to_safety_position
 from squid.stage.cephla import CephlaStage
 from squid.stage.prior import PriorStage
 import control.celesta
@@ -56,17 +36,39 @@ if control._def.USE_XERYON:
         ObjectiveChanger2PosController_Simulation,
     )
 else:
-    ObjectiveChanger2PosController = TypeVar("ObjectiveChanger2PosController")
+    ObjectiveChanger2PosController = None
 
 if control._def.RUN_FLUIDICS:
     from control.fluidics import Fluidics
 else:
-    Fluidics = TypeVar("Fluidics")
+    Fluidics = None
 
 if control._def.ENABLE_NL5:
     import control.NL5 as NL5
 else:
-    NL5 = TypeVar("NL5")
+    NL5 = None
+
+
+def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
+    """Determine if a component should be simulated.
+
+    Args:
+        global_simulated: The global --simulation flag value.
+        component_override: Per-component override from control._def.SIMULATE_*.
+            True = simulate this component
+            False = use real hardware (default)
+
+    Returns:
+        True if the component should be simulated, False otherwise.
+
+    Behavior:
+        - With --simulation flag: ALL components are simulated (per-component settings ignored)
+        - Without --simulation flag: per-component settings apply
+    """
+    if global_simulated:
+        return True  # --simulation flag: all components simulated
+    # No --simulation flag: per-component settings apply
+    return bool(component_override)
 
 
 class MicroscopeAddons:
@@ -88,7 +90,7 @@ class MicroscopeAddons:
     """
     @staticmethod
     def build_from_global_config(
-        stage: AbstractStage, micro: Optional[Microcontroller], simulated: bool = False
+        stage: AbstractStage, micro: Optional[Microcontroller], simulated: bool = False, skip_init: bool = False
     ) -> "MicroscopeAddons":
         """
         Build MicroscopeAddons from global configuration.
@@ -101,6 +103,11 @@ class MicroscopeAddons:
         Returns:
             MicroscopeAddons instance with all configured addons
         """
+        # Per-component simulation settings
+        spinning_disk_simulated = _should_simulate(simulated, control._def.SIMULATE_SPINNING_DISK)
+        filter_wheel_simulated = _should_simulate(simulated, control._def.SIMULATE_FILTER_WHEEL)
+        objective_changer_simulated = _should_simulate(simulated, control._def.SIMULATE_OBJECTIVE_CHANGER)
+        laser_af_camera_simulated = _should_simulate(simulated, control._def.SIMULATE_LASER_AF_CAMERA)
 
         # XLight/Cicero: Spinning disk confocal system for high-speed imaging
         xlight = None
@@ -108,8 +115,11 @@ class MicroscopeAddons:
             # TODO: For user compatibility, when ENABLE_SPINNING_DISK_CONFOCAL is True, we use XLight/Cicero on default.
             # This needs to be changed when we figure out better machine configuration structure.
             xlight = (
-                serial_peripherals.XLight(control._def.XLIGHT_SERIAL_NUMBER, control._def.XLIGHT_SLEEP_TIME_FOR_WHEEL)
-                if not simulated
+                serial_peripherals.XLight(
+                    control._def.XLIGHT_SERIAL_NUMBER,
+                    control._def.XLIGHT_SLEEP_TIME_FOR_WHEEL,
+                )
+                if not spinning_disk_simulated
                 else serial_peripherals.XLight_Simulation()
             )
 
@@ -118,7 +128,7 @@ class MicroscopeAddons:
         if control._def.ENABLE_SPINNING_DISK_CONFOCAL and control._def.USE_DRAGONFLY:
             dragonfly = (
                 serial_peripherals.Dragonfly(SN=control._def.DRAGONFLY_SERIAL_NUMBER)
-                if not simulated
+                if not spinning_disk_simulated
                 else serial_peripherals.Dragonfly_Simulation()
             )
 
@@ -141,7 +151,7 @@ class MicroscopeAddons:
         fw_config = squid.config.get_filter_wheel_config()
         if fw_config:
             emission_filter_wheel = squid.filter_wheel_controller.utils.get_filter_wheel_controller(
-                fw_config, microcontroller=micro, simulated=simulated
+                fw_config, microcontroller=micro, simulated=filter_wheel_simulated, skip_init=skip_init
             )
 
         # Objective changer: Automatically switches between objectives (e.g., 10x and 20x)
@@ -149,7 +159,7 @@ class MicroscopeAddons:
         if control._def.USE_XERYON:
             objective_changer = (
                 ObjectiveChanger2PosController(sn=control._def.XERYON_SERIAL_NUMBER, stage=stage)
-                if not simulated
+                if not objective_changer_simulated
                 else ObjectiveChanger2PosController_Simulation(sn=control._def.XERYON_SERIAL_NUMBER, stage=stage)
             )
 
@@ -157,7 +167,7 @@ class MicroscopeAddons:
         camera_focus = None
         if control._def.SUPPORT_LASER_AUTOFOCUS:
             camera_focus = squid.camera.utils.get_camera(
-                squid.config.get_autofocus_camera_config(), simulated=simulated
+                squid.config.get_autofocus_camera_config(), simulated=laser_af_camera_simulated
             )
 
         # Fluidics: Automated sample handling and reagent delivery
@@ -237,15 +247,19 @@ class MicroscopeAddons:
         self.sci_microscopy_led_array = sci_microscopy_led_array
         self.nidaq = nidaq
 
-    def prepare_for_use(self):
+    def prepare_for_use(self, skip_init: bool = False):
         """
         Prepare all the addon hardware for immediate use.
+
+        Args:
+            skip_init: If True, skip homing operations (e.g., during restart).
         """
         if self.emission_filter_wheel:
             fw_config = squid.config.get_filter_wheel_config()
             self.emission_filter_wheel.initialize(fw_config.indices)
-            self.emission_filter_wheel.home()
-        if self.piezo_stage:
+            if not skip_init:
+                self.emission_filter_wheel.home()
+        if self.piezo_stage and not skip_init:
             self.piezo_stage.home()
 
 
@@ -260,38 +274,36 @@ class LowLevelDrivers:
     - Hardware trigger generation for synchronized acquisition
     """
     @staticmethod
-    def build_from_global_config(simulated: bool = False) -> "LowLevelDrivers":
-        """
-        Build LowLevelDrivers from global configuration.
-        
-        Args:
-            simulated: If True, create simulated microcontroller
-            
-        Returns:
-            LowLevelDrivers instance
-        """
-        # Find and connect to the microcontroller (Teensy board)
+    def build_from_global_config(simulated: bool = False, skip_init: bool = False) -> "LowLevelDrivers":
+        # Per-component simulation for microcontroller
+        mcu_simulated = _should_simulate(simulated, control._def.SIMULATE_MICROCONTROLLER)
+
         micro_serial_device = (
             control.microcontroller.get_microcontroller_serial_device(
                 version=control._def.CONTROLLER_VERSION, sn=control._def.CONTROLLER_SN
             )
-            if not simulated
+            if not mcu_simulated
             else control.microcontroller.get_microcontroller_serial_device(simulated=True)
         )
-        micro = control.microcontroller.Microcontroller(serial_device=micro_serial_device)
+        # Skip MCU reset/initialize when restarting (hardware already configured)
+        micro = control.microcontroller.Microcontroller(
+            serial_device=micro_serial_device,
+            reset_and_initialize=not skip_init,
+        )
 
         return LowLevelDrivers(microcontroller=micro)
 
     def __init__(self, microcontroller: Optional[Microcontroller] = None):
         self.microcontroller: Optional[Microcontroller] = microcontroller
 
-    def prepare_for_use(self):
+    def prepare_for_use(self, skip_init: bool = False):
         """
-        Configure hardware for use. Sets up DAC gains for piezo control.
+        Prepare the low-level drivers for immediate use.
         
-        The DAC80508 has 8 channels. Channel 7 is typically used for objective piezo.
-        Gain settings determine the output voltage range (2.5V or 5V).
+        Args:
+            skip_init: If True, skip homing operations (e.g., during restart).
         """
+        # Note: Currently no homing operations here, but accepting skip_init for API consistency
         if self.microcontroller and control._def.HAS_OBJECTIVE_PIEZO:
             # Configure DAC gains for objective piezo
             # If piezo requires 5V range, enable gain on channel 7
@@ -323,26 +335,18 @@ class Microscope:
     - Configuration managers: Channel settings, objectives, autofocus parameters
     """
     @staticmethod
-    def build_from_global_config(simulated: bool = False):
+    def build_from_global_config(simulated: bool = False, skip_init: bool = False) -> "Microscope":
         """
-        Build a complete Microscope instance from global configuration.
-        
-        This factory method:
-        1. Creates low-level drivers (microcontroller)
-        2. Creates stage (Prior or Cephla)
-        3. Creates optional addons
-        4. Creates camera with hardware trigger support
-        5. Creates illumination controller
-        6. Wires everything together
+        Build Microscope from global configuration.
         
         Args:
-            simulated: If True, use simulated hardware
-            
-        Returns:
-            Fully configured Microscope instance
+            simulated: If True, create simulated hardware
+            skip_init: If True, skip homing operations (e.g., during restart).
         """
-        # Create low-level hardware drivers (microcontroller for stage control, DAC, etc.)
-        low_level_devices = LowLevelDrivers.build_from_global_config(simulated)
+        low_level_devices = LowLevelDrivers.build_from_global_config(simulated, skip_init=skip_init)
+
+        # Per-component simulation for camera (with bypass for fast acquisition: use real camera when NI_DAQ_BYPASS_SIMULATION)
+        camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
 
         # Create stage: Prior (external controller) or Cephla (integrated with microcontroller)
         stage_config = squid.config.get_stage_config()
@@ -357,7 +361,7 @@ class Microscope:
 
         # Create optional addon components
         addons = MicroscopeAddons.build_from_global_config(
-            stage, low_level_devices.microcontroller, simulated=simulated
+            stage, low_level_devices.microcontroller, simulated=simulated, skip_init=skip_init
         )
 
         # Set up hardware trigger functions for synchronized acquisition
@@ -392,7 +396,7 @@ class Microscope:
                 )
                 # Send trigger: control_illumination=True means turn on LED during exposure
                 low_level_devices.microcontroller.send_hardware_trigger(
-                    True if illumination_time else False, illumination_time_us
+                    illumination_time is not None, illumination_time_us
                 )
             return True
 
@@ -420,7 +424,7 @@ class Microscope:
         
         camera = squid.camera.utils.get_camera(
             config=squid.config.get_camera_config(),
-            simulated=simulated,
+            simulated=camera_simulated,
             hw_trigger_fn=acquisition_camera_hw_trigger_fn,
             hw_set_strobe_delay_ms_fn=acquisition_camera_hw_strobe_delay_fn,
         )
@@ -465,6 +469,7 @@ class Microscope:
             addons=addons,
             low_level_drivers=low_level_devices,
             simulated=simulated,
+            skip_init=skip_init,
         )
 
     def __init__(
@@ -477,7 +482,9 @@ class Microscope:
         stream_handler_callbacks: Optional[StreamHandlerFunctions] = NoOpStreamHandlerFunctions,
         simulated: bool = False,
         skip_prepare_for_use: bool = False,
+        skip_init: bool = False,
     ):
+
         """
         Initialize the Microscope with all components.
         
@@ -491,7 +498,6 @@ class Microscope:
             simulated: Whether using simulated hardware
             skip_prepare_for_use: Skip hardware initialization (for testing)
         """
-        super().__init__()
         self._log = squid.logging.get_logger(self.__class__.__name__)
 
         # Core hardware components
@@ -508,18 +514,24 @@ class Microscope:
         # Configuration and state management
         # ObjectiveStore: Tracks current objective and its properties (NA, magnification, etc.)
         self.objective_store: ObjectiveStore = ObjectiveStore()
-        # ChannelConfigurationManager: Manages imaging channel settings (exposure, intensity, filters)
-        self.channel_configuration_manager: ChannelConfigurationManager = ChannelConfigurationManager()
-        # LaserAFSettingManager: Settings for laser-based autofocus
-        self.laser_af_settings_manager: Optional[LaserAFSettingManager] = None
-        if control._def.SUPPORT_LASER_AUTOFOCUS:
-            self.laser_af_settings_manager = LaserAFSettingManager()
 
-        # ConfigurationManager: Coordinates all configuration settings
-        self.configuration_manager: ConfigurationManager = ConfigurationManager(
-            self.channel_configuration_manager, self.laser_af_settings_manager
-        )
-        # ContrastManager: Manages image contrast/brightness settings
+        # Centralized config management
+        self.config_repo: ConfigRepository = ConfigRepository()
+
+        # Note: Migration from acquisition_configurations to user_profiles is handled
+        # by run_auto_migration() in main_hcs.py before Microscope is created
+
+        # Load default profile (ensures configs exist)
+        profiles = self.config_repo.get_available_profiles()
+        if profiles:
+            self.config_repo.load_profile(profiles[0])
+        else:
+            # Create a default profile if none exist - load_profile() will call
+            # ensure_default_configs() to generate configs from illumination_channel_config.yaml
+            self._log.info("No profiles found, creating 'default' profile")
+            self.config_repo.create_profile("default")
+            self.config_repo.load_profile("default")
+
         self.contrast_manager: ContrastManager = ContrastManager()
         # StreamHandler: Processes camera frames and routes them to callbacks
         self.stream_handler: StreamHandler = StreamHandler(handler_functions=stream_handler_callbacks)
@@ -541,11 +553,14 @@ class Microscope:
         # Handles live image streaming, illumination control, and trigger modes
         self.live_controller: LiveController = LiveController(microscope=self, camera=self.camera)
 
-        # Initialize hardware (set pixel formats, acquisition modes, etc.)
-        if not skip_prepare_for_use:
-            self._prepare_for_use()
+        # Sync confocal mode from hardware (must be after LiveController creation)
+        if control._def.ENABLE_SPINNING_DISK_CONFOCAL:
+            self._sync_confocal_mode_from_hardware()
 
-    def _prepare_for_use(self):
+        if not skip_prepare_for_use:
+            self._prepare_for_use(skip_init=skip_init)
+
+    def _prepare_for_use(self, skip_init: bool = False):
         """
         Initialize all hardware components for use.
         
@@ -554,10 +569,23 @@ class Microscope:
         - Initializes filter wheels and other addons
         - Sets camera pixel formats and acquisition modes
         """
-        # Configure low-level drivers (DAC settings, etc.)
-        self.low_level_drivers.prepare_for_use()
-        # Initialize addon components (filter wheels, piezo, etc.)
-        self.addons.prepare_for_use()
+        self.low_level_drivers.prepare_for_use(skip_init=skip_init)
+        self.addons.prepare_for_use(skip_init=skip_init)
+
+        # Configure serial watchdog for illumination safety (requires firmware v1.1+)
+        if self.low_level_drivers.microcontroller:
+            mcu = self.low_level_drivers.microcontroller
+            if mcu.firmware_version >= (1, 1):
+                timeout_s = control._def.WATCHDOG_TIMEOUT_S
+                mcu.set_watchdog_timeout(timeout_s)
+                mcu.wait_till_operation_is_completed()
+                mcu.start_heartbeat(interval_s=timeout_s / 2)
+                self._log.info(f"Illumination watchdog enabled: timeout={timeout_s}s, heartbeat={timeout_s / 2}s")
+            else:
+                self._log.warning(
+                    f"Illumination watchdog not available: firmware v{mcu.firmware_version[0]}.{mcu.firmware_version[1]} "
+                    "requires v1.1+"
+                )
 
         # Configure main camera
         # Set pixel format (MONO8, MONO16, etc.) from configuration
@@ -583,20 +611,106 @@ class Microscope:
             self.addons.camera_focus.set_pixel_format(squid.config.CameraPixelFormat.from_string("MONO8"))
             self.addons.camera_focus.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
 
-    def update_camera_functions(self, functions: StreamHandlerFunctions):
+    def _sync_confocal_mode_from_hardware(self) -> bool:
+        """Sync confocal mode state from spinning disk hardware.
+
+        Queries the actual hardware state (XLight disk position or Dragonfly modality)
+        and updates the live controller accordingly.
+        This ensures correct channel settings are used in both GUI and headless modes.
+
+        Returns:
+            True if sync was successful, False if hardware query failed.
+        """
+        confocal_mode = False
+        sync_successful = True
+
+        if self.addons.dragonfly is not None:
+            try:
+                modality = self.addons.dragonfly.get_modality()
+                confocal_mode = modality == "CONFOCAL" if modality else False
+            except Exception as e:
+                self._log.warning(f"Could not query Dragonfly modality: {e}")
+                sync_successful = False
+        elif self.addons.xlight is not None:
+            try:
+                # XLight returns 0 for widefield, 1 for confocal
+                disk_position = self.addons.xlight.get_disk_position()
+                confocal_mode = bool(disk_position)
+            except Exception as e:
+                self._log.warning(f"Could not query XLight disk position: {e}")
+                sync_successful = False
+
+        if sync_successful:
+            self.live_controller.sync_confocal_mode_from_hardware(confocal_mode)
+        else:
+            self._log.warning(
+                "Confocal mode could not be synchronized from hardware; " "keeping existing live controller state."
+            )
+        return sync_successful
+
+    def set_confocal_mode(self, confocal: bool) -> None:
+        """Set confocal/widefield mode and move the spinning disk.
+
+        This is the preferred method for headless scripts to switch imaging modes.
+        It updates both the hardware and the live controller.
+
+        Args:
+            confocal: True for confocal mode, False for widefield mode.
+
+        Raises:
+            RuntimeError: If spinning disk confocal is not enabled or hardware unavailable.
+        """
+        if not control._def.ENABLE_SPINNING_DISK_CONFOCAL:
+            raise RuntimeError("Spinning disk confocal is not enabled in configuration")
+
+        if self.addons.dragonfly is not None:
+            modality = "CONFOCAL" if confocal else "BF"
+            self.addons.dragonfly.set_modality(modality)
+        elif self.addons.xlight is not None:
+            # XLight: 1 for confocal, 0 for widefield
+            self.addons.xlight.set_disk_position(1 if confocal else 0)
+        else:
+            raise RuntimeError("No spinning disk hardware available")
+
+        self.live_controller.toggle_confocal_widefield(confocal)
+
+    def is_confocal_mode(self) -> bool:
+        """Check if currently in confocal mode.
+
+        Returns:
+            True if in confocal mode, False if in widefield mode.
+        """
+        return self.live_controller.is_confocal_mode()
+
+    def update_camera_functions(self, functions: StreamHandlerFunctions) -> None:
+        """Update the stream handler callback functions for the main camera.
+
+        Args:
+            functions: New callback functions for frame handling.
+        """
         self.stream_handler.set_functions(functions)
 
-    def update_camera_focus_functions(self, functions: StreamHandlerFunctions):
+    def update_camera_focus_functions(self, functions: StreamHandlerFunctions) -> None:
+        """Update the stream handler callback functions for the focus camera.
+
+        Args:
+            functions: New callback functions for frame handling.
+
+        Raises:
+            ValueError: If no focus camera is configured.
+        """
         if not self.addons.camera_focus:
             raise ValueError("No focus camera, cannot change its stream handler functions.")
 
         self.stream_handler_focus.set_functions(functions)
 
-    def initialize_core_components(self):
+    def initialize_core_components(self) -> None:
+        """Initialize and home core hardware components like piezo stage."""
         if self.addons.piezo_stage:
             self.addons.piezo_stage.home()
 
-    def setup_hardware(self):
+    def setup_hardware(self) -> None:
+        """Set up camera frame callbacks and start streaming for focus camera if present."""
         self.camera.add_frame_callback(self.stream_handler.on_new_frame)
         self.camera.enable_callbacks(True)
 
@@ -605,23 +719,26 @@ class Microscope:
             self.addons.camera_focus.enable_callbacks(True)
             self.addons.camera_focus.start_streaming()
 
-    def acquire_image(self):
-        """
-        Acquire a single image from the camera.
-        
-        This method handles both software and hardware trigger modes:
-        - Software trigger: Manually turn on illumination, trigger camera, read frame, turn off illumination
-        - Hardware trigger: Send synchronized trigger signal that controls both camera and illumination
-        
+    def acquire_image(self) -> np.ndarray:
+        """Acquire a single image from the camera.
+
+        Turns on illumination, triggers the camera, reads the frame, and turns off
+        illumination. The trigger mode (software vs hardware) is determined by the
+        live controller configuration.
+
         Returns:
-            Image array from camera, or None if acquisition failed
+            The acquired image as a numpy array.
+
+        Raises:
+            RuntimeError: If the camera fails to return a frame.
         """
-        # Turn on illumination and send trigger
-        if self.live_controller.trigger_mode == control._def.TriggerMode.SOFTWARE:
-            # Software trigger: Manual control sequence
+        using_software_trigger = self.live_controller.trigger_mode == control._def.TriggerMode.SOFTWARE
+
+        # turn on illumination and send trigger
+        if using_software_trigger:
             self.live_controller.turn_on_illumination()
-            self.waitForMicrocontroller()  # Wait for illumination to stabilize
-            self.camera.send_trigger()  # Trigger camera exposure
+            self._wait_for_microcontroller()
+            self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
             # Hardware trigger: Synchronized via microcontroller
             # Microcontroller sends trigger to camera and controls illumination timing
@@ -629,29 +746,25 @@ class Microscope:
                 control_illumination=True, illumination_on_time_us=self.camera.get_exposure_time() * 1000
             )
 
-        # Read a frame from camera
-        image = self.camera.read_frame()
-        if image is None:
-            print("self.camera.read_frame() returned None")
+        try:
+            # read a frame from camera
+            image = self.camera.read_frame()
+            if image is None:
+                self._log.error("camera.read_frame() returned None")
+                raise RuntimeError("Failed to acquire image: camera.read_frame() returned None")
+            return image
+        finally:
+            # always turn off illumination when using software trigger
+            if using_software_trigger:
+                self.live_controller.turn_off_illumination()
 
-        # Turn off the illumination if using software trigger
-        # (Hardware trigger automatically handles illumination timing)
-        if self.live_controller.trigger_mode == control._def.TriggerMode.SOFTWARE:
-            self.live_controller.turn_off_illumination()
+    def home_xyz(self) -> None:
+        """Home the X, Y, and Z axes based on configuration settings.
 
-        return image
-
-    def home_xyz(self):
+        Homes Z first if enabled, then performs a coordinated X/Y homing sequence
+        that avoids the plate clamp actuation post by moving Y first, homing X,
+        moving X clear, then homing Y.
         """
-        Home the X, Y, and Z axes of the stage.
-        
-        Homing moves the stage to its reference position (typically limit switches).
-        This is important for accurate positioning, especially after power cycles.
-        
-        The homing sequence includes safety movements to avoid collisions with
-        the plate clamp mechanism.
-        """
-        # Home Z axis first (if enabled)
         if control._def.HOMING_ENABLED_Z:
             self.stage.home(x=False, y=False, z=True, theta=False)
             
@@ -678,97 +791,181 @@ class Microscope:
             self._log.info("Homing the Y axis...")
             self.stage.home(x=False, y=True, z=False, theta=False)
 
-    def move_x(self, distance, blocking=True):
+    def move_x(self, distance: float, blocking: bool = True) -> None:
+        """Move the stage by a relative distance along the X axis.
+
+        Args:
+            distance: Distance to move in mm (positive or negative).
+            blocking: If True, wait for movement to complete before returning.
+        """
         self.stage.move_x(distance, blocking=blocking)
 
-    def move_y(self, distance, blocking=True):
+    def move_y(self, distance: float, blocking: bool = True) -> None:
+        """Move the stage by a relative distance along the Y axis.
+
+        Args:
+            distance: Distance to move in mm (positive or negative).
+            blocking: If True, wait for movement to complete before returning.
+        """
         self.stage.move_y(distance, blocking=blocking)
 
-    def move_x_to(self, position, blocking=True):
+    def move_x_to(self, position: float, blocking: bool = True) -> None:
+        """Move the stage to an absolute X position.
+
+        Args:
+            position: Target position in mm.
+            blocking: If True, wait for movement to complete before returning.
+        """
         self.stage.move_x_to(position, blocking=blocking)
 
-    def move_y_to(self, position, blocking=True):
+    def move_y_to(self, position: float, blocking: bool = True) -> None:
+        """Move the stage to an absolute Y position.
+
+        Args:
+            position: Target position in mm.
+            blocking: If True, wait for movement to complete before returning.
+        """
         self.stage.move_y_to(position, blocking=blocking)
 
-    def get_x(self):
+    def get_x(self) -> float:
+        """Get the current X position of the stage.
+
+        Returns:
+            Current X position in mm.
+        """
         return self.stage.get_pos().x_mm
 
-    def get_y(self):
+    def get_y(self) -> float:
+        """Get the current Y position of the stage.
+
+        Returns:
+            Current Y position in mm.
+        """
         return self.stage.get_pos().y_mm
 
-    def get_z(self):
+    def get_z(self) -> float:
+        """Get the current Z position of the stage.
+
+        Returns:
+            Current Z position in mm.
+        """
         return self.stage.get_pos().z_mm
 
-    def move_z_to(self, z_mm, blocking=True):
-        self.stage.move_z_to(z_mm)
+    def move_z_to(self, z_mm: float, blocking: bool = True) -> None:
+        """Move the stage to an absolute Z position.
 
-    def start_live(self):
+        Args:
+            z_mm: Target position in mm.
+            blocking: If True, wait for movement to complete before returning.
+        """
+        self.stage.move_z_to(z_mm, blocking=blocking)
+
+    def start_live(self) -> None:
+        """Start live view streaming from the camera."""
         self.camera.start_streaming()
         self.live_controller.start_live()
 
-    def stop_live(self):
+    def stop_live(self) -> None:
+        """Stop live view streaming from the camera."""
         self.live_controller.stop_live()
         self.camera.stop_streaming()
 
-    def waitForMicrocontroller(self, timeout=5.0, error_message=None):
+    def _wait_for_microcontroller(self, timeout: float = 5.0, error_message: Optional[str] = None) -> None:
+        """Wait for the microcontroller to complete the current operation.
+
+        Args:
+            timeout: Maximum time to wait in seconds.
+            error_message: Custom error message for timeout errors.
+
+        Raises:
+            TimeoutError: If operation does not complete within timeout.
+        """
         try:
             self.low_level_drivers.microcontroller.wait_till_operation_is_completed(timeout)
         except TimeoutError as e:
             self._log.error(error_message or "Microcontroller operation timed out!")
             raise e
 
-    def close(self):
-        self.stop_live()
-        self.low_level_drivers.microcontroller.close()
-        if self.addons.emission_filter_wheel:
-            self.addons.emission_filter_wheel.close()
-        if self.addons.camera_focus:
-            self.addons.camera_focus.close()
-        self.camera.close()
+    def close(self) -> None:
+        """Close the microscope and release all hardware resources.
 
-    def move_to_position(self, x, y, z):
+        Attempts to cleanly shut down all hardware components. Errors during
+        shutdown are logged but do not prevent other components from being closed.
+        """
+        try:
+            self.stop_live()
+        except Exception as e:
+            self._log.warning(f"Error stopping live view during close: {e}")
+
+        if self.low_level_drivers.microcontroller:
+            try:
+                self.low_level_drivers.microcontroller.close()
+            except Exception as e:
+                self._log.warning(f"Error closing microcontroller: {e}")
+
+        if self.addons.emission_filter_wheel:
+            try:
+                self.addons.emission_filter_wheel.close()
+            except Exception as e:
+                self._log.warning(f"Error closing emission filter wheel: {e}")
+
+        if self.addons.camera_focus:
+            try:
+                self.addons.camera_focus.close()
+            except Exception as e:
+                self._log.warning(f"Error closing focus camera: {e}")
+
+        try:
+            self.camera.close()
+        except Exception as e:
+            self._log.warning(f"Error closing camera: {e}")
+
+    def move_to_position(self, x: float, y: float, z: float) -> None:
+        """Move the stage to an absolute XYZ position.
+
+        Args:
+            x: Target X position in mm.
+            y: Target Y position in mm.
+            z: Target Z position in mm.
+        """
         self.move_x_to(x)
         self.move_y_to(y)
         self.move_z_to(z)
 
-    def set_objective(self, objective):
+    def set_objective(self, objective: str) -> None:
+        """Set the current objective lens.
+
+        Args:
+            objective: Name of the objective to set as current.
+        """
         self.objective_store.set_current_objective(objective)
 
-    def set_illumination_intensity(self, channel, intensity, objective=None):
-        """
-        Set illumination intensity for a specific channel and objective.
-        
-        Intensity settings are stored per objective because different objectives
-        may require different illumination levels (e.g., 10x vs 20x).
-        
-        Args:
-            channel: Wavelength channel (e.g., "405", "488", "561")
-            intensity: Intensity percentage (0-100%)
-            objective: Objective name (uses current objective if None)
-        """
-        if objective is None:
-            objective = self.objective_store.current_objective
-        # Get or create channel configuration for this objective/channel combination
-        channel_config = self.channel_configuration_manager.get_channel_configuration_by_name(objective, channel)
-        channel_config.illumination_intensity = intensity
-        # Apply the configuration to live controller (updates illumination)
-        self.live_controller.set_microscope_mode(channel_config)
+    def set_illumination_intensity(self, channel: str, intensity: float, objective: Optional[str] = None) -> None:
+        """Set the illumination intensity for a channel.
 
-    def set_exposure_time(self, channel, exposure_time, objective=None):
-        """
-        Set camera exposure time for a specific channel and objective.
-        
-        Exposure times are stored per objective because different objectives
-        may require different exposure times (e.g., due to different NA).
-        
         Args:
-            channel: Wavelength channel
-            exposure_time: Exposure time in milliseconds
-            objective: Objective name (uses current objective if None)
+            channel: Name of the channel.
+            intensity: Illumination intensity value.
+            objective: Objective name. If None, uses current objective.
         """
         if objective is None:
             objective = self.objective_store.current_objective
-        channel_config = self.channel_configuration_manager.get_channel_configuration_by_name(objective, channel)
-        channel_config.exposure_time = exposure_time
-        # Apply the configuration to live controller (updates camera settings)
-        self.live_controller.set_microscope_mode(channel_config)
+        channel_config = self.live_controller.get_channel_by_name(objective, channel)
+        if channel_config:
+            channel_config.illumination_intensity = intensity
+            self.live_controller.set_microscope_mode(channel_config)
+
+    def set_exposure_time(self, channel: str, exposure_time: float, objective: Optional[str] = None) -> None:
+        """Set the exposure time for a channel.
+
+        Args:
+            channel: Name of the channel.
+            exposure_time: Exposure time in milliseconds.
+            objective: Objective name. If None, uses current objective.
+        """
+        if objective is None:
+            objective = self.objective_store.current_objective
+        channel_config = self.live_controller.get_channel_by_name(objective, channel)
+        if channel_config:
+            channel_config.exposure_time = exposure_time
+            self.live_controller.set_microscope_mode(channel_config)

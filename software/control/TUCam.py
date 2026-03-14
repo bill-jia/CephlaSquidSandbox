@@ -9,14 +9,21 @@ import ctypes
 from ctypes import *
 from enum import Enum
 import time
+import sys
 
-#加载SDK动态库
-# 32bit
-#TUSDKdll = OleDLL("./lib/x86/TUCam.dll")
-# 64bit
-# TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
-TUSDKdll = OleDLL("./drivers and libraries/tucsen/lib/x64/TUCam.dll")
+# Auto-detect platform and architecture for loading SDK library
+# Paths relative to software/ (main_hcs.py cwd). DLLs live under drivers and libraries/tucsen/lib/
+_is_windows = sys.platform.startswith('win')
+_is_64bit = sys.maxsize > 2**32  # True if 64-bit Python
 
+if _is_windows:
+    if _is_64bit:
+        TUSDKdll = cdll.LoadLibrary("./drivers and libraries/tucsen/lib/x64/TUCam.dll")
+    else:
+        TUSDKdll = cdll.LoadLibrary("./drivers and libraries/tucsen/lib/x86/TUCam.dll")
+else:
+    # Linux
+    TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
 
 #  class typedef enum TUCAM status:
 class TUCAMRET(Enum):
