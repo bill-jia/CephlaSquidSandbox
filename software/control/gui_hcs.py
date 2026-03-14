@@ -58,7 +58,7 @@ from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
-from control.microscope import Microscope
+from control.microscope import Microscope, _should_simulate
 from control.models import AcquisitionChannel
 from squid.abc import AbstractCamera, AbstractStage, AbstractFilterWheelController
 import control._def
@@ -996,10 +996,8 @@ class HighContentScreeningGui(QMainWindow):
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
 
         if ENABLE_NIDAQ:
-            if NI_DAQ_BYPASS_SIMULATION:
-                self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=False)
-            else:
-                self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=is_simulation)
+            nidaq_simulated = _should_simulate(is_simulation, SIMULATE_NIDAQ)
+            self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=nidaq_simulated)
         
         # Fast acquisition widget
         if ENABLE_FAST_ACQUISITION:

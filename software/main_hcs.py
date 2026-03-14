@@ -86,6 +86,10 @@ if __name__ == "__main__":
 
     log.info(f"Squid Repository State: {control.utils.get_squid_repo_state_description()}")
 
+    # When running with --simulation, default all per-component SIMULATE_* to True
+    # (config can override with simulate_camera=false etc. to use real hardware for that component)
+    control._def.apply_simulation_mode_defaults(args.simulation)
+
     # Auto-migrate legacy acquisition configurations if present
     run_auto_migration()
 

@@ -54,7 +54,7 @@ def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
 
     Args:
         global_simulated: The global --simulation flag value.
-        component_override: Per-component override from control._def.SIMULATE_*.
+        component_override: Per-component setting from control._def.SIMULATE_*.
             True = simulate this component
             False = use real hardware (default)
 
@@ -62,12 +62,10 @@ def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
         True if the component should be simulated, False otherwise.
 
     Behavior:
-        - With --simulation flag: ALL components are simulated (per-component settings ignored)
-        - Without --simulation flag: per-component settings apply
+        - Per-component SIMULATE_* is always respected.
+        - When --simulation is used, apply_simulation_mode_defaults(True) sets any
+          SIMULATE_* not specified in config to True, so unset components are simulated.
     """
-    if global_simulated:
-        return True  # --simulation flag: all components simulated
-    # No --simulation flag: per-component settings apply
     return bool(component_override)
 
 
@@ -203,8 +201,9 @@ class MicroscopeAddons:
             sci_microscopy_led_array.set_NA(control._def.SCIMICROSCOPY_LED_ARRAY_DEFAULT_NA)
 
         # NIDAQ: For hardware triggering
+        nidaq_simulated = _should_simulate(simulated, control._def.SIMULATE_NIDAQ)
         nidaq = None
-        if control._def.ENABLE_NIDAQ and ((not simulated) or control._def.NI_DAQ_BYPASS_SIMULATION):
+        if control._def.ENABLE_NIDAQ and not nidaq_simulated:
             nidaq = NIDAQ(config=NIDAQ_CONFIG())
 
         return MicroscopeAddons(
@@ -345,7 +344,7 @@ class Microscope:
         """
         low_level_devices = LowLevelDrivers.build_from_global_config(simulated, skip_init=skip_init)
 
-        # Per-component simulation for camera (with bypass for fast acquisition: use real camera when NI_DAQ_BYPASS_SIMULATION)
+        # Per-component simulation for camera
         camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
 
         # Create stage: Prior (external controller) or Cephla (integrated with microcontroller)
@@ -419,9 +418,6 @@ class Microscope:
 
         # Create camera with hardware trigger support
         # The camera will call hw_trigger_fn when it needs to start acquisition
-        if control._def.CAMERA_BYPASS_SIMULATION:
-            simulated = False
-        
         camera = squid.camera.utils.get_camera(
             config=squid.config.get_camera_config(),
             simulated=camera_simulated,

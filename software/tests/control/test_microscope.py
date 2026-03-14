@@ -26,8 +26,8 @@ class TestShouldSimulate:
         assert _should_simulate(global_simulated=False, component_override=False) is False
 
     def test_real_hardware_with_global_flag(self):
-        """Real Hardware (False) with --simulation flag should still simulate (--simulation overrides all)."""
-        assert _should_simulate(global_simulated=True, component_override=False) is True
+        """Per-component False with --simulation: use real hardware (per-component is respected)."""
+        assert _should_simulate(global_simulated=True, component_override=False) is False
 
 
 def test_create_simulated_microscope():
@@ -123,22 +123,17 @@ class TestPerComponentSimulationIntegration:
         finally:
             scope.close()
 
-    def test_global_simulation_overrides_per_component(self, monkeypatch):
-        """--simulation flag should simulate ALL components regardless of per-component settings."""
-        # Set per-component to "Real Hardware" (False) for all components
-        monkeypatch.setattr(control._def, "SIMULATE_CAMERA", False)
-        monkeypatch.setattr(control._def, "SIMULATE_MICROCONTROLLER", False)
-        monkeypatch.setattr(control._def, "SIMULATE_SPINNING_DISK", False)
-        monkeypatch.setattr(control._def, "SIMULATE_FILTER_WHEEL", False)
-        monkeypatch.setattr(control._def, "SIMULATE_OBJECTIVE_CHANGER", False)
-        monkeypatch.setattr(control._def, "SIMULATE_LASER_AF_CAMERA", False)
+    def test_global_simulation_defaults_to_simulated_components(self, monkeypatch):
+        """With --simulation, apply_simulation_mode_defaults(True) sets unset SIMULATE_* to True, so components are simulated."""
+        # Clear any config-loaded keys so defaults apply when we call apply_simulation_mode_defaults
+        monkeypatch.setattr(control._def, "SIMULATION_KEYS_FROM_CONFIG", set())
+        control._def.apply_simulation_mode_defaults(True)
 
-        # Build microscope WITH --simulation flag (simulated=True)
+        # Build microscope WITH --simulation flag (simulated=True); SIMULATE_CAMERA etc. are now True
         scope = control.microscope.Microscope.build_from_global_config(simulated=True)
         try:
-            # Camera should be simulated because --simulation overrides per-component
             assert isinstance(
                 scope.camera, SimulatedCamera
-            ), f"Expected SimulatedCamera (--simulation overrides per-component) but got {type(scope.camera).__name__}"
+            ), f"Expected SimulatedCamera (default when --simulation) but got {type(scope.camera).__name__}"
         finally:
             scope.close()

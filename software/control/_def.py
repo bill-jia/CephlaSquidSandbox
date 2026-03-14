@@ -855,15 +855,19 @@ SIMULATED_DISK_IO_SPEED_MB_S = 200.0  # Target write speed in MB/s (HDD: 50-100,
 SIMULATED_DISK_IO_COMPRESSION = True  # Exercise compression CPU/RAM for realistic simulation
 
 # Per-component hardware simulation controls
-# These settings only apply when running WITHOUT the --simulation flag.
-# When --simulation is used, ALL components are simulated regardless of these settings.
 # Values: False = use real hardware (default), True = simulate this component
+# When --simulation is used, apply_simulation_mode_defaults(True) sets any unset SIMULATE_* to True.
+# Config can set e.g. simulate_camera = false to use real camera even when running with --simulation.
 SIMULATE_CAMERA = False
 SIMULATE_MICROCONTROLLER = False  # Also controls stage (stage uses MCU)
 SIMULATE_SPINNING_DISK = False  # XLight/Dragonfly
 SIMULATE_FILTER_WHEEL = False
 SIMULATE_OBJECTIVE_CHANGER = False
 SIMULATE_LASER_AF_CAMERA = False  # Laser autofocus camera
+SIMULATE_NIDAQ = False  # NI DAQ for hardware triggering
+
+# Tracks which SIMULATION section keys were loaded from config (for --simulation defaults)
+SIMULATION_KEYS_FROM_CONFIG = set()
 
 # Acquisition Backpressure Settings
 # Prevents RAM exhaustion when acquisition speed exceeds disk write speed
@@ -988,7 +992,6 @@ NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 6
 
 # National Instruments DAQ integration
 ENABLE_NIDAQ = False
-NI_DAQ_BYPASS_SIMULATION = True
 
 # NI DAQ Digital I/O logic family configuration
 # This setting determines the voltage levels used for digital I/O:
@@ -1249,13 +1252,6 @@ FLUIDICS_CONFIG_PATH = "./merfish_config/MERFISH_config.json"
 USE_TEMPLATE_MULTIPOINT = False
 
 FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
-
-#######################################################
-#### Simulation bypasses for individual components ####
-#######################################################
-# When True, use real hardware even when --simulation is set (e.g. for NIDAQ + camera sync)
-CAMERA_BYPASS_SIMULATION = False
-NI_DAQ_BYPASS_SIMULATION = False
 
 # Zarr v3 saving configuration
 ZARR_CHUNK_MODE = ZarrChunkMode.FULL_FRAME
@@ -1519,27 +1515,56 @@ if CACHED_CONFIG_FILE_PATH and os.path.exists(CACHED_CONFIG_FILE_PATH):
         _sim_config.read(CACHED_CONFIG_FILE_PATH)
         if _sim_config.has_section("SIMULATION"):
             if _sim_config.has_option("SIMULATION", "simulate_camera"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_camera")
                 SIMULATE_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_camera"))
                 log.info(f"Loaded SIMULATE_CAMERA={SIMULATE_CAMERA} from config")
             if _sim_config.has_option("SIMULATION", "simulate_microcontroller"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_microcontroller")
                 SIMULATE_MICROCONTROLLER = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_microcontroller"))
                 log.info(f"Loaded SIMULATE_MICROCONTROLLER={SIMULATE_MICROCONTROLLER} from config")
             if _sim_config.has_option("SIMULATION", "simulate_spinning_disk"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_spinning_disk")
                 SIMULATE_SPINNING_DISK = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_spinning_disk"))
                 log.info(f"Loaded SIMULATE_SPINNING_DISK={SIMULATE_SPINNING_DISK} from config")
             if _sim_config.has_option("SIMULATION", "simulate_filter_wheel"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_filter_wheel")
                 SIMULATE_FILTER_WHEEL = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_filter_wheel"))
                 log.info(f"Loaded SIMULATE_FILTER_WHEEL={SIMULATE_FILTER_WHEEL} from config")
             if _sim_config.has_option("SIMULATION", "simulate_objective_changer"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_objective_changer")
                 SIMULATE_OBJECTIVE_CHANGER = _parse_sim_setting(
                     _sim_config.get("SIMULATION", "simulate_objective_changer")
                 )
                 log.info(f"Loaded SIMULATE_OBJECTIVE_CHANGER={SIMULATE_OBJECTIVE_CHANGER} from config")
             if _sim_config.has_option("SIMULATION", "simulate_laser_af_camera"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_laser_af_camera")
                 SIMULATE_LASER_AF_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_laser_af_camera"))
                 log.info(f"Loaded SIMULATE_LASER_AF_CAMERA={SIMULATE_LASER_AF_CAMERA} from config")
+            if _sim_config.has_option("SIMULATION", "simulate_nidaq"):
+                SIMULATION_KEYS_FROM_CONFIG.add("simulate_nidaq")
+                SIMULATE_NIDAQ = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_nidaq"))
+                log.info(f"Loaded SIMULATE_NIDAQ={SIMULATE_NIDAQ} from config")
     except Exception as e:
         log.warning(f"Failed to load SIMULATION settings from config: {e}")
+
+
+def apply_simulation_mode_defaults(simulation_mode: bool) -> None:
+    """When running with --simulation, set any SIMULATE_* not specified in config to True."""
+    if not simulation_mode:
+        return
+    g = globals()
+    defaults = [
+        ("simulate_camera", "SIMULATE_CAMERA"),
+        ("simulate_microcontroller", "SIMULATE_MICROCONTROLLER"),
+        ("simulate_spinning_disk", "SIMULATE_SPINNING_DISK"),
+        ("simulate_filter_wheel", "SIMULATE_FILTER_WHEEL"),
+        ("simulate_objective_changer", "SIMULATE_OBJECTIVE_CHANGER"),
+        ("simulate_laser_af_camera", "SIMULATE_LASER_AF_CAMERA"),
+        ("simulate_nidaq", "SIMULATE_NIDAQ"),
+    ]
+    for config_key, attr_name in defaults:
+        if config_key not in SIMULATION_KEYS_FROM_CONFIG:
+            g[attr_name] = True
 
 
 @dataclass

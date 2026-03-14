@@ -1648,7 +1648,7 @@ class PreferencesDialog(QDialog):
             checkbox.setChecked(current in ("true", "1", "yes", "simulate"))
             return checkbox
 
-        sim_tooltip = "Simulate this component (even without --simulation flag).\nWith --simulation flag, ALL components are always simulated."
+        sim_tooltip = "Simulate this component (even without --simulation flag).\nWith --simulation, unset components default to simulated; set to unchecked to use real hardware for this component."
 
         self.sim_camera_checkbox = create_sim_checkbox("simulate_camera")
         self.sim_camera_checkbox.setToolTip(sim_tooltip)
