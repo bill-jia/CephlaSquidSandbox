@@ -11,6 +11,7 @@ from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, NoOpStreamHandlerFunctions
 
+from control.core.io_controller import IORegistry, LightSourceSerialAdapter
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
@@ -22,6 +23,7 @@ import control.celesta
 import control.illumination_andor
 import control.microcontroller
 import control.serial_peripherals as serial_peripherals
+import control.serial_peripherals_coolled as coolled_peripherals
 import squid.camera.utils
 import squid.config
 import squid.filter_wheel_controller.utils
@@ -173,22 +175,6 @@ class MicroscopeAddons:
         if control._def.RUN_FLUIDICS:
             fluidics = Fluidics(config_path=control._def.FLUIDICS_CONFIG_PATH, simulation=simulated)
 
-        # Piezo stage: Fine Z positioning (typically mounted on objective)
-        # Provides sub-micron precision for focus control
-        piezo_stage = None
-        if control._def.HAS_OBJECTIVE_PIEZO:
-            if not micro:
-                raise ValueError("Cannot create PiezoStage without a Microcontroller.")
-            piezo_stage = PiezoStage(
-                microcontroller=micro,
-                config={
-                    "OBJECTIVE_PIEZO_HOME_UM": control._def.OBJECTIVE_PIEZO_HOME_UM,
-                    "OBJECTIVE_PIEZO_RANGE_UM": control._def.OBJECTIVE_PIEZO_RANGE_UM,
-                    "OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE": control._def.OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE,
-                    "OBJECTIVE_PIEZO_FLIP_DIR": control._def.OBJECTIVE_PIEZO_FLIP_DIR,
-                },
-            )
-
         # SciMicroscopy LED array: RGB LED array for brightfield illumination
         sci_microscopy_led_array = None
         if control._def.SUPPORT_SCIMICROSCOPY_LED_ARRAY:
@@ -206,6 +192,54 @@ class MicroscopeAddons:
         if control._def.ENABLE_NIDAQ and not nidaq_simulated:
             nidaq = NIDAQ(config=NIDAQ_CONFIG())
 
+        # coolLED pE-400 / pE-400max light source (hybrid serial + TTL)
+        coolled = None
+        if control._def.USE_COOLLED:
+            coolled = (
+                coolled_peripherals.CoolLEDpE400(
+                    SN=control._def.COOLLED_SN or None,
+                    port=control._def.COOLLED_PORT,
+                )
+                if not simulated
+                else coolled_peripherals.CoolLEDpE400_Simulation()
+            )
+
+        # Serial-controlled devices that participate in IO endpoint routing.
+        # Each entry wraps a device controller via the SerialIODevice protocol,
+        # exposing only its value-setting operations to the IO endpoint system.
+        serial_devices = {}
+        if coolled is not None:
+            serial_devices["coolled"] = LightSourceSerialAdapter(coolled)
+
+        # IO endpoint registry — wires logical endpoints to physical controllers
+        io_registry = None
+        if micro is not None:
+            io_config = ConfigRepository().get_io_endpoint_config()
+            io_registry = IORegistry(
+                config=io_config,
+                microcontroller=micro,
+                nidaq=nidaq,
+                serial_devices=serial_devices or None,
+            )
+            io_registry.log_summary()
+
+        # Piezo stage (provide IO endpoint when registry available)
+        piezo_stage = None
+        if control._def.HAS_OBJECTIVE_PIEZO:
+            if not micro:
+                raise ValueError("Cannot create PiezoStage without a Microcontroller.")
+            piezo_ep = io_registry.get("piezo") if io_registry else None
+            piezo_stage = PiezoStage(
+                microcontroller=micro,
+                config={
+                    "OBJECTIVE_PIEZO_HOME_UM": control._def.OBJECTIVE_PIEZO_HOME_UM,
+                    "OBJECTIVE_PIEZO_RANGE_UM": control._def.OBJECTIVE_PIEZO_RANGE_UM,
+                    "OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE": control._def.OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE,
+                    "OBJECTIVE_PIEZO_FLIP_DIR": control._def.OBJECTIVE_PIEZO_FLIP_DIR,
+                },
+                piezo_endpoint=piezo_ep,
+            )
+
         return MicroscopeAddons(
             xlight,
             dragonfly,
@@ -217,7 +251,9 @@ class MicroscopeAddons:
             fluidics,
             piezo_stage,
             sci_microscopy_led_array,
-            nidaq
+            nidaq,
+            io_registry=io_registry,
+            coolled=coolled,
         )
 
     def __init__(
@@ -233,6 +269,8 @@ class MicroscopeAddons:
         piezo_stage: Optional[PiezoStage] = None,
         sci_microscopy_led_array: Optional[SciMicroscopyLEDArray] = None,
         nidaq: Optional[AbstractNIDAQ] = None,
+        io_registry: Optional[IORegistry] = None,
+        coolled=None,
     ):
         self.xlight: Optional[serial_peripherals.XLight] = xlight
         self.dragonfly: Optional[serial_peripherals.Dragonfly] = dragonfly
@@ -245,6 +283,8 @@ class MicroscopeAddons:
         self.piezo_stage = piezo_stage
         self.sci_microscopy_led_array = sci_microscopy_led_array
         self.nidaq = nidaq
+        self.io_registry: Optional[IORegistry] = io_registry
+        self.coolled = coolled
 
     def prepare_for_use(self, skip_init: bool = False):
         """
@@ -363,61 +403,48 @@ class Microscope:
             stage, low_level_devices.microcontroller, simulated=simulated, skip_init=skip_init
         )
 
-        # Set up hardware trigger functions for synchronized acquisition
-        # Hardware triggering allows precise timing between illumination and camera exposure
+        # Set up hardware trigger functions for synchronized acquisition.
+        # When an IORegistry is available, the trigger endpoint resolves to either
+        # the Teensy MCU or the NI-DAQ depending on io_endpoints.yaml.
         cam_trigger_log = squid.logging.get_logger("camera hw functions")
+        io_reg = addons.io_registry
+        trigger_ep = io_reg.get("camera_trigger") if io_reg else None
 
         def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
-            """
-            Hardware trigger function called by camera to start acquisition.
-            
-            This function:
-            - Sends hardware trigger signal to camera
-            - Optionally controls illumination timing for synchronized exposure
-            
-            Args:
-                illumination_time: Duration to keep illumination on (ms), or None for no illumination
-                
-            Returns:
-                True if trigger was sent successfully
-            """
-            # NOTE(imo): If this succeeds, it means we sent the request,
-            # but we didn't necessarily get confirmation of success.
             if addons.nl5 and control._def.NL5_USE_DOUT:
-                # Use NL5 laser combiner's digital output for triggering
                 addons.nl5.start_acquisition()
+            elif trigger_ep is not None:
+                illumination_time_us = int(1000.0 * illumination_time) if illumination_time else 0
+                cam_trigger_log.debug(
+                    f"Sending hw trigger via IO endpoint with illumination_time="
+                    f"{illumination_time_us if illumination_time else None} [us]"
+                )
+                trigger_ep.send_trigger(
+                    control_illumination=illumination_time is not None,
+                    illumination_on_time_us=illumination_time_us,
+                )
             else:
-                # Use microcontroller to send hardware trigger
-                # Convert illumination time from ms to microseconds
                 illumination_time_us = 1000.0 * illumination_time if illumination_time else 0
                 cam_trigger_log.debug(
-                    f"Sending hw trigger with illumination_time={illumination_time_us if illumination_time else None} [us]"
+                    f"Sending hw trigger (legacy) with illumination_time="
+                    f"{illumination_time_us if illumination_time else None} [us]"
                 )
-                # Send trigger: control_illumination=True means turn on LED during exposure
                 low_level_devices.microcontroller.send_hardware_trigger(
                     illumination_time is not None, illumination_time_us
                 )
             return True
 
         def acquisition_camera_hw_strobe_delay_fn(strobe_delay_ms: float) -> bool:
-            """
-            Set the strobe delay for hardware-triggered acquisition.
-            
-            Strobe delay is the time between trigger signal and illumination turn-on.
-            This allows fine-tuning of illumination timing relative to camera exposure.
-            
-            Args:
-                strobe_delay_ms: Delay in milliseconds
-            """
             strobe_delay_us = int(1000 * strobe_delay_ms)
-            cam_trigger_log.debug(f"Setting microcontroller strobe delay to {strobe_delay_us} [us]")
-            low_level_devices.microcontroller.set_strobe_delay_us(strobe_delay_us)
-            low_level_devices.microcontroller.wait_till_operation_is_completed()
-
+            cam_trigger_log.debug(f"Setting strobe delay to {strobe_delay_us} [us]")
+            if trigger_ep is not None:
+                trigger_ep.set_strobe_delay(strobe_delay_us)
+                trigger_ep.wait()
+            else:
+                low_level_devices.microcontroller.set_strobe_delay_us(strobe_delay_us)
+                low_level_devices.microcontroller.wait_till_operation_is_completed()
             return True
 
-        # Create camera with hardware trigger support
-        # The camera will call hw_trigger_fn when it needs to start acquisition
         camera = squid.camera.utils.get_camera(
             config=squid.config.get_camera_config(),
             simulated=camera_simulated,
@@ -426,14 +453,23 @@ class Microscope:
         )
 
         # Create illumination controller based on configured light source
-        if control._def.USE_LDI_SERIAL_CONTROL and not simulated:
-            # Lumencor Light Engine (LDI) - controlled via serial communication
+        io_reg = addons.io_registry
+        if control._def.USE_COOLLED and addons.coolled is not None:
+            illumination_controller = IlluminationController(
+                low_level_devices.microcontroller,
+                IntensityControlMode.Software,
+                ShutterControlMode.TTL,
+                LightSourceType.CoolLED,
+                addons.coolled,
+                io_registry=io_reg,
+            )
+        elif control._def.USE_LDI_SERIAL_CONTROL and not simulated:
             ldi = serial_peripherals.LDI()
             illumination_controller = IlluminationController(
-                low_level_devices.microcontroller, ldi.intensity_mode, ldi.shutter_mode, LightSourceType.LDI, ldi
+                low_level_devices.microcontroller, ldi.intensity_mode, ldi.shutter_mode,
+                LightSourceType.LDI, ldi, io_registry=io_reg,
             )
         elif control._def.USE_CELESTA_ETHERNET_CONTROL and not simulated:
-            # Lumencor CELESTA - controlled via Ethernet
             celesta = control.celesta.CELESTA()
             illumination_controller = IlluminationController(
                 low_level_devices.microcontroller,
@@ -441,9 +477,9 @@ class Microscope:
                 ShutterControlMode.TTL,
                 LightSourceType.CELESTA,
                 celesta,
+                io_registry=io_reg,
             )
         elif control._def.USE_ANDOR_LASER_CONTROL and not simulated:
-            # Andor laser system - controlled via USB
             andor_laser = control.illumination_andor.AndorLaser(
                 control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
             )
@@ -453,10 +489,12 @@ class Microscope:
                 ShutterControlMode.TTL,
                 LightSourceType.AndorLaser,
                 andor_laser,
+                io_registry=io_reg,
             )
         else:
-            # Default: Built-in LEDs/lasers controlled via DAC on microcontroller
-            illumination_controller = IlluminationController(low_level_devices.microcontroller)
+            illumination_controller = IlluminationController(
+                low_level_devices.microcontroller, io_registry=io_reg,
+            )
 
         return Microscope(
             stage=stage,
@@ -590,15 +628,15 @@ class Microscope:
             squid.config.CameraPixelFormat.from_string(control._def.CAMERA_CONFIG.PIXEL_FORMAT_DEFAULT)
         )
 
-        # Start with software trigger mode (can be changed to hardware trigger later)
-        if control._def.DEFAULT_TRIGGER_MODE == TriggerMode.SOFTWARE:
-            self.camera.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
-        elif control._def.DEFAULT_TRIGGER_MODE == TriggerMode.HARDWARE:
-            self.camera.set_acquisition_mode(CameraAcquisitionMode.HARDWARE_TRIGGER)
-        elif control._def.DEFAULT_TRIGGER_MODE == TriggerMode.CONTINUOUS:
-            self.camera.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
-        else:
+        _trigger_map = {
+            TriggerMode.SOFTWARE: CameraAcquisitionMode.SOFTWARE_TRIGGER,
+            TriggerMode.HARDWARE: CameraAcquisitionMode.HARDWARE_TRIGGER,
+            TriggerMode.CONTINUOUS: CameraAcquisitionMode.CONTINUOUS,
+        }
+        acq_mode = _trigger_map.get(control._def.DEFAULT_TRIGGER_MODE)
+        if acq_mode is None:
             raise ValueError(f"Invalid trigger mode: {control._def.DEFAULT_TRIGGER_MODE}")
+        self.camera.set_acquisition_mode(acq_mode)
 
 
         # Configure focus camera if available
@@ -736,11 +774,17 @@ class Microscope:
             self._wait_for_microcontroller()
             self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
-            # Hardware trigger: Synchronized via microcontroller
-            # Microcontroller sends trigger to camera and controls illumination timing
-            self.low_level_drivers.microcontroller.send_hardware_trigger(
-                control_illumination=True, illumination_on_time_us=self.camera.get_exposure_time() * 1000
-            )
+            trigger_ep = self.addons.io_registry.get("camera_trigger") if self.addons.io_registry else None
+            illumination_time_us = int(self.camera.get_exposure_time() * 1000)
+            if trigger_ep is not None:
+                trigger_ep.send_trigger(
+                    control_illumination=True,
+                    illumination_on_time_us=illumination_time_us,
+                )
+            else:
+                self.low_level_drivers.microcontroller.send_hardware_trigger(
+                    control_illumination=True, illumination_on_time_us=illumination_time_us,
+                )
 
         try:
             # read a frame from camera

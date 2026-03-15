@@ -1,0 +1,139 @@
+# IO Endpoint Configuration
+# Maps logical device functions to physical controller channels.
+#
+# controller: "MCU" (Teensy) or "NIDAQ" (NI DAQ)
+# signal_type: "digital" (TTL) or "analog" (voltage)
+# direction: "output" or "input"
+# channel_id — controller-specific:
+#   MCU:   "port:N" (illumination port 0-15), "dac:N" (DAC 0-7),
+#          "pin:N" (GPIO), "trigger:N" (hw trigger channel)
+#   NIDAQ: "aoN" (analog out), "portP/lineL" (digital out), "aiN" (analog in)
+# role: semantic tag ("intensity", "shutter", "camera_trigger", "af_laser", "piezo")
+
+version: 1.0
+
+endpoints:
+  # --- illumination D1 (405 nm) ---
+  - name: illum_D1_intensity
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "port:0"
+    role: intensity
+  - name: illum_D1_shutter
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "port:0"
+    role: shutter
+
+  # --- illumination D2 (488 nm) ---
+  - name: illum_D2_intensity
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "port:1"
+    role: intensity
+  - name: illum_D2_shutter
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "port:1"
+    role: shutter
+
+  # --- illumination D3 (561 nm) ---
+  - name: illum_D3_intensity
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "port:2"
+    role: intensity
+  - name: illum_D3_shutter
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "port:2"
+    role: shutter
+
+  # --- illumination D4 (638 nm) ---
+  - name: illum_D4_intensity
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "port:3"
+    role: intensity
+  - name: illum_D4_shutter
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "port:3"
+    role: shutter
+
+  # --- illumination D5 (730 nm) ---
+  - name: illum_D5_intensity
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "port:4"
+    role: intensity
+  - name: illum_D5_shutter
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "port:4"
+    role: shutter
+
+  # --- camera hardware trigger ---
+  - name: camera_trigger
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "trigger:0"
+    role: camera_trigger
+
+  # --- autofocus laser gate ---
+  - name: af_laser
+    controller: MCU
+    signal_type: digital
+    direction: output
+    channel_id: "pin:15"
+    role: af_laser
+
+  # --- objective piezo (DAC channel 7) ---
+  - name: piezo
+    controller: MCU
+    signal_type: analog
+    direction: output
+    channel_id: "dac:7"
+    role: piezo
+
+  # --- coolLED pE-400 example (hybrid serial + TTL) ---
+  # Intensity is controlled via USB serial (controller: SERIAL).
+  # Shutter is controlled via a TTL line on the NI-DAQ or MCU.
+  # Uncomment and adjust channel_id values to match your wiring.
+  #
+  # - name: illum_coolled_A_intensity
+  #   controller: SERIAL
+  #   signal_type: analog
+  #   direction: output
+  #   channel_id: "coolled:A"
+  #   role: intensity
+  # - name: illum_coolled_A_shutter
+  #   controller: NIDAQ
+  #   signal_type: digital
+  #   direction: output
+  #   channel_id: "port0/line5"
+  #   role: shutter
+  #
+  # - name: illum_coolled_B_intensity
+  #   controller: SERIAL
+  #   signal_type: analog
+  #   direction: output
+  #   channel_id: "coolled:B"
+  #   role: intensity
+  # - name: illum_coolled_B_shutter
+  #   controller: NIDAQ
+  #   signal_type: digital
+  #   direction: output
+  #   channel_id: "port0/line6"
+  #   role: shutter

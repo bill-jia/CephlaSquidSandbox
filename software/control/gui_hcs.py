@@ -589,6 +589,10 @@ class HighContentScreeningGui(QMainWindow):
                 liveController=self.liveController, show_LUT=False, autoLevels=False
             )
             self.displacementMeasurementController = core_displacement_measurement.DisplacementMeasurementController()
+            af_laser_ep = (
+                microscope.addons.io_registry.get("af_laser")
+                if microscope.addons.io_registry else None
+            )
             self.laserAutofocusController = LaserAutofocusController(
                 self.microcontroller,
                 self.camera_focus,
@@ -596,6 +600,7 @@ class HighContentScreeningGui(QMainWindow):
                 self.stage,
                 self.piezo,
                 self.objectiveStore,
+                af_laser_endpoint=af_laser_ep,
             )
 
         self.live_only_mode = live_only_mode or LIVE_ONLY_MODE

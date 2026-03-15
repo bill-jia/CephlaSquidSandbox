@@ -11,17 +11,26 @@ This module provides a unified interface for controlling various illumination so
 The controller maps wavelength channels (405nm, 488nm, 561nm, etc.) to hardware
 channels and applies calibration curves to convert desired optical power percentages
 to DAC values for accurate intensity control.
+
+When an IORegistry is available, illumination intensity and shutter control are
+routed through the IO endpoint abstraction layer so that signals can be directed
+to either the Teensy MCU or an NI-DAQ without changing higher-level code.
 """
+
+from __future__ import annotations
 
 from enum import Enum
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from control.microcontroller import Microcontroller
 from control.core.config import ConfigRepository
 from control._def import ILLUMINATION_CODE
+
+if TYPE_CHECKING:
+    from control.core.io_controller import IORegistry
 
 # Number of illumination ports supported (matches firmware)
 NUM_ILLUMINATION_PORTS = 16
@@ -36,18 +45,21 @@ class LightSourceType(Enum):
     VersaLase = 4    # VersaLase laser system
     SCI = 5           # SciMicroscopy LED array
     AndorLaser = 6    # Andor laser system
+    CoolLED = 7       # coolLED pE-400 / pE-400max
 
 
 class IntensityControlMode(Enum):
     """Methods for controlling illumination intensity."""
     SquidControllerDAC = 0  # Control via DAC on microcontroller (analog voltage)
     Software = 1            # Control via software API of light source
+    IOEndpoint = 2          # Control via IO endpoint abstraction (MCU or NI-DAQ)
 
 
 class ShutterControlMode(Enum):
     """Methods for controlling illumination shutters."""
     TTL = 0       # Control via TTL signals from microcontroller
     Software = 1  # Control via software API of light source
+    IOEndpoint = 2  # Control via IO endpoint abstraction (MCU or NI-DAQ)
 
 
 class IlluminationController:
@@ -96,6 +108,7 @@ class IlluminationController:
         light_source_type=None,
         light_source=None,
         disable_intensity_calibration=False,
+        io_registry: Optional["IORegistry"] = None,
     ):
         """
     Initialize the illumination controller.
@@ -107,13 +120,32 @@ class IlluminationController:
             light_source_type: Type of light source (SquidLED, SquidLaser, etc.)
             light_source: External light source object (for software control)
             disable_intensity_calibration: Set True to control LED/laser current directly
+            io_registry: Optional IORegistry for flexible IO routing.  When provided,
+                DAC and TTL control modes are automatically promoted to IOEndpoint
+                mode and routed through the registry.
         """
         self.microcontroller = microcontroller
-        self.intensity_control_mode = intensity_control_mode
-        self.shutter_control_mode = shutter_control_mode
         self.light_source_type = light_source_type
         self.light_source = light_source
         self.disable_intensity_calibration = disable_intensity_calibration
+        self.io_registry = io_registry
+
+        # When an IORegistry is present, promote DAC/TTL modes to IOEndpoint
+        if io_registry is not None:
+            self.intensity_control_mode = (
+                IntensityControlMode.IOEndpoint
+                if intensity_control_mode == IntensityControlMode.SquidControllerDAC
+                else intensity_control_mode
+            )
+            self.shutter_control_mode = (
+                ShutterControlMode.IOEndpoint
+                if shutter_control_mode == ShutterControlMode.TTL
+                else shutter_control_mode
+            )
+        else:
+            self.intensity_control_mode = intensity_control_mode
+            self.shutter_control_mode = shutter_control_mode
+
         # Default wavelength -> source code mappings
         # Maps common wavelengths to their corresponding laser port source codes
         # Multiple wavelengths can map to the same port (e.g., 470nm and 488nm both to D2)
@@ -135,6 +167,11 @@ class IlluminationController:
         # Try to load custom channel mappings from file, fallback to defaults
         self.channel_mappings_TTL = self._load_channel_mappings(default_mappings)
 
+        # Build wavelength -> IO endpoint-name mapping for IOEndpoint mode
+        self._wavelength_to_port_name: Dict[int, str] = {}
+        if io_registry is not None:
+            self._build_wavelength_endpoint_map()
+
         # State tracking
         self.channel_mappings_software = {}  # Software-controlled channel mappings
         self.is_on = {}                      # Track which channels are currently on
@@ -155,6 +192,46 @@ class IlluminationController:
         # This allows power-linear control instead of voltage-linear control
         if self.light_source_type is None and self.disable_intensity_calibration is False:
             self._load_intensity_calibrations()
+
+    def _build_wavelength_endpoint_map(self) -> None:
+        """Map wavelengths to IO endpoint port names using the illumination config.
+
+        Uses the illumination_channel_config.yaml to discover which wavelength
+        maps to which D-port, then produces a mapping like {488: "D2"}.
+        Falls back to the hardcoded default if the config is unavailable.
+        """
+        from control._def import source_code_to_port_index
+
+        default_port_map = {
+            405: "D1", 470: "D2", 488: "D2", 545: "D3", 550: "D3",
+            555: "D3", 561: "D3", 638: "D4", 640: "D4", 730: "D5",
+            735: "D5", 750: "D5",
+        }
+
+        try:
+            config_repo = ConfigRepository()
+            illum_cfg = config_repo.get_illumination_config()
+            if illum_cfg is not None:
+                for ch in illum_cfg.channels:
+                    if ch.wavelength_nm is not None:
+                        source_code = illum_cfg.get_source_code(ch)
+                        port_idx = source_code_to_port_index(source_code)
+                        if port_idx >= 0:
+                            self._wavelength_to_port_name[ch.wavelength_nm] = f"D{port_idx + 1}"
+        except Exception:
+            pass
+
+        if not self._wavelength_to_port_name:
+            self._wavelength_to_port_name = default_port_map
+
+    def _get_io_endpoints(self, wavelength: int):
+        """Return (intensity_bound_endpoint, shutter_bound_endpoint) for a wavelength."""
+        port_name = self._wavelength_to_port_name.get(wavelength)
+        if port_name is None:
+            raise KeyError(f"No IO endpoint mapping for wavelength {wavelength}nm")
+        intensity_ep = self.io_registry.get(f"illum_{port_name}_intensity")
+        shutter_ep = self.io_registry.get(f"illum_{port_name}_shutter")
+        return intensity_ep, shutter_ep
 
     def _load_channel_mappings(self, default_mappings: Dict[int, int]) -> Dict[int, int]:
         """Load channel mappings from illumination_channel_config.yaml, fallback to default if not found.
@@ -220,11 +297,13 @@ class IlluminationController:
             channel = self.current_channel
 
         if self.shutter_control_mode == ShutterControlMode.Software:
-            # Control shutter via light source API
             self.light_source.set_shutter_state(self.channel_mappings_software[channel], on=True)
+        elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
+            _, shutter_ep = self._get_io_endpoints(channel)
+            if shutter_ep is not None:
+                shutter_ep.set_digital(True)
+                shutter_ep.wait()
         elif self.shutter_control_mode == ShutterControlMode.TTL:
-            # Control shutter via TTL signal from microcontroller
-            # Note: Intensity should already be set via set_intensity() before turning on
             self.microcontroller.turn_on_illumination()
             self.microcontroller.wait_till_operation_is_completed()
 
@@ -242,8 +321,12 @@ class IlluminationController:
 
         if self.shutter_control_mode == ShutterControlMode.Software:
             self.light_source.set_shutter_state(self.channel_mappings_software[channel], on=False)
+        elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
+            _, shutter_ep = self._get_io_endpoints(channel)
+            if shutter_ep is not None:
+                shutter_ep.set_digital(False)
+                shutter_ep.wait()
         elif self.shutter_control_mode == ShutterControlMode.TTL:
-            # Send TTL signal to close shutter
             self.microcontroller.turn_off_illumination()
             self.microcontroller.wait_till_operation_is_completed()
 
@@ -306,28 +389,33 @@ class IlluminationController:
         percentage using the calibration lookup table. This ensures linear power control
         even if the LED/laser response is non-linear with voltage.
         """
-        # Initialize intensity setting for this channel if it doesn't exist
         if channel not in self.intensity_settings:
             self.intensity_settings[channel] = -1
-            
+
         if self.intensity_control_mode == IntensityControlMode.Software:
-            # Control intensity via light source API
             if intensity != self.intensity_settings[channel]:
                 self.light_source.set_intensity(self.channel_mappings_software[channel], intensity)
                 self.intensity_settings[channel] = intensity
             if self.shutter_control_mode == ShutterControlMode.TTL:
-                # Still need to set channel on microcontroller for TTL shutter control
-                # This selects which channel will be opened when turn_on_illumination() is called
                 self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], intensity)
+            elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
+                intensity_ep, _ = self._get_io_endpoints(channel)
+                if intensity_ep is not None:
+                    intensity_ep.set_analog(intensity)
+
+        elif self.intensity_control_mode == IntensityControlMode.IOEndpoint:
+            effective = self._apply_lut(channel, intensity) if channel in self.intensity_luts else intensity
+            intensity_ep, _ = self._get_io_endpoints(channel)
+            if intensity_ep is not None:
+                intensity_ep.set_analog(effective)
+            self.intensity_settings[channel] = intensity
+
         else:
-            # Control intensity via DAC on microcontroller
+            # Legacy SquidControllerDAC path
             if channel in self.intensity_luts:
-                # Apply calibration LUT to convert power percentage to DAC percentage
-                # This accounts for non-linear LED/laser response
                 dac_percent = self._apply_lut(channel, intensity)
                 self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], dac_percent)
             else:
-                # No calibration available, use intensity directly as DAC percentage
                 self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], intensity)
             self.intensity_settings[channel] = intensity
 

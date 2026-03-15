@@ -59,6 +59,14 @@ from control.models.acquisition_config import (
     validate_channel_group,
 )
 from control.models.laser_af_config import LaserAFConfig
+from control.models.io_endpoint_config import (
+    IOControllerType,
+    IOSignalType,
+    IODirection,
+    IOEndpoint,
+    IOEndpointConfig,
+    build_default_io_endpoint_config,
+)
 
 __all__ = [
     # Illumination
@@ -103,4 +111,11 @@ __all__ = [
     "validate_channel_group",
     # Laser AF
     "LaserAFConfig",
+    # IO Endpoints
+    "IOControllerType",
+    "IOSignalType",
+    "IODirection",
+    "IOEndpoint",
+    "IOEndpointConfig",
+    "build_default_io_endpoint_config",
 ]

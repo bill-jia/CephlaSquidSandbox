@@ -969,6 +969,10 @@ USE_ANDOR_LASER_CONTROL = False
 ANDOR_LASER_VID = 0x1BDB
 ANDOR_LASER_PID = 0x0300
 
+USE_COOLLED = False
+COOLLED_SN = ""       # Serial number for USB auto-discovery (alternative to COOLLED_PORT)
+COOLLED_PORT = None    # Explicit COM port (e.g. "COM5"), overrides SN-based discovery
+
 XLIGHT_SERIAL_NUMBER = "B00031BE"
 XLIGHT_SLEEP_TIME_FOR_WHEEL = 0.25
 XLIGHT_VALIDATE_WHEEL_POS = False

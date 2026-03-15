@@ -39,6 +39,8 @@ from control.models import (
     LaserAFConfig,
     ObjectiveChannelConfig,
     merge_channel_configs,
+    IOEndpointConfig,
+    build_default_io_endpoint_config,
 )
 from control.models.hardware_bindings import (
     FilterWheelReference,
@@ -353,6 +355,22 @@ class ConfigRepository:
         if cache_key not in self._machine_cache:
             path = self.machine_configs_path / "illumination_channel_config.yaml"
             self._machine_cache[cache_key] = self._load_yaml(path, IlluminationChannelConfig)
+        return self._machine_cache[cache_key]
+
+    def get_io_endpoint_config(self) -> IOEndpointConfig:
+        """Load IO endpoint configuration (cached).
+
+        Falls back to built-in defaults that mirror legacy MCU-only wiring
+        when io_endpoints.yaml is absent.
+        """
+        cache_key = "io_endpoints"
+        if cache_key not in self._machine_cache:
+            path = self.machine_configs_path / "io_endpoints.yaml"
+            loaded = self._load_yaml(path, IOEndpointConfig)
+            if loaded is None:
+                logger.info("io_endpoints.yaml not found — using default MCU-only IO endpoints")
+                loaded = build_default_io_endpoint_config()
+            self._machine_cache[cache_key] = loaded
         return self._machine_cache[cache_key]
 
     def get_confocal_config(self) -> Optional[ConfocalConfig]:
