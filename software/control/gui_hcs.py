@@ -1093,12 +1093,24 @@ class HighContentScreeningGui(QMainWindow):
             return
 
         binning_restored = self._restore_binning(cached_settings.binning)
-        pixel_format_restored = self._restore_pixel_format(cached_settings.pixel_format)
 
-        if binning_restored or pixel_format_restored:
+        # Prefer restoring high-level camera modes when the driver exposes them
+        # (e.g., Photometrics and Tucsen), and fall back to pixel format for
+        # legacy cameras.
+        camera_mode_restored = False
+        if getattr(cached_settings, "camera_mode", None):
+            camera_mode_restored = self._restore_camera_mode(cached_settings.camera_mode)
+
+        pixel_format_restored = False
+        if not camera_mode_restored and getattr(cached_settings, "pixel_format", None):
+            pixel_format_restored = self._restore_pixel_format(cached_settings.pixel_format)
+
+        if binning_restored or camera_mode_restored or pixel_format_restored:
             self.log.info(
-                f"Restored camera settings: binning={cached_settings.binning}, "
-                f"pixel_format={cached_settings.pixel_format}"
+                "Restored camera settings: "
+                f"binning={cached_settings.binning}, "
+                f"camera_mode={getattr(cached_settings, 'camera_mode', None)}, "
+                f"pixel_format={getattr(cached_settings, 'pixel_format', None)}"
             )
 
     def _restore_binning(self, binning: Tuple[int, int]) -> bool:
@@ -1121,12 +1133,51 @@ class HighContentScreeningGui(QMainWindow):
         self.cameraSettingWidget.dropdown_binning.blockSignals(False)
         return True
 
-    def _restore_pixel_format(self, pixel_format_str: Optional[str]) -> bool:
-        """Apply pixel format setting to camera and sync UI dropdown.
+    def _restore_camera_mode(self, mode_name: Optional[str]) -> bool:
+        """Apply camera mode setting (Photometrics / Tucsen-style) and sync UI dropdown.
 
         Returns True if successfully applied, False otherwise.
         """
-        # TBD: harmonize camera mode and pixel format settings
+        if not mode_name:
+            return False
+
+        # Only attempt restore when the camera exposes the camera-mode API.
+        if not hasattr(self.camera, "set_camera_mode") or not hasattr(self.camera, "get_available_camera_modes"):
+            return False
+
+        try:
+            available_modes = set(self.camera.get_available_camera_modes())  # type: ignore[attr-defined]
+        except Exception as e:
+            self.log.error(f"Camera error while querying available camera modes: {e}")
+            return False
+
+        if mode_name not in available_modes:
+            self.log.warning(
+                f"Cached camera mode '{mode_name}' is not available on this camera. "
+                f"Available modes: {sorted(available_modes)}"
+            )
+            return False
+
+        try:
+            self.camera.set_camera_mode(mode_name)  # type: ignore[attr-defined]
+        except (ValueError, AttributeError, RuntimeError) as e:
+            self.log.error(f"Camera error while restoring camera mode '{mode_name}': {e}")
+            return False
+
+        # Sync the camera-mode dropdown with the restored value.
+        self.cameraSettingWidget.dropdown_cameraMode.blockSignals(True)
+        self.cameraSettingWidget.dropdown_cameraMode.setCurrentText(mode_name)
+        self.cameraSettingWidget.dropdown_cameraMode.blockSignals(False)
+        return True
+
+    def _restore_pixel_format(self, pixel_format_str: Optional[str]) -> bool:
+        """Apply pixel format setting to camera and sync UI dropdown.
+
+        This is kept for backwards compatibility and for cameras that do not yet
+        expose a high-level camera-mode API.
+
+        Returns True if successfully applied, False otherwise.
+        """
         if not pixel_format_str:
             return False
 
@@ -1141,10 +1192,12 @@ class HighContentScreeningGui(QMainWindow):
         except ValueError as e:
             self.log.warning(f"Cannot restore pixel format {pixel_format_str} - not supported by this camera: {e}")
             return False
-        except (AttributeError, RuntimeError) as e:
+        except (AttributeError, RuntimeError, NotImplementedError) as e:
             self.log.error(f"Camera error while restoring pixel format settings: {e}")
             return False
 
+        # For legacy cameras where "camera mode" is effectively just pixel
+        # format, keep the dropdown text in sync with the pixel-format name.
         self.cameraSettingWidget.dropdown_cameraMode.blockSignals(True)
         self.cameraSettingWidget.dropdown_cameraMode.setCurrentText(pixel_format_str)
         self.cameraSettingWidget.dropdown_cameraMode.blockSignals(False)
