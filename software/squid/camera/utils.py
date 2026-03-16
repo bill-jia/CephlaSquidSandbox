@@ -77,6 +77,7 @@ def get_camera(
         hw_set_strobe_delay_ms_fn = None
 
     try:
+        print(f"config.camera_type: {config.camera_type}")
         if config.camera_type == CameraVariant.TOUPCAM:
             import control.camera_toupcam
 

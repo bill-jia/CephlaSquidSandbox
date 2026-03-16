@@ -1121,6 +1121,7 @@ class HighContentScreeningGui(QMainWindow):
 
         Returns True if successfully applied, False otherwise.
         """
+        # TBD: harmonize camera mode and pixel format settings
         if not pixel_format_str:
             return False
 
@@ -1139,9 +1140,9 @@ class HighContentScreeningGui(QMainWindow):
             self.log.error(f"Camera error while restoring pixel format settings: {e}")
             return False
 
-        self.cameraSettingWidget.dropdown_pixelFormat.blockSignals(True)
-        self.cameraSettingWidget.dropdown_pixelFormat.setCurrentText(pixel_format_str)
-        self.cameraSettingWidget.dropdown_pixelFormat.blockSignals(False)
+        self.cameraSettingWidget.dropdown_cameraMode.blockSignals(True)
+        self.cameraSettingWidget.dropdown_cameraMode.setCurrentText(pixel_format_str)
+        self.cameraSettingWidget.dropdown_cameraMode.blockSignals(False)
         return True
 
     def setupImageDisplayTabs(self):

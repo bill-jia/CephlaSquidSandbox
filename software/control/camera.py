@@ -22,7 +22,7 @@ precise timing control between illumination and image capture.
 """
 
 import threading
-from typing import Optional, Tuple, Sequence, Callable
+from typing import List, Optional, Tuple, Sequence, Callable
 import time
 import pydantic
 
@@ -34,7 +34,7 @@ from squid.abc import (
     CameraFrameFormat,
     CameraError,
 )
-from squid.config import CameraConfig, CameraPixelFormat, GxipyCameraModel, CameraSensor
+from squid.config import CameraConfig, CameraPixelFormat, CameraReadoutMode, GxipyCameraModel, CameraSensor
 from control._def import CAMERA_PIXEL_SIZE_UM
 
 try:
@@ -341,6 +341,30 @@ class DefaultCamera(AbstractCamera):
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
         raise NotImplementedError("get_available_pixel_formats is not implemented for DefaultCamera")
+
+    def get_camera_mode(self) -> str:
+        """Returns the current camera mode. DefaultCamera has a single fixed mode."""
+        return "default"
+
+    def get_available_camera_modes(self) -> List[str]:
+        """Returns the list of available camera modes. DefaultCamera supports only one mode."""
+        return ["default"]
+
+    def set_camera_mode(self, camera_mode: str):
+        """Sets the camera mode. DefaultCamera has a single fixed mode; setting is a no-op."""
+        pass
+
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """Get the current readout mode. DefaultCamera (GXiPy) uses a fixed readout."""
+        return CameraReadoutMode.GLOBAL
+
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """Get the list of readout modes supported by this camera."""
+        return [CameraReadoutMode.GLOBAL]
+
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """Set the readout mode. DefaultCamera has fixed readout; setting is a no-op."""
+        pass
 
     def get_resolution(self) -> Tuple[int, int]:
         return self._camera.WidthMax.get(), self._camera.HeightMax.get()
