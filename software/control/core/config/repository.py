@@ -378,16 +378,33 @@ class ConfigRepository:
     def get_machine_config(self) -> MachineConfig:
         """Load the unified machine configuration (cached).
 
-        Falls back to ``build_default_machine_config()`` when
-        ``machine_config.yaml`` is absent.
+        Resolution order:
+        1. Explicit ``machine_config.yaml`` (active config for this install)
+        2. If missing, a single matching ``machine_config_*.yaml`` file
+           (for setups that keep multiple named configs side-by-side)
+        3. Built-in default via ``build_default_machine_config()``
         """
         cache_key = "machine_config"
         if cache_key not in self._machine_cache:
-            path = self.machine_configs_path / "machine_config.yaml"
-            loaded = self._load_yaml(path, MachineConfig)
+            primary = self.machine_configs_path / "machine_config.yaml"
+            loaded: Optional[MachineConfig] = None
+
+            # 1) Primary explicit config file
+            if primary.exists():
+                loaded = self._load_yaml(primary, MachineConfig)
+            else:
+                # 2) Fallback: single named machine_config_*.yaml
+                candidates = sorted(self.machine_configs_path.glob("machine_config_*.yaml"))
+                if len(candidates) == 1:
+                    logger.info(
+                        f"machine_config.yaml not found — using named config {candidates[0].name}"
+                    )
+                    loaded = self._load_yaml(candidates[0], MachineConfig)
+
             if loaded is None:
                 logger.info(
-                    "machine_config.yaml not found — using default machine config"
+                    "No machine_config.yaml (or unique machine_config_*.yaml) found — "
+                    "using built-in default machine config"
                 )
                 loaded = build_default_machine_config()
             else:
