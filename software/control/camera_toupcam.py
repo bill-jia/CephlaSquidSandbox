@@ -1,6 +1,6 @@
 import math
 import time
-from typing import Optional, Tuple, Sequence, Dict
+from typing import List, Optional, Tuple, Sequence, Dict
 
 import numpy as np
 import pydantic
@@ -15,7 +15,7 @@ from squid.abc import (
     CameraPixelFormat,
     CameraFrame,
 )
-from squid.config import CameraConfig, ToupcamCameraModel
+from squid.config import CameraConfig, CameraReadoutMode, ToupcamCameraModel
 from control._def import *
 
 import threading
@@ -544,6 +544,38 @@ class ToupcamCamera(AbstractCamera):
 
     def get_available_pixel_formats(self) -> Sequence[CameraPixelFormat]:
         raise NotImplementedError("get_available_pixel_formats is not implemented for Toupcam")
+
+    # ------------------------------------------------------------------
+    # Camera/readout mode implementations required by AbstractCamera
+    # ToupcamCamera historically did not expose logical "camera modes"
+    # or configurable readout modes through this interface, so we treat
+    # both as single fixed values and keep setters as no-ops. This
+    # satisfies the abstract API without changing existing behavior.
+    # ------------------------------------------------------------------
+
+    def get_camera_mode(self) -> str:
+        """Return the current camera mode. ToupcamCamera exposes a single logical mode."""
+        return "default"
+
+    def get_available_camera_modes(self) -> List[str]:
+        """Return the list of available camera modes."""
+        return ["default"]
+
+    def set_camera_mode(self, camera_mode: str):
+        """Set the camera mode. ToupcamCamera has a single fixed mode; this is a no-op."""
+        pass
+
+    def set_readout_mode(self, readout_mode: CameraReadoutMode):
+        """Set the readout mode. ToupcamCamera does not expose readout modes; this is a no-op."""
+        pass
+
+    def get_readout_mode(self) -> CameraReadoutMode:
+        """Get the current readout mode. Treated as a fixed GLOBAL mode."""
+        return CameraReadoutMode.GLOBAL
+
+    def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
+        """Get the list of supported readout modes."""
+        return [CameraReadoutMode.GLOBAL]
 
     def set_auto_exposure(self, enabled: bool):
         try:
