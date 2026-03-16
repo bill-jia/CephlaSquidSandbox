@@ -3,7 +3,6 @@
 *.xml
 **/.idea/
 hardware_docs/
-.cursor/
 .migration_complete
 
 # PlatformIO
