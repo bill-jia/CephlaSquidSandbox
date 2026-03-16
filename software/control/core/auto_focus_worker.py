@@ -9,7 +9,7 @@ from control import utils
 import control._def
 from control.core.live_controller import LiveController
 from control.microcontroller import Microcontroller
-from control.microscope import NL5
+from control import NL5
 from squid.abc import AbstractCamera, AbstractStage
 
 AutoFocusController = TypeVar("AutoFocusController")
