@@ -30,7 +30,7 @@ from control.models.io_endpoint_config import (
 
 if TYPE_CHECKING:
     from control.microcontroller import Microcontroller
-    from control.ni_daq import AbstractNIDAQ
+    from control.nidaq import AbstractNIDAQ
     from squid.abc import LightSource
 
 logger = logging.getLogger(__name__)
@@ -509,6 +509,10 @@ class IORegistry:
     def get_serial_controller(self, prefix: str) -> Optional[SerialIOController]:
         """Get a serial IO controller by device prefix (e.g. 'coolled')."""
         return self._serial_controllers.get(prefix)
+
+    def list_endpoint_names(self) -> List[str]:
+        """Return all bound endpoint names."""
+        return list(self._bound.keys())
 
     @property
     def endpoint_config(self) -> IOEndpointConfig:

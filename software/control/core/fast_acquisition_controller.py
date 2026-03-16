@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 from squid.abc import AbstractCamera, CameraAcquisitionMode, CameraFrame
 from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
-from control.ni_daq import AbstractNIDAQ, WaveformData, TriggerSource
-from control.ni_daq import generate_pulse_train
+from control.nidaq import AbstractNIDAQ, WaveformData, TriggerSource
+from control.nidaq import generate_pulse_train
 from control._def import NIDAQ_CONFIG
 
 

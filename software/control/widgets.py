@@ -15078,7 +15078,7 @@ class SurfacePlotWidget(QWidget):
         self.canvas.draw()
         self.signal_point_clicked.emit(float(self.x_plot[idx]), float(self.y_plot[idx]))
 
-from control.ni_daq import (
+from control.nidaq import (
     AbstractNIDAQ, WaveformData, AcquisitionResult,
     TriggerSource, TriggerEdge, create_ni_daq,
     generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
@@ -15108,7 +15108,7 @@ class NIDAQWidget(QWidget):
         
         # Import NI DAQ module
 
-        self._ni_daq_module = __import__('control.ni_daq', fromlist=[''])
+        self._ni_daq_module = __import__('control.nidaq', fromlist=[''])
         
         self.is_simulation = is_simulation
 
@@ -15507,7 +15507,7 @@ class NIDAQWidget(QWidget):
     
     def _update_config(self):
         """Update the configuration from UI values."""
-        from control.ni_daq import TriggerSource, TriggerEdge
+        from control.nidaq import TriggerSource, TriggerEdge
         
         self._config.device_name = self.device_combo.currentText()
         self._config.sample_rate_hz = self.sample_rate_spin.value()
@@ -15636,7 +15636,7 @@ class NIDAQWidget(QWidget):
         Returns:
             WaveformData object with analog_output and digital_output dictionaries
         """
-        from control.ni_daq import WaveformData
+        from control.nidaq import WaveformData
         return WaveformData(
             analog_output=self._ao_waveforms.copy(),
             digital_output=self._do_patterns.copy()
@@ -16040,7 +16040,7 @@ class NIDAQWidget(QWidget):
                 zero_do_patterns[line] = np.zeros(num_samples, dtype=bool)
             
             # Create a minimal config for writing zeros
-            from control.ni_daq import WaveformData, NIDAQ_CONFIG, TriggerSource
+            from control.nidaq import WaveformData, NIDAQ_CONFIG, TriggerSource
             zero_waveforms = WaveformData(
                 analog_output=zero_ao_waveforms,
                 digital_output=zero_do_patterns
@@ -16130,7 +16130,7 @@ class NIDAQWidget(QWidget):
             self._ni_daq.configure(self._config)
             
             # Set waveforms
-            from control.ni_daq import WaveformData
+            from control.nidaq import WaveformData
             waveforms = WaveformData(
                 analog_output=self._ao_waveforms.copy(),
                 digital_output=self._do_patterns.copy()
@@ -16195,7 +16195,7 @@ class NIDAQWidget(QWidget):
     
     def _update_ai_plot(self, result):
         """Update the analog input plot with acquired data."""
-        from control.ni_daq import AcquisitionResult
+        from control.nidaq import AcquisitionResult
         
         self.ax_ai.clear()
         self.ax_ai.set_title("Analog Input (Acquired)")
@@ -16338,7 +16338,7 @@ class AOWaveformDialog(QDialog):
     
     def get_waveform(self) -> tuple:
         """Generate and return the configured waveform."""
-        from control.ni_daq import generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_staircase_ramp
+        from control.nidaq import generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_staircase_ramp
         
         channel = self.channel_combo.currentText()
         waveform_type = self.type_combo.currentText()
@@ -16480,7 +16480,7 @@ class DOPatternDialog(QDialog):
     
     def get_pattern(self) -> tuple:
         """Generate and return the configured pattern."""
-        from control.ni_daq import generate_pulse_train
+        from control.nidaq import generate_pulse_train
         
         line = self.line_combo.currentData()
         pattern_type = self.type_combo.currentText()

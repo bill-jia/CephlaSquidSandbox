@@ -67,6 +67,22 @@ from control.models.io_endpoint_config import (
     IOEndpointConfig,
     build_default_io_endpoint_config,
 )
+from control.models.machine_config import (
+    DeviceIOLine,
+    DeviceChannel,
+    DeviceConnection,
+    DeviceEntry,
+    DisplaySettings,
+    AcquisitionSettings,
+    AutofocusSettings,
+    TrackingSettings,
+    OpticsSettings,
+    PlateReaderSettings,
+    WellplateCalibration,
+    SoftwareConfig,
+    MachineConfig,
+    build_default_machine_config,
+)
 
 __all__ = [
     # Illumination
@@ -118,4 +134,19 @@ __all__ = [
     "IOEndpoint",
     "IOEndpointConfig",
     "build_default_io_endpoint_config",
+    # Machine Config
+    "DeviceIOLine",
+    "DeviceChannel",
+    "DeviceConnection",
+    "DeviceEntry",
+    "DisplaySettings",
+    "AcquisitionSettings",
+    "AutofocusSettings",
+    "TrackingSettings",
+    "OpticsSettings",
+    "PlateReaderSettings",
+    "WellplateCalibration",
+    "SoftwareConfig",
+    "MachineConfig",
+    "build_default_machine_config",
 ]

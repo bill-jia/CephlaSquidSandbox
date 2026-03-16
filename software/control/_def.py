@@ -1,8 +1,5 @@
 import os
-import sys
-import glob
 from pathlib import Path
-from configparser import ConfigParser
 from typing import Union
 import json
 import csv
@@ -1308,67 +1305,6 @@ class SlackNotifications:
     NOTIFY_ON_ACQUISITION_FINISHED = True
     SEND_MOSAIC_SNAPSHOTS = True
 
-
-try:
-    with open("cache/config_file_path.txt", "r") as file:
-        for line in file:
-            CACHED_CONFIG_FILE_PATH = line
-            break
-except FileNotFoundError:
-    CACHED_CONFIG_FILE_PATH = None
-
-config_files = glob.glob("." + "/" + "configuration*.ini")
-if config_files:
-    if len(config_files) > 1:
-        if CACHED_CONFIG_FILE_PATH in config_files:
-            log.info(f"defaulting to last cached config file at '{CACHED_CONFIG_FILE_PATH}'")
-            config_files = [CACHED_CONFIG_FILE_PATH]
-        else:
-            log.error("multiple machine configuration files found, the program will exit")
-            sys.exit(1)
-    log.info("load machine-specific configuration")
-    # exec(open(config_files[0]).read())
-    cfp = ConfigParser()
-    cfp.read(config_files[0])
-    var_items = list(locals().keys())
-    for var_name in var_items:
-        if type(locals()[var_name]) is type:
-            continue
-        varnamelower = var_name.lower()
-        if varnamelower not in cfp.options("GENERAL"):
-            continue
-        value = cfp.get("GENERAL", varnamelower)
-        actualvalue = conf_attribute_reader(value)
-        locals()[var_name] = actualvalue
-    for classkey in var_items:
-        myclass = None
-        classkeyupper = classkey.upper()
-        pop_items = None
-        try:
-            pop_items = cfp.items(classkeyupper)
-        except:
-            continue
-        if type(locals()[classkey]) is not type:
-            continue
-        myclass = locals()[classkey]
-        populate_class_from_dict(myclass, pop_items)
-
-    with open("cache/config_file_path.txt", "w") as file:
-        file.write(config_files[0])
-    CACHED_CONFIG_FILE_PATH = config_files[0]
-else:
-    log.warning("configuration*.ini file not found, defaulting to legacy configuration")
-    config_files = glob.glob("." + "/" + "configuration*.txt")
-    if config_files:
-        if len(config_files) > 1:
-            log.error("multiple machine configuration files found, the program will exit")
-            sys.exit(1)
-        log.info("load machine-specific configuration")
-        exec(open(config_files[0]).read())
-    else:
-        log.error("machine-specific configuration not present, the program will exit")
-        sys.exit(1)
-
 try:
     with open("cache/objective_and_sample_format.txt", "r") as f:
         cached_settings = json.load(f)
@@ -1425,131 +1361,12 @@ DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)
 if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))):
     DEFAULT_SAVING_PATH = str(Path.home() / DEFAULT_SAVING_PATH.strip("/").strip("\\"))
 
-# Load Views settings from config file at startup
-# These values override the defaults above and are accessed via control._def.XXX
-if CACHED_CONFIG_FILE_PATH and os.path.exists(CACHED_CONFIG_FILE_PATH):
-    try:
-        _views_config = ConfigParser()
-        _views_config.read(CACHED_CONFIG_FILE_PATH)
-        if _views_config.has_section("VIEWS"):
-            log.info("Loading Views settings from config file")
-            if _views_config.has_option("VIEWS", "display_plate_view"):
-                DISPLAY_PLATE_VIEW = _views_config.get("VIEWS", "display_plate_view").lower() in ("true", "1", "yes")
-            if _views_config.has_option("VIEWS", "display_mosaic_view"):
-                USE_NAPARI_FOR_MOSAIC_DISPLAY = _views_config.get("VIEWS", "display_mosaic_view").lower() in (
-                    "true",
-                    "1",
-                    "yes",
-                )
-            # Support both old and new config key names for backward compatibility
-            if _views_config.has_option("VIEWS", "save_downsampled_well_images"):
-                SAVE_DOWNSAMPLED_WELL_IMAGES = _views_config.get("VIEWS", "save_downsampled_well_images").lower() in (
-                    "true",
-                    "1",
-                    "yes",
-                )
-            elif _views_config.has_option("VIEWS", "generate_downsampled_well_images"):
-                # Legacy config key
-                SAVE_DOWNSAMPLED_WELL_IMAGES = _views_config.get(
-                    "VIEWS", "generate_downsampled_well_images"
-                ).lower() in ("true", "1", "yes")
-            if _views_config.has_option("VIEWS", "downsampled_well_resolutions_um"):
-                try:
-                    _res_str = _views_config.get("VIEWS", "downsampled_well_resolutions_um")
-                    DOWNSAMPLED_WELL_RESOLUTIONS_UM = [float(x.strip()) for x in _res_str.split(",") if x.strip()]
-                except ValueError:
-                    pass
-            if _views_config.has_option("VIEWS", "downsampled_plate_resolution_um"):
-                try:
-                    DOWNSAMPLED_PLATE_RESOLUTION_UM = _views_config.getfloat("VIEWS", "downsampled_plate_resolution_um")
-                except ValueError:
-                    pass
-            if _views_config.has_option("VIEWS", "downsampled_z_projection"):
-                try:
-                    DOWNSAMPLED_Z_PROJECTION = ZProjectionMode.convert_to_enum(
-                        _views_config.get("VIEWS", "downsampled_z_projection")
-                    )
-                except ValueError:
-                    pass
-            if _views_config.has_option("VIEWS", "downsampled_interpolation_method"):
-                try:
-                    DOWNSAMPLED_INTERPOLATION_METHOD = DownsamplingMethod.convert_to_enum(
-                        _views_config.get("VIEWS", "downsampled_interpolation_method")
-                    )
-                except ValueError:
-                    pass
-            if _views_config.has_option("VIEWS", "mosaic_view_target_pixel_size_um"):
-                try:
-                    MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM = _views_config.getfloat(
-                        "VIEWS", "mosaic_view_target_pixel_size_um"
-                    )
-                except ValueError:
-                    pass
-            if _views_config.has_option("VIEWS", "enable_ndviewer"):
-                ENABLE_NDVIEWER = _views_config.get("VIEWS", "enable_ndviewer").lower() in ("true", "1", "yes")
-    except Exception as e:
-        log.warning(f"Failed to load Views settings from config: {e}")
-
-    # Load GENERAL settings from config file
-    try:
-        _general_config = ConfigParser()
-        _general_config.read(CACHED_CONFIG_FILE_PATH)
-        if _general_config.has_section("GENERAL"):
-            if _general_config.has_option("GENERAL", "enable_memory_profiling"):
-                ENABLE_MEMORY_PROFILING = _general_config.get("GENERAL", "enable_memory_profiling").lower() in (
-                    "true",
-                    "1",
-                    "yes",
-                )
-                log.info(f"Loaded ENABLE_MEMORY_PROFILING={ENABLE_MEMORY_PROFILING} from config")
-    except Exception as e:
-        log.warning(f"Failed to load GENERAL settings from config: {e}")
-
-    # Load per-component simulation settings from config file
-    def _parse_sim_setting(value_str):
-        """Parse simulation setting: True (simulate) or False (real hardware)."""
-        val = value_str.strip().lower()
-        if val in ("true", "1", "yes", "simulate"):
-            return True
-        # Everything else (false, none, auto, unrecognized) = real hardware
-        return False
-
-    try:
-        _sim_config = ConfigParser()
-        _sim_config.read(CACHED_CONFIG_FILE_PATH)
-        if _sim_config.has_section("SIMULATION"):
-            if _sim_config.has_option("SIMULATION", "simulate_camera"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_camera")
-                SIMULATE_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_camera"))
-                log.info(f"Loaded SIMULATE_CAMERA={SIMULATE_CAMERA} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_microcontroller"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_microcontroller")
-                SIMULATE_MICROCONTROLLER = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_microcontroller"))
-                log.info(f"Loaded SIMULATE_MICROCONTROLLER={SIMULATE_MICROCONTROLLER} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_spinning_disk"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_spinning_disk")
-                SIMULATE_SPINNING_DISK = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_spinning_disk"))
-                log.info(f"Loaded SIMULATE_SPINNING_DISK={SIMULATE_SPINNING_DISK} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_filter_wheel"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_filter_wheel")
-                SIMULATE_FILTER_WHEEL = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_filter_wheel"))
-                log.info(f"Loaded SIMULATE_FILTER_WHEEL={SIMULATE_FILTER_WHEEL} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_objective_changer"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_objective_changer")
-                SIMULATE_OBJECTIVE_CHANGER = _parse_sim_setting(
-                    _sim_config.get("SIMULATION", "simulate_objective_changer")
-                )
-                log.info(f"Loaded SIMULATE_OBJECTIVE_CHANGER={SIMULATE_OBJECTIVE_CHANGER} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_laser_af_camera"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_laser_af_camera")
-                SIMULATE_LASER_AF_CAMERA = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_laser_af_camera"))
-                log.info(f"Loaded SIMULATE_LASER_AF_CAMERA={SIMULATE_LASER_AF_CAMERA} from config")
-            if _sim_config.has_option("SIMULATION", "simulate_nidaq"):
-                SIMULATION_KEYS_FROM_CONFIG.add("simulate_nidaq")
-                SIMULATE_NIDAQ = _parse_sim_setting(_sim_config.get("SIMULATION", "simulate_nidaq"))
-                log.info(f"Loaded SIMULATE_NIDAQ={SIMULATE_NIDAQ} from config")
-    except Exception as e:
-        log.warning(f"Failed to load SIMULATION settings from config: {e}")
+#
+# NOTE: Legacy INI-based overrides for Views / GENERAL / SIMULATION sections
+# have been removed.  Machine-specific and user-tunable settings should be
+# provided via machine_config.yaml (MachineConfig) and user_profiles/*
+# (ConfigRepository).  The flags above now serve as library defaults that
+# can be overridden by the unified configuration layer.
 
 
 def apply_simulation_mode_defaults(simulation_mode: bool) -> None:

@@ -24,7 +24,7 @@ import glob
 # Add the software directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from control.ni_daq import NIDAQ, NIDAQConfig, WaveformData, TriggerSource, generate_pulse_train
+from control.nidaq import NIDAQ, NIDAQConfig, WaveformData, TriggerSource, generate_pulse_train
 from control.camera_flir import FLIRCamera
 from squid.config import CameraConfig, CameraVariant
 from squid.abc import CameraAcquisitionMode, CameraPixelFormat

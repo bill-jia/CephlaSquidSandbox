@@ -659,10 +659,7 @@ _camera_config = CameraConfig(
 
 
 def get_camera_config() -> CameraConfig:
-    """
-    Returns the CameraConfig that existed at process startup.
-    """
-    print(f"get_camera_config: {_camera_config}")
+    """Returns the CameraConfig (may be rebuilt after ``reconfigure_from_machine_config``)."""
     return _camera_config
 
 
@@ -677,7 +674,164 @@ _autofocus_camera_config = CameraConfig(
 
 
 def get_autofocus_camera_config() -> CameraConfig:
-    """
-    Returns the CameraConfig that existed at startup for the laser autofocus system.
-    """
+    """Returns the CameraConfig for the laser autofocus camera."""
     return _autofocus_camera_config
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MachineConfig bridge — rebuild configs from the unified YAML
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def reconfigure_from_machine_config(mc: "MachineConfig") -> None:  # noqa: F821 (forward ref)
+    """Rebuild camera and stage singletons from a :class:`MachineConfig`.
+
+    Called by ``apply_machine_config()`` after _def.py globals have been
+    populated.  This ensures that ``get_camera_config()`` and
+    ``get_stage_config()`` return values derived from
+    ``machine_config.yaml`` rather than whatever the INI file set at
+    import time.
+    """
+    global _camera_config, _autofocus_camera_config, _stage_config
+
+    main_cam = mc.get_device("main_camera")
+    if main_cam and main_cam.enabled:
+        _camera_config = _build_camera_config_from_device(main_cam)
+
+    focus_cam = mc.get_device("focus_camera")
+    if focus_cam and focus_cam.enabled:
+        _autofocus_camera_config = _build_camera_config_from_device(
+            focus_cam,
+            default_pixel_format=CameraPixelFormat.MONO8,
+            default_binning=(1, 1),
+        )
+
+    stage_dev = mc.get_device("stage")
+    if stage_dev and stage_dev.enabled:
+        _stage_config = _build_stage_config_from_device(stage_dev)
+
+
+def _build_camera_config_from_device(
+    dev: "DeviceEntry",  # noqa: F821
+    default_pixel_format: Optional[CameraPixelFormat] = None,
+    default_binning: Optional[Tuple[int, int]] = None,
+) -> CameraConfig:
+    """Build a CameraConfig from a MachineConfig DeviceEntry."""
+    from control.utils import FlipVariant
+
+    driver = dev.driver
+    legacy_type_map = {
+        "toupcam": "Toupcam", "daheng": "Default", "flir": "FLIR",
+        "hamamatsu": "Hamamatsu", "tucsen": "Tucsen", "photometrics": "Photometrics",
+        "andor_camera": "Andor", "retiga": "Retiga", "ids": "iDS", "tis": "TIS",
+    }
+    cam_type = _old_camera_variant_to_enum(legacy_type_map.get(driver, "Default"))
+    cfg = dev.config
+    model_str = cfg.get("model")
+
+    pixel_fmt = default_pixel_format
+    if pixel_fmt is None:
+        pf_str = cfg.get("pixel_format", "MONO12")
+        try:
+            pixel_fmt = CameraPixelFormat[pf_str]
+        except KeyError:
+            pixel_fmt = CameraPixelFormat.MONO12
+
+    binning = default_binning
+    if binning is None:
+        b = cfg.get("binning", 1)
+        binning = (b, b)
+
+    roi_dict = cfg.get("roi")
+    roi = None
+    if roi_dict:
+        roi = (
+            roi_dict.get("offset_x"), roi_dict.get("offset_y"),
+            roi_dict.get("width"), roi_dict.get("height"),
+        )
+
+    crop_dict = cfg.get("crop")
+    crop_w = crop_dict.get("width") if crop_dict else None
+    crop_h = crop_dict.get("height") if crop_dict else None
+
+    flip_str = cfg.get("flip")
+    flip = None
+    if flip_str:
+        try:
+            flip = FlipVariant(flip_str)
+        except (ValueError, KeyError):
+            pass
+
+    wb = cfg.get("awb_ratios")
+    wb_gains = None
+    if wb:
+        wb_gains = RGBValue(r=wb.get("r", 1), g=wb.get("g", 1), b=wb.get("b", 1))
+
+    return CameraConfig(
+        camera_type=cam_type,
+        camera_model=model_str,
+        serial_number=dev.connection.serial_number if dev.connection else None,
+        default_pixel_format=pixel_fmt,
+        default_binning=binning,
+        default_roi=roi,
+        rotate_image_angle=cfg.get("rotate_angle"),
+        flip=flip,
+        crop_width=crop_w,
+        crop_height=crop_h,
+        default_temperature=cfg.get("temperature"),
+        default_fan_speed=cfg.get("fan_speed"),
+        default_black_level=cfg.get("blacklevel"),
+        default_white_balance_gains=wb_gains,
+        hardware_triggering_enabled=cfg.get("hardware_triggering_enabled", True),
+        default_readout_mode=cfg.get("readout_mode"),
+    )
+
+
+def _build_stage_config_from_device(dev: "DeviceEntry") -> StageConfig:  # noqa: F821
+    """Build a StageConfig from a MachineConfig stage DeviceEntry."""
+    cfg = dev.config
+
+    def _axis(axis_key: str, defaults: dict) -> AxisConfig:
+        a = cfg.get(axis_key, {})
+        enc_cfg = cfg.get("encoders", {}).get(axis_key, {})
+        pid_cfg = cfg.get("pid", {}).get(axis_key, {})
+        limits = cfg.get("software_limits", {}).get(axis_key, {})
+
+        return AxisConfig(
+            MOVEMENT_SIGN=a.get("movement_sign", defaults.get("movement_sign", 1)),
+            USE_ENCODER=enc_cfg.get("enabled", False),
+            ENCODER_SIGN=a.get("encoder_sign", 1),
+            ENCODER_STEP_SIZE=a.get("encoder_step_size", defaults.get("encoder_step_size", 100e-6)),
+            FULL_STEPS_PER_REV=a.get("fullsteps_per_rev", defaults.get("fullsteps_per_rev", 200)),
+            SCREW_PITCH=a.get("screw_pitch_mm", defaults.get("screw_pitch_mm", 1)),
+            MICROSTEPS_PER_STEP=a.get("microstepping", defaults.get("microstepping", 8)),
+            MAX_SPEED=a.get("max_velocity_mm", defaults.get("max_velocity_mm", 25)),
+            MAX_ACCELERATION=a.get("max_acceleration_mm", defaults.get("max_acceleration_mm", 500)),
+            MIN_POSITION=limits.get("negative", defaults.get("min_pos", -0.5)),
+            MAX_POSITION=limits.get("positive", defaults.get("max_pos", 56)),
+            PID=PIDConfig(
+                ENABLED=pid_cfg.get("enabled", False),
+                P=pid_cfg.get("p", 1 << 12),
+                I=pid_cfg.get("i", 0),
+                D=pid_cfg.get("d", 0),
+            ) if pid_cfg.get("enabled", False) else None,
+        )
+
+    return StageConfig(
+        X_AXIS=_axis("x", {"movement_sign": 1, "screw_pitch_mm": 2.54, "max_velocity_mm": 30}),
+        Y_AXIS=_axis("y", {"movement_sign": 1, "screw_pitch_mm": 2.54, "max_velocity_mm": 30}),
+        Z_AXIS=_axis("z", {"movement_sign": -1, "screw_pitch_mm": 0.3, "max_velocity_mm": 2, "min_pos": 0.05, "max_pos": 7}),
+        THETA_AXIS=_axis("theta", {"screw_pitch_mm": 2 * 3.14159 / 200, "max_velocity_mm": 1.57}) if "theta" in cfg else AxisConfig(
+            MOVEMENT_SIGN=1,
+            USE_ENCODER=False,
+            ENCODER_SIGN=1,
+            ENCODER_STEP_SIZE=1,
+            FULL_STEPS_PER_REV=200,
+            SCREW_PITCH=2 * 3.14159 / 200,
+            MICROSTEPS_PER_STEP=256,
+            MAX_SPEED=1.57,
+            MAX_ACCELERATION=500,
+            MIN_POSITION=0,
+            MAX_POSITION=1.57,
+            PID=None,
+        ),
+    )

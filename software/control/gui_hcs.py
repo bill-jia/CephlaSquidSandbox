@@ -60,6 +60,7 @@ from control.lighting import LightSourceType, IntensityControlMode, ShutterContr
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope, _should_simulate
 from control.models import AcquisitionChannel
+from control.nidaq import AbstractNIDAQ
 from squid.abc import AbstractCamera, AbstractStage, AbstractFilterWheelController
 import control._def
 import control.lighting
@@ -590,7 +591,7 @@ class HighContentScreeningGui(QMainWindow):
             )
             self.displacementMeasurementController = core_displacement_measurement.DisplacementMeasurementController()
             af_laser_ep = (
-                microscope.addons.io_registry.get("af_laser")
+                microscope.addons.io_registry.get("laser_af.laser_gate")
                 if microscope.addons.io_registry else None
             )
             self.laserAutofocusController = LaserAutofocusController(

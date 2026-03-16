@@ -41,6 +41,8 @@ from control.models import (
     merge_channel_configs,
     IOEndpointConfig,
     build_default_io_endpoint_config,
+    MachineConfig,
+    build_default_machine_config,
 )
 from control.models.hardware_bindings import (
     FilterWheelReference,
@@ -370,6 +372,28 @@ class ConfigRepository:
             if loaded is None:
                 logger.info("io_endpoints.yaml not found — using default MCU-only IO endpoints")
                 loaded = build_default_io_endpoint_config()
+            self._machine_cache[cache_key] = loaded
+        return self._machine_cache[cache_key]
+
+    def get_machine_config(self) -> MachineConfig:
+        """Load the unified machine configuration (cached).
+
+        Falls back to ``build_default_machine_config()`` when
+        ``machine_config.yaml`` is absent.
+        """
+        cache_key = "machine_config"
+        if cache_key not in self._machine_cache:
+            path = self.machine_configs_path / "machine_config.yaml"
+            loaded = self._load_yaml(path, MachineConfig)
+            if loaded is None:
+                logger.info(
+                    "machine_config.yaml not found — using default machine config"
+                )
+                loaded = build_default_machine_config()
+            else:
+                issues = loaded.validate_io_lines()
+                for issue in issues:
+                    logger.warning(f"machine_config IO validation: {issue}")
             self._machine_cache[cache_key] = loaded
         return self._machine_cache[cache_key]
 

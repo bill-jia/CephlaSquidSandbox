@@ -1,12 +1,14 @@
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 
 import control._def
 from control._def import TriggerMode, NIDAQ_CONFIG
 from control.core.config import ConfigRepository
+from control.core.config_bridge import apply_machine_config
 from control.core.contrast_manager import ContrastManager
+from control.core.driver_registry import get_driver_class, is_registered
 from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, NoOpStreamHandlerFunctions
@@ -14,41 +16,23 @@ from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, N
 from control.core.io_controller import IORegistry, LightSourceSerialAdapter
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
+from control.models.machine_config import MachineConfig, DeviceEntry
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
-from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController
+from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController, LightSource
 from squid.stage.cephla import CephlaStage
 from squid.stage.prior import PriorStage
 import control.celesta
 import control.illumination_andor
 import control.microcontroller
 import control.serial_peripherals as serial_peripherals
-import control.serial_peripherals_coolled as coolled_peripherals
 import squid.camera.utils
 import squid.config
 import squid.filter_wheel_controller.utils
 import squid.logging
 import squid.stage.cephla
 import squid.stage.utils
-from control.ni_daq import AbstractNIDAQ, NIDAQ
-
-if control._def.USE_XERYON:
-    from control.objective_changer_2_pos_controller import (
-        ObjectiveChanger2PosController,
-        ObjectiveChanger2PosController_Simulation,
-    )
-else:
-    ObjectiveChanger2PosController = None
-
-if control._def.RUN_FLUIDICS:
-    from control.fluidics import Fluidics
-else:
-    Fluidics = None
-
-if control._def.ENABLE_NL5:
-    import control.NL5 as NL5
-else:
-    NL5 = None
+from control.nidaq import AbstractNIDAQ, NIDAQ
 
 
 def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
@@ -90,131 +74,157 @@ class MicroscopeAddons:
     """
     @staticmethod
     def build_from_global_config(
-        stage: AbstractStage, micro: Optional[Microcontroller], simulated: bool = False, skip_init: bool = False
+        stage: AbstractStage,
+        micro: Optional[Microcontroller],
+        simulated: bool = False,
+        skip_init: bool = False,
+        machine_config: Optional[MachineConfig] = None,
     ) -> "MicroscopeAddons":
-        """
-        Build MicroscopeAddons from global configuration.
-        
-        Args:
-            stage: Stage instance (needed for objective changer)
-            micro: Microcontroller instance (needed for piezo control)
-            simulated: If True, create simulated hardware
-            
-        Returns:
-            MicroscopeAddons instance with all configured addons
-        """
-        # Per-component simulation settings
-        spinning_disk_simulated = _should_simulate(simulated, control._def.SIMULATE_SPINNING_DISK)
-        filter_wheel_simulated = _should_simulate(simulated, control._def.SIMULATE_FILTER_WHEEL)
-        objective_changer_simulated = _should_simulate(simulated, control._def.SIMULATE_OBJECTIVE_CHANGER)
-        laser_af_camera_simulated = _should_simulate(simulated, control._def.SIMULATE_LASER_AF_CAMERA)
+        """Build MicroscopeAddons from MachineConfig device entries.
 
-        # XLight/Cicero: Spinning disk confocal system for high-speed imaging
+        Device construction is driven by the ``devices`` section of
+        ``machine_config.yaml``.  The ``_def.py`` globals have already been
+        populated by :func:`apply_machine_config` before this is called.
+        """
+        log = squid.logging.get_logger("MicroscopeAddons")
+        mc = machine_config or ConfigRepository().get_machine_config()
+
+        def _dev(name: str) -> Optional[DeviceEntry]:
+            d = mc.get_device(name)
+            return d if d and d.enabled else None
+
+        def _sim(name: str) -> bool:
+            d = mc.get_device(name)
+            return d.simulate if d else simulated
+
+        # ── Spinning disk confocal ────────────────────────────────────────
         xlight = None
-        if control._def.ENABLE_SPINNING_DISK_CONFOCAL and not control._def.USE_DRAGONFLY:
-            # TODO: For user compatibility, when ENABLE_SPINNING_DISK_CONFOCAL is True, we use XLight/Cicero on default.
-            # This needs to be changed when we figure out better machine configuration structure.
-            xlight = (
-                serial_peripherals.XLight(
-                    control._def.XLIGHT_SERIAL_NUMBER,
-                    control._def.XLIGHT_SLEEP_TIME_FOR_WHEEL,
-                )
-                if not spinning_disk_simulated
-                else serial_peripherals.XLight_Simulation()
-            )
+        xlight_entry = _dev("xlight")
+        if xlight_entry:
+            if not _sim("xlight"):
+                sn = xlight_entry.connection.serial_number if xlight_entry.connection else ""
+                sleep_time = xlight_entry.config.get("sleep_time_for_wheel", 0.25)
+                xlight = serial_peripherals.XLight(sn, sleep_time)
+            else:
+                xlight = serial_peripherals.XLight_Simulation()
 
-        # Dragonfly: Alternative spinning disk confocal system
         dragonfly = None
-        if control._def.ENABLE_SPINNING_DISK_CONFOCAL and control._def.USE_DRAGONFLY:
-            dragonfly = (
-                serial_peripherals.Dragonfly(SN=control._def.DRAGONFLY_SERIAL_NUMBER)
-                if not spinning_disk_simulated
-                else serial_peripherals.Dragonfly_Simulation()
-            )
+        dragonfly_entry = _dev("dragonfly")
+        if dragonfly_entry:
+            if not _sim("dragonfly"):
+                sn = dragonfly_entry.connection.serial_number if dragonfly_entry.connection else ""
+                dragonfly = serial_peripherals.Dragonfly(SN=sn)
+            else:
+                dragonfly = serial_peripherals.Dragonfly_Simulation()
 
-        # NL5: Laser combiner for multiple laser lines
+        # ── NL5 laser combiner ────────────────────────────────────────────
         nl5 = None
-        if control._def.ENABLE_NL5:
-            nl5 = NL5.NL5() if not simulated else NL5.NL5_Simulation()
+        if _dev("nl5"):
+            try:
+                import control.NL5 as NL5_mod
+                nl5 = NL5_mod.NL5() if not _sim("nl5") else NL5_mod.NL5_Simulation()
+            except ImportError:
+                log.warning("NL5 module not available")
 
-        # CellX: Automated cell culture system
+        # ── CellX ─────────────────────────────────────────────────────────
         cellx = None
-        if control._def.ENABLE_CELLX:
+        cellx_entry = _dev("cellx")
+        if cellx_entry:
+            sn = cellx_entry.connection.serial_number if cellx_entry.connection else ""
             cellx = (
-                serial_peripherals.CellX(control._def.CELLX_SN)
-                if not simulated
+                serial_peripherals.CellX(sn)
+                if not _sim("cellx")
                 else serial_peripherals.CellX_Simulation()
             )
 
-        # Emission filter wheel: Selects emission filters for multi-color fluorescence
+        # ── Emission filter wheel ─────────────────────────────────────────
         emission_filter_wheel = None
         fw_config = squid.config.get_filter_wheel_config()
         if fw_config:
             emission_filter_wheel = squid.filter_wheel_controller.utils.get_filter_wheel_controller(
-                fw_config, microcontroller=micro, simulated=filter_wheel_simulated, skip_init=skip_init
+                fw_config, microcontroller=micro,
+                simulated=_should_simulate(simulated, control._def.SIMULATE_FILTER_WHEEL),
+                skip_init=skip_init,
             )
 
-        # Objective changer: Automatically switches between objectives (e.g., 10x and 20x)
+        # ── Objective changer ─────────────────────────────────────────────
         objective_changer = None
-        if control._def.USE_XERYON:
-            objective_changer = (
-                ObjectiveChanger2PosController(sn=control._def.XERYON_SERIAL_NUMBER, stage=stage)
-                if not objective_changer_simulated
-                else ObjectiveChanger2PosController_Simulation(sn=control._def.XERYON_SERIAL_NUMBER, stage=stage)
-            )
+        oc_entry = _dev("objective_changer")
+        if oc_entry:
+            try:
+                from control.objective_changer_2_pos_controller import (
+                    ObjectiveChanger2PosController,
+                    ObjectiveChanger2PosController_Simulation,
+                )
+                sn = oc_entry.connection.serial_number if oc_entry.connection else ""
+                objective_changer = (
+                    ObjectiveChanger2PosController(sn=sn, stage=stage)
+                    if not _sim("objective_changer")
+                    else ObjectiveChanger2PosController_Simulation(sn=sn, stage=stage)
+                )
+            except ImportError:
+                log.warning("Objective changer module not available")
 
-        # Focus camera: Separate camera for autofocus or laser-based displacement measurement
+        # ── Focus camera (laser AF) ──────────────────────────────────────
         camera_focus = None
-        if control._def.SUPPORT_LASER_AUTOFOCUS:
+        if _dev("focus_camera") or _dev("laser_af"):
             camera_focus = squid.camera.utils.get_camera(
-                squid.config.get_autofocus_camera_config(), simulated=laser_af_camera_simulated
+                squid.config.get_autofocus_camera_config(),
+                simulated=_sim("focus_camera"),
             )
 
-        # Fluidics: Automated sample handling and reagent delivery
+        # ── Fluidics ──────────────────────────────────────────────────────
         fluidics = None
-        if control._def.RUN_FLUIDICS:
-            fluidics = Fluidics(config_path=control._def.FLUIDICS_CONFIG_PATH, simulation=simulated)
+        fluidics_entry = _dev("fluidics")
+        if fluidics_entry:
+            try:
+                from control.fluidics import Fluidics
+                cfg_path = fluidics_entry.config.get("config_path", "")
+                fluidics = Fluidics(config_path=cfg_path, simulation=_sim("fluidics"))
+            except ImportError:
+                log.warning("Fluidics module not available")
 
-        # SciMicroscopy LED array: RGB LED array for brightfield illumination
+        # ── SciMicroscopy LED array ───────────────────────────────────────
         sci_microscopy_led_array = None
-        if control._def.SUPPORT_SCIMICROSCOPY_LED_ARRAY:
-            # to do: add error handling
-            sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(
-                control._def.SCIMICROSCOPY_LED_ARRAY_SN,
-                control._def.SCIMICROSCOPY_LED_ARRAY_DISTANCE,
-                control._def.SCIMICROSCOPY_LED_ARRAY_TURN_ON_DELAY,
-            )
-            sci_microscopy_led_array.set_NA(control._def.SCIMICROSCOPY_LED_ARRAY_DEFAULT_NA)
+        led_entry = _dev("led_matrix")
+        if led_entry:
+            sn = led_entry.connection.serial_number if led_entry.connection else ""
+            dist = led_entry.config.get("distance", 50)
+            delay = led_entry.config.get("turn_on_delay", 0.03)
+            na = led_entry.config.get("default_na", 0.8)
+            sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(sn, dist, delay)
+            sci_microscopy_led_array.set_NA(na)
 
-        # NIDAQ: For hardware triggering
-        nidaq_simulated = _should_simulate(simulated, control._def.SIMULATE_NIDAQ)
+        # ── NI-DAQ ────────────────────────────────────────────────────────
         nidaq = None
-        if control._def.ENABLE_NIDAQ and not nidaq_simulated:
+        nidaq_entry = _dev("nidaq")
+        if nidaq_entry and not _sim("nidaq"):
             nidaq = NIDAQ(config=NIDAQ_CONFIG())
 
-        # coolLED pE-400 / pE-400max light source (hybrid serial + TTL)
+        # ── Hybrid serial+IO light sources ────────────────────────────────
         coolled = None
-        if control._def.USE_COOLLED:
-            coolled = (
-                coolled_peripherals.CoolLEDpE400(
-                    SN=control._def.COOLLED_SN or None,
-                    port=control._def.COOLLED_PORT,
-                )
-                if not simulated
-                else coolled_peripherals.CoolLEDpE400_Simulation()
-            )
+        coolled_entry = _dev("coolled")
+        if coolled_entry:
+            try:
+                import control.serial_peripherals_coolled as coolled_peripherals
+                if not _sim("coolled"):
+                    sn = coolled_entry.connection.serial_number if coolled_entry.connection else None
+                    port = coolled_entry.connection.port if coolled_entry.connection else None
+                    coolled = coolled_peripherals.CoolLEDpE400(SN=sn, port=port)
+                else:
+                    coolled = coolled_peripherals.CoolLEDpE400_Simulation()
+            except ImportError:
+                log.warning("coolLED module not available")
 
-        # Serial-controlled devices that participate in IO endpoint routing.
-        # Each entry wraps a device controller via the SerialIODevice protocol,
-        # exposing only its value-setting operations to the IO endpoint system.
-        serial_devices = {}
+        serial_devices: Dict[str, object] = {}
         if coolled is not None:
             serial_devices["coolled"] = LightSourceSerialAdapter(coolled)
 
-        # IO endpoint registry — wires logical endpoints to physical controllers
+        # ── IO endpoint registry ──────────────────────────────────────────
+        # Collect IO endpoints from device entries in machine_config.yaml
         io_registry = None
         if micro is not None:
-            io_config = ConfigRepository().get_io_endpoint_config()
+            io_config = mc.collect_io_endpoints()
             io_registry = IORegistry(
                 config=io_config,
                 microcontroller=micro,
@@ -223,19 +233,20 @@ class MicroscopeAddons:
             )
             io_registry.log_summary()
 
-        # Piezo stage (provide IO endpoint when registry available)
+        # ── Piezo stage ───────────────────────────────────────────────────
         piezo_stage = None
-        if control._def.HAS_OBJECTIVE_PIEZO:
+        piezo_entry = _dev("piezo")
+        if piezo_entry:
             if not micro:
                 raise ValueError("Cannot create PiezoStage without a Microcontroller.")
-            piezo_ep = io_registry.get("piezo") if io_registry else None
+            piezo_ep = io_registry.get("piezo.output") if io_registry else None
             piezo_stage = PiezoStage(
                 microcontroller=micro,
                 config={
-                    "OBJECTIVE_PIEZO_HOME_UM": control._def.OBJECTIVE_PIEZO_HOME_UM,
-                    "OBJECTIVE_PIEZO_RANGE_UM": control._def.OBJECTIVE_PIEZO_RANGE_UM,
-                    "OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE": control._def.OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE,
-                    "OBJECTIVE_PIEZO_FLIP_DIR": control._def.OBJECTIVE_PIEZO_FLIP_DIR,
+                    "OBJECTIVE_PIEZO_HOME_UM": piezo_entry.config.get("home_um", 150),
+                    "OBJECTIVE_PIEZO_RANGE_UM": piezo_entry.config.get("range_um", 300),
+                    "OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE": piezo_entry.config.get("control_voltage_range", 10),
+                    "OBJECTIVE_PIEZO_FLIP_DIR": piezo_entry.config.get("flip_direction", False),
                 },
                 piezo_endpoint=piezo_ep,
             )
@@ -258,24 +269,24 @@ class MicroscopeAddons:
 
     def __init__(
         self,
-        xlight: Optional[serial_peripherals.XLight] = None,
-        dragonfly: Optional[serial_peripherals.Dragonfly] = None,
-        nl5: Optional[NL5] = None,
-        cellx: Optional[serial_peripherals.CellX] = None,
+        xlight=None,
+        dragonfly=None,
+        nl5=None,
+        cellx=None,
         emission_filter_wheel: Optional[AbstractFilterWheelController] = None,
-        objective_changer: Optional[ObjectiveChanger2PosController] = None,
+        objective_changer=None,
         camera_focus: Optional[AbstractCamera] = None,
-        fluidics: Optional[Fluidics] = None,
+        fluidics=None,
         piezo_stage: Optional[PiezoStage] = None,
         sci_microscopy_led_array: Optional[SciMicroscopyLEDArray] = None,
         nidaq: Optional[AbstractNIDAQ] = None,
         io_registry: Optional[IORegistry] = None,
         coolled=None,
     ):
-        self.xlight: Optional[serial_peripherals.XLight] = xlight
-        self.dragonfly: Optional[serial_peripherals.Dragonfly] = dragonfly
-        self.nl5: Optional[NL5] = nl5
-        self.cellx: Optional[serial_peripherals.CellX] = cellx
+        self.xlight = xlight
+        self.dragonfly = dragonfly
+        self.nl5 = nl5
+        self.cellx = cellx
         self.emission_filter_wheel = emission_filter_wheel
         self.objective_changer = objective_changer
         self.camera_focus: Optional[AbstractCamera] = camera_focus
@@ -313,18 +324,31 @@ class LowLevelDrivers:
     - Hardware trigger generation for synchronized acquisition
     """
     @staticmethod
-    def build_from_global_config(simulated: bool = False, skip_init: bool = False) -> "LowLevelDrivers":
-        # Per-component simulation for microcontroller
-        mcu_simulated = _should_simulate(simulated, control._def.SIMULATE_MICROCONTROLLER)
+    def build_from_global_config(
+        simulated: bool = False,
+        skip_init: bool = False,
+        machine_config: Optional[MachineConfig] = None,
+    ) -> "LowLevelDrivers":
+        mc = machine_config or ConfigRepository().get_machine_config()
+        teensy_entry = mc.get_device("teensy")
+        mcu_simulated = _should_simulate(
+            simulated, control._def.SIMULATE_MICROCONTROLLER
+        )
+        if teensy_entry and teensy_entry.simulate:
+            mcu_simulated = True
+
+        sn = None
+        if teensy_entry and teensy_entry.connection:
+            sn = teensy_entry.connection.serial_number
 
         micro_serial_device = (
             control.microcontroller.get_microcontroller_serial_device(
-                version=control._def.CONTROLLER_VERSION, sn=control._def.CONTROLLER_SN
+                version=control._def.CONTROLLER_VERSION,
+                sn=sn or control._def.CONTROLLER_SN,
             )
             if not mcu_simulated
             else control.microcontroller.get_microcontroller_serial_device(simulated=True)
         )
-        # Skip MCU reset/initialize when restarting (hardware already configured)
         micro = control.microcontroller.Microcontroller(
             serial_device=micro_serial_device,
             reset_and_initialize=not skip_init,
@@ -354,6 +378,66 @@ class LowLevelDrivers:
             self.microcontroller.configure_dac80508_refdiv_and_gain(div, gains)
 
 
+def _build_illumination_controller(
+    micro: Optional[Microcontroller],
+    io_registry: Optional[IORegistry],
+    illum_entry: Optional[DeviceEntry],
+    coolled_entry: Optional[DeviceEntry],
+    coolled_instance: Optional[LightSource],
+    simulated: bool,
+) -> IlluminationController:
+    """Construct the appropriate IlluminationController from device entries."""
+    driver = ""
+    if coolled_entry and coolled_entry.enabled:
+        driver = "coolled_pe400"
+    elif illum_entry and illum_entry.enabled:
+        driver = illum_entry.driver
+
+    if driver == "coolled_pe400" and coolled_instance is not None:
+        return IlluminationController(
+            micro,
+            IntensityControlMode.Software,
+            ShutterControlMode.TTL,
+            LightSourceType.CoolLED,
+            coolled_instance,
+            io_registry=io_registry,
+        )
+
+    if driver == "ldi" and not simulated:
+        ldi = serial_peripherals.LDI()
+        return IlluminationController(
+            micro, ldi.intensity_mode, ldi.shutter_mode,
+            LightSourceType.LDI, ldi, io_registry=io_registry,
+        )
+
+    if driver == "celesta" and not simulated:
+        celesta = control.celesta.CELESTA()
+        return IlluminationController(
+            micro,
+            IntensityControlMode.Software,
+            ShutterControlMode.TTL,
+            LightSourceType.CELESTA,
+            celesta,
+            io_registry=io_registry,
+        )
+
+    if driver == "andor_laser" and not simulated:
+        andor_laser = control.illumination_andor.AndorLaser(
+            control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
+        )
+        return IlluminationController(
+            micro,
+            IntensityControlMode.Software,
+            ShutterControlMode.TTL,
+            LightSourceType.AndorLaser,
+            andor_laser,
+            io_registry=io_registry,
+        )
+
+    # Default: Cephla built-in (MCU DAC/TTL)
+    return IlluminationController(micro, io_registry=io_registry)
+
+
 class Microscope:
     """
     Main microscope control class.
@@ -375,40 +459,46 @@ class Microscope:
     """
     @staticmethod
     def build_from_global_config(simulated: bool = False, skip_init: bool = False) -> "Microscope":
-        """
-        Build Microscope from global configuration.
-        
-        Args:
-            simulated: If True, create simulated hardware
-            skip_init: If True, skip homing operations (e.g., during restart).
-        """
-        low_level_devices = LowLevelDrivers.build_from_global_config(simulated, skip_init=skip_init)
+        """Build Microscope from ``machine_config.yaml`` via :class:`MachineConfig`.
 
-        # Per-component simulation for camera
-        camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
+        Loads the unified machine configuration, applies it to ``_def.py``
+        globals for backward compatibility, then constructs all devices from
+        the device entries.
+        """
+        config_repo = ConfigRepository()
+        mc = config_repo.get_machine_config()
 
-        # Create stage: Prior (external controller) or Cephla (integrated with microcontroller)
+        # Backward-compat bridge: populate _def.py globals from MachineConfig
+        apply_machine_config(mc)
+
+        # ── Low-level drivers (Teensy MCU) ────────────────────────────────
+        low_level_devices = LowLevelDrivers.build_from_global_config(
+            simulated, skip_init=skip_init, machine_config=mc,
+        )
+
+        # ── Stage ─────────────────────────────────────────────────────────
         stage_config = squid.config.get_stage_config()
-        if control._def.USE_PRIOR_STAGE:
-            # Prior stage uses its own controller via serial communication
-            stage = PriorStage(sn=control._def.PRIOR_STAGE_SN, stage_config=stage_config)
+        stage_entry = mc.get_device("stage")
+        use_prior = stage_entry and stage_entry.driver == "prior" if stage_entry else False
+
+        if use_prior:
+            sn = stage_entry.connection.serial_number if stage_entry.connection else ""
+            stage = PriorStage(sn=sn, stage_config=stage_config)
         else:
-            # Cephla stage is controlled directly by the microcontroller
             if low_level_devices.microcontroller is None:
                 raise ValueError("For a cephla stage microscope, you must provide a microcontroller.")
             stage = CephlaStage(low_level_devices.microcontroller, stage_config)
 
-        # Create optional addon components
+        # ── Addons (IO, peripherals, focus camera, etc.) ──────────────────
         addons = MicroscopeAddons.build_from_global_config(
-            stage, low_level_devices.microcontroller, simulated=simulated, skip_init=skip_init
+            stage, low_level_devices.microcontroller,
+            simulated=simulated, skip_init=skip_init, machine_config=mc,
         )
 
-        # Set up hardware trigger functions for synchronized acquisition.
-        # When an IORegistry is available, the trigger endpoint resolves to either
-        # the Teensy MCU or the NI-DAQ depending on io_endpoints.yaml.
+        # ── Camera trigger routing ────────────────────────────────────────
         cam_trigger_log = squid.logging.get_logger("camera hw functions")
         io_reg = addons.io_registry
-        trigger_ep = io_reg.get("camera_trigger") if io_reg else None
+        trigger_ep = io_reg.get("main_camera.trigger") if io_reg else None
 
         def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
             if addons.nl5 and control._def.NL5_USE_DOUT:
@@ -445,6 +535,7 @@ class Microscope:
                 low_level_devices.microcontroller.wait_till_operation_is_completed()
             return True
 
+        camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
         camera = squid.camera.utils.get_camera(
             config=squid.config.get_camera_config(),
             simulated=camera_simulated,
@@ -452,49 +543,14 @@ class Microscope:
             hw_set_strobe_delay_ms_fn=acquisition_camera_hw_strobe_delay_fn,
         )
 
-        # Create illumination controller based on configured light source
+        # ── Illumination controller ───────────────────────────────────────
         io_reg = addons.io_registry
-        if control._def.USE_COOLLED and addons.coolled is not None:
-            illumination_controller = IlluminationController(
-                low_level_devices.microcontroller,
-                IntensityControlMode.Software,
-                ShutterControlMode.TTL,
-                LightSourceType.CoolLED,
-                addons.coolled,
-                io_registry=io_reg,
-            )
-        elif control._def.USE_LDI_SERIAL_CONTROL and not simulated:
-            ldi = serial_peripherals.LDI()
-            illumination_controller = IlluminationController(
-                low_level_devices.microcontroller, ldi.intensity_mode, ldi.shutter_mode,
-                LightSourceType.LDI, ldi, io_registry=io_reg,
-            )
-        elif control._def.USE_CELESTA_ETHERNET_CONTROL and not simulated:
-            celesta = control.celesta.CELESTA()
-            illumination_controller = IlluminationController(
-                low_level_devices.microcontroller,
-                IntensityControlMode.Software,
-                ShutterControlMode.TTL,
-                LightSourceType.CELESTA,
-                celesta,
-                io_registry=io_reg,
-            )
-        elif control._def.USE_ANDOR_LASER_CONTROL and not simulated:
-            andor_laser = control.illumination_andor.AndorLaser(
-                control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
-            )
-            illumination_controller = IlluminationController(
-                low_level_devices.microcontroller,
-                IntensityControlMode.Software,
-                ShutterControlMode.TTL,
-                LightSourceType.AndorLaser,
-                andor_laser,
-                io_registry=io_reg,
-            )
-        else:
-            illumination_controller = IlluminationController(
-                low_level_devices.microcontroller, io_registry=io_reg,
-            )
+        illum_entry = mc.get_device("illumination")
+        coolled_entry = mc.get_device("coolled")
+        illumination_controller = _build_illumination_controller(
+            low_level_devices.microcontroller, io_reg, illum_entry, coolled_entry,
+            addons.coolled, simulated,
+        )
 
         return Microscope(
             stage=stage,
@@ -774,7 +830,7 @@ class Microscope:
             self._wait_for_microcontroller()
             self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
-            trigger_ep = self.addons.io_registry.get("camera_trigger") if self.addons.io_registry else None
+            trigger_ep = self.addons.io_registry.get("main_camera.trigger") if self.addons.io_registry else None
             illumination_time_us = int(self.camera.get_exposure_time() * 1000)
             if trigger_ep is not None:
                 trigger_ep.send_trigger(

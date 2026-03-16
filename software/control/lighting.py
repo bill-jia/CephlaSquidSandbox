@@ -19,6 +19,7 @@ to either the Teensy MCU or an NI-DAQ without changing higher-level code.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 import numpy as np
 import pandas as pd
@@ -34,6 +35,16 @@ if TYPE_CHECKING:
 
 # Number of illumination ports supported (matches firmware)
 NUM_ILLUMINATION_PORTS = 16
+
+_WL_RE = re.compile(r"(\d{3,4})(?:nm)?$", re.IGNORECASE)
+
+
+def _extract_wavelength(channel_name: str) -> Optional[int]:
+    """Extract a wavelength integer from a channel name like '488nm' or '488'."""
+    m = _WL_RE.search(channel_name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 class LightSourceType(Enum):
@@ -167,8 +178,8 @@ class IlluminationController:
         # Try to load custom channel mappings from file, fallback to defaults
         self.channel_mappings_TTL = self._load_channel_mappings(default_mappings)
 
-        # Build wavelength -> IO endpoint-name mapping for IOEndpoint mode
-        self._wavelength_to_port_name: Dict[int, str] = {}
+        # Build wavelength -> IO endpoint name prefix mapping for IOEndpoint mode
+        self._wavelength_to_endpoint_prefix: Dict[int, str] = {}
         if io_registry is not None:
             self._build_wavelength_endpoint_map()
 
@@ -194,20 +205,44 @@ class IlluminationController:
             self._load_intensity_calibrations()
 
     def _build_wavelength_endpoint_map(self) -> None:
-        """Map wavelengths to IO endpoint port names using the illumination config.
+        """Map wavelengths to IO endpoint name prefixes.
 
-        Uses the illumination_channel_config.yaml to discover which wavelength
-        maps to which D-port, then produces a mapping like {488: "D2"}.
-        Falls back to the hardcoded default if the config is unavailable.
+        With the unified machine_config.yaml, endpoint names are generated as
+        ``illumination.{channel_name}.intensity`` and
+        ``illumination.{channel_name}.shutter`` by ``MachineConfig.collect_io_endpoints()``.
+
+        This method tries three strategies in order:
+        1. Scan the IORegistry for endpoints whose name contains a wavelength
+           substring (e.g. ``illumination.488nm.intensity``).
+        2. Fall back to the legacy ``illum_D{n}`` naming via
+           illumination_channel_config.yaml.
+        3. Fall back to hardcoded default D-port map.
         """
-        from control._def import source_code_to_port_index
+        # Strategy 1: Discover from IORegistry endpoint names
+        if self.io_registry is not None:
+            for ep_name in self.io_registry.list_endpoint_names():
+                if ".intensity" not in ep_name and ".shutter" not in ep_name:
+                    continue
+                parts = ep_name.rsplit(".", 1)
+                if len(parts) != 2:
+                    continue
+                prefix = parts[0]
+                mid_parts = prefix.split(".")
+                if len(mid_parts) >= 2:
+                    ch_name = mid_parts[-1]
+                    wl = _extract_wavelength(ch_name)
+                    if wl is not None:
+                        self._wavelength_to_endpoint_prefix[wl] = prefix
+            if self._wavelength_to_endpoint_prefix:
+                return
 
+        # Strategy 2: Legacy naming from illumination_channel_config.yaml
+        from control._def import source_code_to_port_index
         default_port_map = {
             405: "D1", 470: "D2", 488: "D2", 545: "D3", 550: "D3",
             555: "D3", 561: "D3", 638: "D4", 640: "D4", 730: "D5",
             735: "D5", 750: "D5",
         }
-
         try:
             config_repo = ConfigRepository()
             illum_cfg = config_repo.get_illumination_config()
@@ -217,20 +252,28 @@ class IlluminationController:
                         source_code = illum_cfg.get_source_code(ch)
                         port_idx = source_code_to_port_index(source_code)
                         if port_idx >= 0:
-                            self._wavelength_to_port_name[ch.wavelength_nm] = f"D{port_idx + 1}"
+                            self._wavelength_to_endpoint_prefix[ch.wavelength_nm] = f"illum_D{port_idx + 1}"
         except Exception:
             pass
 
-        if not self._wavelength_to_port_name:
-            self._wavelength_to_port_name = default_port_map
+        # Strategy 3: Hardcoded fallback
+        if not self._wavelength_to_endpoint_prefix:
+            for wl, port_name in default_port_map.items():
+                self._wavelength_to_endpoint_prefix[wl] = f"illum_{port_name}"
 
     def _get_io_endpoints(self, wavelength: int):
         """Return (intensity_bound_endpoint, shutter_bound_endpoint) for a wavelength."""
-        port_name = self._wavelength_to_port_name.get(wavelength)
-        if port_name is None:
+        prefix = self._wavelength_to_endpoint_prefix.get(wavelength)
+        if prefix is None:
             raise KeyError(f"No IO endpoint mapping for wavelength {wavelength}nm")
-        intensity_ep = self.io_registry.get(f"illum_{port_name}_intensity")
-        shutter_ep = self.io_registry.get(f"illum_{port_name}_shutter")
+        # New-style: prefix like "illumination.488nm"
+        # Legacy-style: prefix like "illum_D2"
+        if "." in prefix:
+            intensity_ep = self.io_registry.get(f"{prefix}.intensity")
+            shutter_ep = self.io_registry.get(f"{prefix}.shutter")
+        else:
+            intensity_ep = self.io_registry.get(f"{prefix}_intensity")
+            shutter_ep = self.io_registry.get(f"{prefix}_shutter")
         return intensity_ep, shutter_ep
 
     def _load_channel_mappings(self, default_mappings: Dict[int, int]) -> Dict[int, int]:
