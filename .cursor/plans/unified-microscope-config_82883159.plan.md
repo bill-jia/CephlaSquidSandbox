@@ -30,7 +30,6 @@ Configuration is scattered across four systems with no single source of truth:
 2. `**control/_def.py**` -- 1172 lines of module-level constants, loaded at import time by exec-ing the INI into `locals()`. Contains ~50 boolean device flags (`USE_*`, `ENABLE_*`, `SIMULATE_*`), enums, dataclasses, and utility functions all interleaved
 3. `**machine_configs/*.yaml**` -- newer Pydantic-backed YAML files for illumination channels, IO endpoints, filter wheels, cameras (well-structured, but disconnected from the INI/`_def.py` world)
 4. `**squid/config.py**` -- bridge layer that reads `_def.py` globals into `CameraConfig`, `StageConfig`, `FilterWheelConfig` dataclasses
-
 ```mermaid
 flowchart LR
     INI["configuration*.ini"]
@@ -50,7 +49,6 @@ flowchart LR
     SquidConfig -->|"CameraConfig, StageConfig"| Microscope
     ConfigRepo -->|"IOEndpoints, Illumination"| Microscope
 ```
-
 
 
 ### Problems
@@ -78,8 +76,6 @@ flowchart LR
     Pydantic -->|"device entries"| Registry
     Registry -->|"construct drivers"| Microscope
 ```
-
-
 
 ### Single configuration file: `machine_configs/machine_config.yaml`
 
@@ -402,8 +398,6 @@ flowchart TD
     Validate --> NIDAQ_auto
 ```
 
-
-
 Each `io:` entry in the YAML becomes an `IOEndpoint` in the registry, with the endpoint name auto-generated from the device name and io key (e.g. device `main_camera`, io key `trigger` becomes endpoint name `main_camera.trigger`; device `illumination`, channel `488nm`, io key `shutter` becomes `illumination.488nm.shutter`).
 
 The NI-DAQ controller inspects its collected endpoints to determine which physical AO channels and DO lines it needs to configure, rather than having them pre-declared.
@@ -575,4 +569,3 @@ This is a large change. The phased approach:
 ### What goes away
 
 - `**io_endpoints.yaml`** -- replaced entirely by the `io:` blocks distributed across device entries in `machine_config.yaml`. The `IOEndpointConfig` / `IOEndpoint` Pydantic models are still used internally (the `collect_io_endpoints()` method on `MachineConfig` produces them), but they are no longer loaded from a standalone file.
-

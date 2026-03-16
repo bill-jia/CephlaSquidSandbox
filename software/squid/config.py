@@ -4,8 +4,8 @@ from typing import Dict, Optional, Tuple, Union
 
 import pydantic
 
-import control._def as _def
 from control.utils import FlipVariant
+from control.models import DeviceEntry, MachineConfig
 
 
 class FilterWheelControllerVariant(enum.Enum):
@@ -73,60 +73,40 @@ class FilterWheelConfig(pydantic.BaseModel):
 
 
 def _load_filter_wheel_config() -> Optional[FilterWheelConfig]:
-    """Load filter wheel configuration from _def.py."""
-    if not _def.USE_EMISSION_FILTER_WHEEL:
+    """Load emission filter wheel configuration from the unified config system.
+
+    This uses the v1.1 ``filter_wheels.yaml`` / ``hardware_bindings.yaml`` +
+    the active ``MachineConfig`` instead of reading directly from ``_def.py``.
+    """
+    from control.core.config.repository import ConfigRepository
+    from control.models import FilterWheelType
+
+    repo = ConfigRepository()
+
+    # Resolve the effective emission wheel for the main camera (camera_id=0).
+    emission_wheel = repo.get_effective_emission_wheel(camera_id=0)
+    if emission_wheel is None or emission_wheel.type != FilterWheelType.EMISSION:
         return None
 
-    controller_type = FilterWheelControllerVariant.from_string(_def.EMISSION_FILTER_WHEEL_TYPE)
-    if controller_type is None:
-        return None
+    # For now we assume a SQUID-style MCU-driven wheel with reasonable defaults
+    # for the mechanics; these can be extended in the registry schema later.
+    positions = emission_wheel.positions or {}
+    min_index = 1
+    max_index = max(int(p) for p in positions.keys()) if positions else 8
 
-    controller_config = None
-    squid_wheel_configs = None
-
-    if controller_type == FilterWheelControllerVariant.SQUID:
-        # Build per-wheel configs from SQUID_FILTERWHEEL_CONFIGS if available
-        squid_configs_dict = getattr(_def, "SQUID_FILTERWHEEL_CONFIGS", None)
-        if squid_configs_dict:
-            squid_wheel_configs = {}
-            for wheel_id, wheel_cfg in squid_configs_dict.items():
-                # Only include wheels that are in EMISSION_FILTER_WHEEL_INDICES
-                if wheel_id in _def.EMISSION_FILTER_WHEEL_INDICES:
-                    squid_wheel_configs[wheel_id] = SquidFilterWheelConfig(
-                        max_index=wheel_cfg["max_index"],
-                        min_index=wheel_cfg["min_index"],
-                        offset=wheel_cfg["offset"],
-                        motor_slot_index=wheel_cfg["motor_slot_index"],
-                        transitions_per_revolution=wheel_cfg["transitions_per_revolution"],
-                    )
-
-        # Also create the legacy single config for backward compatibility (uses first wheel)
-        controller_config = SquidFilterWheelConfig(
-            max_index=_def.SQUID_FILTERWHEEL_MAX_INDEX,
-            min_index=_def.SQUID_FILTERWHEEL_MIN_INDEX,
-            offset=_def.SQUID_FILTERWHEEL_OFFSET,
-            motor_slot_index=_def.SQUID_FILTERWHEEL_MOTORSLOTINDEX,
-            transitions_per_revolution=_def.SQUID_FILTERWHEEL_TRANSITIONS_PER_REVOLUTION,
-        )
-    elif controller_type == FilterWheelControllerVariant.ZABER:
-        controller_config = ZaberFilterWheelConfig(
-            serial_number=_def.FILTER_CONTROLLER_SERIAL_NUMBER,
-            delay_ms=_def.ZABER_EMISSION_FILTER_WHEEL_DELAY_MS,
-            blocking_call=_def.ZABER_EMISSION_FILTER_WHEEL_BLOCKING_CALL,
-        )
-    elif controller_type == FilterWheelControllerVariant.OPTOSPIN:
-        controller_config = OptospinFilterWheelConfig(
-            serial_number=_def.FILTER_CONTROLLER_SERIAL_NUMBER,
-            speed_hz=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_SPEED_HZ,
-            delay_ms=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_DELAY_MS,
-            ttl_trigger=_def.OPTOSPIN_EMISSION_FILTER_WHEEL_TTL_TRIGGER,
-        )
+    squid_cfg = SquidFilterWheelConfig(
+        max_index=max_index,
+        min_index=min_index,
+        offset=0.008,
+        motor_slot_index=3,
+        transitions_per_revolution=4000,
+    )
 
     return FilterWheelConfig(
-        controller_type=controller_type,
-        indices=_def.EMISSION_FILTER_WHEEL_INDICES,
-        controller_config=controller_config,
-        squid_wheel_configs=squid_wheel_configs,
+        controller_type=FilterWheelControllerVariant.SQUID,
+        indices=[emission_wheel.id],
+        controller_config=squid_cfg,
+        squid_wheel_configs={emission_wheel.id: squid_cfg},
     )
 
 
@@ -209,68 +189,47 @@ class StageConfig(pydantic.BaseModel):
     THETA_AXIS: AxisConfig
 
 
-# NOTE(imo): This is temporary until we can just pass in instances of AxisConfig wherever we need it.  Having
-# this getter for the temporary singleton will help with the refactor once we can get rid of it.
-_stage_config = StageConfig(
-    X_AXIS=AxisConfig(
-        MOVEMENT_SIGN=_def.STAGE_MOVEMENT_SIGN_X,
-        USE_ENCODER=_def.USE_ENCODER_X,
-        ENCODER_SIGN=_def.ENCODER_POS_SIGN_X,
-        ENCODER_STEP_SIZE=_def.ENCODER_STEP_SIZE_X_MM,
-        FULL_STEPS_PER_REV=_def.FULLSTEPS_PER_REV_X,
-        SCREW_PITCH=_def.SCREW_PITCH_X_MM,
-        MICROSTEPS_PER_STEP=_def.MICROSTEPPING_DEFAULT_X,
-        MAX_SPEED=_def.MAX_VELOCITY_X_mm,
-        MAX_ACCELERATION=_def.MAX_ACCELERATION_X_mm,
-        MIN_POSITION=_def.SOFTWARE_POS_LIMIT.X_NEGATIVE,
-        MAX_POSITION=_def.SOFTWARE_POS_LIMIT.X_POSITIVE,
-        PID=None,
-    ),
-    Y_AXIS=AxisConfig(
-        MOVEMENT_SIGN=_def.STAGE_MOVEMENT_SIGN_Y,
-        USE_ENCODER=_def.USE_ENCODER_Y,
-        ENCODER_SIGN=_def.ENCODER_POS_SIGN_Y,
-        ENCODER_STEP_SIZE=_def.ENCODER_STEP_SIZE_Y_MM,
-        FULL_STEPS_PER_REV=_def.FULLSTEPS_PER_REV_Y,
-        SCREW_PITCH=_def.SCREW_PITCH_Y_MM,
-        MICROSTEPS_PER_STEP=_def.MICROSTEPPING_DEFAULT_Y,
-        MAX_SPEED=_def.MAX_VELOCITY_Y_mm,
-        MAX_ACCELERATION=_def.MAX_ACCELERATION_Y_mm,
-        MIN_POSITION=_def.SOFTWARE_POS_LIMIT.Y_NEGATIVE,
-        MAX_POSITION=_def.SOFTWARE_POS_LIMIT.Y_POSITIVE,
-        PID=None,
-    ),
-    Z_AXIS=AxisConfig(
-        MOVEMENT_SIGN=_def.STAGE_MOVEMENT_SIGN_Z,
-        USE_ENCODER=_def.USE_ENCODER_Z,
-        ENCODER_SIGN=_def.ENCODER_POS_SIGN_Z,
-        ENCODER_STEP_SIZE=_def.ENCODER_STEP_SIZE_Z_MM,
-        FULL_STEPS_PER_REV=_def.FULLSTEPS_PER_REV_Z,
-        SCREW_PITCH=_def.SCREW_PITCH_Z_MM,
-        MICROSTEPS_PER_STEP=_def.MICROSTEPPING_DEFAULT_Z,
-        MAX_SPEED=_def.MAX_VELOCITY_Z_mm,
-        MAX_ACCELERATION=_def.MAX_ACCELERATION_Z_mm,
-        MIN_POSITION=_def.SOFTWARE_POS_LIMIT.Z_NEGATIVE,
-        MAX_POSITION=_def.SOFTWARE_POS_LIMIT.Z_POSITIVE,
-        PID=None,
-    ),
-    THETA_AXIS=AxisConfig(
-        MOVEMENT_SIGN=_def.STAGE_MOVEMENT_SIGN_THETA,
-        USE_ENCODER=_def.USE_ENCODER_THETA,
-        ENCODER_SIGN=_def.ENCODER_POS_SIGN_THETA,
-        ENCODER_STEP_SIZE=_def.ENCODER_STEP_SIZE_THETA,
-        FULL_STEPS_PER_REV=_def.FULLSTEPS_PER_REV_THETA,
-        SCREW_PITCH=2.0 * math.pi / _def.FULLSTEPS_PER_REV_THETA,
-        MICROSTEPS_PER_STEP=_def.MICROSTEPPING_DEFAULT_Y,
-        MAX_SPEED=2.0
-        * math.pi
-        / 4,  # NOTE(imo): I arbitrarily guessed this at 4 sec / rev, so it probably needs adjustment.
-        MAX_ACCELERATION=_def.MAX_ACCELERATION_X_mm,
-        MIN_POSITION=0,  # NOTE(imo): Min and Max need adjusting.  They are arbitrary right now!
-        MAX_POSITION=2.0 * math.pi / 4,
-        PID=None,
-    ),
-)
+def _default_stage_config() -> StageConfig:
+    """Build a generic stage config used before MachineConfig is applied."""
+
+    def _axis_default() -> AxisConfig:
+        return AxisConfig(
+            MOVEMENT_SIGN=DirectionSign.DIRECTION_SIGN_POSITIVE,
+            USE_ENCODER=False,
+            ENCODER_SIGN=DirectionSign.DIRECTION_SIGN_POSITIVE,
+            ENCODER_STEP_SIZE=100e-6,
+            FULL_STEPS_PER_REV=200,
+            SCREW_PITCH=1.0,
+            MICROSTEPS_PER_STEP=8,
+            MAX_SPEED=25.0,
+            MAX_ACCELERATION=500.0,
+            MIN_POSITION=-0.5,
+            MAX_POSITION=56.0,
+            PID=None,
+        )
+
+    return StageConfig(
+        X_AXIS=_axis_default(),
+        Y_AXIS=_axis_default(),
+        Z_AXIS=_axis_default(),
+        THETA_AXIS=AxisConfig(
+            MOVEMENT_SIGN=DirectionSign.DIRECTION_SIGN_POSITIVE,
+            USE_ENCODER=False,
+            ENCODER_SIGN=DirectionSign.DIRECTION_SIGN_POSITIVE,
+            ENCODER_STEP_SIZE=1.0,
+            FULL_STEPS_PER_REV=200,
+            SCREW_PITCH=2.0 * math.pi / 200,
+            MICROSTEPS_PER_STEP=256,
+            MAX_SPEED=2.0 * math.pi / 4,
+            MAX_ACCELERATION=500.0,
+            MIN_POSITION=0.0,
+            MAX_POSITION=2.0 * math.pi / 4,
+            PID=None,
+        ),
+    )
+
+
+_stage_config = _default_stage_config()
 
 
 def get_stage_config() -> StageConfig:
@@ -633,29 +592,29 @@ def _old_camera_variant_to_enum(old_string) -> CameraVariant:
     raise ValueError(f"Unknown old camera type {old_string=}")
 
 
-_camera_config = CameraConfig(
-    camera_type=_old_camera_variant_to_enum(_def.CAMERA_TYPE),
-    camera_model=_def.MAIN_CAMERA_MODEL,
-    default_pixel_format=_def.CAMERA_CONFIG.PIXEL_FORMAT_DEFAULT,
-    default_binning=(_def.CAMERA_CONFIG.BINNING_FACTOR_DEFAULT, _def.CAMERA_CONFIG.BINNING_FACTOR_DEFAULT),
-    default_roi=(
-        _def.CAMERA_CONFIG.ROI_OFFSET_X_DEFAULT,
-        _def.CAMERA_CONFIG.ROI_OFFSET_Y_DEFAULT,
-        _def.CAMERA_CONFIG.ROI_WIDTH_DEFAULT,
-        _def.CAMERA_CONFIG.ROI_HEIGHT_DEFAULT,
-    ),
-    rotate_image_angle=_def.CAMERA_CONFIG.ROTATE_IMAGE_ANGLE,
-    flip=_def.CAMERA_CONFIG.FLIP_IMAGE,
-    crop_width=_def.CAMERA_CONFIG.CROP_WIDTH_UNBINNED,
-    crop_height=_def.CAMERA_CONFIG.CROP_HEIGHT_UNBINNED,
-    hardware_triggering_enabled=_def.CAMERA_CONFIG.HARDWARE_TRIGGERING_ENABLED,
-    default_temperature=_def.CAMERA_CONFIG.TEMPERATURE_DEFAULT,
-    default_fan_speed=_def.CAMERA_CONFIG.FAN_SPEED_DEFAULT,
-    default_black_level=_def.CAMERA_CONFIG.BLACKLEVEL_VALUE_DEFAULT,
-    default_white_balance_gains=RGBValue(
-        r=_def.CAMERA_CONFIG.AWB_RATIOS_R, g=_def.CAMERA_CONFIG.AWB_RATIOS_G, b=_def.CAMERA_CONFIG.AWB_RATIOS_B
-    ),
-)
+def _default_camera_config() -> CameraConfig:
+    """Build a generic main camera config used before MachineConfig is applied."""
+
+    return CameraConfig(
+        camera_type=CameraVariant.GXIPY,
+        camera_model=None,
+        default_pixel_format=CameraPixelFormat.MONO12,
+        default_binning=(1, 1),
+        default_roi=None,
+        rotate_image_angle=None,
+        flip=None,
+        crop_width=None,
+        crop_height=None,
+        default_temperature=None,
+        default_fan_speed=None,
+        default_black_level=None,
+        default_white_balance_gains=None,
+        hardware_triggering_enabled=True,
+        default_readout_mode=None,
+    )
+
+
+_camera_config = _default_camera_config()
 
 
 def get_camera_config() -> CameraConfig:
@@ -663,14 +622,29 @@ def get_camera_config() -> CameraConfig:
     return _camera_config
 
 
-_autofocus_camera_config = CameraConfig(
-    camera_type=_old_camera_variant_to_enum(_def.FOCUS_CAMERA_TYPE),
-    camera_model=_def.FOCUS_CAMERA_MODEL,
-    default_pixel_format=CameraPixelFormat.MONO8,
-    default_binning=(1, 1),
-    rotate_image_angle=None,
-    flip=None,
-)
+def _default_autofocus_camera_config() -> CameraConfig:
+    """Build a generic autofocus camera config used before MachineConfig is applied."""
+
+    return CameraConfig(
+        camera_type=CameraVariant.GXIPY,
+        camera_model=None,
+        default_pixel_format=CameraPixelFormat.MONO8,
+        default_binning=(1, 1),
+        default_roi=None,
+        rotate_image_angle=None,
+        flip=None,
+        crop_width=None,
+        crop_height=None,
+        default_temperature=None,
+        default_fan_speed=None,
+        default_black_level=None,
+        default_white_balance_gains=None,
+        hardware_triggering_enabled=True,
+        default_readout_mode=None,
+    )
+
+
+_autofocus_camera_config = _default_autofocus_camera_config()
 
 
 def get_autofocus_camera_config() -> CameraConfig:
