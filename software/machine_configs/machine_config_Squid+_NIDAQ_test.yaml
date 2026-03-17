@@ -138,13 +138,13 @@ devices:
             signal_type: analog
             direction: output
             channel_id: "port:0"
-            display_name: "405 intensity (MCU)"
+            display_name: "405_intensity_mcu"
           shutter:
             controller: teensy
             signal_type: digital
             direction: output
             channel_id: "port:0"
-            display_name: "405 shutter (MCU)"
+            display_name: "405_shutter_mcu"
       488nm:
         wavelength_nm: 488
         io:
@@ -153,13 +153,13 @@ devices:
             signal_type: analog
             direction: output
             channel_id: "port:1"
-            display_name: "488 intensity (MCU)"
+            display_name: "488_intensity_mcu"
           shutter:
             controller: teensy
             signal_type: digital
             direction: output
             channel_id: "port:1"
-            display_name: "488 shutter (MCU)"
+            display_name: "488_shutter_mcu"
       561nm:
         wavelength_nm: 561
         io:
@@ -168,13 +168,13 @@ devices:
             signal_type: analog
             direction: output
             channel_id: "port:2"
-            display_name: "561 intensity (MCU)"
+            display_name: "561_intensity_mcu"
           shutter:
             controller: teensy
             signal_type: digital
             direction: output
             channel_id: "port:2"
-            display_name: "561 shutter (MCU)"
+            display_name: "561_shutter_mcu"
       638nm:
         wavelength_nm: 638
         io:
@@ -183,13 +183,13 @@ devices:
             signal_type: analog
             direction: output
             channel_id: "port:3"
-            display_name: "638 intensity (MCU)"
+            display_name: "638_intensity_mcu"
           shutter:
             controller: teensy
             signal_type: digital
             direction: output
             channel_id: "port:3"
-            display_name: "638 shutter (MCU)"
+            display_name: "638_shutter_mcu"
       730nm:
         wavelength_nm: 730
         io:
@@ -198,13 +198,13 @@ devices:
             signal_type: analog
             direction: output
             channel_id: "port:4"
-            display_name: "730 intensity (MCU)"
+            display_name: "730_intensity_mcu"
           shutter:
             controller: teensy
             signal_type: digital
             direction: output
             channel_id: "port:4"
-            display_name: "730 shutter (MCU)"
+            display_name: "730_shutter_mcu"
 
   laser_af:
     driver: laser_af
@@ -215,7 +215,7 @@ devices:
         signal_type: digital
         direction: output
         channel_id: "pin:15"
-        display_name: "Laser AF gate (MCU)"
+        display_name: "laser_af_gate_mcu"
     config:
       spot_detection_mode: dual_left
 
