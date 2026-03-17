@@ -15084,6 +15084,8 @@ from control.nidaq import (
     TriggerSource, TriggerEdge, create_ni_daq,
     generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
 )
+from control.core.config.repository import ConfigRepository
+from control.models.io_endpoint_config import IOControllerType, IOSignalType, IODirection
 
 class NIDAQWidget(QWidget):
     """
@@ -15111,6 +15113,15 @@ class NIDAQWidget(QWidget):
         self._ni_daq_module = __import__('control.nidaq', fromlist=[''])
         
         self.is_simulation = is_simulation
+
+        # Cache IO endpoint config so we can show human-readable labels for
+        # NIDAQ-controlled endpoints when available in the machine config.
+        try:
+            repo = ConfigRepository()
+            self._io_endpoint_config = repo.get_io_endpoint_config()
+        except Exception as e:
+            self._log.warning(f"Could not load IO endpoint config for NIDAQWidget: {e}", exc_info=True)
+            self._io_endpoint_config = None
 
         if self.is_simulation:
             # Create a simulated NI DAQ so the widget always talks to an AbstractNIDAQ.
@@ -15542,13 +15553,50 @@ class NIDAQWidget(QWidget):
         # Get device info and update channel lists
         if self._ni_daq is not None:
             info = self._ni_daq.get_device_info(device_name)
+
+            # Build a mapping from NIDAQ physical channel IDs to IO endpoint display names
+            endpoint_labels_ao: dict[str, str] = {}
+            endpoint_labels_ai: dict[str, str] = {}
+            endpoint_labels_do: dict[tuple[str, int], str] = {}
+            if self._io_endpoint_config is not None:
+                try:
+                    for ep in self._io_endpoint_config.get_controller_endpoints(IOControllerType.NIDAQ):
+                        if not ep.display_name:
+                            continue
+                        cid = ep.channel_id
+                        if ep.signal_type == IOSignalType.ANALOG and ep.direction == IODirection.OUTPUT:
+                            # Expect "ao0", "ao1", ...
+                            endpoint_labels_ao[cid] = ep.display_name
+                        elif ep.signal_type == IOSignalType.ANALOG and ep.direction == IODirection.INPUT:
+                            # Expect "ai0", "ai1", ...
+                            endpoint_labels_ai[cid] = ep.display_name
+                        elif ep.signal_type == IOSignalType.DIGITAL:
+                            # Expect "port0/line6" style channel_id
+                            if "port" in cid and "/line" in cid:
+                                try:
+                                    port_part, line_part = cid.split("/", 1)
+                                    port_name = port_part
+                                    line_idx = int(line_part.replace("line", ""))
+                                    endpoint_labels_do[(port_name, line_idx)] = ep.display_name
+                                except Exception:
+                                    # Ignore unparsable IDs; they just won't get labels
+                                    continue
+                except Exception as e:
+                    self._log.warning(f"Failed to build NIDAQ endpoint label map: {e}", exc_info=True)
             
             # Update AO channels
             self.ao_channels_list.clear()
             for ch in info.get("ao_channels", []):
                 # Extract just the channel part (e.g., "ao0" from "Dev1/ao0")
                 ch_name = ch.split("/")[-1] if "/" in ch else ch
-                item = QListWidgetItem(ch_name)
+                label = endpoint_labels_ao.get(ch_name)
+                if label:
+                    text = f"{ch_name} — {label}"
+                else:
+                    text = ch_name
+                item = QListWidgetItem(text)
+                # Store the raw channel id for later use
+                item.setData(Qt.UserRole, ch_name)
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
                 self.ao_channels_list.addItem(item)
@@ -15557,7 +15605,13 @@ class NIDAQWidget(QWidget):
             self.ai_channels_list.clear()
             for ch in info.get("ai_channels", []):
                 ch_name = ch.split("/")[-1] if "/" in ch else ch
-                item = QListWidgetItem(ch_name)
+                label = endpoint_labels_ai.get(ch_name)
+                if label:
+                    text = f"{ch_name} — {label}"
+                else:
+                    text = ch_name
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, ch_name)
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
                 self.ai_channels_list.addItem(item)
@@ -15571,13 +15625,15 @@ class NIDAQWidget(QWidget):
             selected_ao = set(task_io.get("ao_channels", []))
             for i in range(self.ao_channels_list.count()):
                 item = self.ao_channels_list.item(i)
-                item.setCheckState(Qt.Checked if item.text() in selected_ao else Qt.Unchecked)
+                ch_name = item.data(Qt.UserRole) or item.text()
+                item.setCheckState(Qt.Checked if ch_name in selected_ao else Qt.Unchecked)
 
             # AI channels: prefer task-IO selection if available
             selected_ai = set(task_io.get("ai_channels", []))
             for i in range(self.ai_channels_list.count()):
                 item = self.ai_channels_list.item(i)
-                item.setCheckState(Qt.Checked if item.text() in selected_ai else Qt.Unchecked)
+                ch_name = item.data(Qt.UserRole) or item.text()
+                item.setCheckState(Qt.Checked if ch_name in selected_ai else Qt.Unchecked)
 
             # DO port and lines
             cfg_do_port = getattr(self._ni_daq, "do_port", None)
@@ -15639,14 +15695,16 @@ class NIDAQWidget(QWidget):
         for i in range(self.ao_channels_list.count()):
             item = self.ao_channels_list.item(i)
             if item.checkState() == Qt.Checked:
-                selected_ao.append(item.text())
+                ch_name = item.data(Qt.UserRole) or item.text()
+                selected_ao.append(ch_name)
         
         # Get selected AI channels (task IO subset) from checkboxes
         selected_ai = []
         for i in range(self.ai_channels_list.count()):
             item = self.ai_channels_list.item(i)
             if item.checkState() == Qt.Checked:
-                selected_ai.append(item.text())
+                ch_name = item.data(Qt.UserRole) or item.text()
+                selected_ai.append(ch_name)
         
         # Get selected DO lines (task IO subset) from checkboxes
         selected_do: list[int] = []
