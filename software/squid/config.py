@@ -753,7 +753,7 @@ def _build_camera_config_from_device(
         crop_height=crop_h,
         default_temperature=cfg.get("temperature"),
         default_fan_speed=cfg.get("fan_speed"),
-        default_black_level=cfg.get("blacklevel"),
+        default_black_level=cfg.get("black_level"),
         default_white_balance_gains=wb_gains,
         hardware_triggering_enabled=cfg.get("hardware_triggering_enabled", True),
         default_readout_mode=cfg.get("readout_mode"),

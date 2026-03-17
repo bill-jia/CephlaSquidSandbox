@@ -14,6 +14,7 @@ from control.core.scan_coordinates import (
     RemovedScanCoordinateRegion,
     ClearedScanCoordinates,
 )
+from control.NL5 import NL5
 
 os.environ["QT_API"] = "pyqt5"
 import re
@@ -176,7 +177,7 @@ class QtAutoFocusController(AutoFocusController, QObject):
         stage: AbstractStage,
         liveController: LiveController,
         microcontroller: Microcontroller,
-        nl5: Optional[control.microscope.NL5],
+        nl5: Optional[NL5],
     ):
         QObject.__init__(self)
         AutoFocusController.__init__(

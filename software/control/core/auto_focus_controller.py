@@ -11,7 +11,7 @@ import control._def
 from control.core.auto_focus_worker import AutofocusWorker
 from control.core.live_controller import LiveController
 from control.microcontroller import Microcontroller
-from control.microscope import NL5
+from control.NL5 import NL5
 from squid.abc import AbstractCamera, AbstractStage
 
 

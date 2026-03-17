@@ -25,6 +25,7 @@ import enum
 import struct
 import threading
 import time
+import sys
 from abc import abstractmethod
 from typing import Callable
 

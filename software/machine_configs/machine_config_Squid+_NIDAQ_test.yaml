@@ -19,6 +19,7 @@ devices:
     config:
       device_name: "Dev1"
       sample_rate: 100000
+      logic_family: "THREE_POINT_THREE_V"
 
   main_camera:
     driver: toupcam
@@ -35,9 +36,17 @@ devices:
       binning: 2
       roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
       crop: { width: 4168, height: 4168 }
-      rotate_angle: null
+      rotate_angle: 0
       flip: null
       temperature: 20
+      fan_speed: 1
+      black_level: 3
+      awb_ratios:
+        r: 1.375
+        g: 1
+        b: 1.4141
+      hardware_triggering_enabled: true
+      readout_mode: "GLOBAL"
 
   focus_camera:
     driver: daheng
