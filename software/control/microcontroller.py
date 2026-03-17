@@ -656,6 +656,11 @@ class Microcontroller:
         self._serial = serial_device
         self._is_simulated = isinstance(serial_device, SimSerial)
 
+        # LED matrix white-LED RGB factors (configured at construction time)
+        self._led_matrix_r_factor: float = 1.0
+        self._led_matrix_g_factor: float = 1.0
+        self._led_matrix_b_factor: float = 1.0
+
         # Communication buffer sizes
         self.tx_buffer_length = MicrocontrollerDef.CMD_LENGTH  # Command packet size
         self.rx_buffer_length = MicrocontrollerDef.MSG_LENGTH  # Status packet size
@@ -840,6 +845,37 @@ class Microcontroller:
         cmd[4] = min(int(r * 255), 255)
         cmd[5] = min(int(b * 255), 255)
         self.send_command(cmd)
+
+    def set_led_matrix_factors(self, r_factor: float, g_factor: float, b_factor: float) -> None:
+        """Set per-machine RGB weighting for MCU-driven LED matrix brightfield."""
+        self._led_matrix_r_factor = float(r_factor)
+        self._led_matrix_g_factor = float(g_factor)
+        self._led_matrix_b_factor = float(b_factor)
+
+    def apply_led_matrix_channel_configuration(
+        self,
+        channel_name: str,
+        illumination_source: int,
+        intensity: float,
+    ) -> None:
+        """Map a logical LED-matrix channel name to RGB and send it to firmware.
+
+        The per-channel RGB weighting is provided via *r_factor*/*g_factor*/*b_factor*
+        (typically loaded from MachineConfig for the white LED source).
+        """
+        if "BF LED matrix full_R" in channel_name:
+            r, g, b = intensity / 100.0, 0.0, 0.0
+        elif "BF LED matrix full_G" in channel_name:
+            r, g, b = 0.0, intensity / 100.0, 0.0
+        elif "BF LED matrix full_B" in channel_name:
+            r, g, b = 0.0, 0.0, intensity / 100.0
+        else:
+            scale = intensity / 100.0
+            r = scale * self._led_matrix_r_factor
+            g = scale * self._led_matrix_g_factor
+            b = scale * self._led_matrix_b_factor
+
+        self.set_illumination_led_matrix(illumination_source, r, g, b)
 
     # Multi-port illumination commands (firmware v1.0+)
     # These allow multiple ports to be ON simultaneously with independent intensities

@@ -167,7 +167,7 @@ class MicroscopeAddons:
 
         # ── Focus camera (laser AF) ──────────────────────────────────────
         camera_focus = None
-        if _dev("focus_camera") or _dev("laser_af"):
+        if _dev("focus_camera") and _dev("laser_af") and _dev("laser_af").enabled:
             camera_focus = squid.camera.utils.get_camera(
                 squid.config.get_autofocus_camera_config(),
                 simulated=_sim("focus_camera"),
@@ -184,16 +184,23 @@ class MicroscopeAddons:
             except ImportError:
                 log.warning("Fluidics module not available")
 
-        # ── SciMicroscopy LED array ───────────────────────────────────────
+        # ── SciMicroscopy LED array (serial device) ───────────────────────
         sci_microscopy_led_array = None
         led_entry = _dev("led_matrix")
         if led_entry:
-            sn = led_entry.connection.serial_number if led_entry.connection else ""
-            dist = led_entry.config.get("distance", 50)
-            delay = led_entry.config.get("turn_on_delay", 0.03)
-            na = led_entry.config.get("default_na", 0.8)
-            sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(sn, dist, delay)
-            sci_microscopy_led_array.set_NA(na)
+            if led_entry.driver == "scimicroscopy_led_array":
+                sn = led_entry.connection.serial_number if led_entry.connection else ""
+                dist = led_entry.config.get("distance", 50)
+                delay = led_entry.config.get("turn_on_delay", 0.03)
+                na = led_entry.config.get("default_na", 0.8)
+                default_color = tuple(led_entry.config.get("default_color", [1, 1, 1]))
+                sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(
+                    SN=sn,
+                    array_distance=dist,
+                    turn_on_delay=delay,
+                    default_color=default_color,
+                )
+                sci_microscopy_led_array.set_NA(na)
 
         # ── NI-DAQ ────────────────────────────────────────────────────────
         nidaq = None
@@ -355,6 +362,14 @@ class LowLevelDrivers:
             serial_device=micro_serial_device,
             reset_and_initialize=not skip_init,
         )
+
+        # Configure LED matrix RGB factors for MCU-driven brightfield, if present.
+        led_entry = mc.get_device("led_matrix")
+        if led_entry:
+            r_factor = float(led_entry.config.get("r_factor", 1.0))
+            g_factor = float(led_entry.config.get("g_factor", 1.0))
+            b_factor = float(led_entry.config.get("b_factor", 1.0))
+            micro.set_led_matrix_factors(r_factor, g_factor, b_factor)
 
         return LowLevelDrivers(microcontroller=micro)
 

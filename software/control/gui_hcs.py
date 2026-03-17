@@ -76,6 +76,7 @@ import squid.camera.utils
 import squid.config
 import squid.logging
 import squid.stage.utils
+from squid.config import CameraVariant
 
 log = squid.logging.get_logger(__name__)
 
@@ -94,9 +95,8 @@ if USE_XERYON:
 import control.core.core as core
 import control.microcontroller as microcontroller
 import control.serial_peripherals as serial_peripherals
+import control.core_displacement_measurement as core_displacement_measurement
 
-if SUPPORT_LASER_AUTOFOCUS:
-    import control.core_displacement_measurement as core_displacement_measurement
 
 
 if USE_JUPYTER_CONSOLE:
@@ -583,8 +583,10 @@ class HighContentScreeningGui(QMainWindow):
             core_displacement_measurement.DisplacementMeasurementController
         ] = None
         self.laserAutofocusController: Optional[LaserAutofocusController] = None
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
+            # self.log.info(self.microscope.addons.camera_focus._config)
             self.liveController_focus_camera = self.microscope.live_controller_focus
+            self.log.info(f"liveController_focus_camera: {self.liveController_focus_camera}")
             self.streamHandler_focus_camera = core.QtStreamHandler(
                 accept_new_frame_fn=lambda: self.liveController_focus_camera.is_live
             )
@@ -975,8 +977,8 @@ class HighContentScreeningGui(QMainWindow):
             self.stage, self.navigationViewer, self.scanCoordinates, core.FocusMap()
         )
 
-        if SUPPORT_LASER_AUTOFOCUS:
-            if FOCUS_CAMERA_TYPE == "Toupcam":
+        if self.microscope.addons.camera_focus:
+            if self.microscope.addons.camera_focus._config.camera_type == CameraVariant.TOUPCAM:
                 self.cameraSettingWidget_focus_camera = widgets.CameraSettingsWidget(
                     self.camera_focus,
                     include_gain_exposure_time=False,
@@ -1289,7 +1291,7 @@ class HighContentScreeningGui(QMainWindow):
             # Connect the point clicked signal to move the stage
             self.zPlotWidget.signal_point_clicked.connect(self.move_to_mm)
 
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
             dock_laserfocus_image_display = dock.Dock("Focus Camera Image Display", autoOrientation=False)
             dock_laserfocus_image_display.showTitleBar()
             dock_laserfocus_image_display.addWidget(self.imageDisplayWindow_focus.widget)
@@ -1392,7 +1394,7 @@ class HighContentScreeningGui(QMainWindow):
             self.cameraTabWidget.addTab(self.filterControllerWidget, "Emission Filter")
         self.cameraTabWidget.addTab(self.cameraSettingWidget, "Camera")
         self.cameraTabWidget.addTab(self.autofocusWidget, "Contrast AF")
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
             self.cameraTabWidget.addTab(self.laserAutofocusControlWidget, "Laser AF")
         self.cameraTabWidget.addTab(self.focusMapWidget, "Focus Map")
         self.cameraTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.cameraTabWidget))

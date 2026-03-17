@@ -1057,7 +1057,13 @@ class LDI_Simulation(LightSource):
 class SciMicroscopyLEDArray:
     """Wrapper for communicating with SciMicroscopy over serial"""
 
-    def __init__(self, SN, array_distance=50, turn_on_delay=0.03):
+    def __init__(
+        self,
+        SN,
+        array_distance: float = 50,
+        turn_on_delay: float = 0.03,
+        default_color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ):
         """
         Provide serial number
         """
@@ -1079,6 +1085,7 @@ class SciMicroscopyLEDArray:
         self.illumination = None
         self.NA = 0.5
         self.turn_on_delay = turn_on_delay
+        self._default_color: tuple[float, float, float] = default_color
 
     def write(self, command):
         self.serial_connection.write_and_check(command + "\r", "", read_delay=0.01, print_response=True)
@@ -1144,11 +1151,56 @@ class SciMicroscopyLEDArray:
     def turn_off_illumination(self):
         self.clear()
 
+    # High-level helper used by LiveController to map channel names to
+    # concrete LED array settings. This keeps UI/channel-name logic out of
+    # the acquisition controller.
+    def apply_channel_configuration(
+        self,
+        channel_name: str,
+        intensity: float,
+    ) -> None:
+        """Configure color, brightness and illumination mode from a channel name."""
+        # Map channel name to color
+        if "BF LED matrix full_R" in channel_name:
+            color = (1.0, 0.0, 0.0)
+        elif "BF LED matrix full_G" in channel_name:
+            color = (0.0, 1.0, 0.0)
+        elif "BF LED matrix full_B" in channel_name:
+            color = (0.0, 0.0, 1.0)
+        else:
+            color = self._default_color
+
+        # Map channel name to illumination mode
+        if "BF LED matrix left half" in channel_name:
+            mode = "dpc.l"
+        elif "BF LED matrix right half" in channel_name:
+            mode = "dpc.r"
+        elif "BF LED matrix top half" in channel_name:
+            mode = "dpc.t"
+        elif "BF LED matrix bottom half" in channel_name:
+            mode = "dpc.b"
+        elif "BF LED matrix full" in channel_name:
+            mode = "bf"
+        elif "DF LED matrix" in channel_name:
+            mode = "df"
+        else:
+            mode = "bf"
+
+        self.set_color(color)
+        self.set_brightness(intensity)
+        self.set_illumination(mode)
+
 
 class SciMicroscopyLEDArray_Simulation:
-    """Wrapper for communicating with SciMicroscopy over serial"""
+    """Simulation wrapper mirroring SciMicroscopyLEDArray API."""
 
-    def __init__(self, SN, array_distance=50, turn_on_delay=0.03):
+    def __init__(
+        self,
+        SN,
+        array_distance: float = 50,
+        turn_on_delay: float = 0.03,
+        default_color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ):
         """
         Provide serial number
         """
@@ -1160,6 +1212,7 @@ class SciMicroscopyLEDArray_Simulation:
         self.illumination = None
         self.NA = 0.5
         self.turn_on_delay = turn_on_delay
+        self._default_color: tuple[float, float, float] = default_color
 
     def write(self, command):
         pass
@@ -1205,6 +1258,14 @@ class SciMicroscopyLEDArray_Simulation:
 
     def turn_off_illumination(self):
         pass
+
+    def apply_channel_configuration(
+        self,
+        channel_name: str,
+        intensity: float,
+    ) -> None:
+        """Simulation stub; mirrors real API but is a no-op."""
+        return
 
 
 class CellX:

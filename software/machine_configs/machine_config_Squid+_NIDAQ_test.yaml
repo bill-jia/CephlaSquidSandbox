@@ -212,6 +212,20 @@ devices:
       control_voltage_range: 10
       flip_direction: false
 
+  led_matrix:
+    driver: teensy
+    enabled: true
+    connection:
+      serial_number: null
+    config:
+      distance: 50
+      default_na: 0.8
+      turn_on_delay: 0.03
+      default_color: [1, 1, 1]
+      r_factor: 1.0
+      g_factor: 1.0
+      b_factor: 1.0
+
 illumination_channels_file: illumination_channel_config.yaml
 
 software:

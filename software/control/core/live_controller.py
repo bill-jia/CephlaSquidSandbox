@@ -265,54 +265,15 @@ class LiveController:
         intensity = self.currentConfiguration.illumination_intensity
         if self._is_led_matrix():
             if self.microscope.addons.sci_microscopy_led_array:
-                # set color based on channel name
                 led_array = self.microscope.addons.sci_microscopy_led_array
                 name = self.currentConfiguration.name
-                if "BF LED matrix full_R" in name:
-                    led_colors = (1, 0, 0)
-                elif "BF LED matrix full_G" in name:
-                    led_colors = (0, 1, 0)
-                elif "BF LED matrix full_B" in name:
-                    led_colors = (0, 0, 1)
-                else:
-                    led_colors = SCIMICROSCOPY_LED_ARRAY_DEFAULT_COLOR
-
-                # set mode based on channel name
-                if "BF LED matrix left half" in name:
-                    led_mode = "dpc.l"
-                elif "BF LED matrix right half" in name:
-                    led_mode = "dpc.r"
-                elif "BF LED matrix top half" in name:
-                    led_mode = "dpc.t"
-                elif "BF LED matrix bottom half" in name:
-                    led_mode = "dpc.b"
-                elif "BF LED matrix full" in name:
-                    led_mode = "bf"
-                elif "DF LED matrix" in name:
-                    led_mode = "df"
-                else:
-                    self._log.warning("Unknown configuration name, using default mode 'bf'.")
-                    led_mode = "bf"
-
-                led_array.set_color(led_colors)
-                led_array.set_brightness(intensity)
-                led_array.set_illumination(led_mode)
+                # Delegate channel-name mapping entirely to the LED array controller
+                led_array.apply_channel_configuration(name, intensity)
             else:
                 micro: Microcontroller = self.microscope.low_level_drivers.microcontroller
                 name = self.currentConfiguration.name
-                if "BF LED matrix full_R" in name:
-                    micro.set_illumination_led_matrix(illumination_source, r=(intensity / 100), g=0, b=0)
-                elif "BF LED matrix full_G" in name:
-                    micro.set_illumination_led_matrix(illumination_source, r=0, g=(intensity / 100), b=0)
-                elif "BF LED matrix full_B" in name:
-                    micro.set_illumination_led_matrix(illumination_source, r=0, g=0, b=(intensity / 100))
-                else:
-                    micro.set_illumination_led_matrix(
-                        illumination_source,
-                        r=(intensity / 100) * LED_MATRIX_R_FACTOR,
-                        g=(intensity / 100) * LED_MATRIX_G_FACTOR,
-                        b=(intensity / 100) * LED_MATRIX_B_FACTOR,
-                    )
+                # MCU-controlled LED matrix uses factors configured at construction time
+                micro.apply_led_matrix_channel_configuration(name, illumination_source, intensity)
         else:
             # Laser/fluorescence illumination
             wavelength = self._get_illumination_wavelength()

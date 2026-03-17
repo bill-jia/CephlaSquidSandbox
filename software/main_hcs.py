@@ -15,7 +15,6 @@ The software controls a complete microscope system including:
 
 # Set QT_API environment variable before importing Qt libraries
 # This ensures we use PyQt5 as the Qt backend
-print("Test")
 import argparse
 import logging
 import os
