@@ -326,12 +326,16 @@ class MachineConfig(BaseModel):
                 f"'{ep_name}' references unknown controller '{io_line.controller}'"
             )
 
-        conflict_key = f"{io_line.controller}:{io_line.channel_id}"
+        # Same controller+channel_id can have both analog and digital (e.g. one MCU port
+        # drives DAC intensity and TTL shutter). Only conflict when same signal_type.
+        conflict_key = (
+            f"{io_line.controller}:{io_line.channel_id}:{io_line.signal_type.value}"
+        )
         if conflict_key in seen_channels:
             other = seen_channels[conflict_key]
             issues.append(
                 f"Channel conflict: '{ep_name}' and '{other}' both claim "
-                f"{io_line.controller}:{io_line.channel_id}"
+                f"{io_line.controller}:{io_line.channel_id} ({io_line.signal_type.value})"
             )
         else:
             seen_channels[conflict_key] = ep_name
