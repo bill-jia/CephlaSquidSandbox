@@ -65,7 +65,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     # ── Device-presence flags ────────────────────────────────────────────────
 
     control._def.SUPPORT_LASER_AUTOFOCUS = _dev_enabled("laser_af")
-    control._def.ENABLE_NIDAQ = _dev_enabled("nidaq")
 
     # Piezo (Z motor config)
     piezo_enabled = _dev_enabled("piezo")
@@ -215,7 +214,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.ENABLE_FLEXIBLE_MULTIPOINT = acq.flexible_multipoint
     control._def.ENABLE_WELLPLATE_MULTIPOINT = acq.wellplate_multipoint
     control._def.ENABLE_RECORDING = acq.recording
-    control._def.ENABLE_FAST_ACQUISITION = acq.fast_acquisition
     control._def.DEFAULT_MULTIPOINT_NX = acq.default_nx
     control._def.DEFAULT_MULTIPOINT_NY = acq.default_ny
 

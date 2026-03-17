@@ -833,7 +833,6 @@ ENABLE_FLEXIBLE_MULTIPOINT = True
 USE_OVERLAP_FOR_FLEXIBLE = True
 ENABLE_WELLPLATE_MULTIPOINT = True
 ENABLE_RECORDING = False
-ENABLE_FAST_ACQUISITION = False
 
 RESUME_LIVE_AFTER_ACQUISITION = True
 
@@ -990,9 +989,6 @@ NL5_USE_AOUT = False
 NL5_USE_DOUT = True
 NL5_TRIGGER_PIN = 2
 NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 638: 4, 640: 4}
-
-# National Instruments DAQ integration
-ENABLE_NIDAQ = False
 
 # NI DAQ Digital I/O logic family configuration
 # This setting determines the voltage levels used for digital I/O:

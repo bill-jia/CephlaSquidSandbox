@@ -16,6 +16,7 @@ devices:
 
   nidaq:
     driver: nidaq
+    enabled: true
     config:
       device_name: "Dev1"
       sample_rate: 100000

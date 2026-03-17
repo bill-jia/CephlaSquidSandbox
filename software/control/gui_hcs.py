@@ -1010,17 +1010,29 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
 
-        if ENABLE_NIDAQ:
+        # Determine NIDAQ and fast-acquisition capabilities from MachineConfig
+        from control.core.config import ConfigRepository
+
+        mc = ConfigRepository().get_machine_config()
+        nidaq_entry = mc.get_device("nidaq")
+        nidaq_enabled = bool(nidaq_entry and nidaq_entry.enabled)
+        fast_acq_enabled = bool(
+            getattr(mc, "software", None)
+            and getattr(mc.software, "acquisition", None)
+            and bool(getattr(mc.software.acquisition, "fast_acquisition", False))
+        )
+
+        if nidaq_enabled:
             nidaq_simulated = _should_simulate(is_simulation, SIMULATE_NIDAQ)
             self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=nidaq_simulated)
-        
+
         # Fast acquisition widget
-        if ENABLE_FAST_ACQUISITION:
+        if fast_acq_enabled:
             self.fastAcquisitionWidget = widgets.FastAcquisitionWidget(
                 self.microscope,
-                ni_daq_widget=self.niDAQWidget if ENABLE_NIDAQ else None,
+                ni_daq_widget=self.niDAQWidget if nidaq_enabled else None,
                 live_controller=self.liveController,
-                live_control_widget=self.liveControlWidget
+                live_control_widget=self.liveControlWidget,
             )
 
         self.imageDisplayTabs = QTabWidget(parent=self)
@@ -1328,7 +1340,8 @@ class HighContentScreeningGui(QMainWindow):
         if RUN_FLUIDICS:
             self.imageDisplayTabs.addTab(self.fluidicsWidget, "Fluidics")
 
-        if ENABLE_NIDAQ:
+        # Only add NI DAQ tab if the widget was created (nidaq enabled in MachineConfig)
+        if hasattr(self, "niDAQWidget") and self.niDAQWidget is not None:
             self.imageDisplayTabs.addTab(self.niDAQWidget, "NI DAQ")
 
     def setupRecordTabWidget(self):
@@ -1344,7 +1357,8 @@ class HighContentScreeningGui(QMainWindow):
             self.recordTabWidget.addTab(self.trackingControlWidget, "Tracking")
         if ENABLE_RECORDING:
             self.recordTabWidget.addTab(self.recordingControlWidget, "Simple Recording")
-        if ENABLE_FAST_ACQUISITION:
+        # Only add Fast Acquisition tab if the widget was created (fast_acquisition enabled in MachineConfig)
+        if hasattr(self, "fastAcquisitionWidget") and self.fastAcquisitionWidget is not None:
             self.recordTabWidget.addTab(self.fastAcquisitionWidget, "Fast Acquisition")
         self.recordTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.recordTabWidget))
         self.resizeCurrentTab(self.recordTabWidget)
