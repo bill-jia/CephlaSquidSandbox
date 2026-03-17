@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import psutil
 
@@ -15083,7 +15084,6 @@ from control.nidaq import (
     TriggerSource, TriggerEdge, create_ni_daq,
     generate_sine_wave, generate_square_wave, generate_ramp_wave, generate_pulse_train
 )
-from control._def import NIDAQ_CONFIG
 
 class NIDAQWidget(QWidget):
     """
@@ -15113,11 +15113,29 @@ class NIDAQWidget(QWidget):
         self.is_simulation = is_simulation
 
         if self.is_simulation:
-            self._ni_daq = None
-            self._config = NIDAQ_CONFIG()
+            # Create a simulated NI DAQ so the widget always talks to an AbstractNIDAQ.
+            sim_config = {
+                "device_name": "Simulation",
+                "sample_rate_hz": 10000.0,
+                "samples_per_channel": 10000,
+                "ao_channels": [],
+                "do_port": "port0",
+                "do_lines": [],
+                "di_port": "port0",
+                "di_lines": [],
+                "ai_channels": [],
+                "ai_min_voltage": -10.0,
+                "ai_max_voltage": 10.0,
+                "ai_terminal_config": "RSE",
+                "trigger_source": TriggerSource.SOFTWARE,
+                "external_trigger_terminal": "/Simulation/PFI0",
+                "trigger_edge": TriggerEdge.RISING,
+                "continuous": False,
+                "do_logic_family": "FIVE_V",
+            }
+            self._ni_daq = create_ni_daq(sim_config, simulation=True)
         else:
             self._ni_daq = ni_daq
-            self._config = self._ni_daq._config
         self._log.info(f"NIDAQWidget initialized with NI DAQ: {self._ni_daq}")
         self._waveforms = WaveformData()
         
@@ -15448,7 +15466,46 @@ class NIDAQWidget(QWidget):
         
         main_layout.addLayout(right_panel, 2)
         self.on_device_changed(self.device_combo.currentText())
+        self._load_config_into_ui()
         self._rebuild_live_output_controls()
+
+    def _load_config_into_ui(self):
+        """Initialize UI widgets from the current configuration/state."""
+        # Sample rate and samples per channel
+        self.sample_rate_spin.setValue(float(getattr(self._ni_daq, "sample_rate_hz", 10000.0)))
+        self.num_samples_spin.setValue(int(getattr(self._ni_daq, "samples_per_channel", 10000)))
+        # Continuous mode
+        self.continuous_checkbox.setChecked(bool(getattr(self._ni_daq, "continuous", False)))
+        # Trigger source
+        if hasattr(self._ni_daq, "trigger_source"):
+            src = self._ni_daq.trigger_source
+            # Accept both enum and string
+            if hasattr(src, "name"):
+                src_name = src.name
+            else:
+                src_name = str(src)
+            if src_name.upper().startswith("SOFTWARE"):
+                self.trigger_source_combo.setCurrentText("Software")
+            elif src_name.upper().startswith("EXTERNAL"):
+                self.trigger_source_combo.setCurrentText("External")
+            else:
+                self.trigger_source_combo.setCurrentText("Internal")
+        # Trigger edge
+        if hasattr(self._ni_daq, "trigger_edge"):
+            edge = self._ni_daq.trigger_edge
+            if hasattr(edge, "name"):
+                edge_name = edge.name
+            else:
+                edge_name = str(edge)
+            self.trigger_edge_combo.setCurrentText("Rising" if edge_name.upper().startswith("RISING") else "Falling")
+        # External trigger terminal
+        if hasattr(self._ni_daq, "external_trigger_terminal"):
+            self.trigger_terminal_edit.setText(str(self._ni_daq.external_trigger_terminal))
+        # AI terminal config
+        if hasattr(self._ni_daq, "ai_terminal_config"):
+            idx = self.ai_terminal_combo.findText(str(self._ni_daq.ai_terminal_config))
+            if idx >= 0:
+                self.ai_terminal_combo.setCurrentIndex(idx)
 
     
     def on_refresh(self):
@@ -15474,7 +15531,8 @@ class NIDAQWidget(QWidget):
         if not device_name or device_name in ["No devices found", "DAQ not available"]:
             return
         
-        self._config.device_name = device_name
+        if hasattr(self._ni_daq, "device_name"):
+            self._ni_daq.device_name = device_name
         
         # Get device info and update channel lists
         if self._ni_daq is not None:
@@ -15495,6 +15553,31 @@ class NIDAQWidget(QWidget):
             
             # Update trigger terminal default
             self.trigger_terminal_edit.setText(f"/{device_name}/PFI2")
+            
+            # Pre-select channels/lines based on current config/state
+            # AO channels
+            selected_ao = set(getattr(self._ni_daq, "ao_channels", []) or [])
+            for i in range(self.ao_channels_list.count()):
+                item = self.ao_channels_list.item(i)
+                item.setSelected(item.text() in selected_ao)
+
+            # AI channels
+            selected_ai = set(getattr(self._ni_daq, "ai_channels", []) or [])
+            for i in range(self.ai_channels_list.count()):
+                item = self.ai_channels_list.item(i)
+                item.setSelected(item.text() in selected_ai)
+
+            # DO port and lines
+            cfg_do_port = getattr(self._ni_daq, "do_port", None)
+            if cfg_do_port:
+                idx = self.do_port_combo.findText(str(cfg_do_port))
+                if idx >= 0:
+                    self.do_port_combo.setCurrentIndex(idx)
+
+            selected_do_lines = set(getattr(self._ni_daq, "do_lines", []) or [])
+            for i in range(self.do_lines_list.count()):
+                item = self.do_lines_list.item(i)
+                item.setSelected(i in selected_do_lines)
     
     def on_config_changed(self):
         """Handle configuration changes."""
@@ -15509,69 +15592,69 @@ class NIDAQWidget(QWidget):
         """Update the configuration from UI values."""
         from control.nidaq import TriggerSource, TriggerEdge
         
-        self._config.device_name = self.device_combo.currentText()
-        self._config.sample_rate_hz = self.sample_rate_spin.value()
-        self._config.samples_per_channel = self.num_samples_spin.value()
-        self._config.continuous = self.continuous_checkbox.isChecked()
-        self._config.do_port = self.do_port_combo.currentText()
-        self._config.ai_terminal_config = self.ai_terminal_combo.currentText()
-        self._config.external_trigger_terminal = self.trigger_terminal_edit.text()
+        self._ni_daq.device_name = self.device_combo.currentText()
+        self._ni_daq.sample_rate_hz = self.sample_rate_spin.value()
+        self._ni_daq.samples_per_channel = self.num_samples_spin.value()
+        self._ni_daq.continuous = self.continuous_checkbox.isChecked()
+        self._ni_daq.do_port = self.do_port_combo.currentText()
+        self._ni_daq.ai_terminal_config = self.ai_terminal_combo.currentText()
+        self._ni_daq.external_trigger_terminal = self.trigger_terminal_edit.text()
         
         # Trigger source
         src_text = self.trigger_source_combo.currentText()
         if src_text == "Software":
-            self._config.trigger_source = TriggerSource.SOFTWARE
+            self._ni_daq.trigger_source = TriggerSource.SOFTWARE
         elif src_text == "External":
-            self._config.trigger_source = TriggerSource.EXTERNAL
+            self._ni_daq.trigger_source = TriggerSource.EXTERNAL
             # If terminal is empty, default to PFI2 on the selected device
-            if not self._config.external_trigger_terminal:
-                device = self._config.device_name or self.device_combo.currentText()
+            if not self._ni_daq.external_trigger_terminal:
+                device = self._ni_daq.device_name or self.device_combo.currentText()
                 if device:
-                    self._config.external_trigger_terminal = f"/{device}/PFI2"
-                    self.trigger_terminal_edit.setText(self._config.external_trigger_terminal)
+                    self._ni_daq.external_trigger_terminal = f"/{device}/PFI2"
+                    self.trigger_terminal_edit.setText(self._ni_daq.external_trigger_terminal)
         else:
             # "Internal" option: use internal start trigger routing (master AO/DO/DI)
-            self._config.trigger_source = TriggerSource.INTERNAL
+            self._ni_daq.trigger_source = TriggerSource.INTERNAL
         
         # Trigger edge
         if self.trigger_edge_combo.currentText() == "Rising":
-            self._config.trigger_edge = TriggerEdge.RISING
+            self._ni_daq.trigger_edge = TriggerEdge.RISING
         else:
-            self._config.trigger_edge = TriggerEdge.FALLING
+            self._ni_daq.trigger_edge = TriggerEdge.FALLING
         
         # Get selected AO channels
-        self._config.ao_channels = [
+        self._ni_daq.ao_channels = [
             item.text() for item in self.ao_channels_list.selectedItems()
         ]
         
         # Get selected AI channels
-        self._config.ai_channels = [
+        self._ni_daq.ai_channels = [
             item.text() for item in self.ai_channels_list.selectedItems()
         ]
         
         # Get selected DO lines
-        self._config.do_lines = []
+        self._ni_daq.do_lines = []
         for i in range(self.do_lines_list.count()):
             item = self.do_lines_list.item(i)
             if item.isSelected():
-                self._config.do_lines.append(i)
+                self._ni_daq.do_lines.append(i)
         
         # Set digital I/O logic family from global config
         # FLIR cameras require 3.3V TTL, Photometrics and others use 5V TTL
         from control._def import NI_DAQ_LOGIC_FAMILY
-        self._config.do_logic_family = NI_DAQ_LOGIC_FAMILY
+        self._ni_daq.do_logic_family = NI_DAQ_LOGIC_FAMILY
     
     def _update_duration_display(self):
         """Update the duration display label."""
-        duration = self._config.samples_per_channel / self._config.sample_rate_hz
+        duration = self._ni_daq.samples_per_channel / self._ni_daq.sample_rate_hz
         self.duration_label.setText(f"{duration:.3f}")
     
     def show_ao_waveform_dialog(self):
         """Show dialog to configure analog output waveform."""
         dialog = AOWaveformDialog(
-            self._config.sample_rate_hz,
-            self._config.samples_per_channel,
-            self._config.ao_channels,
+            self._ni_daq.sample_rate_hz,
+            self._ni_daq.samples_per_channel,
+            self._ni_daq.ao_channels,
             self
         )
         if dialog.exec_() == QDialog.Accepted:
@@ -15584,9 +15667,9 @@ class NIDAQWidget(QWidget):
     def show_do_pattern_dialog(self):
         """Show dialog to configure digital output pattern."""
         dialog = DOPatternDialog(
-            self._config.sample_rate_hz,
-            self._config.samples_per_channel,
-            self._config.do_lines,
+            self._ni_daq.sample_rate_hz,
+            self._ni_daq.samples_per_channel,
+            self._ni_daq.do_lines,
             self
         )
         if dialog.exec_() == QDialog.Accepted:
@@ -15602,7 +15685,7 @@ class NIDAQWidget(QWidget):
         self.ax_ao.clear()
         self.ax_do.clear()
         
-        t = np.arange(self._config.samples_per_channel) / self._config.sample_rate_hz
+        t = np.arange(self._ni_daq.samples_per_channel) / self._ni_daq.sample_rate_hz
         
         # Plot AO waveforms
         self.ax_ao.set_title("Analog Output")
@@ -15642,15 +15725,15 @@ class NIDAQWidget(QWidget):
             digital_output=self._do_patterns.copy()
         )
     
-    def get_config(self) -> 'NIDAQ_CONFIG':
+    def get_config(self):
         """
         Get current configuration from the widget.
         
         Returns:
-            NIDAQ_CONFIG object with current settings
+            Configuration/state object with current settings
         """
         self._update_config()
-        return self._config
+        return self._ni_daq
     
     def update_waveforms_for_duration(self, new_duration_s: float, sample_rate_hz: float):
         """
@@ -15687,8 +15770,8 @@ class NIDAQWidget(QWidget):
                 self._do_patterns[line] = extended
         
         # Update config samples_per_channel and sample_rate_hz
-        self._config.samples_per_channel = new_num_samples
-        self._config.sample_rate_hz = sample_rate_hz
+        self._ni_daq.samples_per_channel = new_num_samples
+        self._ni_daq.sample_rate_hz = sample_rate_hz
         
         # Update UI to reflect new sample rate
         self.sample_rate_spin.blockSignals(True)
@@ -15717,7 +15800,7 @@ class NIDAQWidget(QWidget):
         from scipy import signal
         
         new_num_samples = int(new_sample_rate_hz * duration_s)
-        old_sample_rate_hz = self._config.sample_rate_hz
+        old_sample_rate_hz = self._ni_daq.sample_rate_hz
         
         # If sample rate hasn't changed, just update duration
         if abs(old_sample_rate_hz - new_sample_rate_hz) < 1e-6:
@@ -15760,8 +15843,8 @@ class NIDAQWidget(QWidget):
                 self._do_patterns[line] = (resampled_float >= 0.5).astype(old_pattern.dtype)
         
         # Update config
-        self._config.samples_per_channel = new_num_samples
-        self._config.sample_rate_hz = new_sample_rate_hz
+        self._ni_daq.samples_per_channel = new_num_samples
+        self._ni_daq.sample_rate_hz = new_sample_rate_hz
         
         # Update UI to reflect new sample rate
         self.sample_rate_spin.blockSignals(True)
@@ -15791,8 +15874,8 @@ class NIDAQWidget(QWidget):
         if self._ni_daq is None:
             return
         self._update_config()
-        v_min = getattr(self._config, 'ao_min_voltage', -10.0)
-        v_max = getattr(self._config, 'ao_max_voltage', 10.0)
+        v_min = getattr(self._ni_daq, 'ao_min_voltage', -10.0)
+        v_max = getattr(self._ni_daq, 'ao_max_voltage', 10.0)
         for channel in sorted(self._ao_waveforms.keys()):
             row = QHBoxLayout()
             live_cb = QCheckBox("Live")
@@ -15839,8 +15922,8 @@ class NIDAQWidget(QWidget):
         if self._ni_daq is None:
             return
         self._update_config()
-        v_min = getattr(self._config, 'ao_min_voltage', -10.0)
-        v_max = getattr(self._config, 'ao_max_voltage', 10.0)
+        v_min = getattr(self._ni_daq, 'ao_min_voltage', -10.0)
+        v_max = getattr(self._ni_daq, 'ao_max_voltage', 10.0)
         ao_values = {}
         for channel, ctrl in self._live_ao_controls.items():
             if ctrl["live_cb"].isChecked():
@@ -15940,8 +16023,8 @@ class NIDAQWidget(QWidget):
         waveforms = self.get_waveforms()
         self._update_config()
         
-        ai_channels = self._config.ai_channels or None
-        ao_channels = self._config.ao_channels or None
+        ai_channels = self._ni_daq.ai_channels or None
+        ao_channels = self._ni_daq.ao_channels or None
         di_lines = None  # Optional: list of digital input line indices to record; None or [] records no DI
         
         from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
@@ -16024,7 +16107,7 @@ class NIDAQWidget(QWidget):
             
             # Create zero waveforms for all configured outputs
             # Use current config to determine number of samples
-            num_samples = self._config.samples_per_channel
+            num_samples = self._ni_daq.samples_per_channel
             if num_samples == 0:
                 num_samples = 1  # At least one sample needed
             
@@ -16040,24 +16123,24 @@ class NIDAQWidget(QWidget):
                 zero_do_patterns[line] = np.zeros(num_samples, dtype=bool)
             
             # Create a minimal config for writing zeros
-            from control.nidaq import WaveformData, NIDAQ_CONFIG, TriggerSource
+            from control.nidaq import WaveformData, TriggerSource
             zero_waveforms = WaveformData(
                 analog_output=zero_ao_waveforms,
                 digital_output=zero_do_patterns
             )
             
             # Configure DAQ with minimal settings for writing zeros
-            zero_config = NIDAQ_CONFIG(
-                device_name=self._config.device_name,
-                sample_rate_hz=1000.0,  # Low rate for quick write
-                samples_per_channel=num_samples,
-                ao_channels=ao_channels,
-                do_port=self._config.do_port,
-                do_lines=do_lines,
-                trigger_source=TriggerSource.SOFTWARE,
-                continuous=False,
-                do_logic_family=self._config.do_logic_family,
-            )
+            zero_config = {
+                "device_name": self._ni_daq.device_name,
+                "sample_rate_hz": 1000.0,  # Low rate for quick write
+                "samples_per_channel": num_samples,
+                "ao_channels": ao_channels,
+                "do_port": self._ni_daq.do_port,
+                "do_lines": do_lines,
+                "trigger_source": TriggerSource.SOFTWARE,
+                "continuous": False,
+                "do_logic_family": self._ni_daq.do_logic_family,
+            }
             
             # Stop any running tasks first
             try:
@@ -16108,7 +16191,7 @@ class NIDAQWidget(QWidget):
             # Check if line is configured as digital input
             # Update config first to ensure di_lines is current
             self._update_config()
-            if line in self._config.di_lines:
+            if line in self._ni_daq.di_lines:
                 return True
             return False
         else:
@@ -16127,7 +16210,8 @@ class NIDAQWidget(QWidget):
         try:
             # Update configuration
             self._update_config()
-            self._ni_daq.configure(self._config)
+            # Persist any changes already written into the NI DAQ attributes
+            # (no separate config object to pass)
             
             # Set waveforms
             from control.nidaq import WaveformData
@@ -16176,7 +16260,7 @@ class NIDAQWidget(QWidget):
         if self._ni_daq is None:
             return
         
-        timeout = (self._config.samples_per_channel / self._config.sample_rate_hz) + 5.0
+        timeout = (self._ni_daq.samples_per_channel / self._ni_daq.sample_rate_hz) + 5.0
         self._log.info(f"Waiting for tasks to complete (timeout={timeout}s)...")
         success = self._ni_daq.wait_until_done(timeout)
         self._log.info(f"Acquisition completed: {success}")

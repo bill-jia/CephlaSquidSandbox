@@ -50,6 +50,7 @@ class IOEndpoint(BaseModel):
             SERIAL: "device_prefix:channel" (e.g. "coolled:A").
         role: Semantic tag for grouping ("shutter", "intensity", "camera_trigger",
               "af_laser", "piezo").
+        display_name: Optional human-readable label for UI/metadata.
     """
     name: str = Field(..., min_length=1)
     controller: IOControllerType
@@ -57,6 +58,7 @@ class IOEndpoint(BaseModel):
     direction: IODirection = IODirection.OUTPUT
     channel_id: str = Field(..., min_length=1)
     role: str = ""
+    display_name: Optional[str] = None
 
 
 class IOEndpointConfig(BaseModel):

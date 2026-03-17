@@ -1387,26 +1387,3 @@ def apply_simulation_mode_defaults(simulation_mode: bool) -> None:
         if config_key not in SIMULATION_KEYS_FROM_CONFIG:
             g[attr_name] = True
 
-
-@dataclass
-class NIDAQ_CONFIG:
-    """Configuration for NI DAQ operation (high-speed synchronized I/O)."""
-    device_name: str = "Dev1"
-    sample_rate_hz: float = 10000.0
-    samples_per_channel: int = 1000
-    ao_channels: List[str] = field(default_factory=list)
-    ao_min_voltage: float = -10.0
-    ao_max_voltage: float = 10.0
-    do_port: str = "port0"
-    do_lines: List[int] = field(default_factory=list)
-    di_port: str = "port0"
-    di_lines: List[int] = field(default_factory=list)
-    ai_channels: List[str] = field(default_factory=list)
-    ai_min_voltage: float = -10.0
-    ai_max_voltage: float = 10.0
-    ai_terminal_config: str = "RSE"
-    trigger_source: str = "SOFTWARE"
-    external_trigger_terminal: str = "/Dev1/PFI0"
-    trigger_edge: str = "RISING"
-    continuous: bool = False
-    do_logic_family: str = NI_DAQ_LOGIC_FAMILY

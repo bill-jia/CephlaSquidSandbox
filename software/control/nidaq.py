@@ -22,12 +22,18 @@ All tasks share a common sample clock and start trigger for synchronized operati
 import abc
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, Iterable, Set, Mapping, Any
 from nidaqmx.constants import LogicFamily
 from nidaqmx.system.physical_channel import PhysicalChannel
-from control._def import NIDAQ_CONFIG
+from control._def import NI_DAQ_LOGIC_FAMILY
+from control.models.io_endpoint_config import (
+    IOControllerType,
+    IOEndpointConfig,
+    IOSignalType,
+    IODirection,
+)
 import numpy as np
 
 import squid.logging
@@ -89,19 +95,82 @@ class AcquisitionResult:
 class AbstractNIDAQ(abc.ABC):
     """Abstract base class for NI DAQ interface."""
     
-    def __init__(self, config: NIDAQ_CONFIG):
+    def __init__(
+        self,
+        *,
+        device_name: str,
+        sample_rate_hz: float,
+        samples_per_channel: int,
+        ao_channels: Optional[List[str]] = None,
+        ao_min_voltage: float = -10.0,
+        ao_max_voltage: float = 10.0,
+        do_port: str = "port0",
+        do_lines: Optional[List[int]] = None,
+        di_port: str = "port0",
+        di_lines: Optional[List[int]] = None,
+        ai_channels: Optional[List[str]] = None,
+        ai_min_voltage: float = -10.0,
+        ai_max_voltage: float = 10.0,
+        ai_terminal_config: str = "RSE",
+        trigger_source: Union[str, "TriggerSource"] = "SOFTWARE",
+        external_trigger_terminal: Optional[str] = None,
+        trigger_edge: Union[str, "TriggerEdge"] = "RISING",
+        continuous: bool = False,
+        do_logic_family: str = NI_DAQ_LOGIC_FAMILY,
+    ):
         self._log = squid.logging.get_logger(self.__class__.__name__)
-        self._config = config
-        # Map config trigger source and edge to TriggerSource and TriggerEdge enums
-        self._config.trigger_source = TriggerSource[self._config.trigger_source]
-        self._config.trigger_edge = TriggerEdge[self._config.trigger_edge]
+
+        # Required core timing/device settings
+        self.device_name = str(device_name)
+        self.sample_rate_hz = float(sample_rate_hz)
+        self.samples_per_channel = int(samples_per_channel)
+
+        # Channel collections
+        self.ao_channels = list(ao_channels) if ao_channels is not None else []
+        self.do_lines = list(do_lines) if do_lines is not None else []
+        self.di_lines = list(di_lines) if di_lines is not None else []
+        self.ai_channels = list(ai_channels) if ai_channels is not None else []
+
+        # Voltage ranges and AI terminal config
+        self.ao_min_voltage = float(ao_min_voltage)
+        self.ao_max_voltage = float(ao_max_voltage)
+        self.ai_min_voltage = float(ai_min_voltage)
+        self.ai_max_voltage = float(ai_max_voltage)
+        self.ai_terminal_config = str(ai_terminal_config)
+
+        # Digital ports
+        self.do_port = str(do_port)
+        self.di_port = str(di_port)
+
+        # Trigger configuration
+        if isinstance(trigger_source, str):
+            self.trigger_source = TriggerSource[trigger_source]
+        else:
+            self.trigger_source = trigger_source
+
+        if isinstance(trigger_edge, str):
+            self.trigger_edge = TriggerEdge[trigger_edge]
+        else:
+            self.trigger_edge = trigger_edge
+
+        if external_trigger_terminal is None:
+            self.external_trigger_terminal = f"/{self.device_name}/PFI0"
+        else:
+            self.external_trigger_terminal = str(external_trigger_terminal)
+
+        self.continuous = bool(continuous)
+        self.do_logic_family = str(do_logic_family)
+
         self._is_armed = False
         self._is_running = False
-        
+
+        # Backwards-compat alias: config/_config refer to the instance
+        self._config = self
+
     @property
-    def config(self) -> NIDAQ_CONFIG:
-        """Get the current configuration."""
-        return self._config
+    def config(self):
+        """Backwards-compatible accessor for configuration/state."""
+        return self
     
     @property
     def is_armed(self) -> bool:
@@ -114,7 +183,7 @@ class AbstractNIDAQ(abc.ABC):
         return self._is_running
     
     @abc.abstractmethod
-    def configure(self, config: NIDAQ_CONFIG) -> None:
+    def configure(self, config: Mapping[str, Any]) -> None:
         """Update the configuration."""
         pass
     
@@ -216,8 +285,8 @@ class NIDAQ(AbstractNIDAQ):
     tasks that share a common sample clock and start trigger.
     """
     
-    def __init__(self, config: NIDAQ_CONFIG):
-        super().__init__(config)
+    def __init__(self, **config: Any):
+        super().__init__(**config)
         
         try:
             import nidaqmx
@@ -291,12 +360,23 @@ class NIDAQ(AbstractNIDAQ):
             except Exception as e:
                 self._log.warning(f"Could not set DI port logic family for {di_port_name}: {e}")
 
-    def configure(self, config: NIDAQ_CONFIG) -> None:
+    def configure(self, **config: Any) -> None:
         """Update the configuration."""
         with self._lock:
             if self._is_running:
                 raise RuntimeError("Cannot configure while tasks are running")
-            self._config = config
+            # Update known attributes; reject unknown keys
+            for key, value in config.items():
+                if not hasattr(self, key):
+                    raise ValueError(f"Unknown NI-DAQ config key: {key}")
+                setattr(self, key, value)
+
+            # Normalize trigger enums if they were updated
+            if "trigger_source" in config and isinstance(self.trigger_source, str):
+                self.trigger_source = TriggerSource[self.trigger_source]
+            if "trigger_edge" in config and isinstance(self.trigger_edge, str):
+                self.trigger_edge = TriggerEdge[self.trigger_edge]
+
             self._stop_live_output()
             self._cleanup_tasks()
     
@@ -956,8 +1036,8 @@ class SimulatedNIDAQ(AbstractNIDAQ):
     synthetic input data based on the output waveforms.
     """
     
-    def __init__(self, config: NIDAQ_CONFIG):
-        super().__init__(config)
+    def __init__(self, **config: Any):
+        super().__init__(**config)
         
         self._waveforms: Optional[WaveformData] = None
         self._acquired_data: Dict[str, np.ndarray] = {}
@@ -967,12 +1047,20 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         self._completion_event = threading.Event()
         self.configure(config)
     
-    def configure(self, config: NIDAQ_CONFIG) -> None:
+    def configure(self, **config: Any) -> None:
         """Update the configuration."""
         with self._lock:
             if self._is_running:
                 raise RuntimeError("Cannot configure while tasks are running")
-            self._config = config
+            for key, value in config.items():
+                if not hasattr(self, key):
+                    raise ValueError(f"Unknown NI-DAQ config key: {key}")
+                setattr(self, key, value)
+
+            if "trigger_source" in config and isinstance(self.trigger_source, str):
+                self.trigger_source = TriggerSource[self.trigger_source]
+            if "trigger_edge" in config and isinstance(self.trigger_edge, str):
+                self.trigger_edge = TriggerEdge[self.trigger_edge]
     
     def set_waveforms(self, waveforms: WaveformData) -> None:
         """Set the output waveforms."""
@@ -1098,7 +1186,7 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         return {}
 
 
-def create_ni_daq(config: NIDAQ_CONFIG, simulation: bool = False) -> AbstractNIDAQ:
+def create_ni_daq(config: Mapping[str, Any], simulation: bool = False) -> AbstractNIDAQ:
     """
     Factory function to create an NI DAQ instance.
     
@@ -1111,10 +1199,116 @@ def create_ni_daq(config: NIDAQ_CONFIG, simulation: bool = False) -> AbstractNID
     """
     if simulation:
         _log.info("Creating simulated NI DAQ")
-        return SimulatedNIDAQ(config)
+        return SimulatedNIDAQ(**config)
     else:
-        _log.info(f"Creating NI DAQ for device {config.device_name}")
-        return NIDAQ(config)
+        _log.info(f"Creating NI DAQ for device {config.get('device_name', 'Dev1')}")
+        return NIDAQ(**config)
+
+
+def build_nidaq_config_from_io(
+    device_name: str,
+    base_config: Optional[Dict[str, object]],
+    io_config: IOEndpointConfig,
+) -> Dict[str, Any]:
+    """
+    Build a configuration dict from a base config dict and IO endpoints.
+
+    This helper:
+    - Uses ``device_name`` and ``base_config`` (from MachineConfig.nidaq.config)
+      for global settings like sample_rate and logic_family.
+    - Scans IO endpoints for controller==NIDAQ to auto-populate:
+        * ao_channels:  channel_id like \"ao0\", \"ao1\" (analog outputs)
+        * ai_channels:  channel_id like \"ai0\" (analog inputs)
+        * do_port/do_lines:  channel_id like \"port0/line5\" (digital outputs)
+        * di_port/di_lines:  channel_id like \"port0/line6\" (digital inputs)
+
+    The resulting dict can be passed directly to ``create_ni_daq``.
+    """
+    base_config = base_config or {}
+
+    sample_rate_hz = float(base_config.get("sample_rate", 10000.0))
+    samples_per_channel = int(base_config.get("samples_per_channel", 1000))
+    ai_terminal_config = str(base_config.get("ai_terminal_config", "RSE"))
+    trigger_source = str(base_config.get("trigger_source", "SOFTWARE"))
+    external_trigger_terminal = str(
+        base_config.get("external_trigger_terminal", f"/{device_name}/PFI0")
+    )
+    trigger_edge = str(base_config.get("trigger_edge", "RISING"))
+    continuous = bool(base_config.get("continuous", False))
+    do_logic_family = str(base_config.get("logic_family", NI_DAQ_LOGIC_FAMILY))
+
+    ao_channels: Set[str] = set()
+    ai_channels: Set[str] = set()
+    do_ports: Dict[str, Set[int]] = {}
+    di_ports: Dict[str, Set[int]] = {}
+
+    for ep in io_config.get_controller_endpoints(IOControllerType.NIDAQ):
+        cid = ep.channel_id
+
+        # Analog outputs: "ao0", "ao1", ...
+        if ep.signal_type == IOSignalType.ANALOG and ep.direction == IODirection.OUTPUT:
+            if cid.startswith("ao"):
+                ao_channels.add(cid)
+            continue
+
+        # Analog inputs: "ai0", "ai1", ...
+        if ep.signal_type == IOSignalType.ANALOG and ep.direction == IODirection.INPUT:
+            if cid.startswith("ai"):
+                ai_channels.add(cid)
+            continue
+
+        # Digital lines: "portP/lineL"
+        if ep.signal_type == IOSignalType.DIGITAL:
+            if "port" in cid and "/line" in cid:
+                try:
+                    port_part, line_part = cid.split("/", 1)
+                    port_name = port_part  # e.g. "port0"
+                    line_idx = int(line_part.replace("line", ""))
+                except Exception:
+                    _log.warning(f"Could not parse NIDAQ channel_id '{cid}' for endpoint '{ep.name}'")
+                    continue
+
+                if ep.direction == IODirection.OUTPUT:
+                    do_ports.setdefault(port_name, set()).add(line_idx)
+                elif ep.direction == IODirection.INPUT:
+                    di_ports.setdefault(port_name, set()).add(line_idx)
+
+    def _select_port_and_lines(ports: Dict[str, Set[int]]) -> Tuple[Optional[str], List[int]]:
+        if not ports:
+            return None, []
+        if len(ports) > 1:
+            _log.warning(
+                f"Multiple NIDAQ ports referenced ({list(ports.keys())}); "
+                f"using '{sorted(ports.keys())[0]}' for legacy single-port config."
+            )
+        port = sorted(ports.keys())[0]
+        lines = sorted(ports[port])
+        return port, lines
+
+    do_port, do_lines = _select_port_and_lines(do_ports)
+    di_port, di_lines = _select_port_and_lines(di_ports)
+
+    return {
+        "device_name": device_name,
+        "sample_rate_hz": sample_rate_hz,
+        "samples_per_channel": samples_per_channel,
+        "ao_channels": sorted(ao_channels),
+        "ao_min_voltage": float(base_config.get("ao_min_voltage", -10.0)),
+        "ao_max_voltage": float(base_config.get("ao_max_voltage", 10.0)),
+        "do_port": do_port or "port0",
+        "do_lines": do_lines,
+        "di_port": di_port or "port0",
+        "di_lines": di_lines,
+        "ai_channels": sorted(ai_channels),
+        "ai_min_voltage": float(base_config.get("ai_min_voltage", -10.0)),
+        "ai_max_voltage": float(base_config.get("ai_max_voltage", 10.0)),
+        "ai_terminal_config": ai_terminal_config,
+        "trigger_source": trigger_source,
+        "external_trigger_terminal": external_trigger_terminal,
+        "trigger_edge": trigger_edge,
+        "continuous": continuous,
+        "do_logic_family": do_logic_family,
+    }
 
 
 # ============================================================================

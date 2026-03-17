@@ -55,6 +55,8 @@ class DeviceIOLine(BaseModel):
     signal_type: IOSignalType = IOSignalType.DIGITAL
     direction: IODirection = IODirection.OUTPUT
     channel_id: str = Field(..., min_length=1)
+    # Optional human-readable label; NIDAQ will own runtime names, this seeds defaults.
+    display_name: Optional[str] = None
 
 
 class DeviceChannel(BaseModel):
@@ -265,6 +267,7 @@ class MachineConfig(BaseModel):
             direction=io_line.direction,
             channel_id=io_line.channel_id,
             role=role,
+            display_name=io_line.display_name,
         )
 
     def _resolve_controller_type(self, controller_name: str) -> Optional[IOControllerType]:
@@ -377,6 +380,27 @@ def build_default_machine_config() -> MachineConfig:
         driver="teensy",
         config={
             "illumination_intensity_factor": 0.6,
+        },
+    )
+
+    # Default NI-DAQ device (no IO lines by default; endpoints are added by users)
+    devices["nidaq"] = DeviceEntry(
+        driver="nidaq",
+        config={
+            "device_name": "Dev1",
+            "sample_rate": 10000.0,
+            "samples_per_channel": 1000,
+            "ao_min_voltage": -10.0,
+            "ao_max_voltage": 10.0,
+            "ai_min_voltage": -10.0,
+            "ai_max_voltage": 10.0,
+            "ai_terminal_config": "RSE",
+            "trigger_source": "SOFTWARE",
+            "external_trigger_terminal": "/Dev1/PFI0",
+            "trigger_edge": "RISING",
+            "continuous": False,
+            # Digital logic family; may be overridden per-machine (e.g. 3.3V for FLIR).
+            "logic_family": "THREE_POINT_THREE_V",
         },
     )
 

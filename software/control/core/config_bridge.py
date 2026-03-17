@@ -152,6 +152,13 @@ def apply_machine_config(mc: MachineConfig) -> None:
         if model:
             control._def.MAIN_CAMERA_MODEL = model
 
+    # NI-DAQ digital logic family: allow MachineConfig to override camera-based default.
+    nidaq_dev = mc.get_device("nidaq")
+    if nidaq_dev and nidaq_dev.enabled:
+        logic_family = nidaq_dev.config.get("logic_family")
+        if logic_family:
+            control._def.NI_DAQ_LOGIC_FAMILY = str(logic_family)
+
     focus_cam = mc.get_device("focus_camera")
     if focus_cam and focus_cam.enabled:
         legacy_type = _DRIVER_TO_CAMERA_TYPE.get(focus_cam.driver, "Default")

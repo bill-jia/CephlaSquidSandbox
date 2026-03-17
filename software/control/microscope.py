@@ -4,7 +4,7 @@ from typing import Dict, Optional
 import numpy as np
 
 import control._def
-from control._def import TriggerMode, NIDAQ_CONFIG
+from control._def import TriggerMode
 from control.core.config import ConfigRepository
 from control.core.config_bridge import apply_machine_config
 from control.core.contrast_manager import ContrastManager
@@ -32,7 +32,7 @@ import squid.filter_wheel_controller.utils
 import squid.logging
 import squid.stage.cephla
 import squid.stage.utils
-from control.nidaq import AbstractNIDAQ, NIDAQ
+from control.nidaq import AbstractNIDAQ, NIDAQ, build_nidaq_config_from_io
 
 
 def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
@@ -203,10 +203,17 @@ class MicroscopeAddons:
                 sci_microscopy_led_array.set_NA(na)
 
         # ── NI-DAQ ────────────────────────────────────────────────────────
+        io_config = mc.collect_io_endpoints()
         nidaq = None
         nidaq_entry = _dev("nidaq")
         if nidaq_entry and not _sim("nidaq"):
-            nidaq = NIDAQ(config=NIDAQ_CONFIG())
+            device_name = nidaq_entry.config.get("device_name", "Dev1")
+            nidaq_config = build_nidaq_config_from_io(
+                device_name=device_name,
+                base_config=nidaq_entry.config,
+                io_config=io_config,
+            )
+            nidaq = NIDAQ(**nidaq_config)
 
         # ── Hybrid serial+IO light sources ────────────────────────────────
         coolled = None
@@ -228,10 +235,9 @@ class MicroscopeAddons:
             serial_devices["coolled"] = LightSourceSerialAdapter(coolled)
 
         # ── IO endpoint registry ──────────────────────────────────────────
-        # Collect IO endpoints from device entries in machine_config.yaml
+        # Uses io_config collected above (from machine_config.yaml device io: blocks)
         io_registry = None
         if micro is not None:
-            io_config = mc.collect_io_endpoints()
             io_registry = IORegistry(
                 config=io_config,
                 microcontroller=micro,

@@ -24,7 +24,6 @@ from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.nidaq import AbstractNIDAQ, WaveformData, TriggerSource
 from control.nidaq import generate_pulse_train
-from control._def import NIDAQ_CONFIG
 
 
 class AcquisitionCompletionStatus(Enum):
@@ -259,22 +258,22 @@ class FastAcquisitionController:
 
         do_lines_from_waveforms = list(waveforms.digital_output.keys())
 
-        config = NIDAQ_CONFIG(
-            device_name=self._ni_daq.config.device_name,
-            sample_rate_hz=sample_rate_hz,
-            samples_per_channel=samples_per_channel,
-            do_port="port0",
-            do_lines=do_lines_from_waveforms,
-            di_port="port0",
-            di_lines=di_lines_to_record,
-            ai_channels=ai_channels or [],
-            ao_channels=ao_channels or [],
-            trigger_source=self._ni_daq.config.trigger_source,
-            continuous=False,
-            do_logic_family=self._ni_daq.config.do_logic_family,
-        )
+        config = {
+            "device_name": self._ni_daq.config.device_name,
+            "sample_rate_hz": sample_rate_hz,
+            "samples_per_channel": samples_per_channel,
+            "do_port": "port0",
+            "do_lines": do_lines_from_waveforms,
+            "di_port": "port0",
+            "di_lines": di_lines_to_record,
+            "ai_channels": ai_channels or [],
+            "ao_channels": ao_channels or [],
+            "trigger_source": self._ni_daq.config.trigger_source,
+            "continuous": False,
+            "do_logic_family": self._ni_daq.config.do_logic_family,
+        }
 
-        self._ni_daq.configure(config)
+        self._ni_daq.configure(**config)
         self._ni_daq.set_waveforms(waveforms)
         self._ni_daq.arm()
 
