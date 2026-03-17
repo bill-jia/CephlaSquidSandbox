@@ -217,24 +217,11 @@ class FastAcquisitionController:
         n_samples_offset = 1
         samples_per_channel = int(sample_rate_hz * duration_s)
 
-        # Get waveforms: in DAQ-only use as-is; with camera add trigger pattern
-        if self._daq_only:
-            if waveforms is None:
-                waveforms = WaveformData()
-        else:
-            if waveforms is None:
-                frame_period_samples = int(sample_rate_hz / frame_rate_hz)
-                pulse_width_samples = 4
-                trigger_pattern = generate_pulse_train(
-                    pulse_width_samples=pulse_width_samples,
-                    period_samples=frame_period_samples,
-                    num_samples=samples_per_channel,
-                    n_samples_offset=n_samples_offset,
-                    inverted=False
-                )
-                waveforms = WaveformData(
-                    digital_output={self._trigger_dio_line: trigger_pattern}
-                )
+        # Get waveforms: treat input as a task definition and work on a deep copy
+        # so that UI-owned WaveformData objects are not mutated by a running acquisition.
+        if waveforms is None:
+            if self._daq_only:
+                local_waveforms = WaveformData()
             else:
                 frame_period_samples = int(sample_rate_hz / frame_rate_hz)
                 pulse_width_samples = 4
@@ -243,9 +230,36 @@ class FastAcquisitionController:
                     period_samples=frame_period_samples,
                     num_samples=samples_per_channel,
                     n_samples_offset=n_samples_offset,
-                    inverted=False
+                    inverted=False,
                 )
-                waveforms.digital_output[self._trigger_dio_line] = trigger_pattern
+                local_waveforms = WaveformData(
+                    analog_output={},
+                    digital_output={self._trigger_dio_line: trigger_pattern},
+                )
+        else:
+            # Deep-copy underlying arrays so later edits in the UI do not affect the
+            # waveforms used for this acquisition.
+            ao_copy = {
+                ch: np.array(data, copy=True)
+                for ch, data in (waveforms.analog_output or {}).items()
+            }
+            do_copy = {
+                line: np.array(data, copy=True)
+                for line, data in (waveforms.digital_output or {}).items()
+            }
+            local_waveforms = WaveformData(analog_output=ao_copy, digital_output=do_copy)
+
+            if not self._daq_only:
+                frame_period_samples = int(sample_rate_hz / frame_rate_hz)
+                pulse_width_samples = 4
+                trigger_pattern = generate_pulse_train(
+                    pulse_width_samples=pulse_width_samples,
+                    period_samples=frame_period_samples,
+                    num_samples=samples_per_channel,
+                    n_samples_offset=n_samples_offset,
+                    inverted=False,
+                )
+                local_waveforms.digital_output[self._trigger_dio_line] = trigger_pattern
 
         # Digital input lines to record
         if self._daq_only:
@@ -256,25 +270,43 @@ class FastAcquisitionController:
                 di_lines_to_record.extend(di_lines)
             di_lines_to_record = list(set(di_lines_to_record))
 
-        do_lines_from_waveforms = list(waveforms.digital_output.keys())
+        do_lines_from_waveforms = list(local_waveforms.digital_output.keys())
 
-        config = {
-            "device_name": self._ni_daq.config.device_name,
-            "sample_rate_hz": sample_rate_hz,
-            "samples_per_channel": samples_per_channel,
-            "do_port": "port0",
-            "do_lines": do_lines_from_waveforms,
-            "di_port": "port0",
-            "di_lines": di_lines_to_record,
-            "ai_channels": ai_channels or [],
-            "ao_channels": ao_channels or [],
-            "trigger_source": self._ni_daq.config.trigger_source,
-            "continuous": False,
-            "do_logic_family": self._ni_daq.config.do_logic_family,
-        }
+        # Configure which endpoints participate in this acquisition on the NI DAQ.
+        # This narrows the task IO to the selected subsets, without overwriting the
+        # full available-channel collections on the device.
+        try:
+            # Necessary?
+            self._ni_daq.configure_task_io(
+                ao_channels=ao_channels or [],
+                do_lines=do_lines_from_waveforms,
+                di_lines=di_lines_to_record,
+                ai_channels=ai_channels or [],
+            )
+        except AttributeError:
+            # Backwards compatibility: older NI DAQ implementations may not provide
+            # configure_task_io; in that case we fall back to using the config dict.
+            pass
 
-        self._ni_daq.configure(**config)
-        self._ni_daq.set_waveforms(waveforms)
+        # config = {
+        #     "device_name": self._ni_daq.config.device_name,
+        #     "sample_rate_hz": sample_rate_hz,
+        #     "samples_per_channel": samples_per_channel,
+        #     "do_port": "port0",
+        #     "do_lines": do_lines_from_waveforms,
+        #     "di_port": "port0",
+        #     "di_lines": di_lines_to_record,
+        #     "ai_channels": ai_channels or [],
+        #     "ao_channels": ao_channels or [],
+        #     "trigger_source": self._ni_daq.config.trigger_source,
+        #     "continuous": False,
+        #     "do_logic_family": self._ni_daq.config.do_logic_family,
+        # }
+
+        # Prepare NI DAQ to hand off from any active live outputs to this task.
+        self._ni_daq.prepare_for_acquisition()
+        # self._ni_daq.configure(**config)
+        self._ni_daq.set_waveforms(local_waveforms)
         self._ni_daq.arm()
 
         if not self._daq_only:
@@ -379,6 +411,14 @@ class FastAcquisitionController:
                     completion_error = f"DAQ did not complete within timeout ({timeout_s:.2f}s)"
                 
                 self._daq_result = self._ni_daq.get_acquired_data()
+
+                # Restore any live-output state that was active before this acquisition.
+                restore_fn = getattr(self._ni_daq, "restore_after_acquisition", None)
+                if callable(restore_fn):
+                    try:
+                        restore_fn()
+                    except Exception as e:
+                        self._log.warning(f"Failed to restore NI DAQ live-output state: {e}", exc_info=True)
 
                 # Detect frame edges from camera frame signal (camera mode only)
                 if not self._daq_only and self._daq_result and len(self._daq_result.digital_input) > 0:

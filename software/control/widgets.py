@@ -15555,14 +15555,15 @@ class NIDAQWidget(QWidget):
             self.trigger_terminal_edit.setText(f"/{device_name}/PFI2")
             
             # Pre-select channels/lines based on current config/state
-            # AO channels
-            selected_ao = set(getattr(self._ni_daq, "ao_channels", []) or [])
+            # AO channels: prefer task-IO selection if available, otherwise fall back
+            task_io = self._ni_daq.task_io_getter()
+            selected_ao = set(task_io.get("ao_channels", []))
             for i in range(self.ao_channels_list.count()):
                 item = self.ao_channels_list.item(i)
                 item.setSelected(item.text() in selected_ao)
 
-            # AI channels
-            selected_ai = set(getattr(self._ni_daq, "ai_channels", []) or [])
+            # AI channels: prefer task-IO selection if available
+            selected_ai = set(task_io.get("ai_channels", []))
             for i in range(self.ai_channels_list.count()):
                 item = self.ai_channels_list.item(i)
                 item.setSelected(item.text() in selected_ai)
@@ -15622,22 +15623,31 @@ class NIDAQWidget(QWidget):
         else:
             self._ni_daq.trigger_edge = TriggerEdge.FALLING
         
-        # Get selected AO channels
-        self._ni_daq.ao_channels = [
+        # Get selected AO channels (task IO subset)
+        selected_ao = [
             item.text() for item in self.ao_channels_list.selectedItems()
         ]
         
-        # Get selected AI channels
-        self._ni_daq.ai_channels = [
+        # Get selected AI channels (task IO subset)
+        selected_ai = [
             item.text() for item in self.ai_channels_list.selectedItems()
         ]
         
-        # Get selected DO lines
-        self._ni_daq.do_lines = []
+        # Get selected DO lines (task IO subset)
+        selected_do: list[int] = []
         for i in range(self.do_lines_list.count()):
             item = self.do_lines_list.item(i)
             if item.isSelected():
-                self._ni_daq.do_lines.append(i)
+                selected_do.append(i)
+
+        # Push task IO selection into NI DAQ without overwriting full available sets
+        self._ni_daq.configure_task_io(
+            ao_channels=selected_ao,
+            do_lines=selected_do,
+            # DI task selection is currently driven by higher-level controllers;
+            # we leave di_lines unchanged here.
+            ai_channels=selected_ai,
+        )
         
         # Set digital I/O logic family from global config
         # FLIR cameras require 3.3V TTL, Photometrics and others use 5V TTL
@@ -16022,9 +16032,12 @@ class NIDAQWidget(QWidget):
         self.update_waveforms_for_duration(duration_s, sample_rate_hz)
         waveforms = self.get_waveforms()
         self._update_config()
-        
-        ai_channels = self._ni_daq.ai_channels or None
-        ao_channels = self._ni_daq.ao_channels or None
+
+        # Prefer task-IO subsets for acquisition if available
+        task_io = self._ni_daq.task_io_getter()
+        ai_channels = task_io.get("ai_channels")
+        ao_channels = task_io.get("ao_channels")
+
         di_lines = None  # Optional: list of digital input line indices to record; None or [] records no DI
         
         from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
@@ -17153,10 +17166,13 @@ class FastAcquisitionWidget(QWidget):
             ni_daq_config = ni_daq_widget.get_config()
             ni_daq_waveforms = ni_daq_widget.get_waveforms()
             
-            # Get analog input channels from NI DAQ widget config
-            ai_channels = ni_daq_config.ai_channels if ni_daq_config.ai_channels else None
-            ao_channels = ni_daq_config.ao_channels if ni_daq_config.ao_channels else None
-            self._log.info(f"AO channels: {ao_channels}")
+            # Get analog input/output channels for this acquisition.
+            # Prefer task-IO subsets from NI DAQ if available, otherwise fall back
+            # to the full channel collections on the config.
+            task_io = ni_daq.task_io_getter()
+            ai_channels = task_io.get("ai_channels")
+            ao_channels = task_io.get("ao_channels")
+            self._log.info(f"AO channels (task IO): {ao_channels}")
             
             # Calculate acquisition duration
             num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None

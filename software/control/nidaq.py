@@ -126,6 +126,8 @@ class AbstractNIDAQ(abc.ABC):
         self.samples_per_channel = int(samples_per_channel)
 
         # Channel collections
+        # Public attributes reflect all channels/lines available on this device
+        # (typically derived from machine configuration).
         self.ao_channels = list(ao_channels) if ao_channels is not None else []
         self.do_lines = list(do_lines) if do_lines is not None else []
         self.di_lines = list(di_lines) if di_lines is not None else []
@@ -163,6 +165,25 @@ class AbstractNIDAQ(abc.ABC):
 
         self._is_armed = False
         self._is_running = False
+
+        # Logical task configuration (which endpoints participate in the CURRENT
+        # waveform-based task). By default this is initialized to \"all available\"
+        # channels, but higher layers should narrow/modify these via
+        # configure_task_io(...) without overwriting the public collections.
+        self._task_ao_channels: List[str] = list(self.ao_channels)
+        self._task_do_lines: List[int] = list(self.do_lines)
+        self._task_di_lines: List[int] = list(self.di_lines)
+        self._task_ai_channels: List[str] = list(self.ai_channels)
+
+        # Live-output state (logical only; hardware-specific tasks are managed in subclasses)
+        # These track the latest requested live values per endpoint, independent of tasks.
+        self._live_ao_values: Dict[str, float] = {}
+        self._live_do_values: Dict[int, bool] = {}
+
+        # Snapshot of live values for endpoints that overlap with a running acquisition.
+        # Used by prepare_for_acquisition()/restore_after_acquisition() in subclasses.
+        self._live_ao_overrides_for_acquisition: Dict[str, float] = {}
+        self._live_do_overrides_for_acquisition: Dict[int, bool] = {}
 
         # Backwards-compat alias: config/_config refer to the instance
         self._config = self
@@ -260,6 +281,55 @@ class AbstractNIDAQ(abc.ABC):
         """Get information about a specific device."""
         pass
 
+    # -------------------------------------------------------------------------
+    # Task / live state helpers (logical, hardware-agnostic)
+    # -------------------------------------------------------------------------
+
+    def configure_task_io(
+        self,
+        *,
+        ao_channels: Optional[Iterable[str]] = None,
+        do_lines: Optional[Iterable[int]] = None,
+        di_lines: Optional[Iterable[int]] = None,
+        ai_channels: Optional[Iterable[str]] = None,
+    ) -> None:
+        """
+        Configure which endpoints participate in waveform-based tasks.
+
+        This updates only the logical task IO tracking used when hardware tasks
+        are created, without overwriting the full-channel collections
+        (ao_channels/do_lines/di_lines/ai_channels), which represent all
+        available endpoints from machine configuration.
+        """
+        if ao_channels is not None:
+            self._task_ao_channels = list(ao_channels)
+        if do_lines is not None:
+            self._task_do_lines = list(do_lines)
+        if di_lines is not None:
+            self._task_di_lines = list(di_lines)
+        if ai_channels is not None:
+            self._task_ai_channels = list(ai_channels)
+
+    def get_task_io(self) -> Dict[str, List[Union[str, int]]]:
+        """Return the currently configured task IO endpoints."""
+        return {
+            "ao_channels": list(self._task_ao_channels),
+            "do_lines": list(self._task_do_lines),
+            "di_lines": list(self._task_di_lines),
+            "ai_channels": list(self._task_ai_channels),
+        }
+
+    def get_live_output_state(self) -> Dict[str, Dict[Union[str, int], Union[float, bool]]]:
+        """
+        Return the current logical live-output state (latest requested values).
+
+        Subclasses are responsible for ensuring their hardware tasks reflect this state.
+        """
+        return {
+            "ao": dict(self._live_ao_values),
+            "do": dict(self._live_do_values),
+        }
+
     def start_live_output(
         self,
         ao_values: Optional[Dict[str, float]] = None,
@@ -313,6 +383,10 @@ class NIDAQ(AbstractNIDAQ):
         self._acquired_di_data: Optional[np.ndarray] = None
         
         self._lock = threading.Lock()
+
+        # Track whether we have live overrides that were active when an acquisition
+        # was prepared. Used so we can restore live outputs after the task completes.
+        self._has_live_overrides_for_acquisition: bool = False
 
         # Configure digital port logic family ONCE at initialization
         # This must be done before any tasks are created
@@ -531,24 +605,24 @@ class NIDAQ(AbstractNIDAQ):
             samples_acquired=self._config.samples_per_channel
         )
         
-        if self._acquired_data is not None and len(self._config.ai_channels) > 0:
+        if self._acquired_data is not None and len(self._task_ai_channels) > 0:
             # Convert acquired data to dict format
-            if len(self._config.ai_channels) == 1:
+            if len(self._task_ai_channels) == 1:
                 # Single channel returns 1D array
-                result.analog_input[self._config.ai_channels[0]] = np.array(self._acquired_data)
+                result.analog_input[self._task_ai_channels[0]] = np.array(self._acquired_data)
             else:
                 # Multiple channels returns 2D array [channels x samples]
-                for i, channel in enumerate(self._config.ai_channels):
+                for i, channel in enumerate(self._task_ai_channels):
                     result.analog_input[channel] = np.array(self._acquired_data[i])
         
-        if self._acquired_di_data is not None and len(self._config.di_lines) > 0:
+        if self._acquired_di_data is not None and len(self._task_di_lines) > 0:
             # Convert digital input data to dict format
-            if len(self._config.di_lines) == 1:
+            if len(self._task_di_lines) == 1:
                 # Single line returns 1D array
-                result.digital_input[self._config.di_lines[0]] = np.array(self._acquired_di_data, dtype=bool)
+                result.digital_input[self._task_di_lines[0]] = np.array(self._acquired_di_data, dtype=bool)
             else:
                 # Multiple lines returns 2D array [lines x samples]
-                for i, line in enumerate(self._config.di_lines):
+                for i, line in enumerate(self._task_di_lines):
                     result.digital_input[line] = np.array(self._acquired_di_data[i], dtype=bool)
 
         if self._waveforms is not None:
@@ -668,6 +742,10 @@ class NIDAQ(AbstractNIDAQ):
         if do_values is None:
             do_values = {}
         with self._lock:
+            # Update logical live state (do not touch waveform/task definitions)
+            self._live_ao_values.update(ao_values)
+            self._live_do_values.update(do_values)
+
             self._stop_live_output()
             if not ao_values and not do_values:
                 return
@@ -735,6 +813,64 @@ class NIDAQ(AbstractNIDAQ):
         with self._lock:
             self._stop_live_output()
 
+    def prepare_for_acquisition(self) -> None:
+        """
+        Snapshot live-output state for any endpoints that participate in the
+        current task IO set so it can be restored after acquisition.
+        """
+        with self._lock:
+            if self._has_live_overrides_for_acquisition:
+                return
+
+            # Determine which endpoints are both live-controlled and in the task IO set
+            task_ao = set(self._task_ao_channels)
+            task_do = set(self._task_do_lines)
+
+            self._live_ao_overrides_for_acquisition = {
+                ch: val for ch, val in self._live_ao_values.items() if ch in task_ao
+            }
+            self._live_do_overrides_for_acquisition = {
+                line: val for line, val in self._live_do_values.items() if line in task_do
+            }
+
+            if self._live_ao_overrides_for_acquisition or self._live_do_overrides_for_acquisition:
+                self._has_live_overrides_for_acquisition = True
+                self._log.info(
+                    "Prepared live-output overrides for acquisition on AO channels "
+                    f"{sorted(self._live_ao_overrides_for_acquisition.keys())} and DO lines "
+                    f"{sorted(self._live_do_overrides_for_acquisition.keys())}"
+                )
+
+    def restore_after_acquisition(self) -> None:
+        """
+        Restore live-output state for endpoints that were live-controlled when the
+        acquisition was prepared. This uses start_live_output to reapply values
+        without modifying task definitions.
+        """
+        with self._lock:
+            if not self._has_live_overrides_for_acquisition:
+                return
+
+            ao_values = dict(self._live_ao_overrides_for_acquisition)
+            do_values = dict(self._live_do_overrides_for_acquisition)
+
+            # Clear snapshot flags before attempting to restart live output
+            self._live_ao_overrides_for_acquisition.clear()
+            self._live_do_overrides_for_acquisition.clear()
+            self._has_live_overrides_for_acquisition = False
+
+            if ao_values or do_values:
+                # Release live-output lock while calling public API to avoid deadlock
+                # (start_live_output will reacquire the lock).
+                pass
+
+        if ao_values or do_values:
+            try:
+                self.start_live_output(ao_values=ao_values, do_values=do_values)
+                self._log.info("Restored live-output state after acquisition")
+            except Exception as e:
+                self._log.warning(f"Failed to restore live-output state after acquisition: {e}", exc_info=True)
+
     def release_tasks(self) -> None:
         """Stop and close all tasks so the device is free for new tasks (e.g. live output or re-arm)."""
         with self._lock:
@@ -762,11 +898,11 @@ class NIDAQ(AbstractNIDAQ):
         ao_clock_terminal = f"/{device}/ao/SampleClock"
         ao_start_terminal = f"/{device}/ao/StartTrigger"
         
-        # Set up Analog Output task (master clock source)
-        if len(self._config.ao_channels) > 0 and self._waveforms is not None:
+        # Set up Analog Output task (master clock source) for the current task IO set
+        if len(self._task_ao_channels) > 0 and self._waveforms is not None:
             self._ao_task = nidaqmx.Task("ao_task")
             
-            for channel in self._config.ao_channels:
+            for channel in self._task_ao_channels:
                 physical_channel = f"{device}/{channel}"
                 self._ao_task.ao_channels.add_ao_voltage_chan(
                     physical_channel,
@@ -793,24 +929,24 @@ class NIDAQ(AbstractNIDAQ):
             
             # Write waveform data
             ao_data = []
-            for channel in self._config.ao_channels:
+            for channel in self._task_ao_channels:
                 if channel in self._waveforms.analog_output:
                     ao_data.append(self._waveforms.analog_output[channel])
                 else:
                     # Default to zeros if channel not in waveforms
                     ao_data.append(np.zeros(num_samples))
             
-            if len(self._config.ao_channels) == 1:
+            if len(self._task_ao_channels) == 1:
                 self._ao_task.write(ao_data[0], auto_start=False)
             else:
                 self._ao_task.write(ao_data, auto_start=False)
         
-        # Set up Digital Output task
-        if len(self._config.do_lines) > 0 and self._waveforms is not None:
+        # Set up Digital Output task for the current task IO set
+        if len(self._task_do_lines) > 0 and self._waveforms is not None:
             self._do_task = nidaqmx.Task("do_task")
             
-            # Add all DO lines
-            for line in self._config.do_lines:
+            # Add all DO lines for the task
+            for line in self._task_do_lines:
                 physical_line = f"{device}/{self._config.do_port}/line{line}"
                 self._log.info(f"Adding DO channel: {physical_line}")
                 do_chan = self._do_task.do_channels.add_do_chan(physical_line)
@@ -855,13 +991,13 @@ class NIDAQ(AbstractNIDAQ):
             # lines we must pass a 2D array of shape (num_channels, num_samples) with
             # integer dtype (e.g. uint8), not bool.
             do_data = []
-            for line in self._config.do_lines:
+            for line in self._task_do_lines:
                 if line in self._waveforms.digital_output:
                     do_data.append(self._waveforms.digital_output[line].astype(bool))
                 else:
                     do_data.append(np.zeros(num_samples, dtype=bool))
             
-            if len(self._config.do_lines) == 1:
+            if len(self._task_do_lines) == 1:
                 self._log.info(f"Writing single line DO data: {do_data[0].shape}")
                 self._do_task.write(do_data[0], auto_start=False)
             else:
@@ -870,12 +1006,12 @@ class NIDAQ(AbstractNIDAQ):
                 do_array = np.array(do_data, dtype=np.bool)
                 self._do_task.write(do_array, auto_start=False)
         
-        # Set up Digital Input task
-        if len(self._config.di_lines) > 0:
+        # Set up Digital Input task for the current task IO set
+        if len(self._task_di_lines) > 0:
             self._di_task = nidaqmx.Task("di_task")
             
-            # Add all DI lines
-            for line in self._config.di_lines:
+            # Add all DI lines for the task
+            for line in self._task_di_lines:
                 physical_line = f"{device}/{self._config.di_port}/line{line}"
                 di_chan = self._di_task.di_channels.add_di_chan(physical_line)
                 # if line == 0:
@@ -1132,6 +1268,57 @@ class SimulatedNIDAQ(AbstractNIDAQ):
             self._is_armed = False
             self._completion_event.set()
             self._log.info("[SIM] Tasks stopped")
+
+    def start_live_output(
+        self,
+        ao_values: Optional[Dict[str, float]] = None,
+        do_values: Optional[Dict[int, bool]] = None,
+    ) -> None:
+        """
+        Record logical live-output state for simulation.
+
+        No hardware tasks are created; this simply updates the live state
+        dictionaries so higher layers see consistent behavior.
+        """
+        if ao_values is None:
+            ao_values = {}
+        if do_values is None:
+            do_values = {}
+        with self._lock:
+            self._live_ao_values.update(ao_values)
+            self._live_do_values.update(do_values)
+
+    def stop_live_output(self) -> None:
+        """Clear simulation live-output tasks (logical state is preserved)."""
+        # For simulation we don't need to do anything beyond existing state,
+        # but we keep the method for API symmetry.
+        self._log.info("[SIM] stop_live_output called (no hardware tasks to stop)")
+
+    def prepare_for_acquisition(self) -> None:
+        """
+        Mirror NIDAQ behavior: snapshot live-output state for task endpoints.
+        """
+        with self._lock:
+            task_ao = set(self._task_ao_channels)
+            task_do = set(self._task_do_lines)
+            self._live_ao_overrides_for_acquisition = {
+                ch: val for ch, val in self._live_ao_values.items() if ch in task_ao
+            }
+            self._live_do_overrides_for_acquisition = {
+                line: val for line, val in self._live_do_values.items() if line in task_do
+            }
+
+    def restore_after_acquisition(self) -> None:
+        """
+        Mirror NIDAQ behavior: restore recorded live-output state for task endpoints.
+        """
+        with self._lock:
+            if not self._live_ao_overrides_for_acquisition and not self._live_do_overrides_for_acquisition:
+                return
+            self._live_ao_values.update(self._live_ao_overrides_for_acquisition)
+            self._live_do_values.update(self._live_do_overrides_for_acquisition)
+            self._live_ao_overrides_for_acquisition.clear()
+            self._live_do_overrides_for_acquisition.clear()
     
     def get_acquired_data(self) -> AcquisitionResult:
         """Get the acquired analog and digital input data."""
