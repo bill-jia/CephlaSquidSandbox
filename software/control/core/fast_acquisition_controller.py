@@ -52,7 +52,8 @@ class FastAcquisitionController:
                  buffer_size: int = 500,
                  file_format: str = "tiff",
                  trigger_dio_line: int = 1,
-                 camera_frame_dio_line: int = 0):
+                 camera_frame_dio_line: int = 0,
+                 illumination_controller=None):
         """
         Initialize fast acquisition controller.
 
@@ -67,6 +68,10 @@ class FastAcquisitionController:
             file_format: File format for saving ("tiff", "zarr", or "hdf5") (ignored when camera is None)
             trigger_dio_line: Digital output line for camera triggers (default: 1); unused in DAQ-only
             camera_frame_dio_line: Digital input line for camera frame signal (default: 0); unused in DAQ-only
+            illumination_controller: Optional IlluminationController; when provided its
+                state is snapshotted before acquisition and restored afterwards so that
+                the higher-level channel state stays in sync with the hardware lines
+                that the NI-DAQ restores via restore_after_acquisition().
         """
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._camera = camera
@@ -75,6 +80,8 @@ class FastAcquisitionController:
         self._trigger_dio_line = trigger_dio_line
         self._camera_frame_dio_line = camera_frame_dio_line
         self._daq_only = camera is None
+        self._illumination_controller = illumination_controller
+        self._illumination_snapshot = None
 
         if camera is not None:
             # Get frame shape from camera
@@ -303,6 +310,15 @@ class FastAcquisitionController:
         #     "do_logic_family": self._ni_daq.config.do_logic_family,
         # }
 
+        # Snapshot illumination state before handing off to the DAQ task, so the
+        # higher-level channel state can be restored after the acquisition completes.
+        if self._illumination_controller is not None:
+            try:
+                self._illumination_snapshot = self._illumination_controller.snapshot()
+            except Exception as e:
+                self._log.warning(f"Failed to snapshot illumination state: {e}")
+                self._illumination_snapshot = None
+
         # Prepare NI DAQ to hand off from any active live outputs to this task.
         self._ni_daq.prepare_for_acquisition()
         # self._ni_daq.configure(**config)
@@ -419,6 +435,16 @@ class FastAcquisitionController:
                         restore_fn()
                     except Exception as e:
                         self._log.warning(f"Failed to restore NI DAQ live-output state: {e}", exc_info=True)
+
+                # Restore the higher-level illumination controller state so it stays
+                # in sync with the hardware lines restored above by the NI-DAQ.
+                if self._illumination_controller is not None and self._illumination_snapshot is not None:
+                    try:
+                        self._illumination_controller.restore(self._illumination_snapshot)
+                    except Exception as e:
+                        self._log.warning(f"Failed to restore illumination controller state: {e}", exc_info=True)
+                    finally:
+                        self._illumination_snapshot = None
 
                 # Detect frame edges from camera frame signal (camera mode only)
                 if not self._daq_only and self._daq_result and len(self._daq_result.digital_input) > 0:

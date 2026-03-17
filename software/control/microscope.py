@@ -408,6 +408,7 @@ def _build_illumination_controller(
     coolled_entry: Optional[DeviceEntry],
     coolled_instance: Optional[LightSource],
     simulated: bool,
+    channel_config=None,
 ) -> IlluminationController:
     """Construct the appropriate IlluminationController from device entries."""
     driver = ""
@@ -424,13 +425,16 @@ def _build_illumination_controller(
             LightSourceType.CoolLED,
             coolled_instance,
             io_registry=io_registry,
+            channel_config=channel_config,
         )
 
     if driver == "ldi" and not simulated:
         ldi = serial_peripherals.LDI()
         return IlluminationController(
             micro, ldi.intensity_mode, ldi.shutter_mode,
-            LightSourceType.LDI, ldi, io_registry=io_registry,
+            LightSourceType.LDI, ldi,
+            io_registry=io_registry,
+            channel_config=channel_config,
         )
 
     if driver == "celesta" and not simulated:
@@ -442,6 +446,7 @@ def _build_illumination_controller(
             LightSourceType.CELESTA,
             celesta,
             io_registry=io_registry,
+            channel_config=channel_config,
         )
 
     if driver == "andor_laser" and not simulated:
@@ -455,10 +460,11 @@ def _build_illumination_controller(
             LightSourceType.AndorLaser,
             andor_laser,
             io_registry=io_registry,
+            channel_config=channel_config,
         )
 
     # Default: Cephla built-in (MCU DAC/TTL)
-    return IlluminationController(micro, io_registry=io_registry)
+    return IlluminationController(micro, io_registry=io_registry, channel_config=channel_config)
 
 
 class Microscope:
@@ -572,9 +578,11 @@ class Microscope:
         io_reg = addons.io_registry
         illum_entry = mc.get_device("illumination")
         coolled_entry = mc.get_device("coolled")
+        illumination_channel_config = config_repo.get_illumination_config()
         illumination_controller = _build_illumination_controller(
             low_level_devices.microcontroller, io_reg, illum_entry, coolled_entry,
             addons.coolled, simulated,
+            channel_config=illumination_channel_config,
         )
 
         return Microscope(

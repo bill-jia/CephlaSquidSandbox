@@ -19918,3 +19918,255 @@ class WarningErrorWidget(QWidget):
         if len(msg) > 60:
             msg = msg[:57] + "..."
         return msg
+
+
+class IlluminationWidget(QWidget):
+    """Standalone widget for manual illumination control.
+
+    Displays one row per channel defined in the controller's ``channel_config``,
+    with an intensity slider/spinbox pair and an on/off toggle button.  A preset
+    panel below the channel rows lets users save, load, and delete named
+    illumination configurations.
+
+    The widget is controller-agnostic: it calls only
+    ``IlluminationController.set_channel_intensity``, ``turn_on_channel``, and
+    ``turn_off_channel``, regardless of whether the backend is a Teensy MCU,
+    NI-DAQ, or serial light source.
+    """
+
+    def __init__(self, illumination_controller, parent=None):
+        """
+        Args:
+            illumination_controller: An ``IlluminationController`` instance that must
+                have a non-None ``channel_config`` attribute.
+            parent: Optional parent widget.
+        """
+        super().__init__(parent)
+        self._controller = illumination_controller
+        self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
+
+        self._build_ui()
+        self._refresh_from_state()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(4)
+
+        # Title
+        title = QLabel("Illumination Control")
+        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        root.addWidget(title)
+
+        # Channel rows
+        channels_group = QGroupBox("Channels")
+        channels_layout = QGridLayout(channels_group)
+        channels_layout.setSpacing(4)
+
+        channel_config = getattr(self._controller, "channel_config", None)
+        channels = channel_config.channels if channel_config is not None else []
+
+        for row_idx, ch in enumerate(channels):
+            # Name label
+            label_text = ch.name
+            if ch.wavelength_nm is not None:
+                label_text += f"  ({ch.wavelength_nm} nm)"
+            label = QLabel(label_text)
+            label.setMinimumWidth(120)
+
+            # Intensity slider
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(0)
+            slider.setMaximum(100)
+            slider.setValue(0)
+            slider.setMinimumWidth(120)
+
+            # Intensity spinbox
+            spinbox = QDoubleSpinBox()
+            spinbox.setMinimum(0.0)
+            spinbox.setMaximum(100.0)
+            spinbox.setSingleStep(1.0)
+            spinbox.setDecimals(1)
+            spinbox.setValue(0.0)
+            spinbox.setSuffix(" %")
+            spinbox.setFixedWidth(80)
+
+            # On/Off toggle button
+            btn = QPushButton("OFF")
+            btn.setCheckable(True)
+            btn.setChecked(False)
+            btn.setFixedWidth(52)
+            self._apply_shutter_style(btn, False)
+
+            channels_layout.addWidget(label,   row_idx, 0)
+            channels_layout.addWidget(slider,  row_idx, 1)
+            channels_layout.addWidget(spinbox, row_idx, 2)
+            channels_layout.addWidget(btn,     row_idx, 3)
+
+            # Store references
+            self._channel_rows[ch.name] = {
+                "slider": slider,
+                "spinbox": spinbox,
+                "btn": btn,
+            }
+
+            # Wire signals (capture ch.name by closure)
+            name = ch.name
+            slider.valueChanged.connect(
+                lambda v, n=name: self._on_slider_changed(n, v)
+            )
+            spinbox.valueChanged.connect(
+                lambda v, n=name: self._on_spinbox_changed(n, v)
+            )
+            btn.toggled.connect(
+                lambda checked, n=name: self._on_shutter_toggled(n, checked)
+            )
+
+        root.addWidget(channels_group)
+
+        # Preset panel
+        preset_group = QGroupBox("Presets")
+        preset_layout = QHBoxLayout(preset_group)
+        preset_layout.setSpacing(6)
+
+        self._combo_presets = QComboBox()
+        self._combo_presets.setMinimumWidth(140)
+        self._refresh_preset_combo()
+
+        btn_save = QPushButton("Save")
+        btn_save.setToolTip("Save current state as a named preset")
+        btn_save.clicked.connect(self._on_save_preset)
+
+        btn_load = QPushButton("Load")
+        btn_load.setToolTip("Load the selected preset")
+        btn_load.clicked.connect(self._on_load_preset)
+
+        btn_delete = QPushButton("Delete")
+        btn_delete.setToolTip("Delete the selected preset")
+        btn_delete.clicked.connect(self._on_delete_preset)
+
+        preset_layout.addWidget(self._combo_presets, stretch=1)
+        preset_layout.addWidget(btn_save)
+        preset_layout.addWidget(btn_load)
+        preset_layout.addWidget(btn_delete)
+
+        root.addWidget(preset_group)
+        root.addStretch()
+
+    # ------------------------------------------------------------------
+    # Slot handlers
+    # ------------------------------------------------------------------
+
+    def _on_slider_changed(self, channel_name: str, value: int):
+        row = self._channel_rows.get(channel_name)
+        if row is None:
+            return
+        spinbox: QDoubleSpinBox = row["spinbox"]
+        spinbox.blockSignals(True)
+        spinbox.setValue(float(value))
+        spinbox.blockSignals(False)
+        self._controller.set_channel_intensity(channel_name, float(value))
+
+    def _on_spinbox_changed(self, channel_name: str, value: float):
+        row = self._channel_rows.get(channel_name)
+        if row is None:
+            return
+        slider: QSlider = row["slider"]
+        slider.blockSignals(True)
+        slider.setValue(int(round(value)))
+        slider.blockSignals(False)
+        self._controller.set_channel_intensity(channel_name, value)
+
+    def _on_shutter_toggled(self, channel_name: str, checked: bool):
+        row = self._channel_rows.get(channel_name)
+        if row is None:
+            return
+        btn: QPushButton = row["btn"]
+        btn.setText("ON" if checked else "OFF")
+        self._apply_shutter_style(btn, checked)
+        if checked:
+            self._controller.turn_on_channel(channel_name)
+        else:
+            self._controller.turn_off_channel(channel_name)
+
+    def _on_save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
+        if ok and name.strip():
+            self._controller.save_preset(name.strip())
+            self._refresh_preset_combo()
+            idx = self._combo_presets.findText(name.strip())
+            if idx >= 0:
+                self._combo_presets.setCurrentIndex(idx)
+
+    def _on_load_preset(self):
+        name = self._combo_presets.currentText()
+        if not name:
+            return
+        try:
+            self._controller.load_preset(name)
+            self._refresh_from_state()
+        except KeyError:
+            QMessageBox.warning(self, "Preset Not Found", f"Preset '{name}' no longer exists.")
+            self._refresh_preset_combo()
+
+    def _on_delete_preset(self):
+        name = self._combo_presets.currentText()
+        if not name:
+            return
+        self._controller.delete_preset(name)
+        self._refresh_preset_combo()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_shutter_style(btn: QPushButton, is_on: bool):
+        if is_on:
+            btn.setStyleSheet(
+                "QPushButton { background-color: #2ecc71; color: white; font-weight: bold; border-radius: 3px; }"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton { background-color: #555; color: #ccc; font-weight: bold; border-radius: 3px; }"
+            )
+
+    def _refresh_preset_combo(self):
+        self._combo_presets.blockSignals(True)
+        current = self._combo_presets.currentText()
+        self._combo_presets.clear()
+        for name in self._controller.list_presets():
+            self._combo_presets.addItem(name)
+        idx = self._combo_presets.findText(current)
+        if idx >= 0:
+            self._combo_presets.setCurrentIndex(idx)
+        self._combo_presets.blockSignals(False)
+
+    def _refresh_from_state(self):
+        """Update all UI controls to match the controller's current _channel_state."""
+        channel_state: dict = getattr(self._controller, "_channel_state", {})
+        for name, row in self._channel_rows.items():
+            state = channel_state.get(name)
+            if state is None:
+                continue
+            slider: QSlider = row["slider"]
+            spinbox: QDoubleSpinBox = row["spinbox"]
+            btn: QPushButton = row["btn"]
+
+            slider.blockSignals(True)
+            spinbox.blockSignals(True)
+            btn.blockSignals(True)
+
+            slider.setValue(int(round(state.intensity)))
+            spinbox.setValue(state.intensity)
+            btn.setChecked(state.is_on)
+            btn.setText("ON" if state.is_on else "OFF")
+            self._apply_shutter_style(btn, state.is_on)
+
+            slider.blockSignals(False)
+            spinbox.blockSignals(False)
+            btn.blockSignals(False)

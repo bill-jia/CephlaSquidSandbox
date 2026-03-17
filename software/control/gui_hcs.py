@@ -1411,6 +1411,8 @@ class HighContentScreeningGui(QMainWindow):
         if self.microscope.addons.camera_focus:
             self.cameraTabWidget.addTab(self.laserAutofocusControlWidget, "Laser AF")
         self.cameraTabWidget.addTab(self.focusMapWidget, "Focus Map")
+        self.illuminationWidget = widgets.IlluminationWidget(self.microscope.illumination_controller)
+        self.cameraTabWidget.addTab(self.illuminationWidget, "Illumination")
         self.cameraTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.cameraTabWidget))
         self.resizeCurrentTab(self.cameraTabWidget)
 
@@ -1482,7 +1484,7 @@ class HighContentScreeningGui(QMainWindow):
 
         self.centralWidget = QWidget()
         self.centralWidget.setLayout(layout)
-        self.centralWidget.setFixedWidth(self.centralWidget.minimumSizeHint().width())
+        self.centralWidget.setMinimumWidth(self.centralWidget.minimumSizeHint().width())
 
         self.setupSingleWindowLayout()
 
@@ -1521,7 +1523,7 @@ class HighContentScreeningGui(QMainWindow):
         dock_display = dock.Dock("Image Display", autoOrientation=False)
         dock_display.showTitleBar()
         dock_display.addWidget(self.imageDisplayTabs)
-        dock_display.setStretch(x=100, y=100)
+        dock_display.setStretch(x=3, y=100)
         main_dockArea.addDock(dock_display)
 
         self.dock_wellSelection = dock.Dock("Well Selector", autoOrientation=False)
@@ -1533,8 +1535,7 @@ class HighContentScreeningGui(QMainWindow):
 
         dock_controlPanel = dock.Dock("Controls", autoOrientation=False)
         dock_controlPanel.addWidget(self.centralWidget)
-        dock_controlPanel.setStretch(x=1, y=None)
-        dock_controlPanel.setFixedWidth(dock_controlPanel.minimumSizeHint().width())
+        dock_controlPanel.setStretch(x=1, y=100)
         main_dockArea.addDock(dock_controlPanel, "right")
         self.setCentralWidget(main_dockArea)
 

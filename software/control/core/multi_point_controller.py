@@ -806,12 +806,26 @@ class MultiPointController:
             self.abort_acqusition_requested = False
 
             self.configuration_before_running_multipoint = self.liveController.currentConfiguration
+
+            # Snapshot illumination state before acquisition so it can be restored afterwards
+            _illum_ctrl = getattr(self.liveController.microscope, "illumination_controller", None)
+            self._illumination_snapshot_before_acquisition = (
+                _illum_ctrl.snapshot() if _illum_ctrl is not None else None
+            )
+
             # stop live
             if self.liveController.is_live:
                 self.liveController_was_live_before_multipoint = True
                 self.liveController.stop_live()  # @@@ to do: also uncheck the live button
             else:
                 self.liveController_was_live_before_multipoint = False
+
+            # Ensure all channels are off before acquisition begins
+            if _illum_ctrl is not None:
+                try:
+                    _illum_ctrl.turn_off_all()
+                except Exception as e:
+                    self._log.warning(f"Failed to turn off all illumination before acquisition: {e}")
 
             self.camera_callback_was_enabled_before_multipoint = self.camera.get_callbacks_enabled()
             # We need callbacks, because we trigger and then use callbacks for image processing.  This
@@ -1046,6 +1060,17 @@ class MultiPointController:
             self.autofocusController.use_focus_map = self.already_using_fmap
         self.callbacks.signal_current_configuration(self.configuration_before_running_multipoint)
         self.liveController.set_microscope_mode(self.configuration_before_running_multipoint)
+
+        # Restore illumination state that was active before the acquisition
+        _illum_snapshot = getattr(self, "_illumination_snapshot_before_acquisition", None)
+        if _illum_snapshot is not None:
+            _illum_ctrl = getattr(self.liveController.microscope, "illumination_controller", None)
+            if _illum_ctrl is not None:
+                try:
+                    _illum_ctrl.restore(_illum_snapshot)
+                except Exception as e:
+                    self._log.warning(f"Failed to restore illumination state after acquisition: {e}")
+            self._illumination_snapshot_before_acquisition = None
 
         # Restore callbacks to pre-acquisition state
         self.camera.enable_callbacks(self.camera_callback_was_enabled_before_multipoint)
