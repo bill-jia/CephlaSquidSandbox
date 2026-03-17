@@ -15257,7 +15257,9 @@ class NIDAQWidget(QWidget):
         ao_layout = QVBoxLayout()
         
         self.ao_channels_list = QListWidget()
-        self.ao_channels_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        # Use per-item checkboxes instead of selection to make state more explicit
+        # and less prone to accidental changes.
+        self.ao_channels_list.setSelectionMode(QAbstractItemView.NoSelection)
         ao_layout.addWidget(self.ao_channels_list)
         
         ao_btn_row = QHBoxLayout()
@@ -15282,9 +15284,12 @@ class NIDAQWidget(QWidget):
         do_layout.addLayout(do_port_row)
         
         self.do_lines_list = QListWidget()
-        self.do_lines_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.do_lines_list.setSelectionMode(QAbstractItemView.NoSelection)
         for i in range(8):
-            self.do_lines_list.addItem(f"Line {i}")
+            item = QListWidgetItem(f"Line {i}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.do_lines_list.addItem(item)
         do_layout.addWidget(self.do_lines_list)
         
         do_btn_row = QHBoxLayout()
@@ -15317,7 +15322,7 @@ class NIDAQWidget(QWidget):
         ai_layout = QVBoxLayout()
         
         self.ai_channels_list = QListWidget()
-        self.ai_channels_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.ai_channels_list.setSelectionMode(QAbstractItemView.NoSelection)
         ai_layout.addWidget(self.ai_channels_list)
         
         ai_terminal_row = QHBoxLayout()
@@ -15543,30 +15548,36 @@ class NIDAQWidget(QWidget):
             for ch in info.get("ao_channels", []):
                 # Extract just the channel part (e.g., "ao0" from "Dev1/ao0")
                 ch_name = ch.split("/")[-1] if "/" in ch else ch
-                self.ao_channels_list.addItem(ch_name)
+                item = QListWidgetItem(ch_name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                self.ao_channels_list.addItem(item)
             
             # Update AI channels  
             self.ai_channels_list.clear()
             for ch in info.get("ai_channels", []):
                 ch_name = ch.split("/")[-1] if "/" in ch else ch
-                self.ai_channels_list.addItem(ch_name)
+                item = QListWidgetItem(ch_name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                self.ai_channels_list.addItem(item)
             
             # Update trigger terminal default
             self.trigger_terminal_edit.setText(f"/{device_name}/PFI2")
             
             # Pre-select channels/lines based on current config/state
             # AO channels: prefer task-IO selection if available, otherwise fall back
-            task_io = self._ni_daq.task_io_getter()
+            task_io = self._ni_daq.get_task_io()
             selected_ao = set(task_io.get("ao_channels", []))
             for i in range(self.ao_channels_list.count()):
                 item = self.ao_channels_list.item(i)
-                item.setSelected(item.text() in selected_ao)
+                item.setCheckState(Qt.Checked if item.text() in selected_ao else Qt.Unchecked)
 
             # AI channels: prefer task-IO selection if available
             selected_ai = set(task_io.get("ai_channels", []))
             for i in range(self.ai_channels_list.count()):
                 item = self.ai_channels_list.item(i)
-                item.setSelected(item.text() in selected_ai)
+                item.setCheckState(Qt.Checked if item.text() in selected_ai else Qt.Unchecked)
 
             # DO port and lines
             cfg_do_port = getattr(self._ni_daq, "do_port", None)
@@ -15578,7 +15589,7 @@ class NIDAQWidget(QWidget):
             selected_do_lines = set(getattr(self._ni_daq, "do_lines", []) or [])
             for i in range(self.do_lines_list.count()):
                 item = self.do_lines_list.item(i)
-                item.setSelected(i in selected_do_lines)
+                item.setCheckState(Qt.Checked if i in selected_do_lines else Qt.Unchecked)
     
     def on_config_changed(self):
         """Handle configuration changes."""
@@ -15623,21 +15634,25 @@ class NIDAQWidget(QWidget):
         else:
             self._ni_daq.trigger_edge = TriggerEdge.FALLING
         
-        # Get selected AO channels (task IO subset)
-        selected_ao = [
-            item.text() for item in self.ao_channels_list.selectedItems()
-        ]
+        # Get selected AO channels (task IO subset) from checkboxes
+        selected_ao = []
+        for i in range(self.ao_channels_list.count()):
+            item = self.ao_channels_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected_ao.append(item.text())
         
-        # Get selected AI channels (task IO subset)
-        selected_ai = [
-            item.text() for item in self.ai_channels_list.selectedItems()
-        ]
+        # Get selected AI channels (task IO subset) from checkboxes
+        selected_ai = []
+        for i in range(self.ai_channels_list.count()):
+            item = self.ai_channels_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected_ai.append(item.text())
         
-        # Get selected DO lines (task IO subset)
+        # Get selected DO lines (task IO subset) from checkboxes
         selected_do: list[int] = []
         for i in range(self.do_lines_list.count()):
             item = self.do_lines_list.item(i)
-            if item.isSelected():
+            if item.checkState() == Qt.Checked:
                 selected_do.append(i)
 
         # Push task IO selection into NI DAQ without overwriting full available sets
@@ -16034,7 +16049,7 @@ class NIDAQWidget(QWidget):
         self._update_config()
 
         # Prefer task-IO subsets for acquisition if available
-        task_io = self._ni_daq.task_io_getter()
+        task_io = self._ni_daq.get_task_io()
         ai_channels = task_io.get("ai_channels")
         ao_channels = task_io.get("ao_channels")
 
@@ -17169,7 +17184,7 @@ class FastAcquisitionWidget(QWidget):
             # Get analog input/output channels for this acquisition.
             # Prefer task-IO subsets from NI DAQ if available, otherwise fall back
             # to the full channel collections on the config.
-            task_io = ni_daq.task_io_getter()
+            task_io = ni_daq.get_task_io()
             ai_channels = task_io.get("ai_channels")
             ao_channels = task_io.get("ao_channels")
             self._log.info(f"AO channels (task IO): {ao_channels}")
