@@ -70,6 +70,11 @@ if __name__ == "__main__":
         help="Skip hardware initialization and homing (for restart after settings change)",
         action="store_true",
     )
+    parser.add_argument(
+        "--skip-homing",
+        help="Initialize devices but skip mechanical motions (stage/filter wheel homing, etc.)",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     # Set up logging
@@ -99,12 +104,15 @@ if __name__ == "__main__":
     # This allows shutdown via ctrl+C even after the gui has popped up.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    microscope = control.microscope.Microscope.build_from_global_config(args.simulation, skip_init=args.skip_init)
+    microscope = control.microscope.Microscope.build_from_global_config(
+        args.simulation, skip_init=args.skip_init, skip_homing=args.skip_homing
+    )
     win = gui.HighContentScreeningGui(
         microscope=microscope,
         is_simulation=args.simulation,
         live_only_mode=args.live_only,
         skip_init=args.skip_init,
+        skip_homing=args.skip_homing,
     )
 
     microscope_utils_menu = QMenu("Utils", win)

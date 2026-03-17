@@ -544,6 +544,7 @@ class HighContentScreeningGui(QMainWindow):
         is_simulation=False,
         live_only_mode=False,
         skip_init=False,
+        skip_homing=False,
         *args,
         **kwargs,
     ):
@@ -551,6 +552,7 @@ class HighContentScreeningGui(QMainWindow):
 
         self.log = squid.logging.get_logger(self.__class__.__name__)
         self._skip_init = skip_init
+        self._skip_homing = skip_homing
 
         self.microscope: control.microscope.Microscope = microscope
         self.stage: AbstractStage = microscope.stage
@@ -581,7 +583,6 @@ class HighContentScreeningGui(QMainWindow):
             core_displacement_measurement.DisplacementMeasurementController
         ] = None
         self.laserAutofocusController: Optional[LaserAutofocusController] = None
-
         if SUPPORT_LASER_AUTOFOCUS:
             self.liveController_focus_camera = self.microscope.live_controller_focus
             self.streamHandler_focus_camera = core.QtStreamHandler(
@@ -629,7 +630,7 @@ class HighContentScreeningGui(QMainWindow):
         load_slack_settings_from_cache()
 
         self.load_objects(is_simulation=is_simulation)
-        self.setup_hardware(skip_init=self._skip_init)
+        self.setup_hardware(skip_init=self._skip_init, skip_homing=self._skip_homing)
 
         self.setup_movement_updater()
 
@@ -701,6 +702,8 @@ class HighContentScreeningGui(QMainWindow):
                     self.stage.move_z_to(target_z_mm)
             else:
                 self.log.info("Skipping cached position restoration (--skip-init flag set)")
+        elif self._skip_homing:
+            self.log.info("Skipping cached position restoration and init_z (--skip-homing flag set)")
         elif HOMING_ENABLED_X and HOMING_ENABLED_Y and HOMING_ENABLED_Z:
             # TODO(imo): Why is moving to the cached position after boot hidden behind homing?
             if cached_pos := squid.stage.utils.get_cached_position():
@@ -823,7 +826,7 @@ class HighContentScreeningGui(QMainWindow):
             fluidics=self.fluidics,
         )
 
-    def setup_hardware(self, skip_init: bool = False):
+    def setup_hardware(self, skip_init: bool = False, skip_homing: bool = False):
         # Setup hardware components
         if not self.microcontroller:
             raise ValueError("Microcontroller must be none-None for hardware setup.")
@@ -852,7 +855,10 @@ class HighContentScreeningGui(QMainWindow):
                     z_neg_mm=z_config.MIN_POSITION,
                 )
 
-                self.microscope.home_xyz()
+                if not skip_homing:
+                    self.microscope.home_xyz()
+                else:
+                    self.log.info("Skipping stage homing (--skip-homing flag set)")
 
         except TimeoutError as e:
             # If we can't recover from a timeout, at least do our best to make sure the system is left in a safe
@@ -882,7 +888,7 @@ class HighContentScreeningGui(QMainWindow):
             self.camera_focus.enable_callbacks(enabled=True)
             self.camera_focus.start_streaming()
 
-        if self.objective_changer:
+        if self.objective_changer and not skip_homing:
             self.objective_changer.home()
             self.objective_changer.setSpeed(XERYON_SPEED)
             if DEFAULT_OBJECTIVE in XERYON_OBJECTIVE_SWITCHER_POS_1:

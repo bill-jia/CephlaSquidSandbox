@@ -297,19 +297,21 @@ class MicroscopeAddons:
         self.io_registry: Optional[IORegistry] = io_registry
         self.coolled = coolled
 
-    def prepare_for_use(self, skip_init: bool = False):
+    def prepare_for_use(self, skip_init: bool = False, skip_homing: bool = False):
         """
         Prepare all the addon hardware for immediate use.
 
         Args:
             skip_init: If True, skip homing operations (e.g., during restart).
+            skip_homing: If True, skip mechanical motions (filter wheel home, piezo home).
         """
+        skip_motion = skip_init or skip_homing
         if self.emission_filter_wheel:
             fw_config = squid.config.get_filter_wheel_config()
             self.emission_filter_wheel.initialize(fw_config.indices)
-            if not skip_init:
+            if not skip_motion:
                 self.emission_filter_wheel.home()
-        if self.piezo_stage and not skip_init:
+        if self.piezo_stage and not skip_motion:
             self.piezo_stage.home()
 
 
@@ -458,7 +460,9 @@ class Microscope:
     - Configuration managers: Channel settings, objectives, autofocus parameters
     """
     @staticmethod
-    def build_from_global_config(simulated: bool = False, skip_init: bool = False) -> "Microscope":
+    def build_from_global_config(
+        simulated: bool = False, skip_init: bool = False, skip_homing: bool = False
+    ) -> "Microscope":
         """Build Microscope from ``machine_config.yaml`` via :class:`MachineConfig`.
 
         Loads the unified machine configuration, applies it to ``_def.py``
@@ -560,6 +564,7 @@ class Microscope:
             low_level_drivers=low_level_devices,
             simulated=simulated,
             skip_init=skip_init,
+            skip_homing=skip_homing,
         )
 
     def __init__(
@@ -573,6 +578,7 @@ class Microscope:
         simulated: bool = False,
         skip_prepare_for_use: bool = False,
         skip_init: bool = False,
+        skip_homing: bool = False,
     ):
 
         """
@@ -648,9 +654,9 @@ class Microscope:
             self._sync_confocal_mode_from_hardware()
 
         if not skip_prepare_for_use:
-            self._prepare_for_use(skip_init=skip_init)
+            self._prepare_for_use(skip_init=skip_init, skip_homing=skip_homing)
 
-    def _prepare_for_use(self, skip_init: bool = False):
+    def _prepare_for_use(self, skip_init: bool = False, skip_homing: bool = False):
         """
         Initialize all hardware components for use.
         
@@ -658,9 +664,10 @@ class Microscope:
         - Configures DAC gains for piezo control
         - Initializes filter wheels and other addons
         - Sets camera pixel formats and acquisition modes
+        When skip_homing is True, device init runs but no mechanical motions (e.g. homing) are performed.
         """
         self.low_level_drivers.prepare_for_use(skip_init=skip_init)
-        self.addons.prepare_for_use(skip_init=skip_init)
+        self.addons.prepare_for_use(skip_init=skip_init, skip_homing=skip_homing)
 
         # Configure serial watchdog for illumination safety (requires firmware v1.1+)
         if self.low_level_drivers.microcontroller:
