@@ -1,31 +1,29 @@
 """
 Illumination control system for the microscope.
 
-This module provides a unified interface for controlling various illumination sources
-(LEDs, lasers) with support for:
-- Per-channel routing to the correct physical controller (Teensy or NI-DAQ), as
-  declared in the machine config's per-channel ``io:`` blocks
-- Intensity calibration using lookup tables (LUTs) for power-linear control
-- Named illumination presets and full snapshot/restore for acquisition workflows
-- Multiple light source types (Squid LEDs, lasers, LDI, CELESTA, etc.)
+``IlluminationController`` is a compositor that aggregates any number of
+``IlluminationDevice`` instances.  Each device — whether a multi-channel serial
+light source (CoolLED pE-400, Lumencor LDI/CELESTA), IO-routed individual
+lasers, or an LED matrix — exposes a uniform channel-name API.  Consumers
+(LiveController, FastAcquisitionController, widgets) call
+``set_channel_intensity`` / ``turn_on_channel`` / ``turn_off_channel`` without
+knowing the underlying hardware.
 
-When ``channel_config`` and ``io_registry`` are both provided, each illumination
-channel is routed independently to whichever physical controller is declared for it
-in the machine config (Teensy MCU, NI-DAQ, or serial device), rather than using a
-single global control mode.  The primary API is channel-name based:
+Primary API (channel-name based, device-agnostic)::
 
-    controller.set_channel_intensity("488nm", 50)
-    controller.turn_on_channel("488nm")
+    controller.set_channel_intensity("Fluorescence 488 nm Ex", 50)
+    controller.turn_on_channel("Fluorescence 488 nm Ex")
     snapshot = controller.snapshot()
     ...
     controller.restore(snapshot)
 
-The legacy wavelength-integer API (``set_intensity``, ``turn_on_illumination``, etc.)
-is preserved as a backward-compatible shim.
+The legacy wavelength-integer API (``set_intensity``, ``turn_on_illumination``,
+``turn_off_illumination``) is preserved as a backward-compatible shim.
 """
 
 from __future__ import annotations
 
+import abc
 import logging
 import re
 from dataclasses import dataclass, field
@@ -36,13 +34,11 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from control.microcontroller import Microcontroller
-from control.core.config import ConfigRepository
-from control._def import ILLUMINATION_CODE
-
 if TYPE_CHECKING:
     from control.core.io_controller import IORegistry, BoundEndpoint
-    from control.models.illumination_config import IlluminationChannelConfig
+    from control.microcontroller import Microcontroller
+    from squid.abc import LightSource
+    from control.serial_peripherals import SciMicroscopyLEDArray
 
 logger = logging.getLogger(__name__)
 
@@ -53,54 +49,45 @@ _WL_RE = re.compile(r"(\d{3,4})(?:nm)?$", re.IGNORECASE)
 
 
 def _extract_wavelength(channel_name: str) -> Optional[int]:
-    """Extract a wavelength integer from a channel name like '488nm' or '488'."""
+    """Extract a wavelength integer from a channel name like '488nm' or 'Fluorescence 488 nm Ex'."""
     m = _WL_RE.search(channel_name)
-    if m:
-        return int(m.group(1))
-    return None
+    return int(m.group(1)) if m else None
 
 
 # ---------------------------------------------------------------------------
-# Enumerations
+# Deprecated enumerations
+# Kept for backward-compatible imports in microscope.py and test code.
+# Device-type decisions are now encapsulated inside IlluminationDevice subclasses.
 # ---------------------------------------------------------------------------
 
 class LightSourceType(Enum):
-    """Enumeration of supported light source types."""
-    SquidLED = 0      # Built-in LED array on Squid controller
-    SquidLaser = 1    # Built-in laser on Squid controller
-    LDI = 2           # Lumencor Light Engine
-    CELESTA = 3       # Lumencor CELESTA light engine
-    VersaLase = 4     # VersaLase laser system
-    SCI = 5           # SciMicroscopy LED array
-    AndorLaser = 6    # Andor laser system
-    CoolLED = 7       # coolLED pE-400 / pE-400max
+    """Deprecated: device type is encapsulated in IlluminationDevice subclasses."""
+    SquidLED = 0
+    SquidLaser = 1
+    LDI = 2
+    CELESTA = 3
+    VersaLase = 4
+    SCI = 5
+    AndorLaser = 6
+    CoolLED = 7
 
 
 class IntensityControlMode(Enum):
-    """Global intensity control mode.
-
-    Deprecated: when ``channel_config`` and ``io_registry`` are both provided to
-    ``IlluminationController``, routing is determined per-channel from the machine
-    config.  These values are retained for backward compatibility with light-source
-    drivers (LDI, CELESTA, etc.) that still require an explicit mode.
-    """
-    SquidControllerDAC = 0  # Control via DAC on microcontroller (analog voltage)
-    Software = 1            # Control via software API of light source
-    IOEndpoint = 2          # Control via IO endpoint abstraction (MCU or NI-DAQ)
+    """Deprecated: per-channel routing is handled inside IlluminationDevice subclasses."""
+    SquidControllerDAC = 0
+    Software = 1
+    IOEndpoint = 2
 
 
 class ShutterControlMode(Enum):
-    """Global shutter control mode.
-
-    Deprecated: see :class:`IntensityControlMode` for details.
-    """
-    TTL = 0       # Control via TTL signals from microcontroller
-    Software = 1  # Control via software API of light source
-    IOEndpoint = 2  # Control via IO endpoint abstraction (MCU or NI-DAQ)
+    """Deprecated: see IntensityControlMode."""
+    TTL = 0
+    Software = 1
+    IOEndpoint = 2
 
 
 # ---------------------------------------------------------------------------
-# State dataclasses
+# State dataclasses (public API — unchanged)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -112,12 +99,7 @@ class ChannelState:
 
 @dataclass
 class IlluminationSnapshot:
-    """A point-in-time capture of all channel states, keyed by channel name.
-
-    Keying by ``IlluminationChannel.name`` (from ``IlluminationChannelConfig``)
-    makes the snapshot agnostic to whether the underlying controller is a Teensy
-    MCU, NI-DAQ, or a serial light source.
-    """
+    """A point-in-time capture of all channel states, keyed by channel name."""
     channel_states: Dict[str, ChannelState] = field(default_factory=dict)
 
     def copy(self) -> "IlluminationSnapshot":
@@ -134,626 +116,664 @@ class IlluminationPreset:
 
 
 # ---------------------------------------------------------------------------
-# Main controller
+# IlluminationDevice ABC
+# ---------------------------------------------------------------------------
+
+class IlluminationDevice(abc.ABC):
+    """Abstract base for a single illumination source (single- or multi-channel).
+
+    A device owns one or more named channels.  All operations take a channel
+    name string.  ``IlluminationController`` aggregates multiple devices and
+    routes calls to the correct one.
+
+    Implementors:
+        - ``IORoutedIlluminationDevice``: MCU / NI-DAQ IO endpoint channels
+        - ``SerialIlluminationDevice``: CoolLED, Lumencor LDI/CELESTA, etc.
+        - ``LEDMatrixIlluminationDevice``: SciMicroscopy LED array or plain MCU matrix
+    """
+
+    @property
+    @abc.abstractmethod
+    def channel_names(self) -> List[str]:
+        """Return the list of channel names provided by this device."""
+
+    @abc.abstractmethod
+    def initialize(self) -> None:
+        """Initialize the device (open serial port, configure modes, etc.)."""
+
+    @abc.abstractmethod
+    def shut_down(self) -> None:
+        """Release device resources and turn off all channels."""
+
+    @abc.abstractmethod
+    def set_intensity(self, channel: str, intensity: float) -> None:
+        """Set intensity for *channel* (0–100 %)."""
+
+    @abc.abstractmethod
+    def turn_on(self, channel: str) -> None:
+        """Open shutter / assert TTL / enable *channel*."""
+
+    @abc.abstractmethod
+    def turn_off(self, channel: str) -> None:
+        """Close shutter / de-assert TTL / disable *channel*."""
+
+    def turn_off_all(self) -> None:
+        """Turn off all channels.  Default implementation iterates ``channel_names``."""
+        for ch in self.channel_names:
+            try:
+                self.turn_off(ch)
+            except Exception as exc:
+                logger.warning(f"[{self.__class__.__name__}] turn_off('{ch}') failed: {exc}")
+
+    @abc.abstractmethod
+    def get_intensity(self, channel: str) -> float:
+        """Return last-set intensity for *channel*."""
+
+    @abc.abstractmethod
+    def is_on(self, channel: str) -> bool:
+        """Return True if *channel* is currently enabled."""
+
+
+# ---------------------------------------------------------------------------
+# Concrete device: IO-routed channels (MCU / NI-DAQ endpoints)
+# ---------------------------------------------------------------------------
+
+class IORoutedIlluminationDevice(IlluminationDevice):
+    """Illumination device whose channels are wired via ``IORegistry`` endpoints.
+
+    Each channel has an optional intensity ``BoundEndpoint`` (analog) and an
+    optional shutter ``BoundEndpoint`` (digital).  When a shutter endpoint is
+    absent the microcontroller's global TTL command is used as a fallback.
+    Intensity LUT calibration is applied per channel when provided.
+
+    This device also exposes the multi-port MCU API (firmware v1.0+) so that
+    callers needing to synchronise multiple ports at once can do so.
+    """
+
+    def __init__(
+        self,
+        channel_endpoints: Dict[str, Tuple[Optional["BoundEndpoint"], Optional["BoundEndpoint"]]],
+        microcontroller: Optional["Microcontroller"] = None,
+        luts: Optional[Dict[str, Dict]] = None,
+    ):
+        """
+        Args:
+            channel_endpoints: ``{channel_name: (intensity_ep, shutter_ep)}``.
+                Either endpoint may be ``None``.
+            microcontroller: MCU used as shutter fallback and for multi-port API.
+            luts: Per-channel calibration tables
+                ``{name: {"power_percent": [...], "dac_percent": [...]}}``.
+        """
+        self._channel_endpoints = channel_endpoints
+        self._microcontroller = microcontroller
+        self._luts: Dict[str, Dict] = luts or {}
+        self._intensity: Dict[str, float] = {n: 0.0 for n in channel_endpoints}
+        self._is_on_state: Dict[str, bool] = {n: False for n in channel_endpoints}
+        self._port_intensity: Dict[int, float] = {i: 0.0 for i in range(NUM_ILLUMINATION_PORTS)}
+        self._port_is_on: Dict[int, bool] = {i: False for i in range(NUM_ILLUMINATION_PORTS)}
+
+    @property
+    def channel_names(self) -> List[str]:
+        return list(self._channel_endpoints.keys())
+
+    def initialize(self) -> None:
+        pass
+
+    def shut_down(self) -> None:
+        self.turn_off_all()
+
+    def set_intensity(self, channel: str, intensity: float) -> None:
+        intensity = float(np.clip(intensity, 0, 100))
+        intensity_ep, _ = self._channel_endpoints[channel]
+        effective = self._apply_lut(channel, intensity)
+        if intensity_ep is not None:
+            intensity_ep.set_analog(effective)
+        self._intensity[channel] = intensity
+
+    def turn_on(self, channel: str) -> None:
+        _, shutter_ep = self._channel_endpoints[channel]
+        if shutter_ep is not None:
+            shutter_ep.set_digital(True)
+            shutter_ep.wait()
+        elif self._microcontroller is not None:
+            self._microcontroller.turn_on_illumination()
+            self._microcontroller.wait_till_operation_is_completed()
+        self._is_on_state[channel] = True
+
+    def turn_off(self, channel: str) -> None:
+        _, shutter_ep = self._channel_endpoints[channel]
+        if shutter_ep is not None:
+            shutter_ep.set_digital(False)
+            shutter_ep.wait()
+        elif self._microcontroller is not None:
+            self._microcontroller.turn_off_illumination()
+            self._microcontroller.wait_till_operation_is_completed()
+        self._is_on_state[channel] = False
+
+    def get_intensity(self, channel: str) -> float:
+        return self._intensity.get(channel, 0.0)
+
+    def is_on(self, channel: str) -> bool:
+        return self._is_on_state.get(channel, False)
+
+    # -- LUT helper ----------------------------------------------------------
+
+    def _apply_lut(self, channel: str, intensity: float) -> float:
+        lut = self._luts.get(channel)
+        if lut is None:
+            return float(np.clip(intensity, 0, 100))
+        intensity = float(np.clip(intensity, 0, 100))
+        dac = float(np.interp(intensity, lut["power_percent"], lut["dac_percent"]))
+        return float(np.clip(dac, 0, 100))
+
+    # -- Multi-port MCU API (firmware v1.0+) ---------------------------------
+
+    def _require_multi_port(self) -> None:
+        if self._microcontroller is None or not self._microcontroller.supports_multi_port():
+            raise RuntimeError(
+                "Firmware does not support multi-port illumination commands. "
+                "Update firmware to version 1.0 or later."
+            )
+
+    def set_port_intensity(self, port_index: int, intensity: float) -> None:
+        """Set intensity for a specific MCU port without changing on/off state."""
+        self._require_multi_port()
+        if not 0 <= port_index < NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self._microcontroller.set_port_intensity(port_index, intensity)
+        self._microcontroller.wait_till_operation_is_completed()
+        self._port_intensity[port_index] = intensity
+
+    def turn_on_port(self, port_index: int) -> None:
+        """Turn on a specific MCU illumination port."""
+        self._require_multi_port()
+        if not 0 <= port_index < NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self._microcontroller.turn_on_port(port_index)
+        self._microcontroller.wait_till_operation_is_completed()
+        self._port_is_on[port_index] = True
+
+    def turn_off_port(self, port_index: int) -> None:
+        """Turn off a specific MCU illumination port."""
+        self._require_multi_port()
+        if not 0 <= port_index < NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self._microcontroller.turn_off_port(port_index)
+        self._microcontroller.wait_till_operation_is_completed()
+        self._port_is_on[port_index] = False
+
+    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool) -> None:
+        """Set intensity and on/off for an MCU port in one command."""
+        self._require_multi_port()
+        if not 0 <= port_index < NUM_ILLUMINATION_PORTS:
+            raise ValueError(f"Invalid port index: {port_index}")
+        self._microcontroller.set_port_illumination(port_index, intensity, turn_on)
+        self._microcontroller.wait_till_operation_is_completed()
+        self._port_intensity[port_index] = intensity
+        self._port_is_on[port_index] = turn_on
+
+    def turn_on_multiple_ports(self, port_indices: List[int]) -> None:
+        """Turn on multiple MCU ports simultaneously."""
+        if not port_indices:
+            return
+        self._require_multi_port()
+        port_mask = on_mask = 0
+        for i in port_indices:
+            if not 0 <= i < NUM_ILLUMINATION_PORTS:
+                raise ValueError(f"Invalid port index: {i}")
+            port_mask |= 1 << i
+            on_mask |= 1 << i
+        self._microcontroller.set_multi_port_mask(port_mask, on_mask)
+        self._microcontroller.wait_till_operation_is_completed()
+        for i in port_indices:
+            self._port_is_on[i] = True
+
+    def turn_off_all_ports(self) -> None:
+        """Turn off all MCU illumination ports."""
+        self._require_multi_port()
+        self._microcontroller.turn_off_all_ports()
+        self._microcontroller.wait_till_operation_is_completed()
+        for i in range(NUM_ILLUMINATION_PORTS):
+            self._port_is_on[i] = False
+
+    def get_active_ports(self) -> List[int]:
+        """Return list of currently active port indices."""
+        return [i for i in range(NUM_ILLUMINATION_PORTS) if self._port_is_on[i]]
+
+
+# ---------------------------------------------------------------------------
+# Concrete device: single-channel NI-DAQ lines (analog intensity + digital shutter)
+# ---------------------------------------------------------------------------
+
+class NIDAQIlluminationDevice(IlluminationDevice):
+    """Illumination device backed by one NI-DAQ AO line and one DO line.
+
+    This is a convenience wrapper for the common case where a single
+    fluorescence channel is driven directly from NI-DAQ hardware:
+
+    - Analog output (AO) line for intensity control
+    - Digital output (DO) line for shutter/on-off control
+
+    The endpoints are provided as ``BoundEndpoint`` instances obtained from
+    ``IORegistry`` (typically via an ``illumination_devices`` entry).
+    """
+
+    def __init__(
+        self,
+        channel_name: str,
+        intensity_endpoint: "BoundEndpoint",
+        shutter_endpoint: "BoundEndpoint",
+    ) -> None:
+        self._channel_name = channel_name
+        self._intensity_ep = intensity_endpoint
+        self._shutter_ep = shutter_endpoint
+        self._intensity: float = 0.0
+        self._is_on: bool = False
+
+    # IlluminationDevice API -------------------------------------------------
+
+    @property
+    def channel_names(self) -> List[str]:
+        return [self._channel_name]
+
+    def initialize(self) -> None:
+        # NI-DAQ endpoints are configured at IORegistry construction time.
+        # Nothing to do here.
+        pass
+
+    def shut_down(self) -> None:
+        try:
+            self.turn_off(self._channel_name)
+        except Exception as exc:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] shut_down failed for '{self._channel_name}': {exc}"
+            )
+
+    def set_intensity(self, channel: str, intensity: float) -> None:
+        if channel != self._channel_name:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] set_intensity called for unknown channel '{channel}'"
+            )
+            return
+        intensity = float(np.clip(intensity, 0, 100))
+        self._intensity_ep.set_analog(intensity)
+        self._intensity = intensity
+
+    def turn_on(self, channel: str) -> None:
+        if channel != self._channel_name:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] turn_on called for unknown channel '{channel}'"
+            )
+            return
+        self._shutter_ep.set_digital(True)
+        self._shutter_ep.wait()
+        self._is_on = True
+
+    def turn_off(self, channel: str) -> None:
+        if channel != self._channel_name:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] turn_off called for unknown channel '{channel}'"
+            )
+            return
+        self._shutter_ep.set_digital(False)
+        self._shutter_ep.wait()
+        self._is_on = False
+
+    def get_intensity(self, channel: str) -> float:
+        if channel != self._channel_name:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] get_intensity called for unknown channel '{channel}'"
+            )
+            return 0.0
+        return self._intensity
+
+    def is_on(self, channel: str) -> bool:
+        if channel != self._channel_name:
+            logger.warning(
+                f"[NIDAQIlluminationDevice] is_on called for unknown channel '{channel}'"
+            )
+            return False
+        return self._is_on
+
+
+# ---------------------------------------------------------------------------
+# Concrete device: serial light source (CoolLED, LDI, CELESTA, Andor, ...)
+# ---------------------------------------------------------------------------
+
+class SerialIlluminationDevice(IlluminationDevice):
+    """Illumination device backed by a serial ``LightSource``.
+
+    Intensity is always controlled via the serial protocol.  Shutter control
+    can use either the LightSource's own API or a per-channel
+    ``BoundEndpoint`` (e.g. an NI-DAQ TTL line), whichever is available.
+
+    Args:
+        light_source: The ``squid.abc.LightSource`` driver instance.
+        channel_serial_keys: ``{channel_name: device_internal_key}``.
+            ``device_internal_key`` is whatever key the LightSource accepts in
+            ``set_intensity`` / ``set_shutter_state`` (letter for CoolLED,
+            wavelength int for some others).
+        shutter_endpoints: Optional per-channel shutter ``BoundEndpoint``;
+            when present the TTL path is used instead of the serial API.
+    """
+
+    def __init__(
+        self,
+        light_source: "LightSource",
+        channel_serial_keys: Dict[str, object],
+        shutter_endpoints: Optional[Dict[str, Optional["BoundEndpoint"]]] = None,
+    ):
+        self._light_source = light_source
+        self._channel_serial_keys = channel_serial_keys
+        self._shutter_endpoints: Dict[str, Optional["BoundEndpoint"]] = shutter_endpoints or {}
+        self._intensity: Dict[str, float] = {n: 0.0 for n in channel_serial_keys}
+        self._is_on_state: Dict[str, bool] = {n: False for n in channel_serial_keys}
+
+    @property
+    def channel_names(self) -> List[str]:
+        return list(self._channel_serial_keys.keys())
+
+    def initialize(self) -> None:
+        self._light_source.initialize()
+
+    def shut_down(self) -> None:
+        self._light_source.shut_down()
+
+    def set_intensity(self, channel: str, intensity: float) -> None:
+        intensity = float(np.clip(intensity, 0, 100))
+        key = self._channel_serial_keys[channel]
+        self._light_source.set_intensity(key, intensity)
+        self._intensity[channel] = intensity
+
+    def turn_on(self, channel: str) -> None:
+        ep = self._shutter_endpoints.get(channel)
+        if ep is not None:
+            ep.set_digital(True)
+            ep.wait()
+        else:
+            key = self._channel_serial_keys[channel]
+            self._light_source.set_shutter_state(key, on=True)
+        self._is_on_state[channel] = True
+
+    def turn_off(self, channel: str) -> None:
+        ep = self._shutter_endpoints.get(channel)
+        if ep is not None:
+            ep.set_digital(False)
+            ep.wait()
+        else:
+            key = self._channel_serial_keys[channel]
+            self._light_source.set_shutter_state(key, on=False)
+        self._is_on_state[channel] = False
+
+    def get_intensity(self, channel: str) -> float:
+        return self._intensity.get(channel, 0.0)
+
+    def is_on(self, channel: str) -> bool:
+        return self._is_on_state.get(channel, False)
+
+    @property
+    def light_source(self) -> "LightSource":
+        """Expose the underlying LightSource for callers that need direct access."""
+        return self._light_source
+
+
+# ---------------------------------------------------------------------------
+# Concrete device: LED matrix (SciMicroscopy array or plain MCU patterns)
+# ---------------------------------------------------------------------------
+
+class LEDMatrixIlluminationDevice(IlluminationDevice):
+    """Illumination device for a programmable LED array.
+
+    Channels correspond to named illumination patterns
+    (e.g. ``"BF LED matrix full"``).  Each channel maps to a source_code
+    integer that the MCU uses to select the pattern.
+
+    Either a ``SciMicroscopyLEDArray`` or a plain ``Microcontroller`` can
+    back this device:
+
+    - SciMicroscopy array: ``apply_channel_configuration(name, intensity)`` /
+      ``turn_on_illumination()`` / ``turn_off_illumination()``
+    - Plain MCU: ``apply_led_matrix_channel_configuration(name, code, intensity)`` /
+      ``turn_on_illumination()`` / ``turn_off_illumination()``
+    """
+
+    def __init__(
+        self,
+        channel_source_codes: Dict[str, int],
+        microcontroller: Optional["Microcontroller"] = None,
+        sci_array: Optional["SciMicroscopyLEDArray"] = None,
+    ):
+        """
+        Args:
+            channel_source_codes: ``{channel_name: source_code}``
+            microcontroller: MCU for plain LED matrix control.
+            sci_array: SciMicroscopyLEDArray instance (takes priority over MCU).
+        """
+        if microcontroller is None and sci_array is None:
+            raise ValueError(
+                "LEDMatrixIlluminationDevice requires microcontroller or sci_array"
+            )
+        self._channel_source_codes = channel_source_codes
+        self._microcontroller = microcontroller
+        self._sci_array = sci_array
+        self._intensity: Dict[str, float] = {n: 0.0 for n in channel_source_codes}
+        self._is_on_state: Dict[str, bool] = {n: False for n in channel_source_codes}
+        self._active_channel: Optional[str] = None
+
+    @property
+    def channel_names(self) -> List[str]:
+        return list(self._channel_source_codes.keys())
+
+    def initialize(self) -> None:
+        pass
+
+    def shut_down(self) -> None:
+        self.turn_off_all()
+
+    def set_intensity(self, channel: str, intensity: float) -> None:
+        """Configure the LED pattern for *channel* at *intensity* percent."""
+        intensity = float(np.clip(intensity, 0, 100))
+        self._intensity[channel] = intensity
+        self._active_channel = channel
+        if self._sci_array is not None:
+            self._sci_array.apply_channel_configuration(channel, intensity)
+        elif self._microcontroller is not None:
+            source_code = self._channel_source_codes[channel]
+            self._microcontroller.apply_led_matrix_channel_configuration(
+                channel, source_code, intensity
+            )
+
+    def turn_on(self, channel: str) -> None:
+        """Activate the LED pattern for *channel*."""
+        self._active_channel = channel
+        if self._sci_array is not None:
+            self._sci_array.turn_on_illumination()
+        elif self._microcontroller is not None:
+            self._microcontroller.turn_on_illumination()
+        self._is_on_state[channel] = True
+
+    def turn_off(self, channel: str) -> None:
+        """Deactivate LED illumination."""
+        if self._sci_array is not None:
+            self._sci_array.turn_off_illumination()
+        elif self._microcontroller is not None:
+            self._microcontroller.turn_off_illumination()
+        self._is_on_state[channel] = False
+
+    def get_intensity(self, channel: str) -> float:
+        return self._intensity.get(channel, 0.0)
+
+    def is_on(self, channel: str) -> bool:
+        return self._is_on_state.get(channel, False)
+
+
+# ---------------------------------------------------------------------------
+# LUT loading helper
+# ---------------------------------------------------------------------------
+
+def load_intensity_luts(
+    calibrations_dir: Path,
+    channel_wavelengths: Dict[str, Optional[int]],
+) -> Dict[str, Dict]:
+    """Load intensity calibration LUTs for a set of channels.
+
+    Args:
+        calibrations_dir: Directory containing ``{wavelength}.csv`` files.
+        channel_wavelengths: ``{channel_name: wavelength_nm}`` mapping.
+
+    Returns:
+        ``{channel_name: {"power_percent": [...], "dac_percent": [...]}}``
+        for channels where a calibration file was found.
+    """
+    luts: Dict[str, Dict] = {}
+    if not calibrations_dir.exists():
+        return luts
+    for ch_name, wl in channel_wavelengths.items():
+        if wl is None:
+            continue
+        csv_path = calibrations_dir / f"{wl}.csv"
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+            if "DAC Percent" in df.columns and "Optical Power (mW)" in df.columns:
+                max_power = df["Optical Power (mW)"].max()
+                if max_power > 0:
+                    luts[ch_name] = {
+                        "power_percent": (df["Optical Power (mW)"] / max_power * 100).values,
+                        "dac_percent": np.clip(df["DAC Percent"].values, 0, 100),
+                    }
+        except Exception as exc:
+            logger.warning(f"Could not load calibration from {csv_path}: {exc}")
+    return luts
+
+
+# ---------------------------------------------------------------------------
+# IlluminationController — compositor
 # ---------------------------------------------------------------------------
 
 class IlluminationController:
-    """Controls microscope illumination (LEDs, lasers, LED matrix).
+    """Aggregates multiple ``IlluminationDevice`` instances behind a uniform API.
 
-    **Primary API (channel-name based, controller-agnostic):**
+    All channels from all devices are merged into a single flat
+    ``channel_name → IlluminationDevice`` map.  Callers use channel names
+    directly without knowing which device owns each one.
 
-        set_channel_intensity(name, intensity)  — route to correct physical controller
-        turn_on_channel(name)                   — open shutter / assert TTL
-        turn_off_channel(name)                  — close shutter / de-assert TTL
-        turn_off_all()                          — turn off every configured channel
-        snapshot() -> IlluminationSnapshot      — capture current state
-        restore(snapshot)                       — apply a previously captured state
-        save_preset(name) / load_preset(name)   — named cached configurations
+    **Primary channel-name API**::
 
-    **Backward-compatible wavelength API (delegates to primary API when possible):**
+        set_channel_intensity(name, intensity)
+        turn_on_channel(name)
+        turn_off_channel(name)
+        turn_off_all()
+        snapshot() -> IlluminationSnapshot
+        restore(snapshot)
+        save_preset(name) / load_preset(name)
+
+    **Backward-compatible wavelength shims** (delegate to primary API)::
 
         set_intensity(wavelength, intensity)
         turn_on_illumination(channel=wavelength)
         turn_off_illumination(channel=wavelength)
 
-    **Multi-port API (firmware v1.0+):**
+    **Multi-port forwarding** (delegates to the first IORoutedIlluminationDevice)::
 
         set_port_intensity / turn_on_port / turn_off_port
-        turn_on_multiple_ports / turn_off_all_ports
-
-    When ``channel_config`` and ``io_registry`` are both provided, each channel is
-    routed to whichever physical controller (Teensy or NI-DAQ) is declared for it in
-    the machine config, rather than using a global control mode.
+        set_port_illumination / turn_on_multiple_ports / turn_off_all_ports
     """
 
-    def __init__(
-        self,
-        microcontroller: Microcontroller,
-        intensity_control_mode: IntensityControlMode = IntensityControlMode.SquidControllerDAC,
-        shutter_control_mode: ShutterControlMode = ShutterControlMode.TTL,
-        light_source_type=None,
-        light_source=None,
-        disable_intensity_calibration: bool = False,
-        io_registry: Optional["IORegistry"] = None,
-        channel_config: Optional["IlluminationChannelConfig"] = None,
-    ):
+    def __init__(self, devices: List[IlluminationDevice]):
         """
-        Initialize the illumination controller.
-
         Args:
-            microcontroller: MCU interface for hardware communication
-            intensity_control_mode: Legacy global intensity mode.  Ignored when
-                ``channel_config`` and ``io_registry`` are both provided and a
-                per-channel endpoint is found in the registry.
-            shutter_control_mode: Legacy global shutter mode.  Same caveat as above.
-            light_source_type: Type of external light source (LDI, CELESTA, etc.)
-            light_source: External light source object for Software-mode control
-            disable_intensity_calibration: Skip LUT-based calibration
-            io_registry: IORegistry for per-channel endpoint routing
-            channel_config: IlluminationChannelConfig defining available channels;
-                enables per-channel routing, name-based API, and snapshot/preset support
+            devices: All illumination devices for this microscope.
+                     Channel names must be unique across all devices.
         """
-        self.microcontroller = microcontroller
-        self.light_source_type = light_source_type
-        self.light_source = light_source
-        self.disable_intensity_calibration = disable_intensity_calibration
-        self.io_registry = io_registry
-        self.channel_config = channel_config
+        self._devices = list(devices)
+        self._channel_map: Dict[str, IlluminationDevice] = {}
+        for dev in devices:
+            for ch in dev.channel_names:
+                if ch in self._channel_map:
+                    raise ValueError(
+                        f"Duplicate illumination channel name '{ch}' from "
+                        f"{dev.__class__.__name__} conflicts with "
+                        f"{self._channel_map[ch].__class__.__name__}"
+                    )
+                self._channel_map[ch] = dev
 
-        # Legacy global modes — used as fallback for channels with no IORegistry endpoint
-        if io_registry is not None:
-            self.intensity_control_mode = (
-                IntensityControlMode.IOEndpoint
-                if intensity_control_mode == IntensityControlMode.SquidControllerDAC
-                else intensity_control_mode
-            )
-            self.shutter_control_mode = (
-                ShutterControlMode.IOEndpoint
-                if shutter_control_mode == ShutterControlMode.TTL
-                else shutter_control_mode
-            )
-        else:
-            self.intensity_control_mode = intensity_control_mode
-            self.shutter_control_mode = shutter_control_mode
-
-        # Per-channel endpoint map: channel_name -> (intensity_ep, shutter_ep)
-        # Built from IORegistry + channel_config; empty when either is absent.
-        self._channel_endpoints: Dict[str, Tuple[Optional["BoundEndpoint"], Optional["BoundEndpoint"]]] = {}
-        self._build_channel_endpoint_map()
-
-        # Legacy wavelength-prefix map (kept as fallback when channel_config is absent)
-        self._wavelength_to_endpoint_prefix: Dict[int, str] = {}
-        if io_registry is not None and not self._channel_endpoints:
-            self._build_wavelength_endpoint_map()
-
-        # Default wavelength -> source code mappings (legacy MCU TTL path)
-        default_mappings = {
-            405: ILLUMINATION_CODE.ILLUMINATION_D1,
-            470: ILLUMINATION_CODE.ILLUMINATION_D2,
-            488: ILLUMINATION_CODE.ILLUMINATION_D2,
-            545: ILLUMINATION_CODE.ILLUMINATION_D3,
-            550: ILLUMINATION_CODE.ILLUMINATION_D3,
-            555: ILLUMINATION_CODE.ILLUMINATION_D3,
-            561: ILLUMINATION_CODE.ILLUMINATION_D3,
-            638: ILLUMINATION_CODE.ILLUMINATION_D4,
-            640: ILLUMINATION_CODE.ILLUMINATION_D4,
-            730: ILLUMINATION_CODE.ILLUMINATION_D5,
-            735: ILLUMINATION_CODE.ILLUMINATION_D5,
-            750: ILLUMINATION_CODE.ILLUMINATION_D5,
+        self._channel_state: Dict[str, ChannelState] = {
+            ch: ChannelState() for ch in self._channel_map
         }
-        self.channel_mappings_TTL = self._load_channel_mappings(default_mappings)
-
-        # Legacy state dicts — kept for backward compat; updated alongside _channel_state
-        self.channel_mappings_software: Dict = {}
-        self.is_on: Dict = {}
-        self.intensity_settings: Dict = {}
-        self.current_channel = None
-        self.intensity_luts: Dict = {}
-        self.max_power: Dict = {}
-
-        # Multi-port state (16 ports max, firmware v1.0+)
-        self.port_is_on: Dict[int, bool] = {i: False for i in range(NUM_ILLUMINATION_PORTS)}
-        self.port_intensity: Dict[int, float] = {i: 0.0 for i in range(NUM_ILLUMINATION_PORTS)}
-
-        # Primary per-channel runtime state — keyed by channel name
-        self._channel_state: Dict[str, ChannelState] = {}
-        if channel_config is not None:
-            for ch in channel_config.channels:
-                self._channel_state[ch.name] = ChannelState()
-
-        # Named preset storage
         self.presets: Dict[str, IlluminationPreset] = {}
 
-        if self.light_source_type is not None:
-            self._configure_light_source()
+    # -- Device access -------------------------------------------------------
 
-        if self.light_source_type is None and not self.disable_intensity_calibration:
-            self._load_intensity_calibrations()
+    @property
+    def devices(self) -> List[IlluminationDevice]:
+        return list(self._devices)
 
-    # -----------------------------------------------------------------------
-    # Endpoint map construction
-    # -----------------------------------------------------------------------
+    def get_device_for_channel(self, channel_name: str) -> Optional[IlluminationDevice]:
+        """Return the device that owns *channel_name*, or None."""
+        return self._channel_map.get(channel_name)
 
-    def _build_channel_endpoint_map(self) -> None:
-        """Build per-channel endpoint map from IORegistry + channel_config.
+    # -- Primary channel-name API --------------------------------------------
 
-        For each channel in ``channel_config``, looks up
-        ``illumination.{ch.name}.intensity`` and ``illumination.{ch.name}.shutter``
-        in the IORegistry.  Channels without registry entries are omitted and fall
-        back to the legacy MCU path.
-        """
-        if self.io_registry is None or self.channel_config is None:
-            return
-        for ch in self.channel_config.channels:
-            intensity_ep = self.io_registry.get(f"illumination.{ch.name}.intensity")
-            shutter_ep = self.io_registry.get(f"illumination.{ch.name}.shutter")
-            if intensity_ep is not None or shutter_ep is not None:
-                self._channel_endpoints[ch.name] = (intensity_ep, shutter_ep)
-
-    def _build_wavelength_endpoint_map(self) -> None:
-        """Fallback: map wavelengths to IO endpoint prefixes when channel_config is absent.
-
-        Strategy 1: Scan IORegistry endpoint names for wavelength substrings.
-        Strategy 2: Legacy ``illum_D{n}`` naming from illumination_channel_config.yaml.
-        Strategy 3: Hardcoded default D-port map.
-        """
-        if self.io_registry is not None:
-            for ep_name in self.io_registry.list_endpoint_names():
-                if ".intensity" not in ep_name and ".shutter" not in ep_name:
-                    continue
-                parts = ep_name.rsplit(".", 1)
-                if len(parts) != 2:
-                    continue
-                prefix = parts[0]
-                mid_parts = prefix.split(".")
-                if len(mid_parts) >= 2:
-                    ch_name = mid_parts[-1]
-                    wl = _extract_wavelength(ch_name)
-                    if wl is not None:
-                        self._wavelength_to_endpoint_prefix[wl] = prefix
-            if self._wavelength_to_endpoint_prefix:
-                return
-
-        from control._def import source_code_to_port_index
-        default_port_map = {
-            405: "D1", 470: "D2", 488: "D2", 545: "D3", 550: "D3",
-            555: "D3", 561: "D3", 638: "D4", 640: "D4", 730: "D5",
-            735: "D5", 750: "D5",
-        }
-        try:
-            config_repo = ConfigRepository()
-            illum_cfg = config_repo.get_illumination_config()
-            if illum_cfg is not None:
-                for ch in illum_cfg.channels:
-                    if ch.wavelength_nm is not None:
-                        source_code = illum_cfg.get_source_code(ch)
-                        port_idx = source_code_to_port_index(source_code)
-                        if port_idx >= 0:
-                            self._wavelength_to_endpoint_prefix[ch.wavelength_nm] = f"illum_D{port_idx + 1}"
-        except Exception:
-            pass
-
-        if not self._wavelength_to_endpoint_prefix:
-            for wl, port_name in default_port_map.items():
-                self._wavelength_to_endpoint_prefix[wl] = f"illum_{port_name}"
-
-    def _get_io_endpoints_legacy(self, wavelength: int):
-        """Return (intensity_ep, shutter_ep) for a wavelength via the legacy prefix map."""
-        prefix = self._wavelength_to_endpoint_prefix.get(wavelength)
-        if prefix is None:
-            raise KeyError(f"No IO endpoint mapping for wavelength {wavelength}nm")
-        if "." in prefix:
-            intensity_ep = self.io_registry.get(f"{prefix}.intensity")
-            shutter_ep = self.io_registry.get(f"{prefix}.shutter")
-        else:
-            intensity_ep = self.io_registry.get(f"{prefix}_intensity")
-            shutter_ep = self.io_registry.get(f"{prefix}_shutter")
-        return intensity_ep, shutter_ep
-
-    # -----------------------------------------------------------------------
-    # Channel name / wavelength helpers
-    # -----------------------------------------------------------------------
-
-    def _wavelength_to_channel_name(self, wavelength: int) -> Optional[str]:
-        """Resolve a wavelength integer to a channel name via channel_config."""
-        if self.channel_config is None:
-            return None
-        for ch in self.channel_config.channels:
-            if ch.wavelength_nm == wavelength:
-                return ch.name
-        return None
-
-    def _name_to_wavelength(self, channel_name: str) -> Optional[int]:
-        """Look up wavelength for a channel name via channel_config or name pattern."""
-        if self.channel_config is not None:
-            ch = self.channel_config.get_channel_by_name(channel_name)
-            if ch is not None and ch.wavelength_nm is not None:
-                return ch.wavelength_nm
-        return _extract_wavelength(channel_name)
-
-    # -----------------------------------------------------------------------
-    # Primary channel-name-based API
-    # -----------------------------------------------------------------------
+    @property
+    def channel_names(self) -> List[str]:
+        """Return all channel names across all devices."""
+        return list(self._channel_map.keys())
 
     def set_channel_intensity(self, channel_name: str, intensity: float) -> None:
-        """Set intensity for a named channel, routing to the correct physical controller.
+        """Set intensity for a named channel (0–100 %).
 
-        Routing priority per channel:
-        1. Per-channel IORegistry endpoint declared in the machine config ``io:`` block
-        2. Legacy global mode (Software via light_source, or MCU DAC)
-
-        Args:
-            channel_name: Name matching ``IlluminationChannel.name`` in channel_config
-            intensity: Intensity percentage 0–100
+        Routes to whichever device owns *channel_name*.
         """
         intensity = float(np.clip(intensity, 0, 100))
-
-        # Update name-keyed state
-        if channel_name not in self._channel_state:
-            self._channel_state[channel_name] = ChannelState()
+        dev = self._channel_map.get(channel_name)
+        if dev is None:
+            logger.warning(f"set_channel_intensity: unknown channel '{channel_name}'")
+            return
+        dev.set_intensity(channel_name, intensity)
         self._channel_state[channel_name].intensity = intensity
 
-        # Keep legacy wavelength-keyed state in sync
-        wl = self._name_to_wavelength(channel_name)
-        if wl is not None:
-            self.intensity_settings[wl] = intensity
-
-        intensity_ep, _ = self._channel_endpoints.get(channel_name, (None, None))
-        if intensity_ep is not None:
-            effective = self._apply_lut_by_name(channel_name, intensity)
-            intensity_ep.set_analog(effective)
-            return
-
-        self._set_intensity_legacy(channel_name, intensity)
-
     def turn_on_channel(self, channel_name: str) -> None:
-        """Turn on illumination for a named channel.
-
-        Args:
-            channel_name: Name matching ``IlluminationChannel.name`` in channel_config
-        """
-        if channel_name not in self._channel_state:
-            self._channel_state[channel_name] = ChannelState()
+        """Turn on a named channel."""
+        dev = self._channel_map.get(channel_name)
+        if dev is None:
+            logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
+            return
+        dev.turn_on(channel_name)
         self._channel_state[channel_name].is_on = True
 
-        wl = self._name_to_wavelength(channel_name)
-        if wl is not None:
-            self.is_on[wl] = True
-
-        _, shutter_ep = self._channel_endpoints.get(channel_name, (None, None))
-        if shutter_ep is not None:
-            shutter_ep.set_digital(True)
-            shutter_ep.wait()
-            return
-
-        self._turn_on_legacy(channel_name)
-
     def turn_off_channel(self, channel_name: str) -> None:
-        """Turn off illumination for a named channel.
-
-        Args:
-            channel_name: Name matching ``IlluminationChannel.name`` in channel_config
-        """
-        if channel_name not in self._channel_state:
-            self._channel_state[channel_name] = ChannelState()
+        """Turn off a named channel."""
+        dev = self._channel_map.get(channel_name)
+        if dev is None:
+            logger.warning(f"turn_off_channel: unknown channel '{channel_name}'")
+            return
+        dev.turn_off(channel_name)
         self._channel_state[channel_name].is_on = False
 
-        wl = self._name_to_wavelength(channel_name)
-        if wl is not None:
-            self.is_on[wl] = False
-
-        _, shutter_ep = self._channel_endpoints.get(channel_name, (None, None))
-        if shutter_ep is not None:
-            shutter_ep.set_digital(False)
-            shutter_ep.wait()
-            return
-
-        self._turn_off_legacy(channel_name)
-
     def turn_off_all(self) -> None:
-        """Turn off all illumination channels.
-
-        If ``channel_config`` is available, iterates channels by name via
-        ``turn_off_channel``.  Falls back to the multi-port MCU command or legacy
-        per-wavelength calls when no config is present.
-        """
-        if self.channel_config is not None:
-            for ch in self.channel_config.channels:
-                try:
-                    self.turn_off_channel(ch.name)
-                except Exception as e:
-                    logger.warning(f"Failed to turn off channel '{ch.name}': {e}")
-            return
-
-        # Fallback: MCU multi-port or legacy per-wavelength
-        try:
-            if self.microcontroller is not None and self.microcontroller.supports_multi_port():
-                self.turn_off_all_ports()
-                return
-        except Exception:
-            pass
-
-        for ch in list(self.is_on.keys()):
+        """Turn off all channels on all devices."""
+        for dev in self._devices:
             try:
-                self.turn_off_illumination(ch)
-            except Exception:
-                pass
+                dev.turn_off_all()
+            except Exception as exc:
+                logger.warning(f"turn_off_all on {dev.__class__.__name__} failed: {exc}")
+        for state in self._channel_state.values():
+            state.is_on = False
 
-    # -----------------------------------------------------------------------
-    # Legacy fallback helpers (used when no per-channel endpoint is available)
-    # -----------------------------------------------------------------------
-
-    def _set_intensity_legacy(self, channel_name: str, intensity: float) -> None:
-        """Route set_intensity through the legacy global modes."""
-        wl = self._name_to_wavelength(channel_name)
-
-        if self.intensity_control_mode == IntensityControlMode.Software:
-            ch_key = self.channel_mappings_software.get(channel_name) or (
-                self.channel_mappings_software.get(wl) if wl is not None else None
-            )
-            if ch_key is not None and intensity != self.intensity_settings.get(wl, -1):
-                self.light_source.set_intensity(ch_key, intensity)
-            if self.shutter_control_mode == ShutterControlMode.TTL:
-                if wl is not None and wl in self.channel_mappings_TTL:
-                    self.microcontroller.set_illumination(self.channel_mappings_TTL[wl], intensity)
-            elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-                try:
-                    if wl is not None:
-                        intensity_ep, _ = self._get_io_endpoints_legacy(wl)
-                        if intensity_ep is not None:
-                            intensity_ep.set_analog(intensity)
-                except (KeyError, TypeError):
-                    pass
-            return
-
-        if self.intensity_control_mode == IntensityControlMode.IOEndpoint:
-            try:
-                if wl is not None:
-                    effective = self._apply_lut(wl, intensity) if wl in self.intensity_luts else intensity
-                    intensity_ep, _ = self._get_io_endpoints_legacy(wl)
-                    if intensity_ep is not None:
-                        intensity_ep.set_analog(effective)
-            except (KeyError, TypeError):
-                pass
-            return
-
-        # SquidControllerDAC fallback
-        if wl is not None and wl in self.channel_mappings_TTL:
-            dac = self._apply_lut(wl, intensity) if wl in self.intensity_luts else intensity
-            self.microcontroller.set_illumination(self.channel_mappings_TTL[wl], dac)
-
-    def _turn_on_legacy(self, channel_name: str) -> None:
-        """Route turn_on through the legacy global modes."""
-        wl = self._name_to_wavelength(channel_name)
-
-        if self.shutter_control_mode == ShutterControlMode.Software:
-            ch_key = self.channel_mappings_software.get(channel_name) or (
-                self.channel_mappings_software.get(wl) if wl is not None else None
-            )
-            if ch_key is not None:
-                self.light_source.set_shutter_state(ch_key, on=True)
-            return
-
-        if self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-            try:
-                if wl is not None:
-                    _, shutter_ep = self._get_io_endpoints_legacy(wl)
-                    if shutter_ep is not None:
-                        shutter_ep.set_digital(True)
-                        shutter_ep.wait()
-            except (KeyError, TypeError):
-                pass
-            return
-
-        # TTL
-        self.microcontroller.turn_on_illumination()
-        self.microcontroller.wait_till_operation_is_completed()
-
-    def _turn_off_legacy(self, channel_name: str) -> None:
-        """Route turn_off through the legacy global modes."""
-        wl = self._name_to_wavelength(channel_name)
-
-        if self.shutter_control_mode == ShutterControlMode.Software:
-            ch_key = self.channel_mappings_software.get(channel_name) or (
-                self.channel_mappings_software.get(wl) if wl is not None else None
-            )
-            if ch_key is not None:
-                self.light_source.set_shutter_state(ch_key, on=False)
-            return
-
-        if self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-            try:
-                if wl is not None:
-                    _, shutter_ep = self._get_io_endpoints_legacy(wl)
-                    if shutter_ep is not None:
-                        shutter_ep.set_digital(False)
-                        shutter_ep.wait()
-            except (KeyError, TypeError):
-                pass
-            return
-
-        # TTL
-        self.microcontroller.turn_off_illumination()
-        self.microcontroller.wait_till_operation_is_completed()
-
-    # -----------------------------------------------------------------------
-    # Backward-compatible wavelength API (shims)
-    # -----------------------------------------------------------------------
-
-    def turn_on_illumination(self, channel=None) -> None:
-        """Turn on illumination.  Delegates to turn_on_channel() when a per-channel
-        endpoint is available; otherwise falls back to the legacy global-mode path.
-
-        Args:
-            channel: Wavelength channel (e.g. 488). If None, uses current_channel.
-        """
-        if channel is None:
-            channel = self.current_channel
-
-        name = self._wavelength_to_channel_name(channel) if channel is not None else None
-        if name is not None and name in self._channel_endpoints:
-            self.turn_on_channel(name)
-            return
-
-        # Legacy path
-        if self.shutter_control_mode == ShutterControlMode.Software:
-            self.light_source.set_shutter_state(self.channel_mappings_software[channel], on=True)
-        elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-            try:
-                _, shutter_ep = self._get_io_endpoints_legacy(channel)
-                if shutter_ep is not None:
-                    shutter_ep.set_digital(True)
-                    shutter_ep.wait()
-            except (KeyError, TypeError):
-                pass
-        else:
-            self.microcontroller.turn_on_illumination()
-            self.microcontroller.wait_till_operation_is_completed()
-
-        if channel is not None:
-            self.is_on[channel] = True
-            if name is not None and name in self._channel_state:
-                self._channel_state[name].is_on = True
-
-    def turn_off_illumination(self, channel=None) -> None:
-        """Turn off illumination.  Delegates to turn_off_channel() when a per-channel
-        endpoint is available; otherwise falls back to the legacy global-mode path.
-
-        Args:
-            channel: Wavelength channel. If None, uses current_channel.
-        """
-        if channel is None:
-            channel = self.current_channel
-
-        name = self._wavelength_to_channel_name(channel) if channel is not None else None
-        if name is not None and name in self._channel_endpoints:
-            self.turn_off_channel(name)
-            return
-
-        # Legacy path
-        if self.shutter_control_mode == ShutterControlMode.Software:
-            self.light_source.set_shutter_state(self.channel_mappings_software[channel], on=False)
-        elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-            try:
-                _, shutter_ep = self._get_io_endpoints_legacy(channel)
-                if shutter_ep is not None:
-                    shutter_ep.set_digital(False)
-                    shutter_ep.wait()
-            except (KeyError, TypeError):
-                pass
-        else:
-            self.microcontroller.turn_off_illumination()
-            self.microcontroller.wait_till_operation_is_completed()
-
-        if channel is not None:
-            self.is_on[channel] = False
-            if name is not None and name in self._channel_state:
-                self._channel_state[name].is_on = False
-
-    def set_intensity(self, channel, intensity) -> None:
-        """Set illumination intensity.  Delegates to set_channel_intensity() when a
-        per-channel endpoint is available; otherwise falls back to the legacy path.
-
-        Args:
-            channel: Wavelength channel (e.g. 405, 488, 561)
-            intensity: Intensity percentage 0–100
-        """
-        if channel not in self.intensity_settings:
-            self.intensity_settings[channel] = -1
-
-        name = self._wavelength_to_channel_name(channel)
-        if name is not None and name in self._channel_endpoints:
-            self.set_channel_intensity(name, intensity)
-            return
-
-        # Legacy path (unchanged behaviour)
-        if self.intensity_control_mode == IntensityControlMode.Software:
-            if intensity != self.intensity_settings[channel]:
-                self.light_source.set_intensity(self.channel_mappings_software[channel], intensity)
-                self.intensity_settings[channel] = intensity
-            if self.shutter_control_mode == ShutterControlMode.TTL:
-                self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], intensity)
-            elif self.shutter_control_mode == ShutterControlMode.IOEndpoint:
-                try:
-                    intensity_ep, _ = self._get_io_endpoints_legacy(channel)
-                    if intensity_ep is not None:
-                        intensity_ep.set_analog(intensity)
-                except (KeyError, TypeError):
-                    pass
-
-        elif self.intensity_control_mode == IntensityControlMode.IOEndpoint:
-            effective = self._apply_lut(channel, intensity) if channel in self.intensity_luts else intensity
-            try:
-                intensity_ep, _ = self._get_io_endpoints_legacy(channel)
-                if intensity_ep is not None:
-                    intensity_ep.set_analog(effective)
-            except (KeyError, TypeError):
-                pass
-            self.intensity_settings[channel] = intensity
-
-        else:
-            # SquidControllerDAC
-            if channel in self.intensity_luts:
-                dac_percent = self._apply_lut(channel, intensity)
-                self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], dac_percent)
-            else:
-                self.microcontroller.set_illumination(self.channel_mappings_TTL[channel], intensity)
-            self.intensity_settings[channel] = intensity
-
-        # Sync _channel_state
-        if name is not None and name in self._channel_state:
-            self._channel_state[name].intensity = intensity
-
-    # -----------------------------------------------------------------------
-    # LUT helpers
-    # -----------------------------------------------------------------------
-
-    def _apply_lut_by_name(self, channel_name: str, intensity_percent: float) -> float:
-        """Apply calibration LUT for a named channel."""
-        wl = self._name_to_wavelength(channel_name)
-        if wl is not None and wl in self.intensity_luts:
-            return float(self._apply_lut(wl, intensity_percent))
-        return float(np.clip(intensity_percent, 0, 100))
-
-    def _apply_lut(self, channel, intensity_percent) -> float:
-        """Convert desired optical power percentage to DAC percentage using calibration LUT."""
-        lut = self.intensity_luts[channel]
-        intensity_percent = np.clip(intensity_percent, 0, 100)
-        dac_percent = np.interp(intensity_percent, lut["power_percent"], lut["dac_percent"])
-        return float(np.clip(dac_percent, 0, 100))
-
-    # -----------------------------------------------------------------------
-    # Snapshot / restore / preset
-    # -----------------------------------------------------------------------
+    # -- Snapshot / restore / preset -----------------------------------------
 
     def snapshot(self) -> IlluminationSnapshot:
-        """Capture current illumination state for all configured channels.
-
-        Returns a deep copy of the current ``_channel_state``, keyed by channel name.
-        Falls back to capturing wavelength-keyed state when ``channel_config`` is absent.
-        """
-        if self.channel_config is not None:
-            states = {}
-            for ch in self.channel_config.channels:
-                s = self._channel_state.get(ch.name, ChannelState())
-                states[ch.name] = ChannelState(s.intensity, s.is_on)
-            return IlluminationSnapshot(states)
-
-        # Fallback when no channel_config
-        states = {}
-        for wl, intensity in self.intensity_settings.items():
-            states[str(wl)] = ChannelState(
-                intensity=intensity,
-                is_on=self.is_on.get(wl, False),
-            )
+        """Capture current illumination state for all channels."""
+        states = {
+            ch: ChannelState(s.intensity, s.is_on)
+            for ch, s in self._channel_state.items()
+        }
         return IlluminationSnapshot(states)
 
     def restore(self, snapshot: IlluminationSnapshot) -> None:
-        """Restore illumination state from a snapshot.
-
-        Applies intensity and on/off state for each channel in the snapshot via the
-        primary name-based API.
-        """
+        """Restore illumination state from a snapshot."""
         for name, state in snapshot.channel_states.items():
             try:
                 self.set_channel_intensity(name, state.intensity)
@@ -761,17 +781,11 @@ class IlluminationController:
                     self.turn_on_channel(name)
                 else:
                     self.turn_off_channel(name)
-            except Exception as e:
-                logger.warning(f"Failed to restore channel '{name}': {e}")
+            except Exception as exc:
+                logger.warning(f"Failed to restore channel '{name}': {exc}")
 
     def save_preset(self, name: str) -> IlluminationPreset:
-        """Save the current illumination state as a named preset.
-
-        Args:
-            name: Preset name
-        Returns:
-            The saved IlluminationPreset
-        """
+        """Save the current illumination state as a named preset."""
         preset = IlluminationPreset(name=name, snapshot=self.snapshot())
         self.presets[name] = preset
         return preset
@@ -779,10 +793,8 @@ class IlluminationController:
     def load_preset(self, name: str) -> None:
         """Load and apply a named preset.
 
-        Args:
-            name: Preset name (must exist in self.presets)
         Raises:
-            KeyError: if preset name is not found
+            KeyError: if preset name is not found.
         """
         preset = self.presets.get(name)
         if preset is None:
@@ -798,11 +810,7 @@ class IlluminationController:
         return sorted(self.presets.keys())
 
     def save_presets_to_file(self, path: str) -> None:
-        """Persist all presets to a YAML file.
-
-        Args:
-            path: Path to the YAML file to write
-        """
+        """Persist all presets to a YAML file."""
         import yaml
         data = {
             preset_name: {
@@ -815,11 +823,7 @@ class IlluminationController:
             yaml.safe_dump(data, f)
 
     def load_presets_from_file(self, path: str) -> None:
-        """Load presets from a YAML file, merging with any existing presets.
-
-        Args:
-            path: Path to the YAML file to read
-        """
+        """Load presets from a YAML file, merging with existing presets."""
         import yaml
         try:
             with open(path, "r") as f:
@@ -836,155 +840,136 @@ class IlluminationController:
                     name=preset_name,
                     snapshot=IlluminationSnapshot(states),
                 )
-        except Exception as e:
-            logger.warning(f"Failed to load presets from '{path}': {e}")
+        except Exception as exc:
+            logger.warning(f"Failed to load presets from '{path}': {exc}")
 
-    # -----------------------------------------------------------------------
-    # Light source helpers
-    # -----------------------------------------------------------------------
+    # -- Backward-compatible wavelength API shims ----------------------------
 
-    def get_intensity(self, channel):
-        if self.intensity_control_mode == IntensityControlMode.Software:
-            intensity = self.light_source.get_intensity(self.channel_mappings_software[channel])
-            self.intensity_settings[channel] = intensity
-            return intensity
+    def _channel_name_for_wavelength(self, wavelength: int) -> Optional[str]:
+        """Resolve a wavelength integer to a channel name.
 
-    def get_shutter_state(self):
-        return self.is_on
+        Searches channel names for an embedded wavelength number.
+        """
+        for ch_name in self._channel_map:
+            if _extract_wavelength(ch_name) == wavelength:
+                return ch_name
+        return None
 
-    def _load_channel_mappings(self, default_mappings: Dict[int, int]) -> Dict[int, int]:
-        """Load channel mappings from illumination_channel_config.yaml; fall back to defaults."""
-        try:
-            config_repo = ConfigRepository()
-            illumination_config = config_repo.get_illumination_config()
-            if illumination_config is None:
-                return default_mappings
-            mappings = {}
-            for channel in illumination_config.channels:
-                if channel.wavelength_nm is not None:
-                    source_code = illumination_config.get_source_code(channel)
-                    mappings[channel.wavelength_nm] = source_code
-            return mappings if mappings else default_mappings
-        except Exception:
-            return default_mappings
+    def turn_on_illumination(self, channel=None) -> None:
+        """Legacy: turn on illumination by wavelength integer.
 
-    def _configure_light_source(self):
-        self.light_source.initialize()
-        self._set_intensity_control_mode(self.intensity_control_mode)
-        self._set_shutter_control_mode(self.shutter_control_mode)
-        self.channel_mappings_software = self.light_source.channel_mappings
-        for ch in self.channel_mappings_software:
-            self.intensity_settings[ch] = self.get_intensity(ch)
-            self.is_on[ch] = self.light_source.get_shutter_state(self.channel_mappings_software[ch])
+        Delegates to ``turn_on_channel`` when the wavelength can be resolved
+        to a channel name.
+        """
+        if channel is not None:
+            name = self._channel_name_for_wavelength(channel)
+            if name is not None:
+                self.turn_on_channel(name)
+                return
+        logger.warning(f"turn_on_illumination: could not resolve channel={channel}")
 
-    def _set_intensity_control_mode(self, mode):
-        self.light_source.set_intensity_control_mode(mode)
-        self.intensity_control_mode = mode
+    def turn_off_illumination(self, channel=None) -> None:
+        """Legacy: turn off illumination by wavelength integer."""
+        if channel is not None:
+            name = self._channel_name_for_wavelength(channel)
+            if name is not None:
+                self.turn_off_channel(name)
+                return
+        logger.warning(f"turn_off_illumination: could not resolve channel={channel}")
 
-    def _set_shutter_control_mode(self, mode):
-        self.light_source.set_shutter_control_mode(mode)
-        self.shutter_control_mode = mode
+    def set_intensity(self, channel, intensity) -> None:
+        """Legacy: set intensity by wavelength integer or channel name."""
+        if isinstance(channel, int):
+            name = self._channel_name_for_wavelength(channel)
+        else:
+            name = channel if channel in self._channel_map else None
+        if name is not None:
+            self.set_channel_intensity(name, intensity)
+        else:
+            logger.warning(f"set_intensity: could not resolve channel={channel}")
 
-    def _load_intensity_calibrations(self):
-        """Load intensity calibrations for all available wavelengths."""
-        calibrations_dir = Path(__file__).parent.parent / "machine_configs" / "intensity_calibrations"
-        if not calibrations_dir.exists():
-            return
-        for calibration_file in calibrations_dir.glob("*.csv"):
-            try:
-                wavelength = int(calibration_file.stem)
-                calibration_data = pd.read_csv(calibration_file)
-                if "DAC Percent" in calibration_data.columns and "Optical Power (mW)" in calibration_data.columns:
-                    self.max_power[wavelength] = calibration_data["Optical Power (mW)"].max()
-                    normalized_power = (
-                        calibration_data["Optical Power (mW)"] / self.max_power[wavelength] * 100
-                    )
-                    dac_percent = np.clip(calibration_data["DAC Percent"].values, 0, 100)
-                    self.intensity_luts[wavelength] = {
-                        "power_percent": normalized_power.values,
-                        "dac_percent": dac_percent,
-                    }
-            except (ValueError, KeyError) as e:
-                logger.warning(f"Could not load calibration from {calibration_file}: {e}")
+    # -- Legacy state access -------------------------------------------------
 
-    # -----------------------------------------------------------------------
-    # Multi-port illumination API (firmware v1.0+)
-    # -----------------------------------------------------------------------
+    @property
+    def is_on(self) -> Dict[str, bool]:
+        """Legacy: ``{channel_name: is_on}`` for all channels."""
+        return {ch: s.is_on for ch, s in self._channel_state.items()}
 
-    def _check_multi_port_support(self):
-        """Raise if firmware does not support multi-port commands."""
-        if not self.microcontroller.supports_multi_port():
-            raise RuntimeError(
-                "Firmware does not support multi-port illumination commands. "
-                "Update firmware to version 1.0 or later."
-            )
+    @property
+    def intensity_settings(self) -> Dict[str, float]:
+        """Legacy: ``{channel_name: intensity}`` for all channels."""
+        return {ch: s.intensity for ch, s in self._channel_state.items()}
 
-    def set_port_intensity(self, port_index: int, intensity: float):
-        """Set intensity for a specific port without changing on/off state."""
-        self._check_multi_port_support()
-        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
-            raise ValueError(f"Invalid port index: {port_index}")
-        self.microcontroller.set_port_intensity(port_index, intensity)
-        self.microcontroller.wait_till_operation_is_completed()
-        self.port_intensity[port_index] = intensity
+    def get_intensity(self, channel) -> Optional[float]:
+        """Legacy: get intensity for a wavelength or channel name."""
+        if isinstance(channel, int):
+            name = self._channel_name_for_wavelength(channel)
+        else:
+            name = channel
+        if name and name in self._channel_map:
+            return self._channel_map[name].get_intensity(name)
+        return None
 
-    def turn_on_port(self, port_index: int):
-        """Turn on a specific illumination port."""
-        self._check_multi_port_support()
-        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
-            raise ValueError(f"Invalid port index: {port_index}")
-        self.microcontroller.turn_on_port(port_index)
-        self.microcontroller.wait_till_operation_is_completed()
-        self.port_is_on[port_index] = True
+    def get_shutter_state(self) -> Dict[str, bool]:
+        """Legacy: return on/off state dict for all channels."""
+        return {ch: s.is_on for ch, s in self._channel_state.items()}
 
-    def turn_off_port(self, port_index: int):
-        """Turn off a specific illumination port."""
-        self._check_multi_port_support()
-        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
-            raise ValueError(f"Invalid port index: {port_index}")
-        self.microcontroller.turn_off_port(port_index)
-        self.microcontroller.wait_till_operation_is_completed()
-        self.port_is_on[port_index] = False
+    # -- Multi-port forwarding (delegates to IORoutedIlluminationDevice) -----
 
-    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool):
-        """Set intensity and on/off state for a specific port in one command."""
-        self._check_multi_port_support()
-        if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
-            raise ValueError(f"Invalid port index: {port_index}")
-        self.microcontroller.set_port_illumination(port_index, intensity, turn_on)
-        self.microcontroller.wait_till_operation_is_completed()
-        self.port_intensity[port_index] = intensity
-        self.port_is_on[port_index] = turn_on
+    def _get_io_routed_device(self) -> Optional[IORoutedIlluminationDevice]:
+        """Return the first IORoutedIlluminationDevice, or None."""
+        for dev in self._devices:
+            if isinstance(dev, IORoutedIlluminationDevice):
+                return dev
+        return None
 
-    def turn_on_multiple_ports(self, port_indices: List[int]):
-        """Turn on multiple ports simultaneously."""
-        if not port_indices:
-            return
-        self._check_multi_port_support()
-        port_mask = 0
-        on_mask = 0
-        for port_index in port_indices:
-            if port_index < 0 or port_index >= NUM_ILLUMINATION_PORTS:
-                raise ValueError(f"Invalid port index: {port_index}")
-            port_mask |= 1 << port_index
-            on_mask |= 1 << port_index
-        self.microcontroller.set_multi_port_mask(port_mask, on_mask)
-        self.microcontroller.wait_till_operation_is_completed()
-        for port_index in port_indices:
-            self.port_is_on[port_index] = True
+    def set_port_intensity(self, port_index: int, intensity: float) -> None:
+        """Multi-port: set intensity for an MCU port."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.set_port_intensity(port_index, intensity)
 
-    def turn_off_all_ports(self):
-        """Turn off all illumination ports."""
-        self._check_multi_port_support()
-        self.microcontroller.turn_off_all_ports()
-        self.microcontroller.wait_till_operation_is_completed()
-        for i in range(NUM_ILLUMINATION_PORTS):
-            self.port_is_on[i] = False
+    def turn_on_port(self, port_index: int) -> None:
+        """Multi-port: turn on an MCU port."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.turn_on_port(port_index)
+
+    def turn_off_port(self, port_index: int) -> None:
+        """Multi-port: turn off an MCU port."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.turn_off_port(port_index)
+
+    def set_port_illumination(self, port_index: int, intensity: float, turn_on: bool) -> None:
+        """Multi-port: set intensity and on/off state for an MCU port."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.set_port_illumination(port_index, intensity, turn_on)
+
+    def turn_on_multiple_ports(self, port_indices: List[int]) -> None:
+        """Multi-port: turn on multiple MCU ports simultaneously."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.turn_on_multiple_ports(port_indices)
+
+    def turn_off_all_ports(self) -> None:
+        """Multi-port: turn off all MCU ports."""
+        dev = self._get_io_routed_device()
+        if dev:
+            dev.turn_off_all_ports()
 
     def get_active_ports(self) -> List[int]:
-        """Get list of currently active (on) port indices."""
-        return [i for i in range(NUM_ILLUMINATION_PORTS) if self.port_is_on[i]]
+        """Multi-port: return list of currently active port indices."""
+        dev = self._get_io_routed_device()
+        return dev.get_active_ports() if dev else []
 
-    def close(self):
-        if self.light_source is not None:
-            self.light_source.shut_down()
+    # -- Cleanup -------------------------------------------------------------
+
+    def close(self) -> None:
+        """Shut down all devices."""
+        for dev in self._devices:
+            try:
+                dev.shut_down()
+            except Exception as exc:
+                logger.warning(f"Device {dev.__class__.__name__} shut_down failed: {exc}")

@@ -128,84 +128,7 @@ devices:
         scanning: { x_mm: 20, y_mm: 20 }
         default_z_mm: 2.287
 
-  illumination:
-    driver: squid_builtin
-    channels:
-      405nm:
-        wavelength_nm: 405
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:0"
-            display_name: "405_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:0"
-            display_name: "405_shutter_mcu"
-      488nm:
-        wavelength_nm: 488
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:1"
-            display_name: "488_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:1"
-            display_name: "488_shutter_mcu"
-      561nm:
-        wavelength_nm: 561
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:2"
-            display_name: "561_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:2"
-            display_name: "561_shutter_mcu"
-      638nm:
-        wavelength_nm: 638
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:3"
-            display_name: "638_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:3"
-            display_name: "638_shutter_mcu"
-      730nm:
-        wavelength_nm: 730
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:4"
-            display_name: "730_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:4"
-            display_name: "730_shutter_mcu"
+  # illumination: block removed — channels are declared in illumination_devices below
 
   laser_af:
     driver: laser_af
@@ -250,6 +173,125 @@ devices:
       b_factor: 1.0
 
 illumination_channels_file: illumination_channel_config.yaml
+
+# ============================================================
+# ILLUMINATION DEVICES
+# Composable illumination sources.  Each entry becomes an
+# IlluminationDevice inside IlluminationController.  Channel
+# keys must match the names in illumination_channel_config.yaml
+# and in user profile general.yaml files.
+# ============================================================
+
+illumination_devices:
+
+  - id: squid_lasers
+    driver: squid_builtin
+    channels:
+      "Fluorescence 405 nm Ex":
+        wavelength_nm: 405
+        type: epi_illumination
+        io:
+          intensity:
+            controller: teensy
+            signal_type: analog
+            direction: output
+            channel_id: "port:0"
+            display_name: "405_intensity_mcu"
+          shutter:
+            controller: teensy
+            signal_type: digital
+            direction: output
+            channel_id: "port:0"
+            display_name: "405_shutter_mcu"
+      "Fluorescence 488 nm Ex":
+        wavelength_nm: 488
+        type: epi_illumination
+        io:
+          intensity:
+            controller: teensy
+            signal_type: analog
+            direction: output
+            channel_id: "port:1"
+            display_name: "488_intensity_mcu"
+          shutter:
+            controller: teensy
+            signal_type: digital
+            direction: output
+            channel_id: "port:1"
+            display_name: "488_shutter_mcu"
+      "Fluorescence 561 nm Ex":
+        wavelength_nm: 561
+        type: epi_illumination
+        io:
+          intensity:
+            controller: teensy
+            signal_type: analog
+            direction: output
+            channel_id: "port:2"
+            display_name: "561_intensity_mcu"
+          shutter:
+            controller: teensy
+            signal_type: digital
+            direction: output
+            channel_id: "port:2"
+            display_name: "561_shutter_mcu"
+      "Fluorescence 638 nm Ex":
+        wavelength_nm: 638
+        type: epi_illumination
+        io:
+          intensity:
+            controller: teensy
+            signal_type: analog
+            direction: output
+            channel_id: "port:3"
+            display_name: "638_intensity_mcu"
+          shutter:
+            controller: teensy
+            signal_type: digital
+            direction: output
+            channel_id: "port:3"
+            display_name: "638_shutter_mcu"
+      "Fluorescence 730 nm Ex":
+        wavelength_nm: 730
+        type: epi_illumination
+        io:
+          intensity:
+            controller: teensy
+            signal_type: analog
+            direction: output
+            channel_id: "port:4"
+            display_name: "730_intensity_mcu"
+          shutter:
+            controller: teensy
+            signal_type: digital
+            direction: output
+            channel_id: "port:4"
+            display_name: "730_shutter_mcu"
+
+  - id: led_matrix
+    driver: led_matrix
+    channels:
+      "BF LED matrix full":
+        source_code: 0
+        type: transillumination
+      "DF LED matrix":
+        source_code: 3
+        type: transillumination
+      "BF LED matrix low NA":
+        source_code: 4
+        type: transillumination
+      "BF LED matrix left half":
+        source_code: 1
+        type: transillumination
+      "BF LED matrix right half":
+        source_code: 2
+        type: transillumination
+      "BF LED matrix top half":
+        source_code: 7
+        type: transillumination
+      "BF LED matrix bottom half":
+        source_code: 8
+        type: transillumination
 
 software:
   is_hcs: true

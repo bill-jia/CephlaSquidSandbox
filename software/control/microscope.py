@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -14,9 +14,20 @@ from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler, StreamHandlerFunctions, NoOpStreamHandlerFunctions
 
 from control.core.io_controller import IORegistry, LightSourceSerialAdapter
-from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
+from control.lighting import (
+    IlluminationController,
+    IlluminationDevice,
+    IORoutedIlluminationDevice,
+    SerialIlluminationDevice,
+    LEDMatrixIlluminationDevice,
+    load_intensity_luts,
+    # Deprecated enums kept for any remaining callers
+    LightSourceType,
+    IntensityControlMode,
+    ShutterControlMode,
+)
 from control.microcontroller import Microcontroller
-from control.models.machine_config import MachineConfig, DeviceEntry
+from control.models.machine_config import MachineConfig, DeviceEntry, IlluminationDeviceEntry
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
 from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController, LightSource
@@ -401,70 +412,241 @@ class LowLevelDrivers:
             self.microcontroller.configure_dac80508_refdiv_and_gain(div, gains)
 
 
+def _build_io_routed_device(
+    dev_entry: IlluminationDeviceEntry,
+    io_registry: Optional[IORegistry],
+    micro: Optional[Microcontroller],
+    calibrations_dir: Path,
+) -> IORoutedIlluminationDevice:
+    """Build an IORoutedIlluminationDevice from an illumination_devices entry."""
+    channel_endpoints = {}
+    channel_wavelengths = {}
+
+    for ch_name, ch in dev_entry.channels.items():
+        intensity_ep = io_registry.get(f"{dev_entry.id}.{ch_name}.intensity") if io_registry else None
+        shutter_ep = io_registry.get(f"{dev_entry.id}.{ch_name}.shutter") if io_registry else None
+        channel_endpoints[ch_name] = (intensity_ep, shutter_ep)
+        channel_wavelengths[ch_name] = ch.wavelength_nm
+
+    luts = load_intensity_luts(calibrations_dir, channel_wavelengths)
+    return IORoutedIlluminationDevice(
+        channel_endpoints=channel_endpoints,
+        microcontroller=micro,
+        luts=luts,
+    )
+
+
+def _build_serial_device(
+    dev_entry: IlluminationDeviceEntry,
+    light_source: "LightSource",
+    io_registry: Optional[IORegistry],
+) -> SerialIlluminationDevice:
+    """Build a SerialIlluminationDevice from an illumination_devices entry."""
+    channel_serial_keys = {}
+    shutter_endpoints = {}
+
+    for ch_name, ch in dev_entry.channels.items():
+        serial_key = ch.serial_key
+        if serial_key is None:
+            wl = ch.wavelength_nm
+            serial_key = wl if wl is not None else ch_name
+        channel_serial_keys[ch_name] = serial_key
+
+        shutter_ep = io_registry.get(f"{dev_entry.id}.{ch_name}.shutter") if io_registry else None
+        if shutter_ep is not None:
+            shutter_endpoints[ch_name] = shutter_ep
+
+    light_source.initialize()
+    return SerialIlluminationDevice(
+        light_source=light_source,
+        channel_serial_keys=channel_serial_keys,
+        shutter_endpoints=shutter_endpoints or None,
+    )
+
+
+def _build_led_matrix_device(
+    dev_entry: IlluminationDeviceEntry,
+    micro: Optional[Microcontroller],
+    sci_array: Optional[SciMicroscopyLEDArray],
+) -> LEDMatrixIlluminationDevice:
+    """Build a LEDMatrixIlluminationDevice from an illumination_devices entry."""
+    channel_source_codes = {
+        ch_name: (ch.source_code if ch.source_code is not None else 0)
+        for ch_name, ch in dev_entry.channels.items()
+    }
+    if sci_array is None and micro is None:
+        raise ValueError(
+            f"LED matrix device '{dev_entry.id}' requires a microcontroller or sci_array"
+        )
+    return LEDMatrixIlluminationDevice(
+        channel_source_codes=channel_source_codes,
+        microcontroller=micro,
+        sci_array=sci_array,
+    )
+
+
 def _build_illumination_controller(
+    mc: MachineConfig,
     micro: Optional[Microcontroller],
     io_registry: Optional[IORegistry],
-    illum_entry: Optional[DeviceEntry],
-    coolled_entry: Optional[DeviceEntry],
-    coolled_instance: Optional[LightSource],
+    sci_array: Optional[SciMicroscopyLEDArray],
     simulated: bool,
-    channel_config=None,
+    config_repo,
+    coolled_instance: Optional[LightSource] = None,
 ) -> IlluminationController:
-    """Construct the appropriate IlluminationController from device entries."""
-    driver = ""
+    """Build IlluminationController from machine config.
+
+    If ``mc.illumination_devices`` is non-empty, constructs one
+    ``IlluminationDevice`` per entry and composes them.
+
+    Falls back to the legacy ``devices.illumination`` + ``devices.coolled``
+    path when ``illumination_devices`` is absent.
+    """
+    calibrations_dir = Path(__file__).parent.parent / "machine_configs" / "intensity_calibrations"
+
+    if mc.illumination_devices:
+        devices: List[IlluminationDevice] = []
+        for dev_entry in mc.illumination_devices:
+            if not dev_entry.enabled:
+                continue
+            driver = dev_entry.driver
+            try:
+                if driver == "squid_builtin":
+                    devices.append(
+                        _build_io_routed_device(dev_entry, io_registry, micro, calibrations_dir)
+                    )
+                elif driver == "led_matrix":
+                    devices.append(
+                        _build_led_matrix_device(dev_entry, micro, sci_array)
+                    )
+                elif driver == "coolled_pe400" and not simulated:
+                    import control.serial_peripherals_coolled as _coolled_module
+                    sn = dev_entry.connection.serial_number if dev_entry.connection else None
+                    port = dev_entry.connection.port if dev_entry.connection else None
+                    coolled_ls = _coolled_module.CoolLEDpE400(SN=sn, port=port)
+                    devices.append(_build_serial_device(dev_entry, coolled_ls, io_registry))
+                elif driver == "ldi" and not simulated:
+                    devices.append(_build_serial_device(dev_entry, serial_peripherals.LDI(), io_registry))
+                elif driver == "celesta" and not simulated:
+                    devices.append(_build_serial_device(dev_entry, control.celesta.CELESTA(), io_registry))
+                elif driver == "andor_laser" and not simulated:
+                    andor = control.illumination_andor.AndorLaser(
+                        control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
+                    )
+                    devices.append(_build_serial_device(dev_entry, andor, io_registry))
+                elif driver == "versalase" and not simulated:
+                    versalase = serial_peripherals.VersaLase()
+                    devices.append(_build_serial_device(dev_entry, versalase, io_registry))
+                else:
+                    squid.logging.get_logger("illumination").info(
+                        f"Skipping illumination device '{dev_entry.id}' "
+                        f"(driver='{driver}', simulated={simulated})"
+                    )
+            except Exception as exc:
+                squid.logging.get_logger("illumination").warning(
+                    f"Failed to build illumination device '{dev_entry.id}': {exc}"
+                )
+
+        if devices:
+            return IlluminationController(devices)
+
+    # ── Legacy fallback: single illumination: or coolled: device entry ────────
+    illum_entry = mc.get_device("illumination")
+    coolled_entry = mc.get_device("coolled")
+    channel_config = config_repo.get_illumination_config()
+
+    _legacy_driver = ""
     if coolled_entry and coolled_entry.enabled:
-        driver = "coolled_pe400"
+        _legacy_driver = "coolled_pe400"
     elif illum_entry and illum_entry.enabled:
-        driver = illum_entry.driver
+        _legacy_driver = illum_entry.driver
 
-    if driver == "coolled_pe400" and coolled_instance is not None:
-        return IlluminationController(
-            micro,
-            IntensityControlMode.Software,
-            ShutterControlMode.TTL,
-            LightSourceType.CoolLED,
-            coolled_instance,
-            io_registry=io_registry,
-            channel_config=channel_config,
+    # Build a single IORoutedIlluminationDevice from legacy devices.illumination
+    if _legacy_driver in ("squid_builtin", "") or _legacy_driver not in (
+        "coolled_pe400", "ldi", "celesta", "andor_laser", "versalase"
+    ):
+        # Build channel endpoints from legacy io_registry naming
+        channel_endpoints = {}
+        channel_wavelengths = {}
+        if channel_config and io_registry:
+            for ch in channel_config.channels:
+                intensity_ep = io_registry.get(f"illumination.{ch.name}.intensity")
+                if intensity_ep is None and ch.wavelength_nm is not None:
+                    intensity_ep = io_registry.get(f"illumination.{ch.wavelength_nm}nm.intensity")
+                shutter_ep = io_registry.get(f"illumination.{ch.name}.shutter")
+                if shutter_ep is None and ch.wavelength_nm is not None:
+                    shutter_ep = io_registry.get(f"illumination.{ch.wavelength_nm}nm.shutter")
+                if intensity_ep is not None or shutter_ep is not None:
+                    channel_endpoints[ch.name] = (intensity_ep, shutter_ep)
+                    channel_wavelengths[ch.name] = ch.wavelength_nm
+        luts = load_intensity_luts(calibrations_dir, channel_wavelengths)
+        io_dev = IORoutedIlluminationDevice(
+            channel_endpoints=channel_endpoints,
+            microcontroller=micro,
+            luts=luts,
         )
 
-    if driver == "ldi" and not simulated:
+        # Add LED matrix device for transillumination channels (source_code < 10)
+        led_channels = {}
+        if channel_config:
+            for ch in channel_config.channels:
+                source_code = channel_config.get_source_code(ch)
+                if source_code < 10:
+                    led_channels[ch.name] = source_code
+
+        devices_legacy: List[IlluminationDevice] = [io_dev]
+        if led_channels:
+            try:
+                devices_legacy.append(
+                    LEDMatrixIlluminationDevice(
+                        channel_source_codes=led_channels,
+                        microcontroller=micro,
+                        sci_array=sci_array,
+                    )
+                )
+            except ValueError as exc:
+                squid.logging.get_logger("illumination").warning(
+                    f"LED matrix device not created: {exc}"
+                )
+
+        return IlluminationController(devices_legacy)
+
+    # Serial light source (legacy single-device path)
+    if _legacy_driver == "coolled_pe400" and coolled_instance is not None and not simulated:
+        ch_keys = {wl: key for wl, key in coolled_instance.channel_mappings.items()} if hasattr(coolled_instance, "channel_mappings") else {}
+        shutter_eps = {}
+        if channel_config and io_registry:
+            for ch in channel_config.channels:
+                ep = io_registry.get(f"coolled.{ch.name}.shutter")
+                if ep:
+                    shutter_eps[ch.name] = ep
+        dev = SerialIlluminationDevice(
+            light_source=coolled_instance,
+            channel_serial_keys={str(wl): key for wl, key in ch_keys.items()},
+            shutter_endpoints=shutter_eps or None,
+        )
+        return IlluminationController([dev])
+
+    if _legacy_driver == "ldi" and not simulated:
         ldi = serial_peripherals.LDI()
-        return IlluminationController(
-            micro, ldi.intensity_mode, ldi.shutter_mode,
-            LightSourceType.LDI, ldi,
-            io_registry=io_registry,
-            channel_config=channel_config,
-        )
+        ldi.initialize()
+        ch_map = {str(wl): key for wl, key in ldi.channel_mappings.items()} if hasattr(ldi, "channel_mappings") else {}
+        return IlluminationController([
+            SerialIlluminationDevice(light_source=ldi, channel_serial_keys=ch_map)
+        ])
 
-    if driver == "celesta" and not simulated:
+    if _legacy_driver == "celesta" and not simulated:
         celesta = control.celesta.CELESTA()
-        return IlluminationController(
-            micro,
-            IntensityControlMode.Software,
-            ShutterControlMode.TTL,
-            LightSourceType.CELESTA,
-            celesta,
-            io_registry=io_registry,
-            channel_config=channel_config,
-        )
+        celesta.initialize()
+        ch_map = {str(wl): key for wl, key in celesta.channel_mappings.items()} if hasattr(celesta, "channel_mappings") else {}
+        return IlluminationController([
+            SerialIlluminationDevice(light_source=celesta, channel_serial_keys=ch_map)
+        ])
 
-    if driver == "andor_laser" and not simulated:
-        andor_laser = control.illumination_andor.AndorLaser(
-            control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
-        )
-        return IlluminationController(
-            micro,
-            IntensityControlMode.Software,
-            ShutterControlMode.TTL,
-            LightSourceType.AndorLaser,
-            andor_laser,
-            io_registry=io_registry,
-            channel_config=channel_config,
-        )
-
-    # Default: Cephla built-in (MCU DAC/TTL)
-    return IlluminationController(micro, io_registry=io_registry, channel_config=channel_config)
+    # Final fallback: empty controller with just an IO-routed device
+    return IlluminationController([
+        IORoutedIlluminationDevice(channel_endpoints={}, microcontroller=micro)
+    ])
 
 
 class Microscope:
@@ -576,13 +758,14 @@ class Microscope:
 
         # ── Illumination controller ───────────────────────────────────────
         io_reg = addons.io_registry
-        illum_entry = mc.get_device("illumination")
-        coolled_entry = mc.get_device("coolled")
-        illumination_channel_config = config_repo.get_illumination_config()
         illumination_controller = _build_illumination_controller(
-            low_level_devices.microcontroller, io_reg, illum_entry, coolled_entry,
-            addons.coolled, simulated,
-            channel_config=illumination_channel_config,
+            mc=mc,
+            micro=low_level_devices.microcontroller,
+            io_registry=io_reg,
+            sci_array=addons.sci_microscopy_led_array,
+            simulated=simulated,
+            config_repo=config_repo,
+            coolled_instance=addons.coolled,
         )
 
         return Microscope(

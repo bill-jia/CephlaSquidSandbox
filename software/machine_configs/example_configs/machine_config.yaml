@@ -123,75 +123,7 @@ devices:
         scanning: { x_mm: 20, y_mm: 20 }
         default_z_mm: 2.287
 
-  # -- Illumination -------------------------------------------
-  illumination:
-    driver: squid_builtin
-    channels:
-      405nm:
-        wavelength_nm: 405
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:0"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:0"
-      488nm:
-        wavelength_nm: 488
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:1"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:1"
-      561nm:
-        wavelength_nm: 561
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:2"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:2"
-      638nm:
-        wavelength_nm: 638
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:3"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:3"
-      730nm:
-        wavelength_nm: 730
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:4"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:4"
+  # illumination: block removed — channels are declared in illumination_devices below
 
   # Example: coolLED hybrid (serial intensity + NI-DAQ TTL shutter)
   # coolled:
@@ -262,6 +194,83 @@ devices:
 # This file provides supplementary info: display names, LED matrix
 # patterns, intensity calibration CSVs, excitation filter mappings.
 illumination_channels_file: illumination_channel_config.yaml
+
+# ============================================================
+# ILLUMINATION DEVICES
+# Composable illumination sources.  Each entry becomes one
+# IlluminationDevice inside IlluminationController.  Channel
+# keys must match names in illumination_channel_config.yaml.
+#
+# Supported drivers:
+#   squid_builtin  — IO-routed lasers (MCU / NI-DAQ)
+#   led_matrix     — Programmable LED array (MCU or SciMicroscopy)
+#   coolled_pe400  — CoolLED pE-400 / pE-400max (serial intensity + TTL/serial shutter)
+#   ldi            — Lumencor LDI light engine
+#   celesta        — Lumencor CELESTA light engine
+#   andor_laser    — Andor laser system
+#   versalase      — VersaLase laser system
+# ============================================================
+
+illumination_devices:
+
+  - id: squid_lasers
+    driver: squid_builtin
+    channels:
+      "Fluorescence 405 nm Ex":
+        wavelength_nm: 405
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:0" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:0" }
+      "Fluorescence 488 nm Ex":
+        wavelength_nm: 488
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:1" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:1" }
+      "Fluorescence 561 nm Ex":
+        wavelength_nm: 561
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:2" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:2" }
+      "Fluorescence 638 nm Ex":
+        wavelength_nm: 638
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:3" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:3" }
+      "Fluorescence 730 nm Ex":
+        wavelength_nm: 730
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:4" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:4" }
+
+  - id: led_matrix
+    driver: led_matrix
+    channels:
+      "BF LED matrix full":       { source_code: 0, type: transillumination }
+      "DF LED matrix":            { source_code: 3, type: transillumination }
+      "BF LED matrix low NA":     { source_code: 4, type: transillumination }
+      "BF LED matrix left half":  { source_code: 1, type: transillumination }
+      "BF LED matrix right half": { source_code: 2, type: transillumination }
+      "BF LED matrix top half":   { source_code: 7, type: transillumination }
+      "BF LED matrix bottom half":{ source_code: 8, type: transillumination }
+
+# Example: CoolLED pE-400 (serial intensity) with NI-DAQ TTL shutter
+# Uncomment and adjust to add a CoolLED alongside the squid_lasers above.
+#
+#  - id: coolled
+#    driver: coolled_pe400
+#    connection: { port: "COM5" }
+#    channels:
+#      "BF 470 nm":
+#        wavelength_nm: 470
+#        type: transillumination
+#        serial_key: "A"               # CoolLED internal channel letter
+#        io:
+#          shutter: { controller: nidaq, signal_type: digital, direction: output, channel_id: "port0/line5" }
 
 # ============================================================
 # SOFTWARE / GUI SETTINGS

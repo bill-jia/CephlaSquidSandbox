@@ -9,6 +9,40 @@ IO endpoints are owned by the devices that use them (via ``io:`` blocks on
 each device or channel), not pre-declared on the low-level controllers.
 At startup, ``MachineConfig.collect_io_endpoints()`` walks all devices and
 channels to build the ``IOEndpointConfig`` consumed by ``IORegistry``.
+
+The optional ``illumination_devices`` list supports composing multiple
+illumination sources (multi-channel serial devices such as CoolLED pE-400 or
+Lumencor SPECTRA, individual IO-routed lasers, LED matrices) under a single
+``IlluminationController``.  Example::
+
+    illumination_devices:
+      - id: squid_lasers
+        driver: squid_builtin
+        channels:
+          "Fluorescence 488 nm Ex":
+            wavelength_nm: 488
+            type: epi_illumination
+            io:
+              intensity: { controller: teensy, signal_type: analog, channel_id: "port:1" }
+              shutter:   { controller: teensy, signal_type: digital, channel_id: "port:1" }
+
+      - id: coolled
+        driver: coolled_pe400
+        connection: { port: "COM5" }
+        channels:
+          "BF 470 nm":
+            wavelength_nm: 470
+            type: transillumination
+            serial_key: "A"
+            io:
+              shutter: { controller: nidaq, signal_type: digital, channel_id: "port0/line5" }
+
+      - id: led_matrix
+        driver: led_matrix
+        channels:
+          "BF LED matrix full":
+            source_code: 0
+            type: transillumination
 """
 
 import logging
@@ -75,6 +109,60 @@ class DeviceConnection(BaseModel):
     port: Optional[str] = None
     vid: Optional[int] = None
     pid: Optional[int] = None
+
+    model_config = {"extra": "allow"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Illumination device models (for the illumination_devices list)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class IlluminationDeviceChannel(BaseModel):
+    """A single channel within an illumination device.
+
+    Extends ``DeviceChannel`` with illumination-specific metadata:
+
+    - ``type``: ``"epi_illumination"`` or ``"transillumination"``
+    - ``source_code``: MCU pattern code (LED matrix devices only)
+    - ``serial_key``: Device-internal channel key (serial devices, e.g. ``"A"``
+      for CoolLED channel A)
+    """
+
+    wavelength_nm: Optional[int] = None
+    type: str = "epi_illumination"
+    source_code: Optional[int] = None
+    serial_key: Optional[str] = None
+    io: Dict[str, DeviceIOLine] = Field(default_factory=dict)
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "allow"}
+
+
+class IlluminationDeviceEntry(BaseModel):
+    """An entry in the ``illumination_devices`` list.
+
+    Represents one physical illumination source (may have multiple channels).
+    Channel keys in ``channels`` are the canonical channel names used
+    throughout the system (must match ``IlluminationChannelConfig`` names and
+    ``AcquisitionChannel.illumination_settings.illumination_channel``).
+
+    Attributes:
+        id: Unique identifier for this device (used to prefix IO endpoint names).
+        driver: Driver name: ``"squid_builtin"``, ``"coolled_pe400"``, ``"ldi"``,
+            ``"celesta"``, ``"andor_laser"``, ``"versalase"``, ``"led_matrix"``.
+        enabled: Whether to construct this device at startup.
+        connection: Serial / USB connection details.
+        channels: ``{canonical_channel_name: IlluminationDeviceChannel}``.
+        config: Driver-specific parameters.
+    """
+
+    id: str
+    driver: str
+    enabled: bool = True
+    connection: Optional[DeviceConnection] = None
+    channels: Dict[str, IlluminationDeviceChannel] = Field(default_factory=dict)
+    config: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
 
@@ -213,6 +301,14 @@ class MachineConfig(BaseModel):
     version: float = Field(3.0, description="Configuration format version")
     devices: Dict[str, DeviceEntry] = Field(default_factory=dict)
     illumination_channels_file: Optional[str] = "illumination_channel_config.yaml"
+    illumination_devices: List[IlluminationDeviceEntry] = Field(
+        default_factory=list,
+        description=(
+            "Composable illumination sources.  When present, "
+            "IlluminationController is built from this list instead of the "
+            "legacy devices.illumination entry."
+        ),
+    )
     software: SoftwareConfig = Field(default_factory=SoftwareConfig)
 
     model_config = {"extra": "allow"}
@@ -224,6 +320,9 @@ class MachineConfig(BaseModel):
 
         Endpoint names are auto-generated as ``device.io_key`` for device-level
         IO and ``device.channel.io_key`` for channel-level IO.
+
+        Also walks ``illumination_devices`` entries, using
+        ``{device.id}.{channel_name}.{io_key}`` as endpoint names.
 
         Returns an ``IOEndpointConfig`` ready for the ``IORegistry``.
         """
@@ -244,6 +343,17 @@ class MachineConfig(BaseModel):
                 for io_key, io_line in ch.io.items():
                     ep = self._make_endpoint(
                         f"{dev_name}.{ch_name}.{io_key}", io_line, io_key,
+                    )
+                    if ep is not None:
+                        endpoints.append(ep)
+
+        for illum_dev in self.illumination_devices:
+            if not illum_dev.enabled:
+                continue
+            for ch_name, ch in illum_dev.channels.items():
+                for io_key, io_line in ch.io.items():
+                    ep = self._make_endpoint(
+                        f"{illum_dev.id}.{ch_name}.{io_key}", io_line, io_key,
                     )
                     if ep is not None:
                         endpoints.append(ep)
@@ -312,6 +422,14 @@ class MachineConfig(BaseModel):
             for ch_name, ch in dev.channels.items():
                 for io_key, io_line in ch.io.items():
                     ep_name = f"{dev_name}.{ch_name}.{io_key}"
+                    self._check_io_line(ep_name, io_line, seen_channels, issues)
+
+        for illum_dev in self.illumination_devices:
+            if not illum_dev.enabled:
+                continue
+            for ch_name, ch in illum_dev.channels.items():
+                for io_key, io_line in ch.io.items():
+                    ep_name = f"{illum_dev.id}.{ch_name}.{io_key}"
                     self._check_io_line(ep_name, io_line, seen_channels, issues)
 
         return issues
