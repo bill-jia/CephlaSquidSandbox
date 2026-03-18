@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import cv2
 
 from control import utils
 import control._def
-from squid.abc import CameraFrame
+from squid.abc import CameraFrame, AbstractCamera
 
 
 @dataclass
@@ -31,6 +31,7 @@ class StreamHandler:
         self,
         handler_functions: StreamHandlerFunctions,
         display_resolution_scaling=1,
+        camera: Optional[AbstractCamera] = None,
     ):
         self.fps_display = 1
         self.fps_save = 1
@@ -38,7 +39,7 @@ class StreamHandler:
         self.timestamp_last_display = 0
         self.timestamp_last_save = 0
         self.timestamp_last_track = 0
-
+        self.camera = camera
         self.display_resolution_scaling = display_resolution_scaling
 
         self.save_image_flag = False
@@ -100,6 +101,9 @@ class StreamHandler:
             self.counter = 0
             if control._def.PRINT_CAMERA_FPS:
                 print("real camera fps is " + str(self.fps_real))
+
+                if self.camera is not None:
+                    print(f"Stream handler grabbing from camera: {self.camera}, frame: {frame.frame.shape}")
 
         # crop image
         image = np.squeeze(frame.frame)

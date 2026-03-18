@@ -659,14 +659,14 @@ class Microscope:
 
         self.contrast_manager: ContrastManager = ContrastManager()
         # StreamHandler: Processes camera frames and routes them to callbacks
-        self.stream_handler: StreamHandler = StreamHandler(handler_functions=stream_handler_callbacks)
+        self.stream_handler: StreamHandler = StreamHandler(handler_functions=stream_handler_callbacks, camera=self.camera)
 
         # Focus camera setup (if available)
         # Used for laser autofocus or displacement measurement
         self.stream_handler_focus: Optional[StreamHandler] = None
         self.live_controller_focus: Optional[LiveController] = None
         if self.addons.camera_focus:
-            self.stream_handler_focus = StreamHandler(handler_functions=NoOpStreamHandlerFunctions)
+            self.stream_handler_focus = StreamHandler(handler_functions=NoOpStreamHandlerFunctions, camera=self.addons.camera_focus)
             self.live_controller_focus = LiveController(
                 microscope=self,
                 camera=self.addons.camera_focus,

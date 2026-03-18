@@ -576,7 +576,7 @@ class HighContentScreeningGui(QMainWindow):
         self.liveController: LiveController = microscope.live_controller
         self.objectiveStore: ObjectiveStore = microscope.objective_store
 
-        self.liveController_focus_camera: Optional[AbstractCamera] = None
+        self.liveController_focus_camera: Optional[LiveController] = None
         self.streamHandler_focus_camera: Optional[StreamHandler] = None
         self.imageDisplayWindow_focus: Optional[core.ImageDisplayWindow] = None
         self.displacementMeasurementController: Optional[
@@ -586,12 +586,11 @@ class HighContentScreeningGui(QMainWindow):
         if self.microscope.addons.camera_focus:
             # self.log.info(self.microscope.addons.camera_focus._config)
             self.liveController_focus_camera = self.microscope.live_controller_focus
-            self.log.info(f"liveController_focus_camera: {self.liveController_focus_camera}")
             self.streamHandler_focus_camera = core.QtStreamHandler(
                 accept_new_frame_fn=lambda: self.liveController_focus_camera.is_live
-            )
+            ,camera=self.camera_focus)
             self.imageDisplayWindow_focus = core.ImageDisplayWindow(
-                liveController=self.liveController, show_LUT=False, autoLevels=False
+                liveController=self.liveController_focus_camera, show_LUT=False, autoLevels=False
             )
             self.displacementMeasurementController = core_displacement_measurement.DisplacementMeasurementController()
             af_laser_ep = (
@@ -783,7 +782,7 @@ class HighContentScreeningGui(QMainWindow):
             self.addDockWidget(Qt.LeftDockWidgetArea, self.jupyter_dock)
 
     def load_objects(self, is_simulation):
-        self.streamHandler = core.QtStreamHandler(accept_new_frame_fn=lambda: self.liveController.is_live)
+        self.streamHandler = core.QtStreamHandler(accept_new_frame_fn=lambda: self.liveController.is_live, camera=self.camera)
         self.autofocusController = QtAutoFocusController(
             self.camera, self.stage, self.liveController, self.microcontroller, self.nl5
         )
@@ -1005,7 +1004,7 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusControlWidget: widgets.LaserAutofocusControlWidget = widgets.LaserAutofocusControlWidget(
                 self.laserAutofocusController, self.liveController
             )
-            self.imageDisplayWindow_focus = core.ImageDisplayWindow(liveController=self.liveController)
+            self.imageDisplayWindow_focus = core.ImageDisplayWindow(liveController=self.liveController_focus_camera)
 
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
@@ -1667,7 +1666,8 @@ class HighContentScreeningGui(QMainWindow):
             )
         )
 
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
+            self.log.info(f"laser autofocus controller: {self.laserAutofocusController}, camera: {self.camera_focus}, setting up connections")
 
             def slot_settings_changed_laser_af():
                 self.laserAutofocusController.on_settings_changed()
@@ -2377,7 +2377,7 @@ class HighContentScreeningGui(QMainWindow):
             current_widget.activate()
 
         # Stop focus camera live if not on laser focus tab
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
             is_laser_focus_tab = self.imageDisplayTabs.tabText(index) == self.LASER_BASED_FOCUS_TAB_NAME
 
             if hasattr(self, "dock_wellSelection"):
@@ -2851,7 +2851,7 @@ class HighContentScreeningGui(QMainWindow):
                     raise
 
         # Stop laser autofocus
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self.microscope.addons.camera_focus:
             try:
                 self.liveController_focus_camera.stop_live()
                 self.imageDisplayWindow_focus.close()

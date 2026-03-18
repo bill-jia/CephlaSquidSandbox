@@ -61,7 +61,7 @@ class QtStreamHandler(QObject):
     packet_image_to_write = Signal(np.ndarray, int, float)
     signal_new_frame_received = Signal()
 
-    def __init__(self, display_resolution_scaling=1, accept_new_frame_fn: Callable[[], bool] = lambda: True):
+    def __init__(self, display_resolution_scaling=1, accept_new_frame_fn: Callable[[], bool] = lambda: True, camera: Optional[AbstractCamera] = None):
         super().__init__()
 
         functions = StreamHandlerFunctions(
@@ -71,7 +71,7 @@ class QtStreamHandler(QObject):
             accept_new_frame=accept_new_frame_fn,
         )
         self._handler = StreamHandler(
-            handler_functions=functions, display_resolution_scaling=display_resolution_scaling
+            handler_functions=functions, display_resolution_scaling=display_resolution_scaling, camera=camera
         )
 
     def get_frame_callback(self) -> Callable[[CameraFrame], None]:
@@ -1211,6 +1211,7 @@ class ImageDisplayWindow(QMainWindow):
 
     def display_image(self, image):
         # enable the line profiler button after the first image is displayed
+        self._log.info(f"camera: {self.liveController.camera}, attempt to display image: {image.shape}")
         if self.first_image:
             self.first_image = False
             self.btn_line_profiler.setEnabled(True)
