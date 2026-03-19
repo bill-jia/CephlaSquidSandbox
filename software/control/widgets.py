@@ -19968,13 +19968,36 @@ class IlluminationWidget(QWidget):
         channels_layout.setSpacing(4)
 
         channel_config = getattr(self._controller, "channel_config", None)
-        channels = channel_config.channels if channel_config is not None else []
+        channel_names: List[str] = getattr(self._controller, "channel_names", []) or []
+        name_to_wavelength: Dict[str, Optional[int]] = {}
 
-        for row_idx, ch in enumerate(channels):
+        # Option B: show only channels backed by devices, i.e. controller.channel_names.
+        # If the controller also exposes an IlluminationChannelConfig, use it only
+        # to enrich labels (wavelength display).
+        if channel_config is not None and hasattr(channel_config, "channels"):
+            try:
+                channels = channel_config.channels or []
+                for ch in channels:
+                    if ch.name in channel_names:
+                        name_to_wavelength[ch.name] = getattr(ch, "wavelength_nm", None)
+            except Exception:
+                # If we can't inspect channel_config, fall back to parsing from names.
+                name_to_wavelength = {}
+
+        # Fallback wavelength extraction for compositor-backed channel names.
+        # Channel names typically look like "Fluorescence 405 nm Ex".
+        _WL_RE = re.compile(r"(\d{3,4})\s*nm", re.IGNORECASE)
+        for ch_name in channel_names:
+            if ch_name not in name_to_wavelength:
+                m = _WL_RE.search(ch_name)
+                name_to_wavelength[ch_name] = int(m.group(1)) if m else None
+
+        for row_idx, ch_name in enumerate(channel_names):
             # Name label
-            label_text = ch.name
-            if ch.wavelength_nm is not None:
-                label_text += f"  ({ch.wavelength_nm} nm)"
+            label_text = ch_name
+            wl = name_to_wavelength.get(ch_name)
+            if wl is not None:
+                label_text += f"  ({wl} nm)"
             label = QLabel(label_text)
             label.setMinimumWidth(120)
 
@@ -20008,14 +20031,14 @@ class IlluminationWidget(QWidget):
             channels_layout.addWidget(btn,     row_idx, 3)
 
             # Store references
-            self._channel_rows[ch.name] = {
+            self._channel_rows[ch_name] = {
                 "slider": slider,
                 "spinbox": spinbox,
                 "btn": btn,
             }
 
             # Wire signals (capture ch.name by closure)
-            name = ch.name
+            name = ch_name
             slider.valueChanged.connect(
                 lambda v, n=name: self._on_slider_changed(n, v)
             )
