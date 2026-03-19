@@ -290,13 +290,10 @@ class ILLUMINATION_CODE:
     ILLUMINATION_D4 = 13
     ILLUMINATION_D5 = 15
 
-    # Illumination Control TTL Ports - legacy wavelength-based names (deprecated, kept for compatibility)
-    # Use ILLUMINATION_D1-D5 for new code; wavelength is configured in YAML
-    ILLUMINATION_SOURCE_405NM = ILLUMINATION_D1
-    ILLUMINATION_SOURCE_488NM = ILLUMINATION_D2
-    ILLUMINATION_SOURCE_561NM = ILLUMINATION_D3
-    ILLUMINATION_SOURCE_638NM = ILLUMINATION_D4
-    ILLUMINATION_SOURCE_730NM = ILLUMINATION_D5
+    # NOTE:
+    # Legacy wavelength-based alias names (e.g. ILLUMINATION_SOURCE_405NM) were
+    # removed as they are no longer needed: wavelengths are configured via
+    # `illumination_channel_config.yaml`.
 
 
 class ILLUMINATION_PORT:
@@ -964,10 +961,6 @@ USE_CELESTA_ETHERNET_CONTROL = False
 USE_ANDOR_LASER_CONTROL = False
 ANDOR_LASER_VID = 0x1BDB
 ANDOR_LASER_PID = 0x0300
-
-USE_COOLLED = False
-COOLLED_SN = ""       # Serial number for USB auto-discovery (alternative to COOLLED_PORT)
-COOLLED_PORT = None    # Explicit COM port (e.g. "COM5"), overrides SN-based discovery
 
 XLIGHT_SERIAL_NUMBER = "B00031BE"
 XLIGHT_SLEEP_TIME_FOR_WHEEL = 0.25

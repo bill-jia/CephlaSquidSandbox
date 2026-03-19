@@ -85,16 +85,9 @@ def apply_machine_config(mc: MachineConfig) -> None:
     illum = mc.get_device("illumination")
     if illum and illum.enabled:
         drv = illum.driver
-        control._def.USE_COOLLED = drv == "coolled_pe400"
         control._def.USE_LDI_SERIAL_CONTROL = drv == "ldi"
         control._def.USE_CELESTA_ETHERNET_CONTROL = drv == "celesta"
         control._def.USE_ANDOR_LASER_CONTROL = drv == "andor_laser"
-
-    # Also check for a dedicated coolled device
-    if _dev_enabled("coolled"):
-        control._def.USE_COOLLED = True
-        control._def.COOLLED_SN = _dev_connection("coolled", "serial_number", "")
-        control._def.COOLLED_PORT = _dev_connection("coolled", "port")
 
     # Spinning disk confocal
     xlight_enabled = _dev_enabled("xlight")

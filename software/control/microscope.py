@@ -227,23 +227,7 @@ class MicroscopeAddons:
             nidaq = NIDAQ(**nidaq_config)
 
         # ── Hybrid serial+IO light sources ────────────────────────────────
-        coolled = None
-        coolled_entry = _dev("coolled")
-        if coolled_entry:
-            try:
-                import control.serial_peripherals_coolled as coolled_peripherals
-                if not _sim("coolled"):
-                    sn = coolled_entry.connection.serial_number if coolled_entry.connection else None
-                    port = coolled_entry.connection.port if coolled_entry.connection else None
-                    coolled = coolled_peripherals.CoolLEDpE400(SN=sn, port=port)
-                else:
-                    coolled = coolled_peripherals.CoolLEDpE400_Simulation()
-            except ImportError:
-                log.warning("coolLED module not available")
-
         serial_devices: Dict[str, object] = {}
-        if coolled is not None:
-            serial_devices["coolled"] = LightSourceSerialAdapter(coolled)
 
         # ── IO endpoint registry ──────────────────────────────────────────
         # Uses io_config collected above (from machine_config.yaml device io: blocks)
@@ -287,8 +271,7 @@ class MicroscopeAddons:
             piezo_stage,
             sci_microscopy_led_array,
             nidaq,
-            io_registry=io_registry,
-            coolled=coolled,
+            io_registry=io_registry
         )
 
     def __init__(
@@ -304,8 +287,7 @@ class MicroscopeAddons:
         piezo_stage: Optional[PiezoStage] = None,
         sci_microscopy_led_array: Optional[SciMicroscopyLEDArray] = None,
         nidaq: Optional[AbstractNIDAQ] = None,
-        io_registry: Optional[IORegistry] = None,
-        coolled=None,
+        io_registry: Optional[IORegistry] = None
     ):
         self.xlight = xlight
         self.dragonfly = dragonfly
@@ -319,7 +301,6 @@ class MicroscopeAddons:
         self.sci_microscopy_led_array = sci_microscopy_led_array
         self.nidaq = nidaq
         self.io_registry: Optional[IORegistry] = io_registry
-        self.coolled = coolled
 
     def prepare_for_use(self, skip_init: bool = False, skip_homing: bool = False):
         """
@@ -491,8 +472,7 @@ def _build_illumination_controller(
     io_registry: Optional[IORegistry],
     sci_array: Optional[SciMicroscopyLEDArray],
     simulated: bool,
-    config_repo,
-    coolled_instance: Optional[LightSource] = None,
+    config_repo
 ) -> IlluminationController:
     """Build IlluminationController from machine config.
 
@@ -563,7 +543,7 @@ def _build_illumination_controller(
 
     # Build a single IORoutedIlluminationDevice from legacy devices.illumination
     if _legacy_driver in ("squid_builtin", "") or _legacy_driver not in (
-        "coolled_pe400", "ldi", "celesta", "andor_laser", "versalase"
+        "ldi", "celesta", "andor_laser", "versalase"
     ):
         # Build channel endpoints from legacy io_registry naming
         channel_endpoints = {}
@@ -610,22 +590,6 @@ def _build_illumination_controller(
                 )
 
         return IlluminationController(devices_legacy)
-
-    # Serial light source (legacy single-device path)
-    if _legacy_driver == "coolled_pe400" and coolled_instance is not None and not simulated:
-        ch_keys = {wl: key for wl, key in coolled_instance.channel_mappings.items()} if hasattr(coolled_instance, "channel_mappings") else {}
-        shutter_eps = {}
-        if channel_config and io_registry:
-            for ch in channel_config.channels:
-                ep = io_registry.get(f"coolled.{ch.name}.shutter")
-                if ep:
-                    shutter_eps[ch.name] = ep
-        dev = SerialIlluminationDevice(
-            light_source=coolled_instance,
-            channel_serial_keys={str(wl): key for wl, key in ch_keys.items()},
-            shutter_endpoints=shutter_eps or None,
-        )
-        return IlluminationController([dev])
 
     if _legacy_driver == "ldi" and not simulated:
         ldi = serial_peripherals.LDI()
@@ -764,8 +728,7 @@ class Microscope:
             io_registry=io_reg,
             sci_array=addons.sci_microscopy_led_array,
             simulated=simulated,
-            config_repo=config_repo,
-            coolled_instance=addons.coolled,
+            config_repo=config_repo
         )
 
         return Microscope(

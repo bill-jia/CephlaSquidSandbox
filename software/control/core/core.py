@@ -1211,7 +1211,6 @@ class ImageDisplayWindow(QMainWindow):
 
     def display_image(self, image):
         # enable the line profiler button after the first image is displayed
-        self._log.info(f"camera: {self.liveController.camera}, attempt to display image: {image.shape}")
         if self.first_image:
             self.first_image = False
             self.btn_line_profiler.setEnabled(True)

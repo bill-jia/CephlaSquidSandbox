@@ -184,89 +184,56 @@ illumination_channels_file: illumination_channel_config.yaml
 
 illumination_devices:
 
-  - id: squid_lasers
-    driver: squid_builtin
+  - id: coolled_pe400
+    driver: coolled_pe400
+    # Update COM port / connection details to match your setup.
+    connection:
+      serial_number: "3065377C3433"
     channels:
       "Fluorescence 405 nm Ex":
         wavelength_nm: 405
         type: epi_illumination
+        serial_key: "B"
         io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:0"
-            display_name: "405_intensity_mcu"
           shutter:
-            controller: teensy
+            controller: nidaq
             signal_type: digital
             direction: output
-            channel_id: "port:0"
-            display_name: "405_shutter_mcu"
+            channel_id: "port0/line0"
+            display_name: "coolled_shutter_405_nidaq0"
       "Fluorescence 488 nm Ex":
         wavelength_nm: 488
         type: epi_illumination
+        serial_key: "C"
         io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:1"
-            display_name: "488_intensity_mcu"
           shutter:
-            controller: teensy
+            controller: nidaq
             signal_type: digital
             direction: output
-            channel_id: "port:1"
-            display_name: "488_shutter_mcu"
-      "Fluorescence 561 nm Ex":
+            channel_id: "port0/line1"
+            display_name: "coolled_shutter_488_nidaq1"
+      "Fluorescence 561/594 nm Ex":
         wavelength_nm: 561
         type: epi_illumination
+        serial_key: "D"
         io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:2"
-            display_name: "561_intensity_mcu"
           shutter:
-            controller: teensy
+            controller: nidaq
             signal_type: digital
             direction: output
-            channel_id: "port:2"
-            display_name: "561_shutter_mcu"
-      "Fluorescence 638 nm Ex":
-        wavelength_nm: 638
+            channel_id: "port0/line2"
+            display_name: "coolled_shutter_561/594_nidaq2"
+      "Fluorescence 635 nm Ex":
+        wavelength_nm: 635
         type: epi_illumination
+        serial_key: "A"
         io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:3"
-            display_name: "638_intensity_mcu"
           shutter:
-            controller: teensy
+            controller: nidaq
             signal_type: digital
             direction: output
-            channel_id: "port:3"
-            display_name: "638_shutter_mcu"
-      "Fluorescence 730 nm Ex":
-        wavelength_nm: 730
-        type: epi_illumination
-        io:
-          intensity:
-            controller: teensy
-            signal_type: analog
-            direction: output
-            channel_id: "port:4"
-            display_name: "730_intensity_mcu"
-          shutter:
-            controller: teensy
-            signal_type: digital
-            direction: output
-            channel_id: "port:4"
-            display_name: "730_shutter_mcu"
+            channel_id: "port0/line3"
+            display_name: "coolled_shutter_638_nidaq3"
 
   - id: led_matrix
     driver: led_matrix
