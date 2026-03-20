@@ -792,7 +792,6 @@ class NIDAQ(AbstractNIDAQ):
                         samps_per_chan=LIVE_SAMPS,
                     )
                     vals = [do_values[line] for line in do_values]
-                    self._log.info(f"Writing DO values: {vals}")
                     if len(vals) == 1:
                         self._live_do_task.write(
                             np.full(LIVE_SAMPS, bool(vals[0]), dtype=np.bool_),
