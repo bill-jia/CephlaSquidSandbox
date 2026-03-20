@@ -792,17 +792,21 @@ class NIDAQ(AbstractNIDAQ):
                         samps_per_chan=LIVE_SAMPS,
                     )
                     vals = [do_values[line] for line in do_values]
+                    self._log.info(f"Writing DO values: {vals}")
                     if len(vals) == 1:
                         self._live_do_task.write(
-                            np.full(LIVE_SAMPS, bool(vals[0])),
+                            np.full(LIVE_SAMPS, bool(vals[0]), dtype=np.bool_),
                             auto_start=False,
                         )
                     else:
-                        arr = np.array(
-                            [[bool(v)] * LIVE_SAMPS for v in vals],
-                            dtype=np.uint8,
-                        )
-                        self._live_do_task.write(arr, auto_start=False)
+                        # NIDAQmx expects boolean samples for DO tasks.
+                        # Using uint8 can fail when the number of digital lines
+                        # in the task changes (e.g. 1 -> 2 lines).
+                        per_line = np.array([
+                            np.full(LIVE_SAMPS, bool(v), dtype=np.bool_)
+                            for v in vals
+                        ], dtype=np.bool_)
+                        self._live_do_task.write(per_line, auto_start=False)
                     self._live_do_task.start()
             except Exception as e:
                 self._log.error(f"Failed to start live output: {e}", exc_info=True)
