@@ -19971,6 +19971,10 @@ class IlluminationWidget(QWidget):
         channel_names: List[str] = getattr(self._controller, "channel_names", []) or []
         name_to_wavelength: Dict[str, Optional[int]] = {}
 
+        unified_lm_name: Optional[str] = None
+        if getattr(self._controller, "has_unified_led_matrix", lambda: False)():
+            unified_lm_name = getattr(self._controller, "unified_led_matrix_channel_name", lambda: None)()
+
         # Option B: show only channels backed by devices, i.e. controller.channel_names.
         # If the controller also exposes an IlluminationChannelConfig, use it only
         # to enrich labels (wavelength display).
@@ -19993,13 +19997,33 @@ class IlluminationWidget(QWidget):
                 name_to_wavelength[ch_name] = int(m.group(1)) if m else None
 
         for row_idx, ch_name in enumerate(channel_names):
-            # Name label
+            # Name label (unified LED matrix: label + mode selector)
             label_text = ch_name
             wl = name_to_wavelength.get(ch_name)
             if wl is not None:
                 label_text += f"  ({wl} nm)"
-            label = QLabel(label_text)
-            label.setMinimumWidth(120)
+
+            mode_combo: Optional[QComboBox] = None
+            if unified_lm_name and ch_name == unified_lm_name:
+                name_cell = QWidget()
+                name_row = QHBoxLayout(name_cell)
+                name_row.setContentsMargins(0, 0, 0, 0)
+                name_row.setSpacing(6)
+                name_row.addWidget(QLabel(label_text))
+                mode_combo = QComboBox()
+                for mode_key, mode_label in self._controller.led_matrix_mode_items():
+                    mode_combo.addItem(mode_label, mode_key)
+                cur_mode = self._controller.get_led_matrix_mode()
+                if cur_mode is not None:
+                    mi = mode_combo.findData(cur_mode)
+                    if mi >= 0:
+                        mode_combo.setCurrentIndex(mi)
+                mode_combo.setMinimumWidth(160)
+                name_row.addWidget(mode_combo, stretch=1)
+                label = name_cell
+            else:
+                label = QLabel(label_text)
+                label.setMinimumWidth(120)
 
             # Intensity slider
             slider = QSlider(Qt.Horizontal)
@@ -20031,11 +20055,14 @@ class IlluminationWidget(QWidget):
             channels_layout.addWidget(btn,     row_idx, 3)
 
             # Store references
-            self._channel_rows[ch_name] = {
+            row_data: Dict = {
                 "slider": slider,
                 "spinbox": spinbox,
                 "btn": btn,
             }
+            if mode_combo is not None:
+                row_data["mode_combo"] = mode_combo
+            self._channel_rows[ch_name] = row_data
 
             # Wire signals (capture ch.name by closure)
             name = ch_name
@@ -20048,6 +20075,10 @@ class IlluminationWidget(QWidget):
             btn.toggled.connect(
                 lambda checked, n=name: self._on_shutter_toggled(n, checked)
             )
+            if mode_combo is not None:
+                mode_combo.currentIndexChanged.connect(
+                    lambda idx, n=name: self._on_led_matrix_mode_changed(n, idx)
+                )
 
         root.addWidget(channels_group)
 
@@ -20115,6 +20146,17 @@ class IlluminationWidget(QWidget):
             self._controller.turn_on_channel(channel_name)
         else:
             self._controller.turn_off_channel(channel_name)
+
+    def _on_led_matrix_mode_changed(self, channel_name: str, index: int):
+        row = self._channel_rows.get(channel_name)
+        if row is None:
+            return
+        combo = row.get("mode_combo")
+        if combo is None:
+            return
+        mode_key = combo.itemData(index)
+        if mode_key is not None and getattr(self._controller, "set_led_matrix_mode", None):
+            self._controller.set_led_matrix_mode(mode_key)
 
     def _on_save_preset(self):
         name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
@@ -20189,6 +20231,16 @@ class IlluminationWidget(QWidget):
             btn.setChecked(state.is_on)
             btn.setText("ON" if state.is_on else "OFF")
             self._apply_shutter_style(btn, state.is_on)
+
+            combo = row.get("mode_combo")
+            if combo is not None and getattr(self._controller, "get_led_matrix_mode", None):
+                mk = self._controller.get_led_matrix_mode()
+                if mk is not None:
+                    mi = combo.findData(mk)
+                    if mi >= 0:
+                        combo.blockSignals(True)
+                        combo.setCurrentIndex(mi)
+                        combo.blockSignals(False)
 
             slider.blockSignals(False)
             spinbox.blockSignals(False)

@@ -79,6 +79,10 @@ class IlluminationSettings(BaseModel):
         None, description="Illumination channel name from illumination_channel_config (only in general.yaml)"
     )
     intensity: float = Field(..., ge=0, le=100, description="Illumination intensity percentage (0-100)")
+    led_matrix_mode: Optional[str] = Field(
+        None,
+        description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -386,6 +390,7 @@ def merge_channel_configs(
         merged_illumination = IlluminationSettings(
             illumination_channel=gen_channel.illumination_settings.illumination_channel,
             intensity=obj_channel.illumination_settings.intensity,
+            led_matrix_mode=gen_channel.illumination_settings.led_matrix_mode,
         )
 
         # Merge camera settings (v1.0: single object, not Dict)

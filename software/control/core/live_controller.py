@@ -216,6 +216,12 @@ class LiveController:
         """Turn on illumination for the current channel."""
         channel_name = self._get_illumination_channel_name()
         if channel_name:
+            if self.currentConfiguration is not None:
+                ill = self.currentConfiguration.illumination_settings
+                mode = getattr(ill, "led_matrix_mode", None)
+                ic = self.microscope.illumination_controller
+                if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
+                    ic.set_led_matrix_mode(mode)
             self.microscope.illumination_controller.turn_on_channel(channel_name)
         else:
             self._log.warning(
@@ -243,6 +249,11 @@ class LiveController:
             return
         channel_name = self._get_illumination_channel_name()
         intensity = self.currentConfiguration.illumination_intensity
+        ill = self.currentConfiguration.illumination_settings
+        mode = getattr(ill, "led_matrix_mode", None)
+        ic = self.microscope.illumination_controller
+        if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
+            ic.set_led_matrix_mode(mode)
         if channel_name:
             self.microscope.illumination_controller.set_channel_intensity(channel_name, intensity)
             # NL5 / CellX laser power forwarding (wavelength-specific accessories)

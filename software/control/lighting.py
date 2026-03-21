@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -518,15 +518,93 @@ class SerialIlluminationDevice(IlluminationDevice):
 
 
 # ---------------------------------------------------------------------------
+# LED matrix defaults (Teensy / SciMicroscopy channel-name conventions)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
+    "bf_full": {
+        "source_code": 0,
+        "label": "BF full",
+        "matrix_channel_name": "BF LED matrix full",
+    },
+    "df": {
+        "source_code": 3,
+        "label": "Dark field",
+        "matrix_channel_name": "DF LED matrix",
+    },
+    "low_na": {
+        "source_code": 4,
+        "label": "BF low NA",
+        "matrix_channel_name": "BF LED matrix low NA",
+    },
+    "left_half": {
+        "source_code": 1,
+        "label": "BF left half",
+        "matrix_channel_name": "BF LED matrix left half",
+    },
+    "right_half": {
+        "source_code": 2,
+        "label": "BF right half",
+        "matrix_channel_name": "BF LED matrix right half",
+    },
+    "top_half": {
+        "source_code": 7,
+        "label": "BF top half",
+        "matrix_channel_name": "BF LED matrix top half",
+    },
+    "bottom_half": {
+        "source_code": 8,
+        "label": "BF bottom half",
+        "matrix_channel_name": "BF LED matrix bottom half",
+    },
+    "bf_r": {
+        "source_code": 0,
+        "label": "BF (red)",
+        "matrix_channel_name": "BF LED matrix full_R",
+    },
+    "bf_g": {
+        "source_code": 0,
+        "label": "BF (green)",
+        "matrix_channel_name": "BF LED matrix full_G",
+    },
+    "bf_b": {
+        "source_code": 0,
+        "label": "BF (blue)",
+        "matrix_channel_name": "BF LED matrix full_B",
+    },
+}
+
+_DEFAULT_LEGACY_TO_MODE: Dict[str, str] = {
+    "BF LED matrix full": "bf_full",
+    "DF LED matrix": "df",
+    "BF LED matrix low NA": "low_na",
+    "BF LED matrix left half": "left_half",
+    "BF LED matrix right half": "right_half",
+    "BF LED matrix top half": "top_half",
+    "BF LED matrix bottom half": "bottom_half",
+    "BF LED matrix full_R": "bf_r",
+    "BF LED matrix full_G": "bf_g",
+    "BF LED matrix full_B": "bf_b",
+    "BF LED matrix full_RGB": "bf_full",
+}
+
+
+# ---------------------------------------------------------------------------
 # Concrete device: LED matrix (SciMicroscopy array or plain MCU patterns)
 # ---------------------------------------------------------------------------
 
 class LEDMatrixIlluminationDevice(IlluminationDevice):
     """Illumination device for a programmable LED array.
 
-    Channels correspond to named illumination patterns
-    (e.g. ``"BF LED matrix full"``).  Each channel maps to a source_code
-    integer that the MCU uses to select the pattern.
+    **Classic mode:** Each channel name maps to a ``source_code`` (MCU pattern).
+
+    **Unified mode (Teensy / single logical channel):** One channel name (e.g.
+    ``"LED matrix"``) with a separate **mode** (BF, DF, halves, RGB, etc.).
+    Configure with ``illumination_devices[].config``::
+
+        unified: true
+        unified_channel_name: "LED matrix"
+        modes: { bf_full: { source_code: 0, label: "BF full", ... }, ... }
 
     Either a ``SciMicroscopyLEDArray`` or a plain ``Microcontroller`` can
     back this device:
@@ -542,26 +620,105 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         channel_source_codes: Dict[str, int],
         microcontroller: Optional["Microcontroller"] = None,
         sci_array: Optional["SciMicroscopyLEDArray"] = None,
+        *,
+        unified: bool = False,
+        unified_channel_name: str = "LED matrix",
+        modes: Optional[Dict[str, Dict[str, Any]]] = None,
+        legacy_channel_to_mode: Optional[Dict[str, str]] = None,
     ):
         """
         Args:
-            channel_source_codes: ``{channel_name: source_code}``
+            channel_source_codes: ``{channel_name: source_code}`` (ignored when unified)
             microcontroller: MCU for plain LED matrix control.
             sci_array: SciMicroscopyLEDArray instance (takes priority over MCU).
+            unified: If True, expose a single channel and use ``set_matrix_mode``.
+            unified_channel_name: Logical channel name when unified.
+            modes: ``{mode_key: {source_code, label, matrix_channel_name?}}``
+            legacy_channel_to_map: Map old channel names to mode keys (for acquisition).
         """
         if microcontroller is None and sci_array is None:
             raise ValueError(
                 "LEDMatrixIlluminationDevice requires microcontroller or sci_array"
             )
-        self._channel_source_codes = channel_source_codes
         self._microcontroller = microcontroller
         self._sci_array = sci_array
-        self._intensity: Dict[str, float] = {n: 0.0 for n in channel_source_codes}
-        self._is_on_state: Dict[str, bool] = {n: False for n in channel_source_codes}
+        self._unified = bool(unified)
+        self._unified_channel_name = unified_channel_name
+
+        if self._unified:
+            self._modes: Dict[str, Dict[str, Any]] = dict(modes) if modes else dict(_DEFAULT_UNIFIED_MODES)
+            self._legacy_to_mode: Dict[str, str] = (
+                dict(legacy_channel_to_mode)
+                if legacy_channel_to_mode
+                else dict(_DEFAULT_LEGACY_TO_MODE)
+            )
+            keys = list(self._modes.keys())
+            if not keys:
+                raise ValueError("unified LED matrix requires at least one mode")
+            self._active_mode_key: str = keys[0]
+            self._channel_source_codes = {}
+            self._intensity = {unified_channel_name: 0.0}
+            self._is_on_state = {unified_channel_name: False}
+        else:
+            self._modes = {}
+            self._legacy_to_mode = {}
+            self._active_mode_key = ""
+            self._channel_source_codes = channel_source_codes
+            self._intensity = {n: 0.0 for n in channel_source_codes}
+            self._is_on_state = {n: False for n in channel_source_codes}
+
         self._active_channel: Optional[str] = None
 
     @property
+    def is_unified_mode(self) -> bool:
+        return self._unified
+
+    @property
+    def unified_channel_name(self) -> str:
+        return self._unified_channel_name
+
+    @property
+    def legacy_channel_to_mode(self) -> Dict[str, str]:
+        return self._legacy_to_mode
+
+    def matrix_mode_items(self) -> List[Tuple[str, str]]:
+        """Return ``(mode_key, label)`` for UI combo boxes."""
+        out: List[Tuple[str, str]] = []
+        for key, spec in self._modes.items():
+            label = str(spec.get("label", key))
+            out.append((key, label))
+        return out
+
+    def get_matrix_mode(self) -> str:
+        return self._active_mode_key
+
+    def set_matrix_mode(self, mode_key: str) -> None:
+        if not self._unified:
+            logger.warning("set_matrix_mode: device is not in unified mode")
+            return
+        if mode_key not in self._modes:
+            logger.warning(f"set_matrix_mode: unknown mode '{mode_key}'")
+            return
+        self._active_mode_key = mode_key
+        u = self._unified_channel_name
+        if self._is_on_state.get(u, False):
+            self.set_intensity(u, self._intensity.get(u, 0.0))
+
+    def _apply_unified_intensity(self, intensity: float) -> None:
+        spec = self._modes[self._active_mode_key]
+        source_code = int(spec["source_code"])
+        mcu_name = str(spec.get("matrix_channel_name", "BF LED matrix full"))
+        if self._sci_array is not None:
+            self._sci_array.apply_channel_configuration(mcu_name, intensity)
+        elif self._microcontroller is not None:
+            self._microcontroller.apply_led_matrix_channel_configuration(
+                mcu_name, source_code, intensity
+            )
+
+    @property
     def channel_names(self) -> List[str]:
+        if self._unified:
+            return [self._unified_channel_name]
         return list(self._channel_source_codes.keys())
 
     def initialize(self) -> None:
@@ -571,8 +728,19 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         self.turn_off_all()
 
     def set_intensity(self, channel: str, intensity: float) -> None:
-        """Configure the LED pattern for *channel* at *intensity* percent."""
+        """Configure intensity. In unified mode *channel* must be the unified name."""
         intensity = float(np.clip(intensity, 0, 100))
+        if self._unified:
+            if channel != self._unified_channel_name:
+                logger.warning(
+                    f"set_intensity: expected unified channel '{self._unified_channel_name}', got '{channel}'"
+                )
+                return
+            self._intensity[channel] = intensity
+            self._active_channel = channel
+            self._apply_unified_intensity(intensity)
+            return
+
         self._intensity[channel] = intensity
         self._active_channel = channel
         if self._sci_array is not None:
@@ -585,25 +753,38 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
 
     def turn_on(self, channel: str) -> None:
         """Activate the LED pattern for *channel*."""
+        if self._unified and channel != self._unified_channel_name:
+            logger.warning(f"turn_on: expected unified channel '{self._unified_channel_name}'")
+            return
         self._active_channel = channel
+        key = self._unified_channel_name if self._unified else channel
+        self._is_on_state[key] = True
+        if self._unified:
+            self._apply_unified_intensity(self._intensity.get(self._unified_channel_name, 0.0))
         if self._sci_array is not None:
             self._sci_array.turn_on_illumination()
         elif self._microcontroller is not None:
             self._microcontroller.turn_on_illumination()
-        self._is_on_state[channel] = True
 
     def turn_off(self, channel: str) -> None:
         """Deactivate LED illumination."""
+        if self._unified and channel != self._unified_channel_name:
+            logger.warning(f"turn_off: expected unified channel '{self._unified_channel_name}'")
+            return
         if self._sci_array is not None:
             self._sci_array.turn_off_illumination()
         elif self._microcontroller is not None:
             self._microcontroller.turn_off_illumination()
-        self._is_on_state[channel] = False
+        self._is_on_state[self._unified_channel_name if self._unified else channel] = False
 
     def get_intensity(self, channel: str) -> float:
+        if self._unified:
+            return self._intensity.get(self._unified_channel_name, 0.0)
         return self._intensity.get(channel, 0.0)
 
     def is_on(self, channel: str) -> bool:
+        if self._unified:
+            return self._is_on_state.get(self._unified_channel_name, False)
         return self._is_on_state.get(channel, False)
 
 
@@ -704,6 +885,12 @@ class IlluminationController:
         }
         self.presets: Dict[str, IlluminationPreset] = {}
 
+        self._led_matrix_unified: Optional[LEDMatrixIlluminationDevice] = None
+        for _dev in self._devices:
+            if isinstance(_dev, LEDMatrixIlluminationDevice) and _dev.is_unified_mode:
+                self._led_matrix_unified = _dev
+                break
+
     # -- Device access -------------------------------------------------------
 
     @property
@@ -713,6 +900,52 @@ class IlluminationController:
     def get_device_for_channel(self, channel_name: str) -> Optional[IlluminationDevice]:
         """Return the device that owns *channel_name*, or None."""
         return self._channel_map.get(channel_name)
+
+    def has_unified_led_matrix(self) -> bool:
+        """True when the LED matrix is configured as one channel + mode switching."""
+        return self._led_matrix_unified is not None
+
+    def unified_led_matrix_channel_name(self) -> Optional[str]:
+        """Logical channel name for unified LED matrix (e.g. 'LED matrix'), or None."""
+        if self._led_matrix_unified is None:
+            return None
+        return self._led_matrix_unified.unified_channel_name
+
+    def set_led_matrix_mode(self, mode_key: str) -> bool:
+        """Select LED matrix pattern (unified device only). Returns False if N/A."""
+        if self._led_matrix_unified is None:
+            return False
+        self._led_matrix_unified.set_matrix_mode(mode_key)
+        return True
+
+    def get_led_matrix_mode(self) -> Optional[str]:
+        """Current LED matrix mode key, or None if not using unified matrix."""
+        if self._led_matrix_unified is None:
+            return None
+        return self._led_matrix_unified.get_matrix_mode()
+
+    def led_matrix_mode_items(self) -> List[Tuple[str, str]]:
+        """``(mode_key, label)`` pairs for unified LED matrix, or empty list."""
+        if self._led_matrix_unified is None:
+            return []
+        return self._led_matrix_unified.matrix_mode_items()
+
+    def _resolve_led_matrix_channel(
+        self, channel_name: str
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """If *channel_name* refers to unified LED matrix, return ``(unified_name, mode_key)``.
+
+        *mode_key* is None when *channel_name* is already the unified channel (keep current mode).
+        """
+        dev = self._led_matrix_unified
+        if dev is None:
+            return None
+        if channel_name == dev.unified_channel_name:
+            return (dev.unified_channel_name, None)
+        mode_key = dev.legacy_channel_to_mode.get(channel_name)
+        if mode_key is not None:
+            return (dev.unified_channel_name, mode_key)
+        return None
 
     # -- Primary channel-name API --------------------------------------------
 
@@ -727,6 +960,17 @@ class IlluminationController:
         Routes to whichever device owns *channel_name*.
         """
         intensity = float(np.clip(intensity, 0, 100))
+        lm = self._resolve_led_matrix_channel(channel_name)
+        if lm is not None:
+            unified_name, mode_key = lm
+            dev = self._channel_map.get(unified_name)
+            if isinstance(dev, LEDMatrixIlluminationDevice):
+                if mode_key is not None:
+                    dev.set_matrix_mode(mode_key)
+                dev.set_intensity(unified_name, intensity)
+                self._channel_state[unified_name].intensity = intensity
+            return
+
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"set_channel_intensity: unknown channel '{channel_name}'")
@@ -736,6 +980,17 @@ class IlluminationController:
 
     def turn_on_channel(self, channel_name: str) -> None:
         """Turn on a named channel."""
+        lm = self._resolve_led_matrix_channel(channel_name)
+        if lm is not None:
+            unified_name, mode_key = lm
+            dev = self._channel_map.get(unified_name)
+            if isinstance(dev, LEDMatrixIlluminationDevice):
+                if mode_key is not None:
+                    dev.set_matrix_mode(mode_key)
+                dev.turn_on(unified_name)
+                self._channel_state[unified_name].is_on = True
+            return
+
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
@@ -745,6 +1000,15 @@ class IlluminationController:
 
     def turn_off_channel(self, channel_name: str) -> None:
         """Turn off a named channel."""
+        lm = self._resolve_led_matrix_channel(channel_name)
+        if lm is not None:
+            unified_name, _mode_key = lm
+            dev = self._channel_map.get(unified_name)
+            if isinstance(dev, LEDMatrixIlluminationDevice):
+                dev.turn_off(unified_name)
+                self._channel_state[unified_name].is_on = False
+            return
+
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"turn_off_channel: unknown channel '{channel_name}'")
@@ -882,7 +1146,13 @@ class IlluminationController:
         if isinstance(channel, int):
             name = self._channel_name_for_wavelength(channel)
         else:
-            name = channel if channel in self._channel_map else None
+            if channel in self._channel_map:
+                name = channel
+            elif self._resolve_led_matrix_channel(channel) is not None:
+                self.set_channel_intensity(channel, intensity)
+                return
+            else:
+                name = None
         if name is not None:
             self.set_channel_intensity(name, intensity)
         else:
@@ -906,7 +1176,15 @@ class IlluminationController:
             name = self._channel_name_for_wavelength(channel)
         else:
             name = channel
-        if name and name in self._channel_map:
+        if not name:
+            return None
+        lm = self._resolve_led_matrix_channel(name)
+        if lm is not None:
+            unified_name, _ = lm
+            dev = self._channel_map.get(unified_name)
+            if dev is not None:
+                return dev.get_intensity(unified_name)
+        if name in self._channel_map:
             return self._channel_map[name].get_intensity(name)
         return None
 

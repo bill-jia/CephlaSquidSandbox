@@ -451,14 +451,29 @@ def _build_led_matrix_device(
     sci_array: Optional[SciMicroscopyLEDArray],
 ) -> LEDMatrixIlluminationDevice:
     """Build a LEDMatrixIlluminationDevice from an illumination_devices entry."""
-    channel_source_codes = {
-        ch_name: (ch.source_code if ch.source_code is not None else 0)
-        for ch_name, ch in dev_entry.channels.items()
-    }
+    cfg = dev_entry.config or {}
+    unified = bool(cfg.get("unified", False))
     if sci_array is None and micro is None:
         raise ValueError(
             f"LED matrix device '{dev_entry.id}' requires a microcontroller or sci_array"
         )
+    if unified:
+        modes = cfg.get("modes")
+        legacy = cfg.get("legacy_channel_to_mode")
+        unified_name = str(cfg.get("unified_channel_name", "LED matrix"))
+        return LEDMatrixIlluminationDevice(
+            channel_source_codes={},
+            microcontroller=micro,
+            sci_array=sci_array,
+            unified=True,
+            unified_channel_name=unified_name,
+            modes=modes,
+            legacy_channel_to_mode=legacy,
+        )
+    channel_source_codes = {
+        ch_name: (ch.source_code if ch.source_code is not None else 0)
+        for ch_name, ch in dev_entry.channels.items()
+    }
     return LEDMatrixIlluminationDevice(
         channel_source_codes=channel_source_codes,
         microcontroller=micro,

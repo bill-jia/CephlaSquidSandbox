@@ -18,6 +18,13 @@ controller_port_mapping:
   USB8: 8  # LED bottom_half
 
 channels:
+  # Unified Teensy LED matrix (single channel; pattern = software mode)
+  - name: LED matrix
+    type: transillumination
+    controller_port: USB1
+    wavelength_nm: null
+    intensity_calibration_file: null
+
   # BF LED matrix full
   - name: BF LED matrix full
     type: transillumination

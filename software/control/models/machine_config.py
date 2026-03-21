@@ -39,10 +39,11 @@ Lumencor SPECTRA, individual IO-routed lasers, LED matrices) under a single
 
       - id: led_matrix
         driver: led_matrix
-        channels:
-          "BF LED matrix full":
-            source_code: 0
-            type: transillumination
+        config:
+          unified: true
+          unified_channel_name: "LED matrix"
+        channels: {}
+        # Classic (one GUI row per pattern): omit unified and list channels with source_code.
 """
 
 import logging
