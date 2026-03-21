@@ -98,12 +98,9 @@ if USE_JUPYTER_CONSOLE:
 if RUN_FLUIDICS:
     from control.fluidics import Fluidics
 
-# Import the custom widget
-from gui.custom_multipoint_widget import TemplateMultiPointWidget
-
-# Slack notifications
 from control.slack_notifier import SlackNotifier, TimepointStats, AcquisitionStats
-from gui.widgets_slack import SlackSettingsDialog, load_slack_settings_from_cache
+from gui.widgets.integrations import SlackSettingsDialog, load_slack_settings_from_cache
+from gui.widgets.multipoint import TemplateMultiPointWidget
 
 
 class MovementUpdater(QObject):

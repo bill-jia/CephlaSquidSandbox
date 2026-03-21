@@ -4750,3 +4750,149 @@ class PandasTableModel(QAbstractTableModel):
         return True
 
 
+class TemplateMultiPointWidget(FlexibleMultiPointWidget):
+    """Flexible multipoint widget with CSV template load/add-from-template."""
+
+    def __init__(
+        self,
+        stage,
+        microscope,
+        navigationViewer,
+        multipointController,
+        objectiveStore,
+        scanCoordinates,
+        focusMapWidget,
+        *args,
+        **kwargs,
+    ):
+        self.templates = {}
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+
+        super().__init__(
+            stage,
+            microscope,
+            navigationViewer,
+            multipointController,
+            objectiveStore,
+            scanCoordinates,
+            focusMapWidget,
+            *args,
+            **kwargs,
+        )
+        self.region_id = 0
+
+    def add_components(self):
+        super().add_components()
+
+        self.btn_load_template = QPushButton("Load Template")
+        self.btn_add_from_template = QPushButton("Add Using Template")
+        self.dropdown_template = QComboBox()
+        self.dropdown_template.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        temp = QHBoxLayout()
+        temp.addWidget(QLabel("Template     "))
+        temp.addWidget(self.dropdown_template)
+        self.grid_template = QGridLayout()
+        self.grid_template.addLayout(temp, 0, 0, 1, 6)
+        self.grid_template.addWidget(self.btn_load_template, 0, 6, 1, 2)
+
+        self.grid_add_next_clear = QGridLayout()
+        self.grid_add_next_clear.addWidget(self.btn_add_from_template, 0, 0, 1, 4)
+        self.grid_add_next_clear.addWidget(self.btn_next, 0, 4, 1, 2)
+        self.grid_add_next_clear.addWidget(self.btn_clear, 0, 6, 1, 2)
+
+        for i in range(4):
+            self.grid_template.setColumnStretch(i, 1)
+            self.grid_template.setColumnStretch(i + 4, 1)
+            self.grid_add_next_clear.setColumnStretch(i, 1)
+            self.grid_add_next_clear.setColumnStretch(i + 4, 1)
+
+    def setup_layout(self):
+        self.grid = QVBoxLayout()
+        self.grid.addLayout(self.grid_line0)
+        self.grid.addLayout(self.grid_template)
+        self.grid.addLayout(self.grid_location_list_line1)
+        self.grid.addLayout(self.grid_add_next_clear)
+        self.grid.addLayout(self.grid_location_list_line3)
+        self.grid.addLayout(self.grid_acquisition)
+        self.grid.addLayout(self.row_progress_layout)
+        self.setLayout(self.grid)
+
+        self.grid_location_list_line3.setEnabled(False)
+
+    def setup_connections(self):
+        super().setup_connections()
+        self.btn_load_template.clicked.connect(self.load_template)
+        self.btn_add_from_template.clicked.connect(self.add_from_template)
+
+    def load_template(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Template", "", "CSV Files (*.csv);;All Files (*)")
+        if not file_path:
+            return
+
+        try:
+            template_df = pd.read_csv(file_path)
+            template_name = QFileInfo(file_path).baseName()
+
+            self.templates[template_name] = template_df
+
+            if template_name not in [self.dropdown_template.itemText(i) for i in range(self.dropdown_template.count())]:
+                self.dropdown_template.addItem(template_name)
+                self.dropdown_template.setCurrentText(template_name)
+
+            self._log.info(f"Loaded template '{template_name}' with {len(template_df)} positions")
+
+        except Exception as e:
+            QMessageBox.warning(self, "Template Error", f"Failed to load template: {str(e)}")
+
+    def add_from_template(self):
+        self.region_id = self.region_id + 1
+
+        template_name = self.dropdown_template.currentText()
+        if not template_name or template_name not in self.templates:
+            QMessageBox.warning(self, "Template Error", "No template selected")
+            return
+
+        template_df = self.templates[template_name]
+
+        ref_x, ref_y, ref_z = self.stage.get_pos().x_mm, self.stage.get_pos().y_mm, self.stage.get_pos().z_mm
+
+        if not all(col in template_df.columns for col in ["x_offset_mm", "y_offset_mm"]):
+            QMessageBox.warning(
+                self, "Template Error", "Template must contain 'x_offset_mm', and 'y_offset_mm' columns"
+            )
+            return
+
+        self.table_location_list.blockSignals(True)
+        self.dropdown_location_list.blockSignals(True)
+
+        for _, row in template_df.iterrows():
+            x = ref_x + row["x_offset_mm"]
+            y = ref_y + row["y_offset_mm"]
+
+            self.location_list = np.vstack((self.location_list, [[x, y, ref_z]]))
+            self.location_ids = np.append(self.location_ids, f"R{len(self.location_ids)}")
+
+            location_str = f"x:{round(x,3)} mm  y:{round(y,3)} mm  z:{round(ref_z*1000,1)} μm"
+            self.dropdown_location_list.addItem(location_str)
+
+            row = self.table_location_list.rowCount()
+            self.table_location_list.insertRow(row)
+            self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
+            self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
+            self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(ref_z * 1000, 1))))
+            self.table_location_list.setItem(row, 3, QTableWidgetItem(str(self.region_id)))
+
+        self.scanCoordinates.add_template_region(
+            ref_x, ref_y, ref_z, template_df["x_offset_mm"], template_df["y_offset_mm"], str(self.region_id)
+        )
+        self._log.info(f"Added {len(template_df)} locations from template '{template_name}'")
+
+        self.table_location_list.blockSignals(False)
+        self.dropdown_location_list.blockSignals(False)
+
+    def clear(self):
+        super().clear()
+        self.region_id = 0
+
+

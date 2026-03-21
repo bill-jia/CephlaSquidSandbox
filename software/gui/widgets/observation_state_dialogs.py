@@ -6,7 +6,7 @@ Shared by the HCS main window (Settings menu) and IlluminationWidget.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QInputDialog, QMessageBox

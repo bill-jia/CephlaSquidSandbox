@@ -48,7 +48,7 @@ if USE_TERMINAL_CONSOLE:
 
 if ENABLE_MCP_SERVER_SUPPORT:
     from control.microscope_control_server import MicroscopeControlServer
-    from gui.widgets_claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
+    from gui.widgets.claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
     import shlex
     import subprocess
     import shutil

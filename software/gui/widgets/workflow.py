@@ -1,37 +1,11 @@
-"""
-Workflow Runner UI Components.
-
-Dialog and widgets for configuring and running workflow sequences.
-"""
+"""Workflow Runner UI: dialogs for configuring and running workflow sequences."""
 
 import os
 from typing import Optional
 
-from qtpy.QtCore import Qt, Signal
-from qtpy.QtGui import QColor
-from qtpy.QtWidgets import (
-    QCheckBox,
-    QDialog,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from ._bootstrap import *
 
 from control.workflow_runner import SequenceItem, SequenceType, Workflow
-
-import squid.logging
 
 
 def _confirm_missing_file(parent: QWidget, file_path: str, file_type: str) -> bool:
@@ -51,14 +25,6 @@ class AddSequenceDialog(QDialog):
     """Dialog for adding or editing a script sequence."""
 
     def __init__(self, parent=None, edit_data: dict = None):
-        """
-        Initialize dialog.
-
-        Args:
-            parent: Parent widget
-            edit_data: If provided, pre-populate fields for editing. Keys: name, script_path,
-                      arguments, python_path, conda_env
-        """
         super().__init__(parent)
         self._edit_mode = edit_data is not None
         self.setWindowTitle("Edit Sequence" if self._edit_mode else "Add Sequence")
@@ -70,12 +36,10 @@ class AddSequenceDialog(QDialog):
     def _setup_ui(self):
         layout = QFormLayout(self)
 
-        # Name
         self.edit_name = QLineEdit()
         self.edit_name.setPlaceholderText("e.g., Liquid Handling, Robotic Arm, Fluidics Control")
         layout.addRow("Name:", self.edit_name)
 
-        # Script path with browse button
         script_layout = QHBoxLayout()
         self.edit_script_path = QLineEdit()
         self.edit_script_path.setPlaceholderText("/home/user/scripts/fluidics_control.py")
@@ -86,12 +50,10 @@ class AddSequenceDialog(QDialog):
         script_layout.addWidget(self.btn_browse)
         layout.addRow("Script Path:", script_layout)
 
-        # Arguments
         self.edit_arguments = QLineEdit()
         self.edit_arguments.setPlaceholderText("--wash --cycles 3 --volume 500")
         layout.addRow("Arguments:", self.edit_arguments)
 
-        # Separator for environment options
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
         layout.addRow(separator)
@@ -100,7 +62,6 @@ class AddSequenceDialog(QDialog):
         env_label.setStyleSheet("font-weight: bold;")
         layout.addRow(env_label)
 
-        # Python executable path (optional)
         python_layout = QHBoxLayout()
         self.edit_python_path = QLineEdit()
         self.edit_python_path.setPlaceholderText("/usr/bin/python3.10 or /home/user/venv/bin/python")
@@ -111,12 +72,10 @@ class AddSequenceDialog(QDialog):
         python_layout.addWidget(self.btn_browse_python)
         layout.addRow("Python Path:", python_layout)
 
-        # Conda environment (optional)
         self.edit_conda_env = QLineEdit()
         self.edit_conda_env.setPlaceholderText("fluidics_env, squid, base")
         layout.addRow("Conda Env:", self.edit_conda_env)
 
-        # Help text
         help_text = QLabel(
             "<small><i>Leave both empty to use Squid's Python (recommended).<br>"
             "If Conda Env is set, Python Path is ignored.</i></small>"
@@ -124,7 +83,6 @@ class AddSequenceDialog(QDialog):
         help_text.setStyleSheet("color: gray;")
         layout.addRow(help_text)
 
-        # Buttons
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("Save" if self._edit_mode else "Add")
         self.btn_add.clicked.connect(self._validate_and_accept)
@@ -135,7 +93,6 @@ class AddSequenceDialog(QDialog):
         layout.addRow(btn_layout)
 
     def _populate_from_data(self, data: dict):
-        """Pre-populate form fields from existing data."""
         field_mapping = {
             "name": self.edit_name,
             "script_path": self.edit_script_path,
@@ -193,13 +150,6 @@ class AddAcquisitionDialog(QDialog):
     """Dialog for adding or editing an acquisition sequence."""
 
     def __init__(self, parent=None, edit_data: dict = None):
-        """
-        Initialize dialog.
-
-        Args:
-            parent: Parent widget
-            edit_data: If provided, pre-populate fields for editing. Keys: name, config_path
-        """
         super().__init__(parent)
         self._edit_mode = edit_data is not None
         self.setWindowTitle("Edit Acquisition" if self._edit_mode else "Add Acquisition")
@@ -211,13 +161,11 @@ class AddAcquisitionDialog(QDialog):
     def _setup_ui(self):
         layout = QFormLayout(self)
 
-        # Name
         self.edit_name = QLineEdit()
         self.edit_name.setPlaceholderText("e.g., Acquisition, Pre-scan, Post-treatment scan")
         self.edit_name.setText("Acquisition")
         layout.addRow("Name:", self.edit_name)
 
-        # Config path with browse button
         config_layout = QHBoxLayout()
         self.edit_config_path = QLineEdit()
         self.edit_config_path.setPlaceholderText("(Optional) /path/to/acquisition.yaml")
@@ -228,7 +176,6 @@ class AddAcquisitionDialog(QDialog):
         config_layout.addWidget(self.btn_browse)
         layout.addRow("Config File:", config_layout)
 
-        # Help text
         help_text = QLabel(
             "<small><i>Leave empty to use current software settings.<br>"
             "If a YAML file is provided, acquisition settings will be<br>"
@@ -237,7 +184,6 @@ class AddAcquisitionDialog(QDialog):
         help_text.setStyleSheet("color: gray;")
         layout.addRow(help_text)
 
-        # Buttons
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("Save" if self._edit_mode else "Add")
         self.btn_add.clicked.connect(self._validate_and_accept)
@@ -248,7 +194,6 @@ class AddAcquisitionDialog(QDialog):
         layout.addRow(btn_layout)
 
     def _populate_from_data(self, data: dict):
-        """Pre-populate form fields from existing data."""
         for key, widget in [("name", self.edit_name), ("config_path", self.edit_config_path)]:
             if data.get(key):
                 widget.setText(data[key])
@@ -279,12 +224,11 @@ class AddAcquisitionDialog(QDialog):
 class WorkflowRunnerDialog(QDialog):
     """Dialog for configuring and running workflow sequences."""
 
-    signal_run_workflow = Signal(object)  # Emitted when Run is clicked, passes Workflow
-    signal_pause_workflow = Signal()  # Emitted when Pause is clicked
-    signal_resume_workflow = Signal()  # Emitted when Resume is clicked
-    signal_stop_workflow = Signal()  # Emitted when Stop is clicked
+    signal_run_workflow = Signal(object)
+    signal_pause_workflow = Signal()
+    signal_resume_workflow = Signal()
+    signal_stop_workflow = Signal()
 
-    # Column indices
     COL_INCLUDE = 0
     COL_NAME = 1
     COL_COMMAND = 2
@@ -305,7 +249,6 @@ class WorkflowRunnerDialog(QDialog):
         self.setMinimumSize(750, 550)
         layout = QVBoxLayout(self)
 
-        # Info label
         info_label = QLabel(
             "Define sequences to run. 'Acquisition' runs the built-in acquisition "
             "with current settings. Other sequences run external scripts."
@@ -313,7 +256,6 @@ class WorkflowRunnerDialog(QDialog):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Table
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -321,7 +263,6 @@ class WorkflowRunnerDialog(QDialog):
         self._setup_table_columns()
         layout.addWidget(self.table)
 
-        # Cycles section
         cycles_layout = QHBoxLayout()
         cycles_label = QLabel("Cycles:")
         cycles_layout.addWidget(cycles_label)
@@ -334,7 +275,6 @@ class WorkflowRunnerDialog(QDialog):
         cycles_layout.addStretch()
         layout.addLayout(cycles_layout)
 
-        # All buttons in one row
         btn_layout = QHBoxLayout()
 
         self.btn_insert_above = QPushButton("Insert Above")
@@ -380,11 +320,9 @@ class WorkflowRunnerDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-        # Status label
         self.label_status = QLabel("")
         layout.addWidget(self.label_status)
 
-        # Script output area
         output_header_layout = QHBoxLayout()
         output_label = QLabel("Log:")
         output_header_layout.addWidget(output_label)
@@ -401,31 +339,26 @@ class WorkflowRunnerDialog(QDialog):
         layout.addWidget(self.text_output)
 
     def _setup_table_columns(self):
-        """Configure table columns."""
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["Include", "Name", "Command/Path", "Cycle Arg", "Cycle Arg Values"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)  # Command column stretches
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
     def _on_cycles_changed(self, value):
-        """Handle cycles spinbox value change."""
         self._workflow.num_cycles = value
 
     def _load_workflow_to_table(self):
-        """Populate table from workflow data."""
         self.table.setRowCount(len(self._workflow.sequences))
 
         for row, seq in enumerate(self._workflow.sequences):
             self._populate_table_row(row, seq)
 
     def _populate_table_row(self, row: int, seq: SequenceItem):
-        """Populate a single table row with sequence data."""
         is_acq = seq.is_acquisition()
 
-        # Include checkbox
         checkbox = QCheckBox()
         checkbox.setChecked(seq.included)
         checkbox.toggled.connect(lambda checked, r=row: self._on_include_toggled(r, checked))
@@ -436,27 +369,22 @@ class WorkflowRunnerDialog(QDialog):
         cell_layout.setContentsMargins(0, 0, 0, 0)
         self.table.setCellWidget(row, self.COL_INCLUDE, cell_widget)
 
-        # Name
         name_item = QTableWidgetItem(seq.name)
         self._apply_acquisition_styling(name_item, is_acq)
         self.table.setItem(row, self.COL_NAME, name_item)
 
-        # Command
         cmd_item = self._create_command_item(seq)
         self.table.setItem(row, self.COL_COMMAND, cmd_item)
 
-        # Cycle Arg name
         cycle_arg_item = QTableWidgetItem(seq.cycle_arg_name or "")
         self._apply_acquisition_styling(cycle_arg_item, is_acq, include_foreground=True)
         self.table.setItem(row, self.COL_CYCLE_ARG, cycle_arg_item)
 
-        # Cycle Values
         cycle_values_item = QTableWidgetItem(seq.cycle_arg_values or "")
         self._apply_acquisition_styling(cycle_values_item, is_acq, include_foreground=True)
         self.table.setItem(row, self.COL_CYCLE_VALUES, cycle_values_item)
 
     def _create_command_item(self, seq: SequenceItem) -> QTableWidgetItem:
-        """Create the command column item for a sequence."""
         if seq.is_acquisition():
             if seq.config_path:
                 cmd_text = f"Config: {os.path.basename(seq.config_path)}"
@@ -478,21 +406,18 @@ class WorkflowRunnerDialog(QDialog):
     def _apply_acquisition_styling(
         self, item: QTableWidgetItem, is_acquisition: bool, include_foreground: bool = False
     ):
-        """Apply read-only styling for acquisition sequence items."""
         if not is_acquisition:
             return
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-        item.setBackground(QColor(240, 240, 255))  # Light blue
+        item.setBackground(QColor(240, 240, 255))
         if include_foreground:
-            item.setForeground(QColor(128, 128, 128))  # Gray text
+            item.setForeground(QColor(128, 128, 128))
 
     def _on_include_toggled(self, row: int, checked: bool):
-        """Handle include checkbox toggle."""
         if row < len(self._workflow.sequences):
             self._workflow.sequences[row].included = checked
 
     def _prompt_sequence_type(self) -> Optional[str]:
-        """Prompt user to choose between script and acquisition. Returns 'script', 'acquisition', or None."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Sequence Type")
         msg_box.setText("What type of sequence do you want to add?")
@@ -509,7 +434,6 @@ class WorkflowRunnerDialog(QDialog):
         return None
 
     def _create_sequence_from_dialog(self, sequence_type: str) -> Optional[SequenceItem]:
-        """Show dialog and create SequenceItem. Returns None if cancelled."""
         if sequence_type == "acquisition":
             dialog = AddAcquisitionDialog(self)
             if dialog.exec_() != QDialog.Accepted:
@@ -537,7 +461,6 @@ class WorkflowRunnerDialog(QDialog):
             )
 
     def _insert_sequence(self, above: bool, sequence_type: str = None):
-        """Insert a new sequence above or below current selection."""
         if sequence_type is None:
             sequence_type = self._prompt_sequence_type()
             if sequence_type is None:
@@ -559,7 +482,6 @@ class WorkflowRunnerDialog(QDialog):
         self.label_status.setText(f"Added sequence '{new_seq.name}'")
 
     def _edit_sequence(self):
-        """Edit the selected sequence."""
         current_row = self.table.currentRow()
         if current_row < 0:
             QMessageBox.information(self, "No Selection", "Please select a sequence to edit.")
@@ -598,7 +520,6 @@ class WorkflowRunnerDialog(QDialog):
         self.label_status.setText("Changes saved")
 
     def _remove_sequence(self):
-        """Remove selected sequence."""
         current_row = self.table.currentRow()
         if current_row < 0:
             QMessageBox.information(self, "No Selection", "Please select a sequence to remove.")
@@ -616,7 +537,6 @@ class WorkflowRunnerDialog(QDialog):
             self.label_status.setText(f"Removed {seq_type} '{seq.name}'")
 
     def _save_workflow(self):
-        """Save workflow to YAML file."""
         self._sync_table_to_workflow()
 
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Workflow", "", "YAML Files (*.yaml *.yml)")
@@ -633,7 +553,6 @@ class WorkflowRunnerDialog(QDialog):
             self._set_status(f"Save failed: {e}", "red")
 
     def _load_workflow(self):
-        """Load workflow from YAML file."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Workflow", "", "YAML Files (*.yaml *.yml)")
         if not file_path:
             return
@@ -648,22 +567,18 @@ class WorkflowRunnerDialog(QDialog):
             self._set_status(f"Load failed: {e}", "red")
 
     def _run_workflow(self):
-        """Validate and emit signal to run workflow."""
         self._sync_table_to_workflow()
 
-        # Validate cycle args if any sequence has them
         errors = self._workflow.validate_cycle_args()
         if errors:
             QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
 
-        # Check at least one sequence is included
         included = self._workflow.get_included_sequences()
         if not included:
             QMessageBox.warning(self, "No Sequences", "Please include at least one sequence to run.")
             return
 
-        # Confirmation
         seq_names = [s.name for s in included]
         num_cycles = self._workflow.num_cycles
         msg = f"Run workflow with {len(included)} sequences?\n\n" + "\n".join(
@@ -681,7 +596,6 @@ class WorkflowRunnerDialog(QDialog):
         self.signal_run_workflow.emit(self._workflow)
 
     def _pause_workflow(self):
-        """Pause or resume the workflow."""
         if self._is_paused:
             self._log.info("Resuming workflow")
             self.signal_resume_workflow.emit()
@@ -690,42 +604,34 @@ class WorkflowRunnerDialog(QDialog):
             self.signal_pause_workflow.emit()
 
     def _stop_workflow(self):
-        """Stop the workflow after current sequence."""
         self._log.info("Stopping workflow")
         self.signal_stop_workflow.emit()
 
     def _get_table_text(self, row: int, col: int) -> Optional[str]:
-        """Get text from table cell, or None if empty."""
         item = self.table.item(row, col)
         return item.text().strip() or None if item else None
 
     def _sync_table_to_workflow(self):
-        """Sync table edits back to workflow data."""
         self._workflow.num_cycles = self.spinbox_cycles.value()
 
         for row, seq in enumerate(self._workflow.sequences):
-            # Get include state from checkbox
             cell_widget = self.table.cellWidget(row, self.COL_INCLUDE)
             if cell_widget:
                 checkbox = cell_widget.findChild(QCheckBox)
                 if checkbox:
                     seq.included = checkbox.isChecked()
 
-            # Skip Acquisition - it's not editable via table
             if seq.is_acquisition():
                 continue
 
-            # Update name (but not to "acquisition")
             new_name = self._get_table_text(row, self.COL_NAME)
             if new_name and new_name.lower() != "acquisition":
                 seq.name = new_name
 
-            # Cycle args
             seq.cycle_arg_name = self._get_table_text(row, self.COL_CYCLE_ARG)
             seq.cycle_arg_values = self._get_table_text(row, self.COL_CYCLE_VALUES)
 
     def highlight_sequence(self, index: int):
-        """Highlight the currently running sequence."""
         for row in range(self.table.rowCount()):
             background = self._get_row_background_color(row, is_running=(row == index))
             for col in range(self.table.columnCount()):
@@ -734,29 +640,24 @@ class WorkflowRunnerDialog(QDialog):
                     item.setBackground(background)
 
     def _get_row_background_color(self, row: int, is_running: bool = False) -> QColor:
-        """Get the appropriate background color for a table row."""
         if is_running:
-            return QColor(200, 255, 200)  # Light green for running
+            return QColor(200, 255, 200)
         seq = self._workflow.sequences[row] if row < len(self._workflow.sequences) else None
         if seq and seq.is_acquisition():
-            return QColor(240, 240, 255)  # Light blue for acquisition
-        return QColor(255, 255, 255)  # White for scripts
+            return QColor(240, 240, 255)
+        return QColor(255, 255, 255)
 
     def clear_highlight(self):
-        """Clear all row highlights."""
         self.highlight_sequence(-1)
 
     def _set_status(self, text: str, color: str = "black"):
-        """Set status label text and color."""
         self.label_status.setText(text)
         self.label_status.setStyleSheet(f"color: {color};")
 
     def set_running_state(self, running: bool):
-        """Update UI based on running state."""
         self._is_running = running
         self._is_paused = False
 
-        # Enable/disable editing controls (inverse of running state)
         for widget in [
             self.btn_run,
             self.btn_insert_above,
@@ -769,7 +670,6 @@ class WorkflowRunnerDialog(QDialog):
         ]:
             widget.setEnabled(not running)
 
-        # Pause and Stop buttons enabled when running
         self.btn_pause.setEnabled(running)
         self.btn_stop.setEnabled(running)
         self.btn_pause.setText("Pause")
@@ -783,19 +683,16 @@ class WorkflowRunnerDialog(QDialog):
                 self._set_status("Ready")
 
     def on_workflow_paused(self):
-        """Handle workflow paused."""
         self._is_paused = True
         self.btn_pause.setText("Resume")
         self._set_status("Workflow paused - click Resume to continue", "orange")
 
     def on_workflow_resumed(self):
-        """Handle workflow resumed."""
         self._is_paused = False
         self.btn_pause.setText("Pause")
         self._set_status("Workflow running...", "blue")
 
     def on_workflow_finished(self, success: bool):
-        """Handle workflow completion."""
         self.set_running_state(False)
         if success:
             self._set_status("Workflow completed successfully", "green")
@@ -803,23 +700,18 @@ class WorkflowRunnerDialog(QDialog):
             self._set_status("Workflow stopped", "red")
 
     def on_sequence_started(self, index: int, name: str):
-        """Handle sequence start."""
         self.highlight_sequence(index)
         self._set_status(f"Running: {name}", "blue")
 
     def on_error(self, error_msg: str):
-        """Handle error from workflow runner."""
         self._set_status(f"Error: {error_msg}", "red")
 
     def on_script_output(self, line: str):
-        """Append script output line."""
         self.text_output.append(line)
-        # Auto-scroll to bottom
         scrollbar = self.text_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
     def _save_log(self):
-        """Save the log output to a text file."""
         from datetime import datetime
 
         default_name = f"workflow_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -836,7 +728,6 @@ class WorkflowRunnerDialog(QDialog):
             self._set_status(f"Save failed: {e}", "red")
 
     def closeEvent(self, event):
-        """Handle dialog close - warn if workflow is running."""
         if self._is_running:
             reply = QMessageBox.question(
                 self,

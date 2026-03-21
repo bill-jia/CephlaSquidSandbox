@@ -1,8 +1,4 @@
-"""Anthropic API key dialog for Claude Code integration.
-
-Provides a dialog for entering the Anthropic API key used when launching
-Claude Code from the GUI. The key is cached locally in cache/claude_api_key.yaml.
-"""
+"""Anthropic / Claude Code UI: API key dialog and cache loading."""
 
 import os
 
@@ -11,11 +7,11 @@ import yaml
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QDialog,
-    QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QVBoxLayout,
 )
 
 import control._def
@@ -23,21 +19,16 @@ import squid.logging
 
 log = squid.logging.get_logger(__name__)
 
-CACHE_FILE = "cache/claude_api_key.yaml"
-
-_MASK_CHAR = "\u2022"  # bullet character for masking
+CLAUDE_API_KEY_CACHE_FILE = "cache/claude_api_key.yaml"
+_MASK_CHAR = "\u2022"
 
 
 def load_claude_api_key_from_cache():
-    """Load Anthropic API key from cache file into runtime config.
-
-    This should be called during application startup to restore
-    the API key from the cache file.
-    """
-    if not os.path.exists(CACHE_FILE):
+    """Load Anthropic API key from cache file into runtime config (call at startup)."""
+    if not os.path.exists(CLAUDE_API_KEY_CACHE_FILE):
         return
     try:
-        with open(CACHE_FILE, "r") as f:
+        with open(CLAUDE_API_KEY_CACHE_FILE, "r") as f:
             data = yaml.safe_load(f)
         if data is None:
             return
@@ -47,7 +38,9 @@ def load_claude_api_key_from_cache():
         key = data.get("api_key")
         if key:
             if not isinstance(key, str):
-                log.error("Anthropic API key cache has invalid type " f"(expected str, got {type(key).__name__})")
+                log.error(
+                    "Anthropic API key cache has invalid type " f"(expected str, got {type(key).__name__})"
+                )
                 return
             control._def.ANTHROPIC_API_KEY = key
             log.info("Loaded Anthropic API key from cache")
@@ -75,7 +68,6 @@ class ClaudeApiKeyDialog(QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # API key input — multi-line for long keys
         layout.addWidget(QLabel("API Key:"))
         self.textedit_api_key = QPlainTextEdit()
         self.textedit_api_key.setPlaceholderText("sk-ant-...")
@@ -83,7 +75,6 @@ class ClaudeApiKeyDialog(QDialog):
         self.textedit_api_key.setTabChangesFocus(True)
         layout.addWidget(self.textedit_api_key)
 
-        # Show/hide toggle
         toggle_layout = QHBoxLayout()
         self.btn_show = QPushButton("Show")
         self.btn_show.setCheckable(True)
@@ -92,7 +83,6 @@ class ClaudeApiKeyDialog(QDialog):
         toggle_layout.addStretch()
         layout.addLayout(toggle_layout)
 
-        # Help text
         help_label = QLabel(
             "<small>Get your API key from "
             '<a href="https://console.anthropic.com/settings/keys">console.anthropic.com</a>.<br>'
@@ -103,12 +93,10 @@ class ClaudeApiKeyDialog(QDialog):
         help_label.setStyleSheet("color: gray;")
         layout.addWidget(help_label)
 
-        # Status label
         self.label_status = QLabel("")
         self.label_status.setStyleSheet("color: gray;")
         layout.addWidget(self.label_status)
 
-        # Buttons
         button_layout = QHBoxLayout()
         self.btn_clear = QPushButton("Clear")
         self.btn_save = QPushButton("Save")
@@ -145,20 +133,18 @@ class ClaudeApiKeyDialog(QDialog):
     def _load_key(self):
         key = control._def.ANTHROPIC_API_KEY or ""
         self._stored_key = key
-        # Start masked and read-only
         self.textedit_api_key.setPlainText(_MASK_CHAR * len(key))
         self.textedit_api_key.setReadOnly(True)
 
     def _save_key(self):
-        """Save the API key to runtime config and cache file."""
         if self._is_visible:
             self._stored_key = self.textedit_api_key.toPlainText().replace("\n", "").strip()
         key = self._stored_key or None
 
         data = {"api_key": key}
         try:
-            os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-            fd = os.open(CACHE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.makedirs(os.path.dirname(CLAUDE_API_KEY_CACHE_FILE), exist_ok=True)
+            fd = os.open(CLAUDE_API_KEY_CACHE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 yaml.dump(data, f, default_flow_style=False)
             control._def.ANTHROPIC_API_KEY = key

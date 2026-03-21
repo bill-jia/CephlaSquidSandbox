@@ -77,7 +77,7 @@ class ObservationStateWidget(QGroupBox):
             self._on_state_changed()
 
     def _on_save(self) -> None:
-        from gui.observation_state_gui import run_save_observation_state_dialog
+        from gui.widgets.observation_state_dialogs import run_save_observation_state_dialog
 
         run_save_observation_state_dialog(
             self,
@@ -89,7 +89,7 @@ class ObservationStateWidget(QGroupBox):
         )
 
     def _on_load(self) -> None:
-        from gui.observation_state_gui import run_load_observation_state
+        from gui.widgets.observation_state_dialogs import run_load_observation_state
 
         name = self._combo_presets.currentText()
         run_load_observation_state(
