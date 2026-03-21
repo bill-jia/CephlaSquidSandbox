@@ -4,7 +4,7 @@ import control.microcontroller
 import control.lighting
 
 from control.core.core import NavigationViewer
-from control.gui_hcs import QtMultiPointController
+from gui.gui_hcs import QtMultiPointController
 from control.microscope import Microscope
 import tests.control.test_stubs as ts
 

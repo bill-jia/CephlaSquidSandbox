@@ -7,7 +7,7 @@ import pytest
 
 import control._def
 import control.microscope
-from control.widgets import check_ram_available_with_error_dialog, NDViewerTab, SurfacePlotWidget
+from gui.widgets import check_ram_available_with_error_dialog, NDViewerTab, SurfacePlotWidget
 
 import tests.control.test_stubs as ts
 
@@ -78,7 +78,7 @@ def test_check_ram_available_with_error_dialog_insufficient_ram():
         mock_vmem.available = 1024  # Only 1KB available
 
         with patch("psutil.virtual_memory", return_value=mock_vmem):
-            with patch("control.widgets.error_dialog"):  # Mock dialog to avoid GUI
+            with patch("gui.widgets.error_dialog"):  # Mock dialog to avoid GUI
                 result = check_ram_available_with_error_dialog(mpc, logger, performance_mode=False)
                 assert result is False
 
@@ -131,7 +131,7 @@ def test_check_ram_available_with_error_dialog_factor_of_safety():
         mock_vmem.available = base_estimate  # Exactly equal to base estimate
 
         with patch("psutil.virtual_memory", return_value=mock_vmem):
-            with patch("control.widgets.error_dialog"):
+            with patch("gui.widgets.error_dialog"):
                 # With default factor_of_safety=1.15, should fail (needs 15% more)
                 result = check_ram_available_with_error_dialog(
                     mpc, logger, factor_of_safety=1.15, performance_mode=False
@@ -336,7 +336,7 @@ class TestSurfacePlotWidget:
 # RAMMonitorWidget Tests
 # ============================================================================
 
-from control.widgets import RAMMonitorWidget
+from gui.widgets import RAMMonitorWidget
 from control.core.memory_profiler import MemoryMonitor
 
 
@@ -725,7 +725,7 @@ class TestMultiPointControllerMemoryMonitoring:
 # BackpressureMonitorWidget Tests
 # ============================================================================
 
-from control.widgets import BackpressureMonitorWidget
+from gui.widgets import BackpressureMonitorWidget
 from control.core.backpressure import BackpressureStats
 from unittest.mock import Mock
 
@@ -1604,7 +1604,7 @@ class TestNDViewerTabPushAPI:
 # WarningErrorWidget Tests
 # ============================================================================
 
-from control.widgets import WarningErrorWidget
+from gui.widgets import WarningErrorWidget
 from squid.logging import BufferingHandler
 import threading
 import time

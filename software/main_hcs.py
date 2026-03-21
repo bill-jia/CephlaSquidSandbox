@@ -33,7 +33,7 @@ import squid.logging
 squid.logging.setup_uncaught_exception_logging()
 
 # Application-specific libraries
-import control.gui_hcs as gui
+import gui.gui_hcs as gui
 from control._def import USE_TERMINAL_CONSOLE, ENABLE_MCP_SERVER_SUPPORT, CONTROL_SERVER_HOST, CONTROL_SERVER_PORT
 import control._def
 import control.utils
@@ -48,7 +48,7 @@ if USE_TERMINAL_CONSOLE:
 
 if ENABLE_MCP_SERVER_SUPPORT:
     from control.microscope_control_server import MicroscopeControlServer
-    from control.widgets_claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
+    from gui.widgets_claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
     import shlex
     import subprocess
     import shutil

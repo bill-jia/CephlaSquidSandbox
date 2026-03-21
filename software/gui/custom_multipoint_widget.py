@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import time
 
-from control.widgets import FlexibleMultiPointWidget
+from gui.widgets import FlexibleMultiPointWidget
 import squid.logging
 
 

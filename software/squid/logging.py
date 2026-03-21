@@ -14,7 +14,7 @@ _baseline_log_format = (
 )
 _baseline_log_dateformat = "%Y-%m-%d %H:%M:%S"
 
-# Public aliases for use by other modules (e.g., WarningErrorWidget in control/widgets.py)
+# Public aliases for use by other modules (e.g., WarningErrorWidget in gui.widgets)
 LOG_FORMAT = _baseline_log_format
 LOG_DATEFORMAT = _baseline_log_dateformat
 

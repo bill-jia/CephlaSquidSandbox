@@ -5,11 +5,11 @@ from configparser import ConfigParser
 import pytest
 
 import tests.control.gui_test_stubs
-import control.widgets
+import gui.widgets
 
 
 def test_config_editor_save_to_file(qtbot):
-    config_editor = control.widgets.ConfigEditor(ConfigParser())
+    config_editor = gui.widgets.ConfigEditor(ConfigParser())
 
     (good_fd, good_filename) = tempfile.mkstemp()
     os.close(good_fd)

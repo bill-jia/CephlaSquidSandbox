@@ -8,7 +8,7 @@ import pytest
 @pytest.fixture
 def plate_view_widget(qtbot):
     """Create a NapariPlateViewWidget for testing."""
-    from control.widgets import NapariPlateViewWidget
+    from gui.widgets import NapariPlateViewWidget
     from control.core.contrast_manager import ContrastManager
 
     contrast_manager = ContrastManager()

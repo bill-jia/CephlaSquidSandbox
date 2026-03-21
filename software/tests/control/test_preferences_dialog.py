@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from qtpy.QtWidgets import QMessageBox
 
-import control.widgets
+import gui.widgets
 
 
 @pytest.fixture
@@ -131,7 +131,7 @@ def preferences_dialog(qtbot, sample_config, temp_config_file, sync_def_with_con
     Uses sync_def_with_config to ensure _def matches sample_config,
     mimicking app startup behavior.
     """
-    dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+    dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
     qtbot.addWidget(dialog)
     return dialog
 
@@ -345,7 +345,7 @@ class TestApplySettings:
         with open(temp_config_file, "w") as f:
             config.write(f)
 
-        dialog = control.widgets.PreferencesDialog(config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(config, temp_config_file)
         qtbot.addWidget(dialog)
         dialog._apply_settings()
 
@@ -602,7 +602,7 @@ class TestViewsTabDefIntegration:
             control._def.USE_NAPARI_FOR_MOSAIC_DISPLAY = False
 
             # Create dialog - should read from _def, not config
-            dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+            dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
             qtbot.addWidget(dialog)
 
             # UI should show _def values, not config values
@@ -626,7 +626,7 @@ class TestViewsTabDefIntegration:
             # Set control._def to True
             control._def.SAVE_DOWNSAMPLED_WELL_IMAGES = True
 
-            dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+            dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
             qtbot.addWidget(dialog)
 
             # UI shows True (from control._def), don't change anything
@@ -657,7 +657,7 @@ class TestViewsTabDefIntegration:
             control._def.DOWNSAMPLED_PLATE_RESOLUTION_UM = 25.0
 
             # Open dialog - should show MCP-changed values
-            dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+            dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
             qtbot.addWidget(dialog)
 
             assert dialog.mosaic_pixel_size_spinbox.value() == 5.0
@@ -677,7 +677,7 @@ class TestViewsTabDefIntegration:
             # Simulate MCP changing z-projection to "middle"
             control._def.DOWNSAMPLED_Z_PROJECTION = control._def.ZProjectionMode.MIDDLE
 
-            dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+            dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
             qtbot.addWidget(dialog)
 
             # UI shows "middle" (from control._def)
@@ -695,7 +695,7 @@ class TestDevTabVisibility:
 
     def test_dev_tab_hidden_by_default(self, qtbot, sample_config, temp_config_file):
         """Dev tab should be hidden when show_dev_tab config is not set or false."""
-        dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
         qtbot.addWidget(dialog)
 
         # Find Dev tab index
@@ -718,7 +718,7 @@ class TestDevTabVisibility:
         with open(temp_config_file, "w") as f:
             config.write(f)
 
-        dialog = control.widgets.PreferencesDialog(config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(config, temp_config_file)
         qtbot.addWidget(dialog)
 
         # Find Dev tab index
@@ -733,7 +733,7 @@ class TestDevTabVisibility:
 
     def test_show_dev_tab_checkbox_updates_tab_visibility(self, qtbot, sample_config, temp_config_file):
         """Toggling Show Dev Tab checkbox should update Dev tab visibility."""
-        dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
         qtbot.addWidget(dialog)
 
         # Use the stored _dev_tab_index directly
@@ -752,7 +752,7 @@ class TestDevTabVisibility:
 
     def test_show_dev_tab_config_saved(self, qtbot, sample_config, temp_config_file):
         """Show Dev Tab setting should persist to config file."""
-        dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
         qtbot.addWidget(dialog)
 
         # Enable Show Dev Tab
@@ -768,7 +768,7 @@ class TestDevTabVisibility:
 
     def test_show_dev_tab_change_detected(self, qtbot, sample_config, temp_config_file):
         """Show Dev Tab change should be detected in _get_changes."""
-        dialog = control.widgets.PreferencesDialog(sample_config, temp_config_file)
+        dialog = gui.widgets.PreferencesDialog(sample_config, temp_config_file)
         qtbot.addWidget(dialog)
 
         # Enable Show Dev Tab
