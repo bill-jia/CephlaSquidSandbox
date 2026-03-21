@@ -208,6 +208,31 @@ class LiveController:
         channels = self.get_channels(objective)
         return next((ch for ch in channels if ch.name == name), None)
 
+    def set_active_channel_reference(self, configuration: Optional["AcquisitionChannel"]) -> None:
+        """Record the selected acquisition channel without touching camera or illumination hardware.
+
+        The UI (e.g. Live Control) chooses a channel from the profile before ``set_microscope_mode`` runs.
+        We intentionally skip ``set_microscope_mode`` at startup so restored camera cache settings are not
+        overwritten, but contrast/LUT, Observation State collection, and display code still need a stable
+        ``currentConfiguration`` for channel *name* and preset bookkeeping.
+
+        Observation State: ``collect_observation_state`` reads ``active_channel_name`` from
+        ``currentConfiguration``; keeping this reference in sync with the Live Control / Napari dropdown
+        matches that paradigm without forcing a full hardware apply.
+        """
+        self.currentConfiguration = configuration
+
+    def get_channel_name_for_contrast(self) -> str:
+        """Channel key for ContrastManager / display when only a logical selection exists."""
+        if self.currentConfiguration is not None:
+            return self.currentConfiguration.name
+        objective = getattr(getattr(self.microscope, "objective_store", None), "current_objective", None)
+        if objective:
+            chs = self.get_channels(objective)
+            if chs:
+                return chs[0].name
+        return "default"
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Illumination control
     # ─────────────────────────────────────────────────────────────────────────────

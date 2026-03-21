@@ -1253,7 +1253,7 @@ class ImageDisplayWindow(QMainWindow):
         min_val, max_val = info.min, info.max
 
         if self.liveController is not None and self.contrastManager is not None:
-            channel_name = self.liveController.currentConfiguration.name
+            channel_name = self.liveController.get_channel_name_for_contrast()
             if self.contrastManager.acquisition_dtype != None and self.contrastManager.acquisition_dtype != np.dtype(
                 image.dtype
             ):
@@ -1319,7 +1319,7 @@ class ImageDisplayWindow(QMainWindow):
     def update_contrast_limits(self):
         if self.show_LUT and self.contrastManager and self.contrastManager.acquisition_dtype:
             min_val, max_val = self.LUTWidget.region.getRegion()
-            self.contrastManager.update_limits(self.liveController.currentConfiguration.name, min_val, max_val)
+            self.contrastManager.update_limits(self.liveController.get_channel_name_for_contrast(), min_val, max_val)
 
     def update_ROI(self):
         self.roi_pos = self.ROI.pos()

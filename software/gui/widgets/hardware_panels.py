@@ -1755,6 +1755,10 @@ class LiveControlWidget(QFrame):
         else:
             self.currentConfiguration = channels[0]
 
+        # Keep LiveController.currentConfiguration in sync for contrast/LUT and Observation State
+        # ``active_channel_name`` without calling set_microscope_mode() (manual live defers hardware apply).
+        self.liveController.set_active_channel_reference(self.currentConfiguration)
+
         self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
         # Manual live output is controlled by camera + illumination widgets.
@@ -2009,6 +2013,8 @@ class LiveControlWidget(QFrame):
             if self._control_illumination_before_live is None:
                 self._control_illumination_before_live = self.liveController.control_illumination
             self.liveController.control_illumination = False
+            if self.currentConfiguration is not None:
+                self.liveController.set_active_channel_reference(self.currentConfiguration)
             self.liveController.start_live()
             self.btn_live.setText("Stop Live")
             self.signal_start_live.emit()
@@ -2110,6 +2116,7 @@ class LiveControlWidget(QFrame):
         # Do not call set_microscope_mode() here, since it would override camera exposure/gain.
         if first_config is not None:
             self.currentConfiguration = first_config
+            self.liveController.set_active_channel_reference(first_config)
             # Keep dropdown current text consistent (even if the widget is hidden in the main layout).
             self.dropdown_modeSelection.blockSignals(True)
             self.dropdown_modeSelection.setCurrentText(first_config.name)
@@ -2129,6 +2136,8 @@ class LiveControlWidget(QFrame):
         try:
             self.is_switching_mode = True
             self.currentConfiguration = config
+            if self.currentConfiguration is not None:
+                self.liveController.set_active_channel_reference(self.currentConfiguration)
             self.dropdown_modeSelection.blockSignals(True)
             self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
             self.dropdown_modeSelection.blockSignals(False)

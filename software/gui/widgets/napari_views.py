@@ -877,7 +877,10 @@ class NapariLiveWidget(QWidget):
         self.stage = stage
         self.objectiveStore = objectiveStore
         self.wellSelectionWidget = wellSelectionWidget
-        self.live_configuration = self.liveController.currentConfiguration
+        chs = self.liveController.get_channels(self.objectiveStore.current_objective)
+        if self.liveController.currentConfiguration is None and chs:
+            self.liveController.set_active_channel_reference(chs[0])
+        self.live_configuration = self.liveController.currentConfiguration or (chs[0] if chs else None)
         self.image_width = 0
         self.image_height = 0
         self.dtype = np.uint8
@@ -896,7 +899,10 @@ class NapariLiveWidget(QWidget):
         self.initNapariViewer()
         self.addNapariGrayclipColormap()
         self.initControlWidgets(show_trigger_options, show_display_options, show_autolevel, autolevel)
-        self.update_ui_for_mode(self.live_configuration)
+        if self.live_configuration is not None:
+            self.update_ui_for_mode(self.live_configuration)
+        else:
+            self._log.error("NapariLiveWidget: no acquisition channels for current objective")
 
     def initNapariViewer(self):
         self.viewer = napari.Viewer(show=False)
@@ -955,7 +961,8 @@ class NapariLiveWidget(QWidget):
         self.dropdown_modeSelection = QComboBox()
         for config in self.liveController.get_channels(self.objectiveStore.current_objective):
             self.dropdown_modeSelection.addItem(config.name)
-        self.dropdown_modeSelection.setCurrentText(self.live_configuration.name)
+        if self.live_configuration is not None:
+            self.dropdown_modeSelection.setCurrentText(self.live_configuration.name)
         self.dropdown_modeSelection.activated.connect(self.select_new_microscope_mode_by_name)
 
         # Live button

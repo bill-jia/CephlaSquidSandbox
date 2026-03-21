@@ -380,9 +380,14 @@ def collect_observation_state(
         snap = None
     channels = _merge_illumination_hardware_into_channels(channels, snap, ic)
     channels = _merge_led_matrix_mode_into_channels(channels, ic)
+    # Same logical channel as Live Control / Napari (set via set_active_channel_reference or set_microscope_mode).
     active: Optional[str] = None
     if live_controller.currentConfiguration is not None:
         active = live_controller.currentConfiguration.name
+    else:
+        fallback = live_controller.get_channel_name_for_contrast()
+        if fallback != "default":
+            active = fallback
     camera = live_controller.camera
     channels = _merge_active_channel_camera_from_hardware(channels, active, camera)
     camera_live = _collect_camera_live_snapshot(camera, live_controller)
