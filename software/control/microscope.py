@@ -808,10 +808,14 @@ class Microscope:
         # Note: Migration from acquisition_configurations to user_profiles is handled
         # by run_auto_migration() in main_hcs.py before Microscope is created
 
-        # Load default profile (ensures configs exist)
+        # Load profile: restore last session if still valid, else first alphabetically
         profiles = self.config_repo.get_available_profiles()
         if profiles:
-            self.config_repo.load_profile(profiles[0])
+            last = self.config_repo.get_last_active_profile()
+            initial = last if last else profiles[0]
+            if initial not in profiles:
+                initial = profiles[0]
+            self.config_repo.load_profile(initial)
         else:
             # Create a default profile if none exist - load_profile() will call
             # ensure_default_configs() to generate configs from illumination_channel_config.yaml

@@ -924,6 +924,30 @@ class IlluminationController:
             return None
         return self._led_matrix_unified.get_matrix_mode()
 
+    def illumination_maps_to_unified_led_matrix(self, illumination_channel_name: Optional[str]) -> bool:
+        """True if *illumination_channel_name* (from acquisition config) maps to the unified LED matrix.
+
+        Matches the unified logical name and legacy per-mode aliases (see ``_resolve_led_matrix_channel``).
+        """
+        if not illumination_channel_name or self._led_matrix_unified is None:
+            return False
+        return self._resolve_led_matrix_channel(illumination_channel_name) is not None
+
+    def snapshot_key_for_acquisition_illumination_channel(self, illumination_channel_name: Optional[str]) -> Optional[str]:
+        """Return the ``_channel_state`` / snapshot dict key for an acquisition ``illumination_channel`` string.
+
+        Legacy aliases (per-mode names) map to the unified logical channel name used in ``snapshot()``.
+        """
+        if not illumination_channel_name:
+            return None
+        if illumination_channel_name in self._channel_state:
+            return illumination_channel_name
+        lm = self._resolve_led_matrix_channel(illumination_channel_name)
+        if lm is not None:
+            unified_name, _mode_key = lm
+            return unified_name
+        return None
+
     def led_matrix_mode_items(self) -> List[Tuple[str, str]]:
         """``(mode_key, label)`` pairs for unified LED matrix, or empty list."""
         if self._led_matrix_unified is None:

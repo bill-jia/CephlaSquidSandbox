@@ -12,6 +12,8 @@ Organization:
 - Channel Config Convenience: higher-level helpers (merge, update settings)
 - Laser AF Configs: per-profile laser autofocus settings
 - Acquisition Output: saving settings to experiment directories
+- Observation State: objective-free presets under each profile
+- Acquisition Metadata: per-run manifest next to experiment outputs
 - Cache Management: cache control
 """
 
@@ -50,6 +52,8 @@ from control.models.hardware_bindings import (
     FILTER_WHEEL_SOURCE_CONFOCAL,
     FILTER_WHEEL_SOURCE_STANDALONE,
 )
+from control.models.acquisition_metadata import AcquisitionMetadata
+from control.models.observation_state import ObservationState
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,8 @@ class ConfigRepository:
                 ├── channel_configs/
                 │   ├── general.yaml (includes channel_groups in v1.1)
                 │   └── {objective}.yaml
+                ├── observation_presets/
+                │   └── *.yaml
                 └── laser_af_configs/
                     └── {objective}.yaml
     """
@@ -191,6 +197,38 @@ class ConfigRepository:
         """Get the current profile name."""
         return self._current_profile
 
+    def _last_active_profile_path(self) -> Path:
+        """Cache file so the same profile is restored on the next application start."""
+        return self.base_path / "cache" / "last_active_profile.txt"
+
+    def get_last_active_profile(self) -> Optional[str]:
+        """
+        Read the last successfully loaded profile name from disk, if valid.
+
+        Returns None if missing, unreadable, or the profile directory no longer exists.
+        """
+        path = self._last_active_profile_path()
+        if not path.is_file():
+            return None
+        try:
+            name = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not name:
+            return None
+        if not (self.user_profiles_path / name).is_dir():
+            return None
+        return name
+
+    def _persist_last_active_profile(self, profile: str) -> None:
+        """Write last active profile for restore on next startup (see Microscope init)."""
+        try:
+            path = self._last_active_profile_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(profile + "\n", encoding="utf-8")
+        except OSError as e:
+            logger.warning("Could not persist last active profile: %s", e)
+
     def set_profile(self, profile: str) -> None:
         """
         Set the current profile. Clears profile cache.
@@ -207,6 +245,7 @@ class ConfigRepository:
 
         self._current_profile = profile
         self._profile_cache.clear()
+        self._persist_last_active_profile(profile)
         logger.debug(f"Switched to profile: {profile}")
 
     def load_profile(self, profile: str, objectives: Optional[List[str]] = None) -> None:
@@ -288,6 +327,7 @@ class ConfigRepository:
             raise ValueError(f"Profile '{name}' already exists")
 
         (profile_path / "channel_configs").mkdir(parents=True)
+        (profile_path / "observation_presets").mkdir(parents=True, exist_ok=True)
         (profile_path / "laser_af_configs").mkdir(parents=True)
         logger.info(f"Created profile: {name}")
 
@@ -314,6 +354,7 @@ class ConfigRepository:
 
         # Create directory structure
         (dest_path / "channel_configs").mkdir(parents=True)
+        (dest_path / "observation_presets").mkdir(parents=True, exist_ok=True)
         (dest_path / "laser_af_configs").mkdir(parents=True)
 
         # Copy all YAML files from source to dest
@@ -323,6 +364,14 @@ class ConfigRepository:
             if source_dir.exists():
                 for yaml_file in source_dir.glob("*.yaml"):
                     shutil.copy2(yaml_file, dest_dir / yaml_file.name)
+
+        # Observation State presets (objective-free YAML files)
+        obs_src = source_path / "observation_presets"
+        obs_dst = dest_path / "observation_presets"
+        if obs_src.exists():
+            obs_dst.mkdir(parents=True, exist_ok=True)
+            for yaml_file in obs_src.glob("*.yaml"):
+                shutil.copy2(yaml_file, obs_dst / yaml_file.name)
 
         logger.info(f"Created profile '{dest}' by copying from '{source}'")
 
@@ -340,6 +389,7 @@ class ConfigRepository:
         """Create profile directories if they don't exist."""
         profile_path = self._get_profile_path(profile)
         (profile_path / "channel_configs").mkdir(parents=True, exist_ok=True)
+        (profile_path / "observation_presets").mkdir(parents=True, exist_ok=True)
         (profile_path / "laser_af_configs").mkdir(parents=True, exist_ok=True)
 
     def get_profile_path(self, profile: Optional[str] = None) -> Path:
@@ -975,6 +1025,88 @@ class ConfigRepository:
         )
         output_path = Path(output_dir) / "acquisition_channels.yaml"
         self._save_yaml(output_path, output_config)
+
+    def save_acquisition_metadata(
+        self,
+        output_dir: Union[Path, str],
+        metadata: AcquisitionMetadata,
+    ) -> None:
+        """
+        Write Acquisition Metadata manifest to an experiment directory.
+
+        Creates ``acquisition_metadata.yaml`` alongside legacy sidecars.
+        """
+        output_path = Path(output_dir) / "acquisition_metadata.yaml"
+        self._save_yaml(output_path, metadata)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # OBSERVATION STATE (objective-free presets)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def list_observation_presets(self, profile: Optional[str] = None) -> List[str]:
+        """
+        List saved Observation State preset names (without ``.yaml``) for a profile.
+
+        Args:
+            profile: Profile name (defaults to current profile)
+        """
+        profile = profile or self._current_profile
+        if profile is None:
+            return []
+        presets_dir = self.user_profiles_path / profile / "observation_presets"
+        if not presets_dir.is_dir():
+            return []
+        names: List[str] = []
+        for p in sorted(presets_dir.glob("*.yaml")):
+            names.append(p.stem)
+        return names
+
+    def save_observation_preset(self, name: str, state: ObservationState, profile: Optional[str] = None) -> Path:
+        """
+        Save an Observation State preset under ``user_profiles/{profile}/observation_presets/``.
+
+        Args:
+            name: Display name (sanitized to a file stem)
+            state: Objective-free Observation State
+            profile: Profile name (defaults to current profile)
+
+        Returns:
+            Path to the written YAML file
+        """
+        from control.core.observation_state_service import observation_preset_path, sanitize_preset_filename
+
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
+        sanitize_preset_filename(name)
+        path = observation_preset_path(self, name, profile=profile)
+        self._save_yaml(path, state)
+        return path
+
+    def load_observation_preset(self, name: str, profile: Optional[str] = None) -> Optional[ObservationState]:
+        """
+        Load a named Observation State preset from the profile.
+
+        Returns None if missing or invalid.
+        """
+        from control.core.observation_state_service import observation_preset_path
+
+        profile = profile or self._current_profile
+        if profile is None:
+            return None
+        path = observation_preset_path(self, name, profile=profile)
+        if not path.exists():
+            logger.debug("Observation preset not found: %s", path)
+            return None
+        try:
+            with open(path, "r") as f:
+                data = yaml.safe_load(f)
+            if data is None:
+                data = {}
+            return ObservationState.model_validate(data)
+        except (yaml.YAMLError, ValidationError, OSError) as e:
+            logger.warning("Failed to load Observation State preset %s: %s", path, e)
+            return None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CACHE MANAGEMENT

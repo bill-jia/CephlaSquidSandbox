@@ -3740,6 +3740,14 @@ class EmissionFilterWheelPanel(QWidget):
         else:
             self.live_controller.enable_channel_auto_filter_switching = True
 
+    def sync_positions_from_hardware(self) -> None:
+        """Update Position comboboxes from the filter controller (after preset load or external move)."""
+        boxes = getattr(self, "_combo_boxes", None)
+        if not boxes:
+            return
+        for wheel_id in boxes:
+            self._update_position_from_controller(wheel_id)
+
 
 class CameraSettingsWidget(QFrame):
 
@@ -4226,6 +4234,100 @@ class CameraSettingsWidget(QFrame):
             self.camera.set_black_level(blacklevel)
         except AttributeError:
             self._log.warning("Cannot set black level - not supported.")
+
+    def sync_controls_from_hardware(self) -> None:
+        """
+        Refresh Camera tab widgets from camera + live_controller (after Observation State load, etc.).
+        """
+        from control.core.observation_state_service import infer_roi_centered_from_camera
+
+        self.entry_exposureTime.blockSignals(True)
+        self.entry_analogGain.blockSignals(True)
+        self.dropdown_cameraMode.blockSignals(True)
+        if getattr(self, "dropdown_binning", None) is not None:
+            self.dropdown_binning.blockSignals(True)
+        self.entry_ROI_offset_x.blockSignals(True)
+        self.entry_ROI_offset_y.blockSignals(True)
+        self.entry_ROI_width.blockSignals(True)
+        self.entry_ROI_height.blockSignals(True)
+        self.checkbox_ROI_centered.blockSignals(True)
+        if getattr(self, "dropdown_triggerMode", None) is not None:
+            self.dropdown_triggerMode.blockSignals(True)
+        if getattr(self, "entry_triggerFPS", None) is not None:
+            self.entry_triggerFPS.blockSignals(True)
+        try:
+            self.entry_exposureTime.setValue(float(self.camera.get_exposure_time()))
+            try:
+                self.entry_analogGain.setValue(float(self.camera.get_analog_gain()))
+            except Exception:
+                pass
+            try:
+                cm = self.camera.get_camera_mode()
+                if cm is not None:
+                    self.dropdown_cameraMode.setCurrentText(cm)
+            except Exception:
+                pass
+            try:
+                bx, by = self.camera.get_binning()
+                if getattr(self, "dropdown_binning", None) is not None and self.dropdown_binning.isEnabled():
+                    self.dropdown_binning.setCurrentText(f"{bx}x{by}")
+            except Exception:
+                pass
+            try:
+                ox, oy, w, h = self.camera.get_region_of_interest()
+                self.entry_ROI_offset_x.setValue(int(ox))
+                self.entry_ROI_offset_y.setValue(int(oy))
+                self.entry_ROI_width.setValue(int(w))
+                self.entry_ROI_height.setValue(int(h))
+            except Exception:
+                pass
+            centered = infer_roi_centered_from_camera(self.camera)
+            self.checkbox_ROI_centered.setChecked(centered)
+            self.entry_ROI_offset_x.setEnabled(not centered)
+            self.entry_ROI_offset_y.setEnabled(not centered)
+
+            if self.live_controller is not None:
+                if getattr(self, "dropdown_triggerMode", None) is not None:
+                    try:
+                        tm = self.live_controller.get_trigger_mode()
+                        text = tm if isinstance(tm, str) else getattr(tm, "value", str(tm))
+                        idx = self.dropdown_triggerMode.findText(text)
+                        if idx >= 0:
+                            self.dropdown_triggerMode.setCurrentIndex(idx)
+                    except Exception:
+                        pass
+                if getattr(self, "entry_triggerFPS", None) is not None:
+                    try:
+                        fps = float(getattr(self.live_controller, "fps_trigger", 10.0) or 10.0)
+                        self.entry_triggerFPS.setValue(fps)
+                    except Exception:
+                        pass
+
+            panel = getattr(self, "_emission_filter_panel", None)
+            if panel is not None and hasattr(panel, "sync_positions_from_hardware"):
+                panel.sync_positions_from_hardware()
+            if panel is not None and self.live_controller is not None and hasattr(panel, "checkBox"):
+                panel.checkBox.blockSignals(True)
+                try:
+                    panel.checkBox.setChecked(not self.live_controller.enable_channel_auto_filter_switching)
+                except Exception:
+                    pass
+                panel.checkBox.blockSignals(False)
+        finally:
+            self.entry_exposureTime.blockSignals(False)
+            self.entry_analogGain.blockSignals(False)
+            self.dropdown_cameraMode.blockSignals(False)
+            if getattr(self, "dropdown_binning", None) is not None:
+                self.dropdown_binning.blockSignals(False)
+            self.entry_ROI_offset_x.blockSignals(False)
+            self.entry_ROI_offset_y.blockSignals(False)
+            self.entry_ROI_width.blockSignals(False)
+            self.entry_ROI_height.blockSignals(False)
+            self.checkbox_ROI_centered.blockSignals(False)
+            if getattr(self, "dropdown_triggerMode", None) is not None:
+                self.dropdown_triggerMode.blockSignals(False)
+            if getattr(self, "entry_triggerFPS", None) is not None:
+                self.entry_triggerFPS.blockSignals(False)
 
 
 class ProfileWidget(QFrame):
@@ -20066,9 +20168,10 @@ class IlluminationWidget(QWidget):
     """Standalone widget for manual illumination control.
 
     Displays one row per channel defined in the controller's ``channel_config``,
-    with an intensity slider/spinbox pair and an on/off toggle button.  A preset
-    panel below the channel rows lets users save, load, and delete named
-    illumination configurations.
+    with an intensity slider/spinbox pair and an on/off toggle button. When
+    ``config_repo``, ``live_controller``, and ``objective_store`` are provided,
+    a separate ``ObservationStateWidget`` (``control.widgets_observation_state``) is
+    placed below the channel rows for saving and loading imaging presets.
 
     The widget is controller-agnostic: it calls only
     ``IlluminationController.set_channel_intensity``, ``turn_on_channel``, and
@@ -20108,25 +20211,54 @@ class IlluminationWidget(QWidget):
         }
     """
 
-    def __init__(self, illumination_controller, parent=None):
+    def __init__(
+        self,
+        illumination_controller,
+        parent=None,
+        *,
+        config_repo=None,
+        live_controller=None,
+        objective_store=None,
+        emission_filter_wheel=None,
+        on_observation_state_changed=None,
+    ):
         """
         Args:
             illumination_controller: An ``IlluminationController`` instance that must
                 have a non-None ``channel_config`` attribute.
             parent: Optional parent widget.
+            config_repo: ``ConfigRepository`` for Observation State presets (optional).
+            live_controller: ``LiveController`` for collecting/applying Observation State.
+            objective_store: ``ObjectiveStore`` for current objective when applying state.
+            emission_filter_wheel: Optional hardware handle for filter positions in presets.
+            on_observation_state_changed: Callback after save/load (e.g. refresh channel lists).
         """
         super().__init__(parent)
         self._controller = illumination_controller
         self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
+        self._on_observation_state_changed = on_observation_state_changed
+        self.observation_state_widget: Optional["ObservationStateWidget"] = None
 
-        self._build_ui()
+        self._build_ui(
+            config_repo=config_repo,
+            live_controller=live_controller,
+            objective_store=objective_store,
+            emission_filter_wheel=emission_filter_wheel,
+        )
         self._refresh_from_state()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
+    def _build_ui(
+        self,
+        *,
+        config_repo=None,
+        live_controller=None,
+        objective_store=None,
+        emission_filter_wheel=None,
+    ):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(4)
@@ -20260,33 +20392,18 @@ class IlluminationWidget(QWidget):
 
         root.addWidget(channels_group)
 
-        # Preset panel
-        preset_group = QGroupBox("Presets")
-        preset_layout = QHBoxLayout(preset_group)
-        preset_layout.setSpacing(6)
+        if config_repo is not None and live_controller is not None and objective_store is not None:
+            from control.widgets_observation_state import ObservationStateWidget
 
-        self._combo_presets = QComboBox()
-        self._combo_presets.setMinimumWidth(140)
-        self._refresh_preset_combo()
-
-        btn_save = QPushButton("Save")
-        btn_save.setToolTip("Save current state as a named preset")
-        btn_save.clicked.connect(self._on_save_preset)
-
-        btn_load = QPushButton("Load")
-        btn_load.setToolTip("Load the selected preset")
-        btn_load.clicked.connect(self._on_load_preset)
-
-        btn_delete = QPushButton("Delete")
-        btn_delete.setToolTip("Delete the selected preset")
-        btn_delete.clicked.connect(self._on_delete_preset)
-
-        preset_layout.addWidget(self._combo_presets, stretch=1)
-        preset_layout.addWidget(btn_save)
-        preset_layout.addWidget(btn_load)
-        preset_layout.addWidget(btn_delete)
-
-        root.addWidget(preset_group)
+            self.observation_state_widget = ObservationStateWidget(
+                parent=self,
+                config_repo=config_repo,
+                live_controller=live_controller,
+                objective_store=objective_store,
+                emission_filter_wheel=emission_filter_wheel,
+                on_state_changed=self._on_observation_state_applied,
+            )
+            root.addWidget(self.observation_state_widget)
         root.addStretch()
 
     # ------------------------------------------------------------------
@@ -20336,32 +20453,15 @@ class IlluminationWidget(QWidget):
         if mode_key is not None and getattr(self._controller, "set_led_matrix_mode", None):
             self._controller.set_led_matrix_mode(mode_key)
 
-    def _on_save_preset(self):
-        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if ok and name.strip():
-            self._controller.save_preset(name.strip())
-            self._refresh_preset_combo()
-            idx = self._combo_presets.findText(name.strip())
-            if idx >= 0:
-                self._combo_presets.setCurrentIndex(idx)
+    def refresh_observation_state_presets(self) -> None:
+        """Refresh the Observation State preset dropdown (e.g. after profile switch)."""
+        if self.observation_state_widget is not None:
+            self.observation_state_widget.refresh_presets()
 
-    def _on_load_preset(self):
-        name = self._combo_presets.currentText()
-        if not name:
-            return
-        try:
-            self._controller.load_preset(name)
-            self._refresh_from_state()
-        except KeyError:
-            QMessageBox.warning(self, "Preset Not Found", f"Preset '{name}' no longer exists.")
-            self._refresh_preset_combo()
-
-    def _on_delete_preset(self):
-        name = self._combo_presets.currentText()
-        if not name:
-            return
-        self._controller.delete_preset(name)
-        self._refresh_preset_combo()
+    def _on_observation_state_applied(self) -> None:
+        self._refresh_from_state()
+        if self._on_observation_state_changed:
+            self._on_observation_state_changed()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -20377,17 +20477,6 @@ class IlluminationWidget(QWidget):
             btn.setStyleSheet(
                 "QPushButton { background-color: #555; color: #ccc; font-weight: bold; border-radius: 3px; }"
             )
-
-    def _refresh_preset_combo(self):
-        self._combo_presets.blockSignals(True)
-        current = self._combo_presets.currentText()
-        self._combo_presets.clear()
-        for name in self._controller.list_presets():
-            self._combo_presets.addItem(name)
-        idx = self._combo_presets.findText(current)
-        if idx >= 0:
-            self._combo_presets.setCurrentIndex(idx)
-        self._combo_presets.blockSignals(False)
 
     def _refresh_from_state(self):
         """Update all UI controls to match the controller's current _channel_state."""

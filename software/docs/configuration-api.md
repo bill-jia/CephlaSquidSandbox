@@ -40,6 +40,9 @@ config_repo = ConfigRepository(base_path=Path("/custom/path"))
 base_path/
 ├── machine_configs/
 └── user_profiles/
+    └── {profile}/
+        ├── channel_configs/
+        └── observation_presets/
 ```
 
 ### Profile Management
@@ -698,6 +701,22 @@ if obj_config is None:
     # Fall back to general-only
     channels = list(config_repo.get_general_config().channels)
 ```
+
+---
+
+## Observation State and Acquisition Metadata
+
+**Observation State** is the objective-free imaging preset users save from **Settings → Save Observation State Preset…** in the HCS GUI. It is stored as YAML under `user_profiles/{profile}/observation_presets/*.yaml` using the `ObservationState` Pydantic model (`control/models/observation_state.py`). It does not include `objective`; when loading, **Load Observation State Preset…** writes `general.yaml` and applies the current objective’s overrides via `merge_channel_configs`.
+
+The **active profile** is persisted in `cache/last_active_profile.txt` (under the repo `base_path`, typically `software/`) whenever `set_profile` runs, so the next startup reloads the same profile instead of always using the first profile alphabetically—otherwise presets saved under another profile would appear to “disappear” after restart.
+
+**Acquisition Metadata** is the per-run manifest written as `acquisition_metadata.yaml` in each experiment folder (`AcquisitionMetadata` in `control/models/acquisition_metadata.py`). It includes **objective** and scan/trigger summary for reproducibility. Legacy `acquisition parameters.json` (multipoint) and `acquisition_channels.yaml` remain side‑by‑side; analysis tools can read `acquisition_metadata.yaml` (see `tools/analyze_acquisition_logs.py`).
+
+**API**
+
+- `ConfigRepository.save_observation_preset` / `load_observation_preset` / `list_observation_presets`
+- `ConfigRepository.save_acquisition_metadata`
+- `control.core.observation_state_service.collect_observation_state` / `apply_observation_state`
 
 ---
 

@@ -40,6 +40,8 @@ from control.models.hardware_bindings import (
     FILTER_WHEEL_SOURCE_CONFOCAL,
     FILTER_WHEEL_SOURCE_STANDALONE,
 )
+from control.models.acquisition_metadata import AcquisitionMetadata
+from control.models.observation_state import CameraLiveSnapshot, ObservationState
 from control.models.acquisition_config import (
     CameraSettings,
     ConfocalSettings,
@@ -119,6 +121,9 @@ __all__ = [
     "GeneralChannelConfig",
     "ObjectiveChannelConfig",
     "AcquisitionOutputConfig",
+    "AcquisitionMetadata",
+    "CameraLiveSnapshot",
+    "ObservationState",
     "merge_channel_configs",
     "validate_illumination_references",
     "get_illumination_channel_names",

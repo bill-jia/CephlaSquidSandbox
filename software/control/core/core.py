@@ -37,7 +37,7 @@ from threading import Thread, Lock
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
-from control.models import AcquisitionChannel
+from control.models import AcquisitionChannel, AcquisitionMetadata
 import time
 import itertools
 import json
@@ -419,6 +419,33 @@ class TrackingController(QObject):
                 objective=self.objectiveStore.current_objective,
                 channels=self.selected_configurations,
                 confocal_mode=self.liveController.is_confocal_mode(),
+            )
+            current_objective = self.objectiveStore.current_objective
+            objective_details: Dict[str, Any] = {}
+            try:
+                objective_details = dict(self.objectiveStore.objectives_dict.get(current_objective, {}))
+                objective_details["name"] = current_objective
+            except (AttributeError, KeyError, TypeError):
+                objective_details = {"name": current_objective}
+            try:
+                trigger_mode = str(self.liveController.get_trigger_mode())
+            except Exception:
+                trigger_mode = None
+            acquisition_metadata = AcquisitionMetadata(
+                experiment_id=self.experiment_ID,
+                recording_start_time=self.recording_start_time,
+                objective=current_objective,
+                objective_details=objective_details,
+                confocal_mode=self.liveController.is_confocal_mode(),
+                sensor_pixel_size_um=self.camera.get_pixel_size_binned_um(),
+                tube_lens_mm=control._def.TUBE_LENS_MM,
+                trigger_mode=trigger_mode,
+                selected_channel_names=[c.name for c in self.selected_configurations],
+                scan_parameters={"source": "tracking"},
+            )
+            self.liveController.microscope.config_repo.save_acquisition_metadata(
+                experiment_dir,
+                acquisition_metadata,
             )
         except:
             self._log.info("error in making a new folder")

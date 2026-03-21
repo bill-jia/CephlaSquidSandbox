@@ -232,11 +232,20 @@ def parse_acquisition_folder(folder_path: str) -> Tuple[AcquisitionTiming, dict]
     # Load acquisition parameters
     params_path = folder / "acquisition parameters.json"
     yaml_path = folder / "acquisition.yaml"
+    acquisition_metadata_path = folder / "acquisition_metadata.yaml"
 
     metadata = {}
     if params_path.exists():
         with open(params_path, "r") as f:
             metadata["params"] = json.load(f)
+    if acquisition_metadata_path.exists():
+        try:
+            import yaml
+
+            with open(acquisition_metadata_path, "r") as f:
+                metadata["acquisition_metadata"] = yaml.safe_load(f)
+        except ImportError:
+            pass
     if yaml_path.exists():
         try:
             import yaml

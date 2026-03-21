@@ -45,6 +45,7 @@ import pandas as pd
 
 from control import utils, utils_acquisition
 import control._def
+from control.models.acquisition_metadata import AcquisitionMetadata
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
 from control.core.scan_coordinates import ScanCoordinates
@@ -553,6 +554,37 @@ class MultiPointController:
         acquisition_parameters["sensor_pixel_size_um"] = self.camera.get_pixel_size_binned_um()
         acquisition_parameters["tube_lens_mm"] = control._def.TUBE_LENS_MM
         acquisition_parameters["confocal_mode"] = self.liveController.is_confocal_mode()
+
+        obj_block = acquisition_parameters.get("objective")
+        if isinstance(obj_block, dict):
+            objective_name = obj_block.get("name", self.objectiveStore.current_objective)
+            objective_details = dict(obj_block)
+        else:
+            objective_name = self.objectiveStore.current_objective
+            objective_details = {}
+        scan_parameters = {k: v for k, v in acquisition_parameters.items() if k != "objective"}
+        try:
+            trigger_mode = str(self.liveController.get_trigger_mode())
+        except Exception:
+            trigger_mode = None
+        selected_names = [c.name for c in self.selected_configurations]
+        acquisition_metadata = AcquisitionMetadata(
+            experiment_id=self.experiment_ID,
+            recording_start_time=self.recording_start_time,
+            objective=objective_name,
+            objective_details=objective_details,
+            confocal_mode=self.liveController.is_confocal_mode(),
+            sensor_pixel_size_um=acquisition_parameters.get("sensor_pixel_size_um"),
+            tube_lens_mm=acquisition_parameters.get("tube_lens_mm"),
+            trigger_mode=trigger_mode,
+            selected_channel_names=selected_names,
+            scan_parameters=scan_parameters,
+        )
+        self.liveController.microscope.config_repo.save_acquisition_metadata(
+            experiment_dir,
+            acquisition_metadata,
+        )
+
         f = open(os.path.join(self.base_path, self.experiment_ID) + "/acquisition parameters.json", "w")
         f.write(json.dumps(acquisition_parameters))
         f.close()
