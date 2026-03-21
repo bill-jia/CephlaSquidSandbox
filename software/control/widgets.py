@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from control.core.memory_profiler import MemoryMonitor
+    from control.microscope import Microscope
 
 import squid.logging
 from control.core.config import ConfigRepository
@@ -3577,6 +3578,8 @@ class CameraSettingsWidget(QFrame):
         include_gain_exposure_time=False,
         include_camera_temperature_setting=False,
         include_camera_auto_wb_setting=False,
+        include_trigger_controls: bool = False,
+        live_controller: Optional[LiveController] = None,
         main=None,
         *args,
         **kwargs,
@@ -3585,14 +3588,22 @@ class CameraSettingsWidget(QFrame):
         super().__init__(*args, **kwargs)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.camera: AbstractCamera = camera
+        self.live_controller: Optional[LiveController] = live_controller
         self.add_components(
-            include_gain_exposure_time, include_camera_temperature_setting, include_camera_auto_wb_setting
+            include_gain_exposure_time,
+            include_camera_temperature_setting,
+            include_camera_auto_wb_setting,
+            include_trigger_controls,
         )
         # set frame style
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
     def add_components(
-        self, include_gain_exposure_time, include_camera_temperature_setting, include_camera_auto_wb_setting
+        self,
+        include_gain_exposure_time,
+        include_camera_temperature_setting,
+        include_camera_auto_wb_setting,
+        include_trigger_controls: bool,
     ):
 
         # add buttons and input fields
@@ -3704,6 +3715,55 @@ class CameraSettingsWidget(QFrame):
             gain_line.addWidget(QLabel("Analog Gain"))
             gain_line.addWidget(self.entry_analogGain)
             self.camera_layout.addLayout(gain_line)
+
+        if include_trigger_controls and self.live_controller is not None:
+            trigger_line = QHBoxLayout()
+            trigger_line.addWidget(QLabel("Trigger Mode"))
+
+            self.dropdown_triggerMode = QComboBox()
+            self.dropdown_triggerMode.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
+
+            initial_trigger_mode = self.camera.get_acquisition_mode().value
+            self.dropdown_triggerMode.blockSignals(True)
+            idx = self.dropdown_triggerMode.findText(initial_trigger_mode)
+            if idx >= 0:
+                self.dropdown_triggerMode.setCurrentIndex(idx)
+            self.dropdown_triggerMode.blockSignals(False)
+            # Ensure LiveController.trigger_mode matches the camera acquisition mode.
+            try:
+                self.live_controller.set_trigger_mode(initial_trigger_mode)
+            except Exception:
+                pass
+            trigger_line.addWidget(self.dropdown_triggerMode, stretch=1)
+
+            trigger_line.addWidget(QLabel("Trigger FPS"))
+            self.entry_triggerFPS = QDoubleSpinBox()
+            self.entry_triggerFPS.setKeyboardTracking(False)
+            self.entry_triggerFPS.setRange(0.02, 1000)
+            self.entry_triggerFPS.setSingleStep(1)
+            self.entry_triggerFPS.setDecimals(0)
+
+            # Legacy default: LiveControlWidget historically defaulted to 10 fps.
+            initial_fps = getattr(self.live_controller, "fps_trigger", None)
+            # Treat the LiveController constructor default (1 fps) as "unset" for UI defaults.
+            if initial_fps is None or initial_fps <= 0 or initial_fps == 1:
+                initial_fps = 10
+
+            try:
+                self.live_controller.set_trigger_fps(initial_fps)
+            except Exception:
+                # If trigger_fps cannot be set in the current mode, keep the UI value.
+                pass
+            self.entry_triggerFPS.blockSignals(True)
+            self.entry_triggerFPS.setValue(float(initial_fps))
+            self.entry_triggerFPS.blockSignals(False)
+            trigger_line.addWidget(self.entry_triggerFPS)
+
+            # Wire after initial values are set to avoid overriding during construction.
+            self.dropdown_triggerMode.currentTextChanged.connect(lambda s: self.live_controller.set_trigger_mode(s))
+            self.entry_triggerFPS.valueChanged.connect(lambda v: self.live_controller.set_trigger_fps(v))
+
+            self.camera_layout.addLayout(trigger_line)
 
         format_line = QHBoxLayout()
         format_line.addWidget(QLabel("Camera Mode"))
@@ -4035,6 +4095,7 @@ class LiveControlWidget(QFrame):
         show_autolevel=False,
         autolevel=False,
         stretch=True,
+        objectives_widget=None,
         main=None,
         *args,
         **kwargs,
@@ -4045,9 +4106,9 @@ class LiveControlWidget(QFrame):
         self.camera = self.liveController.microscope.camera
         self.streamHandler = streamHandler
         self.objectiveStore = objectiveStore
+        # Used as the hidden widget default; CameraSettingsWidget now owns trigger FPS.
         self.fps_trigger = 10
         self.fps_display = 10
-        self.liveController.set_trigger_fps(self.fps_trigger)
         self.streamHandler.set_display_fps(self.fps_display)
 
         channels = self.liveController.get_channels(self.objectiveStore.current_objective)
@@ -4057,15 +4118,18 @@ class LiveControlWidget(QFrame):
         else:
             self.currentConfiguration = channels[0]
 
-        self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch)
+        self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        if self.currentConfiguration:
-            self.liveController.set_microscope_mode(self.currentConfiguration)
-            self.update_ui_for_mode(self.currentConfiguration)
+        # Manual live output is controlled by camera + illumination widgets.
+        # Avoid calling set_microscope_mode() here, since it would override
+        # camera exposure/gain and illumination intensity from the channel config.
 
         self.is_switching_mode = False  # flag used to prevent from settings being set by twice - from both mode change slot and value change slot; another way is to use blockSignals(True)
+        # Manual live should not override illumination channel state/levels.
+        # Acquisition code still calls LiveController.set_microscope_mode().
+        self._control_illumination_before_live: Optional[bool] = None
 
-    def add_components(self, show_trigger_options, show_display_options, show_autolevel, autolevel, stretch):
+    def add_components(self, show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget=None):
         # line 0: trigger mode
         self.dropdown_triggerManu = QComboBox()
         self.dropdown_triggerManu.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
@@ -4284,11 +4348,17 @@ class LiveControlWidget(QFrame):
         snap_group.setLayout(snap_layout)
 
         self.grid = QVBoxLayout()
-        if show_trigger_options:
-            self.grid.addLayout(grid_line0)
-        self.grid.addLayout(grid_line1)
-        self.grid.addLayout(grid_line2)
-        self.grid.addLayout(grid_line4)
+        # Manual live: hide trigger/exposure/gain/illumination and the "Live Configuration" selector.
+        # Camera + Illumination widgets now own those controls.
+        top_line = QHBoxLayout()
+        top_line.setSpacing(8)
+        top_line.addWidget(self.btn_live, 0)
+        if show_autolevel:
+            top_line.addWidget(self.btn_autolevel, 0)
+        if objectives_widget is not None:
+            top_line.addWidget(objectives_widget, 0)
+        top_line.addStretch(1)
+        self.grid.addLayout(top_line)
         if show_display_options:
             self.grid.addLayout(grid_line05)
         self.grid.addWidget(snap_group)
@@ -4298,11 +4368,19 @@ class LiveControlWidget(QFrame):
 
     def toggle_live(self, pressed):
         if pressed:
+            # Manual live: illumination is controlled by IlluminationWidget.
+            if self._control_illumination_before_live is None:
+                self._control_illumination_before_live = self.liveController.control_illumination
+            self.liveController.control_illumination = False
             self.liveController.start_live()
             self.btn_live.setText("Stop Live")
             self.signal_start_live.emit()
         else:
             self.liveController.stop_live()
+            # Restore previous illumination control behavior.
+            if self._control_illumination_before_live is not None:
+                self.liveController.control_illumination = self._control_illumination_before_live
+                self._control_illumination_before_live = None
             self.btn_live.setText("Start Live")
 
     def set_snap_saving_dir(self):
@@ -4326,7 +4404,7 @@ class LiveControlWidget(QFrame):
                 self.liveController.start_live()
                 # Wait for camera to start and capture at least one frame
                 # Wait for exposure time + some buffer
-                exposure_time_ms = self.entry_exposureTime.value()
+                exposure_time_ms = float(self.camera.get_exposure_time())
                 wait_time_s = max(0.5, (exposure_time_ms / 1000.0) * 2)
                 time.sleep(wait_time_s)
             
@@ -4376,8 +4454,9 @@ class LiveControlWidget(QFrame):
         self.btn_autolevel.setChecked(autolevel_on)
 
     def update_camera_settings(self):
-        self.signal_newAnalogGain.emit(self.entry_analogGain.value())
-        self.signal_newExposureTime.emit(self.entry_exposureTime.value())
+        # Manual live is controlled by CameraSettingsWidget + IlluminationWidget.
+        # Keep this method to avoid breaking callers, but do nothing.
+        return
 
     def refresh_mode_list(self):
         # Update the mode selection dropdown (only show enabled channels)
@@ -4390,10 +4469,14 @@ class LiveControlWidget(QFrame):
             self.dropdown_modeSelection.addItem(microscope_configuration.name)
         self.dropdown_modeSelection.blockSignals(False)
 
-        # Update to first configuration
-        if self.dropdown_modeSelection.count() > 0:
-            self.update_ui_for_mode(first_config)
-            self.liveController.set_microscope_mode(first_config)
+        # Manual live output is controlled by CameraSettingsWidget + IlluminationWidget.
+        # Do not call set_microscope_mode() here, since it would override camera exposure/gain.
+        if first_config is not None:
+            self.currentConfiguration = first_config
+            # Keep dropdown current text consistent (even if the widget is hidden in the main layout).
+            self.dropdown_modeSelection.blockSignals(True)
+            self.dropdown_modeSelection.setCurrentText(first_config.name)
+            self.dropdown_modeSelection.blockSignals(False)
 
     def select_new_microscope_mode_by_name(self, config_name):
         maybe_new_config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, config_name)
@@ -4409,7 +4492,9 @@ class LiveControlWidget(QFrame):
         try:
             self.is_switching_mode = True
             self.currentConfiguration = config
+            self.dropdown_modeSelection.blockSignals(True)
             self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
+            self.dropdown_modeSelection.blockSignals(False)
             if self.currentConfiguration:
                 self.signal_live_configuration.emit(self.currentConfiguration)
 
@@ -4417,6 +4502,10 @@ class LiveControlWidget(QFrame):
                 self.entry_exposureTime.setValue(self.currentConfiguration.exposure_time)
                 self.entry_analogGain.setValue(self.currentConfiguration.analog_gain)
                 self.entry_illuminationIntensity.setValue(self.currentConfiguration.illumination_intensity)
+                # Sync camera widget controls when acquisition updates the active channel.
+                # (Manual live view does not call set_microscope_mode() from this widget.)
+                self.signal_newExposureTime.emit(self.currentConfiguration.exposure_time)
+                self.signal_newAnalogGain.emit(self.currentConfiguration.analog_gain)
         finally:
             self.is_switching_mode = False
 
@@ -4765,7 +4854,7 @@ class NavigationWidget(QFrame):
 
     def add_components(self):
         x_label = QLabel("X :")
-        x_label.setFixedWidth(20)
+        x_label.setFixedWidth(15)
         self.label_Xpos = QLabel()
         self.label_Xpos.setNum(0)
         self.label_Xpos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
@@ -4777,17 +4866,20 @@ class NavigationWidget(QFrame):
         self.entry_dX.setDecimals(3)
         self.entry_dX.setSuffix(" mm")
         self.entry_dX.setKeyboardTracking(False)
-        self.btn_moveX_forward = QPushButton("Forward")
+        self.entry_dX.setFixedWidth(70)
+        self.btn_moveX_forward = QPushButton("Up")
         self.btn_moveX_forward.setDefault(False)
-        self.btn_moveX_backward = QPushButton("Backward")
+        self.btn_moveX_forward.setFixedWidth(55)
+        self.btn_moveX_backward = QPushButton("Down")
         self.btn_moveX_backward.setDefault(False)
+        self.btn_moveX_backward.setFixedWidth(55)
 
         self.checkbox_clickToMove = QCheckBox("Click to Move")
         self.checkbox_clickToMove.setChecked(False)
         self.checkbox_clickToMove.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
 
         y_label = QLabel("Y :")
-        y_label.setFixedWidth(20)
+        y_label.setFixedWidth(15)
         self.label_Ypos = QLabel()
         self.label_Ypos.setNum(0)
         self.label_Ypos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
@@ -4800,13 +4892,16 @@ class NavigationWidget(QFrame):
         self.entry_dY.setSuffix(" mm")
 
         self.entry_dY.setKeyboardTracking(False)
-        self.btn_moveY_forward = QPushButton("Forward")
+        self.entry_dY.setFixedWidth(70)
+        self.btn_moveY_forward = QPushButton("Up")
         self.btn_moveY_forward.setDefault(False)
-        self.btn_moveY_backward = QPushButton("Backward")
+        self.btn_moveY_forward.setFixedWidth(55)
+        self.btn_moveY_backward = QPushButton("Down")
         self.btn_moveY_backward.setDefault(False)
+        self.btn_moveY_backward.setFixedWidth(55)
 
         self.z_label = QLabel("Z :")
-        self.z_label.setFixedWidth(20)
+        self.z_label.setFixedWidth(15)
         self.label_Zpos = QLabel()
         self.label_Zpos.setNum(0)
         self.label_Zpos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
@@ -4818,12 +4913,17 @@ class NavigationWidget(QFrame):
         self.entry_dZ.setDecimals(3)
         self.entry_dZ.setSuffix(" μm")
         self.entry_dZ.setKeyboardTracking(False)
-        self.btn_moveZ_forward = QPushButton("Forward")
+        self.entry_dZ.setFixedWidth(70)
+        self.btn_moveZ_forward = QPushButton("Up")
         self.btn_moveZ_forward.setDefault(False)
-        self.btn_moveZ_backward = QPushButton("Backward")
+        self.btn_moveZ_forward.setFixedWidth(55)
+        self.btn_moveZ_backward = QPushButton("Down")
         self.btn_moveZ_backward.setDefault(False)
+        self.btn_moveZ_backward.setFixedWidth(55)
 
         grid_line0 = QGridLayout()
+        grid_line0.setHorizontalSpacing(4)
+        grid_line0.setVerticalSpacing(2)
         grid_line0.addWidget(x_label, 0, 0)
         grid_line0.addWidget(self.label_Xpos, 0, 1)
         grid_line0.addWidget(self.entry_dX, 0, 2)
@@ -5537,6 +5637,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def __init__(
         self,
         stage: AbstractStage,
+        microscope,
         navigationViewer,
         multipointController,
         objectiveStore,
@@ -5554,6 +5655,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.last_used_locations = None
         self.last_used_location_ids = None
         self.stage = stage
+        self.microscope = microscope
+        self._enable_laser_autofocus = bool(
+            getattr(microscope.addons, "camera_focus", None)
+        )
         self.navigationViewer = navigationViewer
         self.multipointController = multipointController
         self.objectiveStore = objectiveStore
@@ -5727,9 +5832,14 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_withAutofocus.setChecked(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
         self.multipointController.set_af_flag(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
 
-        self.checkbox_withReflectionAutofocus = QCheckBox("Reflection AF")
-        self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
-        self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+            self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        else:
+            self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.setVisible(False)
+            self.multipointController.set_reflection_af_flag(False)
 
         self.checkbox_genAFMap = QCheckBox("Generate Focus Map")
         self.checkbox_genAFMap.setChecked(False)
@@ -5903,7 +6013,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         grid_af = QVBoxLayout()
         grid_af.addWidget(self.checkbox_withAutofocus)
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self._enable_laser_autofocus:
             grid_af.addWidget(self.checkbox_withReflectionAutofocus)
         # grid_af.addWidget(self.checkbox_genAFMap)  # we are not using auto-focus map for now
         grid_af.addWidget(self.checkbox_useFocusMap)
@@ -5982,7 +6092,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
-        self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
@@ -6039,8 +6150,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             if widget is not None:
                 widget.setVisible(is_visible)
 
-        # Disable reflection autofocus checkbox if Z-range is visible
-        self.checkbox_withReflectionAutofocus.setEnabled(not is_visible)
+        # Disable Laser AF checkbox if Z-range is visible
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setEnabled(not is_visible)
         # Enable/disable NZ entry based on the inverse of is_visible
         self.entry_NZ.setEnabled(not is_visible)
         current_z = self.stage.get_pos().z_mm * 1000
@@ -6110,11 +6222,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_maxZ.setValue(z_pos_um)
 
     def _reset_reflection_af_reference(self):
+        if not self._enable_laser_autofocus:
+            return
         if (
             self.checkbox_withReflectionAutofocus.isChecked()
             and not self.multipointController.laserAutoFocusController.set_reference()
         ):
-            error_dialog("Failed to set reference for reflection autofocus. Is the laser autofocus initialized?")
+            error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
 
     def update_z(self):
         z_mm = self.stage.get_pos().z_mm
@@ -6332,7 +6446,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
             self.multipointController.set_af_flag(self.checkbox_withAutofocus.isChecked())
-            self.multipointController.set_reflection_af_flag(self.checkbox_withReflectionAutofocus.isChecked())
+            self.multipointController.set_reflection_af_flag(
+                self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
+            )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
             self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
@@ -6824,7 +6940,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
-        self.checkbox_withReflectionAutofocus.setEnabled(enabled)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setEnabled(enabled)
         self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
 
@@ -6879,9 +6996,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_dt,
             self.list_configurations,
             self.checkbox_withAutofocus,
-            self.checkbox_withReflectionAutofocus,
-            self.checkbox_usePiezo,
         ]
+        if self._enable_laser_autofocus:
+            widgets_to_block.append(self.checkbox_withReflectionAutofocus)
+        widgets_to_block.append(self.checkbox_usePiezo)
 
         # Add optional widgets if they exist
         if hasattr(self, "entry_deltaX"):
@@ -6925,7 +7043,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Autofocus
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
-            self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
+            if self._enable_laser_autofocus:
+                self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
 
             # Load positions if present
             if yaml_data.flexible_positions:
@@ -7017,6 +7136,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def __init__(
         self,
         stage: AbstractStage,
+        microscope,
         navigationViewer,
         multipointController,
         liveController,
@@ -7033,6 +7153,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.setAcceptDrops(True)  # Enable drag-and-drop for loading acquisition YAML
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.stage = stage
+        self.microscope = microscope
+        self._enable_laser_autofocus = bool(
+            getattr(microscope.addons, "camera_focus", None)
+        )
         self.navigationViewer = navigationViewer
         self.multipointController = multipointController
         self.liveController = liveController
@@ -7226,8 +7350,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.multipointController.set_af_flag(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
 
         self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
-        self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
-        self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+            self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        else:
+            self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.setVisible(False)
+            self.multipointController.set_reflection_af_flag(False)
 
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
         self.checkbox_usePiezo.setChecked(MULTIPOINT_USE_PIEZO_FOR_ZSTACKS)
@@ -7457,7 +7586,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Options and Start button
         options_layout = QVBoxLayout()
         options_layout.addWidget(self.checkbox_withAutofocus)
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self._enable_laser_autofocus:
             options_layout.addWidget(self.checkbox_withReflectionAutofocus)
         # options_layout.addWidget(self.checkbox_genAFMap)  # We are not using AF map now
         options_layout.addWidget(self.checkbox_useFocusMap)
@@ -7532,7 +7661,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Coverage is read-only, derived from scan_size, FOV, and overlap
         self.combobox_shape.currentTextChanged.connect(self.on_shape_changed)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
-        self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
@@ -7576,7 +7706,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_NZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.list_configurations.itemSelectionChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_withAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
-        self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
 
     def enable_manual_ROI(self):
         _manual_index = self.combobox_xy_mode.findText("Manual")
@@ -7607,7 +7738,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "nz": self.entry_NZ.value(),
                 "selected_channels": [item.text() for item in self.list_configurations.selectedItems()],
                 "contrast_af": self.checkbox_withAutofocus.isChecked(),
-                "laser_af": self.checkbox_withReflectionAutofocus.isChecked(),
+                "laser_af": (
+                    self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
+                ),
             }
 
             with open("cache/multipoint_widget_config.yaml", "w") as f:
@@ -7639,7 +7772,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_NZ.blockSignals(True)
             self.list_configurations.blockSignals(True)
             self.checkbox_withAutofocus.blockSignals(True)
-            self.checkbox_withReflectionAutofocus.blockSignals(True)
+            if self._enable_laser_autofocus:
+                self.checkbox_withReflectionAutofocus.blockSignals(True)
 
             # Set flag to prevent automatic file dialog when loading "Load Coordinates" mode from cache
             self._loading_from_cache = True
@@ -7685,7 +7819,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Restore autofocus settings
             self.checkbox_withAutofocus.setChecked(settings.get("contrast_af", False))
-            self.checkbox_withReflectionAutofocus.setChecked(settings.get("laser_af", False))
+            if self._enable_laser_autofocus:
+                self.checkbox_withReflectionAutofocus.setChecked(settings.get("laser_af", False))
 
             # Unblock signals
             self.checkbox_xy.blockSignals(False)
@@ -7700,7 +7835,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_NZ.blockSignals(False)
             self.list_configurations.blockSignals(False)
             self.checkbox_withAutofocus.blockSignals(False)
-            self.checkbox_withReflectionAutofocus.blockSignals(False)
+            if self._enable_laser_autofocus:
+                self.checkbox_withReflectionAutofocus.blockSignals(False)
 
             # Update UI state based on loaded settings
             self.update_scan_control_ui()
@@ -8320,10 +8456,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 if widget:
                     widget.setVisible(is_visible)
 
-        # Disable and uncheck reflection autofocus checkbox if Z-range is visible
-        if is_visible:
-            self.checkbox_withReflectionAutofocus.setChecked(False)
-        self.checkbox_withReflectionAutofocus.setEnabled(not is_visible)
+        # Disable and uncheck Laser AF checkbox if Z-range is visible
+        if self._enable_laser_autofocus:
+            if is_visible:
+                self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.setEnabled(not is_visible)
         # Enable/disable NZ entry based on the inverse of is_visible
         self.entry_NZ.setEnabled(not is_visible)
         current_z = self.stage.get_pos().z_mm * 1000
@@ -8508,12 +8645,14 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_maxZ.setValue(z_pos_um)
 
     def _reset_reflection_af_reference(self):
+        if not self._enable_laser_autofocus:
+            return
         if self.checkbox_withReflectionAutofocus.isChecked():
             was_live = self.liveController.is_live
             if was_live:
                 self.liveController.stop_live()
             if not self.multipointController.laserAutoFocusController.set_reference():
-                error_dialog("Failed to set reference for reflection autofocus. Is the laser autofocus initialized?")
+                error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
             if was_live:
                 self.liveController.start_live()
 
@@ -8674,7 +8813,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
             self.multipointController.set_af_flag(self.checkbox_withAutofocus.isChecked())
-            self.multipointController.set_reflection_af_flag(self.checkbox_withReflectionAutofocus.isChecked())
+            self.multipointController.set_reflection_af_flag(
+                self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
+            )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
             self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
@@ -9062,14 +9203,19 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.combobox_shape,
             self.list_configurations,
             self.checkbox_withAutofocus,
-            self.checkbox_withReflectionAutofocus,
-            self.combobox_xy_mode,
-            self.checkbox_xy,
-            self.checkbox_z,
-            self.checkbox_time,
-            self.combobox_z_mode,
-            self.checkbox_usePiezo,
         ]
+        if self._enable_laser_autofocus:
+            widgets_to_block.append(self.checkbox_withReflectionAutofocus)
+        widgets_to_block.extend(
+            [
+                self.combobox_xy_mode,
+                self.checkbox_xy,
+                self.checkbox_z,
+                self.checkbox_time,
+                self.combobox_z_mode,
+                self.checkbox_usePiezo,
+            ]
+        )
 
         for widget in widgets_to_block:
             widget.blockSignals(True)
@@ -9117,7 +9263,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Autofocus
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
-            self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
+            if self._enable_laser_autofocus:
+                self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
 
             # XY mode - set to Select Wells for wellplate YAML
             if yaml_data.xy_mode in ["Current Position", "Select Wells", "Manual", "Load Coordinates"]:
@@ -9209,6 +9356,7 @@ class MultiPointWithFluidicsWidget(QFrame):
     def __init__(
         self,
         stage: AbstractStage,
+        microscope: "Microscope",
         navigationViewer,
         multipointController,
         objectiveStore,
@@ -9220,6 +9368,10 @@ class MultiPointWithFluidicsWidget(QFrame):
         super().__init__(*args, **kwargs)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.stage = stage
+        self.microscope = microscope
+        self._enable_laser_autofocus = bool(
+            getattr(getattr(microscope, "addons", None), "camera_focus", None)
+        )
         self.navigationViewer = navigationViewer
         self.multipointController = multipointController
         self.objectiveStore = objectiveStore
@@ -9276,10 +9428,15 @@ class MultiPointWithFluidicsWidget(QFrame):
             self.list_configurations.addItems([microscope_configuration.name])
         self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
 
-        # Reflection AF checkbox
-        self.checkbox_withReflectionAutofocus = QCheckBox("Reflection AF")
-        self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
-        self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        # Laser AF checkbox
+        self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+            self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
+        else:
+            self.checkbox_withReflectionAutofocus.setChecked(False)
+            self.checkbox_withReflectionAutofocus.setVisible(False)
+            self.multipointController.set_reflection_af_flag(False)
 
         # Piezo checkbox
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
@@ -9347,7 +9504,7 @@ class MultiPointWithFluidicsWidget(QFrame):
 
         # Options layout
         options_layout = QVBoxLayout()
-        if SUPPORT_LASER_AUTOFOCUS:
+        if self._enable_laser_autofocus:
             options_layout.addWidget(self.checkbox_withReflectionAutofocus)
         if HAS_OBJECTIVE_PIEZO:
             options_layout.addWidget(self.checkbox_usePiezo)
@@ -9392,7 +9549,8 @@ class MultiPointWithFluidicsWidget(QFrame):
         # self.btn_init_fluidics.clicked.connect(self.init_fluidics)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
-        self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
@@ -9456,7 +9614,9 @@ class MultiPointWithFluidicsWidget(QFrame):
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
-            self.multipointController.set_reflection_af_flag(self.checkbox_withReflectionAutofocus.isChecked())
+            self.multipointController.set_reflection_af_flag(
+                self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
+            )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_configurations(
@@ -14844,12 +15004,11 @@ class SampleSettingsWidget(QFrame):
         self.objectivesWidget = ObjectivesWidget
         self.wellplateFormatWidget = WellplateFormatWidget
 
-        # Set up the layout
-        top_row_layout = QGridLayout()
-        top_row_layout.setSpacing(2)
+        # Objective lens lives next to Start Live / Autolevel in LiveControlWidget; sample format only here.
+        top_row_layout = QHBoxLayout()
+        top_row_layout.setSpacing(8)
         top_row_layout.setContentsMargins(0, 2, 0, 2)
-        top_row_layout.addWidget(self.objectivesWidget, 0, 0)
-        top_row_layout.addWidget(self.wellplateFormatWidget, 0, 1)
+        top_row_layout.addWidget(self.wellplateFormatWidget, 1)
         self.setLayout(top_row_layout)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
@@ -16768,18 +16927,47 @@ class FastAcquisitionWidget(QWidget):
     
     def init_ui(self):
         """Initialize UI components."""
-        # Note: Hardware triggering is done via NI DAQ waveforms only
-        # info_label = QLabel(
-        #     "Hardware triggering uses preloaded NI DAQ waveforms.\n"
-        #     "Trigger waveform is generated on DIO 1 (default)."
-        # )
-        # info_label.setWordWrap(True)
-        # main_layout.addWidget(info_label)
-        
-        # Acquisition parameters
+        _compact = 4  # margins/spacing for denser layout (matches multipoint-style tabs)
+
+        # --- Output first (same order as other acquisition widgets) ---
+        output_group = QGroupBox("Output")
+        output_layout = QGridLayout()
+        output_layout.setHorizontalSpacing(8)
+        output_layout.setVerticalSpacing(_compact)
+
+        self.lineEdit_savingDir = QLineEdit()
+        self.lineEdit_savingDir.setReadOnly(True)
+        from control._def import DEFAULT_SAVING_PATH
+
+        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
+        self.output_path = DEFAULT_SAVING_PATH
+        self.base_path_is_set = True
+
+        self.btn_setSavingDir = QPushButton("Browse")
+        self.btn_setSavingDir.setDefault(False)
+        try:
+            self.btn_setSavingDir.setIcon(QIcon("icon/folder.png"))
+        except Exception:
+            pass
+        self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
+
+        self.lineEdit_experimentID = QLineEdit()
+
+        output_layout.addWidget(QLabel("Saving Path:"), 0, 0)
+        output_layout.addWidget(self.lineEdit_savingDir, 0, 1)
+        output_layout.addWidget(self.btn_setSavingDir, 0, 2)
+        output_layout.addWidget(QLabel("Experiment ID:"), 1, 0)
+        output_layout.addWidget(self.lineEdit_experimentID, 1, 1, 1, 2)
+        output_layout.setColumnStretch(1, 1)
+        output_layout.setContentsMargins(_compact, _compact, _compact, _compact)
+        output_group.setLayout(output_layout)
+
+        # --- Acquisition + buffer in one compact 3×4 grid ---
         acq_group = QGroupBox("Acquisition Parameters")
         acq_layout = QGridLayout()
-        
+        acq_layout.setHorizontalSpacing(10)
+        acq_layout.setVerticalSpacing(_compact)
+
         acq_layout.addWidget(QLabel("Frame Rate (Hz):"), 0, 0)
         self.frame_rate_spinbox = QDoubleSpinBox()
         self.frame_rate_spinbox.setRange(0.1, 1000.0)
@@ -16788,98 +16976,55 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
         self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
         acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
-        
-        acq_layout.addWidget(QLabel("Exposure Time (ms):"), 1, 0)
+
+        acq_layout.addWidget(QLabel("Exposure Time (ms):"), 0, 2)
         self.exposure_time_spinbox = QDoubleSpinBox()
         self.exposure_time_spinbox.setRange(0.1, 10000.0)
         self.exposure_time_spinbox.setValue(20.0)
         self.exposure_time_spinbox.setDecimals(2)
-        acq_layout.addWidget(self.exposure_time_spinbox, 1, 1)
-        
-        # Initialize max exposure time based on frame rate and readout time
+        acq_layout.addWidget(self.exposure_time_spinbox, 0, 3)
+
         self._update_max_exposure_time()
-        
-        acq_layout.addWidget(QLabel("Number of Frames:"), 2, 0)
+
+        acq_layout.addWidget(QLabel("Number of Frames:"), 1, 0)
         self.num_frames_spinbox = QSpinBox()
         self.num_frames_spinbox.setRange(0, 1000000)
         self.num_frames_spinbox.setValue(100)
         self.num_frames_spinbox.setSpecialValueText("Continuous")
         self.num_frames_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
-        acq_layout.addWidget(self.num_frames_spinbox, 2, 1)
-        
-        acq_layout.addWidget(QLabel("Total Acquisition Time (s):"), 3, 0)
+        acq_layout.addWidget(self.num_frames_spinbox, 1, 1)
+
+        acq_layout.addWidget(QLabel("Total Acquisition Time (s):"), 1, 2)
         self.total_time_spinbox = QDoubleSpinBox()
-        self.total_time_spinbox.setRange(0.001, 3600.0)  # 1 ms to 1 hour
-        self.total_time_spinbox.setValue(10.0)  # Default: 10 seconds
+        self.total_time_spinbox.setRange(0.001, 3600.0)
+        self.total_time_spinbox.setValue(10.0)
         self.total_time_spinbox.setDecimals(3)
         self.total_time_spinbox.setSuffix(" s")
         self.total_time_spinbox.valueChanged.connect(self._update_frames_from_acquisition_time)
-        acq_layout.addWidget(self.total_time_spinbox, 3, 1)
-        acq_layout.setContentsMargins(8, 8, 8, 8)
-        acq_group.setLayout(acq_layout)
-        
-        
-        # Initialize total time based on initial frame count
-        self._update_acquisition_time_from_frames()
-        
-        # Buffer settings
-        buffer_group = QGroupBox("Buffer Settings")
-        buffer_layout = QGridLayout()
-        
-        buffer_layout.addWidget(QLabel("Buffer Size:"), 0, 0)
+        acq_layout.addWidget(self.total_time_spinbox, 1, 3)
+
+        acq_layout.addWidget(QLabel("Buffer Size:"), 2, 0)
         self.buffer_size_spinbox = QSpinBox()
         self.buffer_size_spinbox.setRange(10, 10000)
         self.buffer_size_spinbox.setValue(500)
-        buffer_layout.addWidget(self.buffer_size_spinbox, 0, 1)
-        
-        buffer_layout.addWidget(QLabel("File Format:"), 0, 2)
+        acq_layout.addWidget(self.buffer_size_spinbox, 2, 1)
+
+        acq_layout.addWidget(QLabel("File Format:"), 2, 2)
         self.file_format_combo = QComboBox()
         self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5"])
-        buffer_layout.addWidget(self.file_format_combo, 0, 3)
+        acq_layout.addWidget(self.file_format_combo, 2, 3)
 
-        buffer_layout.setContentsMargins(8, 8, 8, 8)       
-        buffer_group.setLayout(buffer_layout)
-        
-        
-        # Output directory (matching RecordingWidget style)
-        output_group = QGroupBox("Output")
-        output_layout = QVBoxLayout()
-        
-        # Saving path (like RecordingWidget)
-        path_layout = QGridLayout()
-        path_layout.addWidget(QLabel("Saving Path"), 0, 0)
-        self.lineEdit_savingDir = QLineEdit()
-        self.lineEdit_savingDir.setReadOnly(True)
-        self.lineEdit_savingDir.setText("Choose a base saving directory")
-        from control._def import DEFAULT_SAVING_PATH
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.output_path = DEFAULT_SAVING_PATH
-        self.base_path_is_set = True
-        path_layout.addWidget(self.lineEdit_savingDir, 0, 1)
-        self.btn_setSavingDir = QPushButton("Browse")
-        self.btn_setSavingDir.setDefault(False)
-        try:
-            self.btn_setSavingDir.setIcon(QIcon("icon/folder.png"))
-        except:
-            pass  # Icon file may not exist
-        self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
-        path_layout.addWidget(self.btn_setSavingDir, 0, 2)
-        
-        # Experiment ID (like RecordingWidget)
-        exp_layout = QGridLayout()
-        exp_layout.addWidget(QLabel("Experiment ID"), 0, 0)
-        self.lineEdit_experimentID = QLineEdit()
-        exp_layout.addWidget(self.lineEdit_experimentID, 0, 1)
-        
-        output_layout.addLayout(path_layout)
-        output_layout.addLayout(exp_layout)
-        output_layout.setContentsMargins(8, 8, 8, 8)
-        output_group.setLayout(output_layout)
-        
-        # DAQ configuration
+        acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
+        acq_group.setLayout(acq_layout)
+
+        self._update_acquisition_time_from_frames()
+
+        # --- DAQ configuration (2×2 grid, unchanged logic) ---
         daq_group = QGroupBox("DAQ Configuration")
         daq_layout = QGridLayout()
-        
+        daq_layout.setHorizontalSpacing(10)
+        daq_layout.setVerticalSpacing(_compact)
+
         daq_layout.addWidget(QLabel("Trigger Mode:"), 0, 0)
         self.trigger_mode_combo = QComboBox()
         self.trigger_mode_combo.addItems(["Frame Start", "Acquisition Start"])
@@ -16895,14 +17040,16 @@ class FastAcquisitionWidget(QWidget):
         self.trigger_dio_line_spinbox.setValue(6)
         self.trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
         daq_layout.addWidget(self.trigger_dio_line_spinbox, 0, 3)
-        
+
         daq_layout.addWidget(QLabel("Camera Frame DIO Line:"), 1, 0)
         self.camera_dio_line_spinbox = QSpinBox()
         self.camera_dio_line_spinbox.setRange(0, 31)
         self.camera_dio_line_spinbox.setValue(7)
-        self.camera_dio_line_spinbox.setToolTip("NI DAQ digital input line connected to camera frame signal (default: 0)")
+        self.camera_dio_line_spinbox.setToolTip(
+            "NI DAQ digital input line connected to camera frame signal (default: 0)"
+        )
         daq_layout.addWidget(self.camera_dio_line_spinbox, 1, 1)
-        
+
         daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 1, 2)
         self.daq_sample_rate_spinbox = QDoubleSpinBox()
         self.daq_sample_rate_spinbox.setRange(100.0, 1000000.0)
@@ -16910,45 +17057,42 @@ class FastAcquisitionWidget(QWidget):
         self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
         daq_layout.addWidget(self.daq_sample_rate_spinbox, 1, 3)
 
-        # Note: Analog input configuration is done in the NI DAQ tab
-        daq_layout.setContentsMargins(8, 8, 8, 8)
+        daq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         daq_group.setLayout(daq_layout)
-        
-        
-        # Control buttons
+
+        # --- Control buttons ---
         control_layout = QHBoxLayout()
+        control_layout.setSpacing(_compact)
         self.start_button = QPushButton("Start Acquisition")
         self.start_button.clicked.connect(self.start_acquisition)
         control_layout.addWidget(self.start_button)
-        
+
         self.stop_button = QPushButton("Stop Acquisition")
         self.stop_button.clicked.connect(self.stop_acquisition)
         self.stop_button.setEnabled(False)
         control_layout.addWidget(self.stop_button)
-        
-        # Statistics display
+
+        # --- Statistics: single row ---
         stats_group = QGroupBox("Statistics")
-        stats_layout = QGridLayout()
-        
-        
-        stats_layout.addWidget(QLabel("Buffer Fill:"), 0, 0)
-        self.stats_label = QLabel("Not acquiring")
-        stats_layout.addWidget(self.stats_label, 0, 1)
-        
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(8)
+        stats_layout.addWidget(QLabel("Buffer Fill:"))
         self.buffer_progress_bar = QProgressBar()
         self.buffer_progress_bar.setRange(0, 100)
-        stats_layout.addWidget(self.buffer_progress_bar, 1, 0)
-
-        stats_layout.setRowStretch(0,2)
-        stats_layout.setRowStretch(1,1)
-        stats_layout.setContentsMargins(8, 8, 8, 8)
+        self.buffer_progress_bar.setMinimumHeight(18)
+        stats_layout.addWidget(self.buffer_progress_bar, stretch=1)
+        self.stats_label = QLabel("Not acquiring")
+        self.stats_label.setMinimumWidth(120)
+        stats_layout.addWidget(self.stats_label)
+        stats_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         stats_group.setLayout(stats_layout)
-        
+
         main_layout = QVBoxLayout()
         self.setLayout(main_layout)
-        main_layout.addWidget(acq_group)
-        main_layout.addWidget(buffer_group)
+        main_layout.setSpacing(_compact)
+        main_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         main_layout.addWidget(output_group)
+        main_layout.addWidget(acq_group)
         main_layout.addWidget(daq_group)
         main_layout.addLayout(control_layout)
         main_layout.addWidget(stats_group)
@@ -19934,6 +20078,38 @@ class IlluminationWidget(QWidget):
     NI-DAQ, or serial light source.
     """
 
+    # Thicker horizontal slider track/handle than default (~3px) for touchability
+    _ILLUMINATION_SLIDER_QSS = """
+        QSlider::groove:horizontal {
+            border: 1px solid #888;
+            height: 10px;
+            background: #3a3a3a;
+            margin: 4px 0;
+            border-radius: 4px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #3d8f5a;
+            border: 1px solid #4a9960;
+            height: 10px;
+            border-radius: 4px;
+        }
+        QSlider::add-page:horizontal {
+            background: #3a3a3a;
+            border-radius: 4px;
+        }
+        QSlider::handle:horizontal {
+            background: #e8e8e8;
+            border: 1px solid #666;
+            width: 16px;
+            height: 16px;
+            margin: -5px 0;
+            border-radius: 4px;
+        }
+        QSlider::handle:horizontal:hover {
+            background: #ffffff;
+        }
+    """
+
     def __init__(self, illumination_controller, parent=None):
         """
         Args:
@@ -19957,15 +20133,17 @@ class IlluminationWidget(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(4)
 
-        # Title
+        # Title (compact so channel rows can use taller sliders)
         title = QLabel("Illumination Control")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        title.setStyleSheet("font-weight: bold; font-size: 11px;")
         root.addWidget(title)
 
-        # Channel rows
-        channels_group = QGroupBox("Channels")
+        # Channel rows (no "Channels" group title — layout only)
+        channels_group = QWidget()
         channels_layout = QGridLayout(channels_group)
-        channels_layout.setSpacing(4)
+        channels_layout.setContentsMargins(0, 0, 0, 0)
+        channels_layout.setHorizontalSpacing(6)
+        channels_layout.setVerticalSpacing(6)
 
         channel_config = getattr(self._controller, "channel_config", None)
         channel_names: List[str] = getattr(self._controller, "channel_names", []) or []
@@ -20025,12 +20203,14 @@ class IlluminationWidget(QWidget):
                 label = QLabel(label_text)
                 label.setMinimumWidth(120)
 
-            # Intensity slider
+            # Intensity slider (thicker groove/handle for easier interaction)
             slider = QSlider(Qt.Horizontal)
             slider.setMinimum(0)
             slider.setMaximum(100)
             slider.setValue(0)
             slider.setMinimumWidth(120)
+            slider.setMinimumHeight(22)
+            slider.setStyleSheet(IlluminationWidget._ILLUMINATION_SLIDER_QSS)
 
             # Intensity spinbox
             spinbox = QDoubleSpinBox()

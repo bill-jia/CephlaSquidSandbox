@@ -63,8 +63,8 @@ def apply_machine_config(mc: MachineConfig) -> None:
         return getattr(d.connection, key, default)
 
     # ── Device-presence flags ────────────────────────────────────────────────
-
-    control._def.SUPPORT_LASER_AUTOFOCUS = _dev_enabled("laser_af")
+    # Laser AF UI/hardware presence is determined from ``microscope.addons.camera_focus``
+    # after Microscope is built; do not mirror ``laser_af`` device here (see _def.SUPPORT_LASER_AUTOFOCUS note).
 
     # Piezo (Z motor config)
     piezo_enabled = _dev_enabled("piezo")

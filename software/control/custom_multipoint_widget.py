@@ -10,13 +10,34 @@ import squid.logging
 
 
 class TemplateMultiPointWidget(FlexibleMultiPointWidget):
-    def __init__(self, multipointController, stage, main=None, *args, **kwargs):
+    def __init__(
+        self,
+        stage,
+        microscope,
+        navigationViewer,
+        multipointController,
+        objectiveStore,
+        scanCoordinates,
+        focusMapWidget,
+        *args,
+        **kwargs,
+    ):
         # Initialize templates dict
         self.templates = {}
         self._log = squid.logging.get_logger(self.__class__.__name__)
 
         # Call parent constructor
-        super().__init__(multipointController, stage, main, *args, **kwargs)
+        super().__init__(
+            stage,
+            microscope,
+            navigationViewer,
+            multipointController,
+            objectiveStore,
+            scanCoordinates,
+            focusMapWidget,
+            *args,
+            **kwargs,
+        )
         self.region_id = 0
 
     def add_components(self):

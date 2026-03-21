@@ -529,7 +529,7 @@ class MultiPointController:
             "dt(s)": self.deltat,
             "Nt": self.Nt,
             "with AF": self.do_autofocus,
-            "with reflection AF": self.do_reflection_af,
+            "with laser AF": self.do_reflection_af,
             "with manual focus map": self.use_manual_focus_map,
         }
         try:  # write objective data if it is available

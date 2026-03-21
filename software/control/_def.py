@@ -893,7 +893,8 @@ CONTROLLER_VERSION = "Arduino Due"  # 'Teensy'
 # How to read Spinnaker nodemaps, options are INDIVIDUAL or VALUE
 CHOSEN_READ = "INDIVIDUAL"
 
-# laser autofocus
+# laser autofocus — legacy toggle (unused by GUI). Multipoint widgets use
+# ``microscope.addons.camera_focus`` instead; kept for any external/scripts still reading it.
 SUPPORT_LASER_AUTOFOCUS = False
 MAIN_CAMERA_MODEL = "MER2-1220-32U3M"
 FOCUS_CAMERA_MODEL = "MER2-630-60U3M"

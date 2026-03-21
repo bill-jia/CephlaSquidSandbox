@@ -451,6 +451,9 @@ class LiveController:
         if configuration is None:
             self._log.error("set_microscope_mode() called with None configuration - this is a bug in the caller")
             return
+        # Channel switching for acquisition must follow channel configuration
+        # (illumination intensity + illumination on/off behavior).
+        self.control_illumination = True
         self._log.info("setting microscope mode to " + configuration.name)
 
         # temporarily stop live while changing mode

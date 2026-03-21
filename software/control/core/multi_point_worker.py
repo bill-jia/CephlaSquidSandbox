@@ -1336,7 +1336,7 @@ class MultiPointWorker:
                     self.autofocusController.autofocus()
                     self.autofocusController.wait_till_autofocus_has_completed()
         else:
-            self._log.info("laser reflection af")
+            self._log.info("laser AF")
             try:
                 self.laser_auto_focus_controller.move_to_target(0)
                 self._laser_af_successes += 1

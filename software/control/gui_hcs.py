@@ -678,7 +678,8 @@ class HighContentScreeningGui(QMainWindow):
         self.backpressureMonitorWidget: Optional[widgets.BackpressureMonitorWidget] = None
 
         self.recordTabWidget: QTabWidget = QTabWidget()
-        self.cameraTabWidget: QTabWidget = QTabWidget()
+        # Always-visible controls panel (replaces the old tabbed UI).
+        self.cameraTabWidget: QWidget = QWidget()
         self.load_widgets(is_simulation=is_simulation)
         self.setup_layout()
         self.make_connections()
@@ -921,19 +922,28 @@ class HighContentScreeningGui(QMainWindow):
         if CAMERA_TYPE in ["Toupcam", "Tucsen", "Kinetix"]:
             self.cameraSettingWidget = widgets.CameraSettingsWidget(
                 self.camera,
-                include_gain_exposure_time=False,
+                include_gain_exposure_time=True,
+                include_trigger_controls=True,
+                live_controller=self.liveController,
                 include_camera_temperature_setting=True,
                 include_camera_auto_wb_setting=False,
             )
         else:
             self.cameraSettingWidget = widgets.CameraSettingsWidget(
                 self.camera,
-                include_gain_exposure_time=False,
+                include_gain_exposure_time=True,
+                include_trigger_controls=True,
+                live_controller=self.liveController,
                 include_camera_temperature_setting=False,
                 include_camera_auto_wb_setting=True,
             )
 
         self._restore_cached_camera_settings()
+
+        if USE_XERYON:
+            self.objectivesWidget = widgets.ObjectivesWidget(self.objectiveStore, self.objective_changer)
+        else:
+            self.objectivesWidget = widgets.ObjectivesWidget(self.objectiveStore)
 
         self.profileWidget = widgets.ProfileWidget(self.microscope.config_repo)
         self.liveControlWidget = widgets.LiveControlWidget(
@@ -943,6 +953,7 @@ class HighContentScreeningGui(QMainWindow):
             show_display_options=False,
             show_autolevel=True,
             autolevel=True,
+            objectives_widget=self.objectivesWidget,
         )
         self.navigationWidget = widgets.NavigationWidget(
             self.stage, widget_configuration=f"{WELLPLATE_FORMAT} well plate"
@@ -952,11 +963,6 @@ class HighContentScreeningGui(QMainWindow):
         self.autofocusWidget = widgets.AutoFocusWidget(self.autofocusController)
         if self.piezo:
             self.piezoWidget = widgets.PiezoWidget(self.piezo)
-
-        if USE_XERYON:
-            self.objectivesWidget = widgets.ObjectivesWidget(self.objectiveStore, self.objective_changer)
-        else:
-            self.objectivesWidget = widgets.ObjectivesWidget(self.objectiveStore)
 
         if self.emission_filter_wheel:
             self.filterControllerWidget = widgets.FilterControllerWidget(
@@ -1054,6 +1060,7 @@ class HighContentScreeningGui(QMainWindow):
 
         self.flexibleMultiPointWidget = widgets.FlexibleMultiPointWidget(
             self.stage,
+            self.microscope,
             self.navigationViewer,
             self.multipointController,
             self.objectiveStore,
@@ -1063,6 +1070,7 @@ class HighContentScreeningGui(QMainWindow):
         )
         self.wellplateMultiPointWidget = widgets.WellplateMultiPointWidget(
             self.stage,
+            self.microscope,
             self.navigationViewer,
             self.multipointController,
             self.liveController,
@@ -1076,6 +1084,7 @@ class HighContentScreeningGui(QMainWindow):
         if USE_TEMPLATE_MULTIPOINT:
             self.templateMultiPointWidget = TemplateMultiPointWidget(
                 self.stage,
+                self.microscope,
                 self.navigationViewer,
                 self.multipointController,
                 self.objectiveStore,
@@ -1084,6 +1093,7 @@ class HighContentScreeningGui(QMainWindow):
             )
         self.multiPointWithFluidicsWidget = widgets.MultiPointWithFluidicsWidget(
             self.stage,
+            self.microscope,
             self.navigationViewer,
             self.multipointController,
             self.objectiveStore,
@@ -1395,25 +1405,47 @@ class HighContentScreeningGui(QMainWindow):
         self.alignmentWidget.set_current_position(pos.x_mm, pos.y_mm)
 
     def setupCameraTabWidget(self):
-        if not USE_NAPARI_FOR_LIVE_CONTROL or self.live_only_mode:
-            self.cameraTabWidget.addTab(self.navigationWidget, "Stages")
-        if self.piezoWidget:
-            self.cameraTabWidget.addTab(self.piezoWidget, "Piezo")
-        if ENABLE_NL5:
-            self.cameraTabWidget.addTab(self.nl5Wdiget, "NL5")
-        if ENABLE_SPINNING_DISK_CONFOCAL:
-            self.cameraTabWidget.addTab(self.spinningDiskConfocalWidget, "Confocal")
-        if self.emission_filter_wheel:
-            self.cameraTabWidget.addTab(self.filterControllerWidget, "Emission Filter")
-        self.cameraTabWidget.addTab(self.cameraSettingWidget, "Camera")
-        self.cameraTabWidget.addTab(self.autofocusWidget, "Contrast AF")
-        if self.microscope.addons.camera_focus:
-            self.cameraTabWidget.addTab(self.laserAutofocusControlWidget, "Laser AF")
-        self.cameraTabWidget.addTab(self.focusMapWidget, "Focus Map")
+        # Camera + autofocus are grouped into a tabbed block. Default tab on startup:
+        # "Camera".
+        camera_autofocus_tabs = QTabWidget()
+        camera_autofocus_tabs.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding))
+
+        # Camera tab (default)
+        camera_tab = QWidget()
+        camera_tab_layout = QVBoxLayout()
+        camera_tab_layout.setContentsMargins(0, 0, 0, 0)
+        camera_tab_layout.setSpacing(6)
+        camera_tab_layout.addWidget(self.cameraSettingWidget)
+        camera_tab.setLayout(camera_tab_layout)
+        camera_autofocus_tabs.addTab(camera_tab, "Camera")
+
+        # Autofocus-related tabs
+        camera_autofocus_tabs.addTab(self.autofocusWidget, "Contrast AF")
+        if self.microscope.addons.camera_focus and getattr(self, "laserAutofocusControlWidget", None):
+            camera_autofocus_tabs.addTab(self.laserAutofocusControlWidget, "Laser AF")
+        if getattr(self, "focusMapWidget", None) is not None:
+            camera_autofocus_tabs.addTab(self.focusMapWidget, "Focus Map")
+
+        camera_autofocus_tabs.setCurrentIndex(0)
+
+        camera_outer_layout = QVBoxLayout()
+        camera_outer_layout.setContentsMargins(0, 0, 0, 0)
+        camera_outer_layout.setSpacing(6)
+        camera_outer_layout.addWidget(camera_autofocus_tabs)
+        self.cameraTabWidget.setLayout(camera_outer_layout)
+
+        # Illumination control (2/3 width in setup_layout)
         self.illuminationWidget = widgets.IlluminationWidget(self.microscope.illumination_controller)
-        self.cameraTabWidget.addTab(self.illuminationWidget, "Illumination")
-        self.cameraTabWidget.currentChanged.connect(lambda: self.resizeCurrentTab(self.cameraTabWidget))
-        self.resizeCurrentTab(self.cameraTabWidget)
+
+        # Stage controls (1/3 width in setup_layout): keep only basic controls here.
+        self.stageControlsWidget = QWidget()
+        stage_layout = QVBoxLayout()
+        stage_layout.setContentsMargins(0, 0, 0, 0)
+        stage_layout.setSpacing(6)
+        stage_layout.addWidget(self.navigationWidget)
+        if self.piezoWidget:
+            stage_layout.addWidget(self.piezoWidget)
+        self.stageControlsWidget.setLayout(stage_layout)
 
         # RAM monitor widget (always create, visibility controlled by setting)
         self.ramMonitorWidget = widgets.RAMMonitorWidget()
@@ -1444,13 +1476,25 @@ class HighContentScreeningGui(QMainWindow):
             simulated_io_banner.setAlignment(Qt.AlignCenter)
             layout.addWidget(simulated_io_banner)
 
-        if USE_NAPARI_FOR_LIVE_CONTROL and not self.live_only_mode:
-            layout.addWidget(self.navigationWidget)
-        else:
-            layout.addWidget(self.profileWidget)
-            layout.addWidget(self.liveControlWidget)
+        layout.addWidget(self.profileWidget)
 
-        layout.addWidget(self.cameraTabWidget)
+        # Top row: snaps/start live/autolevel on the left, camera+autofocus tabs on the right.
+        top_row = QWidget()
+        top_row_layout = QHBoxLayout(top_row)
+        top_row_layout.setContentsMargins(0, 0, 0, 0)
+        top_row_layout.setSpacing(8)
+        top_row_layout.addWidget(self.liveControlWidget, stretch=1)
+        top_row_layout.addWidget(self.cameraTabWidget, stretch=1)
+        layout.addWidget(top_row)
+
+        # Bottom row: illumination takes 2/3 width; stage takes 1/3 width.
+        bottom_row = QWidget()
+        bottom_row_layout = QHBoxLayout(bottom_row)
+        bottom_row_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_row_layout.setSpacing(8)
+        bottom_row_layout.addWidget(self.illuminationWidget, stretch=2)
+        bottom_row_layout.addWidget(self.stageControlsWidget, stretch=1)
+        layout.addWidget(bottom_row)
 
         if SHOW_DAC_CONTROL:
             layout.addWidget(self.dacControlWidget)
@@ -1570,7 +1614,7 @@ class HighContentScreeningGui(QMainWindow):
         self.liveControlWidget.signal_newAnalogGain.connect(self.cameraSettingWidget.set_analog_gain)
         if not self.live_only_mode:
             self.liveControlWidget.signal_start_live.connect(self.onStartLive)
-        self.liveControlWidget.update_camera_settings()
+        # LiveControlWidget no longer owns exposure/gain/trigger/illumination for manual live.
 
         self.connectSlidePositionController()
 

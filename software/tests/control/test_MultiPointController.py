@@ -288,7 +288,6 @@ def test_multi_point_controller_basic_acquisition():
 
 def test_multi_point_with_laser_af():
     control._def.MERGE_CHANNELS = False
-    control._def.SUPPORT_LASER_AUTOFOCUS = True
     scope = control.microscope.Microscope.build_from_global_config(True)
     tt = TestAcquisitionTracker()
 
