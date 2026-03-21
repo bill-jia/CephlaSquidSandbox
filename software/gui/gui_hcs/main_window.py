@@ -96,12 +96,9 @@ if USE_JUPYTER_CONSOLE:
 if RUN_FLUIDICS:
     from control.fluidics import Fluidics
 
-# Import the custom widget
-from gui.custom_multipoint_widget import TemplateMultiPointWidget
-
-# Slack notifications
 from control.slack_notifier import SlackNotifier, TimepointStats, AcquisitionStats
-from gui.widgets_slack import SlackSettingsDialog, load_slack_settings_from_cache
+from gui.widgets.integrations import SlackSettingsDialog, load_slack_settings_from_cache
+from gui.widgets.multipoint import TemplateMultiPointWidget
 
 from .qt_controllers import MovementUpdater, QtAutoFocusController, QtMultiPointController
 
@@ -277,23 +274,11 @@ class HighContentScreeningGui(QMainWindow):
                 self.log.info("Skipping cached position restoration (--skip-init flag set)")
         elif self._skip_homing:
             self.log.info("Skipping cached position restoration and init_z (--skip-homing flag set)")
-        elif HOMING_ENABLED_X and HOMING_ENABLED_Y and HOMING_ENABLED_Z:
-            # TODO(imo): Why is moving to the cached position after boot hidden behind homing?
-            if cached_pos := squid.stage.utils.get_cached_position():
-                self.log.info(
-                    f"Cache position exists.  Moving to: ({cached_pos.x_mm},{cached_pos.y_mm},{cached_pos.z_mm}) [mm]"
-                )
-                self.stage.move_x_to(cached_pos.x_mm)
-                self.stage.move_y_to(cached_pos.y_mm)
-
-                if (int(Z_HOME_SAFETY_POINT) / 1000.0) < cached_pos.z_mm:
-                    self.stage.move_z_to(cached_pos.z_mm)
-                else:
-                    self.log.info(f"Cache z position is smaller than Z_HOME_SAFETY_POINT, move to Z_HOME_SAFETY_POINT")
-                    self.stage.move_z_to(int(Z_HOME_SAFETY_POINT) / 1000.0)
-            else:
-                self.log.info(f"Cache position is not exists.  Moving Z axis to safety position")
-                squid.stage.utils.move_z_axis_to_safety_position(self.stage)
+        elif HOMING_ENABLED_X and HOMING_ENABLED_Y:
+            # Restore last session position after homing. Z homing must not gate this: if Z homing is
+            # disabled in config, XY homing still runs and we still need to leave the post-homing
+            # position (X offset +50 mm, etc.) and return to the cached or default workspace.
+            squid.stage.utils.move_to_cached_or_default_startup_position(self.stage, self.stage.get_config())
 
             if ENABLE_WELLPLATE_MULTIPOINT:
                 self.wellplateMultiPointWidget.init_z()
@@ -1712,7 +1697,7 @@ class HighContentScreeningGui(QMainWindow):
 
     def openWorkflowRunner(self):
         """Open the Workflow Runner dialog."""
-        from gui.widgets_workflow import WorkflowRunnerDialog
+        from gui.widgets.workflow import WorkflowRunnerDialog
         from control.workflow_runner import WorkflowRunner
 
         if self.workflowRunnerDialog is None:
@@ -1945,7 +1930,7 @@ class HighContentScreeningGui(QMainWindow):
 
     def saveObservationStatePreset(self):
         """Save current imaging state (Observation State) as a named profile preset."""
-        from gui.observation_state_gui import run_save_observation_state_dialog
+        from gui.widgets.observation_state_dialogs import run_save_observation_state_dialog
 
         run_save_observation_state_dialog(
             self,
@@ -1958,7 +1943,7 @@ class HighContentScreeningGui(QMainWindow):
 
     def loadObservationStatePreset(self):
         """Load a saved Observation State preset into general.yaml and live hardware."""
-        from gui.observation_state_gui import run_load_observation_state
+        from gui.widgets.observation_state_dialogs import run_load_observation_state
 
         run_load_observation_state(
             self,

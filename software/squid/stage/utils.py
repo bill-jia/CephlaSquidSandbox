@@ -9,6 +9,8 @@ import control.utils
 
 _log = squid.logging.get_logger(__package__)
 _DEFAULT_CACHE_PATH = "cache/last_coords.txt"
+# After blocking XY moves, wait for the controller to report idle before changing Z (startup restore).
+_STARTUP_XY_IDLE_TIMEOUT_S = 120.0
 
 """
 Attempts to load a cached stage position and return it.
@@ -21,16 +23,70 @@ def get_cached_position(cache_path=_DEFAULT_CACHE_PATH) -> Optional[Pos]:
         return None
     with open(cache_path, "r") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                x, y, z = line.strip("\n").strip().split(",")
-                x = float(x)
-                y = float(y)
-                z = float(z)
-                return Pos(x_mm=x, y_mm=y, z_mm=z, theta_rad=None)
-            except RuntimeError as e:
-                raise e
-                pass
+                parts = line.split(",")
+                if len(parts) != 3:
+                    raise ValueError(f"expected 3 comma-separated fields, got {len(parts)}")
+                x, y, z = parts
+                return Pos(x_mm=float(x), y_mm=float(y), z_mm=float(z), theta_rad=None)
+            except ValueError as e:
+                _log.warning(f"Skipping invalid cached position line {line!r}: {e}")
     return None
+
+
+def clamp_pos_to_stage_limits(pos: Pos, stage_config: Optional[StageConfig]) -> Pos:
+    if stage_config is None:
+        return pos
+    x = min(max(pos.x_mm, stage_config.X_AXIS.MIN_POSITION), stage_config.X_AXIS.MAX_POSITION)
+    y = min(max(pos.y_mm, stage_config.Y_AXIS.MIN_POSITION), stage_config.Y_AXIS.MAX_POSITION)
+    z = min(max(pos.z_mm, stage_config.Z_AXIS.MIN_POSITION), stage_config.Z_AXIS.MAX_POSITION)
+    return Pos(x_mm=x, y_mm=y, z_mm=z, theta_rad=pos.theta_rad)
+
+
+def move_to_cached_or_default_startup_position(
+    stage: AbstractStage, stage_config: Optional[StageConfig] = None, cache_path: Optional[str] = None
+) -> None:
+    """After XY homing, restore last cached XYZ if present; otherwise move to configured defaults.
+
+    Applies target X and Y first; Z (cached, safety, or default) only after both axes finish.
+    """
+    cfg = stage_config if stage_config is not None else stage.get_config()
+    cached = get_cached_position(cache_path if cache_path is not None else _DEFAULT_CACHE_PATH)
+    if cached is not None:
+        cached = clamp_pos_to_stage_limits(cached, cfg)
+        _log.info(f"Restoring cached position: ({cached.x_mm},{cached.y_mm},{cached.z_mm}) [mm]")
+        stage.move_x_to(cached.x_mm)
+        stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
+        stage.move_y_to(cached.y_mm)
+        stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
+        safety_z_mm = int(_def.Z_HOME_SAFETY_POINT) / 1000.0
+        if safety_z_mm < cached.z_mm:
+            _log.info("XY at cached targets; moving Z to cached z.")
+            stage.move_z_to(cached.z_mm)
+        else:
+            _log.info("Cached z is at or below Z_HOME_SAFETY_POINT; moving Z to Z_HOME_SAFETY_POINT after XY.")
+            stage.move_z_to(safety_z_mm)
+    else:
+        default = Pos(
+            x_mm=_def.STARTUP_DEFAULT_STAGE_X_MM,
+            y_mm=_def.STARTUP_DEFAULT_STAGE_Y_MM,
+            z_mm=_def.STARTUP_DEFAULT_STAGE_Z_MM,
+            theta_rad=None,
+        )
+        default = clamp_pos_to_stage_limits(default, cfg)
+        _log.info(
+            f"No valid cached position; moving to default startup position "
+            f"({default.x_mm},{default.y_mm},{default.z_mm}) [mm]"
+        )
+        stage.move_x_to(default.x_mm)
+        stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
+        stage.move_y_to(default.y_mm)
+        stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
+        _log.info("XY at default targets; moving Z to default z.")
+        stage.move_z_to(default.z_mm)
 
 
 """
