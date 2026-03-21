@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 _PRESET_FILENAME_RE = re.compile(r"^[\w\- ]+$")
 
 
+def collect_emission_filter_positions(emission_filter_wheel: Optional[Any]) -> Dict[str, Union[str, int]]:
+    """Read emission filter wheel positions for observation state and snap metadata."""
+    emission: Dict[str, Union[str, int]] = {}
+    if emission_filter_wheel and hasattr(emission_filter_wheel, "get_filter_wheel_position"):
+        try:
+            pos = emission_filter_wheel.get_filter_wheel_position()
+            if isinstance(pos, dict):
+                emission = {
+                    str(k): int(v) if isinstance(v, (int, float)) else v for k, v in pos.items()
+                }
+        except Exception:
+            pass
+    return emission
+
+
 def _pixel_format_to_optional_str(camera: Any) -> Optional[str]:
     try:
         pf = camera.get_pixel_format()
@@ -66,7 +81,7 @@ def _collect_camera_live_snapshot(
     except Exception:
         gain = 0.0
     try:
-        mode = camera.get_camera_mode()
+        mode = _camera_mode_to_optional_str(camera.get_camera_mode())
     except Exception:
         mode = None
     try:
@@ -111,6 +126,94 @@ def _collect_camera_live_snapshot(
         trigger_fps=trigger_fps,
         roi_centered=roi_centered,
     )
+
+
+def _camera_mode_to_optional_str(mode: Any) -> Optional[str]:
+    if mode is None:
+        return None
+    if isinstance(mode, str):
+        return mode
+    return getattr(mode, "value", str(mode))
+
+
+def _read_binning_and_mode_from_camera(camera: Any) -> tuple[int, int, Optional[str]]:
+    """Fallback when ``camera_live`` could not be built (e.g. exposure read failed)."""
+    try:
+        bx, by = camera.get_binning()
+        bx, by = int(bx), int(by)
+    except Exception:
+        bx, by = 1, 1
+    try:
+        mode = _camera_mode_to_optional_str(camera.get_camera_mode())
+    except Exception:
+        mode = None
+    return bx, by, mode
+
+
+def _top_level_binning_mode_from_camera(
+    camera: Any, camera_live: Optional[CameraLiveSnapshot]
+) -> tuple[int, int, Optional[str]]:
+    """Values stored on ``ObservationState`` for presets and metadata (mirrors ``camera_live`` when present)."""
+    if camera_live is not None:
+        return (
+            camera_live.binning_x,
+            camera_live.binning_y,
+            _camera_mode_to_optional_str(camera_live.camera_mode),
+        )
+    return _read_binning_and_mode_from_camera(camera)
+
+
+def observation_state_binning_mode_for_metadata(
+    state: Optional[ObservationState],
+    camera: Optional[Any] = None,
+) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Resolve binning/mode for ``AcquisitionMetadata`` from observation state (top-level or nested).
+
+    If ``camera`` is given, fills any missing values from hardware (e.g. no profile / no state).
+    """
+    bx: Optional[int] = None
+    by: Optional[int] = None
+    cm: Optional[str] = None
+    if state is not None:
+        if state.binning_x is not None and state.binning_y is not None:
+            bx, by = state.binning_x, state.binning_y
+            cm = _camera_mode_to_optional_str(state.camera_mode)
+        elif state.camera_live is not None:
+            bx = state.camera_live.binning_x
+            by = state.camera_live.binning_y
+            cm = _camera_mode_to_optional_str(state.camera_live.camera_mode)
+        else:
+            cm = _camera_mode_to_optional_str(state.camera_mode)
+    if camera is not None and (bx is None or by is None or cm is None):
+        cx, cy, ccm = _read_binning_and_mode_from_camera(camera)
+        if bx is None:
+            bx = cx
+        if by is None:
+            by = cy
+        if cm is None:
+            cm = ccm
+    return bx, by, cm
+
+
+def _apply_top_level_binning_mode_if_needed(
+    camera: Any,
+    state: ObservationState,
+    camera_live_applied: bool,
+) -> None:
+    """If there is no ``camera_live`` snapshot, apply top-level binning/mode when present."""
+    if camera_live_applied:
+        return
+    if state.binning_x is not None and state.binning_y is not None:
+        try:
+            camera.set_binning(state.binning_x, state.binning_y)
+        except Exception as e:
+            logger.warning("Observation State: could not set binning from top-level fields: %s", e)
+    if state.camera_mode is not None:
+        try:
+            camera.set_camera_mode(_camera_mode_to_optional_str(state.camera_mode))
+        except Exception as e:
+            logger.warning("Observation State: could not set camera mode from top-level field: %s", e)
 
 
 def _merge_illumination_hardware_into_channels(
@@ -391,6 +494,7 @@ def collect_observation_state(
     camera = live_controller.camera
     channels = _merge_active_channel_camera_from_hardware(channels, active, camera)
     camera_live = _collect_camera_live_snapshot(camera, live_controller)
+    bx, by, cmode = _top_level_binning_mode_from_camera(camera, camera_live)
     auto_filter = getattr(live_controller, "enable_channel_auto_filter_switching", True)
     general = config_repo.get_general_config()
     channel_groups = list(general.channel_groups) if general else []
@@ -401,6 +505,9 @@ def collect_observation_state(
         channel_groups=channel_groups,
         emission_filter_positions=dict(emission_filter_positions or {}),
         camera_live=camera_live,
+        binning_x=bx,
+        binning_y=by,
+        camera_mode=cmode,
         enable_channel_auto_filter_switching=auto_filter,
     )
 
@@ -427,7 +534,9 @@ def apply_observation_state(
         channels=list(state.channels),
         channel_groups=list(state.channel_groups),
     )
-    config_repo.save_general_config(profile, general)
+    existing = config_repo.get_general_config(profile)
+    if existing is None or existing != general:
+        config_repo.save_general_config(profile, general)
 
     live_controller.toggle_confocal_widefield(state.confocal_mode)
 
@@ -473,8 +582,11 @@ def apply_observation_state(
         )
         live_controller.set_microscope_mode(channels[0])
 
+    camera_live_applied = False
     if state.camera_live is not None:
         _apply_camera_live_snapshot(live_controller.camera, state.camera_live, live_controller)
+        camera_live_applied = True
+    _apply_top_level_binning_mode_if_needed(live_controller.camera, state, camera_live_applied)
 
     _sync_illumination_hardware_from_channels(ic, channels)
 

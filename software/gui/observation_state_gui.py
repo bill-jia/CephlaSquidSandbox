@@ -8,23 +8,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QInputDialog, QMessageBox
 
-from control.core.observation_state_service import apply_observation_state, collect_observation_state
-
-
-def _collect_emission_positions(emission_filter_wheel: Optional[Any]) -> dict:
-    emission: dict = {}
-    if emission_filter_wheel and hasattr(emission_filter_wheel, "get_filter_wheel_position"):
-        try:
-            pos = emission_filter_wheel.get_filter_wheel_position()
-            if isinstance(pos, dict):
-                emission = {
-                    str(k): int(v) if isinstance(v, (int, float)) else v for k, v in pos.items()
-                }
-        except Exception:
-            pass
-    return emission
+from control.core.observation_state_service import (
+    apply_observation_state,
+    collect_emission_filter_positions,
+    collect_observation_state,
+)
 
 
 def run_save_observation_state_dialog(
@@ -52,7 +43,7 @@ def run_save_observation_state_dialog(
     name, ok = QInputDialog.getText(parent, "Save Observation State", "Preset name:")
     if not ok or not name.strip():
         return False
-    emission = _collect_emission_positions(emission_filter_wheel)
+    emission = collect_emission_filter_positions(emission_filter_wheel)
     try:
         state = collect_observation_state(
             live_controller,
@@ -65,7 +56,7 @@ def run_save_observation_state_dialog(
         QMessageBox.warning(parent, "Observation State", str(e))
         return False
     if on_success:
-        on_success()
+        QTimer.singleShot(0, on_success)
     return True
 
 
@@ -129,5 +120,5 @@ def run_load_observation_state(
         QMessageBox.warning(parent, "Observation State", str(e))
         return False
     if on_success:
-        on_success()
+        QTimer.singleShot(0, on_success)
     return True

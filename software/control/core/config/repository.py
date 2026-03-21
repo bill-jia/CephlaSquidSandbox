@@ -22,6 +22,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
 import yaml
+
+# LibYAML C implementations (when installed) noticeably speed up large configs.
+try:
+    from yaml import CSafeLoader as _YamlSafeLoader
+except ImportError:
+    from yaml import SafeLoader as _YamlSafeLoader
+
+try:
+    from yaml import CDumper as _YamlDumper
+except ImportError:
+    from yaml import Dumper as _YamlDumper
 from pydantic import BaseModel, ValidationError
 
 from control.models import (
@@ -172,7 +183,14 @@ class ConfigRepository:
             data = model.model_dump(exclude_none=True, mode="json")
 
             with open(path, "w") as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                yaml.dump(
+                    data,
+                    f,
+                    Dumper=_YamlDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
             logger.debug(f"Saved config to {path}")
         except PermissionError:
             logger.error(f"Permission denied writing {path}")
@@ -1030,14 +1048,19 @@ class ConfigRepository:
         self,
         output_dir: Union[Path, str],
         metadata: AcquisitionMetadata,
-    ) -> None:
+        *,
+        filename: Optional[str] = None,
+    ) -> Path:
         """
         Write Acquisition Metadata manifest to an experiment directory.
 
-        Creates ``acquisition_metadata.yaml`` alongside legacy sidecars.
+        Creates ``acquisition_metadata.yaml`` alongside legacy sidecars unless
+        ``filename`` is given (e.g. per-snap sidecar next to a TIFF).
         """
-        output_path = Path(output_dir) / "acquisition_metadata.yaml"
+        name = filename if filename else "acquisition_metadata.yaml"
+        output_path = Path(output_dir) / name
         self._save_yaml(output_path, metadata)
+        return output_path
 
     # ═══════════════════════════════════════════════════════════════════════════
     # OBSERVATION STATE (objective-free presets)
@@ -1100,7 +1123,7 @@ class ConfigRepository:
             return None
         try:
             with open(path, "r") as f:
-                data = yaml.safe_load(f)
+                data = yaml.load(f, Loader=_YamlSafeLoader)
             if data is None:
                 data = {}
             return ObservationState.model_validate(data)

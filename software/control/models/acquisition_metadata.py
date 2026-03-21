@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from control.models.observation_state import ObservationState
+
 
 class AcquisitionMetadata(BaseModel):
     """
@@ -29,6 +31,9 @@ class AcquisitionMetadata(BaseModel):
     sensor_pixel_size_um: Optional[float] = Field(None, description="Binned pixel size on sample")
     tube_lens_mm: Optional[float] = None
     trigger_mode: Optional[str] = Field(None, description="Camera/live trigger mode string")
+    binning_x: Optional[int] = Field(None, ge=1, description="Horizontal camera binning at acquisition")
+    binning_y: Optional[int] = Field(None, ge=1, description="Vertical camera binning at acquisition")
+    camera_mode: Optional[str] = Field(None, description="Camera acquisition mode string")
     selected_channel_names: List[str] = Field(
         default_factory=list,
         description="Acquisition channel names selected for this run",
@@ -40,6 +45,10 @@ class AcquisitionMetadata(BaseModel):
     instrument_state_h5: Optional[str] = Field(
         None,
         description="Relative path to instrument_state.h5 when large/binary blobs are stored",
+    )
+    observation_state: Optional[ObservationState] = Field(
+        None,
+        description="Live imaging snapshot (channels, camera_live, etc.) when saved with snap or similar",
     )
 
     model_config = {"extra": "forbid"}

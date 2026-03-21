@@ -67,6 +67,20 @@ class ObservationState(BaseModel):
         None,
         description="Live camera ROI/binning/mode snapshot (applied to hardware on load)",
     )
+    binning_x: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Horizontal binning (mirrors camera_live when set; used if camera_live is absent)",
+    )
+    binning_y: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Vertical binning (mirrors camera_live when set; used if camera_live is absent)",
+    )
+    camera_mode: Optional[str] = Field(
+        None,
+        description="Camera acquisition mode string (mirrors camera_live when set; used if camera_live is absent)",
+    )
     enable_channel_auto_filter_switching: Optional[bool] = Field(
         None,
         description="If set, mirrors LiveController.enable_channel_auto_filter_switching (emission filter follows channel)",

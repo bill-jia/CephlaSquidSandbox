@@ -568,6 +568,9 @@ class MultiPointController:
         except Exception:
             trigger_mode = None
         selected_names = [c.name for c in self.selected_configurations]
+        from control.core.observation_state_service import observation_state_binning_mode_for_metadata
+
+        bx, by, cm = observation_state_binning_mode_for_metadata(None, self.camera)
         acquisition_metadata = AcquisitionMetadata(
             experiment_id=self.experiment_ID,
             recording_start_time=self.recording_start_time,
@@ -577,6 +580,9 @@ class MultiPointController:
             sensor_pixel_size_um=acquisition_parameters.get("sensor_pixel_size_um"),
             tube_lens_mm=acquisition_parameters.get("tube_lens_mm"),
             trigger_mode=trigger_mode,
+            binning_x=bx,
+            binning_y=by,
+            camera_mode=cm,
             selected_channel_names=selected_names,
             scan_parameters=scan_parameters,
         )

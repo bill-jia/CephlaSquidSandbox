@@ -2034,6 +2034,85 @@ class LiveControlWidget(QFrame):
             self.lineEdit_snapSavingDir.setText(save_dir_base)
             self.snap_saving_path = save_dir_base
 
+    def _save_snap_acquisition_metadata(self, filepath: str) -> None:
+        """Write ``{snap_stem}_acquisition_metadata.yaml`` next to the snap TIFF."""
+        from pathlib import Path
+        from typing import Any, Dict, List
+
+        from control.core.observation_state_service import (
+            collect_emission_filter_positions,
+            collect_observation_state,
+            observation_state_binning_mode_for_metadata,
+        )
+        from control.models.acquisition_metadata import AcquisitionMetadata
+
+        path = Path(filepath)
+        stem = path.stem
+        meta_filename = f"{stem}_acquisition_metadata.yaml"
+        repo = self.liveController.microscope.config_repo
+
+        obs_state = None
+        if repo.current_profile:
+            try:
+                wheel = getattr(self.liveController.microscope, "emission_filter_wheel", None)
+                emission = collect_emission_filter_positions(wheel)
+                obs_state = collect_observation_state(
+                    self.liveController,
+                    repo,
+                    self.objectiveStore.current_objective,
+                    emission_filter_positions=emission or None,
+                )
+            except Exception as e:
+                self._log.warning("Snap: could not collect observation state for metadata: %s", e)
+
+        current_objective = self.objectiveStore.current_objective
+        objective_details: Dict[str, Any] = {}
+        try:
+            objective_details = dict(self.objectiveStore.objectives_dict.get(current_objective, {}))
+            objective_details["name"] = current_objective
+        except (AttributeError, KeyError, TypeError):
+            objective_details = {"name": current_objective}
+
+        try:
+            trigger_mode = str(self.liveController.get_trigger_mode())
+        except Exception:
+            trigger_mode = None
+
+        selected_names: List[str] = []
+        if obs_state and obs_state.active_channel_name:
+            selected_names = [obs_state.active_channel_name]
+        elif self.currentConfiguration is not None:
+            selected_names = [self.currentConfiguration.name]
+
+        try:
+            sensor_px = self.camera.get_pixel_size_binned_um()
+        except Exception:
+            sensor_px = None
+
+        bx, by, cm = observation_state_binning_mode_for_metadata(obs_state, self.camera)
+
+        try:
+            metadata = AcquisitionMetadata(
+                experiment_id=stem,
+                recording_start_time=time.time(),
+                objective=current_objective,
+                objective_details=objective_details,
+                confocal_mode=self.liveController.is_confocal_mode(),
+                sensor_pixel_size_um=sensor_px,
+                tube_lens_mm=TUBE_LENS_MM,
+                trigger_mode=trigger_mode,
+                binning_x=bx,
+                binning_y=by,
+                camera_mode=cm,
+                selected_channel_names=selected_names,
+                scan_parameters={"source": "live_snap", "image_file": path.name},
+                observation_state=obs_state,
+            )
+            out = repo.save_acquisition_metadata(path.parent, metadata, filename=meta_filename)
+            self._log.info("Snap acquisition metadata saved to: %s", out)
+        except Exception as e:
+            self._log.warning("Snap: could not save acquisition metadata: %s", e)
+
     def snap_frame(self):
         """Capture and save the most recent frame from Live View."""
         import imageio
@@ -2080,9 +2159,10 @@ class LiveControlWidget(QFrame):
             
             # Save as TIFF
             imageio.imwrite(filepath, image)
-            
+
             self._log.info(f"Snap frame saved to: {filepath}")
-            
+            self._save_snap_acquisition_metadata(filepath)
+
         except Exception as e:
             self._log.error(f"Error during snap: {e}")
             msg = QMessageBox()
