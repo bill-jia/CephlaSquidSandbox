@@ -148,10 +148,11 @@ class MicroscopeAddons:
                 else serial_peripherals.CellX_Simulation()
             )
 
-        # ── Emission filter wheel ─────────────────────────────────────────
+        # ── Emission filter wheel (device entry + FilterWheelConfig from MachineConfig) ──
         emission_filter_wheel = None
+        fw_dev = _dev("emission_filter_wheel")
         fw_config = squid.config.get_filter_wheel_config()
-        if fw_config:
+        if fw_dev and fw_config:
             emission_filter_wheel = squid.filter_wheel_controller.utils.get_filter_wheel_controller(
                 fw_config, microcontroller=micro,
                 simulated=_should_simulate(simulated, control._def.SIMULATE_FILTER_WHEEL),

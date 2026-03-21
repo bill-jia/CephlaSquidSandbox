@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from control.core.memory_profiler import MemoryMonitor
     from control.microscope import Microscope
 
+import squid.config
 import squid.logging
 from control.core.config import ConfigRepository
 from control.core.core import TrackingController, LiveController
@@ -3568,6 +3569,178 @@ class ObjectivesWidget(QWidget):
         self.signal_objective_changed.emit()
 
 
+class EmissionFilterWheelPanel(QWidget):
+    """Compact emission filter wheel controls for the Camera tab (replaces standalone FilterControllerWidget)."""
+
+    def __init__(
+        self,
+        live_controller: Optional[LiveController],
+        config_repo: Optional[ConfigRepository] = None,
+        filter_controller: Optional[AbstractFilterWheelController] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        self.live_controller = live_controller
+        self.config_repo = config_repo
+        self.filter_controller = filter_controller
+        self._combo_boxes: Dict[int, QComboBox] = {}
+        self._home_buttons: Dict[int, QPushButton] = {}
+        self._get_pos_buttons: Dict[int, QPushButton] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        device_configured = False
+        if config_repo is not None:
+            mc = config_repo.get_machine_config()
+            dev = mc.get_device("emission_filter_wheel")
+            device_configured = dev is not None and dev.enabled
+
+        if not device_configured:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lab = QLabel("Emission filter:")
+            lab.setMinimumWidth(100)
+            cb = QComboBox()
+            cb.addItem("Not configured (machine_config)")
+            cb.setEnabled(False)
+            cb.setMaximumWidth(240)
+            row.addWidget(lab)
+            row.addWidget(cb)
+            row.addStretch()
+            layout.addLayout(row)
+            return
+
+        if filter_controller is None:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lab = QLabel("Emission filter:")
+            lab.setMinimumWidth(100)
+            cb = QComboBox()
+            cb.addItem("Hardware not available")
+            cb.setEnabled(False)
+            cb.setMaximumWidth(240)
+            row.addWidget(lab)
+            row.addWidget(cb)
+            row.addStretch()
+            layout.addLayout(row)
+            return
+
+        self._wheel_indices = list(filter_controller.available_filter_wheels) or [1]
+        use_tabs = len(self._wheel_indices) > 1
+
+        if use_tabs:
+            self._tab_widget = QTabWidget()
+            self._tab_widget.setMaximumHeight(118)
+            self._tab_widget.setDocumentMode(True)
+            for wheel_id in self._wheel_indices:
+                tab = self._create_wheel_row_widget(wheel_id)
+                self._tab_widget.addTab(tab, self._get_wheel_name(wheel_id))
+            layout.addWidget(self._tab_widget)
+        else:
+            layout.addWidget(self._create_wheel_row_widget(self._wheel_indices[0]))
+
+        if live_controller is not None:
+            self.checkBox = QCheckBox("Do not move filter when switching channels", self)
+            self.checkBox.setToolTip(
+                "When checked, the wheel does not move automatically when the microscope configuration channel changes."
+            )
+            self.checkBox.stateChanged.connect(self.disable_movement_by_switching_channels)
+            layout.addWidget(self.checkBox)
+
+    def _get_wheel_name(self, wheel_id: int) -> str:
+        if self.config_repo:
+            try:
+                registry = self.config_repo.get_filter_wheel_registry()
+                if registry and registry.filter_wheels:
+                    for wheel in registry.filter_wheels:
+                        if wheel.id == wheel_id and wheel.name:
+                            return wheel.name
+            except Exception as e:
+                self._log.warning(f"Failed to get filter wheel name for wheel_id={wheel_id}: {e}")
+        return f"Wheel {wheel_id}"
+
+    def _create_wheel_row_widget(self, wheel_id: int) -> QWidget:
+        w = QWidget()
+        row = QHBoxLayout(w)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        try:
+            wheel_info = self.filter_controller.get_filter_wheel_info(wheel_id)
+            num_positions = wheel_info.number_of_slots
+        except Exception:
+            num_positions = 8
+
+        position_names: Dict = {}
+        if self.config_repo:
+            try:
+                registry = self.config_repo.get_filter_wheel_registry()
+                if registry and registry.filter_wheels:
+                    for wheel in registry.filter_wheels:
+                        if wheel.id == wheel_id:
+                            position_names = wheel.positions
+                            break
+            except Exception as e:
+                self._log.warning(f"Failed to get filter position names for wheel {wheel_id}: {e}")
+
+        combo_box = QComboBox()
+        combo_box.setMaximumWidth(260)
+        for i in range(1, num_positions + 1):
+            filter_name = position_names.get(i) or position_names.get(str(i)) or f"Position {i}"
+            combo_box.addItem(f"{i}: {filter_name}")
+        self._combo_boxes[wheel_id] = combo_box
+
+        get_pos_btn = QPushButton("Get")
+        get_pos_btn.setMaximumWidth(48)
+        home_btn = QPushButton("Home")
+        home_btn.setMaximumWidth(48)
+
+        self._get_pos_buttons[wheel_id] = get_pos_btn
+        self._home_buttons[wheel_id] = home_btn
+
+        row.addWidget(QLabel("Position:"))
+        row.addWidget(combo_box)
+        row.addWidget(get_pos_btn)
+        row.addWidget(home_btn)
+        row.addStretch()
+
+        combo_box.currentIndexChanged.connect(lambda idx, wid=wheel_id: self._on_selection_change(wid, idx))
+        get_pos_btn.clicked.connect(lambda checked, wid=wheel_id: self._update_position_from_controller(wid))
+        home_btn.clicked.connect(lambda checked, wid=wheel_id: self._home(wid))
+
+        return w
+
+    def _home(self, wheel_id: int):
+        self.filter_controller.home(wheel_id)
+
+    def _update_position_from_controller(self, wheel_id: int):
+        try:
+            current_pos = self.filter_controller.get_filter_wheel_position().get(wheel_id, 1)
+            combo_box = self._combo_boxes.get(wheel_id)
+            if combo_box:
+                combo_box.blockSignals(True)
+                combo_box.setCurrentIndex(current_pos - 1)
+                combo_box.blockSignals(False)
+        except Exception as e:
+            self._log.error(f"Error getting filter wheel {wheel_id} position: {e}")
+
+    def _on_selection_change(self, wheel_id: int, index: int):
+        if index >= 0:
+            self.filter_controller.set_filter_wheel_position({wheel_id: index + 1})
+
+    def disable_movement_by_switching_channels(self, state):
+        if self.live_controller is None:
+            return
+        if state:
+            self.live_controller.enable_channel_auto_filter_switching = False
+        else:
+            self.live_controller.enable_channel_auto_filter_switching = True
+
+
 class CameraSettingsWidget(QFrame):
 
     signal_binning_changed = Signal()
@@ -3581,6 +3754,8 @@ class CameraSettingsWidget(QFrame):
         include_trigger_controls: bool = False,
         live_controller: Optional[LiveController] = None,
         main=None,
+        filter_wheel_controller: Optional[AbstractFilterWheelController] = None,
+        config_repo: Optional[ConfigRepository] = None,
         *args,
         **kwargs,
     ):
@@ -3589,6 +3764,8 @@ class CameraSettingsWidget(QFrame):
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.camera: AbstractCamera = camera
         self.live_controller: Optional[LiveController] = live_controller
+        self._filter_wheel_controller = filter_wheel_controller
+        self._config_repo = config_repo
         self.add_components(
             include_gain_exposure_time,
             include_camera_temperature_setting,
@@ -3704,24 +3881,48 @@ class CameraSettingsWidget(QFrame):
         # ensure initial enabled/disabled state of offsets matches checkbox state
         self.on_centered_toggled(self.checkbox_ROI_centered.isChecked())
 
-        # layout
+        # layout — left: exposure / trigger / mode / emission; right (~half width): ROI in two rows + Centered
         self.camera_layout = QVBoxLayout()
+        self.camera_layout.setSpacing(3)
+        self.camera_layout.setContentsMargins(2, 2, 2, 2)
+        self.entry_exposureTime.setMaximumWidth(120)
+        self.entry_analogGain.setMaximumWidth(120)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(3)
+
         if include_gain_exposure_time:
-            exposure_line = QHBoxLayout()
-            exposure_line.addWidget(QLabel("Exposure Time (ms)"))
-            exposure_line.addWidget(self.entry_exposureTime)
-            self.camera_layout.addLayout(exposure_line)
-            gain_line = QHBoxLayout()
-            gain_line.addWidget(QLabel("Analog Gain"))
-            gain_line.addWidget(self.entry_analogGain)
-            self.camera_layout.addLayout(gain_line)
+            exposure_gain_line = QHBoxLayout()
+            exposure_gain_line.setSpacing(6)
+            exposure_gain_line.addWidget(QLabel("Exposure Time (ms)"))
+            exposure_gain_line.addWidget(self.entry_exposureTime)
+            exposure_gain_line.addSpacing(16)
+            exposure_gain_line.addWidget(QLabel("Analog Gain"))
+            exposure_gain_line.addWidget(self.entry_analogGain)
+            exposure_gain_line.addStretch()
+            left_col.addLayout(exposure_gain_line)
+
+        self.dropdown_cameraMode.setMaximumWidth(200)
+        try:
+            current_binning = self.camera.get_binning()
+            current_binning_string = "x".join([str(current_binning[0]), str(current_binning[1])])
+            binning_options = [f"{binning[0]}x{binning[1]}" for binning in self.camera.get_binning_options()]
+            self.dropdown_binning = QComboBox()
+            self.dropdown_binning.addItems(binning_options)
+            self.dropdown_binning.setCurrentText(current_binning_string)
+
+            self.dropdown_binning.currentTextChanged.connect(self.set_binning)
+        except AttributeError as ae:
+            print(ae)
+            self.dropdown_binning = QComboBox()
+            self.dropdown_binning.setEnabled(False)
+            pass
+        self.dropdown_binning.setMaximumWidth(88)
 
         if include_trigger_controls and self.live_controller is not None:
-            trigger_line = QHBoxLayout()
-            trigger_line.addWidget(QLabel("Trigger Mode"))
-
             self.dropdown_triggerMode = QComboBox()
             self.dropdown_triggerMode.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
+            self.dropdown_triggerMode.setMaximumWidth(160)
 
             initial_trigger_mode = self.camera.get_acquisition_mode().value
             self.dropdown_triggerMode.blockSignals(True)
@@ -3734,14 +3935,13 @@ class CameraSettingsWidget(QFrame):
                 self.live_controller.set_trigger_mode(initial_trigger_mode)
             except Exception:
                 pass
-            trigger_line.addWidget(self.dropdown_triggerMode, stretch=1)
 
-            trigger_line.addWidget(QLabel("Trigger FPS"))
             self.entry_triggerFPS = QDoubleSpinBox()
             self.entry_triggerFPS.setKeyboardTracking(False)
             self.entry_triggerFPS.setRange(0.02, 1000)
             self.entry_triggerFPS.setSingleStep(1)
             self.entry_triggerFPS.setDecimals(0)
+            self.entry_triggerFPS.setMaximumWidth(72)
 
             # Legacy default: LiveControlWidget historically defaulted to 10 fps.
             initial_fps = getattr(self.live_controller, "fps_trigger", None)
@@ -3757,34 +3957,70 @@ class CameraSettingsWidget(QFrame):
             self.entry_triggerFPS.blockSignals(True)
             self.entry_triggerFPS.setValue(float(initial_fps))
             self.entry_triggerFPS.blockSignals(False)
-            trigger_line.addWidget(self.entry_triggerFPS)
 
             # Wire after initial values are set to avoid overriding during construction.
             self.dropdown_triggerMode.currentTextChanged.connect(lambda s: self.live_controller.set_trigger_mode(s))
             self.entry_triggerFPS.valueChanged.connect(lambda v: self.live_controller.set_trigger_fps(v))
 
-            self.camera_layout.addLayout(trigger_line)
+            trigger_row = QHBoxLayout()
+            trigger_row.setSpacing(6)
+            trigger_row.addWidget(QLabel("Trigger Mode"))
+            trigger_row.addWidget(self.dropdown_triggerMode)
+            trigger_row.addWidget(QLabel("Trigger FPS"))
+            trigger_row.addWidget(self.entry_triggerFPS)
+            trigger_row.addStretch()
+            left_col.addLayout(trigger_row)
 
-        format_line = QHBoxLayout()
-        format_line.addWidget(QLabel("Camera Mode"))
-        format_line.addWidget(self.dropdown_cameraMode)
-        try:
-            current_binning = self.camera.get_binning()
-            current_binning_string = "x".join([str(current_binning[0]), str(current_binning[1])])
-            binning_options = [f"{binning[0]}x{binning[1]}" for binning in self.camera.get_binning_options()]
-            self.dropdown_binning = QComboBox()
-            self.dropdown_binning.addItems(binning_options)
-            self.dropdown_binning.setCurrentText(current_binning_string)
+        format_row = QHBoxLayout()
+        format_row.setSpacing(6)
+        format_row.addWidget(QLabel("Camera Mode"))
+        format_row.addWidget(self.dropdown_cameraMode)
+        format_row.addWidget(QLabel("Binning"))
+        format_row.addWidget(self.dropdown_binning)
+        format_row.addStretch()
+        left_col.addLayout(format_row)
 
-            self.dropdown_binning.currentTextChanged.connect(self.set_binning)
-        except AttributeError as ae:
-            print(ae)
-            self.dropdown_binning = QComboBox()
-            self.dropdown_binning.setEnabled(False)
-            pass
-        format_line.addWidget(QLabel("Binning"))
-        format_line.addWidget(self.dropdown_binning)
-        self.camera_layout.addLayout(format_line)
+        if self._config_repo is not None:
+            self._emission_filter_panel = EmissionFilterWheelPanel(
+                self.live_controller,
+                config_repo=self._config_repo,
+                filter_controller=self._filter_wheel_controller,
+                parent=self,
+            )
+            left_col.addWidget(self._emission_filter_panel)
+
+        left_widget = QWidget()
+        left_widget.setLayout(left_col)
+
+        roi_block = QGroupBox("ROI")
+        roi_block_layout = QVBoxLayout(roi_block)
+        roi_block_layout.setSpacing(4)
+        roi_block_layout.setContentsMargins(8, 10, 8, 8)
+        roi_row_hw = QHBoxLayout()
+        roi_row_hw.setSpacing(6)
+        roi_row_hw.addWidget(QLabel("Height"))
+        roi_row_hw.addWidget(self.entry_ROI_height)
+        roi_row_hw.addSpacing(8)
+        roi_row_hw.addWidget(QLabel("Width"))
+        roi_row_hw.addWidget(self.entry_ROI_width)
+        roi_row_hw.addStretch()
+        roi_row_xy = QHBoxLayout()
+        roi_row_xy.setSpacing(6)
+        roi_row_xy.addWidget(QLabel("Y-offset"))
+        roi_row_xy.addWidget(self.entry_ROI_offset_y)
+        roi_row_xy.addSpacing(8)
+        roi_row_xy.addWidget(QLabel("X-offset"))
+        roi_row_xy.addWidget(self.entry_ROI_offset_x)
+        roi_row_xy.addStretch()
+        roi_block_layout.addLayout(roi_row_hw)
+        roi_block_layout.addLayout(roi_row_xy)
+        roi_block_layout.addWidget(self.checkbox_ROI_centered)
+
+        top_split = QHBoxLayout()
+        top_split.setSpacing(10)
+        top_split.addWidget(left_widget, 1, Qt.AlignTop)
+        top_split.addWidget(roi_block, 1, Qt.AlignTop)
+        self.camera_layout.addLayout(top_split)
 
         if include_camera_temperature_setting:
             temp_line = QHBoxLayout()
@@ -3798,22 +4034,6 @@ class CameraSettingsWidget(QFrame):
             except AttributeError:
                 pass
             self.camera_layout.addLayout(temp_line)
-
-        roi_line = QHBoxLayout()
-        roi_line.addWidget(QLabel("Height"))
-        roi_line.addWidget(self.entry_ROI_height)
-        roi_line.addStretch()
-        roi_line.addWidget(QLabel("Y-offset"))
-        roi_line.addWidget(self.entry_ROI_offset_y)
-        roi_line.addStretch()
-        roi_line.addWidget(QLabel("Width"))
-        roi_line.addWidget(self.entry_ROI_width)
-        roi_line.addStretch()
-        roi_line.addWidget(QLabel("X-offset"))
-        roi_line.addWidget(self.entry_ROI_offset_x)
-        roi_line.addStretch()
-        roi_line.addWidget(self.checkbox_ROI_centered)
-        self.camera_layout.addLayout(roi_line)
 
         if DISPLAY_TOUPCAMER_BLACKLEVEL_SETTINGS is True:
             blacklevel_line = QHBoxLayout()
@@ -5162,239 +5382,6 @@ class AutoFocusWidget(QFrame):
     def autofocus_is_finished(self):
         self.btn_autofocus.setChecked(False)
 
-
-class FilterControllerWidget(QFrame):
-    """Widget for controlling filter wheel(s).
-
-    Supports both single and multiple filter wheels. When multiple wheels are
-    available, displays a tabbed interface with one tab per wheel.
-    """
-
-    def __init__(
-        self,
-        filterController: AbstractFilterWheelController,
-        liveController: LiveController,
-        main=None,
-        config_repo=None,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self._log = squid.logging.get_logger(self.__class__.__name__)
-        self.filterController: AbstractFilterWheelController = filterController
-        self.liveController = liveController
-        self.config_repo = config_repo
-
-        # Get available wheel indices
-        self._wheel_indices = list(filterController.available_filter_wheels) or [1]
-
-        # Track combo boxes and buttons per wheel (wheel_id -> widget)
-        self._combo_boxes: Dict[int, QComboBox] = {}
-        self._home_buttons: Dict[int, QPushButton] = {}
-        self._get_pos_buttons: Dict[int, QPushButton] = {}
-        self._next_buttons: Dict[int, QPushButton] = {}
-        self._prev_buttons: Dict[int, QPushButton] = {}
-
-        self.add_components()
-        self.setFrameStyle(QFrame.Panel | QFrame.Raised)
-
-    def _get_wheel_name(self, wheel_id: int) -> str:
-        """Get display name for a wheel from config or generate default."""
-        if self.config_repo:
-            try:
-                registry = self.config_repo.get_filter_wheel_registry()
-                if registry and registry.filter_wheels:
-                    for wheel in registry.filter_wheels:
-                        if wheel.id == wheel_id and wheel.name:
-                            return wheel.name
-            except Exception as e:
-                self._log.warning(f"Failed to get filter wheel name for wheel_id={wheel_id}: {e}")
-        # Default name
-        return f"Wheel {wheel_id}"
-
-    def add_components(self):
-        main_layout = QVBoxLayout()
-
-        # If multiple wheels, use tabs; otherwise use simple layout
-        use_tabs = len(self._wheel_indices) > 1
-
-        if use_tabs:
-            self.tab_widget = QTabWidget()
-            for wheel_id in self._wheel_indices:
-                tab = self._create_wheel_tab(wheel_id)
-                wheel_name = self._get_wheel_name(wheel_id)
-                self.tab_widget.addTab(tab, wheel_name)
-            main_layout.addWidget(self.tab_widget)
-        else:
-            # Single wheel - use simple layout
-            wheel_id = self._wheel_indices[0]
-            wheel_widget = self._create_wheel_tab(wheel_id)
-            main_layout.addWidget(wheel_widget)
-
-        # Shared checkbox for all wheels
-        self.checkBox = QCheckBox("Disable filter wheel movement on changing Microscope Configuration", self)
-        self.checkBox.stateChanged.connect(self.disable_movement_by_switching_channels)
-        main_layout.addWidget(self.checkBox)
-
-        # Info label
-        info_label = QLabel("For acquisition, filter wheel positions need to be set in channel configurations.")
-        main_layout.addWidget(info_label)
-
-        self.setLayout(main_layout)
-
-    def _create_wheel_tab(self, wheel_id: int) -> QWidget:
-        """Create a widget for controlling a single wheel."""
-        widget = QWidget()
-        layout = QGridLayout()
-
-        # Get filter wheel info to populate combo box
-        try:
-            wheel_info = self.filterController.get_filter_wheel_info(wheel_id)
-            num_positions = wheel_info.number_of_slots
-        except Exception:
-            num_positions = 8  # Fallback
-
-        # Get position names from registry if available
-        position_names = {}
-        if self.config_repo:
-            try:
-                registry = self.config_repo.get_filter_wheel_registry()
-                if registry and registry.filter_wheels:
-                    for wheel in registry.filter_wheels:
-                        if wheel.id == wheel_id:
-                            position_names = wheel.positions
-                            break
-            except Exception as e:
-                self._log.warning(f"Failed to get filter position names for wheel {wheel_id}: {e}")
-
-        # Position combo box
-        combo_box = QComboBox()
-        for i in range(1, num_positions + 1):
-            # Try both int and string keys (YAML may load as strings)
-            filter_name = position_names.get(i) or position_names.get(str(i)) or f"Position {i}"
-            combo_box.addItem(f"{i}: {filter_name}")
-        self._combo_boxes[wheel_id] = combo_box
-
-        # Create buttons
-        get_pos_btn = QPushButton("Get Position")
-        home_btn = QPushButton("Home")
-        next_btn = QPushButton("Next")
-        prev_btn = QPushButton("Previous")
-
-        self._get_pos_buttons[wheel_id] = get_pos_btn
-        self._home_buttons[wheel_id] = home_btn
-        self._next_buttons[wheel_id] = next_btn
-        self._prev_buttons[wheel_id] = prev_btn
-
-        # Layout
-        layout.addWidget(QLabel("Position:"), 0, 0)
-        layout.addWidget(combo_box, 0, 1)
-        layout.addWidget(get_pos_btn, 0, 2)
-        layout.addWidget(home_btn, 1, 0)
-        layout.addWidget(next_btn, 1, 1)
-        layout.addWidget(prev_btn, 1, 2)
-
-        widget.setLayout(layout)
-
-        # Connect signals with wheel_id captured in closures
-        combo_box.currentIndexChanged.connect(lambda idx, wid=wheel_id: self._on_selection_change(wid, idx))
-        get_pos_btn.clicked.connect(lambda checked, wid=wheel_id: self._update_position_from_controller(wid))
-        home_btn.clicked.connect(lambda checked, wid=wheel_id: self._home(wid))
-        next_btn.clicked.connect(lambda checked, wid=wheel_id: self._go_to_next_position(wid))
-        prev_btn.clicked.connect(lambda checked, wid=wheel_id: self._go_to_previous_position(wid))
-
-        return widget
-
-    def _home(self, wheel_id: int):
-        """Home a specific filter wheel."""
-        self.filterController.home(wheel_id)
-
-    def _update_position_from_controller(self, wheel_id: int):
-        """Poll the current position from the controller and update the dropdown."""
-        try:
-            current_pos = self.filterController.get_filter_wheel_position().get(wheel_id, 1)
-            combo_box = self._combo_boxes.get(wheel_id)
-            if combo_box:
-                combo_box.blockSignals(True)
-                combo_box.setCurrentIndex(current_pos - 1)
-                combo_box.blockSignals(False)
-            self._log.debug(f"Filter wheel {wheel_id} position updated: {current_pos}")
-        except Exception as e:
-            self._log.error(f"Error getting filter wheel {wheel_id} position: {e}")
-
-    def _on_selection_change(self, wheel_id: int, index: int):
-        """Handle position selection from combo box."""
-        if index >= 0:
-            position = index + 1
-            self.filterController.set_filter_wheel_position({wheel_id: position})
-
-    def _go_to_next_position(self, wheel_id: int):
-        """Move to the next position."""
-        try:
-            current_pos = self.filterController.get_filter_wheel_position().get(wheel_id, 1)
-            wheel_info = self.filterController.get_filter_wheel_info(wheel_id)
-            max_pos = wheel_info.number_of_slots
-
-            if current_pos < max_pos:
-                new_pos = current_pos + 1
-                self.filterController.set_filter_wheel_position({wheel_id: new_pos})
-                combo_box = self._combo_boxes.get(wheel_id)
-                if combo_box:
-                    combo_box.setCurrentIndex(new_pos - 1)
-        except Exception as e:
-            self._log.error(f"Error moving wheel {wheel_id} to next position: {e}")
-
-    def _go_to_previous_position(self, wheel_id: int):
-        """Move to the previous position."""
-        try:
-            current_pos = self.filterController.get_filter_wheel_position().get(wheel_id, 1)
-
-            if current_pos > 1:
-                new_pos = current_pos - 1
-                self.filterController.set_filter_wheel_position({wheel_id: new_pos})
-                combo_box = self._combo_boxes.get(wheel_id)
-                if combo_box:
-                    combo_box.setCurrentIndex(new_pos - 1)
-        except Exception as e:
-            self._log.error(f"Error moving wheel {wheel_id} to previous position: {e}")
-
-    def disable_movement_by_switching_channels(self, state):
-        """Enable/disable automatic filter wheel movement when changing channels."""
-        if state:
-            self.liveController.enable_channel_auto_filter_switching = False
-        else:
-            self.liveController.enable_channel_auto_filter_switching = True
-
-    # Backward compatibility properties and methods
-    @property
-    def wheel_index(self):
-        """Get the first wheel index for backward compatibility."""
-        return self._wheel_indices[0] if self._wheel_indices else 1
-
-    @property
-    def comboBox(self):
-        """Get the first combo box for backward compatibility."""
-        return self._combo_boxes.get(self.wheel_index)
-
-    def home(self):
-        """Home the first filter wheel for backward compatibility."""
-        self._home(self.wheel_index)
-
-    def update_position_from_controller(self):
-        """Update position for first wheel for backward compatibility."""
-        self._update_position_from_controller(self.wheel_index)
-
-    def on_selection_change(self, index):
-        """Handle selection change for first wheel for backward compatibility."""
-        self._on_selection_change(self.wheel_index, index)
-
-    def go_to_next_position(self):
-        """Go to next position on first wheel for backward compatibility."""
-        self._go_to_next_position(self.wheel_index)
-
-    def go_to_previous_position(self):
-        """Go to previous position on first wheel for backward compatibility."""
-        self._go_to_previous_position(self.wheel_index)
 
 
 class StatsDisplayWidget(QFrame):
@@ -18664,9 +18651,14 @@ class BackpressureMonitorWidget(QWidget):
         super().closeEvent(event)
 
 
-def _is_filter_wheel_enabled() -> bool:
-    """Check if filter wheel is enabled in .ini configuration."""
-    return getattr(control._def, "USE_EMISSION_FILTER_WHEEL", False)
+def _is_filter_wheel_enabled(config_repo=None) -> bool:
+    """True if ``emission_filter_wheel`` is enabled in MachineConfig."""
+    from control.core.config.repository import ConfigRepository
+
+    repo = config_repo or ConfigRepository()
+    mc = repo.get_machine_config()
+    d = mc.get_device("emission_filter_wheel")
+    return d is not None and d.enabled
 
 
 def _populate_filter_positions_for_combo(
@@ -18873,7 +18865,7 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         # Determine column visibility
         camera_names = self.config_repo.get_camera_names()
         wheel_names = self.config_repo.get_filter_wheel_names()
-        has_any_wheel = wheel_names or _is_filter_wheel_enabled()
+        has_any_wheel = wheel_names or _is_filter_wheel_enabled(self.config_repo)
 
         # Hide Camera column if single camera (0 or 1)
         if len(camera_names) <= 1:
@@ -19244,7 +19236,7 @@ class AddAcquisitionChannelDialog(QDialog):
 
         # Filter wheel dropdown (hidden if single wheel - 0 or 1 wheels)
         wheel_names = self.config_repo.get_filter_wheel_names()
-        has_any_wheel = wheel_names or _is_filter_wheel_enabled()
+        has_any_wheel = wheel_names or _is_filter_wheel_enabled(self.config_repo)
 
         # Show wheel dropdown only for multi-wheel systems
         if len(wheel_names) > 1:
@@ -19423,9 +19415,15 @@ class FilterWheelConfiguratorDialog(QDialog):
 
         self.registry = self.config_repo.get_filter_wheel_registry()
 
-        # Check if filter wheel is enabled in .ini
-        filter_wheel_enabled = getattr(control._def, "USE_EMISSION_FILTER_WHEEL", False)
-        configured_indices = getattr(control._def, "EMISSION_FILTER_WHEEL_INDICES", [1])
+        # Check if filter wheel is enabled in machine_config.yaml
+        filter_wheel_enabled = _is_filter_wheel_enabled(self.config_repo)
+        fw_cfg = squid.config.get_filter_wheel_config()
+        if fw_cfg and fw_cfg.indices:
+            configured_indices = list(fw_cfg.indices)
+        else:
+            dev = self.config_repo.get_machine_config().get_device("emission_filter_wheel")
+            raw = (dev.config or {}).get("indices", [1]) if dev else [1]
+            configured_indices = list(raw)
 
         # If no registry exists but filter wheel is enabled, create one with wheels for all configured indices
         if self.registry is None:

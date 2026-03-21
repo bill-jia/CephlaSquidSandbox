@@ -111,7 +111,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.ENABLE_NL5 = _dev_enabled("nl5")
     control._def.ENABLE_CELLX = _dev_enabled("cellx")
     control._def.SUPPORT_SCIMICROSCOPY_LED_ARRAY = _dev_enabled("led_matrix")
-    control._def.USE_EMISSION_FILTER_WHEEL = _dev_enabled("emission_filter_wheel")
     control._def.USE_XERYON = _dev_enabled("objective_changer")
     control._def.RUN_FLUIDICS = _dev_enabled("fluidics")
     control._def.USE_PRIOR_STAGE = any(

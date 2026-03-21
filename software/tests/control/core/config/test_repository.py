@@ -662,6 +662,45 @@ filter_wheels:
         cached = repo.get_filter_wheel_registry()
         assert cached is new_registry
 
+    def test_embedded_filter_wheel_registry_overrides_file(self, temp_dir):
+        """Non-empty filter_wheel_registry in machine_config.yaml overrides filter_wheels.yaml."""
+        machine_configs = temp_dir / "machine_configs"
+        machine_configs.mkdir()
+
+        (machine_configs / "machine_config.yaml").write_text(
+            """
+version: 3.0
+devices: {}
+filter_wheel_registry:
+  version: 1.0
+  filter_wheels:
+    - name: "Embedded Wheel"
+      id: 1
+      type: emission
+      positions:
+        1: "From Machine Config"
+"""
+        )
+        (machine_configs / "filter_wheels.yaml").write_text(
+            """
+version: 1.0
+filter_wheels:
+  - name: "File Wheel"
+    id: 1
+    type: emission
+    positions:
+      1: "From File"
+"""
+        )
+
+        repo = ConfigRepository(base_path=temp_dir)
+        registry = repo.get_filter_wheel_registry()
+
+        assert registry is not None
+        assert len(registry.filter_wheels) == 1
+        assert registry.filter_wheels[0].name == "Embedded Wheel"
+        assert registry.filter_wheels[0].positions[1] == "From Machine Config"
+
 
 class TestConfigRepositoryHardwareBindings:
     """Tests for hardware bindings methods."""
@@ -692,6 +731,35 @@ emission_filter_wheels:
         assert ref1.id == 1
         assert ref2.source.value == "standalone"
         assert ref2.id == 1
+
+    def test_embedded_hardware_bindings_overrides_file(self, temp_dir):
+        """hardware_bindings on machine_config.yaml overrides hardware_bindings.yaml."""
+        machine_configs = temp_dir / "machine_configs"
+        machine_configs.mkdir()
+
+        (machine_configs / "machine_config.yaml").write_text(
+            """
+version: 3.0
+devices: {}
+hardware_bindings:
+  version: 1.0
+  emission_filter_wheels:
+    1: "standalone.2"
+"""
+        )
+        (machine_configs / "hardware_bindings.yaml").write_text(
+            """
+version: 1.0
+emission_filter_wheels:
+  1: "standalone.1"
+"""
+        )
+
+        repo = ConfigRepository(base_path=temp_dir)
+        bindings = repo.get_hardware_bindings()
+
+        assert bindings is not None
+        assert bindings.emission_filter_wheels[1].id == 2
 
     def test_get_hardware_bindings_returns_none_when_missing(self, temp_dir):
         """Test that missing hardware_bindings.yaml returns None."""

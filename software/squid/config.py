@@ -1,6 +1,6 @@
 import enum
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pydantic
 
@@ -72,50 +72,161 @@ class FilterWheelConfig(pydantic.BaseModel):
     squid_wheel_configs: Optional[Dict[int, SquidFilterWheelConfig]] = None
 
 
-def _load_filter_wheel_config() -> Optional[FilterWheelConfig]:
-    """Load emission filter wheel configuration from the unified config system.
+def _primary_camera_id_for_bindings(repo: Any) -> int:
+    """First registered camera id for hardware bindings (defaults to 1)."""
+    cr = repo.get_camera_registry()
+    if cr and cr.cameras:
+        ids: List[int] = [c.id for c in cr.cameras if c.id is not None]
+        if ids:
+            return min(ids)
+    return 1 # Should this be 0?
 
-    This uses the v1.1 ``filter_wheels.yaml`` / ``hardware_bindings.yaml`` +
-    the active ``MachineConfig`` instead of reading directly from ``_def.py``.
+
+def _nested_squid_wheel_cfg(sq_map: Any, wheel_id: int) -> Dict[str, Any]:
+    if not isinstance(sq_map, dict):
+        return {}
+    if wheel_id in sq_map:
+        v = sq_map[wheel_id]
+        return v if isinstance(v, dict) else {}
+    s = str(wheel_id)
+    if s in sq_map:
+        v = sq_map[s]
+        return v if isinstance(v, dict) else {}
+    return {}
+
+
+def _build_filter_wheel_config_from_machine(mc: MachineConfig) -> Optional[FilterWheelConfig]:
+    """Build runtime filter wheel config from ``machine_config`` + ConfigRepository.
+
+    Requires ``devices.emission_filter_wheel`` enabled and a resolvable emission wheel
+    from the filter wheel registry / bindings (see ConfigRepository).
     """
     from control.core.config.repository import ConfigRepository
     from control.models import FilterWheelType
 
-    repo = ConfigRepository()
-
-    # Resolve the effective emission wheel for the main camera (camera_id=0).
-    emission_wheel = repo.get_effective_emission_wheel(camera_id=0)
-    if emission_wheel is None or emission_wheel.type != FilterWheelType.EMISSION:
+    dev = mc.get_device("emission_filter_wheel")
+    if dev is None or not dev.enabled:
         return None
 
-    # For now we assume a SQUID-style MCU-driven wheel with reasonable defaults
-    # for the mechanics; these can be extended in the registry schema later.
-    positions = emission_wheel.positions or {}
-    min_index = 1
-    max_index = max(int(p) for p in positions.keys()) if positions else 8
+    repo = ConfigRepository()
+    cam_id = _primary_camera_id_for_bindings(repo)
+    ew = repo.get_effective_emission_wheel(camera_id=cam_id)
+    if ew is None:
+        ew = repo.get_effective_emission_wheel(camera_id=0)
+    if ew is None or ew.type != FilterWheelType.EMISSION:
+        return None
 
-    squid_cfg = SquidFilterWheelConfig(
-        max_index=max_index,
-        min_index=min_index,
-        offset=0.008,
-        motor_slot_index=3,
-        transitions_per_revolution=4000,
-    )
+    cfg = dev.config or {}
+    ctype_str = str(cfg.get("controller_type", "SQUID")).upper()
+    try:
+        ctype = FilterWheelControllerVariant[ctype_str]
+    except KeyError:
+        ctype = FilterWheelControllerVariant.SQUID
 
+    indices = cfg.get("indices")
+    if not indices:
+        reg = repo.get_filter_wheel_registry()
+        if reg:
+            em_wheels = [w for w in reg.filter_wheels if w.type == FilterWheelType.EMISSION]
+            if len(em_wheels) > 1:
+                indices = []
+                for i, w in enumerate(em_wheels):
+                    if w.id is not None:
+                        indices.append(w.id)
+                    else:
+                        indices.append(i + 1)
+            else:
+                indices = [ew.id if ew.id is not None else 1]
+        else:
+            indices = [ew.id if ew.id is not None else 1]
+    else:
+        indices = list(indices)
+
+    serial_from_dev = dev.connection.serial_number if dev.connection else None
+
+    if ctype == FilterWheelControllerVariant.ZABER:
+        sn = serial_from_dev or str(cfg.get("serial_number", ""))
+        return FilterWheelConfig(
+            controller_type=ctype,
+            indices=indices,
+            controller_config=ZaberFilterWheelConfig(
+                serial_number=sn,
+                delay_ms=int(cfg.get("delay_ms", 70)),
+                blocking_call=bool(cfg.get("blocking_call", False)),
+            ),
+        )
+
+    if ctype == FilterWheelControllerVariant.OPTOSPIN:
+        sn = serial_from_dev or str(cfg.get("serial_number", ""))
+        return FilterWheelConfig(
+            controller_type=ctype,
+            indices=indices,
+            controller_config=OptospinFilterWheelConfig(
+                serial_number=sn,
+                speed_hz=int(cfg.get("speed_hz", 50)),
+                delay_ms=int(cfg.get("delay_ms", 70)),
+                ttl_trigger=bool(cfg.get("ttl_trigger", False)),
+            ),
+        )
+
+    def _find_wheel_def(wheel_id: int):
+        reg = repo.get_filter_wheel_registry()
+        if not reg:
+            if len(indices) == 1 and (ew.id == wheel_id or (ew.id is None and wheel_id == 1)):
+                return ew
+            return None
+        for w in reg.filter_wheels:
+            if w.type != FilterWheelType.EMISSION:
+                continue
+            wid = w.id if w.id is not None else 1
+            if wid == wheel_id:
+                return w
+        return None
+
+    def _squid_cfg_for_wheel(wheel_id: int) -> SquidFilterWheelConfig:
+        wheel_def = _find_wheel_def(wheel_id)
+        pos = (wheel_def.positions if wheel_def else None) or (
+            ew.positions if len(indices) == 1 else None
+        ) or {}
+        min_i = min(pos.keys()) if pos else 1
+        max_i = max(pos.keys()) if pos else 8
+        sq_map = cfg.get("squid_wheel_configs")
+        wcfg = _nested_squid_wheel_cfg(sq_map, wheel_id)
+        default_slot = 3 if wheel_id == 1 else 4
+        return SquidFilterWheelConfig(
+            max_index=int(wcfg.get("max_index", max_i)),
+            min_index=int(wcfg.get("min_index", min_i)),
+            offset=float(wcfg.get("offset", cfg.get("offset", 0.008))),
+            motor_slot_index=int(wcfg.get("motor_slot_index", cfg.get("motor_slot_index", default_slot))),
+            transitions_per_revolution=int(
+                wcfg.get("transitions_per_revolution", cfg.get("transitions_per_revolution", 4000))
+            ),
+        )
+
+    if len(indices) == 1:
+        sc = _squid_cfg_for_wheel(indices[0])
+        return FilterWheelConfig(
+            controller_type=ctype,
+            indices=indices,
+            controller_config=sc,
+            squid_wheel_configs={indices[0]: sc},
+        )
+
+    squid_cfgs = {wid: _squid_cfg_for_wheel(wid) for wid in indices}
     return FilterWheelConfig(
-        controller_type=FilterWheelControllerVariant.SQUID,
-        indices=[emission_wheel.id],
-        controller_config=squid_cfg,
-        squid_wheel_configs={emission_wheel.id: squid_cfg},
+        controller_type=ctype,
+        indices=indices,
+        squid_wheel_configs=squid_cfgs,
     )
 
 
-_filter_wheel_config = _load_filter_wheel_config()
+_filter_wheel_config: Optional[FilterWheelConfig] = None
 
 
 def get_filter_wheel_config() -> Optional[FilterWheelConfig]:
     """
-    Returns the FilterWheelConfig that existed at process startup, or None if no filter wheel is configured.
+    Returns the active FilterWheelConfig after ``reconfigure_from_machine_config``,
+    or None if no emission filter wheel is configured.
     """
     return _filter_wheel_config
 
@@ -657,15 +768,16 @@ def get_autofocus_camera_config() -> CameraConfig:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def reconfigure_from_machine_config(mc: "MachineConfig") -> None:  # noqa: F821 (forward ref)
-    """Rebuild camera and stage singletons from a :class:`MachineConfig`.
+    """Rebuild camera, stage, and filter wheel singletons from a :class:`MachineConfig`.
 
     Called by ``apply_machine_config()`` after _def.py globals have been
-    populated.  This ensures that ``get_camera_config()`` and
-    ``get_stage_config()`` return values derived from
-    ``machine_config.yaml`` rather than whatever the INI file set at
-    import time.
+    populated.  This ensures that ``get_camera_config()``,
+    ``get_stage_config()``, and ``get_filter_wheel_config()`` return values
+    derived from ``machine_config.yaml`` rather than import-time defaults.
     """
-    global _camera_config, _autofocus_camera_config, _stage_config
+    global _camera_config, _autofocus_camera_config, _stage_config, _filter_wheel_config
+
+    _filter_wheel_config = _build_filter_wheel_config_from_machine(mc)
 
     main_cam = mc.get_device("main_camera")
     if main_cam and main_cam.enabled:

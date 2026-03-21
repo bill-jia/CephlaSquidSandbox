@@ -9,10 +9,11 @@ The configuration system uses a hierarchical structure that separates concerns:
 ```
 software/
 ├── machine_configs/                    # Hardware-specific (per machine)
+│   ├── machine_config.yaml             # Root device inventory (see README); may embed filter_wheel_registry / hardware_bindings
 │   ├── illumination_channel_config.yaml   # Illumination channels (required)
 │   ├── cameras.yaml                      # Optional: camera registry
-│   ├── filter_wheels.yaml                # Optional: standalone filter wheels
-│   ├── hardware_bindings.yaml            # Optional: camera→wheel mappings
+│   ├── filter_wheels.yaml                # Optional: standalone filter wheels (ignored if embedded registry is non-empty)
+│   ├── hardware_bindings.yaml            # Optional: camera→wheel mappings (ignored if embedded in machine_config.yaml)
 │   ├── confocal_config.yaml              # Optional: confocal settings + wheels
 │   └── intensity_calibrations/           # Optional: power calibration CSVs
 │
@@ -191,6 +192,7 @@ filter_wheels:
 
 **Usage:**
 - If `filter_wheels.yaml` doesn't exist, filter wheel settings in channels are ignored
+- The same schema may be embedded under `filter_wheel_registry` in `machine_config.yaml`; a non-empty embedded list overrides `filter_wheels.yaml`.
 - Filter names appear in UI dropdowns for channel configuration
 - Position numbers must be ≥ 1
 - Wheels here are referenced with the `standalone` source prefix in `hardware_bindings.yaml` (e.g., `standalone.1`)
@@ -239,7 +241,9 @@ objective_specific_properties:
 
 ### hardware_bindings.yaml (Optional)
 
-Maps cameras to their associated filter wheels using **source-qualified references**. This file is only needed for multi-camera systems where each camera uses a different emission filter wheel.
+Maps cameras to their associated filter wheels using **source-qualified references**. This file is only needed for multi-camera systems where each camera uses a different emission filter wheel. The same schema may be embedded as `hardware_bindings` on `machine_config.yaml` and overrides this file when present.
+
+**Physical controller:** enable `devices.emission_filter_wheel` in `machine_config.yaml` and set `config.controller_type` (e.g. `SQUID`) so the filter wheel is constructed with the rest of the microscope.
 
 **Source-Qualified References:**
 

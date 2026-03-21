@@ -476,12 +476,20 @@ class ConfigRepository:
         """
         Load filter wheel registry configuration (cached).
 
-        Returns None if filter_wheels.yaml doesn't exist.
+        When ``machine_config.yaml`` embeds a non-empty ``filter_wheel_registry``,
+        that takes precedence over ``filter_wheels.yaml``.
+
+        Returns None if neither embedded registry nor filter_wheels.yaml provides data.
         """
         cache_key = "filter_wheel_registry"
         if cache_key not in self._machine_cache:
-            path = self.machine_configs_path / "filter_wheels.yaml"
-            self._machine_cache[cache_key] = self._load_yaml(path, FilterWheelRegistryConfig)
+            mc = self.get_machine_config()
+            embedded = mc.filter_wheel_registry
+            if embedded is not None and embedded.filter_wheels:
+                self._machine_cache[cache_key] = embedded
+            else:
+                path = self.machine_configs_path / "filter_wheels.yaml"
+                self._machine_cache[cache_key] = self._load_yaml(path, FilterWheelRegistryConfig)
         return self._machine_cache[cache_key]
 
     def save_camera_registry(self, config: CameraRegistryConfig) -> None:
@@ -518,12 +526,19 @@ class ConfigRepository:
         """
         Load hardware bindings configuration (cached).
 
-        Returns None if hardware_bindings.yaml doesn't exist.
+        When ``machine_config.yaml`` embeds ``hardware_bindings``, that takes
+        precedence over ``hardware_bindings.yaml``.
+
+        Returns None if neither embedded bindings nor hardware_bindings.yaml exists.
         """
         cache_key = "hardware_bindings"
         if cache_key not in self._machine_cache:
-            path = self.machine_configs_path / "hardware_bindings.yaml"
-            self._machine_cache[cache_key] = self._load_yaml(path, HardwareBindingsConfig)
+            mc = self.get_machine_config()
+            if mc.hardware_bindings is not None:
+                self._machine_cache[cache_key] = mc.hardware_bindings
+            else:
+                path = self.machine_configs_path / "hardware_bindings.yaml"
+                self._machine_cache[cache_key] = self._load_yaml(path, HardwareBindingsConfig)
         return self._machine_cache[cache_key]
 
     def save_hardware_bindings(self, config: HardwareBindingsConfig) -> None:
@@ -537,7 +552,7 @@ class ConfigRepository:
         Aggregate filter wheels from all sources.
 
         Returns a dict mapping source name to list of wheels:
-        - "standalone": wheels from filter_wheels.yaml
+        - "standalone": wheels from embedded ``machine_config.filter_wheel_registry`` or ``filter_wheels.yaml``
         - "confocal": wheels from confocal_config.yaml
 
         Each source has its own ID namespace (no global conflicts).

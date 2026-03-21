@@ -590,7 +590,7 @@ the migration script.
 **Completed**:
 - ✅ **Acquisition Channel Configuration dialog** (Settings > Advanced > Acquisition Channel Configuration)
   - Edit channel parameters (name, LED, exposure, analog gain, illumination intensity)
-  - Filter wheel and position selection (when `USE_EMISSION_FILTER_WHEEL=True`)
+  - Filter wheel and position selection (when `devices.emission_filter_wheel` is enabled in `machine_config.yaml` and filter wheel hardware is present)
   - Enable/disable channels
   - Add/remove channels
   - Export/Import channel configurations to/from YAML files

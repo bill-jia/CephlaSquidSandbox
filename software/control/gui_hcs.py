@@ -62,7 +62,7 @@ from control.microcontroller import Microcontroller
 from control.microscope import Microscope, _should_simulate
 from control.models import AcquisitionChannel
 from control.nidaq import AbstractNIDAQ
-from squid.abc import AbstractCamera, AbstractStage, AbstractFilterWheelController
+from squid.abc import AbstractCamera, AbstractStage
 import control._def
 import control.lighting
 import control.utils
@@ -648,7 +648,6 @@ class HighContentScreeningGui(QMainWindow):
         self.autofocusWidget: Optional[widgets.AutoFocusWidget] = None
         self.piezoWidget: Optional[widgets.PiezoWidget] = None
         self.objectivesWidget: Optional[widgets.ObjectivesWidget] = None
-        self.filterControllerWidget: Optional[widgets.FilterControllerWidget] = None
         self.squidFilterWidget: Optional[widgets.SquidFilterWidget] = None
         self.recordingControlWidget: Optional[widgets.RecordingWidget] = None
         self.wellplateFormatWidget: Optional[widgets.WellplateFormatWidget] = None
@@ -764,8 +763,8 @@ class HighContentScreeningGui(QMainWindow):
         channel_config_action.triggered.connect(self.openChannelConfigurationEditor)
         advanced_menu.addAction(channel_config_action)
 
-        # Filter Wheel Configuration (only shown if filter wheel is enabled)
-        if USE_EMISSION_FILTER_WHEEL:
+        # Filter Wheel Configuration (only shown if filter wheel hardware is present)
+        if self.emission_filter_wheel:
             filter_wheel_config_action = QAction("Filter Wheel Configuration", self)
             filter_wheel_config_action.triggered.connect(self.openFilterWheelConfigEditor)
             advanced_menu.addAction(filter_wheel_config_action)
@@ -927,6 +926,8 @@ class HighContentScreeningGui(QMainWindow):
                 live_controller=self.liveController,
                 include_camera_temperature_setting=True,
                 include_camera_auto_wb_setting=False,
+                filter_wheel_controller=self.emission_filter_wheel,
+                config_repo=self.microscope.config_repo,
             )
         else:
             self.cameraSettingWidget = widgets.CameraSettingsWidget(
@@ -936,6 +937,8 @@ class HighContentScreeningGui(QMainWindow):
                 live_controller=self.liveController,
                 include_camera_temperature_setting=False,
                 include_camera_auto_wb_setting=True,
+                filter_wheel_controller=self.emission_filter_wheel,
+                config_repo=self.microscope.config_repo,
             )
 
         self._restore_cached_camera_settings()
@@ -963,11 +966,6 @@ class HighContentScreeningGui(QMainWindow):
         self.autofocusWidget = widgets.AutoFocusWidget(self.autofocusController)
         if self.piezo:
             self.piezoWidget = widgets.PiezoWidget(self.piezo)
-
-        if self.emission_filter_wheel:
-            self.filterControllerWidget = widgets.FilterControllerWidget(
-                self.emission_filter_wheel, self.liveController, config_repo=self.microscope.config_repo
-            )
 
         self.recordingControlWidget = widgets.RecordingWidget(self.streamHandler, self.imageSaver, self.liveController)
         self.wellplateFormatWidget = widgets.WellplateFormatWidget(

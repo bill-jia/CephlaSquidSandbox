@@ -172,6 +172,12 @@ devices:
       g_factor: 1.0
       b_factor: 1.0
 
+  # emission_filter_wheel:
+  #   driver: squid_emission_filter_wheel
+  #   enabled: true
+  #   config:
+  #     controller_type: SQUID
+
 illumination_channels_file: illumination_channel_config.yaml
 
 # ============================================================

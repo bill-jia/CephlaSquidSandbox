@@ -59,6 +59,8 @@ from control.models.io_endpoint_config import (
     IOEndpointConfig,
     IOSignalType,
 )
+from control.models.filter_wheel_config import FilterWheelRegistryConfig
+from control.models.hardware_bindings import HardwareBindingsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +313,20 @@ class MachineConfig(BaseModel):
         ),
     )
     software: SoftwareConfig = Field(default_factory=SoftwareConfig)
+    filter_wheel_registry: Optional[FilterWheelRegistryConfig] = Field(
+        default=None,
+        description=(
+            "Standalone filter wheel definitions (position names).  When set with a "
+            "non-empty ``filter_wheels`` list, overrides ``filter_wheels.yaml``."
+        ),
+    )
+    hardware_bindings: Optional[HardwareBindingsConfig] = Field(
+        default=None,
+        description=(
+            "Camera to filter wheel bindings.  When set, overrides "
+            "``hardware_bindings.yaml``."
+        ),
+    )
 
     model_config = {"extra": "allow"}
 
