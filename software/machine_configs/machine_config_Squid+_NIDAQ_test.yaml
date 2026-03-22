@@ -251,7 +251,7 @@ illumination_devices:
 
 software:
   is_hcs: true
-  wellplate_format: 384
+  wellplate_format: 96
   default_saving_path: "/Downloads"
   display:
     default_crop: 85

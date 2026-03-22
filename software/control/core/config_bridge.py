@@ -188,7 +188,10 @@ def apply_machine_config(mc: MachineConfig) -> None:
 
     sw = mc.software
     control._def.IS_HCS = sw.is_hcs
-    control._def.WELLPLATE_FORMAT = sw.wellplate_format
+    control._def.WELLPLATE_FORMAT = str(sw.wellplate_format)
+    control._def.WELLPLATE_FORMAT = control._def.WELLPLATE_FORMAT + " well plate" if control._def.WELLPLATE_FORMAT.isdigit() else control._def.WELLPLATE_FORMAT
+    if control._def.WELLPLATE_FORMAT not in control._def.WELLPLATE_FORMAT_SETTINGS:
+        control._def.WELLPLATE_FORMAT = "96 well plate"
     if sw.default_saving_path:
         control._def.DEFAULT_SAVING_PATH = sw.default_saving_path
     control._def.USE_NAPARI_FOR_LIVE_VIEW = sw.display.use_napari_for_live_view

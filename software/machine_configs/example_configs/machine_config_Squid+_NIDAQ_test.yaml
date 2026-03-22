@@ -213,14 +213,14 @@ illumination_channels_file: illumination_channel_config.yaml
 
 software:
   is_hcs: true
-  wellplate_format: 384
+  wellplate_format: "96 well plate"
   default_saving_path: "/Downloads"
   display:
     default_crop: 85
     use_napari_for_live_view: false
     use_napari_for_mosaic: true
   acquisition:
-    image_format: bmp
+    image_format: tif
     scaling_factor: 0.85
     dx: 0.9
     dy: 0.9

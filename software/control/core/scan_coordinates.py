@@ -61,6 +61,7 @@ class ScanCoordinates:
         self.well_selector = None
         self.acquisition_pattern = control._def.ACQUISITION_PATTERN
         self.fov_pattern = control._def.FOV_PATTERN
+        self._log.info(f"Initializing scan coordinates with wellplate format: {control._def.WELLPLATE_FORMAT}")
         self.format = control._def.WELLPLATE_FORMAT
         self.a1_x_mm = control._def.A1_X_MM
         self.a1_y_mm = control._def.A1_Y_MM

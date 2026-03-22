@@ -7,3 +7,5 @@ hardware_docs/
 
 # PlatformIO
 .pio/
+
+example_outputs/

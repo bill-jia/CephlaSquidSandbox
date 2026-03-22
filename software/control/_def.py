@@ -1297,11 +1297,12 @@ try:
             cached_settings.get("objective") if cached_settings.get("objective") in OBJECTIVES else "20x"
         )
         WELLPLATE_FORMAT = str(cached_settings.get("wellplate_format"))
-        WELLPLATE_FORMAT = WELLPLATE_FORMAT + " well plate" if WELLPLATE_FORMAT.isdigit() else WELLPLATE_FORMAT
-        if WELLPLATE_FORMAT not in WELLPLATE_FORMAT_SETTINGS:
-            WELLPLATE_FORMAT = "96 well plate"
 except (FileNotFoundError, json.JSONDecodeError):
     DEFAULT_OBJECTIVE = "20x"
+    WELLPLATE_FORMAT = "96 well plate"
+
+WELLPLATE_FORMAT = WELLPLATE_FORMAT + " well plate" if WELLPLATE_FORMAT.isdigit() else WELLPLATE_FORMAT
+if WELLPLATE_FORMAT not in WELLPLATE_FORMAT_SETTINGS:
     WELLPLATE_FORMAT = "96 well plate"
 
 NUMBER_OF_SKIP = WELLPLATE_FORMAT_SETTINGS[WELLPLATE_FORMAT][
