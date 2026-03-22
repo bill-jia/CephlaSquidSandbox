@@ -1022,6 +1022,7 @@ class ConfigRepository:
         objective: str,
         channels: List[AcquisitionChannel],
         confocal_mode: bool = False,
+        observation_state_names: Optional[List[str]] = None,
     ) -> None:
         """
         Save acquisition settings to an experiment output directory.
@@ -1035,11 +1036,13 @@ class ConfigRepository:
             objective: Objective used for acquisition
             channels: List of acquisition channels used
             confocal_mode: Whether confocal mode was active
+            observation_state_names: When multipoint uses Observation State presets, their names
         """
         output_config = AcquisitionOutputConfig(
             objective=objective,
             confocal_mode=confocal_mode,
             channels=channels,
+            observation_state_names=observation_state_names,
         )
         output_path = Path(output_dir) / "acquisition_channels.yaml"
         self._save_yaml(output_path, output_config)

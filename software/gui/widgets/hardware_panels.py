@@ -2037,14 +2037,9 @@ class LiveControlWidget(QFrame):
     def _save_snap_acquisition_metadata(self, filepath: str) -> None:
         """Write ``{snap_stem}_acquisition_metadata.yaml`` next to the snap TIFF."""
         from pathlib import Path
-        from typing import Any, Dict, List
 
-        from control.core.observation_state_service import (
-            collect_emission_filter_positions,
-            collect_observation_state,
-            observation_state_binning_mode_for_metadata,
-        )
-        from control.models.acquisition_metadata import AcquisitionMetadata
+        from control.core.acquisition_metadata_helpers import build_acquisition_metadata
+        from control.core.observation_state_service import collect_emission_filter_positions, collect_observation_state
 
         path = Path(filepath)
         stem = path.stem
@@ -2065,48 +2060,22 @@ class LiveControlWidget(QFrame):
             except Exception as e:
                 self._log.warning("Snap: could not collect observation state for metadata: %s", e)
 
-        current_objective = self.objectiveStore.current_objective
-        objective_details: Dict[str, Any] = {}
-        try:
-            objective_details = dict(self.objectiveStore.objectives_dict.get(current_objective, {}))
-            objective_details["name"] = current_objective
-        except (AttributeError, KeyError, TypeError):
-            objective_details = {"name": current_objective}
-
-        try:
-            trigger_mode = str(self.liveController.get_trigger_mode())
-        except Exception:
-            trigger_mode = None
-
-        selected_names: List[str] = []
+        selected_names = []
         if obs_state and obs_state.active_channel_name:
             selected_names = [obs_state.active_channel_name]
         elif self.currentConfiguration is not None:
             selected_names = [self.currentConfiguration.name]
 
         try:
-            sensor_px = self.camera.get_pixel_size_binned_um()
-        except Exception:
-            sensor_px = None
-
-        bx, by, cm = observation_state_binning_mode_for_metadata(obs_state, self.camera)
-
-        try:
-            metadata = AcquisitionMetadata(
+            metadata = build_acquisition_metadata(
                 experiment_id=stem,
                 recording_start_time=time.time(),
-                objective=current_objective,
-                objective_details=objective_details,
-                confocal_mode=self.liveController.is_confocal_mode(),
-                sensor_pixel_size_um=sensor_px,
-                tube_lens_mm=TUBE_LENS_MM,
-                trigger_mode=trigger_mode,
-                binning_x=bx,
-                binning_y=by,
-                camera_mode=cm,
-                selected_channel_names=selected_names,
+                objective_store=self.objectiveStore,
+                live_controller=self.liveController,
+                camera=self.camera,
                 scan_parameters={"source": "live_snap", "image_file": path.name},
                 observation_state=obs_state,
+                selected_channel_names=selected_names,
             )
             out = repo.save_acquisition_metadata(path.parent, metadata, filename=meta_filename)
             self._log.info("Snap acquisition metadata saved to: %s", out)

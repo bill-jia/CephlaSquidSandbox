@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from enum import Enum
-from typing import Optional, Dict, Callable
+from typing import Any, Optional, Dict, Callable
 import numpy as np
 from scipy import ndimage
 import squid.logging
@@ -53,7 +53,9 @@ class FastAcquisitionController:
                  file_format: str = "tiff",
                  trigger_dio_line: int = 1,
                  camera_frame_dio_line: int = 0,
-                 illumination_controller=None):
+                 illumination_controller=None,
+                 microscope: Optional[Any] = None,
+                 live_controller: Optional[Any] = None):
         """
         Initialize fast acquisition controller.
 
@@ -72,6 +74,8 @@ class FastAcquisitionController:
                 state is snapshotted before acquisition and restored afterwards so that
                 the higher-level channel state stays in sync with the hardware lines
                 that the NI-DAQ restores via restore_after_acquisition().
+            microscope: Optional Microscope; used to write acquisition_metadata.yaml on stop.
+            live_controller: Optional LiveController; used with microscope for metadata YAML.
         """
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._camera = camera
@@ -82,6 +86,8 @@ class FastAcquisitionController:
         self._daq_only = camera is None
         self._illumination_controller = illumination_controller
         self._illumination_snapshot = None
+        self._microscope = microscope
+        self._live_controller = live_controller
 
         if camera is not None:
             # Get frame shape from camera
@@ -659,6 +665,59 @@ class FastAcquisitionController:
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         self._log.info(f"Saved metadata to {metadata_path}")
+        self._save_acquisition_metadata_yaml_sidecar(metadata)
+
+    def _save_acquisition_metadata_yaml_sidecar(self, metadata_json: dict) -> None:
+        """Write acquisition_metadata.yaml next to metadata.json when microscope context is available."""
+        scope = self._microscope
+        lc = self._live_controller
+        if scope is None or lc is None:
+            return
+        try:
+            from control.core.acquisition_metadata_helpers import build_acquisition_metadata
+            from control.core.observation_state_service import (
+                collect_emission_filter_positions,
+                collect_observation_state,
+            )
+
+            repo = scope.config_repo
+            exp_id = os.path.basename(self._output_path.rstrip(os.sep))
+            obs_state = None
+            if repo.current_profile:
+                try:
+                    wheel = getattr(scope, "emission_filter_wheel", None)
+                    emission = collect_emission_filter_positions(wheel)
+                    obs_state = collect_observation_state(
+                        lc,
+                        repo,
+                        scope.objective_store.current_objective,
+                        emission_filter_positions=emission or None,
+                    )
+                except Exception as e:
+                    self._log.warning("Fast acquisition: could not collect observation state: %s", e)
+            scan_parameters = dict(metadata_json)
+            scan_parameters["source"] = "fast_acquisition"
+            scan_parameters.setdefault("metadata_json", "metadata.json")
+            h5_rel = os.path.join("waveforms", "daq_data.h5")
+            npy_rel = os.path.join("waveforms", "frame_sync_map.npy")
+            if os.path.isfile(os.path.join(self._output_path, h5_rel)):
+                scan_parameters["waveforms_h5"] = h5_rel.replace("\\", "/")
+            elif os.path.isfile(os.path.join(self._output_path, npy_rel)):
+                scan_parameters["waveforms_frame_sync_map"] = npy_rel.replace("\\", "/")
+
+            am = build_acquisition_metadata(
+                experiment_id=exp_id,
+                recording_start_time=self._start_time or time.time(),
+                objective_store=scope.objective_store,
+                live_controller=lc,
+                camera=scope.camera,
+                scan_parameters=scan_parameters,
+                observation_state=obs_state,
+            )
+            out = repo.save_acquisition_metadata(self._output_path, am)
+            self._log.info("Saved acquisition metadata YAML to %s", out)
+        except Exception as e:
+            self._log.warning("Could not save acquisition_metadata.yaml for fast acquisition: %s", e, exc_info=True)
 
     def _start_tiff_stack_conversion_thread(self):
         """

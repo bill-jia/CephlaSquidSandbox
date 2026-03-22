@@ -1,10 +1,11 @@
 import abc
+import csv
 import multiprocessing
 import queue
 import os
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import ClassVar, Dict, Generic, List, Optional, Set, Tuple, TypeVar, Union
 from uuid import uuid4
@@ -87,6 +88,8 @@ class CaptureInfo:
     configuration_idx: int
     z_piezo_um: Optional[float] = None
     time_point: Optional[int] = None
+    filename_channel_label: Optional[str] = None
+    """If set, used for TIFF basename instead of configuration.name (e.g. observation preset name)."""
 
 
 @dataclass()
@@ -128,6 +131,57 @@ FILE_LOCK_TIMEOUT_SECONDS = 10
 
 def _metadata_lock_path(metadata_path: str) -> str:
     return metadata_path + ".lock"
+
+
+def append_frame_acquisition_time_csv(
+    info: "CaptureInfo",
+    filename: str,
+    *,
+    channel: Optional[str] = None,
+    channel_index: Optional[int] = None,
+) -> None:
+    """Append one row to ``frame_acquisition_times.csv`` in ``info.save_directory`` (per timepoint folder).
+
+    Records wall-clock time when each frame was committed for saving (``CaptureInfo.capture_time``).
+    Safe across multiprocessing save workers via :class:`filelock.FileLock`.
+    """
+    _log = squid.logging.get_logger("append_frame_acquisition_time_csv")
+    path = os.path.join(info.save_directory, "frame_acquisition_times.csv")
+    lock_path = _metadata_lock_path(path)
+    fieldnames = [
+        "time_point",
+        "region_id",
+        "fov",
+        "z_level",
+        "channel",
+        "channel_index",
+        "filename",
+        "unix_time_s",
+        "utc_iso",
+    ]
+    ch = channel if channel is not None else (info.filename_channel_label or info.configuration.name)
+    cidx = channel_index if channel_index is not None else info.configuration_idx
+    row = {
+        "time_point": "" if info.time_point is None else info.time_point,
+        "region_id": info.region_id,
+        "fov": info.fov,
+        "z_level": info.z_index,
+        "channel": ch,
+        "channel_index": cidx,
+        "filename": filename,
+        "unix_time_s": f"{float(info.capture_time):.6f}",
+        "utc_iso": datetime.fromtimestamp(float(info.capture_time), tz=timezone.utc).isoformat(),
+    }
+    try:
+        with _acquire_file_lock(lock_path, context=path):
+            write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                if write_header:
+                    w.writeheader()
+                w.writerow(row)
+    except Exception as e:
+        _log.warning("Could not append frame acquisition time row to %s: %s", path, e)
 
 
 @contextmanager
@@ -172,9 +226,10 @@ class SaveImageJob(Job):
     def save_image(self, image: np.array, info: CaptureInfo, is_color: bool):
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
         if _def.FILE_SAVING_OPTION == _def.FileSavingOption.MULTI_PAGE_TIFF:
+            _ch_label = info.filename_channel_label or info.configuration.name
             metadata = {
                 "z_level": info.z_index,
-                "channel": info.configuration.name,
+                "channel": _ch_label,
                 "channel_index": info.configuration_idx,
                 "region_id": info.region_id,
                 "fov": info.fov,
@@ -209,6 +264,7 @@ class SaveImageJob(Job):
                     description=description,
                     extratags=extratags,
                 )
+            append_frame_acquisition_time_csv(info, os.path.basename(output_path))
         else:
             saved_image = utils_acquisition.save_image(
                 image=image,
@@ -216,7 +272,13 @@ class SaveImageJob(Job):
                 save_directory=info.save_directory,
                 config=info.configuration,
                 is_color=is_color,
+                filename_channel_label=info.filename_channel_label,
             )
+            _label = info.filename_channel_label or info.configuration.name
+            _written = utils_acquisition.get_image_filepath(
+                info.save_directory, info.file_id, _label, image.dtype
+            )
+            append_frame_acquisition_time_csv(info, os.path.basename(_written))
 
             if _def.MERGE_CHANNELS:
                 # TODO(imo): Add this back in
@@ -336,6 +398,12 @@ class SaveOMETiffJob(Job):
                 stack.flush()
             finally:
                 del stack
+
+            try:
+                _rel_ome = os.path.relpath(output_path, info.save_directory)
+            except ValueError:
+                _rel_ome = os.path.basename(output_path)
+            append_frame_acquisition_time_csv(info, _rel_ome.replace("\\", "/"))
 
             metadata = ome_tiff_writer.update_plane_metadata(metadata, info)
             index_key = f"{time_point}-{channel_index}-{z_index}"
@@ -645,6 +713,11 @@ class SaveZarrJob(Job):
             return result
 
         self._save_zarr(image, info, output_path)
+        try:
+            _rel_z = os.path.relpath(output_path, info.save_directory)
+        except ValueError:
+            _rel_z = output_path
+        append_frame_acquisition_time_csv(info, _rel_z.replace("\\", "/"))
         return result
 
     def _save_zarr(self, image: np.ndarray, info: CaptureInfo, output_path: str) -> None:

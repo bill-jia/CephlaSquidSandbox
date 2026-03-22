@@ -127,10 +127,9 @@ class Stitcher(QThread, QObject):
             print(f"Error reading selected modes: {e}")
 
     def extract_acquisition_parameters(self, input_folder):
-        acquistion_params_path = os.path.join(input_folder, "acquisition parameters.json")
-        with open(acquistion_params_path, "r") as file:
-            acquisition_params = json.load(file)
-        return acquisition_params
+        from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
+        return load_legacy_acquisition_parameters_flat(input_folder)
 
     def extract_wavelength(self, name):
         # Split the string and find the wavelength number immediately after "Fluorescence"
@@ -914,9 +913,9 @@ class CoordinateStitcher(QThread, QObject):
         return self.time_points
 
     def extract_acquisition_parameters(self):
-        acquistion_params_path = os.path.join(self.input_folder, "acquisition parameters.json")
-        with open(acquistion_params_path, "r") as file:
-            self.acquisition_params = json.load(file)
+        from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
+        self.acquisition_params = load_legacy_acquisition_parameters_flat(self.input_folder)
 
     def get_pixel_size_from_params(self):
         obj_mag = self.acquisition_params["objective"]["magnification"]

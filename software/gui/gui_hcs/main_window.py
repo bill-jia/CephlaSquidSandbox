@@ -1968,7 +1968,7 @@ class HighContentScreeningGui(QMainWindow):
         dialog.exec_()
 
     def _refresh_channel_lists(self):
-        """Refresh channel lists in all widgets after channel configuration changes"""
+        """Refresh live mode lists and multipoint observation-preset lists after config or profile changes."""
         if self.liveControlWidget:
             self.liveControlWidget.refresh_mode_list()
         if self.napariLiveWidget:
@@ -1977,6 +1977,8 @@ class HighContentScreeningGui(QMainWindow):
             self.flexibleMultiPointWidget.refresh_channel_list()
         if self.wellplateMultiPointWidget:
             self.wellplateMultiPointWidget.refresh_channel_list()
+        if getattr(self, "multiPointWithFluidicsWidget", None):
+            self.multiPointWithFluidicsWidget.refresh_channel_list()
 
     def _on_observation_state_changed(self):
         """After Observation State save/load: refresh channel lists and sync Camera tab to hardware."""

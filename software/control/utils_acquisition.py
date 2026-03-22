@@ -4,6 +4,7 @@ images, etc.
 """
 
 import os
+from typing import Optional
 
 import numpy as np
 import cv2
@@ -37,9 +38,16 @@ def get_image_filepath(save_directory: str, file_id: str, config_name: str, dtyp
 
 
 def save_image(
-    image: np.array, file_id: str, save_directory: str, config: AcquisitionChannel, is_color: bool
+    image: np.array,
+    file_id: str,
+    save_directory: str,
+    config: AcquisitionChannel,
+    is_color: bool,
+    *,
+    filename_channel_label: Optional[str] = None,
 ) -> np.array:
-    saving_path = get_image_filepath(save_directory, file_id, config.name, image.dtype)
+    label = filename_channel_label if filename_channel_label else config.name
+    saving_path = get_image_filepath(save_directory, file_id, label, image.dtype)
 
     if is_color:
         if "BF LED matrix" in config.name:

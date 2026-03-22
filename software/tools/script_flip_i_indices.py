@@ -1,16 +1,14 @@
 import os
 from glob import glob
 from script_stitch_slide import get_channels, get_time_indices
-import json
 import sys
 import pandas as pd
 
+from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
 
 def get_ny(slide_path):
-    parameter_path = os.path.join(slide_path, "acquisition parameters.json")
-    parameters = {}
-    with open(parameter_path, "r") as f:
-        parameters = json.load(f)
+    parameters = load_legacy_acquisition_parameters_flat(slide_path)
 
     Ny = int(parameters["Ny"])
     return Ny

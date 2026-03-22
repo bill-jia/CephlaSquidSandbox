@@ -238,6 +238,13 @@ def parse_acquisition_folder(folder_path: str) -> Tuple[AcquisitionTiming, dict]
     if params_path.exists():
         with open(params_path, "r") as f:
             metadata["params"] = json.load(f)
+    elif yaml_path.exists():
+        try:
+            from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
+            metadata["params"] = load_legacy_acquisition_parameters_flat(str(folder))
+        except Exception:
+            pass
     if acquisition_metadata_path.exists():
         try:
             import yaml

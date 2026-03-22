@@ -519,11 +519,18 @@ def apply_observation_state(
     objective_store: "ObjectiveStore",
     *,
     emission_filter_wheel: Optional[Any] = None,
+    persist_general_to_profile: bool = True,
 ) -> None:
     """
     Persist Observation State into general.yaml and refresh live mode.
 
     Merges with the current objective's objective.yaml when resolving channels via LiveController.
+
+    Args:
+        persist_general_to_profile: When True (default), write preset channel rows into the profile's
+            ``general.yaml``. When False, apply only to hardware and in-memory live state (no disk write).
+            Use False when cycling multiple presets during one acquisition so the on-disk profile is not
+            rewritten at every step.
     """
     profile = config_repo.current_profile
     if not profile:
@@ -534,9 +541,10 @@ def apply_observation_state(
         channels=list(state.channels),
         channel_groups=list(state.channel_groups),
     )
-    existing = config_repo.get_general_config(profile)
-    if existing is None or existing != general:
-        config_repo.save_general_config(profile, general)
+    if persist_general_to_profile:
+        existing = config_repo.get_general_config(profile)
+        if existing is None or existing != general:
+            config_repo.save_general_config(profile, general)
 
     live_controller.toggle_confocal_widefield(state.confocal_mode)
 
@@ -560,7 +568,7 @@ def apply_observation_state(
     objective = objective_store.current_objective
     merged = live_controller.get_channels(objective)
     if not merged:
-        logger.warning("apply_observation_state: no channels after saving general config")
+        logger.warning("apply_observation_state: no channels available for objective %r", objective)
         return
 
     channels = _overlay_preset_channels_onto_merged(merged, state.channels)

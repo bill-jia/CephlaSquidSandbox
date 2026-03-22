@@ -25,6 +25,7 @@ from control.core.multi_point_utils import (
     PlateViewInit,
     PlateViewUpdate,
 )
+from control.core.observation_state_service import apply_observation_state
 from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope
@@ -47,6 +48,7 @@ from control.core.job_processing import (
     JobResult,
     DownsampledViewJob,
     DownsampledViewResult,
+    append_frame_acquisition_time_csv,
 )
 from control.core.downsampled_views import (
     DownsampledViewManager,
@@ -128,7 +130,13 @@ class MultiPointWorker:
         self.experiment_ID = acquisition_parameters.experiment_ID
         self.base_path = acquisition_parameters.base_path
         self.experiment_path = os.path.join(self.base_path or "", self.experiment_ID or "")
-        self.selected_configurations = acquisition_parameters.selected_configurations
+        self.observation_state_names = list(acquisition_parameters.selected_observation_state_names or [])
+        self._use_observation_presets = bool(self.observation_state_names)
+        self._emission_filter_wheel = getattr(scope.addons, "emission_filter_wheel", None)
+        if self._use_observation_presets:
+            self.selected_configurations = []
+        else:
+            self.selected_configurations = acquisition_parameters.selected_configurations
 
         # Pre-compute acquisition metadata that remains constant throughout the run.
         try:
@@ -144,11 +152,18 @@ class MultiPointWorker:
         self._physical_size_z_um = self.deltaZ if self.NZ > 1 else None
         self.timestamp_acquisition_started = acquisition_parameters.acquisition_start_time
 
+        _channel_display_names = (
+            self.observation_state_names
+            if self._use_observation_presets
+            else [cfg.name for cfg in self.selected_configurations]
+        )
+        _n_channels = len(_channel_display_names)
+
         self.acquisition_info = AcquisitionInfo(
             total_time_points=self.Nt,
             total_z_levels=self.NZ,
-            total_channels=len(self.selected_configurations),
-            channel_names=[cfg.name for cfg in self.selected_configurations],
+            total_channels=_n_channels,
+            channel_names=_channel_display_names,
             experiment_path=self.experiment_path,
             time_increment_s=self._time_increment_s,
             physical_size_z_um=self._physical_size_z_um,
@@ -288,20 +303,37 @@ class MultiPointWorker:
                 region_fov_counts[str(region_id)] = len(coords)
 
             # Extract channel metadata for zarr output
-            channel_names = [cfg.name for cfg in self.selected_configurations]
-            channel_colors = [cfg.display_color for cfg in self.selected_configurations]
-
-            # Get wavelengths from illumination config
-            channel_wavelengths = []
             illumination_config = self.microscope.config_repo.get_illumination_config()
-            for cfg in self.selected_configurations:
-                wavelength = cfg.get_illumination_wavelength(illumination_config) if illumination_config else None
-                channel_wavelengths.append(wavelength)
+            if self._use_observation_presets:
+                channel_names = list(self.observation_state_names)
+                channel_colors = []
+                channel_wavelengths = []
+                repo = self.microscope.config_repo
+                objective = self.objectiveStore.current_objective
+                for pname in self.observation_state_names:
+                    st = repo.load_observation_preset(pname)
+                    c = None
+                    if st is not None and st.active_channel_name:
+                        c = self.liveController.get_channel_by_name(objective, st.active_channel_name)
+                    if c is not None:
+                        channel_colors.append(c.display_color)
+                        wl = c.get_illumination_wavelength(illumination_config) if illumination_config else None
+                        channel_wavelengths.append(wl)
+                    else:
+                        channel_colors.append(0xFFFFFF)
+                        channel_wavelengths.append(None)
+            else:
+                channel_names = [cfg.name for cfg in self.selected_configurations]
+                channel_colors = [cfg.display_color for cfg in self.selected_configurations]
+                channel_wavelengths = []
+                for cfg in self.selected_configurations:
+                    wavelength = cfg.get_illumination_wavelength(illumination_config) if illumination_config else None
+                    channel_wavelengths.append(wavelength)
 
             zarr_writer_info = ZarrWriterInfo(
                 base_path=self.experiment_path,
                 t_size=self.Nt,
-                c_size=len(self.selected_configurations),
+                c_size=len(channel_names),
                 z_size=self.NZ,
                 is_hcs=is_hcs,
                 use_6d_fov=control._def.ZARR_USE_6D_FOV_DIMENSION,
@@ -444,6 +476,29 @@ class MultiPointWorker:
         )
         return True
 
+    def _channel_step_count(self) -> int:
+        if self.observation_state_names:
+            return len(self.observation_state_names)
+        return len(self.selected_configurations)
+
+    def _apply_observation_preset(self, preset_name: str):
+        repo = self.microscope.config_repo
+        state = repo.load_observation_preset(preset_name)
+        if state is None:
+            raise ValueError(f"Observation preset not found: {preset_name!r}")
+        apply_observation_state(
+            state,
+            repo,
+            self.liveController,
+            self.objectiveStore,
+            emission_filter_wheel=self._emission_filter_wheel,
+            persist_general_to_profile=False,
+        )
+        cfg = self.liveController.currentConfiguration
+        if cfg is None:
+            raise RuntimeError(f"No active channel after applying observation preset {preset_name!r}")
+        return cfg
+
     def run(self):
         this_image_callback_id = None
         try:
@@ -459,7 +514,7 @@ class MultiPointWorker:
                         experiment_id=self.experiment_ID or "unknown",
                         num_regions=len(self.scan_region_names) if self.scan_region_names else 0,
                         num_timepoints=self.Nt,
-                        num_channels=len(self.selected_configurations) if self.selected_configurations else 0,
+                        num_channels=self._channel_step_count(),
                         num_z_levels=self.NZ,
                     )
                 except Exception as e:
@@ -956,9 +1011,13 @@ class MultiPointWorker:
 
         # Get channel info
         channel_idx = info.configuration_idx
-        total_channels = len(self.selected_configurations)
+        total_channels = self._channel_step_count()
         channel_name = info.configuration.name if info.configuration else f"Channel_{channel_idx}"
-        channel_names = [cfg.name for cfg in self.selected_configurations]
+        channel_names = (
+            list(self.observation_state_names)
+            if self.observation_state_names
+            else [cfg.name for cfg in self.selected_configurations]
+        )
 
         return DownsampledViewJob(
             capture_info=info,
@@ -1041,8 +1100,12 @@ class MultiPointWorker:
         well_slot_height = max(well_slot_height, min_slot_height)
 
         # Get channel info
-        num_channels = len(self.selected_configurations)
-        channel_names = [cfg.name for cfg in self.selected_configurations]
+        num_channels = self._channel_step_count()
+        channel_names = (
+            list(self.observation_state_names)
+            if self.observation_state_names
+            else [cfg.name for cfg in self.selected_configurations]
+        )
 
         self._downsampled_view_manager = DownsampledViewManager(
             num_rows=self._plate_num_rows,
@@ -1214,7 +1277,7 @@ class MultiPointWorker:
                 )
             )
             self.num_fovs = len(coordinates)
-            self.total_scans = self.num_fovs * self.NZ * len(self.selected_configurations)
+            self.total_scans = self.num_fovs * self.NZ * self._channel_step_count()
 
             for fov, coordinate_mm in enumerate(coordinates):
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
@@ -1263,34 +1326,70 @@ class MultiPointWorker:
                 iio.imwrite(saving_path, image)
 
             current_round_images = {}
-            # iterate through selected modes
-            for config_idx, config in enumerate(self.selected_configurations):
-                if self.NZ == 1:  # TODO: handle z offset for z stack
-                    self.handle_z_offset(config, True)
+            n_steps = self._channel_step_count()
+            # iterate through observation presets or legacy channel configurations
+            if self.observation_state_names:
+                for config_idx, preset_name in enumerate(self.observation_state_names):
+                    try:
+                        config = self._apply_observation_preset(preset_name)
+                    except Exception as e:
+                        self._log.error("Failed to apply observation preset %s: %s", preset_name, e, exc_info=True)
+                        self.request_abort_fn()
+                        return
+                    if self.NZ == 1:  # TODO: handle z offset for z stack
+                        self.handle_z_offset(config, True)
 
-                # acquire image
-                with self._timing.get_timer("acquire_camera_image"):
-                    # TODO(imo): This really should not look for a string in a user configurable name.  We
-                    # need some proper flag on the config to signal this instead...
-                    if "RGB" in config.name:
-                        self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
-                    else:
-                        self.acquire_camera_image(
-                            config, file_ID, current_path, z_level, region_id=region_id, fov=fov, config_idx=config_idx
-                        )
+                    with self._timing.get_timer("acquire_camera_image"):
+                        if "RGB" in config.name:
+                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
+                        else:
+                            self.acquire_camera_image(
+                                config,
+                                file_ID,
+                                current_path,
+                                z_level,
+                                region_id=region_id,
+                                fov=fov,
+                                config_idx=config_idx,
+                                filename_channel_label=preset_name,
+                            )
 
-                if self.NZ == 1:  # TODO: handle z offset for z stack
-                    self.handle_z_offset(config, False)
+                    if self.NZ == 1:
+                        self.handle_z_offset(config, False)
 
-                current_image = (
-                    fov * self.NZ * len(self.selected_configurations)
-                    + z_level * len(self.selected_configurations)
-                    + config_idx
-                    + 1
-                )
-                self.callbacks.signal_region_progress(
-                    RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
-                )
+                    current_image = fov * self.NZ * n_steps + z_level * n_steps + config_idx + 1
+                    self.callbacks.signal_region_progress(
+                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
+                    )
+            else:
+                for config_idx, config in enumerate(self.selected_configurations):
+                    if self.NZ == 1:  # TODO: handle z offset for z stack
+                        self.handle_z_offset(config, True)
+
+                    # acquire image
+                    with self._timing.get_timer("acquire_camera_image"):
+                        # TODO(imo): This really should not look for a string in a user configurable name.  We
+                        # need some proper flag on the config to signal this instead...
+                        if "RGB" in config.name:
+                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
+                        else:
+                            self.acquire_camera_image(
+                                config,
+                                file_ID,
+                                current_path,
+                                z_level,
+                                region_id=region_id,
+                                fov=fov,
+                                config_idx=config_idx,
+                            )
+
+                    if self.NZ == 1:  # TODO: handle z offset for z stack
+                        self.handle_z_offset(config, False)
+
+                    current_image = fov * self.NZ * n_steps + z_level * n_steps + config_idx + 1
+                    self.callbacks.signal_region_progress(
+                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
+                    )
 
             # updates coordinates df
             self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
@@ -1449,7 +1548,16 @@ class MultiPointWorker:
         return (self.camera.get_total_frame_time() / 1e3) + 10
 
     def acquire_camera_image(
-        self, config, file_ID: str, current_path: str, k: int, region_id: int, fov: int, config_idx: int
+        self,
+        config,
+        file_ID: str,
+        current_path: str,
+        k: int,
+        region_id: int,
+        fov: int,
+        config_idx: int,
+        *,
+        filename_channel_label: Optional[str] = None,
     ):
         self._select_config(config)
 
@@ -1506,6 +1614,7 @@ class MultiPointWorker:
                 fov=fov,
                 configuration_idx=config_idx,
                 time_point=self.time_point,
+                filename_channel_label=filename_channel_label,
             )
             self._current_capture_info = current_capture_info
         with self._timing.get_timer("send_trigger"):
@@ -1656,6 +1765,12 @@ class MultiPointWorker:
                 + (".tiff" if images[channel].dtype == np.uint16 else "." + Acquisition.IMAGE_FORMAT)
             )
             iio.imwrite(os.path.join(capture_info.save_directory, file_name), images[channel])
+            append_frame_acquisition_time_csv(
+                capture_info,
+                file_name,
+                channel=channel,
+                channel_index=capture_info.configuration_idx,
+            )
 
     def construct_rgb_image(self, images, capture_info: CaptureInfo):
         rgb_image = np.zeros((*images["BF LED matrix full_R"].shape, 3), dtype=images["BF LED matrix full_R"].dtype)
@@ -1689,6 +1804,12 @@ class MultiPointWorker:
             + (".tiff" if rgb_image.dtype == np.uint16 else "." + Acquisition.IMAGE_FORMAT)
         )
         iio.imwrite(os.path.join(capture_info.save_directory, file_name), rgb_image)
+        append_frame_acquisition_time_csv(
+            capture_info,
+            file_name,
+            channel="BF_LED_matrix_full_RGB",
+            channel_index=capture_info.configuration_idx,
+        )
 
     def handle_acquisition_abort(self, current_path):
         # Save coordinates.csv

@@ -132,6 +132,44 @@ flexible_scan:
         assert len(result.flexible_positions) == 2
         assert result.flexible_positions[0]["name"] == "Position 1"
 
+    def test_parse_preset_observation_state_channel_dict(self, tmp_path):
+        """Unified multipoint YAML uses channels.observation_state_names instead of a channel list."""
+        yaml_content = """
+schema_version: 2
+acquisition:
+  widget_type: flexible
+  xy_mode: Manual
+objective:
+  name: 10x
+  magnification: 10.0
+z_stack:
+  nz: 1
+  delta_z_mm: 0.001
+time_series:
+  nt: 1
+  delta_t_s: 0.0
+channels:
+  observation_state_names:
+    - preset_a
+    - preset_b
+autofocus:
+  contrast_af: false
+  laser_af: false
+flexible_scan:
+  nx: 1
+  ny: 1
+  delta_x_mm: 0.9
+  delta_y_mm: 0.9
+  overlap_percent: 10.0
+  positions: []
+"""
+        yaml_file = tmp_path / "test_presets.yaml"
+        yaml_file.write_text(yaml_content)
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert result.channel_names == ["preset_a", "preset_b"]
+
     def test_parse_minimal_yaml(self, tmp_path):
         """Test parsing YAML with minimal required fields."""
         yaml_content = """

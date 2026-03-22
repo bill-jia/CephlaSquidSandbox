@@ -28,7 +28,6 @@ All acquisition is performed in a background thread to keep the GUI responsive.
 """
 
 import dataclasses
-import json
 import math
 import os
 import pathlib
@@ -38,14 +37,13 @@ import yaml
 from datetime import datetime
 from enum import Enum
 from threading import Thread
-from typing import Optional, Tuple, Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from control import utils, utils_acquisition
 import control._def
-from control.models.acquisition_metadata import AcquisitionMetadata
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
 from control.core.scan_coordinates import ScanCoordinates
@@ -98,7 +96,7 @@ def _serialize_for_yaml(obj):
         return obj
 
 
-def _save_acquisition_yaml(
+def _save_unified_multipoint_acquisition_yaml(
     params: "AcquisitionParameters",
     experiment_path: str,
     region_shapes: dict = None,
@@ -107,19 +105,20 @@ def _save_acquisition_yaml(
     wellplate_format: str = None,
     scan_size_mm: float = 0.0,
     overlap_percent: float = 10.0,
+    *,
+    repo: Any,
+    live_controller: "LiveController",
+    camera: Any,
+    objective_store: "ObjectiveStore",
+    recording_start_time: float,
+    selected_configurations: list,
+    selected_observation_state_names: list,
+    use_manual_focus_map: bool,
+    logger: Any,
 ) -> None:
-    """Save acquisition parameters to YAML file.
+    """Write a single ``acquisition.yaml`` (schema v2): layout + manifest + used observation presets."""
+    from control.core.acquisition_metadata_helpers import augment_multipoint_acquisition_yaml_dict
 
-    Args:
-        params: AcquisitionParameters dataclass
-        experiment_path: Path to experiment folder
-        region_shapes: Optional dict of {region_id: shape} from ScanCoordinates
-        widget_type: "wellplate" or "flexible"
-        objective_info: Dict with objective name, magnification, pixel_size_um
-        wellplate_format: String like "384 well plate" or None
-        scan_size_mm: Scan size in mm (for wellplate mode)
-        overlap_percent: FOV overlap percentage
-    """
     # Build common sections
     yaml_dict = {
         "acquisition": {
@@ -128,6 +127,7 @@ def _save_acquisition_yaml(
             "widget_type": widget_type,
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
+            "use_manual_focus_map": use_manual_focus_map,
         },
         "objective": objective_info or {},
         "sample": {
@@ -148,7 +148,11 @@ def _save_acquisition_yaml(
             "contrast_af": params.do_autofocus,
             "laser_af": params.do_reflection_autofocus,
         },
-        "channels": [_serialize_for_yaml(ch) for ch in params.selected_configurations],
+        "channels": (
+            {"observation_state_names": list(params.selected_observation_state_names)}
+            if params.selected_observation_state_names
+            else [_serialize_for_yaml(ch) for ch in params.selected_configurations]
+        ),
     }
 
     # Add widget-specific scan section
@@ -156,6 +160,10 @@ def _save_acquisition_yaml(
         yaml_dict["wellplate_scan"] = {
             "scan_size_mm": scan_size_mm,
             "overlap_percent": overlap_percent,
+            "nx": params.NX,
+            "ny": params.NY,
+            "delta_x_mm": params.deltaX,
+            "delta_y_mm": params.deltaY,
             "regions": [
                 {
                     "name": name,
@@ -204,11 +212,28 @@ def _save_acquisition_yaml(
         "enabled": params.use_fluidics,
     }
 
+    unified = augment_multipoint_acquisition_yaml_dict(
+        yaml_dict,
+        experiment_id=params.experiment_ID or "",
+        recording_start_time=recording_start_time,
+        repo=repo,
+        objective_store=objective_store,
+        live_controller=live_controller,
+        camera=camera,
+        selected_configurations=list(selected_configurations),
+        obs_names=list(selected_observation_state_names or []),
+        logger=logger,
+    )
+
     yaml_path = os.path.join(experiment_path, "acquisition.yaml")
     try:
         with open(yaml_path, "w", encoding="utf-8") as f:
-            f.write(f"# Acquisition Parameters - {params.experiment_ID}\n\n")
-            yaml.dump(yaml_dict, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+            f.write(
+                f"# Unified multipoint acquisition record (schema_version=2, experiment_id={params.experiment_ID}).\n"
+                f"# Layout, instrument manifest, and observation_states_used (selected presets only).\n"
+                f"# Per-frame wall-clock acquisition times: <timepoint>/frame_acquisition_times.csv (UTC + unix).\n\n"
+            )
+            yaml.dump(unified, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     except (OSError, yaml.YAMLError) as exc:
         _log = squid.logging.get_logger(__name__)
         _log.error("Failed to write acquisition YAML file '%s': %s", yaml_path, exc)
@@ -301,7 +326,10 @@ class MultiPointController:
         self.focus_map_storage = []
         self.already_using_fmap = False
         self.selected_configurations = []
+        self.selected_observation_state_names = []
         self.scanCoordinates = scan_coordinates
+        self._log.info(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}")
+        self._log.info(f"Scan coordinates format: {self.scanCoordinates.format}")
         
         # Display settings
         self.old_images_per_page = 1
@@ -509,96 +537,25 @@ class MultiPointController:
         # generate unique experiment ID
         self.experiment_ID = experiment_ID.replace(" ", "_") + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")
         self.recording_start_time = time.time()
-        # create a new folder
+        # create a new folder (unified acquisition.yaml is written when the run starts in run_acquisition)
         experiment_dir = os.path.join(self.base_path, self.experiment_ID)
         utils.ensure_directory_exists(experiment_dir)
-        # Save acquisition configuration via ConfigRepository
-        self.liveController.microscope.config_repo.save_acquisition_output(
-            output_dir=experiment_dir,
-            objective=self.objectiveStore.current_objective,
-            channels=self.selected_configurations,
-            confocal_mode=self.liveController.is_confocal_mode(),
-        )  # save the configuration for the experiment
-        # Prepare acquisition parameters
-        acquisition_parameters = {
-            "dx(mm)": self.deltaX,
-            "Nx": self.NX,
-            "dy(mm)": self.deltaY,
-            "Ny": self.NY,
-            "dz(um)": self.deltaZ * 1000 if self.deltaZ != 0 else 1,
-            "Nz": self.NZ,
-            "dt(s)": self.deltat,
-            "Nt": self.Nt,
-            "with AF": self.do_autofocus,
-            "with laser AF": self.do_reflection_af,
-            "with manual focus map": self.use_manual_focus_map,
-        }
-        try:  # write objective data if it is available
-            current_objective = self.objectiveStore.current_objective
-            objective_info = self.objectiveStore.objectives_dict.get(current_objective, {})
-            acquisition_parameters["objective"] = {}
-            for k in objective_info.keys():
-                acquisition_parameters["objective"][k] = objective_info[k]
-            acquisition_parameters["objective"]["name"] = current_objective
-        except (AttributeError, KeyError) as e:
-            self._log.debug(f"Could not get objective from objectiveStore: {e}, trying defaults")
-            try:
-                objective_info = control._def.OBJECTIVES[control._def.DEFAULT_OBJECTIVE]
-                acquisition_parameters["objective"] = {}
-                for k in objective_info.keys():
-                    acquisition_parameters["objective"][k] = objective_info[k]
-                acquisition_parameters["objective"]["name"] = control._def.DEFAULT_OBJECTIVE
-            except (AttributeError, KeyError) as e:
-                self._log.debug(f"Could not get default objective info: {e}")
-        # TODO: USE OBJECTIVE STORE DATA
-        acquisition_parameters["sensor_pixel_size_um"] = self.camera.get_pixel_size_binned_um()
-        acquisition_parameters["tube_lens_mm"] = control._def.TUBE_LENS_MM
-        acquisition_parameters["confocal_mode"] = self.liveController.is_confocal_mode()
-
-        obj_block = acquisition_parameters.get("objective")
-        if isinstance(obj_block, dict):
-            objective_name = obj_block.get("name", self.objectiveStore.current_objective)
-            objective_details = dict(obj_block)
-        else:
-            objective_name = self.objectiveStore.current_objective
-            objective_details = {}
-        scan_parameters = {k: v for k, v in acquisition_parameters.items() if k != "objective"}
-        try:
-            trigger_mode = str(self.liveController.get_trigger_mode())
-        except Exception:
-            trigger_mode = None
-        selected_names = [c.name for c in self.selected_configurations]
-        from control.core.observation_state_service import observation_state_binning_mode_for_metadata
-
-        bx, by, cm = observation_state_binning_mode_for_metadata(None, self.camera)
-        acquisition_metadata = AcquisitionMetadata(
-            experiment_id=self.experiment_ID,
-            recording_start_time=self.recording_start_time,
-            objective=objective_name,
-            objective_details=objective_details,
-            confocal_mode=self.liveController.is_confocal_mode(),
-            sensor_pixel_size_um=acquisition_parameters.get("sensor_pixel_size_um"),
-            tube_lens_mm=acquisition_parameters.get("tube_lens_mm"),
-            trigger_mode=trigger_mode,
-            binning_x=bx,
-            binning_y=by,
-            camera_mode=cm,
-            selected_channel_names=selected_names,
-            scan_parameters=scan_parameters,
-        )
-        self.liveController.microscope.config_repo.save_acquisition_metadata(
-            experiment_dir,
-            acquisition_metadata,
-        )
-
-        f = open(os.path.join(self.base_path, self.experiment_ID) + "/acquisition parameters.json", "w")
-        f.write(json.dumps(acquisition_parameters))
-        f.close()
 
     def set_selected_configurations(self, selected_configurations_name):
+        repo = self.liveController.microscope.config_repo
+        preset_set = set(repo.list_observation_presets())
         self.selected_configurations = []
-        for configuration_name in selected_configurations_name:
-            config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, configuration_name)
+        self.selected_observation_state_names = []
+        names = list(selected_configurations_name)
+        if not names:
+            return
+        if all(n in preset_set for n in names):
+            self.selected_observation_state_names = names
+            return
+        for configuration_name in names:
+            config = self.liveController.get_channel_by_name(
+                self.objectiveStore.current_objective, configuration_name
+            )
             if config:
                 self.selected_configurations.append(config)
 
@@ -623,7 +580,12 @@ class MultiPointController:
             ]
             all_regions_coord_count = sum(coords_per_region)
 
-            non_merged_images = self.Nt * self.NZ * all_regions_coord_count * len(self.selected_configurations)
+            n_ch = (
+                len(self.selected_observation_state_names)
+                if self.selected_observation_state_names
+                else len(self.selected_configurations)
+            )
+            non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
             # When capturing merged images, we capture 1 per fov (where all the configurations are merged)
             merged_images = self.Nt * self.NZ * all_regions_coord_count if control._def.MERGE_CHANNELS else 0
 
@@ -768,7 +730,11 @@ class MultiPointController:
         except Exception:
             # If color information isn't available, fall back to the monochrome assumption.
             pass
-        num_channels = len(self.selected_configurations)
+        num_channels = (
+            len(self.selected_observation_state_names)
+            if self.selected_observation_state_names
+            else len(self.selected_configurations)
+        )
         if num_channels == 0:
             # No channels selected; this is likely an invalid acquisition state.
             # Log a warning (similar to disk storage estimation) and return 0 as a sentinel.
@@ -974,6 +940,8 @@ class MultiPointController:
                 "camera_binning": list(self.camera.get_binning()) if hasattr(self.camera, "get_binning") else None,
                 "sensor_pixel_size_um": self.camera.get_pixel_size_binned_um(),
             }
+            if "tube_lens_f_mm" in objective_dict:
+                objective_info["tube_lens_f_mm"] = objective_dict["tube_lens_f_mm"]
 
             # Get wellplate format if available
             wellplate_format = getattr(self.scanCoordinates, "format", None)
@@ -981,7 +949,7 @@ class MultiPointController:
             # Save acquisition parameters to YAML
             experiment_path = os.path.join(self.base_path, self.experiment_ID)
             region_shapes = getattr(self.scanCoordinates, "region_shapes", None)
-            _save_acquisition_yaml(
+            _save_unified_multipoint_acquisition_yaml(
                 acquisition_params,
                 experiment_path,
                 region_shapes,
@@ -990,6 +958,15 @@ class MultiPointController:
                 wellplate_format,
                 self.scan_size_mm,
                 self.overlap_percent,
+                repo=self.liveController.microscope.config_repo,
+                live_controller=self.liveController,
+                camera=self.camera,
+                objective_store=self.objectiveStore,
+                recording_start_time=self.recording_start_time,
+                selected_configurations=self.selected_configurations,
+                selected_observation_state_names=self.selected_observation_state_names,
+                use_manual_focus_map=self.use_manual_focus_map,
+                logger=self._log,
             )
 
             # Get pre-warmed job runner and its shared backpressure values
@@ -1055,7 +1032,6 @@ class MultiPointController:
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
             base_path=self.base_path,
-            selected_configurations=self.selected_configurations,
             acquisition_start_time=self.timestamp_acquisition_started,
             scan_position_information=scan_position_information,
             NX=self.NX,
@@ -1084,6 +1060,8 @@ class MultiPointController:
             plate_num_rows=plate_num_rows,
             plate_num_cols=plate_num_cols,
             xy_mode=self.xy_mode,
+            selected_configurations=self.selected_configurations,
+            selected_observation_state_names=self.selected_observation_state_names,
         )
 
     def _on_acquisition_completed(self):

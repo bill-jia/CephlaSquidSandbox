@@ -1,5 +1,4 @@
 from lxml import etree as ET
-import json
 import sys
 import os
 import re
@@ -58,11 +57,10 @@ def get_dimensions_for_dataset(
         'FOV_shape': int 2-tuple that is the shape of a single channel's FOV,
         'FOV_dtype': numpy dtype representing a single FOV image's dtype
     }"""
-    acq_param_path = os.path.join(dataset_folder_path, "acquisition parameters.json")
     config_xml_path = os.path.join(dataset_folder_path, "configurations.xml")
-    acq_params = None
-    with open(acq_param_path, "r") as file:
-        acq_params = json.load(file)
+    from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
+    acq_params = load_legacy_acquisition_parameters_flat(dataset_folder_path)
     Nt = int(acq_params.get("Nt"))
     if Nt_override is not None:
         if Nt_override < Nt:

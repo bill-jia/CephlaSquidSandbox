@@ -1,10 +1,16 @@
-import json
 import os
 from glob import glob
 from lxml import etree as ET
 import cv2
 from stitcher import stitch_slide, compute_overlap_percent
 import sys
+
+from control.core.acquisition_metadata_helpers import load_legacy_acquisition_parameters_flat
+
+
+def _load_slide_parameters(slide_path):
+    """Legacy JSON or unified ``acquisition.yaml`` (schema v2)."""
+    return load_legacy_acquisition_parameters_flat(slide_path)
 
 
 def get_pixel_size(
@@ -14,10 +20,7 @@ def get_pixel_size(
     default_objective_tube_lens_mm=180.0,
     default_magnification=20.0,
 ):
-    parameter_path = os.path.join(slide_path, "acquisition parameters.json")
-    parameters = {}
-    with open(parameter_path, "r") as f:
-        parameters = json.load(f)
+    parameters = _load_slide_parameters(slide_path)
     try:
         tube_lens_mm = float(parameters["tube_lens_mm"])
     except KeyError:
@@ -49,10 +52,7 @@ def get_overlap(slide_path, **kwargs):
 
     pixel_size_xy = get_pixel_size(slide_path, **kwargs)
 
-    parameter_path = os.path.join(slide_path, "acquisition parameters.json")
-    parameters = {}
-    with open(parameter_path, "r") as f:
-        parameters = json.load(f)
+    parameters = _load_slide_parameters(slide_path)
 
     dx = float(parameters["dx(mm)"]) * 1000.0
     dy = float(parameters["dy(mm)"]) * 1000.0
@@ -64,10 +64,7 @@ def get_overlap(slide_path, **kwargs):
 
 def get_time_indices(slide_path):
 
-    parameter_path = os.path.join(slide_path, "acquisition parameters.json")
-    parameters = {}
-    with open(parameter_path, "r") as f:
-        parameters = json.load(f)
+    parameters = _load_slide_parameters(slide_path)
 
     time_indices = list(range(int(parameters["Nt"])))
     return time_indices
@@ -83,10 +80,7 @@ def get_channels(slide_path):
 
 
 def get_z_indices(slide_path):
-    parameter_path = os.path.join(slide_path, "acquisition parameters.json")
-    parameters = {}
-    with open(parameter_path, "r") as f:
-        parameters = json.load(f)
+    parameters = _load_slide_parameters(slide_path)
 
     z_indices = list(range(int(parameters["Nz"])))
     return z_indices
@@ -147,7 +141,7 @@ def print_usage():
     --objective-tube-lens : Your objective's tube lens focal length in mm
     --magnification : Your objective's listed magnification
 
-    The script will first try to read this parameters from acquisition parameters.json, but will default to your provided values if it can't.
+    The script reads acquisition parameters from acquisition.yaml (or legacy acquisition parameters.json) when present, otherwise uses your provided defaults.
     """
 
     print(usage_str)

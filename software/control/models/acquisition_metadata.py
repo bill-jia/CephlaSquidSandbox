@@ -16,7 +16,7 @@ class AcquisitionMetadata(BaseModel):
     """
     Canonical manifest for an acquisition experiment folder.
 
-    Supplements acquisition_channels.yaml and legacy acquisition parameters.json.
+    Written next to outputs; multipoint runs may embed a compact slice under ``acquisition.yaml`` instead.
     """
 
     version: Union[int, float] = Field(1, description="Acquisition Metadata schema version")
@@ -36,7 +36,11 @@ class AcquisitionMetadata(BaseModel):
     camera_mode: Optional[str] = Field(None, description="Camera acquisition mode string")
     selected_channel_names: List[str] = Field(
         default_factory=list,
-        description="Acquisition channel names selected for this run",
+        description="Acquisition channel names selected for this run (live/profile channel names)",
+    )
+    selected_observation_state_names: List[str] = Field(
+        default_factory=list,
+        description="When multipoint uses Observation State presets, the selected preset names (profile observation_presets/)",
     )
     scan_parameters: Dict[str, Any] = Field(
         default_factory=dict,

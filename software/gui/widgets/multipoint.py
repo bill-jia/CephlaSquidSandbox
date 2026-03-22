@@ -9,6 +9,12 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 
+
+def _multipoint_observation_preset_display_names(microscope) -> list:
+    """Sorted preset names for multipoint acquisition (same source as Observation State combo)."""
+    return sorted(microscope.config_repo.list_observation_presets())
+
+
 class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
@@ -201,10 +207,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_Nt.setFixedWidth(max_num_width)
 
         self.list_configurations = QListWidget()
-        for microscope_configuration in self.multipointController.liveController.get_channels(
-            self.objectiveStore.current_objective
-        ):
-            self.list_configurations.addItems([microscope_configuration.name])
+        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(preset_name)
+        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
         self.list_configurations.setSelectionMode(
             QAbstractItemView.MultiSelection
         )  # ref: https://doc.qt.io/qt-5/qabstractitemview.html#SelectionMode-enum
@@ -765,15 +770,15 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
-        """Refresh the channel list after configuration changes."""
+        """Refresh the observation preset list after profile or preset changes."""
         # Remember currently selected channels
         selected_names = [item.text() for item in self.list_configurations.selectedItems()]
 
         # Clear and repopulate
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
-        for config in self.multipointController.liveController.get_channels(self.objectiveStore.current_objective):
-            self.list_configurations.addItem(config.name)
+        for name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(name)
 
         # Restore selection where possible
         for i in range(self.list_configurations.count()):
@@ -790,7 +795,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             return
         if not self.list_configurations.selectedItems():  # no channel selected
             self.btn_startAcquisition.setChecked(False)
-            error_dialog("Please select at least one imaging channel first")
+            error_dialog("Please select at least one observation state first")
             return
         if pressed:
             if self.multipointController.acquisition_in_progress():
@@ -1257,7 +1262,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     def on_snap_images(self):
         if not self.list_configurations.selectedItems():
-            QMessageBox.warning(self, "Warning", "Please select at least one imaging channel")
+            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
 
         # Set the selected channels for acquisition
@@ -1702,8 +1707,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.list_configurations = QListWidget()
-        for microscope_configuration in self.liveController.get_channels(self.objectiveStore.current_objective):
-            self.list_configurations.addItems([microscope_configuration.name])
+        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(preset_name)
+        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
         self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
 
         # Add a combo box for shape selection
@@ -2117,7 +2123,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
                 "nz": self.entry_NZ.value(),
-                "selected_channels": [item.text() for item in self.list_configurations.selectedItems()],
+                "selected_observation_states": [item.text() for item in self.list_configurations.selectedItems()],
                 "contrast_af": self.checkbox_withAutofocus.isChecked(),
                 "laser_af": (
                     self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
@@ -2189,8 +2195,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
             self.entry_NZ.setValue(settings.get("nz", 1))
 
-            # Restore selected channels
-            selected_channels = settings.get("selected_channels", [])
+            # Restore selected observation states (legacy key: selected_channels)
+            selected_channels = settings.get("selected_observation_states") or settings.get("selected_channels", [])
             if selected_channels:
                 self.list_configurations.clearSelection()
                 for i in range(self.list_configurations.count()):
@@ -3148,7 +3154,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         if not self.list_configurations.selectedItems():
             self.btn_startAcquisition.setChecked(False)
-            QMessageBox.warning(self, "Warning", "Please select at least one imaging channel")
+            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
 
         if pressed:
@@ -3343,7 +3349,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     def on_snap_images(self):
         if not self.list_configurations.selectedItems():
-            QMessageBox.warning(self, "Warning", "Please select at least one imaging channel")
+            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
 
         # Set the selected channels for acquisition
@@ -3380,15 +3386,15 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
-        """Refresh the channel list after configuration changes."""
+        """Refresh the observation preset list after profile or preset changes."""
         # Remember currently selected channels
         selected_names = [item.text() for item in self.list_configurations.selectedItems()]
 
         # Clear and repopulate
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
-        for config in self.liveController.get_channels(self.objectiveStore.current_objective):
-            self.list_configurations.addItem(config.name)
+        for name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(name)
 
         # Restore selection where possible
         for i in range(self.list_configurations.count()):
@@ -3801,12 +3807,11 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.entry_NZ.setSingleStep(1)
         self.entry_NZ.setValue(1)
 
-        # Channel configurations
+        # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = QListWidget()
-        for microscope_configuration in self.multipointController.liveController.get_channels(
-            self.objectiveStore.current_objective
-        ):
-            self.list_configurations.addItems([microscope_configuration.name])
+        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(preset_name)
+        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
         self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
 
         # Laser AF checkbox
@@ -3951,7 +3956,7 @@ class MultiPointWithFluidicsWidget(QFrame):
 
             if not self.list_configurations.selectedItems():
                 self.btn_startAcquisition.setChecked(False)
-                QMessageBox.warning(self, "Warning", "Please select at least one imaging channel")
+                QMessageBox.warning(self, "Warning", "Please select at least one observation state")
                 return
 
             if self.multipointController.acquisition_in_progress():
@@ -4055,6 +4060,19 @@ class MultiPointWithFluidicsWidget(QFrame):
         """Emit signal with list of selected channel names"""
         selected_channels = [item.text() for item in self.list_configurations.selectedItems()]
         self.signal_acquisition_channels.emit(selected_channels)
+
+    def refresh_channel_list(self):
+        """Refresh the observation preset list after profile or preset changes."""
+        selected_names = [item.text() for item in self.list_configurations.selectedItems()]
+        self.list_configurations.blockSignals(True)
+        self.list_configurations.clear()
+        for name in _multipoint_observation_preset_display_names(self.microscope):
+            self.list_configurations.addItem(name)
+        for i in range(self.list_configurations.count()):
+            item = self.list_configurations.item(i)
+            if item.text() in selected_names:
+                item.setSelected(True)
+        self.list_configurations.blockSignals(False)
 
     def acquisition_is_finished(self):
         """Handle acquisition completion"""

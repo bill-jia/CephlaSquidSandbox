@@ -2196,7 +2196,9 @@ class FastAcquisitionWidget(QWidget):
                 buffer_size=self.buffer_size_spinbox.value(),
                 file_format=file_format_map[self.file_format_combo.currentText()],
                 trigger_dio_line=self.trigger_dio_line_spinbox.value(),
-                camera_frame_dio_line=self.camera_dio_line_spinbox.value()
+                camera_frame_dio_line=self.camera_dio_line_spinbox.value(),
+                microscope=self.microscope,
+                live_controller=self.live_controller,
             )
             
             # Set completion callback to handle acquisition completion

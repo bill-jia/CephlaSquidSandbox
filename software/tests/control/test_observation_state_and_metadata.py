@@ -12,6 +12,7 @@ from control.core.observation_state_service import (
     project_merged_channels_for_observation_preset,
     sanitize_preset_filename,
 )
+from control.core.acquisition_metadata_helpers import legacy_flat_multipoint_from_acquisition_yaml_dict
 from control.models import AcquisitionChannel, CameraSettings, GeneralChannelConfig, IlluminationSettings
 from control.models.acquisition_metadata import AcquisitionMetadata
 from control.models.observation_state import CameraLiveSnapshot, ObservationState
@@ -129,6 +130,39 @@ def test_project_merged_strips_confocal_override():
     assert out[0].confocal_override is None
 
 
+def test_apply_observation_state_persist_false_skips_save_general():
+    """Transient apply during multipoint must not write general.yaml."""
+    from control.core.observation_state_service import apply_observation_state
+
+    ch = _minimal_channel()
+    state = ObservationState(channels=[ch], channel_groups=[])
+
+    repo = MagicMock()
+    repo.current_profile = "p1"
+    repo.get_general_config.return_value = None
+
+    lc = MagicMock()
+    lc.is_confocal_mode.return_value = state.confocal_mode
+    lc.get_channels.return_value = [ch]
+    lc.microscope = MagicMock(illumination_controller=None)
+    lc.camera = MagicMock()
+
+    objective_store = MagicMock()
+    objective_store.current_objective = "20x"
+
+    apply_observation_state(
+        state,
+        repo,
+        lc,
+        objective_store,
+        emission_filter_wheel=None,
+        persist_general_to_profile=False,
+    )
+
+    repo.save_general_config.assert_not_called()
+    lc.set_microscope_mode.assert_called()
+
+
 def test_apply_observation_state_skips_general_yaml_when_unchanged():
     """Re-loading the same channel content should not rewrite general.yaml (disk + cache)."""
     from control.core.observation_state_service import apply_observation_state
@@ -234,6 +268,64 @@ def test_save_acquisition_metadata(tmp_path: Path):
     assert data["experiment_id"] == "exp_001"
     assert data["binning_x"] == 2
     assert data["camera_mode"] == "Rolling"
+
+
+def test_append_frame_acquisition_times_csv(tmp_path: Path):
+    from control.core.job_processing import CaptureInfo, append_frame_acquisition_time_csv
+
+    cfg = MagicMock()
+    cfg.name = "BF"
+    pos = MagicMock()
+    pos.x_mm = 1.0
+    pos.y_mm = 2.0
+    pos.z_mm = 3.0
+    info = CaptureInfo(
+        position=pos,
+        z_index=0,
+        capture_time=1_700_000_000.25,
+        configuration=cfg,
+        save_directory=str(tmp_path),
+        file_id="0_0_0",
+        region_id=0,
+        fov=0,
+        configuration_idx=0,
+        time_point=0,
+    )
+    append_frame_acquisition_time_csv(info, "0_0_0_BF.tiff")
+    out = tmp_path / "frame_acquisition_times.csv"
+    assert out.exists()
+    text = out.read_text(encoding="utf-8")
+    assert "unix_time_s" in text
+    assert "1700000000.250000" in text
+    assert "utc_iso" in text
+
+
+def test_legacy_flat_from_unified_yaml_matches_grid_and_objective():
+    data = {
+        "schema_version": 2,
+        "acquisition": {"use_manual_focus_map": True},
+        "objective": {
+            "name": "20x",
+            "magnification": 20.0,
+            "sensor_pixel_size_um": 6.5,
+            "tube_lens_f_mm": 180.0,
+        },
+        "z_stack": {"nz": 3, "delta_z_mm": 0.002},
+        "time_series": {"nt": 2, "delta_t_s": 30.0},
+        "autofocus": {"contrast_af": True, "laser_af": False},
+        "flexible_scan": {"nx": 2, "ny": 3, "delta_x_mm": 0.5, "delta_y_mm": 0.6},
+        "channels": {"observation_state_names": ["p1"]},
+        "manifest": {"confocal_mode": False, "tube_lens_mm": 50.0},
+    }
+    flat = legacy_flat_multipoint_from_acquisition_yaml_dict(data)
+    assert flat["dx(mm)"] == 0.5
+    assert flat["dy(mm)"] == 0.6
+    assert flat["Nx"] == 2
+    assert flat["Ny"] == 3
+    assert flat["dz(um)"] == 2.0
+    assert flat["objective"]["magnification"] == 20.0
+    assert flat["tube_lens_mm"] == 50.0
+    assert flat["observation_state_names"] == ["p1"]
 
 
 def test_save_acquisition_metadata_custom_filename(tmp_path: Path):

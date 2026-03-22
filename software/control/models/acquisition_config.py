@@ -478,7 +478,14 @@ class AcquisitionOutputConfig(BaseModel):
     version: Union[int, float] = Field(1, description="Configuration format version")
     objective: str = Field(..., description="Objective used for acquisition")
     confocal_mode: bool = Field(False, description="Whether confocal mode was active")
-    channels: List[AcquisitionChannel] = Field(default_factory=list, description="List of acquisition channels used")
+    channels: List[AcquisitionChannel] = Field(
+        default_factory=list,
+        description="Acquisition channels when applicable; empty when only observation_state_names is used",
+    )
+    observation_state_names: Optional[List[str]] = Field(
+        None,
+        description="When multipoint uses Observation State presets, names of selected presets",
+    )
 
     model_config = {"extra": "forbid"}
 

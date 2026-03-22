@@ -76,7 +76,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
     obj = data.get("objective", {})
     z_stack = data.get("z_stack", {})
     time_series = data.get("time_series", {})
-    channels = data.get("channels", [])
+    channels_raw = data.get("channels", [])
     autofocus = data.get("autofocus", {})
     wellplate_scan = data.get("wellplate_scan", {})
     flexible_scan = data.get("flexible_scan", {})
@@ -124,8 +124,12 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         # Time series
         nt=time_series.get("nt", 1),
         delta_t_s=time_series.get("delta_t_s", 0.0),
-        # Channels
-        channel_names=[ch.get("name") for ch in channels if ch.get("name")],
+        # Channels (legacy list of dicts, or preset-centric dict)
+        channel_names=(
+            list(channels_raw.get("observation_state_names") or [])
+            if isinstance(channels_raw, dict)
+            else [ch.get("name") for ch in channels_raw if isinstance(ch, dict) and ch.get("name")]
+        ),
         # Autofocus
         contrast_af=autofocus.get("contrast_af", False),
         laser_af=autofocus.get("laser_af", False),

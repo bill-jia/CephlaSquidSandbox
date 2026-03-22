@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Callable, Union, TYPE_CHECKING
 
 from control._def import ZProjectionMode, DownsamplingMethod
@@ -30,7 +30,6 @@ class ScanPositionInformation:
 class AcquisitionParameters:
     experiment_ID: Optional[str]
     base_path: Optional[str]
-    selected_configurations: List[AcquisitionChannel]
     acquisition_start_time: float
     scan_position_information: ScanPositionInformation
 
@@ -69,6 +68,10 @@ class AcquisitionParameters:
 
     # XY mode for determining scan type
     xy_mode: str = "Current Position"  # "Current Position", "Select Wells", "Manual", "Load Coordinates"
+    # Legacy multipoint: profile channel rows. Empty when using observation presets below.
+    selected_configurations: List[AcquisitionChannel] = field(default_factory=list)
+    # Observation State preset names (profile observation_presets/); exclusive with legacy channel list.
+    selected_observation_state_names: List[str] = field(default_factory=list)
 
 
 @dataclass
