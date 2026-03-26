@@ -63,6 +63,7 @@ import gui.widgets as widgets
 import pyqtgraph.dockarea as dock
 import squid.abc
 import squid.camera.settings_cache
+import control.illumination_settings_cache
 import squid.camera.utils
 import squid.config
 import squid.logging
@@ -676,6 +677,27 @@ class HighContentScreeningGui(QMainWindow):
 
         self.setupRecordTabWidget()
         self.setupCameraTabWidget()
+        self._restore_cached_illumination_settings()
+
+    def _restore_cached_illumination_settings(self) -> None:
+        """Restore cached illumination intensities and logical on/off; hardware stays dark until live."""
+        cached = control.illumination_settings_cache.load_illumination_settings()
+        if not cached:
+            return
+        ic = getattr(self.microscope, "illumination_controller", None)
+        if ic is None:
+            return
+        try:
+            ic.restore(cached.snapshot, force_hardware=False)
+            if cached.led_matrix_mode and getattr(ic, "set_led_matrix_mode", None):
+                ic.set_led_matrix_mode(cached.led_matrix_mode)
+        except Exception as e:
+            self.log.warning("Could not restore cached illumination settings: %s", e)
+        if getattr(self, "illuminationWidget", None) is not None:
+            try:
+                self.illuminationWidget._refresh_from_state()
+            except Exception as e:
+                self.log.warning("Could not refresh illumination widget after cache restore: %s", e)
 
     def _restore_cached_camera_settings(self) -> None:
         """Restore cached camera settings from disk and update UI widgets.
@@ -2446,6 +2468,14 @@ class HighContentScreeningGui(QMainWindow):
                 raise
 
         try:
+            control.illumination_settings_cache.save_illumination_settings(self.microscope.illumination_controller)
+        except Exception:
+            if for_restart:
+                self.log.exception(f"Error saving illumination settings during {context}")
+            else:
+                raise
+
+        try:
             self._disconnect_warning_handler()
         except Exception:
             if for_restart:
@@ -2522,6 +2552,16 @@ class HighContentScreeningGui(QMainWindow):
         except Exception:
             if for_restart:
                 self.log.exception(f"Error closing camera during {context}")
+            else:
+                raise
+
+        try:
+            _ic = getattr(self.microscope, "illumination_controller", None)
+            if _ic is not None:
+                _ic.turn_off_all()
+        except Exception:
+            if for_restart:
+                self.log.exception(f"Error turning off illumination during {context}")
             else:
                 raise
 

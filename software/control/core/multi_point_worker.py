@@ -112,6 +112,9 @@ class MultiPointWorker:
         self.objectiveStore: ObjectiveStore = objective_store
         self.fluidics = scope.addons.fluidics
         self.use_fluidics = acquisition_parameters.use_fluidics
+        self.keep_illuminators_on_between_captures = (
+            acquisition_parameters.keep_illuminators_on_between_captures
+        )
 
         self.callbacks: MultiPointControllerFunctions = callbacks
         self.abort_requested_fn: Callable[[], bool] = abort_requested_fn
@@ -207,6 +210,7 @@ class MultiPointWorker:
         self._image_callback_idle.set()
         # This is protected by the threading event above (aka set after clear, take copy before set)
         self._current_capture_info: Optional[CaptureInfo] = None
+        self._last_illumination_config_name: Optional[str] = None
         # This is only touched via the image callback path.  Don't touch it outside of there!
         self._current_round_images = {}
 
@@ -501,6 +505,7 @@ class MultiPointWorker:
 
     def run(self):
         this_image_callback_id = None
+        self._last_illumination_config_name = None
         try:
             start_time = time.perf_counter_ns()
             self.camera.start_streaming()
@@ -1559,6 +1564,16 @@ class MultiPointWorker:
         *,
         filename_channel_label: Optional[str] = None,
     ):
+        # When keeping illuminators on between captures, turn off the previous channel
+        # before switching currentConfiguration (software trigger only).
+        if (
+            self.liveController.trigger_mode == TriggerMode.SOFTWARE
+            and self.keep_illuminators_on_between_captures
+            and self._last_illumination_config_name is not None
+            and self._last_illumination_config_name != config.name
+        ):
+            self.liveController.turn_off_illumination()
+
         self._select_config(config)
 
         # trigger acquisition (including turning on the illumination) and read frame
@@ -1644,7 +1659,9 @@ class MultiPointWorker:
 
         # turn off the illumination if using software trigger
         if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-            self.liveController.turn_off_illumination()
+            if not self.keep_illuminators_on_between_captures:
+                self.liveController.turn_off_illumination()
+        self._last_illumination_config_name = config.name
 
     def _sleep(self, sec):
         time_to_sleep = max(sec, 1e-6)
@@ -1658,6 +1675,14 @@ class MultiPointWorker:
 
         for config_ in self.liveController.get_channels(self.objectiveStore.current_objective):
             if config_.name in rgb_channels:
+                if (
+                    self.liveController.trigger_mode == TriggerMode.SOFTWARE
+                    and self.keep_illuminators_on_between_captures
+                    and self._last_illumination_config_name is not None
+                    and self._last_illumination_config_name != config_.name
+                ):
+                    self.liveController.turn_off_illumination()
+
                 self._select_config(config_)
 
                 # trigger acquisition (including turning on the illumination)
@@ -1676,7 +1701,9 @@ class MultiPointWorker:
                 # TODO(imo): use illum controller
                 # turn off the illumination if using software trigger
                 if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-                    self.liveController.turn_off_illumination()
+                    if not self.keep_illuminators_on_between_captures:
+                        self.liveController.turn_off_illumination()
+                self._last_illumination_config_name = config_.name
 
                 # add the image to dictionary
                 images[config_.name] = np.copy(image)

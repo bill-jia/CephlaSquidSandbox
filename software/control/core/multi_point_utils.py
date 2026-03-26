@@ -55,6 +55,8 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # Software trigger: if True, skip turn_off_illumination after each frame until channel changes
+    keep_illuminators_on_between_captures: bool = False
 
     # Downsampled view generation parameters
     generate_downsampled_views: bool = False

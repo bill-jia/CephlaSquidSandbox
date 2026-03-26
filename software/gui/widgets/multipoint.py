@@ -242,6 +242,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
+        self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
+
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
 
@@ -410,6 +413,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setVisible(False)
         grid_af.addWidget(self.checkbox_set_z_range)
         grid_af.addWidget(self.checkbox_skipSaving)
+        grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
         grid_config = QHBoxLayout()
         grid_config.addWidget(self.list_configurations)
@@ -482,6 +486,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
+            self.multipointController.set_keep_illuminators_on_between_captures
+        )
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
@@ -838,6 +845,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
             self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
+            self.multipointController.set_keep_illuminators_on_between_captures(
+                self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
+            )
             self.multipointController.set_widget_type("flexible")
             self.multipointController.set_selected_configurations(
                 (item.text() for item in self.list_configurations.selectedItems())
@@ -1754,6 +1764,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
+        self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
+
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
@@ -1983,6 +1996,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
         options_layout.addWidget(self.checkbox_skipSaving)
+        options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
         button_layout = QVBoxLayout()
         button_layout.addWidget(self.btn_snap_images)
@@ -2055,6 +2069,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
+            self.multipointController.set_keep_illuminators_on_between_captures
+        )
         self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
@@ -3206,6 +3223,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
             self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
+            self.multipointController.set_keep_illuminators_on_between_captures(
+                self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
+            )
             self.multipointController.set_widget_type("wellplate")
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())

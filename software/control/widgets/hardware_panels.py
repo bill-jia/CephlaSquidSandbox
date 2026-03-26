@@ -413,7 +413,7 @@ class SpinningDiskConfocalWidget(QWidget):
 
         if self.xlight.has_illumination_iris_diaphragm:
             # Slider values are set from acquisition config via update_iris_from_config()
-            # after signal connections are established in gui.gui_hcs
+            # after signal connections are established in control.gui_hcs
             self.slider_illumination_iris.sliderReleased.connect(lambda: self.update_illumination_iris(True))
             # Update spinbox + apply on click-to-position (not during drag)
             self.slider_illumination_iris.valueChanged.connect(self._on_illumination_iris_value_changed)
@@ -1755,10 +1755,6 @@ class LiveControlWidget(QFrame):
         else:
             self.currentConfiguration = channels[0]
 
-        # Keep LiveController.currentConfiguration in sync for contrast/LUT and Observation State
-        # ``active_channel_name`` without calling set_microscope_mode() (manual live defers hardware apply).
-        self.liveController.set_active_channel_reference(self.currentConfiguration)
-
         self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
         # Manual live output is controlled by camera + illumination widgets.
@@ -2039,54 +2035,6 @@ class LiveControlWidget(QFrame):
             self.lineEdit_snapSavingDir.setText(save_dir_base)
             self.snap_saving_path = save_dir_base
 
-    def _save_snap_acquisition_metadata(self, filepath: str) -> None:
-        """Write ``{snap_stem}_acquisition_metadata.yaml`` next to the snap TIFF."""
-        from pathlib import Path
-
-        from control.core.acquisition_metadata_helpers import build_acquisition_metadata
-        from control.core.observation_state_service import collect_emission_filter_positions, collect_observation_state
-
-        path = Path(filepath)
-        stem = path.stem
-        meta_filename = f"{stem}_acquisition_metadata.yaml"
-        repo = self.liveController.microscope.config_repo
-
-        obs_state = None
-        if repo.current_profile:
-            try:
-                wheel = getattr(self.liveController.microscope, "emission_filter_wheel", None)
-                emission = collect_emission_filter_positions(wheel)
-                obs_state = collect_observation_state(
-                    self.liveController,
-                    repo,
-                    self.objectiveStore.current_objective,
-                    emission_filter_positions=emission or None,
-                )
-            except Exception as e:
-                self._log.warning("Snap: could not collect observation state for metadata: %s", e)
-
-        selected_names = []
-        if obs_state and obs_state.active_channel_name:
-            selected_names = [obs_state.active_channel_name]
-        elif self.currentConfiguration is not None:
-            selected_names = [self.currentConfiguration.name]
-
-        try:
-            metadata = build_acquisition_metadata(
-                experiment_id=stem,
-                recording_start_time=time.time(),
-                objective_store=self.objectiveStore,
-                live_controller=self.liveController,
-                camera=self.camera,
-                scan_parameters={"source": "live_snap", "image_file": path.name},
-                observation_state=obs_state,
-                selected_channel_names=selected_names,
-            )
-            out = repo.save_acquisition_metadata(path.parent, metadata, filename=meta_filename)
-            self._log.info("Snap acquisition metadata saved to: %s", out)
-        except Exception as e:
-            self._log.warning("Snap: could not save acquisition metadata: %s", e)
-
     def snap_frame(self):
         """Capture and save the most recent frame from Live View."""
         import imageio
@@ -2136,10 +2084,9 @@ class LiveControlWidget(QFrame):
             
             # Save as TIFF
             imageio.imwrite(filepath, image)
-
+            
             self._log.info(f"Snap frame saved to: {filepath}")
-            self._save_snap_acquisition_metadata(filepath)
-
+            
         except Exception as e:
             self._log.error(f"Error during snap: {e}")
             msg = QMessageBox()
@@ -2176,7 +2123,6 @@ class LiveControlWidget(QFrame):
         # Do not call set_microscope_mode() here, since it would override camera exposure/gain.
         if first_config is not None:
             self.currentConfiguration = first_config
-            self.liveController.set_active_channel_reference(first_config)
             # Keep dropdown current text consistent (even if the widget is hidden in the main layout).
             self.dropdown_modeSelection.blockSignals(True)
             self.dropdown_modeSelection.setCurrentText(first_config.name)
@@ -2196,8 +2142,6 @@ class LiveControlWidget(QFrame):
         try:
             self.is_switching_mode = True
             self.currentConfiguration = config
-            if self.currentConfiguration is not None:
-                self.liveController.set_active_channel_reference(self.currentConfiguration)
             self.dropdown_modeSelection.blockSignals(True)
             self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
             self.dropdown_modeSelection.blockSignals(False)

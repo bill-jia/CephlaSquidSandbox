@@ -446,7 +446,7 @@ class FastAcquisitionController:
                 # in sync with the hardware lines restored above by the NI-DAQ.
                 if self._illumination_controller is not None and self._illumination_snapshot is not None:
                     try:
-                        self._illumination_controller.restore(self._illumination_snapshot)
+                        self._illumination_controller.restore(self._illumination_snapshot, force_hardware=True)
                     except Exception as e:
                         self._log.warning(f"Failed to restore illumination controller state: {e}", exc_info=True)
                     finally:

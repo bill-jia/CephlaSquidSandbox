@@ -128,6 +128,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
             "use_manual_focus_map": use_manual_focus_map,
+            "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
         },
         "objective": objective_info or {},
         "sample": {
@@ -316,6 +317,7 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.keep_illuminators_on_between_captures = False
         self.xy_mode = "Current Position"
         self.widget_type = "wellplate"  # "wellplate" or "flexible"
         self.scan_size_mm = 0.0  # For wellplate mode: size of scan area per region
@@ -520,6 +522,9 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_keep_illuminators_on_between_captures(self, keep_on: bool):
+        self.keep_illuminators_on_between_captures = bool(keep_on)
 
     def set_xy_mode(self, xy_mode):
         self.xy_mode = xy_mode
@@ -1050,6 +1055,7 @@ class MultiPointController:
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving,
+            keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
             # Downsampled view generation parameters
             generate_downsampled_views=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES or control._def.DISPLAY_PLATE_VIEW,
             save_downsampled_well_images=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES,

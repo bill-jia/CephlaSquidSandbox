@@ -891,6 +891,11 @@ class IlluminationController:
                 self._led_matrix_unified = _dev
                 break
 
+        # Live view: when False, channel toggles update logical state only; hardware
+        # follows when set_streaming_active(True). Acquisition paths use force_hardware=True.
+        self._streaming_active: bool = False
+        self._hardware_asserted: Dict[str, bool] = {ch: False for ch in self._channel_map}
+
     # -- Device access -------------------------------------------------------
 
     @property
@@ -1002,8 +1007,51 @@ class IlluminationController:
         dev.set_intensity(channel_name, intensity)
         self._channel_state[channel_name].intensity = intensity
 
-    def turn_on_channel(self, channel_name: str) -> None:
-        """Turn on a named channel."""
+    def set_streaming_active(self, active: bool) -> None:
+        """Gate manual illumination hardware to camera live streaming.
+
+        When *active* is True, logical ``is_on`` channels are asserted on hardware.
+        When False, all hardware outputs are turned off while preserving logical
+        on/off and intensity in :attr:`_channel_state` (UI unchanged).
+        """
+        self._streaming_active = bool(active)
+        if not self._streaming_active:
+            self.turn_off_all_hardware_preserving_state()
+        else:
+            self.apply_logical_state_to_hardware()
+
+    def is_streaming_active(self) -> bool:
+        """True when live view has enabled illumination hardware gating."""
+        return self._streaming_active
+
+    def apply_logical_state_to_hardware(self) -> None:
+        """Assert hardware for every channel that is logically on (requires streaming active)."""
+        if not self._streaming_active:
+            return
+        for name, st in self._channel_state.items():
+            if st.is_on:
+                self.turn_on_channel(name)
+
+    def turn_off_all_hardware_preserving_state(self) -> None:
+        """Turn off every device output without changing logical on/off flags."""
+        for dev in self._devices:
+            try:
+                dev.turn_off_all()
+            except Exception as exc:
+                logger.warning(f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} failed: {exc}")
+        for ch in self._hardware_asserted:
+            self._hardware_asserted[ch] = False
+
+    def turn_on_channel(self, channel_name: str, *, force_hardware: bool = False) -> None:
+        """Turn on a named channel.
+
+        Args:
+            channel_name: Logical channel name (or LED matrix alias).
+            force_hardware: If True, always command hardware (acquisition / legacy).
+                If False, hardware is commanded only when :meth:`set_streaming_active`
+                has enabled streaming (live view).
+        """
+        apply_hw = force_hardware or self._streaming_active
         lm = self._resolve_led_matrix_channel(channel_name)
         if lm is not None:
             unified_name, mode_key = lm
@@ -1011,37 +1059,61 @@ class IlluminationController:
             if isinstance(dev, LEDMatrixIlluminationDevice):
                 if mode_key is not None:
                     dev.set_matrix_mode(mode_key)
-                dev.turn_on(unified_name)
                 self._channel_state[unified_name].is_on = True
+                if apply_hw:
+                    dev.turn_on(unified_name)
+                    self._hardware_asserted[unified_name] = True
             return
 
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
             return
-        dev.turn_on(channel_name)
         self._channel_state[channel_name].is_on = True
+        if apply_hw:
+            dev.turn_on(channel_name)
+            self._hardware_asserted[channel_name] = True
 
-    def turn_off_channel(self, channel_name: str) -> None:
-        """Turn off a named channel."""
+    def turn_off_channel(self, channel_name: str, *, force_hardware: bool = False) -> None:
+        """Turn off a named channel.
+
+        Args:
+            force_hardware: If True, always command hardware. If False, hardware is
+                still turned off when it was previously asserted (e.g. after live view).
+        """
+        apply_hw = force_hardware or self._streaming_active
         lm = self._resolve_led_matrix_channel(channel_name)
         if lm is not None:
             unified_name, _mode_key = lm
             dev = self._channel_map.get(unified_name)
             if isinstance(dev, LEDMatrixIlluminationDevice):
-                dev.turn_off(unified_name)
                 self._channel_state[unified_name].is_on = False
+                hw_was = self._hardware_asserted.get(unified_name, False)
+                if apply_hw or hw_was:
+                    dev.turn_off(unified_name)
+                    self._hardware_asserted[unified_name] = False
             return
 
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"turn_off_channel: unknown channel '{channel_name}'")
             return
-        dev.turn_off(channel_name)
         self._channel_state[channel_name].is_on = False
+        hw_was = self._hardware_asserted.get(channel_name, False)
+        if apply_hw or hw_was:
+            dev.turn_off(channel_name)
+            self._hardware_asserted[channel_name] = False
 
-    def turn_off_all(self) -> None:
-        """Turn off all channels on all devices."""
+    def turn_off_all(self, *, preserve_logical_state: bool = False) -> None:
+        """Turn off all channels on all devices.
+
+        Args:
+            preserve_logical_state: If True, only hardware is turned off; logical
+                ``is_on`` flags and intensities are unchanged (e.g. stop live view).
+        """
+        if preserve_logical_state:
+            self.turn_off_all_hardware_preserving_state()
+            return
         for dev in self._devices:
             try:
                 dev.turn_off_all()
@@ -1049,6 +1121,8 @@ class IlluminationController:
                 logger.warning(f"turn_off_all on {dev.__class__.__name__} failed: {exc}")
         for state in self._channel_state.values():
             state.is_on = False
+        for ch in self._hardware_asserted:
+            self._hardware_asserted[ch] = False
 
     # -- Snapshot / restore / preset -----------------------------------------
 
@@ -1060,15 +1134,20 @@ class IlluminationController:
         }
         return IlluminationSnapshot(states)
 
-    def restore(self, snapshot: IlluminationSnapshot) -> None:
-        """Restore illumination state from a snapshot."""
+    def restore(self, snapshot: IlluminationSnapshot, *, force_hardware: bool = False) -> None:
+        """Restore illumination state from a snapshot.
+
+        Args:
+            force_hardware: When True, always drive hardware (e.g. after fast acquisition).
+                When False, obeys streaming gate (startup cache: logical + UI only until live).
+        """
         for name, state in snapshot.channel_states.items():
             try:
                 self.set_channel_intensity(name, state.intensity)
                 if state.is_on:
-                    self.turn_on_channel(name)
+                    self.turn_on_channel(name, force_hardware=force_hardware)
                 else:
-                    self.turn_off_channel(name)
+                    self.turn_off_channel(name, force_hardware=force_hardware)
             except Exception as exc:
                 logger.warning(f"Failed to restore channel '{name}': {exc}")
 
@@ -1087,7 +1166,7 @@ class IlluminationController:
         preset = self.presets.get(name)
         if preset is None:
             raise KeyError(f"Illumination preset '{name}' not found")
-        self.restore(preset.snapshot)
+        self.restore(preset.snapshot, force_hardware=True)
 
     def delete_preset(self, name: str) -> None:
         """Delete a named preset."""
@@ -1152,7 +1231,7 @@ class IlluminationController:
         if channel is not None:
             name = self._channel_name_for_wavelength(channel)
             if name is not None:
-                self.turn_on_channel(name)
+                self.turn_on_channel(name, force_hardware=True)
                 return
         logger.warning(f"turn_on_illumination: could not resolve channel={channel}")
 
@@ -1161,7 +1240,7 @@ class IlluminationController:
         if channel is not None:
             name = self._channel_name_for_wavelength(channel)
             if name is not None:
-                self.turn_off_channel(name)
+                self.turn_off_channel(name, force_hardware=True)
                 return
         logger.warning(f"turn_off_illumination: could not resolve channel={channel}")
 
