@@ -33,32 +33,26 @@ devices:
       logic_family: "THREE_POINT_THREE_V"
 
   main_camera:
-    driver: toupcam
+    driver: tucsen
     role: main
     io:
       trigger:
-        controller: teensy
+        controller: nidaq
         signal_type: digital
         direction: output
-        channel_id: "trigger:0"
+        channel_id: "port0/line6"
         display_name: "Main camera trigger"
     config:
-      model: "ITR3CMOS26000KMA"
+      model: "ARIES-6506"
       pixel_format: MONO16
-      binning: 2
-      roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
-      crop: { width: 4168, height: 4168 }
+      binning: 1
+      roi: { offset_x: 0, offset_y: 0, width: 2400, height: 2400 }
+      crop: { width: 2400, height: 2400 }
       rotate_angle: 0
       flip: null
-      temperature: 20
-      fan_speed: 1
-      black_level: 3
-      awb_ratios:
-        r: 1.375
-        g: 1
-        b: 1.4141
+      temperature: 0
       hardware_triggering_enabled: true
-      readout_mode: "GLOBAL"
+      readout_mode: "ROLLING"
 
   focus_camera:
     driver: daheng
@@ -252,7 +246,7 @@ illumination_devices:
 software:
   is_hcs: true
   wellplate_format: 96
-  default_saving_path: "/Downloads"
+  default_saving_path: "C:/Microscope_Data"
   display:
     default_crop: 85
     use_napari_for_live_view: false

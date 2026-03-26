@@ -1920,7 +1920,9 @@ class FastAcquisitionWidget(QWidget):
         If readout time is per-row, it's multiplied by the ROI height.
         """
         try:
-            readout_time_ms = self.camera.get_readout_time()
+            # readout_time_ms = self.camera.get_readout_time()
+            readout_time_ms = 0.04 # TBD: get from camera
+            readout_time_us = 40.0 # TBD: get from camera
             frame_rate_hz = self.frame_rate_spinbox.value()
             
             # Calculate frame period in milliseconds

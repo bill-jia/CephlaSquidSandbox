@@ -99,12 +99,6 @@ class StreamHandler:
             self.timestamp_last = timestamp_now
             self.fps_real = self.counter
             self.counter = 0
-            if control._def.PRINT_CAMERA_FPS:
-                print("real camera fps is " + str(self.fps_real))
-
-                if self.camera is not None:
-                    print(f"Stream handler grabbing from camera: {self.camera}, frame: {frame.frame.shape}")
-
         # crop image
         image = np.squeeze(frame.frame)
 

@@ -292,8 +292,8 @@ def apply_machine_config(mc: MachineConfig) -> None:
             control._def.CAMERA_CONFIG.ROI_WIDTH_DEFAULT = roi.get("width")
             control._def.CAMERA_CONFIG.ROI_HEIGHT_DEFAULT = roi.get("height")
         if crop:
-            control._def.CAMERA_CONFIG.CROP_WIDTH_UNBINNED = crop.get("width", 4168)
-            control._def.CAMERA_CONFIG.CROP_HEIGHT_UNBINNED = crop.get("height", 4168)
+            control._def.CAMERA_CONFIG.CROP_WIDTH_UNBINNED = crop.get("width")
+            control._def.CAMERA_CONFIG.CROP_HEIGHT_UNBINNED = crop.get("height")
         if "binning" in cam_cfg:
             control._def.CAMERA_CONFIG.BINNING_FACTOR_DEFAULT = cam_cfg["binning"]
         if "pixel_format" in cam_cfg:

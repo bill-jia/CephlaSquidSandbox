@@ -9,21 +9,14 @@ import ctypes
 from ctypes import *
 from enum import Enum
 import time
-import sys
 
-# Auto-detect platform and architecture for loading SDK library
-# Paths relative to software/ (main_hcs.py cwd). DLLs live under drivers and libraries/tucsen/lib/
-_is_windows = sys.platform.startswith('win')
-_is_64bit = sys.maxsize > 2**32  # True if 64-bit Python
+#加载SDK动态库
+# 32bit
+#TUSDKdll = OleDLL("./lib/x86/TUCam.dll")
+# 64bit
+# TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
+TUSDKdll = OleDLL("./drivers and libraries/tucsen/lib/x64/TUCam.dll")
 
-if _is_windows:
-    if _is_64bit:
-        TUSDKdll = cdll.LoadLibrary("./drivers and libraries/tucsen/lib/x64/TUCam.dll")
-    else:
-        TUSDKdll = cdll.LoadLibrary("./drivers and libraries/tucsen/lib/x86/TUCam.dll")
-else:
-    # Linux
-    TUSDKdll = cdll.LoadLibrary("libTUCam.so.1")
 
 #  class typedef enum TUCAM status:
 class TUCAMRET(Enum):
@@ -321,9 +314,15 @@ class TUCAM_TRIGGER_EDGE(Enum):
 # outputtrigger mode
 # typedef enum the output trigger port mode
 class TUCAM_OUTPUTTRG_PORT(Enum):
+    TUPORT_OUT_ONE   = 0x01
+    TUPORT_OUT_TWO   = 0x02
+    TUPORT_OUT_THREE = 0x03
+
+class TUCAM_TRG_PORT(Enum):
     TUPORT_ONE   = 0x00
     TUPORT_TWO   = 0x01
     TUPORT_THREE = 0x02
+    TUPORT_FOUR  = 0x03
 
 # typedef enum the output trigger kind mode
 class TUCAM_OUTPUTTRG_KIND(Enum):
@@ -684,7 +683,8 @@ class TUCAM_ELEMENT(Structure):
         ("DisplayPrecision", c_int64)
     ]
 
-BUFFER_CALLBACK  = eval('CFUNCTYPE')(c_void_p)
+# SDK buffer callback is void-returning; mismatched restype can corrupt the stack on return.
+BUFFER_CALLBACK  = eval('CFUNCTYPE')(None)
 CONTEXT_CALLBACK = eval('CFUNCTYPE')(c_void_p)
 
 # the API fuction

@@ -365,7 +365,14 @@ class FastAcquisitionController:
         if not self._daq_only:
             def frame_callback(frame: np.ndarray, metadata: dict = None):
                 placeholder_frame_id = self._frame_count
-                timestamp = time.time() if metadata is None else float(metadata["frame_header"]["timestampEofPs"]) / 1e9
+                if metadata is None:
+                    timestamp = time.time()
+                elif "frame_header" in metadata:
+                    timestamp = float(metadata["frame_header"]["timestampEofPs"]) / 1e9
+                elif "timestamp" in metadata:
+                    timestamp = float(metadata["timestamp"])
+                else:
+                    timestamp = time.time()
                 success = self._frame_buffer.write_frame(frame, placeholder_frame_id, timestamp)
                 if success:
                     self._frame_count += 1
@@ -375,7 +382,12 @@ class FastAcquisitionController:
                     self._log.warning(f"Failed to write frame {placeholder_frame_id} to buffer")
 
             if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
-                self._camera.start_fast_acquisition_frame_grabbing(frame_rate_hz, frame_callback=frame_callback)
+                self._camera.start_fast_acquisition_frame_grabbing(
+                    frame_rate_hz,
+                    n_frames_expected=num_frames,
+                    frame_callback=frame_callback,
+                    acquisition_mode=acquisition_mode,
+                )
             else:
                 raise NotImplementedError(
                     "Camera does not support fast acquisition frame grabbing. "
@@ -455,10 +467,15 @@ class FastAcquisitionController:
                 # Detect frame edges from camera frame signal (camera mode only)
                 if not self._daq_only and self._daq_result and len(self._daq_result.digital_input) > 0:
                     camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
-                    if camera_signal is not None:
+                    if camera_signal is not None and max(camera_signal) > 0:
                         self._frame_sample_indices = self._detect_frame_edges(camera_signal)
                         self._frame_count = len(self._frame_sample_indices)
                         self._log.info(f"Detected {len(self._frame_sample_indices)} frames from camera signal")
+                    else:
+                        self._log.warning(
+                            "No trigger detected on camera signal line; "
+                            f"falling back to callback frame count: {self._frame_count}"
+                        )
 
             if not self._daq_only:
                 if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'):
@@ -476,7 +493,7 @@ class FastAcquisitionController:
                     )
                 except Exception as e:
                     self._log.warning(f"Failed to compute dropped frame statistics: {e}", exc_info=True)
-                if getattr(self._frame_writer, "_file_format", "").lower() == "tiff":
+                if getattr(self._frame_writer, "_file_format", "").lower() in ["tiff", "tif"]:
                     self._start_tiff_stack_conversion_thread()
 
             # Save DAQ data and metadata (both camera and DAQ-only)

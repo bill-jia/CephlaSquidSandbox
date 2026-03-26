@@ -163,6 +163,55 @@ TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3,
 }
 
 
+def _rawimg_header_to_numpy(m_rawHeader: TUCAM_RAWIMG_HEADER) -> np.ndarray:
+    """
+    Copy raw image from TUCAM_Buf_GetData header into a (H, W) uint16 array.
+    Mirrors _convert_frame_to_numpy for TUCAM_FRAME, but uses RAWIMG header fields.
+    """
+    size = int(m_rawHeader.uiImgSize)
+    if size == 0 or not m_rawHeader.pImgData:
+        raise ValueError("empty raw image buffer")
+    buf = create_string_buffer(size)
+    memmove(buf, m_rawHeader.pImgData, size)
+    data = bytes(buf)
+    image_np = np.frombuffer(data, dtype=np.uint16)
+    h, w = int(m_rawHeader.usHeight), int(m_rawHeader.usWidth)
+    return image_np.reshape((h, w))
+
+
+class TucsenCameraCallBack:
+    """SDK callback: must call TUCAM_Buf_GetData to dequeue each frame (vendor contract)."""
+
+    def __init__(
+        self,
+        camera_handle,
+        callback_function: Optional[Callable[..., None]],
+        log=None,
+    ):
+        self._camera_handle = camera_handle
+        self.callback_function = callback_function
+
+    def OnCallbackBuffer(self):
+        m_rawHeader = TUCAM_RAWIMG_HEADER()
+        try:
+            result = TUCAM_Buf_GetData(self._camera_handle, pointer(m_rawHeader))
+            if result != TUCAMRET.TUCAMRET_SUCCESS:
+                return
+            if self.callback_function is None:
+                return
+            if int(m_rawHeader.uiImgSize) == 0 or not m_rawHeader.pImgData:
+                return
+            metadata: Dict[str, object] = {
+                "timestamp": m_rawHeader.dblTimeLast,
+                "frame_index": int(m_rawHeader.uiIndex),
+                "exposure_s": float(m_rawHeader.dblExposure),
+            }
+            frame = _rawimg_header_to_numpy(m_rawHeader)
+            self.callback_function(frame, metadata)
+        except Exception as e:
+            print(f"TucsenCameraCallBack: {e}", exc_info=True)
+
+
 # ============================================================================
 # TucsenCamera Class
 # ============================================================================
@@ -263,10 +312,13 @@ class TucsenCamera(AbstractCamera):
         self._is_streaming = threading.Event()
 
         # Fast acquisition support
-        self._fast_acquisition_callback: Optional[Callable[[np.ndarray], None]] = None
+        self._fast_acquisition_callback: Optional[Callable[[np.ndarray, Optional[dict]], None]] = None
         self._fast_acquisition_thread: Optional[threading.Thread] = None
         self._fast_acquisition_thread_keep_running = threading.Event()
         self.fast_acquisition_timeout_ms: Optional[int] = None
+        self._fast_acquisition_capture_active = False
+        self._fast_acq_buffer_callback_obj: Optional[TucsenCameraCallBack] = None
+        self._fast_acq_buffer_callback_fn = None
 
         self._camera = TucsenCamera._open(index=0)
         self._model_properties = self._get_model_properties(self._config.camera_model)
@@ -274,34 +326,36 @@ class TucsenCamera(AbstractCamera):
         self._binning = self._config.default_binning
         if self._config.camera_model == TucsenCameraModel.FL26_BW:
             self._camera_mode = ModeFL26BW.STANDARD if self._config.default_binning == (1, 1) else ModeFL26BW.SENBIN
-            # Low noise mode is not supported for FL26BW model yet.
         elif self._config.camera_model == TucsenCameraModel.DHYANA_400BSI_V3:
-            self._camera_mode = Mode400BSIV3.HDR  # HDR as default
+            self._camera_mode = Mode400BSIV3.HDR
+            self._max_acquisition_rate_hz = 100.0
         elif (
             self._config.camera_model == TucsenCameraModel.LIBRA_25
             or self._config.camera_model == TucsenCameraModel.LIBRA_22
         ):
-            self._camera_mode = ModeLibra.SENSITIVE  # SENSITIVE as default
+            self._camera_mode = ModeLibra.SENSITIVE
         elif (
             self._config.camera_model == TucsenCameraModel.ARIES_6506
             or self._config.camera_model == TucsenCameraModel.ARIES_6510
         ):
-            self._camera_mode = ModeAries.HDR  # HDR as default
+            self._camera_mode = ModeAries.HDR
+            self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
 
-        self._m_frame = None  # image buffer
-        self.frames_polled = 0 # number of frames polled from camera during fast acquisition
-        # We need to keep trigger attribute for starting and stopping streaming
+        if not hasattr(self, "_max_acquisition_rate_hz"):
+            self._max_acquisition_rate_hz = 100.0
+
+        self._m_frame = None
+        self.frames_polled = 0
         self._trigger_attr = TUCAM_TRIGGER_ATTR()
         self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
+        self.temperature_reading_callback = None
+        self._exposure_time_ms: float = (
+            self._get_genicam_parameter("ExposureTime")["value"]
+            if self._model_properties.is_genicam
+            else 20.0
+        )
 
         self._configure_camera()
-
-        self._exposure_time_ms: float = 20.0
-
-        self.temperature_reading_callback = None
-        self._terminate_temperature_event = threading.Event()
-        self.temperature_reading_thread = threading.Thread(target=self._check_temperature, daemon=True)
-        self.temperature_reading_thread.start()
 
     @staticmethod
     def _get_model_properties(camera_model: TucsenCameraModel) -> TucsenModelProperties:
@@ -400,12 +454,20 @@ class TucsenCamera(AbstractCamera):
         return model_properties
 
     def _configure_camera(self):
-        # TODO: Add support for FL26BW model
-        # TODO: For 400BSI V3, we use the default HDR mode for now.
         if self._model_properties.has_temperature_control:
             self.set_temperature(self._config.default_temperature)
+
+        if self._model_properties.is_genicam:
+            for port in TUCAM_OUTPUTTRG_PORT:
+                self._set_genicam_parameter("TriggerPort", port.value, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("TriggerOutputWidth", 40, TUELEM_TYPE.TU_ElemInteger.value)
+
         self.set_binning(*self._config.default_binning)
-        # TODO: Set default roi
+        self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
+
+        self._terminate_temperature_event = threading.Event()
+        self.temperature_reading_thread = threading.Thread(target=self._check_temperature, daemon=True)
+        self.temperature_reading_thread.start()
 
     # =========================================================================
     # Streaming Control
@@ -415,6 +477,8 @@ class TucsenCamera(AbstractCamera):
         if self._is_streaming.is_set():
             self._log.debug("Already streaming, start_streaming is noop")
             return
+
+        self._set_acquisition_mode_imp(CameraAcquisitionMode.CONTINUOUS)
 
         if self._m_frame is None:
             self._allocate_buffer()
@@ -428,7 +492,10 @@ class TucsenCamera(AbstractCamera):
 
         self._trigger_sent.clear()
         self._is_streaming.set()
-        self._log.info("TUCam Camera starts streaming")
+        self._log.info(
+            f"TUCam Camera starts streaming in camera mode: {self.get_camera_mode()}, "
+            f"max acquisition rate: {self._max_acquisition_rate_hz} Hz"
+        )
 
     def _allocate_buffer(self):
         self._m_frame = TUCAM_FRAME()
@@ -463,87 +530,130 @@ class TucsenCamera(AbstractCamera):
     def start_fast_acquisition_frame_grabbing(
         self,
         frame_rate_hz: float,
-        frame_callback: Optional[Callable[[np.ndarray], None]] = None,
+        n_frames_expected=0,
+        frame_callback: Optional[Callable[[np.ndarray, Optional[dict]], None]] = None,
+        acquisition_mode: Optional[CameraAcquisitionMode] = None,
     ):
         """
-        Start dedicated fast acquisition frame grabbing thread.
+        Start fast acquisition using the SDK buffer callback (TUCAM_Buf_DataCallBack).
 
-        Call after setting camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode
-        and before firing DAQ waveforms. The grab thread reads frames with a short
-        timeout and passes raw numpy arrays to the callback.
+        Call after setting the camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST
+        and before firing DAQ waveforms. Each frame is dequeued with TUCAM_Buf_GetData
+        in the SDK thread, then passed to frame_callback.
 
         Args:
-            frame_rate_hz: Expected frame rate (used for buffer sizing).
-            frame_callback: Optional callback(raw_data, metadata). Tucsen passes metadata=None.
+            frame_rate_hz: Expected frame rate (used for internal buffer sizing).
+            n_frames_expected: Hint for expected number of frames (informational).
+            frame_callback: Receives (frame: ndarray, metadata: dict). Metadata includes
+                timestamp, frame_index, exposure_s.
+            acquisition_mode: Optional; use when GenICam cannot distinguish HARDWARE_TRIGGER
+                vs HARDWARE_TRIGGER_FIRST from get_acquisition_mode() alone.
         """
         if self._is_streaming.is_set():
             self._log.warning("Camera is already streaming. Stop streaming before starting fast acquisition.")
             return
 
-        acquisition_mode = self.get_acquisition_mode()
-        self._log.info(f"Starting fast acquisition with mode: {acquisition_mode}")
+        if acquisition_mode is None:
+            acquisition_mode = self.get_acquisition_mode()
+        elif acquisition_mode != self.get_acquisition_mode():
+            self._set_acquisition_mode_imp(acquisition_mode)
+            self._log.info(f"Acquisition mode changed to: {acquisition_mode}")
+
+        if self._model_properties.is_genicam:
+            self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+            self.set_acquisition_frame_rate(self._max_acquisition_rate_hz)
+
+        self._log.info(
+            f"Starting fast acquisition with mode: {acquisition_mode}, "
+            f"camera mode: {self.get_camera_mode()}, "
+            f"camera max acquisition rate: {self._max_acquisition_rate_hz} Hz"
+        )
 
         if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
             raise CameraError("Fast acquisition requires HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode")
 
-        if self._m_frame is None:
-            self._allocate_buffer()
+        self._trigger_attr.nBufFrames = int(np.ceil(0.5 * frame_rate_hz))
+        if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError(f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}")
 
-        # Use a larger buffer for fast acquisition
-        # TBD: why is this valid or not valid for GenICam
-        # if not self._model_properties.is_genicam:
-            
-            # TBD: understand what the correct value should be for number of frames to buffer.
-        # self._trigger_attr.nBufFrames = 16
-        self._trigger_attr.nBufFrames = min(max(2, int(frame_rate_hz * 2)), 1000)
-        if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) == TUCAMRET.TUCAMRET_SUCCESS:
-            self._log.info(f"Trigger buffer set to {self._trigger_attr.nBufFrames}")
-        else:
-            raise CameraError("Failed to set trigger buffer for fast acquisition")
-            self._log.info(f"Trigger buffer set to {self._trigger_attr.nBufFrames}")
+        if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to release buffer")
+        self._allocate_buffer()
 
-        trigger_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
-        if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
+        self._fast_acq_buffer_callback_obj = TucsenCameraCallBack(
+            self._camera, frame_callback, log=self._log
+        )
+        self._fast_acq_buffer_callback_fn = BUFFER_CALLBACK(
+            self._fast_acq_buffer_callback_obj.OnCallbackBuffer
+        )
+        CALL_BACK_USER = CONTEXT_CALLBACK(self._fast_acq_buffer_callback_obj.__class__)
+        TUCAM_Buf_DataCallBack(self._camera, self._fast_acq_buffer_callback_fn, CALL_BACK_USER)
+
+        machine_acquisition_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+        if TUCAM_Cap_Start(self._camera, machine_acquisition_mode) != TUCAMRET.TUCAMRET_SUCCESS:
+            self._fast_acq_buffer_callback_obj = None
+            self._fast_acq_buffer_callback_fn = None
             raise CameraError("Failed to start capture for fast acquisition")
 
+        self._log.info("Capture started for fast acquisition")
+        self._fast_acquisition_capture_active = True
         self._fast_acquisition_callback = frame_callback
-        self._fast_acquisition_thread_keep_running.set()
-        self._fast_acquisition_thread = threading.Thread(
-            target=self._grab_frames_fast_acquisition,
-            daemon=True,
-        )
-        # Reset frames polled counter
-        self.frames_polled = 0
-        # Start fast acquisition thread
-        self._fast_acquisition_thread.start()
-        self._log.info("Fast acquisition frame grabbing thread started")
 
     def stop_fast_acquisition_frame_grabbing(self):
-        """Stop the fast acquisition frame grabbing thread and end camera capture."""
-        if not hasattr(self, "_fast_acquisition_thread") or self._fast_acquisition_thread is None:
+        """Stop fast acquisition (SDK callback or poll thread) and release buffers."""
+        if self._fast_acquisition_thread is not None:
+            self._log.info("Stopping fast acquisition (poll thread)...")
+            self._fast_acquisition_thread_keep_running.clear()
+            if self._fast_acquisition_thread.is_alive():
+                self._fast_acquisition_thread.join(timeout=2.0)
+                if self._fast_acquisition_thread.is_alive():
+                    self._log.warning("Fast acquisition thread did not exit in time")
+            self._fast_acquisition_thread = None
+
+        try:
+            TUCAM_Buf_AbortWait(self._camera)
+        except Exception:
+            pass
+
+        if not self._fast_acquisition_capture_active:
             return
 
         self._log.info("Stopping fast acquisition frame grabbing...")
-        self._fast_acquisition_thread_keep_running.clear()
+        if TUCAM_Cap_Stop(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            self._log.debug("TUCAM_Cap_Stop returned non-success during fast acq cleanup")
+        if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            self._log.debug("TUCAM_Buf_Release returned non-success during fast acq cleanup")
 
-        if TUCAM_Buf_AbortWait(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
-            self._log.debug("TUCAM_Buf_AbortWait failed or not needed")
-        if self._fast_acquisition_thread.is_alive():
-            self._fast_acquisition_thread.join(timeout=2.0)
-            if self._fast_acquisition_thread.is_alive():
-                self._log.warning("Fast acquisition thread did not exit in time")
-
-        try:
-            TUCAM_Cap_Stop(self._camera)
-        except Exception as e:
-            self._log.warning(f"TUCAM_Cap_Stop during fast acq cleanup: {e}")
-
-        if not self._model_properties.is_genicam:
-            self._trigger_attr.nBufFrames = 1
-            TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr)
-
-        self._fast_acquisition_thread = None
+        self._m_frame = None
+        self._fast_acquisition_capture_active = False
+        self._fast_acq_buffer_callback_obj = None
+        self._fast_acq_buffer_callback_fn = None
         self._fast_acquisition_callback = None
+
+        if self._model_properties.is_genicam:
+            self._trigger_attr.nBufFrames = 4
+            if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
+                raise CameraError(f"Failed to reset trigger buffer after fast acquisition to {self._trigger_attr.nBufFrames}")
+        else:
+            if TUCAM_Cap_GetTrigger(self._camera, pointer(self._trigger_attr)) == TUCAMRET.TUCAMRET_SUCCESS:
+                self._trigger_attr.nBufFrames = 1
+                if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
+                    self._log.debug("TUCAM_Cap_SetTrigger restore after fast acq failed")
+
+        # Vendor SDK workaround: close and reopen camera to reset internal state
+        if self.temperature_reading_thread is not None:
+            self._terminate_temperature_event.set()
+            self.temperature_reading_thread.join()
+        if TUCAM_Dev_Close(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to close camera")
+        else:
+            self._log.info("Closed camera successfully")
+        TUCAM_Api_Uninit()
+        self._camera = TucsenCamera._open(index=0)
+        if self._camera is None:
+            raise CameraError("Failed to reopen camera after fast acquisition")
+        self._configure_camera()
+
         self._log.info(f"Fast acquisition frame grabbing stopped, {self.frames_polled} frames polled")
 
     def _grab_frames_fast_acquisition(self):
@@ -736,6 +846,18 @@ class TucsenCamera(AbstractCamera):
     def get_exposure_time(self) -> float:
         return self._exposure_time_ms
 
+    def set_acquisition_frame_rate(self, frame_rate_hz: float):
+        if self._model_properties.is_genicam:
+            self._set_genicam_parameter("AcquisitionFrameRate", frame_rate_hz, TUELEM_TYPE.TU_ElemFloat.value)
+        else:
+            self._trigger_attr.nFrameRate = frame_rate_hz
+
+    def get_acquisition_frame_rate(self) -> float:
+        if self._model_properties.is_genicam:
+            return self._get_genicam_parameter("AcquisitionFrameRate")["value"]
+        else:
+            return self._trigger_attr.nFrameRate
+
     def get_exposure_limits(self) -> Tuple[float, float]:
         if self._model_properties.is_genicam:
             param_info = self._get_genicam_parameter("ExposureTime")
@@ -799,15 +921,23 @@ class TucsenCamera(AbstractCamera):
 
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
         """Set readout mode. Tucsen cameras support GLOBAL only."""
+        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
+            if readout_mode != CameraReadoutMode.ROLLING:
+                raise ValueError(f"Tucsen camera {self._config.camera_model} does not support readout mode {readout_mode}")
+                # TBD: add support for global with reset (grayed out in SamplePro for some reason, figure it out)
         if readout_mode != CameraReadoutMode.GLOBAL:
             raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
 
     def get_readout_mode(self) -> CameraReadoutMode:
         """Get current readout mode."""
+        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
+            return CameraReadoutMode.ROLLING
         return CameraReadoutMode.GLOBAL
 
     def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
         """Get available readout modes."""
+        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
+            return [CameraReadoutMode.ROLLING]
         return [CameraReadoutMode.GLOBAL]
 
     # =========================================================================
@@ -881,10 +1011,9 @@ class TucsenCamera(AbstractCamera):
                     raise CameraError("Failed to set resolution (TUIDC_RESOLUTION)")
                 self._binning = (2, 2) if res_value != 0 else (1, 1)
             else:
-                # Aries: try GenICam ImageMode if available, else only update internal state
                 try:
                     self._set_genicam_parameter(
-                        "ImageMode", enum_member.value, TUELEM_TYPE.TU_ElemEnumeration.value
+                        "SensorOperationMode", enum_member.value, TUELEM_TYPE.TU_ElemEnumeration.value
                     )
                 except (CameraError, Exception):
                     pass
@@ -904,6 +1033,8 @@ class TucsenCamera(AbstractCamera):
             raise CameraError("Failed to release buffer")
         self._allocate_buffer()
         self._calculate_strobe_delay()
+        if self._model_properties.is_genicam:
+            self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
 
     def _raw_set_resolution(self, bin_value: int):
         with self._pause_streaming():
@@ -1047,21 +1178,25 @@ class TucsenCamera(AbstractCamera):
             if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 2, TUELEM_TYPE.TU_ElemEnumeration.value)
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
             elif acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 0, TUELEM_TYPE.TU_ElemEnumeration.value)
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
             elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 1, TUELEM_TYPE.TU_ElemEnumeration.value)
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
             elif acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 1, TUELEM_TYPE.TU_ElemEnumeration.value)
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value
             else:
