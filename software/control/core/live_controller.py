@@ -247,7 +247,7 @@ class LiveController:
                 ic = self.microscope.illumination_controller
                 if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
                     ic.set_led_matrix_mode(mode)
-            self.microscope.illumination_controller.turn_on_channel(channel_name)
+            self.microscope.illumination_controller.turn_on_channel(channel_name, force_hardware=True)
         else:
             self._log.warning(
                 f"turn_on_illumination() skipped - no channel configured for "
@@ -259,7 +259,7 @@ class LiveController:
         """Turn off illumination for the current channel."""
         channel_name = self._get_illumination_channel_name()
         if channel_name:
-            self.microscope.illumination_controller.turn_off_channel(channel_name)
+            self.microscope.illumination_controller.turn_off_channel(channel_name, force_hardware=True)
         else:
             self._log.warning(
                 f"turn_off_illumination() skipped - no channel configured for "
