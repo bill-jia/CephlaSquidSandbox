@@ -117,13 +117,13 @@ def main():
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Level (offset applied)")
-    ax.set_title("Fast Acquisition: Trigger and Exposure Waveforms")
+    n_exposures = np.sum(np.diff(exposure_ds.astype(int)) > 0)
+    n_triggers = np.sum(np.diff(trigger_ds.astype(int)) > 0)
+    ax.set_title(f"Fast Acquisition: Trigger and Exposure (n_exposures: {n_exposures}, n_triggers: {n_triggers})")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
 
-    print(frame_timestamps_ms)
-    if frame_timestamps_ms is not None:
-        ax.vlines(frame_timestamps_ms/1000, ymin=0, ymax=1.1, color="red", label="Frame timestamps")
+    ax.vlines((np.diff(trigger_ds) > 0).nonzero()[0]/sample_rate, ymin=0, ymax=1.1, color="red", label="Trigger edges")
 
     plt.tight_layout()
 

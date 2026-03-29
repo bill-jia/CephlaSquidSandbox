@@ -51,8 +51,8 @@ class FastAcquisitionController:
                  output_path: str,
                  buffer_size: int = 500,
                  file_format: str = "tiff",
-                 trigger_dio_line: int = 1,
-                 camera_frame_dio_line: int = 0,
+                 camera_trigger_dio_line: int = 1,
+                 frame_counter_dio_line: int = 0,
                  illumination_controller=None,
                  microscope: Optional[Any] = None,
                  live_controller: Optional[Any] = None):
@@ -69,8 +69,8 @@ class FastAcquisitionController:
             output_path: Base directory for saving data
             buffer_size: Ring buffer capacity in frames (used when a camera acquisition starts)
             file_format: File format for saving ("tiff", "zarr", "hdf5", or "raw") (ignored when camera is None)
-            trigger_dio_line: Digital output line for camera triggers (default: 1); unused in DAQ-only
-            camera_frame_dio_line: Digital input line for camera frame signal (default: 0); unused in DAQ-only
+            camera_trigger_dio_line: Digital output line for camera triggers (default: 1); unused in DAQ-only
+            frame_counter_dio_line: Digital input line for camera frame signal (default: 0); unused in DAQ-only
             illumination_controller: Optional IlluminationController; when provided its
                 state is snapshotted before acquisition and restored afterwards so that
                 the higher-level channel state stays in sync with the hardware lines
@@ -82,8 +82,8 @@ class FastAcquisitionController:
         self._camera = camera
         self._ni_daq = ni_daq
         self._output_path = output_path
-        self._trigger_dio_line = trigger_dio_line
-        self._camera_frame_dio_line = camera_frame_dio_line
+        self._camera_trigger_dio_line = camera_trigger_dio_line
+        self._frame_counter_dio_line = frame_counter_dio_line
         self._daq_only = camera is None
         self._illumination_controller = illumination_controller
         self._illumination_snapshot = None
@@ -130,8 +130,8 @@ class FastAcquisitionController:
             self._log.info(
                 f"Initialized fast acquisition controller: "
                 f"buffer_size={buffer_size}, format={file_format}, "
-                f"output={output_path}, trigger_line={trigger_dio_line}, "
-                f"frame_signal_line={camera_frame_dio_line}"
+                f"output={output_path}, trigger_line={camera_trigger_dio_line}, "
+                f"frame_signal_line={frame_counter_dio_line}"
             )
 
     def _create_camera_acquisition_resources(self) -> None:
@@ -260,9 +260,10 @@ class FastAcquisitionController:
                          di_lines: Optional[list] = None,
                          acquisition_mode: Optional[CameraAcquisitionMode] = None,
                          waveforms: Optional[WaveformData] = None,
-                         trigger_dio_line: Optional[int] = None,
-                         camera_frame_dio_line: Optional[int] = None,
-                         duration_s: Optional[float] = None):
+                         camera_trigger_dio_line: Optional[int] = None,
+                         frame_counter_dio_line: Optional[int] = None,
+                         duration_s: Optional[float] = None,
+                         camera_offset_ms: float = 0):
         """
         Start fast acquisition with preloaded NI DAQ waveforms.
 
@@ -279,8 +280,8 @@ class FastAcquisitionController:
             di_lines: Optional digital input lines to record (in DAQ-only, only these are recorded)
             acquisition_mode: Camera acquisition mode; ignored in DAQ-only mode
             waveforms: Optional WaveformData from NIDAQWidget. In DAQ-only mode used as-is.
-            trigger_dio_line: Optional trigger line number (overrides default); ignored in DAQ-only
-            camera_frame_dio_line: Optional camera frame counter line; ignored in DAQ-only
+            camera_trigger_dio_line: Optional trigger line number (overrides default); ignored in DAQ-only
+            frame_counter_dio_line: Optional camera frame counter line; ignored in DAQ-only
             duration_s: Duration in seconds. Required when camera is None (DAQ-only mode).
         """
         if self._is_acquiring:
@@ -313,7 +314,7 @@ class FastAcquisitionController:
         elif num_frames is None:
             duration_s = 1
             num_frames_estimate = int(frame_rate_hz * duration_s)
-        else:
+        elif duration_s is None:
             duration_s = num_frames / frame_rate_hz
             num_frames_estimate = num_frames
 
@@ -322,64 +323,59 @@ class FastAcquisitionController:
         self._timeout_s = duration_s + 10
         self._log.info(f"Expected acquisition duration: {duration_s:.2f}s, timeout: {self._timeout_s:.2f}s")
 
-        if not self._daq_only:
-            if trigger_dio_line is not None:
-                self._trigger_dio_line = trigger_dio_line
-            if camera_frame_dio_line is not None:
-                self._camera_frame_dio_line = camera_frame_dio_line
-
-        n_samples_offset = 1
         samples_per_channel = int(sample_rate_hz * duration_s)
-
-        # Get waveforms: treat input as a task definition and work on a deep copy
-        # so that UI-owned WaveformData objects are not mutated by a running acquisition.
-        if waveforms is None:
-            if self._daq_only:
+        n_samples_offset = int(np.ceil(camera_offset_ms * sample_rate_hz / 1000)) + 1
+        
+        # Load waveforms and add camera triggers if needed
+        if self._daq_only:
+            if waveforms is None:
                 local_waveforms = WaveformData()
             else:
-                frame_period_samples = int(sample_rate_hz / frame_rate_hz)
-                pulse_width_samples = 4
-                trigger_pattern = generate_pulse_train(
-                    pulse_width_samples=pulse_width_samples,
-                    period_samples=frame_period_samples,
-                    num_samples=samples_per_channel,
-                    n_samples_offset=n_samples_offset,
-                    inverted=False,
-                )
-                local_waveforms = WaveformData(
-                    analog_output={},
-                    digital_output={self._trigger_dio_line: trigger_pattern},
-                )
+                ao_copy = {
+                    ch: np.array(data, copy=True)
+                    for ch, data in (waveforms.analog_output or {}).items()
+                }
+                do_copy = {
+                    line: np.array(data, copy=True)
+                    for line, data in (waveforms.digital_output or {}).items()
+                }
+                local_waveforms = WaveformData(analog_output=ao_copy, digital_output=do_copy)
+                di_lines_to_record = list(di_lines) if di_lines else []
         else:
-            # Deep-copy underlying arrays so later edits in the UI do not affect the
-            # waveforms used for this acquisition.
-            ao_copy = {
-                ch: np.array(data, copy=True)
-                for ch, data in (waveforms.analog_output or {}).items()
-            }
-            do_copy = {
-                line: np.array(data, copy=True)
-                for line, data in (waveforms.digital_output or {}).items()
-            }
-            local_waveforms = WaveformData(analog_output=ao_copy, digital_output=do_copy)
+            if camera_trigger_dio_line is not None:
+                self._camera_trigger_dio_line = camera_trigger_dio_line
+            if frame_counter_dio_line is not None:
+                self._frame_counter_dio_line = frame_counter_dio_line
 
-            if not self._daq_only:
-                frame_period_samples = int(sample_rate_hz / frame_rate_hz)
-                pulse_width_samples = 4
-                trigger_pattern = generate_pulse_train(
-                    pulse_width_samples=pulse_width_samples,
-                    period_samples=frame_period_samples,
-                    num_samples=samples_per_channel,
-                    n_samples_offset=n_samples_offset,
-                    inverted=False,
-                )
-                local_waveforms.digital_output[self._trigger_dio_line] = trigger_pattern
+            pulse_width_samples = 4
+            trigger_duration_us = int(pulse_width_samples/sample_rate_hz*1e6)
+            self._log.info(f"Setting trigger duration to {trigger_duration_us} us")
+            self._camera.set_trigger_duration_us(trigger_duration_us)
+            frame_period_samples = int(sample_rate_hz / frame_rate_hz)
 
-        # Digital input lines to record
-        if self._daq_only:
-            di_lines_to_record = list(di_lines) if di_lines else []
-        else:
-            di_lines_to_record = [self._camera_frame_dio_line]
+            trigger_pattern = generate_pulse_train(
+                pulse_width_samples=pulse_width_samples,
+                period_samples=frame_period_samples,
+                num_samples=samples_per_channel,
+                n_samples_offset=n_samples_offset,
+                inverted=False,
+                max_num_pulses=num_frames,
+            )
+            if waveforms is None:
+                local_waveforms = WaveformData(digital_output={self._camera_trigger_dio_line: trigger_pattern})
+            else:
+                ao_copy = {
+                    ch: np.array(data, copy=True)
+                    for ch, data in (waveforms.analog_output or {}).items()
+                }
+                do_copy = {
+                    line: np.array(data, copy=True)
+                    for line, data in (waveforms.digital_output or {}).items()
+                }
+                local_waveforms = WaveformData(analog_output=ao_copy, digital_output=do_copy)
+                local_waveforms.digital_output[self._camera_trigger_dio_line] = trigger_pattern
+            
+            di_lines_to_record = [self._frame_counter_dio_line]
             if di_lines:
                 di_lines_to_record.extend(di_lines)
             di_lines_to_record = list(set(di_lines_to_record))
@@ -587,7 +583,7 @@ class FastAcquisitionController:
 
                 # Detect frame edges from camera frame signal (camera mode only)
                 if not self._daq_only and self._daq_result and len(self._daq_result.digital_input) > 0:
-                    camera_signal = self._daq_result.digital_input.get(self._camera_frame_dio_line)
+                    camera_signal = self._daq_result.digital_input.get(self._frame_counter_dio_line)
                     if camera_signal is not None and max(camera_signal) > 0:
                         self._frame_sample_indices = self._detect_frame_edges(camera_signal)
                         self._frame_count = len(self._frame_sample_indices)
@@ -749,8 +745,8 @@ class FastAcquisitionController:
                 # Save metadata
                 f.attrs['sample_rate_hz'] = self._daq_result.sample_rate_hz
                 f.attrs['samples_acquired'] = self._daq_result.samples_acquired
-                f.attrs['trigger_dio_line'] = self._trigger_dio_line
-                f.attrs['camera_frame_dio_line'] = self._camera_frame_dio_line
+                f.attrs['camera_trigger_dio_line'] = self._camera_trigger_dio_line
+                f.attrs['frame_counter_dio_line'] = self._frame_counter_dio_line
                 f.attrs['num_frames_detected'] = len(self._frame_sample_indices)
             
             self._log.info(f"Saved DAQ data to {h5_path}")
@@ -786,8 +782,8 @@ class FastAcquisitionController:
             metadata["frame_count"] = self._frame_count
             metadata["frames_written"] = frames_written
             metadata["frames_dropped"] = dropped_frames
-            metadata["trigger_dio_line"] = self._trigger_dio_line
-            metadata["camera_frame_dio_line"] = self._camera_frame_dio_line
+            metadata["camera_trigger_dio_line"] = self._camera_trigger_dio_line
+            metadata["frame_counter_dio_line"] = self._frame_counter_dio_line
             metadata["buffer_size"] = (
                 self._frame_buffer.get_buffer_status()["buffer_size"]
                 if self._frame_buffer is not None

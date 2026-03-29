@@ -175,7 +175,7 @@ def test_hw_trigger_frame_collection():
         device_name = "Dev1"  # Change if needed
         duration_s = num_frames / frame_rate_hz
         samples_per_channel = int(sample_rate_hz * duration_s)
-        trigger_dio_line = 1  # DIO 1 for camera trigger
+        camera_trigger_dio_line = 1  # DIO 1 for camera trigger
         
         print(f"Device: {device_name}")
         print(f"Sample rate: {sample_rate_hz} Hz")
@@ -183,7 +183,7 @@ def test_hw_trigger_frame_collection():
         print(f"Number of frames: {num_frames}")
         print(f"Duration: {duration_s} s")
         print(f"Samples per channel: {samples_per_channel}")
-        print(f"Trigger DIO line: {trigger_dio_line}")
+        print(f"Trigger DIO line: {camera_trigger_dio_line}")
         
         # Create DAQ config
         daq_config = NIDAQConfig(
@@ -191,7 +191,7 @@ def test_hw_trigger_frame_collection():
             sample_rate_hz=sample_rate_hz,
             samples_per_channel=samples_per_channel,
             do_port="port0",
-            do_lines=[trigger_dio_line],
+            do_lines=[camera_trigger_dio_line],
             trigger_source=TriggerSource.SOFTWARE
         )
         
@@ -236,7 +236,7 @@ def test_hw_trigger_frame_collection():
         
         # Create waveform data
         waveforms = WaveformData()
-        waveforms.digital_output[trigger_dio_line] = trigger_pattern
+        waveforms.digital_output[camera_trigger_dio_line] = trigger_pattern
         
         print("✓ Trigger waveform generated")
         

@@ -1582,7 +1582,8 @@ def generate_pulse_train(
     period_samples: int,
     num_samples: int,
     n_samples_offset: int = 0,
-    inverted: bool = False
+    inverted: bool = False,
+    max_num_pulses: int = None,
 ) -> np.ndarray:
     """
     Generate a digital pulse train.
@@ -1597,11 +1598,14 @@ def generate_pulse_train(
         Boolean array representing the pulse train
     """
     pattern = np.zeros(num_samples, dtype=bool)
-    
+    num_pulses = 0
     for start in range(n_samples_offset, num_samples, period_samples):
         end = min(start + pulse_width_samples, num_samples)
         pattern[start:end] = True
-    
+        num_pulses += 1
+        if max_num_pulses is not None and num_pulses >= max_num_pulses:
+            break
+
     if inverted:
         pattern = ~pattern
     

@@ -445,6 +445,7 @@ class TucsenCamera(AbstractCamera):
 
         self._m_frame = None
         self.frames_polled = 0
+        self._trigger_duration_us = 40
         self._trigger_attr = TUCAM_TRIGGER_ATTR()
         self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
         self.temperature_reading_callback = None
@@ -563,7 +564,7 @@ class TucsenCamera(AbstractCamera):
                     self._set_genicam_parameter("TriggerPortEnable", 1, TUELEM_TYPE.TU_ElemInteger.value)
                 else:
                     self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("TriggerOutputWidth", 40, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("TriggerOutputWidth", self._trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
 
         self.set_binning(*self._config.default_binning)
         self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
@@ -988,7 +989,6 @@ class TucsenCamera(AbstractCamera):
         if self._model_properties.is_genicam:
             param_info = self._get_genicam_parameter("TriggerInputDelay")
             trigger_delay_ms = param_info["value"] / 1000.0  # read in us, convert to ms
-            self._log.info(f"Trigger delay: {trigger_delay_ms} ms")
         else:
             trigger_attr = TUCAM_TRIGGER_ATTR()
             if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
@@ -1384,6 +1384,16 @@ class TucsenCamera(AbstractCamera):
             except Exception as e:
                 self._log.exception(f"Failed to read temperature in callback: {e}")
                 pass
+    
+    def set_trigger_duration_us(self, trigger_duration_us: int):
+        self._trigger_duration_us = trigger_duration_us
+        if self._model_properties.is_genicam:
+            for port in TUCAM_OUTPUTTRG_PORT:
+                self._set_genicam_parameter("TriggerPort", port.value, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("TriggerOutputWidth", trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
+        else:
+            self._trigger_attr.nDelayTm = trigger_duration_us
+        self._update_internal_settings()
 
     def send_trigger(self, illumination_time: Optional[float] = None):
         if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:

@@ -1803,11 +1803,11 @@ class FastAcquisitionWidget(QWidget):
         daq_layout.addWidget(self.trigger_mode_combo, 0, 1)
 
         daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 2)
-        self.trigger_dio_line_spinbox = QSpinBox()
-        self.trigger_dio_line_spinbox.setRange(0, 31)
-        self.trigger_dio_line_spinbox.setValue(6)
-        self.trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
-        daq_layout.addWidget(self.trigger_dio_line_spinbox, 0, 3)
+        self.camera_trigger_dio_line_spinbox = QSpinBox()
+        self.camera_trigger_dio_line_spinbox.setRange(0, 31)
+        self.camera_trigger_dio_line_spinbox.setValue(6)
+        self.camera_trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
+        daq_layout.addWidget(self.camera_trigger_dio_line_spinbox, 0, 3)
 
         daq_layout.addWidget(QLabel("Camera Frame DIO Line:"), 1, 0)
         self.camera_dio_line_spinbox = QSpinBox()
@@ -1930,7 +1930,7 @@ class FastAcquisitionWidget(QWidget):
             
             # Maximum exposure time = frame period - readout time
             # Add a small safety margin (1% of frame period) to account for timing variations
-            max_exposure_time_ms = max(frame_period_ms, readout_time_ms)-0.04
+            max_exposure_time_ms = max(frame_period_ms, readout_time_ms)-0.05
 
             self._log.info(f"Current frame rate: {frame_rate_hz} Hz, frame period: {frame_period_ms:.2f} ms, readout time: {readout_time_ms:.2f} ms, max exposure time: {max_exposure_time_ms:.2f} ms")
             
@@ -2044,7 +2044,7 @@ class FastAcquisitionWidget(QWidget):
         # TBD: implement this
         pass
     
-    def start_acquisition(self):
+    def start_acquisition(self, camera_offset_ms: float = 0):
         """Start fast acquisition."""
         if self._is_acquiring:
             self._log.warning("Acquisition already running")
@@ -2053,14 +2053,14 @@ class FastAcquisitionWidget(QWidget):
         # Store camera state before fast acquisition
         try:
             acquisition_mode = self.camera.get_acquisition_mode()
-            exposure_time_ms = self.camera.get_exposure_time()
+            live_exposure_time_ms = self.camera.get_exposure_time()
             pixel_format = self.camera.get_pixel_format()
             binning_x, binning_y = self.camera.get_binning()
             roi_offset_x, roi_offset_y, roi_width, roi_height = self.camera.get_region_of_interest()
             
             self._camera_state_before_acquisition = CameraState(
                 acquisition_mode=acquisition_mode,
-                exposure_time_ms=exposure_time_ms,
+                exposure_time_ms=live_exposure_time_ms,
                 pixel_format=pixel_format,
                 binning_x=binning_x,
                 binning_y=binning_y,
@@ -2069,10 +2069,6 @@ class FastAcquisitionWidget(QWidget):
                 roi_width=roi_width,
                 roi_height=roi_height
             )
-            self._log.info(f"Stored camera state before fast acquisition: "
-                          f"mode={acquisition_mode.value}, exposure={exposure_time_ms}ms, "
-                          f"pixel_format={pixel_format.value}, binning=({binning_x},{binning_y}), "
-                          f"roi=({roi_offset_x},{roi_offset_y},{roi_width},{roi_height})")
         except Exception as e:
             self._log.warning(f"Could not store camera state before fast acquisition: {e}", exc_info=True)
             self._camera_state_before_acquisition = None
@@ -2117,16 +2113,16 @@ class FastAcquisitionWidget(QWidget):
             return
         
         # Get trigger and camera frame lines
-        trigger_dio_line = self.trigger_dio_line_spinbox.value()
-        camera_frame_dio_line = self.camera_dio_line_spinbox.value()
+        camera_trigger_dio_line = self.camera_trigger_dio_line_spinbox.value()
+        frame_counter_dio_line = self.camera_dio_line_spinbox.value()
         
         # Check for line conflicts - this must be done FIRST before any other changes
         ni_daq_widget = self.ni_daq_widget
         conflicts = []
-        if ni_daq_widget.is_line_configured(trigger_dio_line, is_digital=True):
-            conflicts.append(f"Digital output line {trigger_dio_line} (trigger)")
-        if ni_daq_widget.is_line_configured(camera_frame_dio_line, is_digital=True):
-            conflicts.append(f"Digital input line {camera_frame_dio_line} (camera frame counter)")
+        if ni_daq_widget.is_line_configured(camera_trigger_dio_line, is_digital=True):
+            conflicts.append(f"Digital output line {camera_trigger_dio_line} (trigger)")
+        if ni_daq_widget.is_line_configured(frame_counter_dio_line, is_digital=True):
+            conflicts.append(f"Digital input line {frame_counter_dio_line} (camera frame counter)")
         
         if conflicts:
             conflict_msg = (
@@ -2165,12 +2161,16 @@ class FastAcquisitionWidget(QWidget):
             num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
             frame_rate_hz = self.frame_rate_spinbox.value()
             sample_rate_hz = self.daq_sample_rate_spinbox.value()
+            fast_exposure_time_ms = self.exposure_time_spinbox.value()
             
             if num_frames is None:
                 duration_s = 1  # Continuous mode
             else:
                 duration_s = num_frames / frame_rate_hz
-            
+            # Ensure that last frame is captured and its output trigger is recorded
+            n_exposures_effective = np.floor((duration_s*1000-camera_offset_ms)/fast_exposure_time_ms) + 1
+            duration_s = (n_exposures_effective * fast_exposure_time_ms + camera_offset_ms) / 1000.0 + self.camera._trigger_duration_us *1e-6*1.5
+            self._log.info(f"Effective duration: {duration_s:.2f} s, number of exposures: {n_exposures_effective}, camera offset: {camera_offset_ms:.2f} ms, trigger duration: {self.camera._trigger_duration_us:.2f} us")
             # Update waveforms in NI DAQ widget to match acquisition duration
             # This will crop/extend waveforms and update the display
             ni_daq_widget.update_waveforms_for_duration(duration_s, sample_rate_hz)
@@ -2198,8 +2198,8 @@ class FastAcquisitionWidget(QWidget):
                 output_path=full_output_path,
                 buffer_size=self.buffer_size_spinbox.value(),
                 file_format=file_format_map[self.file_format_combo.currentText()],
-                trigger_dio_line=self.trigger_dio_line_spinbox.value(),
-                camera_frame_dio_line=self.camera_dio_line_spinbox.value(),
+                camera_trigger_dio_line=self.camera_trigger_dio_line_spinbox.value(),
+                frame_counter_dio_line=self.camera_dio_line_spinbox.value(),
                 microscope=self.microscope,
                 live_controller=self.live_controller,
             )
@@ -2212,21 +2212,20 @@ class FastAcquisitionWidget(QWidget):
                 QTimer.singleShot(0, lambda: self._on_acquisition_completed_from_controller(status, error_message))
             
             self._controller.set_completion_callback(on_acquisition_completed)
-            
-            self._log.info(f"Setting exposure time to {self.exposure_time_spinbox.value()} ms")
-            self._log.info(f"Setting frame rate to {frame_rate_hz} Hz")
             # Start acquisition
             self._controller.start_acquisition(
                 num_frames=num_frames,
                 frame_rate_hz=frame_rate_hz,
-                exposure_time_ms=self.exposure_time_spinbox.value(),
+                exposure_time_ms=fast_exposure_time_ms,
                 sample_rate_hz=sample_rate_hz,
                 ai_channels=ai_channels,
                 ao_channels=ao_channels,
                 acquisition_mode=acquisition_mode,
                 waveforms=ni_daq_waveforms,
-                trigger_dio_line=trigger_dio_line,
-                camera_frame_dio_line=camera_frame_dio_line
+                camera_trigger_dio_line=camera_trigger_dio_line,
+                frame_counter_dio_line=frame_counter_dio_line,
+                duration_s=duration_s,
+                camera_offset_ms=camera_offset_ms
             )
             
             # Update UI
