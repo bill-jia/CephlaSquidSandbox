@@ -2169,8 +2169,7 @@ class FastAcquisitionWidget(QWidget):
                 duration_s = num_frames / frame_rate_hz
             # Ensure that last frame is captured and its output trigger is recorded
             n_exposures_effective = np.floor((duration_s*1000-camera_offset_ms)/fast_exposure_time_ms) + 1
-            duration_s = (n_exposures_effective * fast_exposure_time_ms + camera_offset_ms) / 1000.0 + self.camera._trigger_duration_us *1e-6*1.5
-            self._log.info(f"Effective duration: {duration_s:.2f} s, number of exposures: {n_exposures_effective}, camera offset: {camera_offset_ms:.2f} ms, trigger duration: {self.camera._trigger_duration_us:.2f} us")
+            duration_s = (n_exposures_effective * fast_exposure_time_ms + camera_offset_ms + 1) / 1000.0 + self.camera._trigger_duration_us *1e-6*1.5
             # Update waveforms in NI DAQ widget to match acquisition duration
             # This will crop/extend waveforms and update the display
             ni_daq_widget.update_waveforms_for_duration(duration_s, sample_rate_hz)

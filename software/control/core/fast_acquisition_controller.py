@@ -349,7 +349,6 @@ class FastAcquisitionController:
 
             pulse_width_samples = 4
             trigger_duration_us = int(pulse_width_samples/sample_rate_hz*1e6)
-            self._log.info(f"Setting trigger duration to {trigger_duration_us} us")
             self._camera.set_trigger_duration_us(trigger_duration_us)
             frame_period_samples = int(sample_rate_hz / frame_rate_hz)
 

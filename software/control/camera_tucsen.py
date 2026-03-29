@@ -591,6 +591,9 @@ class TucsenCamera(AbstractCamera):
         if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
             TUCAM_Buf_Release(self._camera)
             raise CameraError("Failed to start streaming")
+        
+        self._update_internal_settings()
+
 
         self._ensure_read_thread_running()
 
@@ -609,6 +612,11 @@ class TucsenCamera(AbstractCamera):
 
         if TUCAM_Buf_Alloc(self._camera, pointer(self._m_frame)) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError("Failed to allocate buffer")
+
+    def _reset_buffer(self):
+        if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to release buffer")
+        self._allocate_buffer()
 
     def stop_streaming(self):
         if not self._is_streaming.is_set():
@@ -947,12 +955,16 @@ class TucsenCamera(AbstractCamera):
 
         self._exposure_time_ms = exposure_time_ms
         self._trigger_sent.clear()
+        self._update_internal_settings()
 
     def get_exposure_time(self) -> float:
         return self._exposure_time_ms
 
     def set_acquisition_frame_rate(self, frame_rate_hz: float):
         if self._model_properties.is_genicam:
+            if frame_rate_hz > self._max_acquisition_rate_hz:
+                self._log.warning(f"Frame rate {frame_rate_hz} Hz is greater than the maximum acquisition rate {self._max_acquisition_rate_hz} Hz, setting to maximum")
+                frame_rate_hz = self._max_acquisition_rate_hz
             self._set_genicam_parameter("AcquisitionFrameRate", frame_rate_hz, TUELEM_TYPE.TU_ElemFloat.value)
         else:
             self._trigger_attr.nFrameRate = frame_rate_hz
@@ -1131,6 +1143,7 @@ class TucsenCamera(AbstractCamera):
                     pass
             self._camera_mode = enum_member
             self._update_internal_settings()
+            self._reset_buffer()
         self._log.info(f"Set camera mode to '{spec.display_name or mode_name}' ({spec.bit_depth}-bit)")
 
     def get_camera_mode_spec(self, mode_name: str) -> Optional[TucsenCameraModeSpec]:
@@ -1141,9 +1154,6 @@ class TucsenCamera(AbstractCamera):
         return modes[mode_name][1]
 
     def _update_internal_settings(self):
-        if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError("Failed to release buffer")
-        self._allocate_buffer()
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
@@ -1237,6 +1247,7 @@ class TucsenCamera(AbstractCamera):
 
     def set_region_of_interest(self, offset_x: int, offset_y: int, width: int, height: int):
         # TODO: limit range of values to be within the camera's capabilities
+        self._log.info(f"Setting region of interest to {offset_x}, {offset_y}, {width}, {height}")
         if self._model_properties.is_genicam:
             nHOffset = control.utils.truncate_to_interval(offset_x, 8)
             nVOffset = control.utils.truncate_to_interval(offset_y, 2)
@@ -1253,10 +1264,10 @@ class TucsenCamera(AbstractCamera):
 
         with self._pause_streaming():
             if self._model_properties.is_genicam:
-                self._set_genicam_parameter("MultiROIOffsetX", nHOffset, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("MultiROIOffsetY", nVOffset, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("MultiROIWidth", nWidth, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("MultiROIHeight", nHeight, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("OffsetX", nHOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("OffsetY", nVOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("Width", nWidth, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("Height", nHeight, TUELEM_TYPE.TU_ElemInteger.value)
             else:
                 if TUCAM_Cap_SetROI(self._camera, roi_attr) != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(
@@ -1266,10 +1277,10 @@ class TucsenCamera(AbstractCamera):
 
     def get_region_of_interest(self) -> Tuple[int, int, int, int]:
         if self._model_properties.is_genicam:
-            h_offset = self._get_genicam_parameter("MultiROIOffsetX")["value"]
-            v_offset = self._get_genicam_parameter("MultiROIOffsetY")["value"]
-            width = self._get_genicam_parameter("MultiROIWidth")["value"]
-            height = self._get_genicam_parameter("MultiROIHeight")["value"]
+            h_offset = self._get_genicam_parameter("OffsetX")["value"]
+            v_offset = self._get_genicam_parameter("OffsetY")["value"]
+            width = self._get_genicam_parameter("Width")["value"]
+            height = self._get_genicam_parameter("Height")["value"]
             return (h_offset, v_offset, width, height)
         else:
             roi_attr = TUCAM_ROI_ATTR()

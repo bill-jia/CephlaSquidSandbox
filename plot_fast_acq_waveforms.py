@@ -123,7 +123,7 @@ def main():
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
 
-    ax.vlines((np.diff(trigger_ds) > 0).nonzero()[0]/sample_rate, ymin=0, ymax=1.1, color="red", label="Trigger edges")
+    ax.vlines((np.diff(trigger_ds.astype(int)) > 0).nonzero()[0]/sample_rate, ymin=0, ymax=1.1, color="red", label="Trigger edges")
 
     plt.tight_layout()
 

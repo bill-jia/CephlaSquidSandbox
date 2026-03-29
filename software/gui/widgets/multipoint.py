@@ -590,7 +590,6 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # set entry range values bith to current z pos
         self.entry_minZ.setValue(z_pos_mm * 1000)
         self.entry_maxZ.setValue(z_pos_mm * 1000)
-        print("init z-level flexible:", self.entry_minZ.value())
 
         # reallow updates from entry sinals (signal enforces min <= max when we update either entry)
         self.entry_minZ.blockSignals(False)
