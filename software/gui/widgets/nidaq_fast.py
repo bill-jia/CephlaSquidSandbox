@@ -1649,7 +1649,7 @@ class FastAcquisitionWidget(QWidget):
     - Trigger source selection (TI Microcontroller / NI DAQ)
     - Frame rate and exposure time settings
     - Buffer size configuration
-    - File format selection (TIFF / Zarr / HDF5)
+    - File format selection (TIFF / Zarr / HDF5 / Raw)
     - Output directory selection
     - Start/Stop acquisition controls
     - Real-time statistics (FPS, buffer fill, write speed)
@@ -1779,7 +1779,7 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("File Format:"), 2, 2)
         self.file_format_combo = QComboBox()
-        self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5"])
+        self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5", "Raw"])
         acq_layout.addWidget(self.file_format_combo, 2, 3)
 
         acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
@@ -2189,7 +2189,8 @@ class FastAcquisitionWidget(QWidget):
             file_format_map = {
                 "TIFF": "tiff",
                 "Zarr": "zarr",
-                "HDF5": "hdf5"
+                "HDF5": "hdf5",
+                "Raw": "raw",
             }
             self._controller = FastAcquisitionController(
                 camera=self.camera,

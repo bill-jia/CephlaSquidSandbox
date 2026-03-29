@@ -163,20 +163,109 @@ TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3,
 }
 
 
-def _rawimg_header_to_numpy(m_rawHeader: TUCAM_RAWIMG_HEADER) -> np.ndarray:
-    """
-    Copy raw image from TUCAM_Buf_GetData header into a (H, W) uint16 array.
-    Mirrors _convert_frame_to_numpy for TUCAM_FRAME, but uses RAWIMG header fields.
-    """
-    size = int(m_rawHeader.uiImgSize)
-    if size == 0 or not m_rawHeader.pImgData:
-        raise ValueError("empty raw image buffer")
-    buf = create_string_buffer(size)
-    memmove(buf, m_rawHeader.pImgData, size)
-    data = bytes(buf)
-    image_np = np.frombuffer(data, dtype=np.uint16)
-    h, w = int(m_rawHeader.usHeight), int(m_rawHeader.usWidth)
-    return image_np.reshape((h, w))
+# ============================================================================
+# Fast acquisition: raw byte packing (HDR 16-bit, CMS 12-bit, HS 11-bit)
+# ============================================================================
+
+
+def camera_mode_name_to_packing(mode_name: Optional[str]) -> str:
+    """Map Tucsen get_camera_mode() string to a packing tag."""
+    if not mode_name:
+        return "hdr16"
+    m = str(mode_name).lower().strip()
+    if m in ("hdr", "standard", "low_noise", "senbin"):
+        return "hdr16"
+    if m in ("cms", "sensitivity"):
+        return "cms12"
+    if m in ("high_speed", "speed"):
+        return "hs11"
+    return "hdr16"
+
+
+def max_frame_bytes_for_tucsen_mode(height: int, width: int, packing: str) -> int:
+    """Upper bound on bytes per frame for the fast-acquisition ring buffer."""
+    n = int(height) * int(width)
+    p = packing.lower()
+    if p == "hdr16":
+        return n * 2
+    if p in ("cms12", "hs11"):
+        return (n * 3 + 1) // 2
+    return n * 2
+
+
+def decode_tucsen_hdr16(raw: bytes, height: int, width: int) -> np.ndarray:
+    """Decode HDR16 using fixed (height, width). ``raw`` must be at least ``height*width*2`` bytes (pad upstream)."""
+    n = height * width
+    expected = n * 2
+    if len(raw) < expected:
+        raise ValueError(f"HDR16: need {expected} bytes, got {len(raw)}")
+    return np.frombuffer(raw[:expected], dtype=np.uint16).reshape(height, width)
+
+def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
+    """Vectorized decoding of 12-bit pixels packed into 3 bytes."""
+    n = height * width
+    expected = (n * 3 + 1) // 2
+    if len(raw) < expected:
+        # Extend the raw bytes to the expected length
+        raw = raw + b'\x00' * (expected - len(raw))
+    
+    # Calculate how many full pairs of pixels we have
+    pairs = n // 2
+    
+    # 1. Map the relevant raw bytes directly into a fast, read-only 1D uint8 array
+    # 2. Reshape it into a 2D array where each row is a 3-byte chunk [b0, b1, b2]
+    data = np.frombuffer(raw[:pairs * 3], dtype=np.uint8).reshape(-1, 3)
+    
+    # Cast the columns to uint16 BEFORE bit-shifting to prevent 8-bit overflow
+    b0 = data[:, 0].astype(np.uint16)
+    b1 = data[:, 1].astype(np.uint16)
+    b2 = data[:, 2].astype(np.uint16)
+    
+    # Allocate a 2D array for the output pixel pairs
+    out = np.empty((pairs, 2), dtype=np.uint16)
+    
+    # Perform the bitwise operations on all pixels at once
+    out[:, 0] = (b0 << 4) | (b1 >> 4)
+    out[:, 1] = (b2 << 4) | (b1 & 0x0F)
+    
+    # Flatten the array back to 1D
+    out_flat = out.ravel()
+    
+    # Handle the odd trailing pixel if the total pixel count 'n' is not an even number
+    if n % 2 != 0:
+        out_final = np.empty(n, dtype=np.uint16)
+        out_final[:n-1] = out_flat
+        i = pairs * 3
+        out_final[-1] = int.from_bytes(raw[i : i + 2], "little") & 0xFFF
+        return out_final.reshape(height, width)
+    
+    return out_flat.reshape(height, width)
+
+
+def decode_tucsen_hs11(raw: bytes, height: int, width: int) -> np.ndarray:
+    """11-bit values in 12-bit packing with LSB zero; unpack as CMS12 then shift right by one."""
+    u12 = decode_tucsen_cms12(raw, height, width)
+    return u12.astype(np.uint16) 
+    # return (u12 >> 1).astype(np.uint16)
+
+def tucsen_raw_bytes_to_uint16(raw: bytes, meta: dict, packing: str = "hdr16") -> np.ndarray:
+    """Decode one frame; packing comes from the camera (see byte_decoding_fn closure), not metadata."""
+    height = int(meta["height"])
+    width = int(meta["width"])
+    p = packing.lower()
+    if p == "hdr16":
+        return decode_tucsen_hdr16(raw, height, width)
+    if p == "cms12":
+        return decode_tucsen_cms12(raw, height, width)
+    if p == "hs11":
+        return decode_tucsen_hs11(raw, height, width)
+    raise ValueError(f"Unknown Tucsen packing for fast-acquisition decode: {packing!r}")
+
+
+def decode_tucsen_raw_bytes(packing: str, raw: bytes, height: int, width: int) -> np.ndarray:
+    """Test/helper: decode using explicit dimensions (same as ``tucsen_raw_bytes_to_uint16``)."""
+    meta = {"height": int(height), "width": int(width)}
+    return tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
 
 
 class TucsenCameraCallBack:
@@ -199,15 +288,21 @@ class TucsenCameraCallBack:
                 return
             if self.callback_function is None:
                 return
-            if int(m_rawHeader.uiImgSize) == 0 or not m_rawHeader.pImgData:
+            size = int(m_rawHeader.uiImgSize)
+            if size == 0 or not m_rawHeader.pImgData:
                 return
+            buf = create_string_buffer(size)
+            memmove(buf, m_rawHeader.pImgData, size)
+            frame_bytes = bytes(buf)
             metadata: Dict[str, object] = {
                 "timestamp": m_rawHeader.dblTimeLast,
                 "frame_index": int(m_rawHeader.uiIndex),
                 "exposure_s": float(m_rawHeader.dblExposure),
+                "height": int(m_rawHeader.usHeight),
+                "width": int(m_rawHeader.usWidth),
+                "ui_img_size": size,
             }
-            frame = _rawimg_header_to_numpy(m_rawHeader)
-            self.callback_function(frame, metadata)
+            self.callback_function(frame_bytes, metadata)
         except Exception as e:
             print(f"TucsenCameraCallBack: {e}", exc_info=True)
 
@@ -319,6 +414,7 @@ class TucsenCamera(AbstractCamera):
         self._fast_acquisition_capture_active = False
         self._fast_acq_buffer_callback_obj: Optional[TucsenCameraCallBack] = None
         self._fast_acq_buffer_callback_fn = None
+        self._byte_decoding_fn = None
 
         self._camera = TucsenCamera._open(index=0)
         self._model_properties = self._get_model_properties(self._config.camera_model)
@@ -340,6 +436,9 @@ class TucsenCamera(AbstractCamera):
         ):
             self._camera_mode = ModeAries.HDR
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+
+        packing = camera_mode_name_to_packing(self.get_camera_mode())
+        self._byte_decoding_fn = lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
 
         if not hasattr(self, "_max_acquisition_rate_hz"):
             self._max_acquisition_rate_hz = 100.0
@@ -460,6 +559,10 @@ class TucsenCamera(AbstractCamera):
         if self._model_properties.is_genicam:
             for port in TUCAM_OUTPUTTRG_PORT:
                 self._set_genicam_parameter("TriggerPort", port.value, TUELEM_TYPE.TU_ElemInteger.value)
+                if port == TUCAM_OUTPUTTRG_PORT.TUPORT_OUT_ONE:
+                    self._set_genicam_parameter("TriggerPortEnable", 1, TUELEM_TYPE.TU_ElemInteger.value)
+                else:
+                    self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
                 self._set_genicam_parameter("TriggerOutputWidth", 40, TUELEM_TYPE.TU_ElemInteger.value)
 
         self.set_binning(*self._config.default_binning)
@@ -531,7 +634,7 @@ class TucsenCamera(AbstractCamera):
         self,
         frame_rate_hz: float,
         n_frames_expected=0,
-        frame_callback: Optional[Callable[[np.ndarray, Optional[dict]], None]] = None,
+        frame_callback: Optional[Callable[..., None]] = None,
         acquisition_mode: Optional[CameraAcquisitionMode] = None,
     ):
         """
@@ -544,8 +647,8 @@ class TucsenCamera(AbstractCamera):
         Args:
             frame_rate_hz: Expected frame rate (used for internal buffer sizing).
             n_frames_expected: Hint for expected number of frames (informational).
-            frame_callback: Receives (frame: ndarray, metadata: dict). Metadata includes
-                timestamp, frame_index, exposure_s.
+            frame_callback: Receives (frame: bytes, metadata: dict). Metadata includes
+                timestamp, frame_index, exposure_s, height, width, ui_img_size.
             acquisition_mode: Optional; use when GenICam cannot distinguish HARDWARE_TRIGGER
                 vs HARDWARE_TRIGGER_FIRST from get_acquisition_mode() alone.
         """
@@ -649,6 +752,7 @@ class TucsenCamera(AbstractCamera):
         else:
             self._log.info("Closed camera successfully")
         TUCAM_Api_Uninit()
+        time.sleep(1.0)
         self._camera = TucsenCamera._open(index=0)
         if self._camera is None:
             raise CameraError("Failed to reopen camera after fast acquisition")
@@ -967,6 +1071,14 @@ class TucsenCamera(AbstractCamera):
                     return name
         return None
 
+    def get_fast_acquisition_max_frame_bytes(self) -> int:
+        # Seems like frame buffer still sending as if it's 16 bits
+        roi = self.get_region_of_interest()
+        h, w = roi[3], roi[2]
+        packing = camera_mode_name_to_packing(self.get_camera_mode())
+        n_bytes = max_frame_bytes_for_tucsen_mode(h, w, packing)
+        return n_bytes
+
     def set_camera_mode(self, mode_name: str):
         """
         Set the camera readout mode by name (Tucsen model-specific).
@@ -1035,6 +1147,8 @@ class TucsenCamera(AbstractCamera):
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+        packing = camera_mode_name_to_packing(self.get_camera_mode())
+        self._byte_decoding_fn = lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
 
     def _raw_set_resolution(self, bin_value: int):
         with self._pause_streaming():
@@ -1454,7 +1568,7 @@ class TucsenCamera(AbstractCamera):
 
         return param_info
 
-    def _set_genicam_parameter(self, param_name: str, value: any, param_type: int) -> bool:
+    def _set_genicam_parameter(self, param_name: str, value: any, param_type: int, log_info: bool = False) -> bool:
         """
         Set a GenICam parameter value.
 
@@ -1510,7 +1624,6 @@ class TucsenCamera(AbstractCamera):
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to set boolean parameter '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {bool(node.uValue.Int64.nVal)}")
 
             # Command type
             elif node.Type == elemtype.TU_ElemCommand.value:
@@ -1518,17 +1631,13 @@ class TucsenCamera(AbstractCamera):
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to execute command '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Executed command {param_name}")
 
             # Integer type
             elif node.Type == elemtype.TU_ElemInteger.value:
-                self._log.info(f"Setting integer parameter '{param_name}' to {value}")
                 node.uValue.Int64.nVal = int(value)
-
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to set integer parameter '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {node.uValue.Int64.nVal}")
 
             # Float type
             elif node.Type == elemtype.TU_ElemFloat.value:
@@ -1537,7 +1646,6 @@ class TucsenCamera(AbstractCamera):
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to set float parameter '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {node.uValue.Double.dbVal}")
 
             # String or Register type
             elif node.Type in [elemtype.TU_ElemString.value, elemtype.TU_ElemRegister.value]:
@@ -1546,7 +1654,6 @@ class TucsenCamera(AbstractCamera):
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to set string parameter '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {value}")
 
             # Enumeration type
             elif node.Type == elemtype.TU_ElemEnumeration.value:
@@ -1561,8 +1668,6 @@ class TucsenCamera(AbstractCamera):
                 result = TUCAM_GenICam_SetElementValue(self._camera, pointer(node), TUXML_DEVICE.TU_CAMERA_XML.value)
                 if result != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(f"Failed to set enum parameter '{param_name}'")
-                self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = index {value}")
-
             else:
                 raise ValueError(f"Unsupported GenICam parameter type: {node.Type}")
 
@@ -1572,4 +1677,8 @@ class TucsenCamera(AbstractCamera):
             self._log.exception(f"Error setting GenICam parameter '{param_name}': {e}")
             raise CameraError(f"Failed to set GenICam parameter '{param_name}': {str(e)}")
 
+        if log_info:
+            self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {value}")
+        
+        time.sleep(0.1) # Sleep to avoid sequential parameter setting from causing errors
         return True

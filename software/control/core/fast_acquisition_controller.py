@@ -13,13 +13,13 @@ import os
 import threading
 import time
 from enum import Enum
-from typing import Any, Optional, Dict, Callable
+from typing import Any, Optional, Dict, Callable, Union
 import numpy as np
 from scipy import ndimage
 import squid.logging
 import matplotlib.pyplot as plt
 
-from squid.abc import AbstractCamera, CameraAcquisitionMode, CameraFrame
+from squid.abc import AbstractCamera, CameraAcquisitionMode
 from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.nidaq import AbstractNIDAQ, WaveformData, TriggerSource
@@ -59,15 +59,16 @@ class FastAcquisitionController:
         """
         Initialize fast acquisition controller.
 
-        When camera is None (DAQ-only mode), no frame buffer or writer is created;
-        only DAQ waveform output and recording are performed.
+        When camera is None (DAQ-only mode), no frame buffer or writer is used.
+        With a camera, the ring buffer and writer are created when each acquisition
+        starts and released when it finishes.
 
         Args:
             camera: Camera instance, or None for DAQ-only (waveform output/recording only)
             ni_daq: NI DAQ instance (for triggering and waveform recording)
             output_path: Base directory for saving data
-            buffer_size: Number of frames to buffer in memory (ignored when camera is None)
-            file_format: File format for saving ("tiff", "zarr", or "hdf5") (ignored when camera is None)
+            buffer_size: Ring buffer capacity in frames (used when a camera acquisition starts)
+            file_format: File format for saving ("tiff", "zarr", "hdf5", or "raw") (ignored when camera is None)
             trigger_dio_line: Digital output line for camera triggers (default: 1); unused in DAQ-only
             camera_frame_dio_line: Digital input line for camera frame signal (default: 0); unused in DAQ-only
             illumination_controller: Optional IlluminationController; when provided its
@@ -89,37 +90,12 @@ class FastAcquisitionController:
         self._microscope = microscope
         self._live_controller = live_controller
 
-        if camera is not None:
-            # Get frame shape from camera
-            roi = camera.get_region_of_interest()
-            frame_shape = (roi[3], roi[2])  # (height, width)
-            pixel_format = camera.get_pixel_format()
-            dtype_map = {
-                "MONO8": np.uint8,
-                "MONO10": np.uint8,
-                "MONO12": np.uint16,
-                "MONO14": np.uint16,
-                "MONO16": np.uint16,
-            }
-            dtype = dtype_map.get(pixel_format.name, np.uint16)
-            self._frame_shape = frame_shape
-            self._dtype = dtype
-            self._frame_buffer = FastAcquisitionFrameBuffer(
-                buffer_size=buffer_size,
-                frame_shape=frame_shape,
-                dtype=dtype,
-                overwrite_when_full=True
-            )
-            self._frame_writer = FastAcquisitionWriter(
-                frame_buffer=self._frame_buffer,
-                output_path=output_path,
-                file_format=file_format
-            )
-        else:
-            self._frame_shape = None
-            self._dtype = None
-            self._frame_buffer = None
-            self._frame_writer = None
+        self._buffer_size = buffer_size
+        self._file_format = file_format
+        self._frame_shape = None
+        self._dtype = None
+        self._frame_buffer = None
+        self._frame_writer = None
 
         # State
         self._is_acquiring = False
@@ -129,6 +105,8 @@ class FastAcquisitionController:
         self._expected_duration_s: Optional[float] = None
         self._timeout_s: Optional[float] = None
         self._stop_called = False  # Flag to prevent duplicate stop_acquisition calls
+        self._writer_shutdown_lock = threading.Lock()
+        self._writer_shutdown_thread: Optional[threading.Thread] = None
 
         # Completion tracking
         self._completion_status = AcquisitionCompletionStatus.NOT_STARTED
@@ -155,7 +133,124 @@ class FastAcquisitionController:
                 f"output={output_path}, trigger_line={trigger_dio_line}, "
                 f"frame_signal_line={camera_frame_dio_line}"
             )
-    
+
+    def _create_camera_acquisition_resources(self) -> None:
+        """Allocate the ring buffer and writer for the current camera ROI and format."""
+        if self._daq_only or self._camera is None:
+            return
+        roi = self._camera.get_region_of_interest()
+        frame_shape = (roi[3], roi[2])
+        pixel_format = self._camera.get_pixel_format()
+        dtype_map = {
+            "MONO8": np.uint8,
+            "MONO10": np.uint8,
+            "MONO12": np.uint16,
+            "MONO14": np.uint16,
+            "MONO16": np.uint16,
+        }
+        dtype = dtype_map.get(pixel_format.name, np.uint16)
+        max_frame_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
+        self._frame_shape = frame_shape
+        self._dtype = dtype
+        self._frame_buffer = FastAcquisitionFrameBuffer(
+            buffer_size=self._buffer_size,
+            max_frame_bytes=max_frame_bytes,
+            frame_shape=frame_shape,
+            dtype=dtype,
+            overwrite_when_full=True,
+        )
+        self._frame_writer = FastAcquisitionWriter(
+            frame_buffer=self._frame_buffer,
+            output_path=self._output_path,
+            file_format=self._file_format,
+            byte_decoding_fn=self._camera._byte_decoding_fn,
+            frame_shape=frame_shape,
+            dtype=dtype,
+        )
+
+    def _cleanup_camera_acquisition_resources(self) -> None:
+        """Drop references to the ring buffer and writer after an acquisition ends."""
+        if self._daq_only:
+            return
+        self._frame_buffer = None
+        self._frame_writer = None
+
+    def _is_previous_writer_busy(self) -> bool:
+        """True if a prior FastAcquisitionWriter thread is still running (capture or conversion)."""
+        if self._daq_only:
+            return False
+        w = self._frame_writer
+        if w is None:
+            return False
+        return w.is_alive() or bool(getattr(w, "is_converting_frames", False))
+
+    def _schedule_writer_shutdown_and_cleanup(self) -> None:
+        """
+        Join the frame writer in a daemon thread, then log stats and release buffer/writer refs.
+        Used so stop_acquisition can return before TIFF/Zarr/HDF5 conversion finishes.
+        """
+        writer = self._frame_writer
+        if writer is None:
+            return
+        with self._writer_shutdown_lock:
+            if self._writer_shutdown_thread is not None and self._writer_shutdown_thread.is_alive():
+                return
+
+            def _join_log_cleanup() -> None:
+                try:
+                    writer.join()
+                finally:
+                    try:
+                        if self._frame_writer is writer:
+                            writer_stats = writer.get_write_statistics()
+                            frames_written = int(writer_stats.get("frames_written", 0))
+                            expected_frames = int(self._frame_count)
+                            dropped_frames = max(expected_frames - frames_written, 0)
+                            self._log.info(
+                                f"Fast acquisition frame summary (after writer finished): "
+                                f"expected={expected_frames}, written={frames_written}, "
+                                f"dropped={dropped_frames}"
+                            )
+                    except Exception as e:
+                        self._log.warning(
+                            f"Failed to compute dropped frame statistics after writer join: {e}",
+                            exc_info=True,
+                        )
+                    try:
+                        if self._frame_writer is writer:
+                            self._cleanup_camera_acquisition_resources()
+                    except Exception as e:
+                        self._log.warning(
+                            f"Failed to release frame buffer/writer after join: {e}", exc_info=True
+                        )
+                    with self._writer_shutdown_lock:
+                        self._writer_shutdown_thread = None
+
+            self._writer_shutdown_thread = threading.Thread(
+                target=_join_log_cleanup,
+                daemon=True,
+                name="FastAcqWriterJoin",
+            )
+            self._writer_shutdown_thread.start()
+
+    def _cleanup_after_failed_camera_start(self) -> None:
+        """Stop writer and release buffer/writer if starting the camera acquisition failed."""
+        if self._daq_only:
+            return
+        if self._frame_writer is not None:
+            try:
+                self._frame_writer.stop(wait=True)
+            except Exception as e:
+                self._log.warning(f"Failed to stop frame writer after failed start: {e}", exc_info=True)
+        if self._camera is not None and hasattr(self._camera, "stop_fast_acquisition_frame_grabbing"):
+            try:
+                self._camera.stop_fast_acquisition_frame_grabbing()
+            except Exception as e:
+                self._log.warning(f"Failed to stop camera grab after failed start: {e}", exc_info=True)
+        self._cleanup_camera_acquisition_resources()
+        self._frame_shape = None
+        self._dtype = None
+
     def start_acquisition(self, num_frames: Optional[int] = None,
                          frame_rate_hz: float = 10.0,
                          exposure_time_ms: float = 20.0,
@@ -190,6 +285,12 @@ class FastAcquisitionController:
         """
         if self._is_acquiring:
             self._log.warning("Acquisition already running")
+            return
+        if self._is_previous_writer_busy():
+            self._log.warning(
+                "Cannot start acquisition: the previous run is still converting frames "
+                "to the output format (TIFF/Zarr/HDF5); wait for it to finish"
+            )
             return
 
         if self._ni_daq is None:
@@ -301,20 +402,6 @@ class FastAcquisitionController:
             # configure_task_io; in that case we fall back to using the config dict.
             pass
 
-        # config = {
-        #     "device_name": self._ni_daq.config.device_name,
-        #     "sample_rate_hz": sample_rate_hz,
-        #     "samples_per_channel": samples_per_channel,
-        #     "do_port": "port0",
-        #     "do_lines": do_lines_from_waveforms,
-        #     "di_port": "port0",
-        #     "di_lines": di_lines_to_record,
-        #     "ai_channels": ai_channels or [],
-        #     "ao_channels": ao_channels or [],
-        #     "trigger_source": self._ni_daq.config.trigger_source,
-        #     "continuous": False,
-        #     "do_logic_family": self._ni_daq.config.do_logic_family,
-        # }
 
         # Snapshot illumination state before handing off to the DAQ task, so the
         # higher-level channel state can be restored after the acquisition completes.
@@ -352,47 +439,78 @@ class FastAcquisitionController:
                     self._camera._optimize_for_fast_acquisition()
                 except Exception as e:
                     self._log.warning(f"Could not optimize camera for fast acquisition: {e}")
-            self._frame_writer.start()
+            self._create_camera_acquisition_resources()
+            try:
+                self._frame_writer.start()
+            except Exception:
+                self._cleanup_after_failed_camera_start()
+                raise
 
-        self._is_acquiring = True
         self._frame_count = 0
         self._start_time = time.time()
         self._stop_event.clear()
         self._stop_called = False
         self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
         self._completion_error_message = None
+        expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
 
         if not self._daq_only:
-            def frame_callback(frame: np.ndarray, metadata: dict = None):
+
+            def frame_callback(
+                frame: Union[bytes, np.ndarray], metadata: Optional[dict] = None
+            ):
+                md = dict(metadata) if metadata else {}
+                if isinstance(frame, np.ndarray):
+                    frame_bytes = np.ascontiguousarray(frame).tobytes()
+                    if "height" not in md:
+                        md["height"] = int(frame.shape[0])
+                    if "width" not in md:
+                        md["width"] = int(frame.shape[1])
+                else:
+                    frame_bytes = frame
+
+                if "expected_decode_bytes" not in md:
+                    md["expected_decode_bytes"] = expected_decode_bytes
                 placeholder_frame_id = self._frame_count
-                if metadata is None:
+                if not md:
                     timestamp = time.time()
-                elif "frame_header" in metadata:
-                    timestamp = float(metadata["frame_header"]["timestampEofPs"]) / 1e9
-                elif "timestamp" in metadata:
-                    timestamp = float(metadata["timestamp"])
+                elif "frame_header" in md:
+                    timestamp = float(md["frame_header"]["timestampEofPs"]) / 1e9
+                elif "timestamp" in md:
+                    timestamp = float(md["timestamp"])
                 else:
                     timestamp = time.time()
-                success = self._frame_buffer.write_frame(frame, placeholder_frame_id, timestamp)
+
+                success = self._frame_buffer.write_frame(
+                    frame_bytes, placeholder_frame_id, timestamp, md
+                )
                 if success:
                     self._frame_count += 1
                     with self._stats_lock:
                         self._last_frame_time = time.time()
                 else:
-                    self._log.warning(f"Failed to write frame {placeholder_frame_id} to buffer")
+                    self._log.warning(
+                        f"Failed to write frame {placeholder_frame_id} to buffer"
+                    )
 
-            if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
-                self._camera.start_fast_acquisition_frame_grabbing(
-                    frame_rate_hz,
-                    n_frames_expected=num_frames,
-                    frame_callback=frame_callback,
-                    acquisition_mode=acquisition_mode,
-                )
-            else:
-                raise NotImplementedError(
-                    "Camera does not support fast acquisition frame grabbing. "
-                    "This requires a camera implementation with start_fast_acquisition_frame_grabbing() method."
-                )
+            try:
+                if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
+                    self._camera.start_fast_acquisition_frame_grabbing(
+                        frame_rate_hz,
+                        n_frames_expected=num_frames,
+                        frame_callback=frame_callback,
+                        acquisition_mode=acquisition_mode,
+                    )
+                else:
+                    raise NotImplementedError(
+                        "Camera does not support fast acquisition frame grabbing. "
+                        "This requires a camera implementation with start_fast_acquisition_frame_grabbing() method."
+                    )
+            except Exception:
+                self._cleanup_after_failed_camera_start()
+                raise
+
+        self._is_acquiring = True
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_acquisition,
@@ -408,7 +526,10 @@ class FastAcquisitionController:
     def stop_acquisition(self, manual_stop: bool = False, error_message: Optional[str] = None):
         """
         Stop fast acquisition.
-        
+
+        Returns after DAQ/camera teardown and metadata save; TIFF/Zarr/HDF5 conversion of
+        raw frames (when applicable) continues on a background thread so the UI is not blocked.
+
         Args:
             manual_stop: If True, indicates this is a manual stop by user.
                         If False, indicates automatic completion (e.g., frame limit reached).
@@ -427,13 +548,13 @@ class FastAcquisitionController:
         
         self._log.info(f"Stopping fast acquisition (manual={manual_stop}, error={error_message is not None})...")
         
-        # Signal stop
+        # Signal stop (writer thread may continue converting in the background)
         self._stop_event.set()
-        self._is_acquiring = False
-        
+
         completion_status = None
         completion_error = error_message
-        
+        writer_stopped = False
+
         try:
             # Stop NI DAQ
             if self._ni_daq:
@@ -476,29 +597,24 @@ class FastAcquisitionController:
                             "No trigger detected on camera signal line; "
                             f"falling back to callback frame count: {self._frame_count}"
                         )
-
-            if not self._daq_only:
-                if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'):
-                    self._camera.stop_fast_acquisition_frame_grabbing()
-                self._frame_writer.stop()
-                try:
-                    writer_stats = self._frame_writer.get_write_statistics()
-                    frames_written = int(writer_stats.get("frames_written", 0))
-                    expected_frames = int(self._frame_count)
-                    dropped_frames = max(expected_frames - frames_written, 0)
-                    self._log.info(
-                        f"Fast acquisition frame summary: "
-                        f"expected={expected_frames}, written={frames_written}, "
-                        f"dropped={dropped_frames}"
-                    )
-                except Exception as e:
-                    self._log.warning(f"Failed to compute dropped frame statistics: {e}", exc_info=True)
-                if getattr(self._frame_writer, "_file_format", "").lower() in ["tiff", "tif"]:
-                    self._start_tiff_stack_conversion_thread()
-
             # Save DAQ data and metadata (both camera and DAQ-only)
             self._save_daq_data()
             self._save_metadata()
+            
+            if not self._daq_only:
+                if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'):
+                    self._camera.stop_fast_acquisition_frame_grabbing()
+                if self._frame_writer is not None:
+                    self._frame_writer.stop(wait=False)
+                    self._log.info(
+                        "Frame writer signaled to stop; TIFF/Zarr/HDF5 conversion (if any) "
+                        "continues in the background"
+                    )
+                    self._schedule_writer_shutdown_and_cleanup()
+                    writer_stopped = True
+            # TIFF / Zarr / HDF5 post-decode runs inside FastAcquisitionWriter after raw closes.
+
+
             
             # Determine completion status
             if completion_error:
@@ -515,7 +631,18 @@ class FastAcquisitionController:
             completion_status = AcquisitionCompletionStatus.COMPLETED_ERROR
             if not completion_error:
                 completion_error = str(e)
-        
+        finally:
+            if not self._daq_only:
+                if not writer_stopped and self._frame_writer is not None:
+                    try:
+                        self._frame_writer.stop(wait=False)
+                        self._schedule_writer_shutdown_and_cleanup()
+                    except Exception as e:
+                        self._log.warning(
+                            f"Failed to stop frame writer during cleanup: {e}", exc_info=True
+                        )
+            self._is_acquiring = False
+
         # Notify completion
         self._notify_completion(completion_status, completion_error)
     
@@ -649,10 +776,11 @@ class FastAcquisitionController:
             frames_written = None
             dropped_frames = None
             try:
-                writer_stats = self._frame_writer.get_write_statistics()
-                frames_written = int(writer_stats.get("frames_written", 0))
-                expected_frames = int(self._frame_count)
-                dropped_frames = max(expected_frames - frames_written, 0)
+                if self._frame_writer is not None:
+                    writer_stats = self._frame_writer.get_write_statistics()
+                    frames_written = int(writer_stats.get("frames_written", 0))
+                    expected_frames = int(self._frame_count)
+                    dropped_frames = max(expected_frames - frames_written, 0)
             except Exception as e:
                 self._log.warning(f"Could not compute writer statistics for metadata: {e}", exc_info=True)
             metadata["frame_count"] = self._frame_count
@@ -660,10 +788,21 @@ class FastAcquisitionController:
             metadata["frames_dropped"] = dropped_frames
             metadata["trigger_dio_line"] = self._trigger_dio_line
             metadata["camera_frame_dio_line"] = self._camera_frame_dio_line
-            metadata["buffer_size"] = self._frame_buffer.get_buffer_status()["buffer_size"]
-            metadata["file_format"] = self._frame_writer._file_format
+            metadata["buffer_size"] = (
+                self._frame_buffer.get_buffer_status()["buffer_size"]
+                if self._frame_buffer is not None
+                else self._buffer_size
+            )
+            metadata["file_format"] = (
+                self._frame_writer._file_format
+                if self._frame_writer is not None
+                else self._file_format
+            )
             metadata["frame_shape_hw"] = list(self._frame_shape) if self._frame_shape is not None else None
             metadata["dtype"] = str(self._dtype) if self._dtype is not None else None
+            metadata["frame_metadata_jsonl"] = os.path.join("frames", "frame_metadata.jsonl").replace(
+                "\\", "/"
+            )
             try:
                 metadata["camera_settings"] = {
                     "exposure_time_ms": self._camera.get_exposure_time(),
@@ -736,112 +875,6 @@ class FastAcquisitionController:
         except Exception as e:
             self._log.warning("Could not save acquisition_metadata.yaml for fast acquisition: %s", e, exc_info=True)
 
-    def _start_tiff_stack_conversion_thread(self):
-        """
-        Start a background thread that converts the raw bytestream written
-        during acquisition into a 3D TIFF stack.
-
-        This is intentionally decoupled from the acquisition so that heavy I/O
-        and compression do not interfere with frame capture.
-        """
-
-        def _worker():
-            try:
-                self._convert_raw_to_tiff_stack()
-            except Exception as e:
-                self._log.error(f"Error converting raw frames to TIFF stack: {e}", exc_info=True)
-
-        t = threading.Thread(target=_worker, name="FastAcq-TIFF-Conversion", daemon=True)
-        t.start()
-
-    def _convert_raw_to_tiff_stack(self):
-        """
-        Convert the raw bytestream file produced by FastAcquisitionWriter
-        (TIFF mode) into a single 3D TIFF stack.
-        """
-        import os
-        import imageio as iio
-
-        # Raw file is written by FastAcquisitionWriter in frames/frames.raw
-        raw_path = os.path.join(self._output_path, "frames", "frames.raw")
-        if not os.path.exists(raw_path):
-            self._log.warning(f"Raw frame file not found at {raw_path}, skipping TIFF stack conversion")
-            return
-
-        if not hasattr(self, "_frame_shape") or not hasattr(self, "_dtype"):
-            self._log.error("Frame shape or dtype not available, cannot convert raw data to TIFF stack")
-            return
-
-        height, width = self._frame_shape
-        dtype = self._dtype
-
-        # Compute expected bytes per frame
-        pixels_per_frame = int(height * width)
-        bytes_per_pixel = np.dtype(dtype).itemsize
-        bytes_per_frame = pixels_per_frame * bytes_per_pixel
-
-        file_size = os.path.getsize(raw_path)
-        if bytes_per_frame == 0:
-            self._log.error("Computed bytes per frame is zero, cannot convert raw data")
-            return
-
-        # Use the smaller of: frame_count and file_size-derived frame count
-        max_frames_from_file = file_size // bytes_per_frame
-        n_frames = min(self._frame_count, max_frames_from_file)
-
-        if n_frames <= 0:
-            self._log.warning(
-                f"No frames to convert (frame_count={self._frame_count}, "
-                f"file_size={file_size}, bytes_per_frame={bytes_per_frame})"
-            )
-            return
-
-        if self._frame_count != max_frames_from_file:
-            self._log.warning(
-                "Mismatch between recorded frame_count and raw file size: "
-                f"frame_count={self._frame_count}, "
-                f"file_size={file_size}, "
-                f"bytes_per_frame={bytes_per_frame}, "
-                f"frames_from_file={max_frames_from_file}. "
-                f"Using n_frames={n_frames}."
-            )
-
-        self._log.info(
-            f"Converting raw frames to 3D TIFF stack: {n_frames} frames, "
-            f"shape=({height},{width}), dtype={dtype}, raw_path={raw_path}"
-        )
-
-        # Read raw data and reshape into (n_frames, height, width)
-        with open(raw_path, "rb") as f:
-            raw = np.fromfile(f, dtype=dtype, count=n_frames * pixels_per_frame)
-
-        if raw.size != n_frames * pixels_per_frame:
-            self._log.warning(
-                f"Read {raw.size} pixels, expected {n_frames * pixels_per_frame}; "
-                "resulting stack may be truncated."
-            )
-            n_frames = raw.size // pixels_per_frame
-            raw = raw[: n_frames * pixels_per_frame]
-
-        volume = raw.reshape((n_frames, height, width))
-
-        # Write 3D TIFF stack next to raw file
-        stack_path = os.path.join(self._output_path, "frames", "frames_stack.tiff")
-        try:
-            iio.mimwrite(stack_path, volume, format="tiff")
-            self._log.info(f"Wrote 3D TIFF stack to {stack_path}")
-            
-            # Delete raw file after successful conversion to save disk space
-            try:
-                os.remove(raw_path)
-                self._log.info(f"Deleted raw frame file {raw_path} after successful TIFF stack conversion")
-            except Exception as e:
-                self._log.warning(f"Failed to delete raw file {raw_path}: {e}", exc_info=True)
-                # Non-fatal: conversion succeeded, just couldn't clean up raw file
-        except Exception as e:
-            self._log.error(f"Failed to write TIFF stack to {stack_path}: {e}", exc_info=True)
-            # Don't delete raw file if conversion failed - user may want to retry
-    
     def get_statistics(self) -> Dict:
         """Get acquisition statistics."""
         elapsed = time.time() - self._start_time if self._start_time else 1.0
@@ -850,6 +883,17 @@ class FastAcquisitionController:
                 "duration_s": elapsed,
                 "frame_count": 0,
                 "frame_rate": 0.0,
+                "buffer_fill_percent": 0,
+                "frames_written": 0,
+                "write_rate": 0,
+                "avg_write_time_ms": 0,
+            }
+        if self._frame_buffer is None or self._frame_writer is None:
+            with self._stats_lock:
+                frame_rate = self._frame_count / elapsed if elapsed > 0 else 0.0
+            return {
+                "frame_count": self._frame_count,
+                "frame_rate": frame_rate,
                 "buffer_fill_percent": 0,
                 "frames_written": 0,
                 "write_rate": 0,

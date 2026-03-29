@@ -1151,7 +1151,14 @@ class FLIRCamera(AbstractCamera):
             try:
                 numpy_image = raw_image.GetNDArray()
                 if self._fast_acquisition_callback:
-                    self._fast_acquisition_callback(numpy_image)
+                    meta = {
+                        "height": int(numpy_image.shape[0]),
+                        "width": int(numpy_image.shape[1]),
+                        "dtype": str(numpy_image.dtype),
+                    }
+                    self._fast_acquisition_callback(
+                        np.ascontiguousarray(numpy_image).tobytes(), meta
+                    )
             finally:
                 try:
                     raw_image.Release()

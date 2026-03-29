@@ -944,6 +944,35 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         pass
 
+    def get_fast_acquisition_max_frame_bytes(self) -> int:
+        """
+        Maximum bytes per frame for the fast-acquisition ring buffer.
+        Default: H*W * pixel dtype size from current ROI and pixel format.
+        """
+        roi = self.get_region_of_interest()
+        h, w = roi[3], roi[2]
+        pixel_format = self.get_pixel_format()
+        dtype_map = {
+            "MONO8": np.uint8,
+            "MONO10": np.uint8,
+            "MONO12": np.uint16,
+            "MONO14": np.uint16,
+            "MONO16": np.uint16,
+        }
+        self._log.info(f"dtype_map: {dtype_map}, h: {h}, w: {w}, itemsize: {np.dtype(np.uint16).itemsize}")
+        dtype = dtype_map.get(pixel_format.name, np.uint16)
+        return int(h * w * np.dtype(dtype).itemsize)
+
+    def _raw_to_uint16(self):
+        """
+        Optional packed-raw decoder for fast acquisition.
+
+        Returns:
+            Callable[[bytes, dict], np.ndarray] producing (H, W) uint16, or None to
+            interpret raw bytes as a flat array of self-reported shape/dtype.
+        """
+        return None
+
     @abc.abstractmethod
     def set_temperature(self, temperature_deg_c: Optional[float]):
         """
