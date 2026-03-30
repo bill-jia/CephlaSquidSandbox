@@ -674,6 +674,20 @@ class LaserAutofocusControlWidget(QFrame):
             self.liveController.start_live()
 
 
+# Keys shipped with default sample_formats.csv; user-added formats may be removed from the UI.
+_BUILTIN_WELLPLATE_FORMAT_KEYS = frozenset(
+    {
+        "glass slide",
+        "6 well plate",
+        "12 well plate",
+        "24 well plate",
+        "96 well plate",
+        "384 well plate",
+        "1536 well plate",
+    }
+)
+
+
 class WellplateFormatWidget(QWidget):
 
     signalWellplateSettings = Signal(str, float, float, int, int, float, float, int, int, int)
@@ -778,6 +792,48 @@ class WellplateFormatWidget(QWidget):
             self.comboBox.setCurrentIndex(index)
         self.wellplateChanged(index)
 
+    @staticmethod
+    def is_builtin_format(format_id):
+        return format_id in _BUILTIN_WELLPLATE_FORMAT_KEYS
+
+    def remove_format(self, format_id):
+        """Remove a non-built-in format, update cache CSV, refresh combo, and fix current selection."""
+        if format_id not in WELLPLATE_FORMAT_SETTINGS or self.is_builtin_format(format_id):
+            return False
+
+        del WELLPLATE_FORMAT_SETTINGS[format_id]
+        image_basename = f"{str(format_id).replace(' ', '_')}.png"
+        for images_dir in ("images", os.path.join("software", "images")):
+            path = os.path.join(images_dir, image_basename)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        was_current = self.wellplate_format == format_id
+        self.save_formats_to_csv()
+        self.populate_combo_box()
+
+        if was_current:
+            for i in range(self.comboBox.count()):
+                fid = self.comboBox.itemData(i)
+                if fid != "custom":
+                    self.comboBox.blockSignals(True)
+                    self.comboBox.setCurrentIndex(i)
+                    self.comboBox.blockSignals(False)
+                    self.wellplate_format = fid
+                    self.setWellplateSettings(fid)
+                    break
+        else:
+            idx = self.comboBox.findData(self.wellplate_format)
+            if idx >= 0:
+                self.comboBox.blockSignals(True)
+                self.comboBox.setCurrentIndex(idx)
+                self.comboBox.blockSignals(False)
+
+        return True
+
     def save_formats_to_csv(self):
         cache_path = os.path.join("cache", self.csv_path)
         os.makedirs("cache", exist_ok=True)
@@ -819,6 +875,7 @@ class WellplateCalibration(QDialog):
 
     def __init__(self, wellplateFormatWidget, stage: AbstractStage, navigationViewer, streamHandler, liveController):
         super().__init__()
+        self._log = squid.logging.get_logger(self.__class__.__name__)
         self.setWindowTitle("Well Plate Calibration")
         self.wellplateFormatWidget = wellplateFormatWidget
         self.stage = stage
@@ -852,6 +909,9 @@ class WellplateCalibration(QDialog):
 
         left_layout.addWidget(self.new_format_radio)
         left_layout.addWidget(self.calibrate_format_radio)
+
+        self.delete_format_button = QPushButton("Delete Format")
+        self.delete_format_button.clicked.connect(self.delete_selected_format)
 
         # Existing format selection (initially hidden)
         self.existing_format_combo = QComboBox(self)
@@ -909,6 +969,15 @@ class WellplateCalibration(QDialog):
         self.wellSpacingInput.setSuffix(" mm")
         self.form_layout.addRow("Well Spacing:", self.wellSpacingInput)
 
+        self.new_format_well_size_input = QDoubleSpinBox(self)
+        self.new_format_well_size_input.setKeyboardTracking(False)
+        self.new_format_well_size_input.setRange(0.1, 50)
+        self.new_format_well_size_input.setSingleStep(0.1)
+        self.new_format_well_size_input.setDecimals(3)
+        self.new_format_well_size_input.setValue(6.21)
+        self.new_format_well_size_input.setSuffix(" mm")
+        self.form_layout.addRow("Well diameter (3-point):", self.new_format_well_size_input)
+
         left_layout.addWidget(self.new_format_widget)
 
         # Existing format parameters section (initially hidden)
@@ -936,10 +1005,15 @@ class WellplateCalibration(QDialog):
         self.update_params_button = QPushButton("Update Parameters")
         self.update_params_button.clicked.connect(self.update_existing_parameters)
 
+        existing_format_buttons = QHBoxLayout()
+        existing_format_buttons.addWidget(self.update_params_button, 1)
+        existing_format_buttons.addWidget(self.delete_format_button)
+
         self.existing_params_group.hide()
         self.update_params_button.hide()
+        self.delete_format_button.hide()
         left_layout.addWidget(self.existing_params_group)
-        left_layout.addWidget(self.update_params_button)
+        left_layout.addLayout(existing_format_buttons)
 
         # Calibration method selection
         self.calibration_method_group = QGroupBox("Calibration Method")
@@ -1168,6 +1242,7 @@ class WellplateCalibration(QDialog):
         self.existing_format_combo.clear()
         for format_ in WELLPLATE_FORMAT_SETTINGS:
             self.existing_format_combo.addItem(self._format_display_name(format_), format_)
+        self._sync_delete_format_button()
 
     def toggle_input_mode(self):
         is_new_format = self.new_format_radio.isChecked()
@@ -1179,9 +1254,51 @@ class WellplateCalibration(QDialog):
         self.existing_format_combo.setVisible(not is_new_format)
         self.existing_params_group.setVisible(not is_new_format)
         self.update_params_button.setVisible(not is_new_format)
+        self.delete_format_button.setVisible(not is_new_format)
 
         if not is_new_format:
             self.load_existing_format_values()
+        self._sync_delete_format_button()
+
+    def _sync_delete_format_button(self):
+        if self.new_format_radio.isChecked():
+            self.delete_format_button.setEnabled(False)
+            self.delete_format_button.setToolTip("")
+            return
+        fid = self.existing_format_combo.currentData()
+        if fid is None:
+            self.delete_format_button.setEnabled(False)
+            self.delete_format_button.setToolTip("")
+            return
+        if WellplateFormatWidget.is_builtin_format(fid):
+            self.delete_format_button.setEnabled(False)
+            self.delete_format_button.setToolTip("Built-in sample formats cannot be deleted.")
+            return
+        self.delete_format_button.setEnabled(True)
+        self.delete_format_button.setToolTip("Remove this format from the list and saved settings.")
+
+    def delete_selected_format(self):
+        selected_format = self.existing_format_combo.currentData()
+        if selected_format is None or WellplateFormatWidget.is_builtin_format(selected_format):
+            return
+        display_name = self._format_display_name(selected_format)
+        reply = QMessageBox.question(
+            self,
+            "Delete Format",
+            f"Remove '{display_name}' from saved sample formats?\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if not self.wellplateFormatWidget.remove_format(selected_format):
+            QMessageBox.warning(self, "Delete Failed", "This format could not be removed.")
+            return
+        self.populate_existing_formats()
+        self.load_existing_format_values()
+        self.reset_calibration_points()
+        self._sync_delete_format_button()
+        QMessageBox.information(self, "Format Removed", f"'{display_name}' has been removed.")
 
     def load_existing_format_values(self):
         """Load current values from selected existing format into the parameter inputs."""
@@ -1211,6 +1328,7 @@ class WellplateCalibration(QDialog):
             self.load_existing_format_values()
             # Reset calibration points when format changes
             self.reset_calibration_points()
+        self._sync_delete_format_button()
 
     def reset_calibration_points(self):
         """Reset all calibration points to unset state."""
@@ -1280,9 +1398,24 @@ class WellplateCalibration(QDialog):
             if not all(self.corners):
                 QMessageBox.warning(self, "Incomplete Information", "Please set 3 corner points before calibrating.")
                 return None
-            center, radius = self.calculate_circle(self.corners)
-            well_size_mm = radius * 2
+            if self.calibrate_format_radio.isChecked():
+                well_size_mm = self.existing_well_size_input.value()
+            else:
+                well_size_mm = self.new_format_well_size_input.value()
+            if well_size_mm <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Well Size",
+                    "Well diameter must be positive for 3-point calibration.",
+                )
+                return None
+            self._log.info(
+                f"Fitting circle (fixed diameter {well_size_mm} mm) to corners: {self.corners}"
+            )
+            center, radius = self.calculate_circle(self.corners, well_size_mm)
+            self._log.info(f"Fitted circle center: {center}, radius: {radius}")
             a1_x_mm, a1_y_mm = center
+            well_size_mm = float(radius * 2)
         return a1_x_mm, a1_y_mm, well_size_mm
 
     def update_existing_parameters(self):
@@ -1534,19 +1667,59 @@ class WellplateCalibration(QDialog):
         return image_path
 
     @staticmethod
-    def calculate_circle(points):
-        # Convert points to numpy array
-        points = np.array(points)
-
-        # Calculate the center and radius of the circle
-        A = np.array([points[1] - points[0], points[2] - points[0]])
-        b = np.sum(A * (points[1:3] + points[0]) / 2, axis=1)
+    def _fit_circle_unconstrained(points):
+        """Circumcenter-style center and mean radial distance as radius (original behavior)."""
+        pts = np.asarray(points, dtype=float)
+        A = np.array([pts[1] - pts[0], pts[2] - pts[0]])
+        b = np.sum(A * (pts[1:3] + pts[0]) / 2, axis=1)
         center = np.linalg.solve(A, b)
-
-        # Calculate the radius
-        radius = np.mean(np.linalg.norm(points - center, axis=1))
-
+        radius = np.mean(np.linalg.norm(pts - center, axis=1))
         return center, radius
+
+    def calculate_circle(self, points, well_size_mm):
+        """Best-fit circle: fixed-radius least squares, or unconstrained fit on failure.
+
+        Constrained step minimizes sum_i (||p_i - c|| - R)^2 with R = well_size_mm / 2.
+        If that optimization fails, falls back to :meth:`_fit_circle_unconstrained`.
+
+        Returns:
+            (center, radius_mm): ``radius_mm`` is half the well diameter to use (fitted mean
+            radius after unconstrained fallback).
+        """
+        from scipy.optimize import least_squares
+
+        pts = np.asarray(points, dtype=float)
+        r_mm = well_size_mm / 2.0
+
+        A = np.array([pts[1] - pts[0], pts[2] - pts[0]])
+        b = np.sum(A * (pts[1:3] + pts[0]) / 2, axis=1)
+        try:
+            x0 = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            x0 = np.mean(pts, axis=0)
+
+        def residuals(c_xy):
+            cx, cy = c_xy
+            d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+            return d - r_mm
+
+        warn_msg = (
+            "Fixed-radius optimization did not succeed; using unconstrained fit from the three points instead."
+        )
+
+        try:
+            result = least_squares(residuals, x0, method="trf")
+        except Exception:
+            self._log.warning("Fixed-radius circle least_squares raised", exc_info=True)
+            QMessageBox.warning(self, "Circle fit", warn_msg)
+            return self._fit_circle_unconstrained(points)
+
+        if not result.success or not np.all(np.isfinite(result.x)):
+            self._log.warning("Fixed-radius circle fit did not converge: %s", result.message)
+            QMessageBox.warning(self, "Circle fit", warn_msg)
+            return self._fit_circle_unconstrained(points)
+
+        return result.x, r_mm
 
     def closeEvent(self, event):
         # Stop live view if it wasn't initially on
