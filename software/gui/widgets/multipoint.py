@@ -776,7 +776,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
-        """Refresh the observation preset list after profile or preset changes."""
+        """Refresh the observation state list after profile or preset changes."""
         # Remember currently selected channels
         selected_names = [item.text() for item in self.list_configurations.selectedItems()]
 
@@ -3405,7 +3405,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
-        """Refresh the observation preset list after profile or preset changes."""
+        """Refresh the observation state list after profile or preset changes."""
         # Remember currently selected channels
         selected_names = [item.text() for item in self.list_configurations.selectedItems()]
 
@@ -4081,7 +4081,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
-        """Refresh the observation preset list after profile or preset changes."""
+        """Refresh the observation state list after profile or preset changes."""
         selected_names = [item.text() for item in self.list_configurations.selectedItems()]
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()

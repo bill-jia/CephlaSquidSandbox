@@ -1142,7 +1142,7 @@ class ConfigRepository:
             return None
         path = observation_preset_path(self, name, profile=profile)
         if not path.exists():
-            logger.debug("Observation preset not found: %s", path)
+            logger.debug("observation state not found: %s", path)
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1150,7 +1150,7 @@ class ConfigRepository:
             if data is None:
                 data = {}
             if not isinstance(data, dict):
-                raise ValueError("Observation preset YAML did not parse into a dict")
+                raise ValueError("observation state YAML did not parse into a dict")
 
             # v2-only loader: presets should already be regenerated.
             if data.get("version") != 2:
@@ -1166,7 +1166,7 @@ class ConfigRepository:
 
             camera_states = data.get("camera_states") or {}
             if not isinstance(camera_states, dict) or not camera_states:
-                raise ValueError("Observation preset missing camera_states")
+                raise ValueError("observation state missing camera_states")
 
             # No channel-to-camera mapping exists; if there are multiple cameras, we reconstruct
             # internal per-channel settings from the first camera_state entry.
@@ -1260,7 +1260,7 @@ class ConfigRepository:
                 channels_out.append(base.model_copy(update=update))
 
             if not channels_out:
-                raise ValueError("Observation preset had no valid channels")
+                raise ValueError("observation state had no valid channels")
 
             active_name = next((ch.name for ch in channels_out if bool(ch.illumination_settings.on)), None)
             if active_name is None:

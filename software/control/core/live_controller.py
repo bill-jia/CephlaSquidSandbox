@@ -481,6 +481,8 @@ class LiveController:
         self.control_illumination = True
         self._log.info("setting microscope mode to " + configuration.name)
 
+        _t_total = time.perf_counter()
+
         # temporarily stop live while changing mode
         if self.is_live is True:
             self._stop_existing_timer()
@@ -489,27 +491,37 @@ class LiveController:
                 # turn_off_illumination() reads self.currentConfiguration to determine which
                 # laser wavelength to turn off. If we switch first, we'd turn off the NEW
                 # channel's laser instead of the OLD channel's laser (which is still on).
+                _t0 = time.perf_counter()
                 self.turn_off_illumination()
+                self._log.info("set_microscope_mode: turn_off_illumination took %.4fs", time.perf_counter() - _t0)
 
         self.currentConfiguration = configuration
 
         # set camera exposure time and analog gain
+        _t0 = time.perf_counter()
         self.camera.set_exposure_time(self.currentConfiguration.exposure_time)
+        self._log.info("set_microscope_mode: set_exposure_time took %.4fs", time.perf_counter() - _t0)
+        _t0 = time.perf_counter()
         try:
             self.camera.set_analog_gain(self.currentConfiguration.analog_gain)
         except NotImplementedError:
             pass
+        self._log.info("set_microscope_mode: set_analog_gain took %.4fs", time.perf_counter() - _t0)
 
         # set illumination
         if self.control_illumination:
+            _t0 = time.perf_counter()
             self.update_illumination()
+            self._log.info("set_microscope_mode: update_illumination took %.4fs", time.perf_counter() - _t0)
 
         # restart live
         if self.is_live is True:
             if self.control_illumination:
+                _t0 = time.perf_counter()
                 self.turn_on_illumination()
+                self._log.info("set_microscope_mode: turn_on_illumination took %.4fs", time.perf_counter() - _t0)
             self._start_new_timer()
-        self._log.info("Done setting microscope mode.")
+        self._log.info("set_microscope_mode: TOTAL took %.4fs", time.perf_counter() - _t_total)
 
     def get_trigger_mode(self):
         return self.trigger_mode

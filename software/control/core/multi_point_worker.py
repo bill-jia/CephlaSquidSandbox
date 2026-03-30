@@ -486,11 +486,11 @@ class MultiPointWorker:
             return len(self.observation_state_names)
         return len(self.selected_configurations)
 
-    def _apply_observation_preset(self, preset_name: str):
+    def _apply_observation_state(self, preset_name: str):
         repo = self.microscope.config_repo
         state = repo.load_observation_preset(preset_name)
         if state is None:
-            raise ValueError(f"Observation preset not found: {preset_name!r}")
+            raise ValueError(f"observation state not found: {preset_name!r}")
         apply_observation_state(
             state,
             repo,
@@ -498,10 +498,14 @@ class MultiPointWorker:
             self.objectiveStore,
             emission_filter_wheel=self._emission_filter_wheel,
             persist_general_to_profile=False,
+            apply_live_trigger_settings=False,
+            apply_illumination_on_off_state=False,
+            apply_camera_live_snapshot=False,
         )
         cfg = self.liveController.currentConfiguration
         if cfg is None:
-            raise RuntimeError(f"No active channel after applying observation preset {preset_name!r}")
+            raise RuntimeError(f"No active channel after applying observation state {preset_name!r}")
+        self._last_observation_preset_config = cfg
         return cfg
 
     def _apply_current_illumination_state_to_hardware(self) -> None:
@@ -532,6 +536,7 @@ class MultiPointWorker:
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
+        self._last_observation_preset_config = None
         try:
             start_time = time.perf_counter_ns()
             self.camera.start_streaming()
@@ -1358,13 +1363,14 @@ class MultiPointWorker:
 
             current_round_images = {}
             n_steps = self._channel_step_count()
-            # iterate through observation presets or legacy channel configurations
+            # iterate through observation states or legacy channel configurations
             if self.observation_state_names:
                 for config_idx, preset_name in enumerate(self.observation_state_names):
                     try:
-                        config = self._apply_observation_preset(preset_name)
+                        with self._timing.get_timer("apply_observation_state"):
+                            config = self._apply_observation_state(preset_name)
                     except Exception as e:
-                        self._log.error("Failed to apply observation preset %s: %s", preset_name, e, exc_info=True)
+                        self._log.error("Failed to apply observation state %s: %s", preset_name, e, exc_info=True)
                         self.request_abort_fn()
                         return
                     if self.NZ == 1:  # TODO: handle z offset for z stack
@@ -1444,8 +1450,15 @@ class MultiPointWorker:
 
     def _select_config(self, config: AcquisitionChannel):
         self.callbacks.signal_current_configuration(config)
-        self.liveController.set_microscope_mode(config)
-        self.wait_till_operation_is_completed()
+        last_preset_cfg = getattr(self, '_last_observation_preset_config', None)
+        if config is last_preset_cfg:
+            self._log.info("_select_config: skipping set_microscope_mode (observation state just applied)")
+        else:
+            with self._timing.get_timer("_select_config.set_microscope_mode"):
+                self.liveController.set_microscope_mode(config)
+        self._last_observation_preset_config = None
+        with self._timing.get_timer("_select_config.wait_operation"):
+            self.wait_till_operation_is_completed()
 
     def perform_autofocus(self, region_id, fov):
         if not self.do_reflection_af:
@@ -1605,29 +1618,30 @@ class MultiPointWorker:
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
         using_observation_snapshot = self._use_observation_presets
-        if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-            if using_observation_snapshot:
-                self._apply_current_illumination_state_to_hardware()
-            else:
-                self.liveController.turn_on_illumination()
-            self.wait_till_operation_is_completed()
-            camera_illumination_time = None
-        elif self.liveController.trigger_mode == TriggerMode.HARDWARE:
-            if using_observation_snapshot:
-                self._apply_current_illumination_state_to_hardware()
+        with self._timing.get_timer("illuminate_for_capture"):
+            if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
+                if using_observation_snapshot:
+                    self._apply_current_illumination_state_to_hardware()
+                else:
+                    self.liveController.turn_on_illumination()
                 self.wait_till_operation_is_completed()
-            if "Fluorescence" in config.name and ENABLE_NL5 and NL5_USE_DOUT:
-                # TODO(imo): This used to use the "reset_image_ready_flag=False" on the read_frame, but oinly the toupcam camera implementation had the
-                #  "reset_image_ready_flag" arg, so this is broken for all other cameras.  Also this used to do some other funky stuff like setting internal camera flags.
-                #   I am pretty sure this is broken!
-                self.microscope.addons.nl5.start_acquisition()
-        elif self.liveController.trigger_mode == TriggerMode.CONTINUOUS:
-            if using_observation_snapshot:
-                self._apply_current_illumination_state_to_hardware()
-            else:
-                self.liveController.turn_on_illumination()
-            self.wait_till_operation_is_completed()
-            camera_illumination_time = None
+                camera_illumination_time = None
+            elif self.liveController.trigger_mode == TriggerMode.HARDWARE:
+                if using_observation_snapshot:
+                    self._apply_current_illumination_state_to_hardware()
+                    self.wait_till_operation_is_completed()
+                if "Fluorescence" in config.name and ENABLE_NL5 and NL5_USE_DOUT:
+                    # TODO(imo): This used to use the "reset_image_ready_flag=False" on the read_frame, but oinly the toupcam camera implementation had the
+                    #  "reset_image_ready_flag" arg, so this is broken for all other cameras.  Also this used to do some other funky stuff like setting internal camera flags.
+                    #   I am pretty sure this is broken!
+                    self.microscope.addons.nl5.start_acquisition()
+            elif self.liveController.trigger_mode == TriggerMode.CONTINUOUS:
+                if using_observation_snapshot:
+                    self._apply_current_illumination_state_to_hardware()
+                else:
+                    self.liveController.turn_on_illumination()
+                self.wait_till_operation_is_completed()
+                camera_illumination_time = None
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):

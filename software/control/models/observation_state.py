@@ -1,7 +1,7 @@
 """
 Observation State — user-facing, objective-free imaging presets.
 
-Saved under the active profile (see ConfigRepository observation preset helpers).
+Saved under the active profile (see ConfigRepository observation state helpers).
 Does not include objective: presets apply across software objectives; merge with
 objective YAML at runtime via ObjectiveStore + merge_channel_configs.
 """

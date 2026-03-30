@@ -89,7 +89,7 @@ class CaptureInfo:
     z_piezo_um: Optional[float] = None
     time_point: Optional[int] = None
     filename_channel_label: Optional[str] = None
-    """If set, used for TIFF basename instead of configuration.name (e.g. observation preset name)."""
+    """If set, used for TIFF basename instead of configuration.name (e.g. observation state name)."""
 
 
 @dataclass()

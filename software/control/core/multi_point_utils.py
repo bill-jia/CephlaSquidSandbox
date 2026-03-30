@@ -70,7 +70,7 @@ class AcquisitionParameters:
 
     # XY mode for determining scan type
     xy_mode: str = "Current Position"  # "Current Position", "Select Wells", "Manual", "Load Coordinates"
-    # Legacy multipoint: profile channel rows. Empty when using observation presets below.
+    # Legacy multipoint: profile channel rows. Empty when using observation states below.
     selected_configurations: List[AcquisitionChannel] = field(default_factory=list)
     # Observation State preset names (profile observation_presets/); exclusive with legacy channel list.
     selected_observation_state_names: List[str] = field(default_factory=list)

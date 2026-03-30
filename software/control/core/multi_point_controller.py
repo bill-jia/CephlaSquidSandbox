@@ -117,7 +117,7 @@ def _save_unified_multipoint_acquisition_yaml(
     use_manual_focus_map: bool,
     logger: Any,
 ) -> None:
-    """Write a single ``acquisition.yaml`` (schema v2): layout + manifest + used observation presets."""
+    """Write a single ``acquisition.yaml`` (schema v2): layout + manifest + used observation states."""
     from control.core.acquisition_metadata_helpers import augment_multipoint_acquisition_yaml_dict
 
     # Build common sections

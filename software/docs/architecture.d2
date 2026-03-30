@@ -1,0 +1,742 @@
+# ============================================================================
+# Squid Microscope Control Software — Architecture Diagram
+# Entry point: python software/main_hcs.py
+# ============================================================================
+
+direction: right
+layout: tala
+
+# ============================================================================
+# STYLES
+# ============================================================================
+classes: {
+  hw: {
+    style: {
+      fill: "#fce4ec"
+      stroke: "#c62828"
+      border-radius: 8
+      font-color: "#b71c1c"
+    }
+  }
+  controller: {
+    style: {
+      fill: "#e3f2fd"
+      stroke: "#1565c0"
+      border-radius: 8
+    }
+  }
+  model: {
+    style: {
+      fill: "#fff9c4"
+      stroke: "#f9a825"
+      border-radius: 4
+    }
+  }
+  gui: {
+    style: {
+      fill: "#e8f5e9"
+      stroke: "#2e7d32"
+      border-radius: 8
+    }
+  }
+  io: {
+    style: {
+      fill: "#f3e5f5"
+      stroke: "#7b1fa2"
+      border-radius: 8
+    }
+  }
+  storage: {
+    style: {
+      fill: "#efebe9"
+      stroke: "#4e342e"
+      border-radius: 4
+      3d: true
+    }
+  }
+  signal_style: {
+    style: {
+      stroke: "#ff6f00"
+      stroke-dash: 4
+    }
+  }
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+main_hcs: "main_hcs.py\n(Entry Point)" {
+  class: controller
+  tooltip: "Parses CLI args, creates QApplication,\nbuilds Microscope, launches GUI"
+}
+
+# ============================================================================
+# GUI LAYER
+# ============================================================================
+gui: "GUI Layer (PyQt5)" {
+  style.fill: "#e8f5e9"
+  style.stroke: "#2e7d32"
+
+  main_window: "HighContentScreeningGui\n(QMainWindow)" {
+    class: gui
+    tooltip: "Main application window.\nHolds references to all controllers and widgets."
+  }
+
+  # --- Widget groups ---
+  live_widgets: "Live Imaging Widgets" {
+    class: gui
+    camera_settings: "CameraSettingsWidget\nexposure, gain, binning,\nROI, trigger mode"
+    live_control: "LiveControlWidget\nstart/stop live, FPS"
+    recording: "RecordingWidget\nsnap / record"
+    illumination: "IlluminationWidget\nper-channel intensity\nsliders + on/off"
+    obs_state: "ObservationStateWidget\nsave/load presets"
+  }
+
+  hardware_widgets: "Hardware Control Widgets" {
+    class: gui
+    navigation: "NavigationWidget\nstage XYZ jogging"
+    objectives: "ObjectivesWidget\nobjective selector"
+    profile: "ProfileWidget\nuser profile + objective"
+    piezo: "PiezoWidget\nfine Z control"
+    emission_fw: "EmissionFilterWheelPanel"
+    confocal: "SpinningDiskConfocalWidget\ndisk speed, dichroic, filters"
+    laser_af: "LaserAutofocusSettingWidget\nexposure, gain, calibration"
+    autofocus: "AutoFocusWidget\nN planes, delta Z"
+  }
+
+  acquisition_widgets: "Acquisition Widgets" {
+    class: gui
+    flex_mp: "FlexibleMultiPointWidget\ngrid scan: ΔX, NX, ΔY, NY"
+    wellplate_mp: "WellplateMultiPointWidget\nwell selection, per-well FOV grid"
+    template_mp: "TemplateMultiPointWidget\ntemplate-based scan"
+    focus_map: "FocusMapWidget\n3-point calibration,\ninterpolation fitting"
+  }
+
+  viewers: "Visualization" {
+    class: gui
+    napari: "Napari Viewer\nmulti-channel image display"
+    plate_view: "Plate View\nHCS overview"
+    nd_viewer: "NDViewer\nTIFF / Zarr browsing"
+    stats: "StatsDisplayWidget"
+  }
+
+  main_window -> live_widgets
+  main_window -> hardware_widgets
+  main_window -> acquisition_widgets
+  main_window -> viewers
+}
+
+# ============================================================================
+# CORE CONTROLLERS
+# ============================================================================
+controllers: "Core Controllers" {
+  style.fill: "#e3f2fd"
+  style.stroke: "#1565c0"
+
+  microscope: "Microscope\n(Root Aggregator)" {
+    class: controller
+    tooltip: |md
+      Central object built from machine_config.yaml.
+      Owns all hardware references, controllers, and addons.
+    |
+  }
+
+  live_ctrl: "LiveController" {
+    class: controller
+    tooltip: |md
+      Manages live camera streaming.
+      - Toggles trigger mode (SW / HW / continuous)
+      - Synchronizes illumination on/off with exposure
+      - Controls frame rate
+    |
+  }
+
+  mp_ctrl: "MultiPointController\n(QtMultiPointController)" {
+    class: controller
+    tooltip: |md
+      Orchestrates multi-position acquisition:
+      1. Generate grid coordinates
+      2. Per FOV: move stage → autofocus → per channel: illuminate → acquire → save
+      3. Repeat for Z-stack, time-lapse
+    |
+  }
+
+  af_ctrl: "AutoFocusController\n(QtAutoFocusController)" {
+    class: controller
+    tooltip: |md
+      Software autofocus via defocus sweep.
+      Scans N Z-planes, measures image sharpness,
+      moves to best-focus position.
+    |
+  }
+
+  laser_af_ctrl: "LaserAutofocusController" {
+    class: controller
+    tooltip: |md
+      Hardware reflection-based autofocus.
+      Monitors laser spot position shift on focus camera
+      to infer Z displacement. Per-objective calibration.
+    |
+  }
+
+  illum_ctrl: "IlluminationController" {
+    class: controller
+    tooltip: |md
+      Coordinates all light sources.
+      Channels: set_intensity, turn_on/off.
+      Devices: CoolLED, Andor Laser, LED matrix, IO-routed lasers.
+    |
+  }
+
+  stream_handler: "StreamHandler" {
+    class: controller
+    tooltip: |md
+      Frame routing hub.
+      Camera → on_new_frame() → display callback + save callback.
+      Rate-limits display and save independently.
+    |
+  }
+
+  obj_store: "ObjectiveStore" {
+    class: controller
+    tooltip: |md
+      Tracks current objective, magnification,
+      pixel size factor, tube lens focal length.
+    |
+  }
+
+  contrast_mgr: "ContrastManager" {
+    class: controller
+    tooltip: "Per-channel brightness/contrast adjustment for display"
+  }
+
+  movement_updater: "MovementUpdater\n(QObject)" {
+    class: controller
+    tooltip: "Emits Qt signals with stage position after moves"
+  }
+
+  # Controller ownership
+  microscope -> live_ctrl: owns
+  microscope -> illum_ctrl: owns
+  microscope -> stream_handler: owns
+  microscope -> obj_store: owns
+  microscope -> contrast_mgr: owns
+}
+
+# ============================================================================
+# IO ABSTRACTION LAYER
+# ============================================================================
+io_layer: "IO Abstraction Layer" {
+  style.fill: "#f3e5f5"
+  style.stroke: "#7b1fa2"
+
+  io_registry: "IORegistry" {
+    class: io
+    tooltip: |md
+      Central routing table for all IO endpoints.
+      Maps endpoint names → (controller, signal_type, channel).
+      Configured from io_endpoints.yaml + machine_config.yaml.
+    |
+  }
+
+  bound_ep: "BoundEndpoint" {
+    class: io
+    tooltip: "Resolved endpoint: controller + channel.\nCalls set_digital / set_analog / send_trigger."
+  }
+
+  mcu_io: "MCUIOController" {
+    class: io
+    tooltip: |md
+      Routes to Teensy microcontroller.
+      Channels: port:N (illumination), pin:N (TTL),
+      trigger:N (camera), dac:N (analog out).
+    |
+  }
+
+  nidaq_io: "NIDAQIOController" {
+    class: io
+    tooltip: |md
+      Routes to NI-DAQ hardware.
+      AO channels for analog intensity,
+      DO channels for TTL shutters.
+    |
+  }
+
+  serial_io: "SerialIOController" {
+    class: io
+    tooltip: "Routes to serial light sources\n(CoolLED, LDI, Andor, etc.)"
+  }
+
+  io_registry -> bound_ep: "resolve endpoint"
+  bound_ep -> mcu_io
+  bound_ep -> nidaq_io
+  bound_ep -> serial_io
+}
+
+# ============================================================================
+# ILLUMINATION DEVICES
+# ============================================================================
+illum_devices: "Illumination Devices" {
+  style.fill: "#fce4ec"
+  style.stroke: "#c62828"
+
+  io_routed: "IORoutedIlluminationDevice\nindividual laser/LED channels\nvia DAC (intensity) + TTL (shutter)" {
+    class: hw
+  }
+  serial_illum: "SerialIlluminationDevice\nCoolLED pE-400, Lumencor LDI/CELESTA,\nAndor Laser, VersaLase" {
+    class: hw
+  }
+  led_matrix: "LEDMatrixIlluminationDevice\nMCU-driven LED array or\nSciMicroscopy RGB array\n(BF, DF, DPC patterns)" {
+    class: hw
+  }
+}
+
+# ============================================================================
+# HARDWARE COMPONENTS
+# ============================================================================
+hardware: "Physical Hardware" {
+  style.fill: "#fce4ec"
+  style.stroke: "#c62828"
+
+  mcu: "Teensy Microcontroller\n(USB Serial, CRC8 protocol)" {
+    class: hw
+    tooltip: |md
+      Central hardware coordinator.
+      - Drives stepper motors (X/Y/Z/Theta/W)
+      - 8-channel DAC for analog outputs
+      - 16 illumination ports (multi-port firmware)
+      - TTL outputs for shutters & triggers
+      - Hardware trigger with illumination sync
+      - Status packets every ~10ms
+    |
+  }
+
+  stage: "Motorized Stage\n(X, Y, Z, Theta axes)" {
+    class: hw
+    tooltip: |md
+      Stepper motors with configurable microstepping.
+      Typical: 200 full-steps/rev, 2.54mm screw pitch.
+      Limit switches for homing.
+      Max ~30 mm/s, 500 mm/s² acceleration.
+    |
+  }
+
+  main_camera: "Main Camera" {
+    class: hw
+    tooltip: |md
+      Acquisition camera. Supported SDKs:
+      Daheng (GXiPy), Hamamatsu (DCAM), Tucsen,
+      Andor (SDK3), IDS (Peak), FLIR, Photometrics.
+      Trigger modes: software, hardware (LINE2), continuous.
+      Pixel formats: MONO8/12/16, Bayer.
+    |
+  }
+
+  focus_camera: "Focus Camera\n(Laser AF sensor)" {
+    class: hw
+    tooltip: |md
+      Detects reflected laser spot position.
+      Spot centroid shift → Z displacement.
+      Separate from main camera.
+    |
+  }
+
+  piezo: "Objective Piezo\n(Fine Z, 0–300 μm)" {
+    class: hw
+    tooltip: |md
+      Sub-micron Z positioning for the objective.
+      Controlled via DAC voltage (0–10V).
+      Used for fast Z-stacking and focus tracking.
+    |
+  }
+
+  filter_wheel: "Emission Filter Wheel" {
+    class: hw
+    tooltip: "Multi-position wheel with bandpass filters.\nSelects emission wavelength for fluorescence."
+  }
+
+  spinning_disk: "Spinning Disk Confocal\n(XLight / Dragonfly)" {
+    class: hw
+    tooltip: |md
+      Optical sectioning via spinning pinhole disk.
+      Controls: disk motor, dichroic wheel,
+      emission/excitation filters, iris diaphragm.
+    |
+  }
+
+  laser_combiner: "Laser Combiner\n(NL5 / CellX)" {
+    class: hw
+    tooltip: "Combines multiple laser lines\ninto a single fiber output.\nTTL-gated per line."
+  }
+
+  nidaq_hw: "NI-DAQ Card" {
+    class: hw
+    tooltip: |md
+      National Instruments data acquisition.
+      AO: analog waveforms (100kHz sample rate).
+      DO: digital TTL outputs.
+      Used for high-speed synchronized illumination.
+    |
+  }
+
+  led_array: "LED Matrix /\nSciMicroscopy Array" {
+    class: hw
+    tooltip: |md
+      Programmable LED illumination patterns.
+      Modes: brightfield, darkfield, DPC (phase contrast).
+      RGB color mixing for multi-wavelength.
+    |
+  }
+
+  obj_changer: "Objective Changer\n(Xeryon 2-position turret)" {
+    class: hw
+    tooltip: |md
+      Switches between 2 objectives.
+      Automatic Z-compensation on switch.
+      Xeryon piezo motor, serial control.
+    |
+  }
+
+  fluidics: "Fluidics System" {
+    class: hw
+    tooltip: "Automated sample handling,\nmedia exchange, reagent delivery."
+  }
+
+  # Internal hardware connections
+  mcu -> stage: "stepper\npulses"
+  mcu -> piezo: "DAC voltage\n(dac:7)"
+  mcu -> led_array: "port intensity\n+ TTL patterns"
+}
+
+# ============================================================================
+# DATA MODELS (Pydantic)
+# ============================================================================
+models: "Data Models (Pydantic)" {
+  style.fill: "#fff9c4"
+  style.stroke: "#f9a825"
+
+  acq_channel: "AcquisitionChannel" {
+    class: model
+    tooltip: |md
+      Single imaging channel definition:
+      - camera_settings (exposure, gain, pixel_format)
+      - illumination_settings (channel, intensity, LED mode)
+      - filter_wheel, filter_position
+      - z_offset_um
+      - confocal_override (objective-specific)
+    |
+  }
+
+  obs_state: "ObservationState" {
+    class: model
+    tooltip: |md
+      User-facing imaging preset (objective-free):
+      - channels: List[AcquisitionChannel]
+      - confocal_mode, camera_live snapshot
+      - emission_filter_positions
+      - channel_groups for multi-camera
+    |
+  }
+
+  acq_metadata: "AcquisitionMetadata" {
+    class: model
+    tooltip: |md
+      Per-run reproducibility record:
+      - experiment_id, objective, pixel_size
+      - selected channels, scan parameters
+      - observation_state snapshot
+      - Written to acquisition.yaml
+    |
+  }
+
+  illum_channel: "IlluminationChannel" {
+    class: model
+    tooltip: |md
+      Hardware illumination definition:
+      - type: EPI or TRANSILLUMINATION
+      - controller_port (D1-D8, USB1-USB8)
+      - wavelength_nm
+      - excitation filter wheel + position
+    |
+  }
+
+  hw_bindings: "HardwareBindingsConfig" {
+    class: model
+    tooltip: |md
+      Maps cameras to filter wheels
+      and dichroic positions.
+      Source-qualified references
+      (confocal.1, standalone.Emission).
+    |
+  }
+
+  camera_live: "CameraLiveSnapshot" {
+    class: model
+    tooltip: "Runtime camera state:\nexposure, gain, ROI, binning,\ntrigger mode, FPS"
+  }
+
+  channel_group: "ChannelGroup" {
+    class: model
+    tooltip: "Multi-camera synchronization:\nSIMULTANEOUS or SEQUENTIAL\nwith per-channel timing offsets"
+  }
+
+  obs_state -> acq_channel: "contains"
+  obs_state -> camera_live: "snapshots"
+  obs_state -> channel_group: "groups"
+  acq_metadata -> obs_state: "embeds"
+}
+
+# ============================================================================
+# CONFIGURATION LAYER
+# ============================================================================
+config: "Configuration (YAML)" {
+  style.fill: "#efebe9"
+  style.stroke: "#4e342e"
+
+  config_repo: "ConfigRepository" {
+    class: storage
+    tooltip: |md
+      Loads and caches all YAML configuration.
+      Manages user profiles and per-objective overrides.
+      Merges general + objective channel configs at runtime.
+    |
+  }
+
+  machine_config: "machine_config.yaml" {
+    class: storage
+    tooltip: |md
+      Top-level hardware definition:
+      devices (teensy, camera, stage, piezo, laser_af, nidaq),
+      illumination_devices, objectives,
+      IO endpoints, hardware bindings.
+    |
+  }
+
+  general_yaml: "general.yaml\n(channel identity)" {
+    class: storage
+    tooltip: "Channel name, color, illumination_channel,\nfilter_wheel, z_offset, camera ID.\nShared across all objectives."
+  }
+
+  objective_yaml: "{objective}.yaml\n(per-objective overrides)" {
+    class: storage
+    tooltip: "Intensity, exposure, gain, pixel_format,\nconfocal_override per channel.\nMerged with general.yaml at runtime."
+  }
+
+  preset_yaml: "observation_presets/\n{name}.yaml" {
+    class: storage
+    tooltip: "Saved ObservationState snapshots.\nUser can save/load presets\nfrom the GUI."
+  }
+
+  illum_yaml: "illumination_channel_config.yaml" {
+    class: storage
+    tooltip: "Hardware illumination definitions:\nchannel names, ports, wavelengths,\nfilter wheel associations."
+  }
+
+  io_yaml: "io_endpoints.yaml" {
+    class: storage
+    tooltip: "IO endpoint definitions:\ntrigger, intensity, shutter channels\nmapped to controllers + pins."
+  }
+
+  config_repo -> machine_config: reads
+  config_repo -> general_yaml: reads/writes
+  config_repo -> objective_yaml: reads/writes
+  config_repo -> preset_yaml: reads/writes
+  config_repo -> illum_yaml: reads
+  config_repo -> io_yaml: reads
+}
+
+# ============================================================================
+# DATA OUTPUT / WRITERS
+# ============================================================================
+writers: "Data Output" {
+  style.fill: "#efebe9"
+  style.stroke: "#4e342e"
+
+  mp_worker: "MultiPointWorker\n(Job Queue)" {
+    class: controller
+    tooltip: |md
+      Queue-based async job processing.
+      Job types: SaveImage, SaveOMETiff,
+      SaveZarr, DownsampledView.
+    |
+  }
+
+  fast_writer: "FastAcquisitionWriter\n(Thread)" {
+    class: controller
+    tooltip: |md
+      High-speed streaming:
+      1. Write raw bytes → frames.raw
+      2. Per-frame metadata → frame_metadata.jsonl
+      3. Post-capture decode → final format
+    |
+  }
+
+  zarr_writer: "Zarr v3 Writer\n(TensorStore)" {
+    class: storage
+    tooltip: |md
+      OME-NGFF compliant Zarr output.
+      5D HCS: (T, C, Z, Y, X) per well.
+      6D non-HCS: (FOV, T, C, Z, Y, X).
+      Blosc compression, async writes.
+    |
+  }
+
+  ome_tiff: "OME-TIFF Writer" {
+    class: storage
+    tooltip: |md
+      OME-TIFF stacks.
+      Axes: TZCYX.
+      Per-plane metadata.
+      Compatible with ImageJ/FIJI.
+    |
+  }
+
+  acq_yaml: "acquisition.yaml" {
+    class: storage
+    tooltip: |md
+      Per-experiment metadata file:
+      - manifest (experiment_id, objective, pixel size)
+      - scan_parameters (grid, z-stack, time-lapse)
+      - observation_states_used (full preset snapshots)
+    |
+  }
+
+  mp_worker -> zarr_writer: "SaveZarrJob"
+  mp_worker -> ome_tiff: "SaveOMETiffJob"
+}
+
+# ============================================================================
+# CONNECTIONS — Startup Flow
+# ============================================================================
+main_hcs -> controllers.microscope: "1. build_from_global_config()" {
+  style.stroke: "#1565c0"
+  style.stroke-width: 2
+}
+main_hcs -> gui.main_window: "2. HighContentScreeningGui(microscope)" {
+  style.stroke: "#2e7d32"
+  style.stroke-width: 2
+}
+
+# ============================================================================
+# CONNECTIONS — GUI ↔ Controllers
+# ============================================================================
+gui.main_window -> controllers.microscope: "references"
+gui.main_window -> controllers.mp_ctrl: "owns"
+gui.main_window -> controllers.af_ctrl: "owns"
+gui.main_window -> controllers.laser_af_ctrl: "owns"
+gui.main_window -> controllers.movement_updater: "owns"
+
+gui.live_widgets.live_control -> controllers.live_ctrl: "start/stop\nlive acquisition" {
+  class: signal_style
+}
+gui.live_widgets.illumination -> controllers.illum_ctrl: "set_intensity\nturn_on/off" {
+  class: signal_style
+}
+gui.live_widgets.camera_settings -> hardware.main_camera: "exposure, gain,\nROI, binning" {
+  class: signal_style
+}
+gui.live_widgets.obs_state -> config.preset_yaml: "save/load\npresets" {
+  class: signal_style
+}
+gui.hardware_widgets.navigation -> hardware.stage: "jog XYZ" {
+  class: signal_style
+}
+gui.acquisition_widgets.flex_mp -> controllers.mp_ctrl: "configure &\nstart acquisition" {
+  class: signal_style
+}
+gui.acquisition_widgets.wellplate_mp -> controllers.mp_ctrl: "well-based\nacquisition" {
+  class: signal_style
+}
+
+# ============================================================================
+# CONNECTIONS — Controllers ↔ Hardware
+# ============================================================================
+controllers.microscope -> config.config_repo: "loads config"
+controllers.microscope -> io_layer.io_registry: "owns"
+controllers.live_ctrl -> controllers.stream_handler: "registers\ncallback"
+
+controllers.illum_ctrl -> illum_devices.io_routed: "manages"
+controllers.illum_ctrl -> illum_devices.serial_illum: "manages"
+controllers.illum_ctrl -> illum_devices.led_matrix: "manages"
+
+illum_devices.io_routed -> io_layer.io_registry: "set_analog\nset_digital"
+illum_devices.serial_illum -> io_layer.serial_io: "serial protocol"
+illum_devices.led_matrix -> hardware.mcu: "multi-port API"
+
+io_layer.mcu_io -> hardware.mcu: "USB Serial\nbinary packets"
+io_layer.nidaq_io -> hardware.nidaq_hw: "NI-DAQmx API"
+
+controllers.live_ctrl -> hardware.main_camera: "trigger +\nacquire frames"
+controllers.laser_af_ctrl -> hardware.focus_camera: "acquire spot\nimages"
+controllers.laser_af_ctrl -> hardware.piezo: "fine Z\ncorrection"
+controllers.af_ctrl -> hardware.stage: "Z sweep"
+controllers.af_ctrl -> hardware.main_camera: "sharpness\nmeasurement"
+
+controllers.mp_ctrl -> controllers.live_ctrl: "set_channel\ntrigger acquire"
+controllers.mp_ctrl -> controllers.af_ctrl: "autofocus\nbefore each FOV"
+controllers.mp_ctrl -> controllers.laser_af_ctrl: "laser AF\nbefore each FOV"
+controllers.mp_ctrl -> hardware.stage: "move to\nnext position"
+controllers.mp_ctrl -> writers.mp_worker: "enqueue\nsave jobs"
+
+# ============================================================================
+# CONNECTIONS — Frame Data Flow
+# ============================================================================
+hardware.main_camera -> controllers.stream_handler: "CameraFrame\n(async callback)" {
+  style.stroke: "#d32f2f"
+  style.stroke-width: 2
+}
+controllers.stream_handler -> gui.viewers.napari: "image_to_display\n(rate-limited)" {
+  style.stroke: "#d32f2f"
+  style.stroke-width: 2
+}
+controllers.stream_handler -> writers.mp_worker: "packet_image_to_write\n(frame + metadata)" {
+  style.stroke: "#d32f2f"
+  style.stroke-width: 2
+}
+controllers.stream_handler -> writers.fast_writer: "raw bytes\n(high-speed mode)" {
+  style.stroke: "#d32f2f"
+  style.stroke-width: 2
+}
+
+# ============================================================================
+# CONNECTIONS — Metadata Flow
+# ============================================================================
+controllers.mp_ctrl -> writers.acq_yaml: "build_acquisition_metadata\n+ observation_states_used"
+config.config_repo -> models.acq_channel: "merge_channel_configs\n(general + objective)"
+config.config_repo -> models.obs_state: "load/save\npresets"
+
+# ============================================================================
+# CONNECTIONS — Hardware Trigger Synchronization
+# ============================================================================
+hardware.mcu -> hardware.main_camera: "hardware trigger\n(LINE2 GPIO)" {
+  style.stroke: "#c62828"
+  style.stroke-width: 2
+  style.stroke-dash: 0
+}
+
+# ============================================================================
+# LEGEND
+# ============================================================================
+legend: "Legend" {
+  style.fill: "#fafafa"
+  style.stroke: "#bdbdbd"
+  style.border-radius: 12
+
+  hw_ex: "Hardware Component" { class: hw }
+  ctrl_ex: "Controller / Service" { class: controller }
+  model_ex: "Data Model (Pydantic)" { class: model }
+  gui_ex: "GUI Widget (PyQt5)" { class: gui }
+  io_ex: "IO Abstraction" { class: io }
+  storage_ex: "Config / Storage" { class: storage }
+
+  red_line: "Frame data flow" {
+    style.fill: transparent
+    style.stroke: "#d32f2f"
+    style.stroke-width: 2
+  }
+  orange_line: "Qt signal / user action" {
+    style.fill: transparent
+    style.stroke: "#ff6f00"
+    style.stroke-dash: 4
+  }
+}

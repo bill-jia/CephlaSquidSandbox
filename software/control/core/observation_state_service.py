@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -570,7 +571,7 @@ def apply_observation_state(
     emission_filter_wheel: Optional[Any] = None,
     persist_general_to_profile: bool = True,
     apply_live_trigger_settings: bool = True,
-    apply_illumination_on_off_state: bool = True,
+    apply_illumination_on_off_state: bool = True
 ) -> None:
     """
     Persist Observation State into general.yaml and refresh live mode.
@@ -603,7 +604,9 @@ def apply_observation_state(
         if existing is None or existing != general:
             config_repo.save_general_config(profile, general)
 
+    _t0 = time.perf_counter()
     live_controller.toggle_confocal_widefield(state.confocal_mode)
+    logger.info("apply_observation_state: toggle_confocal_widefield took %.4fs", time.perf_counter() - _t0)
 
     if state.enable_channel_auto_filter_switching is not None:
         try:
@@ -618,7 +621,9 @@ def apply_observation_state(
     ):
         try:
             pos = {int(k): int(v) for k, v in state.emission_filter_positions.items()}
+            _t0 = time.perf_counter()
             emission_filter_wheel.set_filter_wheel_position(pos)
+            logger.info("apply_observation_state: set_filter_wheel_position took %.4fs", time.perf_counter() - _t0)
         except Exception as e:
             logger.warning("Could not apply emission filter positions from Observation State: %s", e)
 
@@ -637,6 +642,7 @@ def apply_observation_state(
     if match is None:
         match = channels[0] if channels else None
 
+    _t0 = time.perf_counter()
     if match is not None:
         live_controller.set_microscope_mode(match)
     else:
@@ -645,21 +651,29 @@ def apply_observation_state(
             objective,
         )
         live_controller.set_microscope_mode(channels[0])
+    logger.info("apply_observation_state: set_microscope_mode took %.4fs", time.perf_counter() - _t0)
 
     camera_live_applied = False
     if state.camera_live is not None:
+        _t0 = time.perf_counter()
         _apply_camera_live_snapshot(
             live_controller.camera,
             state.camera_live,
             live_controller,
             apply_live_trigger_settings=apply_live_trigger_settings,
         )
+        logger.info("apply_observation_state: _apply_camera_live_snapshot took %.4fs", time.perf_counter() - _t0)
         camera_live_applied = True
+
     _apply_top_level_binning_mode_if_needed(live_controller.camera, state, camera_live_applied)
 
+    _t0 = time.perf_counter()
     _sync_illumination_hardware_from_channels(ic, channels)
+    logger.info("apply_observation_state: _sync_illumination_hardware took %.4fs", time.perf_counter() - _t0)
     if apply_illumination_on_off_state:
+        _t0 = time.perf_counter()
         _restore_illumination_on_off_from_channels(ic, channels)
+        logger.info("apply_observation_state: _restore_illumination_on_off took %.4fs", time.perf_counter() - _t0)
 
 
 def sanitize_preset_filename(name: str) -> str:
