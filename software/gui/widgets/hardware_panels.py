@@ -1756,7 +1756,6 @@ class LiveControlWidget(QFrame):
             self.currentConfiguration = channels[0]
 
         # Keep LiveController.currentConfiguration in sync for contrast/LUT and Observation State
-        # ``active_channel_name`` without calling set_microscope_mode() (manual live defers hardware apply).
         self.liveController.set_active_channel_reference(self.currentConfiguration)
 
         self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
@@ -2066,8 +2065,8 @@ class LiveControlWidget(QFrame):
                 self._log.warning("Snap: could not collect observation state for metadata: %s", e)
 
         selected_names = []
-        if obs_state and obs_state.active_channel_name:
-            selected_names = [obs_state.active_channel_name]
+        if obs_state and obs_state.channels:
+            selected_names = [ch.name for ch in obs_state.channels if bool(ch.illumination_settings.on)]
         elif self.currentConfiguration is not None:
             selected_names = [self.currentConfiguration.name]
 

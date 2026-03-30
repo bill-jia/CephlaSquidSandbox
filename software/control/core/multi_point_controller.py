@@ -55,6 +55,7 @@ from control.core.objective_store import ObjectiveStore
 from control.core.memory_profiler import MemoryMonitor, log_memory
 from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
+from control.core.config.repository import ConfigRepository
 from squid.abc import CameraFrame, AbstractCamera, AbstractStage
 import squid.logging
 
@@ -106,7 +107,7 @@ def _save_unified_multipoint_acquisition_yaml(
     scan_size_mm: float = 0.0,
     overlap_percent: float = 10.0,
     *,
-    repo: Any,
+    repo: ConfigRepository,
     live_controller: "LiveController",
     camera: Any,
     objective_store: "ObjectiveStore",

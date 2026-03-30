@@ -212,7 +212,7 @@ illumination_devices:
             direction: output
             channel_id: "port0/line1"
             display_name: "coolled_shutter_488_nidaq1"
-      "Fluorescence 561/594 nm Ex":
+      "Fluorescence 561 nm Ex":
         wavelength_nm: 561
         type: epi_illumination
         serial_key: "D"
@@ -222,7 +222,7 @@ illumination_devices:
             signal_type: digital
             direction: output
             channel_id: "port0/line2"
-            display_name: "coolled_shutter_561/594_nidaq2"
+            display_name: "coolled_shutter_561_nidaq2"
       "Fluorescence 635 nm Ex":
         wavelength_nm: 635
         type: epi_illumination

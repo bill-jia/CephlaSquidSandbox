@@ -1052,27 +1052,28 @@ class IlluminationController:
                 has enabled streaming (live view).
         """
         apply_hw = force_hardware or self._streaming_active
-        lm = self._resolve_led_matrix_channel(channel_name)
-        if lm is not None:
-            unified_name, mode_key = lm
-            dev = self._channel_map.get(unified_name)
-            if isinstance(dev, LEDMatrixIlluminationDevice):
-                if mode_key is not None:
-                    dev.set_matrix_mode(mode_key)
-                self._channel_state[unified_name].is_on = True
-                if apply_hw:
+        self._channel_state[channel_name].is_on = True
+
+
+        if apply_hw and not self._hardware_asserted[channel_name]:
+            lm = self._resolve_led_matrix_channel(channel_name)
+            if lm is not None:
+                unified_name, mode_key = lm
+                dev = self._channel_map.get(unified_name)
+                if isinstance(dev, LEDMatrixIlluminationDevice):
+                    if mode_key is not None:
+                        dev.set_matrix_mode(mode_key)
                     dev.turn_on(unified_name)
                     self._hardware_asserted[unified_name] = True
-            return
-
-        dev = self._channel_map.get(channel_name)
-        if dev is None:
-            logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
-            return
-        self._channel_state[channel_name].is_on = True
-        if apply_hw:
+                return
+            dev = self._channel_map.get(channel_name)
+            if dev is None:
+                logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
+                return
             dev.turn_on(channel_name)
             self._hardware_asserted[channel_name] = True
+        else:
+            return
 
     def turn_off_channel(self, channel_name: str, *, force_hardware: bool = False) -> None:
         """Turn off a named channel.
