@@ -498,14 +498,10 @@ class MultiPointWorker:
             self.objectiveStore,
             emission_filter_wheel=self._emission_filter_wheel,
             persist_general_to_profile=False,
-            apply_live_trigger_settings=False,
-            apply_illumination_on_off_state=False,
-            apply_camera_live_snapshot=False,
         )
         cfg = self.liveController.currentConfiguration
         if cfg is None:
-            raise RuntimeError(f"No active channel after applying observation state {preset_name!r}")
-        self._last_observation_preset_config = cfg
+            raise RuntimeError(f"No active channel after applying observation preset {preset_name!r}")
         return cfg
 
     def _apply_current_illumination_state_to_hardware(self) -> None:
@@ -536,7 +532,6 @@ class MultiPointWorker:
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
-        self._last_observation_preset_config = None
         try:
             start_time = time.perf_counter_ns()
             self.camera.start_streaming()
@@ -1370,7 +1365,7 @@ class MultiPointWorker:
                         with self._timing.get_timer("apply_observation_state"):
                             config = self._apply_observation_state(preset_name)
                     except Exception as e:
-                        self._log.error("Failed to apply observation state %s: %s", preset_name, e, exc_info=True)
+                        self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
                         self.request_abort_fn()
                         return
                     if self.NZ == 1:  # TODO: handle z offset for z stack
@@ -1450,15 +1445,8 @@ class MultiPointWorker:
 
     def _select_config(self, config: AcquisitionChannel):
         self.callbacks.signal_current_configuration(config)
-        last_preset_cfg = getattr(self, '_last_observation_preset_config', None)
-        if config is last_preset_cfg:
-            self._log.info("_select_config: skipping set_microscope_mode (observation state just applied)")
-        else:
-            with self._timing.get_timer("_select_config.set_microscope_mode"):
-                self.liveController.set_microscope_mode(config)
-        self._last_observation_preset_config = None
-        with self._timing.get_timer("_select_config.wait_operation"):
-            self.wait_till_operation_is_completed()
+        self.liveController.set_microscope_mode(config)
+        self.wait_till_operation_is_completed()
 
     def perform_autofocus(self, region_id, fov):
         if not self.do_reflection_af:
