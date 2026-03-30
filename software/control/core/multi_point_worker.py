@@ -503,6 +503,31 @@ class MultiPointWorker:
             raise RuntimeError(f"No active channel after applying observation preset {preset_name!r}")
         return cfg
 
+    def _apply_current_illumination_state_to_hardware(self) -> None:
+        """Assert the illumination controller's current logical on/off state on hardware."""
+        ic = self.microscope.illumination_controller
+        try:
+            logical_states = ic.get_shutter_state()
+        except Exception as e:
+            self._log.warning("Could not read illumination logical state for capture: %s", e)
+            return
+
+        for name, is_on in logical_states.items():
+            try:
+                if is_on:
+                    ic.turn_on_channel(name, force_hardware=True)
+                else:
+                    ic.turn_off_channel(name, force_hardware=True)
+            except Exception as e:
+                self._log.warning("Could not apply illumination state for %r: %s", name, e)
+
+    def _turn_off_capture_illumination_preserving_logical_state(self) -> None:
+        """Clear hardware illumination after a snap without losing the saved logical state."""
+        try:
+            self.microscope.illumination_controller.turn_off_all(preserve_logical_state=True)
+        except Exception as e:
+            self._log.warning("Could not turn off capture illumination after snap: %s", e)
+
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
@@ -1578,16 +1603,30 @@ class MultiPointWorker:
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
+        using_observation_snapshot = self._use_observation_presets
         if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-            self.liveController.turn_on_illumination()
+            if using_observation_snapshot:
+                self._apply_current_illumination_state_to_hardware()
+            else:
+                self.liveController.turn_on_illumination()
             self.wait_till_operation_is_completed()
             camera_illumination_time = None
         elif self.liveController.trigger_mode == TriggerMode.HARDWARE:
+            if using_observation_snapshot:
+                self._apply_current_illumination_state_to_hardware()
+                self.wait_till_operation_is_completed()
             if "Fluorescence" in config.name and ENABLE_NL5 and NL5_USE_DOUT:
                 # TODO(imo): This used to use the "reset_image_ready_flag=False" on the read_frame, but oinly the toupcam camera implementation had the
                 #  "reset_image_ready_flag" arg, so this is broken for all other cameras.  Also this used to do some other funky stuff like setting internal camera flags.
                 #   I am pretty sure this is broken!
                 self.microscope.addons.nl5.start_acquisition()
+        elif self.liveController.trigger_mode == TriggerMode.CONTINUOUS:
+            if using_observation_snapshot:
+                self._apply_current_illumination_state_to_hardware()
+            else:
+                self.liveController.turn_on_illumination()
+            self.wait_till_operation_is_completed()
+            camera_illumination_time = None
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
@@ -1605,11 +1644,14 @@ class MultiPointWorker:
                         f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
                     )
 
-        with self._timing.get_timer("get_ready_for_trigger re-check"):
-            # This should be a noop - we have the frame already.  Still, check!
-            while not self.camera.get_ready_for_trigger():
-                self._sleep(0.001)
+        if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
+            with self._timing.get_timer("get_ready_for_trigger re-check"):
+                # This should be a noop - we have the frame already.  Still, check!
+                while not self.camera.get_ready_for_trigger():
+                    self._sleep(0.001)
 
+                self._ready_for_next_trigger.clear()
+        else:
             self._ready_for_next_trigger.clear()
         with self._timing.get_timer("current_capture_info ="):
             # Even though the capture time will be slightly after this, we need to capture and set the capture info
@@ -1632,8 +1674,9 @@ class MultiPointWorker:
                 filename_channel_label=filename_channel_label,
             )
             self._current_capture_info = current_capture_info
-        with self._timing.get_timer("send_trigger"):
-            self.camera.send_trigger(illumination_time=camera_illumination_time)
+        if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
+            with self._timing.get_timer("send_trigger"):
+                self.camera.send_trigger(illumination_time=camera_illumination_time)
 
         with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
             if self.liveController.trigger_mode == TriggerMode.HARDWARE:
@@ -1657,9 +1700,11 @@ class MultiPointWorker:
                     # Let this fall through so we still turn off illumination.  Let the caller actually break out
                     # of the acquisition.
 
-        # turn off the illumination if using software trigger
-        if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-            if not self.keep_illuminators_on_between_captures:
+        # Turn off capture illumination after a one-frame snap unless the user explicitly keeps it on.
+        if not self.keep_illuminators_on_between_captures:
+            if using_observation_snapshot:
+                self._turn_off_capture_illumination_preserving_logical_state()
+            elif self.liveController.trigger_mode in (TriggerMode.SOFTWARE, TriggerMode.CONTINUOUS):
                 self.liveController.turn_off_illumination()
         self._last_illumination_config_name = config.name
 

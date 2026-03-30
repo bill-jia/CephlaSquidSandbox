@@ -276,6 +276,13 @@ def _merge_led_matrix_mode_into_channels(
     return out
 
 
+def _collect_illumination_channel_states(ill_snapshot: Any) -> Dict[str, bool]:
+    """Extract per-channel logical on/off state from ``IlluminationController.snapshot()``."""
+    if ill_snapshot is None or not getattr(ill_snapshot, "channel_states", None):
+        return {}
+    return {str(name): bool(state.is_on) for name, state in ill_snapshot.channel_states.items()}
+
+
 def _merge_active_channel_camera_from_hardware(
     channels: List[AcquisitionChannel],
     active_channel_name: Optional[str],
@@ -383,10 +390,26 @@ def _sync_illumination_hardware_from_channels(ic: Any, channels: List[Acquisitio
             logger.warning("Could not set intensity for %r: %s", hw, e)
 
 
+def _restore_illumination_channel_states(ic: Any, saved_states: Dict[str, bool]) -> None:
+    """Restore saved logical illumination on/off state across known controller channels."""
+    if ic is None or not saved_states:
+        return
+    for name in getattr(ic, "channel_names", []):
+        try:
+            if bool(saved_states.get(name, False)):
+                ic.turn_on_channel(name)
+            else:
+                ic.turn_off_channel(name)
+        except Exception as e:
+            logger.warning("Could not restore illumination on/off state for %r: %s", name, e)
+
+
 def _apply_camera_live_snapshot(
     camera: Any,
     snap: CameraLiveSnapshot,
     live_controller: Optional[Any] = None,
+    *,
+    apply_live_trigger_settings: bool = True,
 ) -> None:
     """Apply ROI/binning/mode/exposure/trigger saved with the preset to the camera and LiveController."""
     try:
@@ -432,7 +455,7 @@ def _apply_camera_live_snapshot(
         except Exception as e:
             logger.warning("Observation State: could not set ROI: %s", e)
 
-    if live_controller is not None:
+    if live_controller is not None and apply_live_trigger_settings:
         if snap.trigger_mode:
             try:
                 live_controller.set_trigger_mode(snap.trigger_mode)
@@ -504,6 +527,7 @@ def collect_observation_state(
         channels=channels,
         channel_groups=channel_groups,
         emission_filter_positions=dict(emission_filter_positions or {}),
+        illumination_channel_states=_collect_illumination_channel_states(snap),
         camera_live=camera_live,
         binning_x=bx,
         binning_y=by,
@@ -520,6 +544,8 @@ def apply_observation_state(
     *,
     emission_filter_wheel: Optional[Any] = None,
     persist_general_to_profile: bool = True,
+    apply_live_trigger_settings: bool = True,
+    apply_illumination_on_off_state: bool = True,
 ) -> None:
     """
     Persist Observation State into general.yaml and refresh live mode.
@@ -531,6 +557,12 @@ def apply_observation_state(
             ``general.yaml``. When False, apply only to hardware and in-memory live state (no disk write).
             Use False when cycling multiple presets during one acquisition so the on-disk profile is not
             rewritten at every step.
+        apply_live_trigger_settings: When True (default), restore the preset's saved live trigger mode/FPS.
+            Set False for multipoint acquisitions, which manage trigger behavior separately and should not
+            inherit live-view continuous/streaming settings from an Observation State.
+        apply_illumination_on_off_state: When True (default), restore saved illumination channel on/off
+            state through ``IlluminationController``. Set False for multipoint acquisitions, which manage
+            illumination per capture and should not inherit manual live-view on/off state.
     """
     profile = config_repo.current_profile
     if not profile:
@@ -592,11 +624,18 @@ def apply_observation_state(
 
     camera_live_applied = False
     if state.camera_live is not None:
-        _apply_camera_live_snapshot(live_controller.camera, state.camera_live, live_controller)
+        _apply_camera_live_snapshot(
+            live_controller.camera,
+            state.camera_live,
+            live_controller,
+            apply_live_trigger_settings=apply_live_trigger_settings,
+        )
         camera_live_applied = True
     _apply_top_level_binning_mode_if_needed(live_controller.camera, state, camera_live_applied)
 
     _sync_illumination_hardware_from_channels(ic, channels)
+    if apply_illumination_on_off_state:
+        _restore_illumination_channel_states(ic, state.illumination_channel_states)
 
 
 def sanitize_preset_filename(name: str) -> str:

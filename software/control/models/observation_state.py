@@ -41,7 +41,7 @@ class CameraLiveSnapshot(BaseModel):
 
 class ObservationState(BaseModel):
     """
-    Objective-free snapshot of channel definitions and tunables for live imaging.
+    Objective lens-free snapshot of channel definitions and tunables for image acquisition.
 
     Aligns with general.yaml channel content plus UI state (active channel, confocal).
     """
@@ -62,6 +62,10 @@ class ObservationState(BaseModel):
     emission_filter_positions: Dict[str, Union[str, int]] = Field(
         default_factory=dict,
         description="Optional global emission filter wheel id → slot name or index",
+    )
+    illumination_channel_states: Dict[str, bool] = Field(
+        default_factory=dict,
+        description="Saved illumination controller on/off state keyed by logical illumination channel name",
     )
     camera_live: Optional[CameraLiveSnapshot] = Field(
         None,

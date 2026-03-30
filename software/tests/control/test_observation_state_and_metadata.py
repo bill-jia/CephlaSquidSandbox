@@ -59,6 +59,7 @@ def test_observation_state_roundtrip_yaml(tmp_path: Path):
         channels=[ch],
         channel_groups=[],
         emission_filter_positions={"1": 2},
+        illumination_channel_states={"TestLaser": True},
         camera_live=live,
         enable_channel_auto_filter_switching=True,
     )
@@ -68,6 +69,7 @@ def test_observation_state_roundtrip_yaml(tmp_path: Path):
     assert back.confocal_mode is True
     assert back.channels[0].name == "Ch1"
     assert back.emission_filter_positions["1"] == 2
+    assert back.illumination_channel_states["TestLaser"] is True
     assert back.camera_live is not None
     assert back.camera_live.roi_width == 1024
     assert back.camera_live.trigger_fps == 10.0
@@ -192,6 +194,102 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
 
     repo.save_general_config.assert_not_called()
     lc.get_channels.assert_called()
+    lc.set_microscope_mode.assert_called()
+
+
+def test_apply_observation_state_restores_saved_illumination_on_off_state():
+    """Loading an Observation State should restore saved illumination channel toggles."""
+    from control.core.observation_state_service import apply_observation_state
+
+    ch = _minimal_channel()
+    state = ObservationState(
+        channels=[ch],
+        channel_groups=[],
+        illumination_channel_states={"TestLaser": True, "OtherLaser": False},
+    )
+
+    repo = MagicMock()
+    repo.current_profile = "p1"
+    repo.get_general_config.return_value = None
+
+    illum = MagicMock()
+    illum.channel_names = ["TestLaser", "OtherLaser"]
+
+    lc = MagicMock()
+    lc.is_confocal_mode.return_value = state.confocal_mode
+    lc.get_channels.return_value = [ch]
+    lc.microscope = MagicMock(illumination_controller=illum)
+    lc.camera = MagicMock()
+
+    objective_store = MagicMock()
+    objective_store.current_objective = "20x"
+
+    apply_observation_state(
+        state,
+        repo,
+        lc,
+        objective_store,
+        emission_filter_wheel=None,
+    )
+
+    illum.set_channel_intensity.assert_called_once_with("TestLaser", 50.0)
+    illum.turn_on_channel.assert_called_once_with("TestLaser")
+    illum.turn_off_channel.assert_called_once_with("OtherLaser")
+
+
+def test_apply_observation_state_can_skip_live_trigger_restore():
+    """Multipoint preset application should not inherit live-view trigger mode/FPS."""
+    from control.core.observation_state_service import apply_observation_state
+
+    ch = _minimal_channel()
+    state = ObservationState(
+        channels=[ch],
+        channel_groups=[],
+        camera_live=CameraLiveSnapshot(
+            exposure_time_ms=25.0,
+            analog_gain=2.0,
+            binning_x=1,
+            binning_y=1,
+            roi_offset_x=0,
+            roi_offset_y=0,
+            roi_width=512,
+            roi_height=512,
+            trigger_mode="Continuous Acquisition",
+            trigger_fps=12.5,
+        ),
+    )
+
+    repo = MagicMock()
+    repo.current_profile = "p1"
+    repo.get_general_config.return_value = None
+
+    illum = MagicMock()
+    illum.channel_names = ["TestLaser"]
+
+    lc = MagicMock()
+    lc.is_confocal_mode.return_value = state.confocal_mode
+    lc.get_channels.return_value = [ch]
+    lc.microscope = MagicMock(illumination_controller=illum)
+    lc.camera = MagicMock()
+
+    objective_store = MagicMock()
+    objective_store.current_objective = "20x"
+
+    apply_observation_state(
+        state,
+        repo,
+        lc,
+        objective_store,
+        emission_filter_wheel=None,
+        apply_live_trigger_settings=False,
+        apply_illumination_on_off_state=False,
+    )
+
+    lc.set_trigger_mode.assert_not_called()
+    lc.set_trigger_fps.assert_not_called()
+    illum.turn_on_channel.assert_not_called()
+    illum.turn_off_channel.assert_not_called()
+    lc.camera.set_exposure_time.assert_called_once_with(25.0)
     lc.set_microscope_mode.assert_called()
 
 
