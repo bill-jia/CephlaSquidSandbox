@@ -10,6 +10,7 @@ from control.core.config.repository import ConfigRepository
 from control.core.observation_state_service import (
     observation_state_binning_mode_for_metadata,
     project_merged_channels_for_observation_preset,
+    observation_state_to_yaml,
     sanitize_preset_filename,
 )
 from control.core.acquisition_metadata_helpers import legacy_flat_multipoint_from_acquisition_yaml_dict
@@ -39,7 +40,9 @@ def test_sanitize_preset_filename():
 
 
 def test_observation_state_roundtrip_yaml(tmp_path: Path):
-    ch = _minimal_channel()
+    ch = _minimal_channel().model_copy(
+        update={"illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True})}
+    )
     live = CameraLiveSnapshot(
         exposure_time_ms=20.0,
         analog_gain=0.0,
@@ -55,11 +58,9 @@ def test_observation_state_roundtrip_yaml(tmp_path: Path):
     )
     state = ObservationState(
         confocal_mode=True,
-        active_channel_name="Ch1",
         channels=[ch],
         channel_groups=[],
         emission_filter_positions={"1": 2},
-        illumination_channel_states={"TestLaser": True},
         camera_live=live,
         enable_channel_auto_filter_switching=True,
     )
@@ -69,12 +70,69 @@ def test_observation_state_roundtrip_yaml(tmp_path: Path):
     assert back.confocal_mode is True
     assert back.channels[0].name == "Ch1"
     assert back.emission_filter_positions["1"] == 2
-    assert back.illumination_channel_states["TestLaser"] is True
+    assert back.channels[0].illumination_settings.on is True
     assert back.camera_live is not None
     assert back.camera_live.roi_width == 1024
     assert back.camera_live.trigger_fps == 10.0
     assert back.enable_channel_auto_filter_switching is True
     assert "objective" not in data
+
+
+def test_observation_state_yaml_v2_view_strips_channel_camera_fields():
+    """YAML v2 view should remove channel-level camera/filter/z_offset/display fields."""
+    ch1 = _minimal_channel("Ch1").model_copy(
+        update={
+            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True}),
+            "z_offset_um": 3.0,
+            "filter_position": 2,
+            "filter_wheel": "auto",
+        }
+    )
+    ch2 = _minimal_channel("Ch2").model_copy(
+        update={
+            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": False}),
+            "z_offset_um": 99.0,  # should not leak into channel entries
+        }
+    )
+    live = CameraLiveSnapshot(
+        exposure_time_ms=20.0,
+        analog_gain=7.0,
+        pixel_format="MONO16",
+        camera_mode="default",
+        binning_x=1,
+        binning_y=1,
+        roi_offset_x=0,
+        roi_offset_y=0,
+        roi_width=100,
+        roi_height=80,
+    )
+    state = ObservationState(
+        confocal_mode=False,
+        channels=[ch1, ch2],
+        channel_groups=[],
+        emission_filter_positions={"1": 5},
+        camera_live=live,
+        enable_channel_auto_filter_switching=True,
+    )
+    view = observation_state_to_yaml(state, camera_label="Cam0")
+
+    assert view["name"] == state.name
+    assert "active_channel_name" not in view
+    assert "camera_states" in view
+    assert "channels" in view
+    assert view["camera_states"]["Cam0"]["camera_settings"]["exposure_time_ms"] == 20.0
+    assert view["camera_states"]["Cam0"]["camera_settings"]["gain_mode"] == 7.0
+    assert view["camera_states"]["Cam0"]["emission_filter_positions"]["1"] == 5
+
+    for ch_view in view["channels"]:
+        assert "camera" not in ch_view
+        assert "camera_settings" not in ch_view
+        assert "display_color" not in ch_view
+        assert "z_offset_um" not in ch_view
+        assert "filter_wheel" not in ch_view
+        assert "filter_position" not in ch_view
+        assert "illumination_settings" in ch_view
+        assert "on" in ch_view["illumination_settings"]
 
 
 def test_observation_state_top_level_binning_roundtrip_yaml():
@@ -201,11 +259,14 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
     """Loading an Observation State should restore saved illumination channel toggles."""
     from control.core.observation_state_service import apply_observation_state
 
-    ch = _minimal_channel()
+    ch = _minimal_channel().model_copy(
+        update={
+            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True})
+        }
+    )
     state = ObservationState(
         channels=[ch],
         channel_groups=[],
-        illumination_channel_states={"TestLaser": True, "OtherLaser": False},
     )
 
     repo = MagicMock()
@@ -214,6 +275,7 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
 
     illum = MagicMock()
     illum.channel_names = ["TestLaser", "OtherLaser"]
+    illum.snapshot_key_for_acquisition_illumination_channel.side_effect = lambda name: name
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
@@ -315,6 +377,7 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     loaded = repo.load_observation_preset("test_preset")
     assert loaded is not None
     assert loaded.channels[0].name == "Saved"
+    assert loaded.name == "test_preset"
 
 
 def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):

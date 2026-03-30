@@ -79,6 +79,7 @@ class IlluminationSettings(BaseModel):
         None, description="Illumination channel name from illumination_channel_config (only in general.yaml)"
     )
     intensity: float = Field(..., ge=0, le=100, description="Illumination intensity percentage (0-100)")
+    on: bool = Field(False, description="Logical illumination on/off for this acquisition channel")
     led_matrix_mode: Optional[str] = Field(
         None,
         description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",

@@ -65,6 +65,8 @@ from control.models.hardware_bindings import (
 )
 from control.models.acquisition_metadata import AcquisitionMetadata
 from control.models.observation_state import ObservationState
+from control.models.observation_state import CameraLiveSnapshot
+from control.models import ConfocalSettings
 
 logger = logging.getLogger(__name__)
 
@@ -1104,9 +1106,27 @@ class ConfigRepository:
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
-        sanitize_preset_filename(name)
+        safe_name = sanitize_preset_filename(name)
+        state_to_save = state.model_copy(update={"name": safe_name})
         path = observation_preset_path(self, name, profile=profile)
-        self._save_yaml(path, state)
+        from control.core.observation_state_service import observation_state_to_yaml
+
+        # Save the cleaned v2 "view" YAML (not the internal model dump).
+        view = observation_state_to_yaml(state_to_save, camera_label="camera")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    view,
+                    f,
+                    Dumper=_YamlDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+        except (OSError, yaml.YAMLError) as e:
+            logger.error("Failed to save Observation State preset YAML '%s': %s", path, e)
+            raise
         return path
 
     def load_observation_preset(self, name: str, profile: Optional[str] = None) -> Optional[ObservationState]:
@@ -1125,12 +1145,141 @@ class ConfigRepository:
             logger.debug("Observation preset not found: %s", path)
             return None
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = yaml.load(f, Loader=_YamlSafeLoader)
             if data is None:
                 data = {}
-            return ObservationState.model_validate(data)
-        except (yaml.YAMLError, ValidationError, OSError) as e:
+            if not isinstance(data, dict):
+                raise ValueError("Observation preset YAML did not parse into a dict")
+
+            # v2-only loader: presets should already be regenerated.
+            if data.get("version") != 2:
+                raise ValueError(f"Unsupported Observation State preset version: {data.get('version')!r}")
+
+            loaded_name = data.get("name", "live")
+            if not isinstance(loaded_name, str) or not loaded_name:
+                loaded_name = "live"
+
+            general = self.get_general_config(profile)
+            if general is None:
+                raise ValueError(f"No general.yaml available for profile {profile!r}")
+
+            camera_states = data.get("camera_states") or {}
+            if not isinstance(camera_states, dict) or not camera_states:
+                raise ValueError("Observation preset missing camera_states")
+
+            # No channel-to-camera mapping exists; if there are multiple cameras, we reconstruct
+            # internal per-channel settings from the first camera_state entry.
+            _, cam_state = next(iter(camera_states.items()))
+            if not isinstance(cam_state, dict):
+                raise ValueError("camera_states entries must be dicts")
+
+            camera_live_dict = cam_state.get("camera_live")
+            camera_live = (
+                CameraLiveSnapshot.model_validate(camera_live_dict) if isinstance(camera_live_dict, dict) else None
+            )
+
+            camera_settings_dict = cam_state.get("camera_settings") or {}
+            camera_settings = CameraSettings.model_validate(camera_settings_dict)
+
+            z_offset_um = float(cam_state.get("z_offset_um", 0.0))
+            emission_filter_positions = cam_state.get("emission_filter_positions") or {}
+            if not isinstance(emission_filter_positions, dict):
+                emission_filter_positions = {}
+
+            enable_auto_filter = data.get("enable_channel_auto_filter_switching")
+            enable_auto_filter = bool(enable_auto_filter) if enable_auto_filter is not None else None
+
+            confocal_mode = bool(data.get("confocal_mode", False))
+
+            channels_out: List[AcquisitionChannel] = []
+            for ch_view in data.get("channels") or []:
+                if not isinstance(ch_view, dict):
+                    continue
+                name_ = ch_view.get("name")
+                if not isinstance(name_, str):
+                    continue
+                base = general.get_channel_by_name(name_)
+                if base is None:
+                    # Robustness for tests / partially-regenerated presets:
+                    # if the preset contains a channel name not present in general.yaml,
+                    # construct a minimal channel from YAML v2 camera + illumination settings.
+                    camera_settings_dict = cam_state.get("camera_settings") or {}
+                    camera_settings_fallback = CameraSettings.model_validate(camera_settings_dict)
+
+                    channels_out.append(
+                        AcquisitionChannel(
+                            name=name_,
+                            enabled=bool(ch_view.get("enabled", True)),
+                            display_color="#FFFFFF",
+                            camera=None,
+                            camera_settings=camera_settings_fallback,
+                            filter_wheel=None,
+                            filter_position=None,
+                            z_offset_um=z_offset_um,
+                            illumination_settings=IlluminationSettings.model_validate(
+                                ch_view.get("illumination_settings") or {}
+                            ),
+                            confocal_hardware_settings=None,
+                            confocal_override=None,
+                        )
+                    )
+                    continue
+
+                illum_dict = ch_view.get("illumination_settings") or {}
+                illumination_settings = IlluminationSettings.model_validate(illum_dict)
+
+                confocal_hw = base.confocal_hardware_settings
+                if "confocal_hardware_settings" in ch_view:
+                    confocal_hw_dict = ch_view.get("confocal_hardware_settings")
+                    confocal_hw = (
+                        ConfocalSettings.model_validate(confocal_hw_dict)
+                        if isinstance(confocal_hw_dict, dict)
+                        else None
+                    )
+
+                # live_controller auto filter switching uses `filter_position` on the active microscope mode row.
+                # Map emission wheel pos slot id "1" when present.
+                fp_override: Optional[int] = None
+                if "1" in emission_filter_positions:
+                    try:
+                        fp_override = int(emission_filter_positions["1"])
+                    except Exception:
+                        fp_override = None
+
+                update: Dict[str, Any] = {
+                    "enabled": bool(ch_view.get("enabled", base.enabled)),
+                    "illumination_settings": illumination_settings,
+                    "camera_settings": camera_settings,
+                    "z_offset_um": z_offset_um,
+                    "confocal_hardware_settings": confocal_hw,
+                }
+                if fp_override is not None:
+                    update["filter_position"] = fp_override
+
+                channels_out.append(base.model_copy(update=update))
+
+            if not channels_out:
+                raise ValueError("Observation preset had no valid channels")
+
+            active_name = next((ch.name for ch in channels_out if bool(ch.illumination_settings.on)), None)
+            if active_name is None:
+                active_name = channels_out[0].name
+
+            return ObservationState(
+                version=2,
+                name=loaded_name,
+                confocal_mode=confocal_mode,
+                channels=channels_out,
+                channel_groups=list(general.channel_groups),
+                emission_filter_positions=dict(emission_filter_positions),
+                camera_live=camera_live,
+                binning_x=getattr(camera_live, "binning_x", None),
+                binning_y=getattr(camera_live, "binning_y", None),
+                camera_mode=getattr(camera_live, "camera_mode", None),
+                enable_channel_auto_filter_switching=enable_auto_filter,
+            )
+        except (yaml.YAMLError, ValidationError, OSError, ValueError, TypeError) as e:
             logger.warning("Failed to load Observation State preset %s: %s", path, e)
             return None
 

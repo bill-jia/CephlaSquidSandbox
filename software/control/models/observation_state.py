@@ -46,11 +46,9 @@ class ObservationState(BaseModel):
     Aligns with general.yaml channel content plus UI state (active channel, confocal).
     """
 
-    version: Union[int, float] = Field(1, description="Observation State schema version")
+    version: Union[int, float] = Field(2, description="Observation State schema version")
+    name: str = Field("live", description="Human name for this Observation State; presets override this, live collection uses 'live'")
     confocal_mode: bool = Field(False, description="Whether confocal imaging mode is active")
-    active_channel_name: Optional[str] = Field(
-        None, description="Selected live/acquisition channel name, if applicable"
-    )
     channels: List[AcquisitionChannel] = Field(
         default_factory=list,
         description="Channel rows (general-layer; objective field must not appear)",
@@ -62,10 +60,6 @@ class ObservationState(BaseModel):
     emission_filter_positions: Dict[str, Union[str, int]] = Field(
         default_factory=dict,
         description="Optional global emission filter wheel id → slot name or index",
-    )
-    illumination_channel_states: Dict[str, bool] = Field(
-        default_factory=dict,
-        description="Saved illumination controller on/off state keyed by logical illumination channel name",
     )
     camera_live: Optional[CameraLiveSnapshot] = Field(
         None,

@@ -415,6 +415,15 @@ When loading channels for an objective, the system merges `general.yaml` with `{
 3. Replace objective-owned fields with objective values
 4. If `confocal_mode` is active, apply `confocal_override` (iris settings)
 
+### Observation State YAML view (runtime/export-only)
+
+When saving **Observation State** presets and embedding them into multipoint `acquisition.yaml`, the software writes a cleaned **YAML view** (schema v2).
+In this view:
+- `active_channel_name` is not serialized.
+- Per-illumination-channel entries omit UI/camera/filter context (`display_color`, `camera`, `camera_settings`, `filter_wheel`, `filter_position`, `z_offset_um`).
+- Per-illumination-channel on/off is stored as `channels[].illumination_settings.on`.
+- Camera + filter-wheel state is represented under `camera_states` instead (with emission filter wheel positions nested per camera).
+
 ### Confocal Override
 
 When the system has a confocal unit and confocal mode is enabled, the `confocal_override` section can override base settings:

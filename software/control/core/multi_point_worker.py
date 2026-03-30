@@ -317,8 +317,9 @@ class MultiPointWorker:
                 for pname in self.observation_state_names:
                     st = repo.load_observation_preset(pname)
                     c = None
-                    if st is not None and st.active_channel_name:
-                        c = self.liveController.get_channel_by_name(objective, st.active_channel_name)
+                    if st is not None and st.channels:
+                        chosen = next((ch for ch in st.channels if bool(ch.illumination_settings.on)), None) or st.channels[0]
+                        c = chosen
                     if c is not None:
                         channel_colors.append(c.display_color)
                         wl = c.get_illumination_wavelength(illumination_config) if illumination_config else None

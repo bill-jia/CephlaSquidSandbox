@@ -241,7 +241,9 @@ def _merge_illumination_hardware_into_channels(
             out.append(ch)
             continue
         st = states[snap_key]
-        new_ill = ch.illumination_settings.model_copy(update={"intensity": float(st.intensity)})
+        new_ill = ch.illumination_settings.model_copy(
+            update={"intensity": float(st.intensity), "on": bool(st.is_on)}
+        )
         out.append(ch.model_copy(update={"illumination_settings": new_ill}))
     return out
 
@@ -276,22 +278,13 @@ def _merge_led_matrix_mode_into_channels(
     return out
 
 
-def _collect_illumination_channel_states(ill_snapshot: Any) -> Dict[str, bool]:
-    """Extract per-channel logical on/off state from ``IlluminationController.snapshot()``."""
-    if ill_snapshot is None or not getattr(ill_snapshot, "channel_states", None):
-        return {}
-    return {str(name): bool(state.is_on) for name, state in ill_snapshot.channel_states.items()}
-
-
 def _merge_active_channel_camera_from_hardware(
     channels: List[AcquisitionChannel],
-    active_channel_name: Optional[str],
     camera: Any,
 ) -> List[AcquisitionChannel]:
     """Copy live camera exposure/gain/pixel format onto the active acquisition channel row."""
     if not channels:
         return channels
-    target = active_channel_name
     if target is None:
         target = channels[0].name
     try:
@@ -337,6 +330,7 @@ def _overlay_preset_channels_onto_merged(
             update={
                 "intensity": p.illumination_settings.intensity,
                 "led_matrix_mode": p.illumination_settings.led_matrix_mode,
+                "on": p.illumination_settings.on,
             }
         )
         new_cam = p.camera_settings.model_copy()
@@ -390,13 +384,45 @@ def _sync_illumination_hardware_from_channels(ic: Any, channels: List[Acquisitio
             logger.warning("Could not set intensity for %r: %s", hw, e)
 
 
-def _restore_illumination_channel_states(ic: Any, saved_states: Dict[str, bool]) -> None:
-    """Restore saved logical illumination on/off state across known controller channels."""
-    if ic is None or not saved_states:
+def _restore_illumination_on_off_from_channels(ic: Any, channels: List[AcquisitionChannel]) -> None:
+    """
+    Restore logical illumination on/off state from per-channel `illumination_settings.on`.
+
+    For LED matrix aliases, uses `snapshot_key_for_acquisition_illumination_channel` when available so
+    the desired keys line up with `ic.channel_names`.
+    """
+    if ic is None:
         return
+
+    desired: Dict[str, bool] = {}
+    for ch in channels:
+        hw = ch.illumination_settings.illumination_channel
+        if not hw:
+            continue
+        value = bool(ch.illumination_settings.on)
+
+        key = hw
+        if hasattr(ic, "snapshot_key_for_acquisition_illumination_channel"):
+            try:
+                key = ic.snapshot_key_for_acquisition_illumination_channel(hw) or hw
+            except Exception:
+                key = hw
+
+        if key in desired and desired[key] != value:
+            # Deterministic conflict rule: if any source indicates ON, keep ON.
+            logger.warning(
+                "Observation State: conflicting illumination on/off for %r (existing=%s new=%s); using ON",
+                key,
+                desired[key],
+                value,
+            )
+            desired[key] = desired[key] or value
+        else:
+            desired[key] = value
+
     for name in getattr(ic, "channel_names", []):
         try:
-            if bool(saved_states.get(name, False)):
+            if desired.get(name, False):
                 ic.turn_on_channel(name)
             else:
                 ic.turn_off_channel(name)
@@ -522,12 +548,11 @@ def collect_observation_state(
     general = config_repo.get_general_config()
     channel_groups = list(general.channel_groups) if general else []
     return ObservationState(
+        name="live",
         confocal_mode=live_controller.is_confocal_mode(),
-        active_channel_name=active,
         channels=channels,
         channel_groups=channel_groups,
         emission_filter_positions=dict(emission_filter_positions or {}),
-        illumination_channel_states=_collect_illumination_channel_states(snap),
         camera_live=camera_live,
         binning_x=bx,
         binning_y=by,
@@ -606,18 +631,17 @@ def apply_observation_state(
     channels = _overlay_preset_channels_onto_merged(merged, state.channels)
     ic = getattr(live_controller.microscope, "illumination_controller", None)
 
-    active_name = state.active_channel_name
-    if active_name:
-        match = next((c for c in channels if c.name == active_name), None)
-    else:
+    # There is no canonical "active channel" in the YAML v2 view.
+    # Select any microscope mode row based on which illumination channels are enabled.
+    match = next((c for c in channels if bool(getattr(c.illumination_settings, "on", False))), None)
+    if match is None:
         match = channels[0] if channels else None
 
     if match is not None:
         live_controller.set_microscope_mode(match)
     else:
         logger.warning(
-            "apply_observation_state: active channel %r not found for objective %r",
-            active_name,
+            "apply_observation_state: no enabled illumination channel found for objective %r",
             objective,
         )
         live_controller.set_microscope_mode(channels[0])
@@ -635,7 +659,7 @@ def apply_observation_state(
 
     _sync_illumination_hardware_from_channels(ic, channels)
     if apply_illumination_on_off_state:
-        _restore_illumination_channel_states(ic, state.illumination_channel_states)
+        _restore_illumination_on_off_from_channels(ic, channels)
 
 
 def sanitize_preset_filename(name: str) -> str:
@@ -657,3 +681,87 @@ def observation_preset_path(
     """Absolute path for a named preset YAML under the given or current profile."""
     stem = sanitize_preset_filename(preset_name)
     return config_repo.get_profile_path(profile) / "observation_presets" / f"{stem}.yaml"
+
+
+def observation_state_to_yaml(
+    state: ObservationState,
+    *,
+    camera_label: str = "camera",
+) -> Dict[str, Any]:
+    """
+    Convert an internal `ObservationState` into the cleaned YAML v2 "view" used by:
+    - `acquisition.yaml` -> `observation_states_used`
+    - `observation_presets/*.yaml`
+
+    This function is intentionally *not* a 1:1 mapping to the internal model:
+    - removes `active_channel_name`
+    - strips camera/filter/z_offset/display fields from per-illumination channel entries
+    - moves camera + emission filter wheel + z offset into top-level `camera_states`
+    """
+    if state.channels:
+        on_channels = [ch for ch in state.channels if bool(ch.illumination_settings.on)]
+        canonical = on_channels[0] if on_channels else state.channels[0]
+    else:
+        canonical = None
+
+    camera_settings: Optional[Dict[str, Any]] = None
+    z_offset_um: Optional[float] = None
+    if canonical is not None:
+        z_offset_um = float(canonical.z_offset_um)
+
+    # Derive camera settings from the live snapshot (camera hardware state),
+    # not from any particular illumination channel row.
+    if state.camera_live is not None:
+        camera_settings = {
+            "exposure_time_ms": float(state.camera_live.exposure_time_ms),
+            "gain_mode": float(state.camera_live.analog_gain),
+            "pixel_format": state.camera_live.pixel_format,
+        }
+    elif canonical is not None:
+        camera_settings = canonical.camera_settings.model_dump(mode="json")
+
+    # Per internal logic, excitation filter wheel info isn't consistently represented today.
+    # Keep it as an optional/empty map in the view.
+    excitation_filter_positions: Dict[str, Union[str, int]] = {}
+    camera_emission_filter_positions: Dict[str, Union[str, int]] = dict(state.emission_filter_positions or {})
+
+    # If we couldn't collect wheel positions at save-time, fall back to the channel's
+    # configured filter_position (many systems effectively treat this as the wheel position).
+    if not camera_emission_filter_positions and canonical is not None and canonical.filter_position is not None:
+        camera_emission_filter_positions = {"1": int(canonical.filter_position)}
+
+    channel_out: List[Dict[str, Any]] = []
+    for ch in state.channels:
+        out: Dict[str, Any] = {
+            "name": ch.name,
+            "enabled": bool(ch.enabled),
+            "illumination_settings": ch.illumination_settings.model_dump(mode="json"),
+        }
+        if ch.confocal_hardware_settings is not None:
+            out["confocal_hardware_settings"] = ch.confocal_hardware_settings.model_dump(mode="json")
+        channel_out.append(out)
+
+    cam_state: Dict[str, Any] = {}
+    if camera_settings is not None:
+        cam_state["camera_settings"] = camera_settings
+    if z_offset_um is not None:
+        cam_state["z_offset_um"] = z_offset_um
+    cam_state["emission_filter_positions"] = camera_emission_filter_positions
+    if state.camera_live is not None:
+        cam_state["camera_live"] = state.camera_live.model_dump(mode="json")
+
+    out: Dict[str, Any] = {
+        "name": state.name,
+        "version": state.version,
+        "confocal_mode": bool(state.confocal_mode),
+        "channels": channel_out,
+        "channel_groups": [cg.model_dump(mode="json") for cg in state.channel_groups] if state.channel_groups else [],
+        "camera_states": {str(camera_label): cam_state},
+    }
+
+    if excitation_filter_positions:
+        out["excitation_filter_positions"] = excitation_filter_positions
+    if state.enable_channel_auto_filter_switching is not None:
+        out["enable_channel_auto_filter_switching"] = bool(state.enable_channel_auto_filter_switching)
+
+    return out

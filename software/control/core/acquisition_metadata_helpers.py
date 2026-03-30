@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import yaml
 
 from control.models.acquisition_metadata import AcquisitionMetadata
+from control.core.observation_state_service import observation_state_to_yaml
+from control.core.config import ConfigRepository
 
 if TYPE_CHECKING:
     from control.core.live_controller import LiveController
@@ -124,7 +126,7 @@ def augment_multipoint_acquisition_yaml_dict(
     *,
     experiment_id: str,
     recording_start_time: float,
-    repo: Any,
+    repo: ConfigRepository,
     objective_store: Any,
     live_controller: Any,
     camera: Any,
@@ -159,8 +161,9 @@ def augment_multipoint_acquisition_yaml_dict(
     if uses_presets:
         for pname in obs_names:
             st = repo.load_observation_preset(pname)
-            if st and st.active_channel_name:
-                resolved_channel_names.append(st.active_channel_name)
+            if st and st.channels:
+                chosen = next((ch for ch in st.channels if bool(ch.illumination_settings.on)), None)
+                resolved_channel_names.append((chosen or st.channels[0]).name)
     else:
         resolved_channel_names = [c.name for c in selected_configurations]
 
@@ -187,10 +190,12 @@ def augment_multipoint_acquisition_yaml_dict(
 
     observation_states_used: Dict[str, Any] = {}
     if uses_presets:
+
+        camera_label = getattr(camera, "name", None) or getattr(camera, "serial_number", None) or type(camera).__name__ or "camera"
         for pname in obs_names:
             st = repo.load_observation_preset(pname)
             if st is not None:
-                observation_states_used[pname] = st.model_dump(mode="json")
+                observation_states_used[pname] = observation_state_to_yaml(st, camera_label=str(camera_label))
 
     out: Dict[str, Any] = {"schema_version": 2}
     out.update(base_yaml)
