@@ -4,3 +4,4 @@
 
 ## Development
 * Run `conda activate squid` to run any command line code or tests
+* Write documentation in .md files under software/docs as you go.

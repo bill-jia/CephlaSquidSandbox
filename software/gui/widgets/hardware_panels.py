@@ -2065,8 +2065,8 @@ class LiveControlWidget(QFrame):
                 self._log.warning("Snap: could not collect observation state for metadata: %s", e)
 
         selected_names = []
-        if obs_state and obs_state.channels:
-            selected_names = [ch.name for ch in obs_state.channels if bool(ch.illumination_settings.on)]
+        if obs_state and obs_state.illuminator_states:
+            selected_names = [ist.illumination_channel for ist in obs_state.illuminator_states if ist.on]
         elif self.currentConfiguration is not None:
             selected_names = [self.currentConfiguration.name]
 

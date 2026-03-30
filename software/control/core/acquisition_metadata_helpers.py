@@ -161,9 +161,10 @@ def augment_multipoint_acquisition_yaml_dict(
     if uses_presets:
         for pname in obs_names:
             st = repo.load_observation_preset(pname)
-            if st and st.channels:
-                chosen = next((ch for ch in st.channels if bool(ch.illumination_settings.on)), None)
-                resolved_channel_names.append((chosen or st.channels[0]).name)
+            if st and st.illuminator_states:
+                active = st.active_illuminator_states
+                ist = active[0] if active else st.illuminator_states[0]
+                resolved_channel_names.append(ist.illumination_channel)
     else:
         resolved_channel_names = [c.name for c in selected_configurations]
 

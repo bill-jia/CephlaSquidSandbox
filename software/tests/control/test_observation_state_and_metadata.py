@@ -9,27 +9,32 @@ import yaml
 from control.core.config.repository import ConfigRepository
 from control.core.observation_state_service import (
     observation_state_binning_mode_for_metadata,
-    project_merged_channels_for_observation_preset,
     observation_state_to_yaml,
     sanitize_preset_filename,
 )
 from control.core.acquisition_metadata_helpers import legacy_flat_multipoint_from_acquisition_yaml_dict
-from control.models import AcquisitionChannel, CameraSettings, GeneralChannelConfig, IlluminationSettings
+from control.models import AcquisitionChannel, CameraSettings as AcqCameraSettings, GeneralChannelConfig, IlluminationSettings
 from control.models.acquisition_metadata import AcquisitionMetadata
-from control.models.observation_state import CameraLiveSnapshot, ObservationState
+from control.models.observation_state import (
+    CameraLiveSnapshot,
+    CameraSettings,
+    IlluminatorState,
+    ObservationState,
+)
 
 
-def _minimal_channel(name: str = "Ch1") -> AcquisitionChannel:
-    return AcquisitionChannel(
+def _minimal_state(
+    name: str = "test",
+    illumination_channel: str = "TestLaser",
+    on: bool = False,
+) -> ObservationState:
+    return ObservationState(
         name=name,
-        enabled=True,
-        display_color="#FF0000",
-        camera=None,
         camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
-        filter_wheel=None,
-        filter_position=None,
-        z_offset_um=0.0,
-        illumination_settings=IlluminationSettings(illumination_channel="TestLaser", intensity=50.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel=illumination_channel, intensity=50.0, on=on),
+        ],
+        display_color="#FF0000",
     )
 
 
@@ -40,9 +45,6 @@ def test_sanitize_preset_filename():
 
 
 def test_observation_state_roundtrip_yaml(tmp_path: Path):
-    ch = _minimal_channel().model_copy(
-        update={"illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True})}
-    )
     live = CameraLiveSnapshot(
         exposure_time_ms=20.0,
         analog_gain=0.0,
@@ -58,144 +60,113 @@ def test_observation_state_roundtrip_yaml(tmp_path: Path):
     )
     state = ObservationState(
         confocal_mode=True,
-        channels=[ch],
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=True),
+        ],
         channel_groups=[],
         emission_filter_positions={"1": 2},
         camera_live=live,
         enable_channel_auto_filter_switching=True,
+        display_color="#FF0000",
     )
     data = state.model_dump(mode="json")
     y = yaml.safe_dump(data)
     back = ObservationState.model_validate(yaml.safe_load(y))
     assert back.confocal_mode is True
-    assert back.channels[0].name == "Ch1"
+    assert back.illuminator_states[0].illumination_channel == "TestLaser"
+    assert back.illuminator_states[0].on is True
+    assert back.camera_settings is not None
+    assert back.camera_settings.exposure_time_ms == 10.0
+    assert back.camera_settings.gain_mode == 1.0
     assert back.emission_filter_positions["1"] == 2
-    assert back.channels[0].illumination_settings.on is True
     assert back.camera_live is not None
     assert back.camera_live.roi_width == 1024
     assert back.camera_live.trigger_fps == 10.0
     assert back.enable_channel_auto_filter_switching is True
+    assert back.display_color == "#FF0000"
     assert "objective" not in data
 
 
-def test_observation_state_yaml_v2_view_strips_channel_camera_fields():
-    """YAML v2 view should remove channel-level camera/filter/z_offset/display fields."""
-    ch1 = _minimal_channel("Ch1").model_copy(
-        update={
-            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True}),
-            "z_offset_um": 3.0,
-            "filter_position": 2,
-            "filter_wheel": "auto",
-        }
-    )
-    ch2 = _minimal_channel("Ch2").model_copy(
-        update={
-            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": False}),
-            "z_offset_um": 99.0,  # should not leak into channel entries
-        }
-    )
-    live = CameraLiveSnapshot(
-        exposure_time_ms=20.0,
-        analog_gain=7.0,
-        pixel_format="MONO16",
-        camera_mode="default",
-        binning_x=1,
-        binning_y=1,
-        roi_offset_x=0,
-        roi_offset_y=0,
-        roi_width=100,
-        roi_height=80,
-    )
+def test_observation_state_yaml_v3_format():
+    """YAML v3 view should have illuminator_states, camera_states, and top-level display_color."""
     state = ObservationState(
         confocal_mode=False,
-        channels=[ch1, ch2],
+        camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=7.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="LaserA", intensity=80.0, on=True),
+            IlluminatorState(illumination_channel="LaserB", intensity=10.0, on=False),
+        ],
         channel_groups=[],
         emission_filter_positions={"1": 5},
-        camera_live=live,
+        camera_live=CameraLiveSnapshot(
+            exposure_time_ms=20.0,
+            analog_gain=7.0,
+            pixel_format="MONO16",
+            camera_mode="default",
+            binning_x=1,
+            binning_y=1,
+            roi_offset_x=0,
+            roi_offset_y=0,
+            roi_width=100,
+            roi_height=80,
+        ),
         enable_channel_auto_filter_switching=True,
+        display_color="#00FF00",
     )
     view = observation_state_to_yaml(state, camera_label="Cam0")
 
     assert view["name"] == state.name
-    assert "active_channel_name" not in view
+    assert "illuminator_states" in view
+    assert "channels" not in view
+    assert len(view["illuminator_states"]) == 2
+    assert view["illuminator_states"][0]["illumination_channel"] == "LaserA"
+    assert view["illuminator_states"][0]["on"] is True
+
     assert "camera_states" in view
-    assert "channels" in view
     assert view["camera_states"]["Cam0"]["camera_settings"]["exposure_time_ms"] == 20.0
     assert view["camera_states"]["Cam0"]["camera_settings"]["gain_mode"] == 7.0
     assert view["camera_states"]["Cam0"]["emission_filter_positions"]["1"] == 5
 
-    for ch_view in view["channels"]:
-        assert "camera" not in ch_view
-        assert "camera_settings" not in ch_view
-        assert "display_color" not in ch_view
-        assert "z_offset_um" not in ch_view
-        assert "filter_wheel" not in ch_view
-        assert "filter_position" not in ch_view
-        assert "illumination_settings" in ch_view
-        assert "on" in ch_view["illumination_settings"]
+    assert view["display_color"] == "#00FF00"
+
+    # No per-illuminator camera or filter fields
+    for ist_view in view["illuminator_states"]:
+        assert "camera_settings" not in ist_view
+        assert "filter_wheel" not in ist_view
+        assert "filter_position" not in ist_view
 
 
-def test_observation_state_top_level_binning_roundtrip_yaml():
-    ch = _minimal_channel()
-    state = ObservationState(
-        channels=[ch],
-        channel_groups=[],
-        binning_x=2,
-        binning_y=4,
-        camera_mode="TestMode",
-    )
-    data = state.model_dump(mode="json")
-    y = yaml.safe_dump(data)
-    back = ObservationState.model_validate(yaml.safe_load(y))
-    assert back.binning_x == 2
-    assert back.binning_y == 4
-    assert back.camera_mode == "TestMode"
-
-
-def test_observation_state_binning_mode_for_metadata_prefers_top_level():
-    ch = _minimal_channel()
+def test_observation_state_binning_mode_from_camera_live():
+    """Binning/mode for metadata comes from camera_live snapshot."""
     live = CameraLiveSnapshot(
         exposure_time_ms=20.0,
         analog_gain=0.0,
-        binning_x=1,
-        binning_y=1,
+        binning_x=3,
+        binning_y=3,
+        camera_mode="Override",
         roi_offset_x=0,
         roi_offset_y=0,
         roi_width=100,
         roi_height=100,
     )
     state = ObservationState(
-        channels=[ch],
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
         channel_groups=[],
         camera_live=live,
-        binning_x=3,
-        binning_y=3,
-        camera_mode="Override",
     )
     bx, by, cm = observation_state_binning_mode_for_metadata(state, camera=None)
     assert bx == 3 and by == 3 and cm == "Override"
-
-
-def test_project_merged_strips_confocal_override():
-    from control.models import AcquisitionChannelOverride
-
-    ch = _minimal_channel()
-
-    override = AcquisitionChannelOverride(
-        illumination_settings=IlluminationSettings(illumination_channel=None, intensity=10.0),
-        camera_settings=None,
-    )
-    ch2 = ch.model_copy(update={"confocal_override": override})
-    out = project_merged_channels_for_observation_preset([ch2])
-    assert out[0].confocal_override is None
 
 
 def test_apply_observation_state_persist_false_skips_save_general():
     """Transient apply during multipoint must not write general.yaml."""
     from control.core.observation_state_service import apply_observation_state
 
-    ch = _minimal_channel()
-    state = ObservationState(channels=[ch], channel_groups=[])
+    state = _minimal_state(on=True)
 
     repo = MagicMock()
     repo.current_profile = "p1"
@@ -203,7 +174,6 @@ def test_apply_observation_state_persist_false_skips_save_general():
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
-    lc.get_channels.return_value = [ch]
     lc.microscope = MagicMock(illumination_controller=None)
     lc.camera = MagicMock()
 
@@ -224,14 +194,17 @@ def test_apply_observation_state_persist_false_skips_save_general():
 
 
 def test_apply_observation_state_skips_general_yaml_when_unchanged():
-    """Re-loading the same channel content should not rewrite general.yaml (disk + cache)."""
-    from control.core.observation_state_service import apply_observation_state
+    """Re-loading the same state should not rewrite general.yaml."""
+    from control.core.observation_state_service import (
+        _observation_state_to_acquisition_channels,
+        apply_observation_state,
+    )
 
-    ch = _minimal_channel()
-    state = ObservationState(channels=[ch], channel_groups=[])
+    state = _minimal_state(on=True)
+    acq_channels = _observation_state_to_acquisition_channels(state)
     matching = GeneralChannelConfig(
-        version=state.version,
-        channels=list(state.channels),
+        version=1,
+        channels=acq_channels,
         channel_groups=list(state.channel_groups),
     )
 
@@ -241,7 +214,6 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
-    lc.get_channels.return_value = [ch]
     lc.microscope = MagicMock(illumination_controller=None)
     lc.camera = MagicMock()
 
@@ -251,7 +223,6 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
     apply_observation_state(state, repo, lc, objective_store, emission_filter_wheel=None)
 
     repo.save_general_config.assert_not_called()
-    lc.get_channels.assert_called()
     lc.set_microscope_mode.assert_called()
 
 
@@ -259,15 +230,7 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
     """Loading an Observation State should restore saved illumination channel toggles."""
     from control.core.observation_state_service import apply_observation_state
 
-    ch = _minimal_channel().model_copy(
-        update={
-            "illumination_settings": _minimal_channel().illumination_settings.model_copy(update={"on": True})
-        }
-    )
-    state = ObservationState(
-        channels=[ch],
-        channel_groups=[],
-    )
+    state = _minimal_state(on=True)
 
     repo = MagicMock()
     repo.current_profile = "p1"
@@ -279,7 +242,6 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
-    lc.get_channels.return_value = [ch]
     lc.microscope = MagicMock(illumination_controller=illum)
     lc.camera = MagicMock()
 
@@ -303,10 +265,11 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
     """Multipoint preset application should not inherit live-view trigger mode/FPS."""
     from control.core.observation_state_service import apply_observation_state
 
-    ch = _minimal_channel()
     state = ObservationState(
-        channels=[ch],
-        channel_groups=[],
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
         camera_live=CameraLiveSnapshot(
             exposure_time_ms=25.0,
             analog_gain=2.0,
@@ -319,6 +282,7 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
             trigger_mode="Continuous Acquisition",
             trigger_fps=12.5,
         ),
+        display_color="#FF0000",
     )
 
     repo = MagicMock()
@@ -330,7 +294,6 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
-    lc.get_channels.return_value = [ch]
     lc.microscope = MagicMock(illumination_controller=illum)
     lc.camera = MagicMock()
 
@@ -351,7 +314,9 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
     lc.set_trigger_fps.assert_not_called()
     illum.turn_on_channel.assert_not_called()
     illum.turn_off_channel.assert_not_called()
-    lc.camera.set_exposure_time.assert_called_once_with(25.0)
+    # Camera settings are applied from camera_settings (step 5) and camera_live snapshot (step 6)
+    calls = lc.camera.set_exposure_time.call_args_list
+    assert calls[0].args == (10.0,), "First exposure set should come from camera_settings"
     lc.set_microscope_mode.assert_called()
 
 
@@ -363,20 +328,32 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
         "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
     )
-    general = GeneralChannelConfig(version=1, channels=[_minimal_channel()], channel_groups=[])
+    # Create a minimal general.yaml using AcquisitionChannel for the bridge
+    ch = AcquisitionChannel(
+        name="TestLaser",
+        enabled=True,
+        display_color="#FF0000",
+        camera=None,
+        camera_settings=AcqCameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        filter_wheel=None,
+        filter_position=None,
+        z_offset_um=0.0,
+        illumination_settings=IlluminationSettings(illumination_channel="TestLaser", intensity=50.0),
+    )
+    general = GeneralChannelConfig(version=1, channels=[ch], channel_groups=[])
     (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
         yaml.safe_dump(general.model_dump(mode="json")), encoding="utf-8"
     )
 
     repo = ConfigRepository(base_path=base)
     repo.set_profile("p1")
-    state = ObservationState(channels=[_minimal_channel("Saved")])
+    state = _minimal_state(name="Saved", illumination_channel="SavedLaser", on=True)
     path = repo.save_observation_preset("test_preset", state)
     assert path.exists()
     assert repo.list_observation_presets() == ["test_preset"]
     loaded = repo.load_observation_preset("test_preset")
     assert loaded is not None
-    assert loaded.channels[0].name == "Saved"
+    assert loaded.illuminator_states[0].illumination_channel == "SavedLaser"
     assert loaded.name == "test_preset"
 
 
@@ -388,8 +365,19 @@ def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):
     (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
         "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
     )
+    ch = AcquisitionChannel(
+        name="TestLaser",
+        enabled=True,
+        display_color="#FF0000",
+        camera=None,
+        camera_settings=AcqCameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        filter_wheel=None,
+        filter_position=None,
+        z_offset_um=0.0,
+        illumination_settings=IlluminationSettings(illumination_channel="TestLaser", intensity=50.0),
+    )
     for prof in ("alpha", "beta"):
-        gen = GeneralChannelConfig(version=1, channels=[_minimal_channel()], channel_groups=[])
+        gen = GeneralChannelConfig(version=1, channels=[ch], channel_groups=[])
         (base / "user_profiles" / prof / "channel_configs" / "general.yaml").write_text(
             yaml.safe_dump(gen.model_dump(mode="json")), encoding="utf-8"
         )

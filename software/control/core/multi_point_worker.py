@@ -316,13 +316,15 @@ class MultiPointWorker:
                 objective = self.objectiveStore.current_objective
                 for pname in self.observation_state_names:
                     st = repo.load_observation_preset(pname)
-                    c = None
-                    if st is not None and st.channels:
-                        chosen = next((ch for ch in st.channels if bool(ch.illumination_settings.on)), None) or st.channels[0]
-                        c = chosen
-                    if c is not None:
-                        channel_colors.append(c.display_color)
-                        wl = c.get_illumination_wavelength(illumination_config) if illumination_config else None
+                    if st is not None and st.illuminator_states:
+                        channel_colors.append(st.display_color)
+                        # Find wavelength from the first active illuminator
+                        active = st.active_illuminator_states
+                        ist = active[0] if active else st.illuminator_states[0]
+                        wl = None
+                        if illumination_config and ist.illumination_channel:
+                            ch_def = illumination_config.get_channel_by_name(ist.illumination_channel)
+                            wl = ch_def.wavelength_nm if ch_def else None
                         channel_wavelengths.append(wl)
                     else:
                         channel_colors.append(0xFFFFFF)

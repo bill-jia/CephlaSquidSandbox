@@ -41,10 +41,17 @@ from control.models.hardware_bindings import (
     FILTER_WHEEL_SOURCE_STANDALONE,
 )
 from control.models.acquisition_metadata import AcquisitionMetadata
-from control.models.observation_state import CameraLiveSnapshot, ObservationState
-from control.models.acquisition_config import (
+from control.models.observation_state import (
     CameraSettings,
     ConfocalSettings,
+    SynchronizationMode,
+    ChannelGroupEntry,
+    ChannelGroup,
+    IlluminatorState,
+    CameraLiveSnapshot,
+    ObservationState,
+)
+from control.models.acquisition_config import (
     IlluminationSettings,
     AcquisitionChannel,
     AcquisitionChannelOverride,
@@ -54,10 +61,6 @@ from control.models.acquisition_config import (
     merge_channel_configs,
     validate_illumination_references,
     get_illumination_channel_names,
-    # Channel Groups
-    SynchronizationMode,
-    ChannelGroupEntry,
-    ChannelGroup,
     validate_channel_group,
 )
 from control.models.laser_af_config import LaserAFConfig
@@ -122,6 +125,7 @@ __all__ = [
     "ObjectiveChannelConfig",
     "AcquisitionOutputConfig",
     "AcquisitionMetadata",
+    "IlluminatorState",
     "CameraLiveSnapshot",
     "ObservationState",
     "merge_channel_configs",

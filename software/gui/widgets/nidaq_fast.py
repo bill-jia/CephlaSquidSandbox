@@ -2385,12 +2385,14 @@ class FastAcquisitionWidget(QWidget):
             
             # Restore binning
             try:
+                target_bx = state.camera_live.binning_x if state.camera_live else 1
+                target_by = state.camera_live.binning_y if state.camera_live else 1
                 current_binning_x, current_binning_y = self.camera.get_binning()
-                if current_binning_x != state.binning_x or current_binning_y != state.binning_y:
-                    self._log.info(f"Restoring binning from ({current_binning_x},{current_binning_y}) to ({state.binning_x},{state.binning_y})")
-                    self.camera.set_binning(state.binning_x, state.binning_y)
+                if current_binning_x != target_bx or current_binning_y != target_by:
+                    self._log.info(f"Restoring binning from ({current_binning_x},{current_binning_y}) to ({target_bx},{target_by})")
+                    self.camera.set_binning(target_bx, target_by)
                 else:
-                    self._log.debug(f"Binning already correct: ({state.binning_x},{state.binning_y})")
+                    self._log.debug(f"Binning already correct: ({target_bx},{target_by})")
             except Exception as e:
                 self._log.error(f"Failed to restore binning: {e}", exc_info=True)
             

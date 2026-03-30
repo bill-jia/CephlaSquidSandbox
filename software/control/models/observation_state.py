@@ -1,20 +1,153 @@
 """
-Observation State — user-facing, objective-free imaging presets.
+Observation State — the fundamental acquisition unit.
 
-Saved under the active profile (see ConfigRepository observation state helpers).
-Does not include objective: presets apply across software objectives; merge with
-objective YAML at runtime via ObjectiveStore + merge_channel_configs.
+An ObservationState represents the complete light-path configuration needed to
+capture images at one or more cameras through a single objective.  It is the
+microscopy equivalent of a "channel" but properly separates:
+
+  * **Per-camera settings** (exposure, gain, pixel format) — one set per camera.
+  * **Per-illuminator runtime state** (which source, intensity, on/off) — via
+    :class:`IlluminatorState` entries.
+  * **Global optical-path state** (emission filters, confocal iris, z-offset).
+
+Hardware-level illumination source definitions (port mapping, wavelength,
+calibration files) remain in :mod:`control.models.illumination_config`
+(:class:`IlluminationChannel`).  ``IlluminatorState.illumination_channel``
+references those definitions by name.
+
+Saved under the active profile; objective-free by design.
 """
 
+import logging
+from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
-from control.models.acquisition_config import AcquisitionChannel, ChannelGroup
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera & Confocal Settings (shared with acquisition config)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class CameraSettings(BaseModel):
+    """Per-camera settings for an observation state."""
+
+    exposure_time_ms: float = Field(..., gt=0, description="Exposure time in milliseconds")
+    gain_mode: float = Field(
+        ...,
+        ge=0,
+        description="Gain setting (currently analog gain value, may become enum in future)",
+    )
+    pixel_format: Optional[str] = Field(None, description="Pixel format (e.g., 'Mono12')")
+
+    model_config = {"extra": "forbid"}
+
+
+class ConfocalSettings(BaseModel):
+    """Confocal iris aperture settings.
+
+    Note: Filter wheel selection is handled via hardware_bindings.yaml, not here.
+    The camera's bound filter wheel (confocal or standalone) is resolved at runtime.
+    """
+
+    illumination_iris: Optional[float] = Field(
+        None, ge=0, le=100, description="Illumination iris aperture percentage (0-100)"
+    )
+    emission_iris: Optional[float] = Field(None, ge=0, le=100, description="Emission iris aperture percentage (0-100)")
+
+    model_config = {"extra": "forbid"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel Groups (multi-camera acquisition)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SynchronizationMode(str, Enum):
+    """Synchronization mode for channel groups."""
+
+    SIMULTANEOUS = "simultaneous"
+    SEQUENTIAL = "sequential"
+
+
+class ChannelGroupEntry(BaseModel):
+    """A channel entry within a channel group."""
+
+    name: str = Field(..., min_length=1, description="Channel name (must exist in channels list)")
+    offset_us: float = Field(
+        0.0,
+        ge=0,
+        description="Trigger offset in microseconds (only used for simultaneous mode)",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class ChannelGroup(BaseModel):
+    """A group of channels to be acquired together.
+
+    For simultaneous mode, each channel must use a different camera.
+    """
+
+    name: str = Field(..., min_length=1, description="Group name for UI")
+    synchronization: SynchronizationMode = Field(
+        SynchronizationMode.SEQUENTIAL,
+        description="Capture mode: simultaneous or sequential",
+    )
+    channels: List[ChannelGroupEntry] = Field(..., min_length=1, description="Channels in this group")
+
+    model_config = {"extra": "forbid"}
+
+    def get_channel_names(self) -> List[str]:
+        return [entry.name for entry in self.channels]
+
+    def get_channel_offset(self, channel_name: str) -> float:
+        for entry in self.channels:
+            if entry.name == channel_name:
+                return entry.offset_us
+        return 0.0
+
+    def get_channels_sorted_by_offset(self) -> List[ChannelGroupEntry]:
+        return sorted(self.channels, key=lambda c: c.offset_us)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Illuminator State
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class IlluminatorState(BaseModel):
+    """Runtime state of a single illumination source within an ObservationState.
+
+    References an :class:`~control.models.illumination_config.IlluminationChannel`
+    by *name*.  The :class:`~control.lighting.IlluminationController` dispatches
+    to the correct hardware device (Teensy LED matrix, NIDAQ, serial laser, etc.)
+    based on this name.
+    """
+
+    illumination_channel: str = Field(
+        ..., min_length=1, description="Name of the illumination source (references IlluminationChannelConfig)"
+    )
+    intensity: float = Field(0.0, ge=0, le=100, description="Illumination intensity percentage (0-100)")
+    on: bool = Field(False, description="Logical on/off state for this source")
+    led_matrix_mode: Optional[str] = Field(
+        None,
+        description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera Live Snapshot
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class CameraLiveSnapshot(BaseModel):
-    """Runtime camera parameters not fully represented in merged channel YAML (ROI, binning, etc.)."""
+    """Runtime camera parameters: ROI, binning, trigger mode."""
 
     exposure_time_ms: float = Field(..., gt=0, description="Exposure time in milliseconds")
     analog_gain: float = Field(0.0, ge=0, description="Analog gain")
@@ -39,49 +172,85 @@ class CameraLiveSnapshot(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ObservationState
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class ObservationState(BaseModel):
-    """
-    Objective lens-free snapshot of channel definitions and tunables for image acquisition.
+    """Complete light-path configuration for a single acquisition step.
 
-    Aligns with general.yaml channel content plus UI state (active channel, confocal).
+    Analogous to a "channel" in typical microscopy acquisition software, but
+    correctly separates per-camera settings from per-illuminator state and
+    supports multi-camera setups through one objective.
     """
 
-    version: Union[int, float] = Field(2, description="Observation State schema version")
-    name: str = Field("live", description="Human name for this Observation State; presets override this, live collection uses 'live'")
+    version: Union[int, float] = Field(3, description="Observation State schema version")
+    name: str = Field("live", description="Preset name (used for filenames, UI display)")
     confocal_mode: bool = Field(False, description="Whether confocal imaging mode is active")
-    channels: List[AcquisitionChannel] = Field(
-        default_factory=list,
-        description="Channel rows (general-layer; objective field must not appear)",
-    )
-    channel_groups: List[ChannelGroup] = Field(
-        default_factory=list,
-        description="Multi-camera channel groups (from general.yaml)",
-    )
-    emission_filter_positions: Dict[str, Union[str, int]] = Field(
-        default_factory=dict,
-        description="Optional global emission filter wheel id → slot name or index",
+
+    # Per-camera settings (single camera; multi-camera uses channel_groups)
+    camera_settings: Optional[CameraSettings] = Field(
+        None, description="Camera exposure, gain, pixel format (one per camera)"
     )
     camera_live: Optional[CameraLiveSnapshot] = Field(
-        None,
-        description="Live camera ROI/binning/mode snapshot (applied to hardware on load)",
+        None, description="Camera ROI, binning, trigger mode snapshot"
     )
-    binning_x: Optional[int] = Field(
-        None,
-        ge=1,
-        description="Horizontal binning (mirrors camera_live when set; used if camera_live is absent)",
+
+    # Illumination (per-source runtime state)
+    illuminator_states: List[IlluminatorState] = Field(
+        default_factory=list,
+        description="Per-illumination-source state (intensity, on/off, LED matrix mode)",
     )
-    binning_y: Optional[int] = Field(
-        None,
-        ge=1,
-        description="Vertical binning (mirrors camera_live when set; used if camera_live is absent)",
+
+    # Optical path
+    emission_filter_positions: Dict[str, Union[str, int]] = Field(
+        default_factory=dict,
+        description="Emission filter wheel id → slot name or index",
     )
-    camera_mode: Optional[str] = Field(
-        None,
-        description="Camera acquisition mode string (mirrors camera_live when set; used if camera_live is absent)",
+    z_offset_um: float = Field(0.0, description="Z offset in micrometers")
+    confocal_hardware_settings: Optional[ConfocalSettings] = Field(
+        None, description="Confocal iris aperture settings"
     )
+
+    # Presentation
+    display_color: str = Field("#FFFFFF", description="Hex color for UI visualization", pattern=r"^#[0-9A-Fa-f]{6}$")
+
+    # Multi-camera groups
+    channel_groups: List[ChannelGroup] = Field(
+        default_factory=list,
+        description="Multi-camera channel groups",
+    )
+
+    # UI state
     enable_channel_auto_filter_switching: Optional[bool] = Field(
         None,
-        description="If set, mirrors LiveController.enable_channel_auto_filter_switching (emission filter follows channel)",
+        description="If set, emission filter follows observation state selection",
     )
 
     model_config = {"extra": "forbid"}
+
+    # Convenience properties
+
+    @property
+    def exposure_time(self) -> float:
+        """Exposure time in ms from camera_settings (falls back to camera_live)."""
+        if self.camera_settings is not None:
+            return self.camera_settings.exposure_time_ms
+        if self.camera_live is not None:
+            return self.camera_live.exposure_time_ms
+        return 1.0
+
+    @property
+    def analog_gain(self) -> float:
+        """Analog gain from camera_settings (falls back to camera_live)."""
+        if self.camera_settings is not None:
+            return self.camera_settings.gain_mode
+        if self.camera_live is not None:
+            return self.camera_live.analog_gain
+        return 0.0
+
+    @property
+    def active_illuminator_states(self) -> List[IlluminatorState]:
+        """IlluminatorStates where on=True."""
+        return [ist for ist in self.illuminator_states if ist.on]
