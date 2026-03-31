@@ -3,7 +3,9 @@
     "allow": [
       "Bash(xargs grep:*)",
       "Bash(grep -r \"class.*Widget\" /c/Code/CephlaSquidSandbox/software/gui/widgets/*.py)",
-      "Bash(cmd.exe /c \"conda activate*\")"
+      "Bash(cmd.exe /c \"conda activate*\")",
+      "Bash(C:/ProgramData/miniconda3/condabin/conda.bat run:*)",
+      "Bash(wc:*)"
     ]
   }
 }

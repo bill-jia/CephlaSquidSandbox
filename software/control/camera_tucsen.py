@@ -1103,6 +1103,10 @@ class TucsenCamera(AbstractCamera):
                        e.g. "hdr", "cms", "high_speed" (400BSI V3); "standard", "low_noise", "senbin" (FL26);
                        "hdr", "speed", "sensitivity" (Aries).
         """
+        if mode_name == self.get_camera_mode():
+            self._log.debug(f"set_camera_mode: already {mode_name}, skipping")
+            return
+
         modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
         if modes is None:
             raise ValueError(f"No camera modes defined for model {self._config.camera_model}")
@@ -1177,6 +1181,10 @@ class TucsenCamera(AbstractCamera):
             self._update_internal_settings()
 
     def set_binning(self, binning_factor_x: int, binning_factor_y: int):
+        if (binning_factor_x, binning_factor_y) == self._binning:
+            self._log.debug(f"set_binning: already {self._binning}, skipping")
+            return
+
         # TODO: Add support for FL26BW model
         if not (binning_factor_x, binning_factor_y) in self._model_properties.binning_to_set_value:
             raise CameraError(f"No binning option exists for {binning_factor_x}x{binning_factor_y}")
@@ -1261,6 +1269,14 @@ class TucsenCamera(AbstractCamera):
             roi_attr.nVOffset = control.utils.truncate_to_interval(offset_y, 4)
             roi_attr.nWidth = control.utils.truncate_to_interval(width, 4)
             roi_attr.nHeight = control.utils.truncate_to_interval(height, 4)
+
+        if self._model_properties.is_genicam:
+            truncated_roi = (nHOffset, nVOffset, nWidth, nHeight)
+        else:
+            truncated_roi = (roi_attr.nHOffset, roi_attr.nVOffset, roi_attr.nWidth, roi_attr.nHeight)
+        if truncated_roi == self.get_region_of_interest():
+            self._log.debug(f"set_region_of_interest: already {truncated_roi}, skipping")
+            return
 
         with self._pause_streaming():
             if self._model_properties.is_genicam:

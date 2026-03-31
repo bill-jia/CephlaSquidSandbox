@@ -838,6 +838,10 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         hw_trigger_fn and hw_set_strobe_delay_ms_fn to the __init__ must have been valid for the duration of this
         camera's acquisition mode being set to HARDWARE
         """
+        if acquisition_mode == self.get_acquisition_mode():
+            self._log.debug(f"set_acquisition_mode: already {acquisition_mode}, skipping")
+            return
+
         if acquisition_mode is CameraAcquisitionMode.HARDWARE_TRIGGER:
             if not self._hw_trigger_fn:
                 raise ValueError(

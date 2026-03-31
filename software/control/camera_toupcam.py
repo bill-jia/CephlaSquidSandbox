@@ -534,6 +534,10 @@ class ToupcamCamera(AbstractCamera):
         self._pixel_format = pixel_format
 
     def set_pixel_format(self, pixel_format: CameraPixelFormat):
+        if pixel_format == self._pixel_format:
+            self._log.debug(f"set_pixel_format: already {pixel_format}, skipping")
+            return
+
         with self._pause_streaming():
             self._raw_set_pixel_format(pixel_format)
             self.set_black_level(self._config.default_black_level)
@@ -595,6 +599,10 @@ class ToupcamCamera(AbstractCamera):
             )  # 1 is RAW mode, 0 is RGB mode
 
     def set_frame_format(self, data_format: CameraFrameFormat):
+        if data_format == self.get_frame_format():
+            self._log.debug(f"set_frame_format: already {data_format}, skipping")
+            return
+
         with self._pause_streaming():
             self._raw_set_frame_format(data_format)
         self._update_internal_settings()
@@ -610,6 +618,10 @@ class ToupcamCamera(AbstractCamera):
             raise ValueError(f"Camera returned unknown frame format: value={camera_val}")
 
     def set_binning(self, binning_factor_x: int, binning_factor_y: int):
+        if (binning_factor_x, binning_factor_y) == self._binning:
+            self._log.debug(f"set_binning: already {self._binning}, skipping")
+            return
+
         with self._pause_streaming():
             if (binning_factor_x, binning_factor_y) not in self._capabilities.binning_to_resolution:
                 raise ValueError(f"Binning ({binning_factor_x},{binning_factor_y}) not supported by camera")
@@ -730,6 +742,11 @@ class ToupcamCamera(AbstractCamera):
         roi_offset_y = control.utils.truncate_to_interval(offset_y, 2)
         roi_width = control.utils.truncate_to_interval(width, 2)
         roi_height = control.utils.truncate_to_interval(height, 2)
+
+        if (roi_offset_x, roi_offset_y, roi_width, roi_height) == self.get_region_of_interest():
+            self._log.debug(f"set_region_of_interest: already {(roi_offset_x, roi_offset_y, roi_width, roi_height)}, skipping")
+            return
+
         with self._pause_streaming():
             try:
                 self._camera.put_Roi(roi_offset_x, roi_offset_y, roi_width, roi_height)
