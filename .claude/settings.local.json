@@ -11,7 +11,10 @@
       "Bash(echo \"FAILED: $f\")",
       "Bash(done)",
       "Bash(find /c/Code/CephlaSquidSandbox/software -name *.py -path */ui/* -o -name *widget* -o -name *gui*)",
-      "Bash(grep -rn \"collect_observation_state\\\\|apply_observation_state\" \"C:\\\\Code\\\\CephlaSquidSandbox\\\\software\"\" --include=\"*.py \")"
+      "Bash(grep -rn \"collect_observation_state\\\\|apply_observation_state\" \"C:\\\\Code\\\\CephlaSquidSandbox\\\\software\"\" --include=\"*.py \")",
+      "Bash(awk 'NR>=80')",
+      "Bash(cut -d'\\(' -f1)",
+      "Bash(sed 's/.*def //')"
     ]
   }
 }

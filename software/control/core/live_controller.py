@@ -128,7 +128,7 @@ class LiveController:
     @currentConfiguration.setter
     def currentConfiguration(self, value: Optional[ObservationState]) -> None:
         self.current_observation_state = value
-
+        self._log.info(f"currentConfiguration set to: {value.name}")
     # ─────────────────────────────────────────────────────────────────────────────
     # Confocal mode
     # ─────────────────────────────────────────────────────────────────────────────

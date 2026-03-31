@@ -866,28 +866,30 @@ class ConfigRepository:
 
         return True
 
-    def persist_general_config(self, active_channel_name: Optional[str] = None) -> None:
-        """Write the in-memory GeneralObservationConfig to general.yaml.
-
-        Call this at application shutdown to persist any changes made via
-        :meth:`update_channel_setting` during the session.
+    def persist_general_config(
+        self,
+        current_state: Optional[ObservationState] = None,
+    ) -> None:
+        """Write the current observation state to general.yaml at shutdown.
 
         Args:
-            active_channel_name: If provided, saved to a sidecar file so
-                the same channel can be restored on next startup.
+            current_state: The live controller's current observation state.
+                If provided, it replaces the cached general config with a single
+                state named ``"general"``.  If None, falls back to the in-memory
+                cache (legacy behaviour).
         """
         profile = self._current_profile
         if not profile:
             return
-        general = self.get_general_config()
+
+        if current_state is not None:
+            general_state = current_state.model_copy(update={"name": "general"})
+            general = GeneralObservationConfig(observation_states=[general_state])
+        else:
+            general = self.get_general_config()
+
         if general is not None:
             self.save_general_config(profile, general)
-        if active_channel_name is not None:
-            try:
-                path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
-                path.write_text(active_channel_name)
-            except Exception as exc:
-                logger.warning("Could not persist active channel name: %s", exc)
 
     def get_last_active_channel_name(self) -> Optional[str]:
         """Read the channel name that was active when the app last shut down."""

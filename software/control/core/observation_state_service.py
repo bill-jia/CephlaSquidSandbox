@@ -674,6 +674,7 @@ def apply_observation_state(
     # optical path (emission filters, iris), and on/off control during live view.
     # No separate _sync_illumination_hardware / _restore_illumination_on_off needed.
     _t0 = time.perf_counter()
+    logger.info(f"apply_observation_state: setting observation state: {state.name}")
     live_controller.set_observation_state(state)
     logger.info("apply_observation_state: set_observation_state took %.4fs", time.perf_counter() - _t0)
 

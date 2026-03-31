@@ -2523,8 +2523,9 @@ class HighContentScreeningGui(QMainWindow):
                 raise
 
         try:
-            active_name = self.liveController.get_active_channel_name()
-            self.microscope.config_repo.persist_general_config(active_channel_name=active_name)
+            self.microscope.config_repo.persist_general_config(
+                current_state=self.liveController.current_observation_state,
+            )
         except Exception:
             if for_restart:
                 self.log.exception(f"Error persisting general config during {context}")
