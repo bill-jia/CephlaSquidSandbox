@@ -30,7 +30,7 @@ from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
-from control.models import AcquisitionChannel
+from control.models.observation_state import ObservationState
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 import squid.logging
 import control.core.job_processing
@@ -136,10 +136,6 @@ class MultiPointWorker:
         self.observation_state_names = list(acquisition_parameters.selected_observation_state_names or [])
         self._use_observation_presets = bool(self.observation_state_names)
         self._emission_filter_wheel = getattr(scope.addons, "emission_filter_wheel", None)
-        if self._use_observation_presets:
-            self.selected_configurations = []
-        else:
-            self.selected_configurations = acquisition_parameters.selected_configurations
 
         # Pre-compute acquisition metadata that remains constant throughout the run.
         try:
@@ -155,11 +151,7 @@ class MultiPointWorker:
         self._physical_size_z_um = self.deltaZ if self.NZ > 1 else None
         self.timestamp_acquisition_started = acquisition_parameters.acquisition_start_time
 
-        _channel_display_names = (
-            self.observation_state_names
-            if self._use_observation_presets
-            else [cfg.name for cfg in self.selected_configurations]
-        )
+        _channel_display_names = list(self.observation_state_names)
         _n_channels = len(_channel_display_names)
 
         self.acquisition_info = AcquisitionInfo(
@@ -330,12 +322,9 @@ class MultiPointWorker:
                         channel_colors.append(0xFFFFFF)
                         channel_wavelengths.append(None)
             else:
-                channel_names = [cfg.name for cfg in self.selected_configurations]
-                channel_colors = [cfg.display_color for cfg in self.selected_configurations]
+                channel_names = []
+                channel_colors = []
                 channel_wavelengths = []
-                for cfg in self.selected_configurations:
-                    wavelength = cfg.get_illumination_wavelength(illumination_config) if illumination_config else None
-                    channel_wavelengths.append(wavelength)
 
             zarr_writer_info = ZarrWriterInfo(
                 base_path=self.experiment_path,
@@ -484,45 +473,40 @@ class MultiPointWorker:
         return True
 
     def _channel_step_count(self) -> int:
-        if self.observation_state_names:
-            return len(self.observation_state_names)
-        return len(self.selected_configurations)
+        return len(self.observation_state_names)
 
-    def _apply_observation_state(self, preset_name: str):
+    def _apply_observation_state(self, preset_name: str) -> ObservationState:
         repo = self.microscope.config_repo
-        state = repo.load_observation_preset(preset_name)
+        with self._timing.get_timer("load_observation_preset"):
+            state = repo.load_observation_preset(preset_name)
         if state is None:
             raise ValueError(f"observation state not found: {preset_name!r}")
-        apply_observation_state(
-            state,
-            repo,
-            self.liveController,
-            self.objectiveStore,
-            emission_filter_wheel=self._emission_filter_wheel,
-            persist_general_to_profile=False,
-        )
-        cfg = self.liveController.currentConfiguration
-        if cfg is None:
-            raise RuntimeError(f"No active channel after applying observation preset {preset_name!r}")
-        return cfg
+        with self._timing.get_timer("apply_observation_state_to_hardware"):
+            apply_observation_state(
+                state,
+                repo,
+                self.liveController,
+                self.objectiveStore,
+                emission_filter_wheel=self._emission_filter_wheel,
+                persist_general_to_profile=False,
+            )
+        return state
 
     def _apply_current_illumination_state_to_hardware(self) -> None:
         """Assert the illumination controller's current logical on/off state on hardware."""
         ic = self.microscope.illumination_controller
-        try:
-            logical_states = ic.get_shutter_state()
-        except Exception as e:
-            self._log.warning("Could not read illumination logical state for capture: %s", e)
-            return
-
-        for name, is_on in logical_states.items():
+        with self._timing.get_timer("get_shutter_state"):
             try:
-                if is_on:
-                    ic.turn_on_channel(name, force_hardware=True)
-                else:
-                    ic.turn_off_channel(name, force_hardware=True)
+                logical_states = ic.get_shutter_state()
             except Exception as e:
-                self._log.warning("Could not apply illumination state for %r: %s", name, e)
+                self._log.warning("Could not read illumination logical state for capture: %s", e)
+                return
+        with self._timing.get_timer("apply_shutter_state_to_hardware"):
+            for name, is_on in logical_states.items():
+                try:
+                    ic.set_channel_state(name, is_on, force_hardware=True)
+                except Exception as e:
+                    self._log.warning("Could not apply illumination state for %r: %s", name, e)
 
     def _turn_off_capture_illumination_preserving_logical_state(self) -> None:
         """Clear hardware illumination after a snap without losing the saved logical state."""
@@ -615,7 +599,7 @@ class MultiPointWorker:
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
-            self._log.debug(self._timing.get_report())
+            self._log.info(self._timing.get_report())
             if this_image_callback_id:
                 self.camera.remove_frame_callback(this_image_callback_id)
 
@@ -734,37 +718,41 @@ class MultiPointWorker:
             self._laser_af_failures = 0
             self.microcontroller.enable_joystick(False)
 
-            self._log.debug("multipoint acquisition - time point " + str(self.time_point + 1))
+            self._log.info("multipoint acquisition - time point " + str(self.time_point + 1))
 
             # for each time point, create a new folder
-            if self.experiment_path:
-                utils.ensure_directory_exists(str(self.experiment_path))
-            current_path = os.path.join(self.experiment_path, f"{self.time_point:0{FILE_ID_PADDING}}")
-            utils.ensure_directory_exists(str(current_path))
-
+            with self._timing.get_timer("create_new_timepoint"):
+                if self.experiment_path:
+                    utils.ensure_directory_exists(str(self.experiment_path))
+                current_path = os.path.join(self.experiment_path, f"{self.time_point:0{FILE_ID_PADDING}}")
+                utils.ensure_directory_exists(str(current_path))
             # create a dataframe to save coordinates
-            self.initialize_coordinates_dataframe()
+            with self._timing.get_timer("initialize_coordinates_dataframe"):
+                self.initialize_coordinates_dataframe()
 
             # init z parameters, z range
-            self.initialize_z_stack()
+            with self._timing.get_timer("initialize_z_stack"):
+                self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
                 self.run_coordinate_acquisition(current_path)
 
             # Save plate view for this timepoint
-            if self._generate_downsampled_views and self._downsampled_view_manager is not None:
-                # Wait for pending downsampled view jobs to complete
-                self._wait_for_downsampled_view_jobs()
-                # Save plate view
-                plate_resolution = int(self._downsampled_plate_resolution_um)
-                plate_view_path = os.path.join(current_path, "downsampled", f"plate_{plate_resolution}um.tiff")
-                self.save_plate_view(plate_view_path)
-                self._log.info(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
-                # Clear plate view for next timepoint
-                self._downsampled_view_manager.clear()
+            with self._timing.get_timer("save_plate_view"):
+                if self._generate_downsampled_views and self._downsampled_view_manager is not None:
+                    # Wait for pending downsampled view jobs to complete
+                    self._wait_for_downsampled_view_jobs()
+                    # Save plate view
+                    plate_resolution = int(self._downsampled_plate_resolution_um)
+                    plate_view_path = os.path.join(current_path, "downsampled", f"plate_{plate_resolution}um.tiff")
+                    self.save_plate_view(plate_view_path)
+                    self._log.info(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
+                    # Clear plate view for next timepoint
+                    self._downsampled_view_manager.clear()
 
             # finished region scan
-            self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+            with self._timing.get_timer("save_coordinates_csv"):
+                self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
 
             # Send Slack timepoint notification via callback (allows main thread to capture screenshot)
             if self._slack_notifier is not None:
@@ -1045,12 +1033,8 @@ class MultiPointWorker:
         # Get channel info
         channel_idx = info.configuration_idx
         total_channels = self._channel_step_count()
-        channel_name = info.configuration.name if info.configuration else f"Channel_{channel_idx}"
-        channel_names = (
-            list(self.observation_state_names)
-            if self.observation_state_names
-            else [cfg.name for cfg in self.selected_configurations]
-        )
+        channel_name = info.observation_state.name if info.observation_state else f"Channel_{channel_idx}"
+        channel_names = list(self.observation_state_names)
 
         return DownsampledViewJob(
             capture_info=info,
@@ -1134,11 +1118,7 @@ class MultiPointWorker:
 
         # Get channel info
         num_channels = self._channel_step_count()
-        channel_names = (
-            list(self.observation_state_names)
-            if self.observation_state_names
-            else [cfg.name for cfg in self.selected_configurations]
-        )
+        channel_names = list(self.observation_state_names)
 
         self._downsampled_view_manager = DownsampledViewManager(
             num_rows=self._plate_num_rows,
@@ -1396,34 +1376,7 @@ class MultiPointWorker:
                         RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
                     )
             else:
-                for config_idx, config in enumerate(self.selected_configurations):
-                    if self.NZ == 1:  # TODO: handle z offset for z stack
-                        self.handle_z_offset(config, True)
-
-                    # acquire image
-                    with self._timing.get_timer("acquire_camera_image"):
-                        # TODO(imo): This really should not look for a string in a user configurable name.  We
-                        # need some proper flag on the config to signal this instead...
-                        if "RGB" in config.name:
-                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
-                        else:
-                            self.acquire_camera_image(
-                                config,
-                                file_ID,
-                                current_path,
-                                z_level,
-                                region_id=region_id,
-                                fov=fov,
-                                config_idx=config_idx,
-                            )
-
-                    if self.NZ == 1:  # TODO: handle z offset for z stack
-                        self.handle_z_offset(config, False)
-
-                    current_image = fov * self.NZ * n_steps + z_level * n_steps + config_idx + 1
-                    self.callbacks.signal_region_progress(
-                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
-                    )
+                raise ValueError("Legacy channel configurations are deprecated.  Use observation states instead.")
 
             # updates coordinates df
             self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
@@ -1445,9 +1398,13 @@ class MultiPointWorker:
         # Increment FOV counter for Slack notification stats
         self._timepoint_fov_count += 1
 
-    def _select_config(self, config: AcquisitionChannel):
+    def _select_config(self, config):
+        """Apply an ObservationState to hardware before capture."""
         self.callbacks.signal_current_configuration(config)
-        self.liveController.set_microscope_mode(config)
+        if isinstance(config, ObservationState):
+            self.liveController.set_observation_state(config)
+        else:
+            self.liveController.set_microscope_mode(config)
         self.wait_till_operation_is_completed()
 
     def perform_autofocus(self, region_id, fov):
@@ -1493,13 +1450,13 @@ class MultiPointWorker:
         self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
     def handle_z_offset(self, config, not_offset):
-        if config.z_offset is not None:  # perform z offset for config, assume z_offset is in um
-            if config.z_offset != 0.0:
-                direction = 1 if not_offset else -1
-                self._log.info("Moving Z offset" + str(config.z_offset * direction))
-                self.stage.move_z(config.z_offset / 1000 * direction)
-                self.wait_till_operation_is_completed()
-                self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+        z_offset = config.z_offset_um if isinstance(config, ObservationState) else getattr(config, "z_offset", None)
+        if z_offset is not None and z_offset != 0.0:
+            direction = 1 if not_offset else -1
+            self._log.info("Moving Z offset" + str(z_offset * direction))
+            self.stage.move_z(z_offset / 1000 * direction)
+            self.wait_till_operation_is_completed()
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
     def _image_callback(self, camera_frame: CameraFrame):
         try:
@@ -1602,36 +1559,20 @@ class MultiPointWorker:
             and self._last_illumination_config_name != config.name
         ):
             self.liveController.turn_off_illumination()
-
-        self._select_config(config)
+        with self._timing.get_timer("select_config"):
+            self._select_config(config)
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
-        using_observation_snapshot = self._use_observation_presets
+        using_preset_obs_state = self._use_observation_presets
         with self._timing.get_timer("illuminate_for_capture"):
-            if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-                if using_observation_snapshot:
-                    self._apply_current_illumination_state_to_hardware()
-                else:
-                    self.liveController.turn_on_illumination()
-                self.wait_till_operation_is_completed()
-                camera_illumination_time = None
-            elif self.liveController.trigger_mode == TriggerMode.HARDWARE:
-                if using_observation_snapshot:
-                    self._apply_current_illumination_state_to_hardware()
-                    self.wait_till_operation_is_completed()
-                if "Fluorescence" in config.name and ENABLE_NL5 and NL5_USE_DOUT:
-                    # TODO(imo): This used to use the "reset_image_ready_flag=False" on the read_frame, but oinly the toupcam camera implementation had the
-                    #  "reset_image_ready_flag" arg, so this is broken for all other cameras.  Also this used to do some other funky stuff like setting internal camera flags.
-                    #   I am pretty sure this is broken!
-                    self.microscope.addons.nl5.start_acquisition()
-            elif self.liveController.trigger_mode == TriggerMode.CONTINUOUS:
-                if using_observation_snapshot:
-                    self._apply_current_illumination_state_to_hardware()
-                else:
-                    self.liveController.turn_on_illumination()
-                self.wait_till_operation_is_completed()
-                camera_illumination_time = None
+            if using_preset_obs_state:
+                self._log.info("Using observation snapshot for capture")
+                self._apply_current_illumination_state_to_hardware()
+            else:
+                self._log.info("Using legacy illumination for capture")
+                self.liveController.turn_on_illumination()
+            self.wait_till_operation_is_completed()
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
@@ -1669,7 +1610,7 @@ class MultiPointWorker:
                 z_index=k,
                 capture_time=time.time(),
                 z_piezo_um=(self.z_piezo_um if self.use_piezo else None),
-                configuration=config,
+                observation_state=config,
                 save_directory=current_path,
                 file_id=file_ID,
                 region_id=region_id,
@@ -1707,10 +1648,7 @@ class MultiPointWorker:
 
         # Turn off capture illumination after a one-frame snap unless the user explicitly keeps it on.
         if not self.keep_illuminators_on_between_captures:
-            if using_observation_snapshot:
-                self._turn_off_capture_illumination_preserving_logical_state()
-            elif self.liveController.trigger_mode in (TriggerMode.SOFTWARE, TriggerMode.CONTINUOUS):
-                self.liveController.turn_off_illumination()
+            self._turn_off_capture_illumination_preserving_logical_state()
         self._last_illumination_config_name = config.name
 
     def _sleep(self, sec):
@@ -1766,12 +1704,12 @@ class MultiPointWorker:
             z_index=k,
             capture_time=time.time(),
             z_piezo_um=(self.z_piezo_um if self.use_piezo else None),
-            configuration=config,
+            observation_state=config,
             save_directory=current_path,
             file_id=file_ID,
             region_id=region_id,
             fov=fov,
-            configuration_idx=config.id,
+            configuration_idx=0,
             time_point=self.time_point,
         )
 

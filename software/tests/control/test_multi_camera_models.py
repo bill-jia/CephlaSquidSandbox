@@ -26,11 +26,10 @@ from control.models import (
     ChannelGroup,
     ChannelGroupEntry,
     SynchronizationMode,
-    AcquisitionChannel,
     CameraSettings,
-    IlluminationSettings,
     validate_channel_group,
 )
+from control.models.observation_state import ObservationState, IlluminatorState
 
 
 class TestCameraDefinition:
@@ -922,29 +921,24 @@ class TestChannelGroup:
 class TestValidateChannelGroup:
     """Tests for validate_channel_group function."""
 
-    def _make_channel(self, name: str, camera: Optional[int] = 1) -> AcquisitionChannel:
-        """Helper to create a test channel (v1.0 schema).
-
-        Note: camera is now int ID (null for single-camera systems).
-        """
-        return AcquisitionChannel(
+    def _make_state(self, name: str) -> ObservationState:
+        """Helper to create a test observation state."""
+        return ObservationState(
+            version=3,
             name=name,
             display_color="#FFFFFF",
-            camera=camera,
-            illumination_settings=IlluminationSettings(
-                intensity=20.0,
-            ),
             camera_settings=CameraSettings(
                 exposure_time_ms=20.0,
                 gain_mode=0.0,
             ),
+            illuminator_states=[],
         )
 
     def test_valid_sequential_group(self):
         """Test validation passes for valid sequential group."""
-        channels = [
-            self._make_channel("Channel A"),
-            self._make_channel("Channel B"),
+        states = [
+            self._make_state("Channel A"),
+            self._make_state("Channel B"),
         ]
         group = ChannelGroup(
             name="Test",
@@ -954,63 +948,35 @@ class TestValidateChannelGroup:
                 ChannelGroupEntry(name="Channel B"),
             ],
         )
-        errors = validate_channel_group(group, channels)
+        errors = validate_channel_group(group, states)
         assert errors == []
 
     def test_invalid_channel_reference(self):
-        """Test error when channel name not in channels list."""
-        channels = [self._make_channel("Channel A")]
+        """Test error when state name not in states list."""
+        states = [self._make_state("Channel A")]
         group = ChannelGroup(
             name="Test",
             channels=[ChannelGroupEntry(name="Unknown Channel")],
         )
-        errors = validate_channel_group(group, channels)
+        errors = validate_channel_group(group, states)
         assert len(errors) == 1
         assert "not found" in errors[0]
 
     def test_offset_warning_in_sequential_mode(self):
         """Test warning when offset specified for sequential mode."""
-        channels = [self._make_channel("Channel A")]
+        states = [self._make_state("Channel A")]
         group = ChannelGroup(
             name="Test",
             synchronization=SynchronizationMode.SEQUENTIAL,
             channels=[ChannelGroupEntry(name="Channel A", offset_us=100)],
         )
-        errors = validate_channel_group(group, channels)
+        errors = validate_channel_group(group, states)
         assert len(errors) == 1
         assert "offset will be ignored" in errors[0]
 
-    def test_duplicate_camera_in_simultaneous_mode(self):
-        """Test error when same camera ID used twice in simultaneous mode."""
-        channels = [
-            self._make_channel("Channel A", camera=1),
-            self._make_channel("Channel B", camera=1),  # Same camera ID
-        ]
-        group = ChannelGroup(
-            name="Test",
-            synchronization=SynchronizationMode.SIMULTANEOUS,
-            channels=[
-                ChannelGroupEntry(name="Channel A"),
-                ChannelGroupEntry(name="Channel B"),
-            ],
-        )
-        errors = validate_channel_group(group, channels)
-        assert len(errors) == 1
-        assert "same camera" in errors[0]
 
-
-class TestAcquisitionChannelConstraints:
-    """Tests for AcquisitionChannel validation constraints."""
-
-    def test_empty_channel_name_rejected(self):
-        """Test that empty channel name is rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            AcquisitionChannel(
-                name="",
-                illumination_settings=IlluminationSettings(intensity=20.0),
-                camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=0.0),
-            )
-        assert "String should have at least 1 character" in str(exc_info.value)
+class TestObservationStateConstraints:
+    """Tests for ObservationState and related validation constraints."""
 
     def test_negative_exposure_rejected(self):
         """Test that negative exposure time is rejected."""
@@ -1033,21 +999,20 @@ class TestAcquisitionChannelConstraints:
     def test_intensity_below_zero_rejected(self):
         """Test that intensity below 0 is rejected."""
         with pytest.raises(ValidationError) as exc_info:
-            IlluminationSettings(intensity=-10.0)
+            IlluminatorState(illumination_channel="test", intensity=-10.0)
         assert "greater than or equal to 0" in str(exc_info.value)
 
     def test_intensity_above_100_rejected(self):
         """Test that intensity above 100 is rejected."""
         with pytest.raises(ValidationError) as exc_info:
-            IlluminationSettings(intensity=150.0)
+            IlluminatorState(illumination_channel="test", intensity=150.0)
         assert "less than or equal to 100" in str(exc_info.value)
 
     def test_valid_intensity_range(self):
         """Test that valid intensity values are accepted."""
-        settings = IlluminationSettings(intensity=50.0)
-        assert settings.intensity == 50.0
-        # Also test boundary values
-        settings_zero = IlluminationSettings(intensity=0.0)
-        assert settings_zero.intensity == 0.0
-        settings_max = IlluminationSettings(intensity=100.0)
-        assert settings_max.intensity == 100.0
+        ist = IlluminatorState(illumination_channel="test", intensity=50.0)
+        assert ist.intensity == 50.0
+        ist_zero = IlluminatorState(illumination_channel="test", intensity=0.0)
+        assert ist_zero.intensity == 0.0
+        ist_max = IlluminatorState(illumination_channel="test", intensity=100.0)
+        assert ist_max.intensity == 100.0

@@ -4,7 +4,6 @@ from typing import List, Tuple, Dict, Optional, Callable, Union, TYPE_CHECKING
 from control._def import ZProjectionMode, DownsamplingMethod
 from control.core.job_processing import CaptureInfo
 from control.core.scan_coordinates import ScanCoordinates
-from control.models import AcquisitionChannel
 from squid.abc import CameraFrame
 
 if TYPE_CHECKING:
@@ -70,9 +69,7 @@ class AcquisitionParameters:
 
     # XY mode for determining scan type
     xy_mode: str = "Current Position"  # "Current Position", "Select Wells", "Manual", "Load Coordinates"
-    # Legacy multipoint: profile channel rows. Empty when using observation states below.
-    selected_configurations: List[AcquisitionChannel] = field(default_factory=list)
-    # Observation State preset names (profile observation_presets/); exclusive with legacy channel list.
+    # Observation State preset names (profile observation_presets/).
     selected_observation_state_names: List[str] = field(default_factory=list)
 
 
@@ -116,7 +113,7 @@ class MultiPointControllerFunctions:
     signal_acquisition_start: Callable[[AcquisitionParameters], None]
     signal_acquisition_finished: Callable[[], None]
     signal_new_image: Callable[[CameraFrame, CaptureInfo], None]
-    signal_current_configuration: Callable[[AcquisitionChannel], None]
+    signal_current_configuration: Callable
     signal_current_fov: Callable[[float, float], None]
     signal_overall_progress: Callable[[OverallProgressUpdate], None]
     signal_region_progress: Callable[[RegionProgressUpdate], None]

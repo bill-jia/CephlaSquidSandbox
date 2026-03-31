@@ -27,25 +27,30 @@ import squid.logging
 from squid.abc import CameraAcquisitionMode, AbstractCamera
 
 from control._def import *
-from control.core.config.utils import apply_confocal_override
-from control.models import merge_channel_configs
+from control.models import merge_observation_configs
+from control.models.observation_state import (
+    ObservationState,
+    IlluminatorState,
+    CameraSettings,
+    ConfocalSettings,
+)
 
 if TYPE_CHECKING:
-    from control.models import AcquisitionChannel, IlluminationChannelConfig
+    from control.models import IlluminationChannelConfig
 
 
 class LiveController:
     """
     Controller for live image acquisition.
-    
+
     Manages continuous image streaming with proper illumination synchronization.
     Supports both software and hardware trigger modes.
-    
+
     Software trigger mode:
     - Python code controls timing
     - Manual illumination on/off
     - Good for low frame rates (<10 fps)
-    
+
     Hardware trigger mode:
     - Microcontroller controls timing
     - Synchronized illumination and camera trigger
@@ -62,7 +67,7 @@ class LiveController:
     ):
         """
         Initialize the live controller.
-        
+
         Args:
             microscope: Microscope instance (for stage, illumination, etc.)
             camera: Camera to use for acquisition
@@ -73,7 +78,7 @@ class LiveController:
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.microscope = microscope
         self.camera: AbstractCamera = camera
-        self.currentConfiguration: Optional[AcquisitionChannel] = None
+        self.current_observation_state: Optional[ObservationState] = None
         self.trigger_mode: Optional[TriggerMode] = TriggerMode.SOFTWARE  # @@@ change to None
         self.is_live = False
         self.control_illumination = control_illumination
@@ -105,19 +110,25 @@ class LiveController:
         self._confocal_mode: bool = False
 
     # ─────────────────────────────────────────────────────────────────────────────
-    # Illumination channel helpers
+    # Backward-compatible property for external callers
     # ─────────────────────────────────────────────────────────────────────────────
 
-    def _get_illumination_channel_name(self) -> Optional[str]:
-        """Return the canonical illumination channel name for the current configuration.
+    @property
+    def currentConfiguration(self) -> Optional[ObservationState]:
+        """Backward-compatible alias for current_observation_state.
 
-        This is the value stored in
-        ``AcquisitionChannel.illumination_settings.illumination_channel``, which
-        matches a key in ``IlluminationController.channel_names``.
+        .. deprecated:: Access ``current_observation_state`` directly instead.
+
+        External code (widgets, workers) that reads ``liveController.currentConfiguration``
+        will get the ObservationState object.  Because ObservationState exposes the same
+        ``.name``, ``.exposure_time``, and ``.analog_gain`` properties that callers
+        typically use, most read sites will work without changes.
         """
-        if not self.currentConfiguration:
-            return None
-        return self.currentConfiguration.primary_illumination_channel
+        return self.current_observation_state
+
+    @currentConfiguration.setter
+    def currentConfiguration(self, value: Optional[ObservationState]) -> None:
+        self.current_observation_state = value
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Confocal mode
@@ -150,87 +161,95 @@ class LiveController:
     # Channel configuration access
     # ─────────────────────────────────────────────────────────────────────────────
 
-    def get_channels(self, objective: str) -> List["AcquisitionChannel"]:
-        """Get acquisition channels for an objective, with confocal mode applied.
-
-        This method provides channels with the current confocal_mode state applied.
-        It uses ConfigRepository for config I/O and applies confocal overrides
-        based on this controller's confocal_mode state.
+    def get_observation_states(self, objective: str) -> List[ObservationState]:
+        """Get observation states for an objective, with objective overrides applied.
 
         Args:
             objective: Objective name (e.g., "10x", "20x")
 
         Returns:
-            List of AcquisitionChannel objects with confocal overrides applied if
-            in confocal mode. Returns empty list if no profile is set or no configs
-            are available.
+            List of ObservationState objects. Returns empty list if no profile
+            is set or no configs are available.
         """
         config_repo = self.microscope.config_repo
 
-        # Check if a profile is set
         if config_repo.current_profile is None:
-            self._log.warning("get_channels() returning empty list: no profile is set")
+            self._log.warning("get_observation_states() returning empty list: no profile is set")
             return []
 
-        # Get general config (shared settings)
         general = config_repo.get_general_config()
         if not general:
             self._log.warning(
-                f"get_channels() returning empty list: no general config for profile '{config_repo.current_profile}'"
+                f"get_observation_states() returning empty list: no general config for "
+                f"profile '{config_repo.current_profile}'"
             )
             return []
 
-        # Get objective-specific config
         obj_config = config_repo.get_objective_config(objective)
 
-        # Merge configs (if no objective config, use general channels)
         if obj_config:
-            channels = merge_channel_configs(general, obj_config)
+            states = merge_observation_configs(general, obj_config)
         else:
-            channels = list(general.channels)
+            states = list(general.observation_states)
 
-        # Filter to only enabled channels
-        channels = [ch for ch in channels if ch.enabled]
+        return states
 
-        # Apply confocal mode if active
-        return apply_confocal_override(channels, self._confocal_mode)
+    def get_channels(self, objective: str) -> List[ObservationState]:
+        """Backward-compatible alias for get_observation_states.
 
-    def get_channel_by_name(self, objective: str, name: str) -> Optional["AcquisitionChannel"]:
-        """Get a specific channel by name.
+        .. deprecated:: Use :meth:`get_observation_states` instead.
+        """
+        return self.get_observation_states(objective)
+
+    def get_observation_state_by_name(self, objective: str, name: str) -> Optional[ObservationState]:
+        """Get a specific observation state by name.
 
         Args:
             objective: Objective name
-            name: Channel name to find
+            name: Observation state name to find
 
         Returns:
-            AcquisitionChannel if found, None otherwise
+            ObservationState if found, None otherwise
         """
-        channels = self.get_channels(objective)
-        return next((ch for ch in channels if ch.name == name), None)
+        states = self.get_observation_states(objective)
+        return next((s for s in states if s.name == name), None)
 
-    def set_active_channel_reference(self, configuration: Optional["AcquisitionChannel"]) -> None:
-        """Record the selected acquisition channel without touching camera or illumination hardware.
+    def set_active_observation_state(self, state: Optional[ObservationState]) -> None:
+        """Record the selected observation state without touching camera or illumination hardware.
 
-        The UI (e.g. Live Control) chooses a channel from the profile before ``set_microscope_mode`` runs.
-        We intentionally skip ``set_microscope_mode`` at startup so restored camera cache settings are not
+        The UI (e.g. Live Control) chooses a channel from the profile before ``set_observation_state`` runs.
+        We intentionally skip ``set_observation_state`` at startup so restored camera cache settings are not
         overwritten, but contrast/LUT, Observation State collection, and display code still need a stable
-        ``currentConfiguration`` for channel *name* and preset bookkeeping.
+        ``current_observation_state`` for channel *name* and preset bookkeeping.
 
         Observation State: ``collect_observation_state`` reads ``active_channel_name`` from
-        ``currentConfiguration``; keeping this reference in sync with the Live Control / Napari dropdown
+        ``current_observation_state``; keeping this reference in sync with the Live Control / Napari dropdown
         matches that paradigm without forcing a full hardware apply.
         """
-        self.currentConfiguration = configuration
+        self.current_observation_state = state
+
+    def set_active_channel_reference(self, configuration: Optional[ObservationState]) -> None:
+        """Backward-compatible alias for set_active_observation_state.
+
+        .. deprecated:: Use :meth:`set_active_observation_state` instead.
+        """
+        self.set_active_observation_state(configuration)
+
+    def get_active_channel_name(self) -> Optional[str]:
+        """Return the name of the current observation state, or None."""
+        if self.current_observation_state is not None:
+            return self.current_observation_state.name
+        return None
 
     def get_channel_name_for_contrast(self) -> str:
         """Channel key for ContrastManager / display when only a logical selection exists."""
-        if self.currentConfiguration is not None:
-            return self.currentConfiguration.name
+        if self.current_observation_state is not None:
+            return self.current_observation_state.name
         objective = getattr(getattr(self.microscope, "objective_store", None), "current_objective", None)
         if objective:
-            chs = self.get_channels(objective)
-            if chs:
-                return chs[0].name
+            states = self.get_observation_states(objective)
+            if states:
+                return states[0].name
         return "default"
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -238,73 +257,98 @@ class LiveController:
     # ─────────────────────────────────────────────────────────────────────────────
 
     def turn_on_illumination(self):
-        """Turn on illumination for the current channel."""
-        channel_name = self._get_illumination_channel_name()
-        if channel_name:
-            if self.currentConfiguration is not None:
-                ill = self.currentConfiguration.illumination_settings
-                mode = getattr(ill, "led_matrix_mode", None)
-                ic = self.microscope.illumination_controller
-                if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
-                    ic.set_led_matrix_mode(mode)
-            self.microscope.illumination_controller.turn_on_channel(channel_name, force_hardware=True)
-        else:
+        """Turn on illumination for the current observation state's active illuminators."""
+        if self.current_observation_state is None:
+            self._log.warning("turn_on_illumination() skipped - no observation state set")
+            self.illumination_on = True
+            return
+
+        active = self.current_observation_state.active_illuminator_states
+        if not active:
             self._log.warning(
-                f"turn_on_illumination() skipped - no channel configured for "
-                f"'{self.currentConfiguration.name if self.currentConfiguration else 'None'}'"
+                f"turn_on_illumination() skipped - no active illuminators for "
+                f"'{self.current_observation_state.name}'"
             )
+            self.illumination_on = True
+            return
+
+        ic = self.microscope.illumination_controller
+        for ist in active:
+            mode = ist.led_matrix_mode
+            if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
+                ic.set_led_matrix_mode(mode)
+            ic.set_channel_state(ist.illumination_channel, True, force_hardware=True)
         self.illumination_on = True
 
     def turn_off_illumination(self):
-        """Turn off illumination for the current channel."""
-        channel_name = self._get_illumination_channel_name()
-        if channel_name:
-            self.microscope.illumination_controller.turn_off_channel(channel_name, force_hardware=True)
-        else:
+        """Turn off illumination for the current observation state's active illuminators."""
+        if self.current_observation_state is None:
+            self._log.warning("turn_off_illumination() skipped - no observation state set")
+            self.illumination_on = False
+            return
+
+        active = self.current_observation_state.active_illuminator_states
+        if not active:
             self._log.warning(
-                f"turn_off_illumination() skipped - no channel configured for "
-                f"'{self.currentConfiguration.name if self.currentConfiguration else 'None'}'"
+                f"turn_off_illumination() skipped - no active illuminators for "
+                f"'{self.current_observation_state.name}'"
             )
+            self.illumination_on = False
+            return
+
+        ic = self.microscope.illumination_controller
+        for ist in active:
+            ic.set_channel_state(ist.illumination_channel, False, force_hardware=True)
         self.illumination_on = False
 
     def update_illumination(self):
-        """Set intensity for the current channel and apply any device-specific settings."""
-        if self.currentConfiguration is None:
-            self._log.warning("update_illumination() called with no currentConfiguration")
+        """Set intensity for the current observation state and apply any device-specific settings."""
+        if self.current_observation_state is None:
+            self._log.warning("update_illumination() called with no current_observation_state")
             return
-        channel_name = self._get_illumination_channel_name()
-        intensity = self.currentConfiguration.illumination_intensity
-        ill = self.currentConfiguration.illumination_settings
-        mode = getattr(ill, "led_matrix_mode", None)
+
         ic = self.microscope.illumination_controller
-        if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
-            ic.set_led_matrix_mode(mode)
-        if channel_name:
-            self.microscope.illumination_controller.set_channel_intensity(channel_name, intensity)
+        active = self.current_observation_state.active_illuminator_states
+
+        for ist in active:
+            # LED matrix mode
+            mode = ist.led_matrix_mode
+            if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
+                ic.set_led_matrix_mode(mode)
+
+            # Set channel intensity
+            ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
+
             # NL5 / CellX laser power forwarding (wavelength-specific accessories)
-            wavelength = self.currentConfiguration.get_illumination_wavelength(
-                self.microscope.config_repo.get_illumination_config()
-            ) if self.microscope.config_repo.get_illumination_config() else None
+            illum_config = self.microscope.config_repo.get_illumination_config()
+            wavelength = None
+            if illum_config:
+                ch_def = illum_config.get_channel_by_name(ist.illumination_channel)
+                if ch_def:
+                    wavelength = ch_def.wavelength_nm
+
             if wavelength and self.microscope.addons.nl5 and NL5_USE_DOUT:
                 self.microscope.addons.nl5.set_active_channel(NL5_WAVENLENGTH_MAP[wavelength])
                 if NL5_USE_AOUT:
-                    self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(intensity))
+                    self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
                 if self.microscope.addons.cellx and ENABLE_CELLX:
-                    self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(intensity))
+                    self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
 
         # set emission filter position and iris values
+        emission_filter_position = self.current_observation_state.emission_filter_positions.get("default")
+
         if ENABLE_SPINNING_DISK_CONFOCAL and self.microscope.addons.xlight and not USE_DRAGONFLY:
             try:
-                if self.currentConfiguration.emission_filter_position:
+                if emission_filter_position is not None:
                     self.microscope.addons.xlight.set_emission_filter(
-                        self.currentConfiguration.emission_filter_position,
+                        emission_filter_position,
                         extraction=False,
                         validate=XLIGHT_VALIDATE_WHEEL_POS,
                     )
             except Exception as e:
                 self._log.warning(f"Not setting emission filter position: {e}")
             # Apply per-channel iris values
-            hw_settings = self.currentConfiguration.confocal_hardware_settings
+            hw_settings = self.current_observation_state.confocal_hardware_settings
             if hw_settings is not None:
                 xlight = self.microscope.addons.xlight
                 try:
@@ -318,7 +362,7 @@ class LiveController:
             try:
                 self.microscope.addons.dragonfly.set_emission_filter(
                     self.microscope.addons.dragonfly.get_camera_port(),
-                    self.currentConfiguration.emission_filter_position,
+                    emission_filter_position,
                 )
             except Exception as e:
                 self._log.warning(f"Not setting emission filter position: {e}")
@@ -330,7 +374,7 @@ class LiveController:
                 elif self.trigger_mode == TriggerMode.HARDWARE:
                     self.microscope.addons.emission_filter_wheel.set_delay_offset_ms(-self.camera.get_strobe_time())
                 self.microscope.addons.emission_filter_wheel.set_filter_wheel_position(
-                    {1: self.currentConfiguration.emission_filter_position}
+                    {1: emission_filter_position}
                 )
             except Exception as e:
                 self._log.warning(f"Not setting emission filter position: {e}")
@@ -449,7 +493,7 @@ class LiveController:
             if self.trigger_mode == TriggerMode.SOFTWARE and self.is_live:
                 self._stop_triggerred_acquisition()
             self.camera.set_acquisition_mode(CameraAcquisitionMode.HARDWARE_TRIGGER)
-            self.camera.set_exposure_time(self.currentConfiguration.exposure_time)
+            self.camera.set_exposure_time(self.current_observation_state.exposure_time)
 
             if self.is_live and self.use_internal_timer_for_hardware_trigger:
                 self._start_triggerred_acquisition()
@@ -472,14 +516,14 @@ class LiveController:
             self._set_trigger_fps(fps)
 
     # set microscope mode
-    def set_microscope_mode(self, configuration: "AcquisitionChannel"):
-        if configuration is None:
-            self._log.error("set_microscope_mode() called with None configuration - this is a bug in the caller")
+    def set_observation_state(self, state: ObservationState):
+        if state is None:
+            self._log.error("set_observation_state() called with None state - this is a bug in the caller")
             return
         # Channel switching for acquisition must follow channel configuration
         # (illumination intensity + illumination on/off behavior).
         self.control_illumination = True
-        self._log.info("setting microscope mode to " + configuration.name)
+        self._log.info("setting microscope mode to " + state.name)
 
         _t_total = time.perf_counter()
 
@@ -487,41 +531,51 @@ class LiveController:
         if self.is_live is True:
             self._stop_existing_timer()
             if self.control_illumination:
-                # Turn off illumination BEFORE switching self.currentConfiguration.
-                # turn_off_illumination() reads self.currentConfiguration to determine which
+                # Turn off illumination BEFORE switching self.current_observation_state.
+                # turn_off_illumination() reads self.current_observation_state to determine which
                 # laser wavelength to turn off. If we switch first, we'd turn off the NEW
                 # channel's laser instead of the OLD channel's laser (which is still on).
                 _t0 = time.perf_counter()
                 self.turn_off_illumination()
-                self._log.info("set_microscope_mode: turn_off_illumination took %.4fs", time.perf_counter() - _t0)
+                self._log.info("set_observation_state: turn_off_illumination took %.4fs", time.perf_counter() - _t0)
 
-        self.currentConfiguration = configuration
+        self.current_observation_state = state
 
         # set camera exposure time and analog gain
         _t0 = time.perf_counter()
-        self.camera.set_exposure_time(self.currentConfiguration.exposure_time)
-        self._log.info("set_microscope_mode: set_exposure_time took %.4fs", time.perf_counter() - _t0)
+        self.camera.set_exposure_time(self.current_observation_state.exposure_time)
+        self._log.info("set_observation_state: set_exposure_time took %.4fs", time.perf_counter() - _t0)
         _t0 = time.perf_counter()
         try:
-            self.camera.set_analog_gain(self.currentConfiguration.analog_gain)
+            self.camera.set_analog_gain(self.current_observation_state.analog_gain)
         except NotImplementedError:
             pass
-        self._log.info("set_microscope_mode: set_analog_gain took %.4fs", time.perf_counter() - _t0)
+        self._log.info("set_observation_state: set_analog_gain took %.4fs", time.perf_counter() - _t0)
 
         # set illumination
         if self.control_illumination:
             _t0 = time.perf_counter()
             self.update_illumination()
-            self._log.info("set_microscope_mode: update_illumination took %.4fs", time.perf_counter() - _t0)
+            self._log.info("set_observation_state: update_illumination took %.4fs", time.perf_counter() - _t0)
 
         # restart live
         if self.is_live is True:
             if self.control_illumination:
                 _t0 = time.perf_counter()
                 self.turn_on_illumination()
-                self._log.info("set_microscope_mode: turn_on_illumination took %.4fs", time.perf_counter() - _t0)
+                self._log.info("set_observation_state: turn_on_illumination took %.4fs", time.perf_counter() - _t0)
             self._start_new_timer()
-        self._log.info("set_microscope_mode: TOTAL took %.4fs", time.perf_counter() - _t_total)
+        self._log.info("set_observation_state: TOTAL took %.4fs", time.perf_counter() - _t_total)
+
+    def set_microscope_mode(self, configuration: ObservationState):
+        """Backward-compatible alias for set_observation_state.
+
+        .. deprecated:: Use :meth:`set_observation_state` instead.
+        """
+        if configuration is None:
+            self._log.error("set_microscope_mode() called with None configuration - this is a bug in the caller")
+            return
+        self.set_observation_state(configuration)
 
     def get_trigger_mode(self):
         return self.trigger_mode

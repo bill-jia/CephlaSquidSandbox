@@ -145,6 +145,7 @@ controllers: "Core Controllers" {
     class: controller
     tooltip: |md
       Manages live camera streaming.
+      - Holds current_observation_state (ObservationState)
       - Toggles trigger mode (SW / HW / continuous)
       - Synchronizes illumination on/off with exposure
       - Controls frame rate
@@ -415,26 +416,28 @@ models: "Data Models (Pydantic)" {
   style.fill: "#fff9c4"
   style.stroke: "#f9a825"
 
-  acq_channel: "AcquisitionChannel" {
+  obs_state: "ObservationState\n(v3)" {
     class: model
     tooltip: |md
-      Single imaging channel definition:
-      - camera_settings (exposure, gain, pixel_format)
-      - illumination_settings (channel, intensity, LED mode)
-      - filter_wheel, filter_position
-      - z_offset_um
-      - confocal_override (objective-specific)
+      Complete light-path configuration for one acquisition step.
+      Analogous to a 'channel' in microscopy software.
+      - camera_settings: CameraSettings (exposure, gain, pixel_format)
+      - illuminator_states: List[IlluminatorState] (per-source intensity, on/off)
+      - emission_filter_positions, z_offset_um
+      - confocal_hardware_settings: ConfocalSettings (iris)
+      - camera_live: CameraLiveSnapshot (ROI, binning, trigger)
+      - display_color, channel_groups
     |
   }
 
-  obs_state: "ObservationState" {
+  illuminator_state: "IlluminatorState" {
     class: model
     tooltip: |md
-      User-facing imaging preset (objective-free):
-      - channels: List[AcquisitionChannel]
-      - confocal_mode, camera_live snapshot
-      - emission_filter_positions
-      - channel_groups for multi-camera
+      Runtime state of one illumination source:
+      - illumination_channel (name → IlluminationChannel)
+      - intensity (0–100%)
+      - on (bool)
+      - led_matrix_mode (optional)
     |
   }
 
@@ -443,7 +446,7 @@ models: "Data Models (Pydantic)" {
     tooltip: |md
       Per-run reproducibility record:
       - experiment_id, objective, pixel_size
-      - selected channels, scan parameters
+      - selected observation state names
       - observation_state snapshot
       - Written to acquisition.yaml
     |
@@ -452,7 +455,7 @@ models: "Data Models (Pydantic)" {
   illum_channel: "IlluminationChannel" {
     class: model
     tooltip: |md
-      Hardware illumination definition:
+      Hardware illumination definition (machine config):
       - type: EPI or TRANSILLUMINATION
       - controller_port (D1-D8, USB1-USB8)
       - wavelength_nm
@@ -480,9 +483,10 @@ models: "Data Models (Pydantic)" {
     tooltip: "Multi-camera synchronization:\nSIMULTANEOUS or SEQUENTIAL\nwith per-channel timing offsets"
   }
 
-  obs_state -> acq_channel: "contains"
+  obs_state -> illuminator_state: "contains"
   obs_state -> camera_live: "snapshots"
   obs_state -> channel_group: "groups"
+  illuminator_state -> illum_channel: "references by name"
   acq_metadata -> obs_state: "embeds"
 }
 
@@ -702,8 +706,8 @@ controllers.stream_handler -> writers.fast_writer: "raw bytes\n(high-speed mode)
 # CONNECTIONS — Metadata Flow
 # ============================================================================
 controllers.mp_ctrl -> writers.acq_yaml: "build_acquisition_metadata\n+ observation_states_used"
-config.config_repo -> models.acq_channel: "merge_channel_configs\n(general + objective)"
-config.config_repo -> models.obs_state: "load/save\npresets"
+config.config_repo -> models.obs_state: "load/save presets\n+ merge configs"
+config.config_repo -> models.illum_channel: "loads hw definitions"
 
 # ============================================================================
 # CONNECTIONS — Hardware Trigger Synchronization

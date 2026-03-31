@@ -266,9 +266,9 @@ class TestMigrationIntegration:
 
         with open(target_dir / "20x.yaml") as f:
             loaded = yaml.safe_load(f)
-        assert loaded["version"] == 1.0  # v1.0 schema
-        assert len(loaded["channels"]) == 1
-        assert loaded["channels"][0]["name"] == "BF LED matrix full"
+        assert loaded["version"] == 3  # v3 schema
+        assert len(loaded["overrides"]) == 1
+        assert loaded["overrides"][0]["name"] == "BF LED matrix full"
 
     def test_run_auto_migration_no_source(self, temp_dir):
         """Test auto-migration when no source directory exists."""

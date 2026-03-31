@@ -83,7 +83,8 @@ def test_observation_snapshot_continuous_capture_uses_saved_illumination_state()
     worker._select_config.assert_called_once_with(config)
     camera.send_trigger.assert_not_called()
     live_controller.turn_on_illumination.assert_not_called()
-    illum.turn_on_channel.assert_called_once_with("LaserA", force_hardware=True)
-    illum.turn_off_channel.assert_called_once_with("LaserB", force_hardware=True)
+    illum.set_channel_state.assert_any_call("LaserA", True, force_hardware=True)
+    illum.set_channel_state.assert_any_call("LaserB", False, force_hardware=True)
+    assert illum.set_channel_state.call_count == 2
     illum.turn_off_all.assert_called_once_with(preserve_logical_state=True)
     assert worker.request_abort_fn.call_count == 0

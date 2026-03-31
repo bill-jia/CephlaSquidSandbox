@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from control.models import AcquisitionChannel, GeneralChannelConfig
+from control.models import GeneralObservationConfig
 from control.models.observation_state import (
     CameraLiveSnapshot,
     CameraSettings,
@@ -377,62 +377,27 @@ def _restore_illumination_on_off(ic: Any, illuminator_states: List[IlluminatorSt
 
     for name in getattr(ic, "channel_names", []):
         try:
-            if desired.get(name, False):
-                ic.turn_on_channel(name)
-            else:
-                ic.turn_off_channel(name)
+            ic.set_channel_state(name, desired.get(name, False), force_hardware=True)
         except Exception as e:
             logger.warning("Could not restore illumination on/off state for %r: %s", name, e)
 
 
-# ── Conversion helpers (temporary, until GeneralChannelConfig uses v3) ────────
+# ── Conversion helpers (internal) ────────────────────────────────────────────
 
 
-def _observation_state_to_acquisition_channels(state: ObservationState) -> List[AcquisitionChannel]:
+def _collect_illuminator_states_from_observation_states(
+    observation_states: List[ObservationState],
+) -> List[IlluminatorState]:
+    """Collect all unique illuminator states from a list of observation states.
+
+    Merges illuminator states from all observation states, deduplicating by
+    illumination_channel name (last write wins for intensity/on/led_matrix_mode).
     """
-    Convert v3 ObservationState back to List[AcquisitionChannel] for GeneralChannelConfig persistence.
-
-    This is a temporary bridge until GeneralChannelConfig is updated to use v3 fields directly.
-    """
-    from control.models.acquisition_config import CameraSettings as AcqCameraSettings, IlluminationSettings
-
-    cam = state.camera_settings
-    channels: List[AcquisitionChannel] = []
-    for ist in state.illuminator_states:
-        cam_settings = AcqCameraSettings(
-            exposure_time_ms=cam.exposure_time_ms if cam else 10.0,
-            gain_mode=cam.gain_mode if cam else 0.0,
-            pixel_format=cam.pixel_format if cam else None,
-        )
-        ill_settings = IlluminationSettings(
-            illumination_channel=ist.illumination_channel,
-            intensity=ist.intensity,
-        )
-        ch = AcquisitionChannel(
-            name=ist.illumination_channel,
-            enabled=True,
-            display_color=state.display_color,
-            camera_settings=cam_settings,
-            illumination_settings=ill_settings,
-            z_offset_um=state.z_offset_um,
-            confocal_hardware_settings=state.confocal_hardware_settings,
-        )
-        channels.append(ch)
-    return channels
-
-
-def _build_illuminator_states_from_channels(channels: List[AcquisitionChannel]) -> List[IlluminatorState]:
-    """Convert merged AcquisitionChannel list into IlluminatorState list."""
-    states: List[IlluminatorState] = []
-    for ch in channels:
-        ist = IlluminatorState(
-            illumination_channel=ch.illumination_settings.illumination_channel or ch.name,
-            intensity=ch.illumination_settings.intensity,
-            on=getattr(ch.illumination_settings, "on", False),
-            led_matrix_mode=getattr(ch.illumination_settings, "led_matrix_mode", None),
-        )
-        states.append(ist)
-    return states
+    seen: Dict[str, IlluminatorState] = {}
+    for state in observation_states:
+        for ist in state.illuminator_states:
+            seen[ist.illumination_channel] = ist
+    return list(seen.values())
 
 
 # ── Binning/mode helpers ─────────────────────────────────────────────────────
@@ -485,26 +450,25 @@ def collect_observation_state(
     emission_filter_positions: Optional[Dict[str, Union[str, int]]] = None,
 ) -> ObservationState:
     """
-    Build Observation State from the current live merged channels and profile general config.
+    Build Observation State from the current live observation states and profile general config.
 
     Args:
         live_controller: Active live controller (current channel + confocal flag).
         config_repo: Repository for the active profile.
-        objective_name: Current software objective (used only to read merged channels; not stored).
+        objective_name: Current software objective (used only to read merged states; not stored).
         emission_filter_positions: Optional wheel positions from hardware/UI.
     """
-    # get_channels() still returns List[AcquisitionChannel] — convert to v3 fields
-    merged = live_controller.get_channels(objective_name)
+    merged = live_controller.get_observation_states(objective_name)
 
-    # Build illuminator_states from merged channels
-    illuminator_states = _build_illuminator_states_from_channels(merged)
+    # Build illuminator_states from merged observation states
+    illuminator_states = _collect_illuminator_states_from_observation_states(merged)
 
     # Merge hardware state into illuminator_states
     ic = getattr(live_controller.microscope, "illumination_controller", None)
     illuminator_states = _merge_illumination_hardware_into_illuminator_states(illuminator_states, ic)
     illuminator_states = _merge_led_matrix_mode_into_illuminator_states(illuminator_states, ic)
 
-    # Determine the active channel for z_offset, confocal_hardware_settings, display_color
+    # Determine the active state for z_offset, confocal_hardware_settings, display_color
     active_name: Optional[str] = None
     if live_controller.currentConfiguration is not None:
         active_name = live_controller.currentConfiguration.name
@@ -515,15 +479,15 @@ def collect_observation_state(
             if fallback != "default":
                 active_name = fallback
 
-    active_ch: Optional[AcquisitionChannel] = None
+    active_state: Optional[ObservationState] = None
     if active_name is not None:
-        active_ch = next((ch for ch in merged if ch.name == active_name), None)
-    if active_ch is None and merged:
-        active_ch = merged[0]
+        active_state = next((s for s in merged if s.name == active_name), None)
+    if active_state is None and merged:
+        active_state = merged[0]
 
-    z_offset_um = active_ch.z_offset_um if active_ch else 0.0
-    confocal_hw = active_ch.confocal_hardware_settings if active_ch else None
-    display_color = active_ch.display_color if active_ch else "#FFFFFF"
+    z_offset_um = active_state.z_offset_um if active_state else 0.0
+    confocal_hw = active_state.confocal_hardware_settings if active_state else None
+    display_color = active_state.display_color if active_state else "#FFFFFF"
 
     # Camera settings from hardware
     camera = live_controller.camera
@@ -580,12 +544,11 @@ def apply_observation_state(
     if not profile:
         raise ValueError("No profile is set; cannot apply Observation State")
 
-    # ── 1. Persist to general.yaml (temporary bridge via AcquisitionChannel) ──
+    # ── 1. Persist to general.yaml ──
     if persist_general_to_profile:
-        acq_channels = _observation_state_to_acquisition_channels(state)
-        general = GeneralChannelConfig(
-            version=1,
-            channels=acq_channels,
+        general = GeneralObservationConfig(
+            version=3,
+            observation_states=[state],
             channel_groups=list(state.channel_groups),
         )
         existing = config_repo.get_general_config(profile)
@@ -676,34 +639,10 @@ def apply_observation_state(
             "apply_observation_state: _restore_illumination_on_off took %.4fs", time.perf_counter() - _t0
         )
 
-    # ── 8. Update live controller's current configuration (temporary bridge) ──
-    # Build a temporary AcquisitionChannel so set_microscope_mode can update
-    # currentConfiguration for contrast manager / Napari channel name.
-    active_states = state.active_illuminator_states
-    active_ist = active_states[0] if active_states else (state.illuminator_states[0] if state.illuminator_states else None)
-    if active_ist is not None:
-        from control.models.acquisition_config import CameraSettings as AcqCameraSettings, IlluminationSettings
-
-        cam = state.camera_settings
-        tmp_ch = AcquisitionChannel(
-            name=active_ist.illumination_channel,
-            enabled=True,
-            display_color=state.display_color,
-            camera_settings=AcqCameraSettings(
-                exposure_time_ms=cam.exposure_time_ms if cam else 10.0,
-                gain_mode=cam.gain_mode if cam else 0.0,
-                pixel_format=cam.pixel_format if cam else None,
-            ),
-            illumination_settings=IlluminationSettings(
-                illumination_channel=active_ist.illumination_channel,
-                intensity=active_ist.intensity,
-            ),
-            z_offset_um=state.z_offset_um,
-            confocal_hardware_settings=state.confocal_hardware_settings,
-        )
-        _t0 = time.perf_counter()
-        live_controller.set_microscope_mode(tmp_ch)
-        logger.info("apply_observation_state: set_microscope_mode took %.4fs", time.perf_counter() - _t0)
+    # ── 8. Update live controller's current observation state ──
+    _t0 = time.perf_counter()
+    live_controller.set_observation_state(state)
+    logger.info("apply_observation_state: set_observation_state took %.4fs", time.perf_counter() - _t0)
 
 
 # ── Preset path utilities (unchanged) ─────────────────────────────────────────

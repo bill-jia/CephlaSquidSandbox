@@ -8,13 +8,13 @@ import shutil
 from typing import List, TYPE_CHECKING
 
 from control.models import (
-    AcquisitionChannel,
-    GeneralChannelConfig,
-    ObjectiveChannelConfig,
-    merge_channel_configs,
+    GeneralObservationConfig,
+    ObjectiveOverrideConfig,
+    merge_observation_configs,
     validate_illumination_references,
     get_illumination_channel_names,
 )
+from control.models.observation_state import ObservationState
 
 if TYPE_CHECKING:
     from control.core.config.repository import ConfigRepository
@@ -22,60 +22,32 @@ if TYPE_CHECKING:
 # Re-export from models for convenience
 __all__ = [
     # Re-exports from models
-    "merge_channel_configs",
+    "merge_observation_configs",
     "validate_illumination_references",
     "get_illumination_channel_names",
     # New utilities
-    "apply_confocal_override",
+    "get_effective_observation_states",
     "copy_profile_configs",
-    "get_effective_channels",
 ]
 
 
-def apply_confocal_override(
-    channels: List[AcquisitionChannel],
-    confocal_mode: bool,
-) -> List[AcquisitionChannel]:
+def get_effective_observation_states(
+    general: GeneralObservationConfig,
+    objective: ObjectiveOverrideConfig,
+) -> List[ObservationState]:
     """
-    Apply confocal overrides to a list of acquisition channels.
+    Get the effective observation states for a given objective.
 
-    If confocal_mode is False, returns channels unchanged.
-    If confocal_mode is True, calls get_effective_settings() on each channel
-    to apply any confocal_override settings.
+    This is a convenience function that calls merge_observation_configs().
 
     Args:
-        channels: List of acquisition channels
-        confocal_mode: Whether confocal mode is active
+        general: General observation configuration
+        objective: Objective-specific override configuration
 
     Returns:
-        List of channels with confocal overrides applied (if applicable)
+        List of merged ObservationState objects
     """
-    if not confocal_mode:
-        return channels
-    return [ch.get_effective_settings(confocal_mode=True) for ch in channels]
-
-
-def get_effective_channels(
-    general: GeneralChannelConfig,
-    objective: ObjectiveChannelConfig,
-    confocal_mode: bool = False,
-) -> List[AcquisitionChannel]:
-    """
-    Get the effective acquisition channels for a given objective and mode.
-
-    This is a convenience function that combines merge_channel_configs()
-    and apply_confocal_override() into a single call.
-
-    Args:
-        general: General channel configuration
-        objective: Objective-specific channel configuration
-        confocal_mode: Whether confocal mode is active
-
-    Returns:
-        List of merged and mode-adjusted acquisition channels
-    """
-    merged = merge_channel_configs(general, objective)
-    return apply_confocal_override(merged, confocal_mode)
+    return merge_observation_configs(general, objective)
 
 
 def copy_profile_configs(

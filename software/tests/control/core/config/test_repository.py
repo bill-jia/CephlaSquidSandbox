@@ -9,12 +9,12 @@ import shutil
 
 from control.core.config import ConfigRepository
 from control.models import (
-    GeneralChannelConfig,
-    ObjectiveChannelConfig,
-    AcquisitionChannel,
-    IlluminationSettings,
+    GeneralObservationConfig,
+    ObjectiveOverride,
+    ObjectiveOverrideConfig,
     CameraSettings,
 )
+from control.models.observation_state import ObservationState, IlluminatorState
 from control.models.camera_registry import CameraRegistryConfig, CameraDefinition
 from control.models.filter_wheel_config import FilterWheelRegistryConfig, FilterWheelDefinition, FilterWheelType
 from control.models.hardware_bindings import (
@@ -58,38 +58,34 @@ channels:
 """
     )
 
-    # Create a general config (schema v1.0)
-    # Note: z_offset_um is at channel level, not in illumination_settings
+    # Create a general config (schema v3)
     general_yaml = default_profile / "channel_configs" / "general.yaml"
     general_yaml.write_text(
         """
-version: 1.0
+version: 3
 channel_groups: []
-channels:
-  - name: "Fluorescence 488nm"
+observation_states:
+  - version: 3
+    name: "Fluorescence 488nm"
     display_color: "#00FF00"
-    camera: null
     z_offset_um: 0.0
-    illumination_settings:
-      illumination_channel: "488nm"
-      intensity: 50.0
     camera_settings:
       exposure_time_ms: 100.0
       gain_mode: 0.0
+    illuminator_states:
+      - illumination_channel: "488nm"
+        intensity: 50.0
+        'on': false
 """
     )
 
-    # Create an objective config (schema v1.0)
+    # Create an objective config (schema v3)
     objective_yaml = default_profile / "channel_configs" / "20x.yaml"
     objective_yaml.write_text(
         """
-version: 1.0
-channels:
+version: 3
+overrides:
   - name: "Fluorescence 488nm"
-    display_color: "#00FF00"
-    camera: null
-    illumination_settings:
-      intensity: 75.0
     camera_settings:
       exposure_time_ms: 50.0
       gain_mode: 1.0
@@ -201,13 +197,13 @@ class TestConfigRepositoryProfileConfigs:
     """Tests for profile config loading and saving."""
 
     def test_get_general_config(self, repo_with_profile):
-        """Test loading general config (schema v1.0)."""
+        """Test loading general config (schema v3)."""
         config = repo_with_profile.get_general_config()
 
         assert config is not None
-        assert config.version == 1.0  # schema v1.0
-        assert len(config.channels) == 1
-        assert config.channels[0].name == "Fluorescence 488nm"
+        assert config.version == 3
+        assert len(config.observation_states) == 1
+        assert config.observation_states[0].name == "Fluorescence 488nm"
 
     def test_get_general_config_cached(self, repo_with_profile):
         """Test that general config is cached."""
@@ -221,7 +217,7 @@ class TestConfigRepositoryProfileConfigs:
         config = repo_with_profile.get_objective_config("20x")
 
         assert config is not None
-        assert config.channels[0].illumination_settings.intensity == 75.0
+        assert config.overrides[0].camera_settings.exposure_time_ms == 50.0
 
     def test_get_objective_config_returns_none_when_missing(self, repo_with_profile):
         """Test that missing objective config returns None."""
@@ -230,25 +226,25 @@ class TestConfigRepositoryProfileConfigs:
         assert config is None
 
     def test_save_general_config(self, repo_with_profile, temp_dir):
-        """Test saving general config updates cache (schema v1.0).
-
-        Note: camera is now int ID (null for single-camera systems).
-        """
-        new_config = GeneralChannelConfig(
-            version=1.0,
-            channels=[
-                AcquisitionChannel(
+        """Test saving general config updates cache (schema v3)."""
+        new_config = GeneralObservationConfig(
+            version=3,
+            observation_states=[
+                ObservationState(
+                    version=3,
                     name="Test Channel",
                     display_color="#FF0000",
-                    camera=1,  # Camera ID (int), not name
-                    illumination_settings=IlluminationSettings(
-                        illumination_channel="488nm",
-                        intensity=100.0,
-                    ),
                     camera_settings=CameraSettings(
                         exposure_time_ms=200.0,
                         gain_mode=0.0,
                     ),
+                    illuminator_states=[
+                        IlluminatorState(
+                            illumination_channel="488nm",
+                            intensity=100.0,
+                            on=False,
+                        ),
+                    ],
                 )
             ],
         )
@@ -262,23 +258,15 @@ class TestConfigRepositoryProfileConfigs:
         # Check cache was updated
         cached = repo_with_profile.get_general_config()
         assert cached is new_config
-        assert cached.version == 1.0
+        assert cached.version == 3
 
     def test_save_objective_config(self, repo_with_profile, temp_dir):
-        """Test saving objective config (schema v1.0).
-
-        Note: camera is now int ID (null for single-camera systems).
-        """
-        new_config = ObjectiveChannelConfig(
-            version=1.0,
-            channels=[
-                AcquisitionChannel(
+        """Test saving objective config (schema v3)."""
+        new_config = ObjectiveOverrideConfig(
+            version=3,
+            overrides=[
+                ObjectiveOverride(
                     name="Test",
-                    display_color="#0000FF",
-                    camera=1,  # Camera ID (int), not name
-                    illumination_settings=IlluminationSettings(
-                        intensity=30.0,
-                    ),
                     camera_settings=CameraSettings(
                         exposure_time_ms=25.0,
                         gain_mode=2.0,
@@ -308,28 +296,29 @@ class TestConfigRepositoryCacheManagement:
     """Tests for cache management."""
 
     def test_set_profile_clears_profile_cache(self, temp_dir):
-        """Test that switching profiles clears the profile cache (schema v1.0)."""
+        """Test that switching profiles clears the profile cache (schema v3)."""
         user_profiles = temp_dir / "user_profiles"
 
-        # Create two profiles with different configs (schema v1.0)
+        # Create two profiles with different configs (schema v3)
         for profile in ["profile1", "profile2"]:
             profile_path = user_profiles / profile / "channel_configs"
             profile_path.mkdir(parents=True)
             (user_profiles / profile / "laser_af_configs").mkdir()
             (profile_path / "general.yaml").write_text(
                 f"""
-version: 1.0
+version: 3
 channel_groups: []
-channels:
-  - name: "Channel from {profile}"
+observation_states:
+  - version: 3
+    name: "Channel from {profile}"
     display_color: "#00FF00"
-    camera: null
-    illumination_settings:
-      illumination_channel: "488nm"
-      intensity: 50.0
     camera_settings:
       exposure_time_ms: 100.0
       gain_mode: 0.0
+    illuminator_states:
+      - illumination_channel: "488nm"
+        intensity: 50.0
+        'on': false
 """
             )
 
@@ -337,11 +326,11 @@ channels:
 
         repo.set_profile("profile1")
         config1 = repo.get_general_config()
-        assert "profile1" in config1.channels[0].name
+        assert "profile1" in config1.observation_states[0].name
 
         repo.set_profile("profile2")
         config2 = repo.get_general_config()
-        assert "profile2" in config2.channels[0].name
+        assert "profile2" in config2.observation_states[0].name
 
     def test_clear_profile_cache(self, repo_with_profile):
         """Test clearing profile cache."""
@@ -1300,12 +1289,12 @@ filter_wheels:
         assert wheel.name == "Emission Wheel"
 
 
-class TestUpdateChannelSettingConfocal:
-    """Tests for update_channel_setting with confocal_mode parameter."""
+class TestUpdateChannelSettingV3:
+    """Tests for update_channel_setting with v3 (ObservationState) configs."""
 
     @pytest.fixture
-    def repo_with_confocal(self, tmp_path):
-        """ConfigRepository with a profile whose 20x.yaml has confocal_override."""
+    def repo_v3(self, tmp_path):
+        """ConfigRepository with v3 general and objective configs."""
         machine = tmp_path / "machine_configs"
         machine.mkdir()
         (machine / "illumination_channel_config.yaml").write_text(
@@ -1322,130 +1311,76 @@ class TestUpdateChannelSettingConfocal:
         (profile / "laser_af_configs").mkdir()
 
         (profile / "channel_configs" / "general.yaml").write_text(
-            "version: 1.0\n"
-            "channels:\n"
+            "version: 3\n"
+            "observation_states:\n"
             '  - name: "488nm"\n'
+            "    version: 3\n"
             '    display_color: "#1FFF00"\n'
             "    camera_settings:\n"
             "      exposure_time_ms: 20.0\n"
             "      gain_mode: 10.0\n"
-            "    illumination_settings:\n"
-            '      illumination_channel: "488nm"\n'
-            "      intensity: 20.0\n"
-            "    z_offset_um: 0.0\n"
+            "    illuminator_states:\n"
+            '      - illumination_channel: "488nm"\n'
+            "        intensity: 20.0\n"
+            "        'on': true\n"
+            "channel_groups: []\n"
         )
         (profile / "channel_configs" / "20x.yaml").write_text(
-            "version: 1.0\n"
-            "channels:\n"
+            "version: 3\n"
+            "overrides:\n"
             '  - name: "488nm"\n'
-            '    display_color: "#1FFF00"\n'
             "    camera_settings:\n"
             "      exposure_time_ms: 25.0\n"
             "      gain_mode: 5.0\n"
-            "    illumination_settings:\n"
-            "      intensity: 30.0\n"
-            "    z_offset_um: 0.0\n"
-            "    confocal_override:\n"
-            "      camera_settings:\n"
-            "        exposure_time_ms: 50.0\n"
-            "        gain_mode: 2.0\n"
-            "      illumination_settings:\n"
-            "        intensity: 80.0\n"
         )
 
         repo = ConfigRepository(base_path=tmp_path)
         repo.set_profile("default")
         return repo
 
-    def test_widefield_updates_base_settings(self, repo_with_confocal):
-        """confocal_mode=False writes to base camera_settings."""
-        repo_with_confocal.update_channel_setting("20x", "488nm", "ExposureTime", 99.0, confocal_mode=False)
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].camera_settings.exposure_time_ms == 99.0
-        # Override unchanged
-        assert obj.channels[0].confocal_override.camera_settings.exposure_time_ms == 50.0
-
-    def test_confocal_updates_override_settings(self, repo_with_confocal):
-        """confocal_mode=True writes to confocal_override.camera_settings."""
-        repo_with_confocal.update_channel_setting("20x", "488nm", "ExposureTime", 99.0, confocal_mode=True)
-        obj = repo_with_confocal.get_objective_config("20x")
-        # Base unchanged
-        assert obj.channels[0].camera_settings.exposure_time_ms == 25.0
-        # Override updated
-        assert obj.channels[0].confocal_override.camera_settings.exposure_time_ms == 99.0
-
-    def test_confocal_updates_override_intensity(self, repo_with_confocal):
-        """confocal_mode=True writes intensity to confocal_override.illumination_settings."""
-        repo_with_confocal.update_channel_setting("20x", "488nm", "IlluminationIntensity", 55.0, confocal_mode=True)
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].illumination_settings.intensity == 30.0  # base unchanged
-        assert obj.channels[0].confocal_override.illumination_settings.intensity == 55.0
-
-    def test_confocal_updates_override_analog_gain(self, repo_with_confocal):
-        """confocal_mode=True writes gain to confocal_override.camera_settings."""
-        result = repo_with_confocal.update_channel_setting("20x", "488nm", "AnalogGain", 8.0, confocal_mode=True)
+    def test_exposure_update(self, repo_v3):
+        """ExposureTime updates objective override camera_settings."""
+        result = repo_v3.update_channel_setting("20x", "488nm", "ExposureTime", 99.0)
         assert result is True
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].camera_settings.gain_mode == 5.0  # base unchanged
-        assert obj.channels[0].confocal_override.camera_settings.gain_mode == 8.0
+        obj = repo_v3.get_objective_config("20x")
+        assert obj.overrides[0].camera_settings.exposure_time_ms == 99.0
 
-    def test_confocal_creates_override_if_missing(self, repo_with_confocal):
-        """confocal_mode=True creates confocal_override when channel has none."""
-        # Remove confocal_override by rewriting YAML without it
-        profile_path = repo_with_confocal.get_profile_path("default")
-        (profile_path / "channel_configs" / "20x.yaml").write_text(
-            "version: 1.0\n"
-            "channels:\n"
-            '  - name: "488nm"\n'
-            '    display_color: "#1FFF00"\n'
-            "    camera_settings:\n"
-            "      exposure_time_ms: 25.0\n"
-            "      gain_mode: 5.0\n"
-            "    illumination_settings:\n"
-            "      intensity: 30.0\n"
-            "    z_offset_um: 0.0\n"
-        )
-        repo_with_confocal.clear_profile_cache()
+    def test_gain_update(self, repo_v3):
+        """AnalogGain updates objective override camera_settings."""
+        result = repo_v3.update_channel_setting("20x", "488nm", "AnalogGain", 8.0)
+        assert result is True
+        obj = repo_v3.get_objective_config("20x")
+        assert obj.overrides[0].camera_settings.gain_mode == 8.0
 
-        repo_with_confocal.update_channel_setting("20x", "488nm", "ExposureTime", 99.0, confocal_mode=True)
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].confocal_override is not None
-        assert obj.channels[0].confocal_override.camera_settings.exposure_time_ms == 99.0
-        # Other override fields should copy from base as starting values
-        assert obj.channels[0].confocal_override.camera_settings.gain_mode == 5.0
-        assert obj.channels[0].confocal_override.illumination_settings.intensity == 30.0
+    def test_illumination_intensity_updates_general(self, repo_v3):
+        """IlluminationIntensity updates general config illuminator_states."""
+        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIntensity", 55.0)
+        assert result is True
+        gen = repo_v3.get_general_config()
+        assert gen.observation_states[0].illuminator_states[0].intensity == 55.0
 
-    def test_default_confocal_mode_false(self, repo_with_confocal):
-        """Default confocal_mode=False preserves backward compatibility."""
-        repo_with_confocal.update_channel_setting("20x", "488nm", "ExposureTime", 99.0)
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].camera_settings.exposure_time_ms == 99.0
-        assert obj.channels[0].confocal_override.camera_settings.exposure_time_ms == 50.0
+    def test_iris_creates_confocal_hardware_settings(self, repo_v3):
+        """IlluminationIris creates confocal_hardware_settings when None."""
+        obj = repo_v3.get_objective_config("20x")
+        assert obj.overrides[0].confocal_hardware_settings is None
 
-    def test_iris_creates_confocal_hardware_settings_when_none(self, repo_with_confocal):
-        """IlluminationIris lazily creates confocal_hardware_settings when initially None."""
-        # Verify channel starts without confocal_hardware_settings
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].confocal_hardware_settings is None
-
-        result = repo_with_confocal.update_channel_setting("20x", "488nm", "IlluminationIris", 42.0)
+        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIris", 42.0)
         assert result is True
 
-        obj = repo_with_confocal.get_objective_config("20x")
-        assert obj.channels[0].confocal_hardware_settings is not None
-        assert obj.channels[0].confocal_hardware_settings.illumination_iris == 42.0
+        obj = repo_v3.get_objective_config("20x")
+        assert obj.overrides[0].confocal_hardware_settings is not None
+        assert obj.overrides[0].confocal_hardware_settings.illumination_iris == 42.0
 
-    def test_iris_update_when_no_objective_config(self, repo_with_confocal):
+    def test_iris_update_when_no_objective_config(self, repo_v3):
         """IlluminationIris auto-creates objective config from general when missing."""
-        # Remove the 20x.yaml so there's no objective config
-        profile_path = repo_with_confocal.get_profile_path("default")
+        profile_path = repo_v3.get_profile_path("default")
         (profile_path / "channel_configs" / "20x.yaml").unlink()
-        repo_with_confocal.clear_profile_cache()
+        repo_v3.clear_profile_cache()
 
-        result = repo_with_confocal.update_channel_setting("20x", "488nm", "IlluminationIris", 55.0)
+        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIris", 55.0)
         assert result is True
 
-        obj = repo_with_confocal.get_objective_config("20x")
+        obj = repo_v3.get_objective_config("20x")
         assert obj is not None
-        assert obj.channels[0].confocal_hardware_settings is not None
-        assert obj.channels[0].confocal_hardware_settings.illumination_iris == 55.0
+        assert obj.overrides[0].confocal_hardware_settings is not None
+        assert obj.overrides[0].confocal_hardware_settings.illumination_iris == 55.0

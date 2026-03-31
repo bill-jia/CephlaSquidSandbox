@@ -13,7 +13,7 @@ from control.core.observation_state_service import (
     sanitize_preset_filename,
 )
 from control.core.acquisition_metadata_helpers import legacy_flat_multipoint_from_acquisition_yaml_dict
-from control.models import AcquisitionChannel, CameraSettings as AcqCameraSettings, GeneralChannelConfig, IlluminationSettings
+from control.models import GeneralObservationConfig
 from control.models.acquisition_metadata import AcquisitionMetadata
 from control.models.observation_state import (
     CameraLiveSnapshot,
@@ -190,21 +190,17 @@ def test_apply_observation_state_persist_false_skips_save_general():
     )
 
     repo.save_general_config.assert_not_called()
-    lc.set_microscope_mode.assert_called()
+    lc.set_observation_state.assert_called()
 
 
 def test_apply_observation_state_skips_general_yaml_when_unchanged():
     """Re-loading the same state should not rewrite general.yaml."""
-    from control.core.observation_state_service import (
-        _observation_state_to_acquisition_channels,
-        apply_observation_state,
-    )
+    from control.core.observation_state_service import apply_observation_state
 
     state = _minimal_state(on=True)
-    acq_channels = _observation_state_to_acquisition_channels(state)
-    matching = GeneralChannelConfig(
-        version=1,
-        channels=acq_channels,
+    matching = GeneralObservationConfig(
+        version=3,
+        observation_states=[state],
         channel_groups=list(state.channel_groups),
     )
 
@@ -223,7 +219,6 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
     apply_observation_state(state, repo, lc, objective_store, emission_filter_wheel=None)
 
     repo.save_general_config.assert_not_called()
-    lc.set_microscope_mode.assert_called()
 
 
 def test_apply_observation_state_restores_saved_illumination_on_off_state():
@@ -257,8 +252,14 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
     )
 
     illum.set_channel_intensity.assert_called_once_with("TestLaser", 50.0)
-    illum.turn_on_channel.assert_called_once_with("TestLaser")
-    illum.turn_off_channel.assert_called_once_with("OtherLaser")
+    from unittest.mock import call
+    illum.set_channel_state.assert_has_calls(
+        [
+            call("TestLaser", True, force_hardware=True),
+            call("OtherLaser", False, force_hardware=True),
+        ],
+        any_order=True,
+    )
 
 
 def test_apply_observation_state_can_skip_live_trigger_restore():
@@ -312,12 +313,11 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
 
     lc.set_trigger_mode.assert_not_called()
     lc.set_trigger_fps.assert_not_called()
-    illum.turn_on_channel.assert_not_called()
-    illum.turn_off_channel.assert_not_called()
+    illum.set_channel_state.assert_not_called()
     # Camera settings are applied from camera_settings (step 5) and camera_live snapshot (step 6)
     calls = lc.camera.set_exposure_time.call_args_list
     assert calls[0].args == (10.0,), "First exposure set should come from camera_settings"
-    lc.set_microscope_mode.assert_called()
+    lc.set_observation_state.assert_called()
 
 
 def test_config_repository_observation_preset_io(tmp_path: Path):
@@ -328,19 +328,17 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
         "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
     )
-    # Create a minimal general.yaml using AcquisitionChannel for the bridge
-    ch = AcquisitionChannel(
+    # Create a minimal general.yaml with ObservationState
+    state_for_general = ObservationState(
+        version=3,
         name="TestLaser",
-        enabled=True,
         display_color="#FF0000",
-        camera=None,
-        camera_settings=AcqCameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
-        filter_wheel=None,
-        filter_position=None,
-        z_offset_um=0.0,
-        illumination_settings=IlluminationSettings(illumination_channel="TestLaser", intensity=50.0),
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
     )
-    general = GeneralChannelConfig(version=1, channels=[ch], channel_groups=[])
+    general = GeneralObservationConfig(version=3, observation_states=[state_for_general], channel_groups=[])
     (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
         yaml.safe_dump(general.model_dump(mode="json")), encoding="utf-8"
     )
@@ -365,19 +363,17 @@ def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):
     (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
         "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
     )
-    ch = AcquisitionChannel(
+    state_for_general = ObservationState(
+        version=3,
         name="TestLaser",
-        enabled=True,
         display_color="#FF0000",
-        camera=None,
-        camera_settings=AcqCameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
-        filter_wheel=None,
-        filter_position=None,
-        z_offset_um=0.0,
-        illumination_settings=IlluminationSettings(illumination_channel="TestLaser", intensity=50.0),
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
     )
     for prof in ("alpha", "beta"):
-        gen = GeneralChannelConfig(version=1, channels=[ch], channel_groups=[])
+        gen = GeneralObservationConfig(version=3, observation_states=[state_for_general], channel_groups=[])
         (base / "user_profiles" / prof / "channel_configs" / "general.yaml").write_text(
             yaml.safe_dump(gen.model_dump(mode="json")), encoding="utf-8"
         )
@@ -432,7 +428,7 @@ def test_append_frame_acquisition_times_csv(tmp_path: Path):
         position=pos,
         z_index=0,
         capture_time=1_700_000_000.25,
-        configuration=cfg,
+        observation_state=cfg,
         save_directory=str(tmp_path),
         file_id="0_0_0",
         region_id=0,

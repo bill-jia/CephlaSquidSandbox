@@ -13,7 +13,15 @@ import pytest
 
 import squid.abc
 from control.core.job_processing import Job, JobRunner, JobImage, CaptureInfo
-from control.models import AcquisitionChannel, CameraSettings, IlluminationSettings
+from control.models.observation_state import ObservationState, CameraSettings, IlluminatorState
+
+
+def _make_obs_state(name="BF LED matrix full"):
+    return ObservationState(
+        name=name,
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[IlluminatorState(illumination_channel=name, intensity=50.0, on=True)],
+    )
 
 
 def make_test_capture_info() -> CaptureInfo:
@@ -22,20 +30,7 @@ def make_test_capture_info() -> CaptureInfo:
         position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
         z_index=0,
         capture_time=time.time(),
-        configuration=AcquisitionChannel(
-            name="BF LED matrix full",
-            display_color="#FFFFFF",
-            camera=1,  # v1.0: camera is int ID
-            illumination_settings=IlluminationSettings(
-                illumination_channel="BF LED matrix full",
-                intensity=50.0,
-            ),
-            camera_settings=CameraSettings(
-                exposure_time_ms=10.0,
-                gain_mode=1.0,
-            ),
-            z_offset_um=0.0,  # v1.0: at channel level
-        ),
+        observation_state=_make_obs_state("BF LED matrix full"),
         save_directory="/tmp/test",
         file_id="test_0_0",
         region_id="A1",

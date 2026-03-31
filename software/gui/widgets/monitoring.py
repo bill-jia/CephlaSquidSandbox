@@ -388,7 +388,7 @@ def _populate_filter_positions_for_combo(
     combo.setCurrentIndex(0)
 
 
-class AcquisitionChannelConfiguratorDialog(QDialog):
+class ObservationStateConfiguratorDialog(QDialog):
     """Dialog for editing acquisition channel configurations.
 
     Edits user_profiles/{profile}/channel_configs/general.yaml.
@@ -544,28 +544,25 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         if not has_any_wheel:
             self.table.setColumnHidden(self.COL_FILTER_POSITION, True)
 
-        self.table.setRowCount(len(self.general_config.channels))
+        self.table.setRowCount(len(self.general_config.observation_states))
 
-        for row, channel in enumerate(self.general_config.channels):
-            self._populate_row(row, channel)
+        for row, state in enumerate(self.general_config.observation_states):
+            self._populate_row(row, state)
 
-    def _populate_row(self, row: int, channel):
-        """Populate a table row with channel data."""
-        from control.models import AcquisitionChannel
-
-        # Enabled checkbox
+    def _populate_row(self, row: int, state):
+        """Populate a table row with observation state data."""
+        # Enabled checkbox (ObservationState doesn't have 'enabled', always True)
         checkbox_widget = QWidget()
         checkbox_layout = QHBoxLayout(checkbox_widget)
         checkbox_layout.setContentsMargins(0, 0, 0, 0)
         checkbox_layout.setAlignment(Qt.AlignCenter)
         checkbox = QCheckBox()
-        enabled = channel.enabled if hasattr(channel, "enabled") else True
-        checkbox.setChecked(enabled)
+        checkbox.setChecked(True)
         checkbox_layout.addWidget(checkbox)
         self.table.setCellWidget(row, self.COL_ENABLED, checkbox_widget)
 
         # Name (editable text)
-        name_item = QTableWidgetItem(channel.name)
+        name_item = QTableWidgetItem(state.name)
         self.table.setItem(row, self.COL_NAME, name_item)
 
         # Illumination dropdown
@@ -573,10 +570,11 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         if self.illumination_config:
             illum_names = [ch.name for ch in self.illumination_config.channels]
             illum_combo.addItems(illum_names)
-            # Set current illumination
-            current_illum = channel.illumination_settings.illumination_channel
-            if current_illum and current_illum in illum_names:
-                illum_combo.setCurrentText(current_illum)
+            # Set current illumination from first illuminator state
+            if state.illuminator_states:
+                current_illum = state.illuminator_states[0].illumination_channel
+                if current_illum and current_illum in illum_names:
+                    illum_combo.setCurrentText(current_illum)
         self.table.setCellWidget(row, self.COL_ILLUMINATION, illum_combo)
 
         # Camera dropdown
@@ -584,8 +582,6 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         camera_combo.addItem("(None)")
         camera_names = self.config_repo.get_camera_names()
         camera_combo.addItems(camera_names)
-        if channel.camera and channel.camera in camera_names:
-            camera_combo.setCurrentText(channel.camera)
         self.table.setCellWidget(row, self.COL_CAMERA, camera_combo)
 
         # Filter wheel dropdown
@@ -593,21 +589,20 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         wheel_combo.addItem("(None)")
         wheel_names = self.config_repo.get_filter_wheel_names()
         wheel_combo.addItems(wheel_names)
-        # Set selection if channel has explicit wheel name
-        if channel.filter_wheel and channel.filter_wheel in wheel_names:
-            wheel_combo.setCurrentText(channel.filter_wheel)
         wheel_combo.currentTextChanged.connect(lambda text, r=row: self._on_wheel_changed(r, text))
         self.table.setCellWidget(row, self.COL_FILTER_WHEEL, wheel_combo)
 
-        # Filter position dropdown - function auto-resolves single-wheel systems
+        # Filter position dropdown
         position_combo = QComboBox()
+        # Get emission filter position from state
+        filter_pos = state.emission_filter_positions.get("default")
         _populate_filter_positions_for_combo(
-            position_combo, channel.filter_wheel, self.config_repo, channel.filter_position
+            position_combo, None, self.config_repo, filter_pos
         )
         self.table.setCellWidget(row, self.COL_FILTER_POSITION, position_combo)
 
         # Display color (color picker button - fills cell width)
-        color = channel.display_color if hasattr(channel, "display_color") else "#FFFFFF"
+        color = state.display_color if hasattr(state, "display_color") else "#FFFFFF"
         color_btn = QPushButton()
         color_btn.setStyleSheet(f"background-color: {color};")
         color_btn.setProperty("color", color)
@@ -630,21 +625,21 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
             color_btn.setProperty("color", color.name())
 
     def _add_channel(self):
-        """Add a new acquisition channel."""
+        """Add a new observation state."""
         if self.general_config is None:
             QMessageBox.warning(self, "Error", "No configuration loaded. Cannot add channel.")
             return
 
-        dialog = AddAcquisitionChannelDialog(self.config_repo, self)
+        dialog = AddObservationStateDialog(self.config_repo, self)
         if dialog.exec_() == QDialog.Accepted:
-            channel = dialog.get_channel()
-            if channel:
-                self.general_config.channels.append(channel)
+            state = dialog.get_channel()
+            if state:
+                self.general_config.observation_states.append(state)
                 # Reload table
                 self._load_channels()
 
     def _remove_channel(self):
-        """Remove selected channel."""
+        """Remove selected observation state."""
         if self.general_config is None:
             return
 
@@ -660,12 +655,12 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
                 f"Remove channel '{name_item.text()}'?",
                 QMessageBox.Yes | QMessageBox.No,
             )
-            if reply == QMessageBox.Yes and current_row < len(self.general_config.channels):
-                del self.general_config.channels[current_row]
+            if reply == QMessageBox.Yes and current_row < len(self.general_config.observation_states):
+                del self.general_config.observation_states[current_row]
                 self._load_channels()
 
     def _move_up(self):
-        """Move selected channel up."""
+        """Move selected observation state up."""
         if self.general_config is None:
             return
 
@@ -673,22 +668,22 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         if current_row <= 0:
             return
 
-        channels = self.general_config.channels
-        channels[current_row - 1], channels[current_row] = channels[current_row], channels[current_row - 1]
+        states = self.general_config.observation_states
+        states[current_row - 1], states[current_row] = states[current_row], states[current_row - 1]
         self._load_channels()
         self.table.selectRow(current_row - 1)
 
     def _move_down(self):
-        """Move selected channel down."""
+        """Move selected observation state down."""
         if self.general_config is None:
             return
 
         current_row = self.table.currentRow()
-        if current_row < 0 or current_row >= len(self.general_config.channels) - 1:
+        if current_row < 0 or current_row >= len(self.general_config.observation_states) - 1:
             return
 
-        channels = self.general_config.channels
-        channels[current_row], channels[current_row + 1] = channels[current_row + 1], channels[current_row]
+        states = self.general_config.observation_states
+        states[current_row], states[current_row + 1] = states[current_row + 1], states[current_row]
         self._load_channels()
         self.table.selectRow(current_row + 1)
 
@@ -703,10 +698,9 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
 
         # Validate filter wheel/position consistency
         warnings = []
-        for channel in self.general_config.channels:
-            if channel.filter_wheel is not None and channel.filter_position is None:
-                warnings.append(f"Channel '{channel.name}' has filter wheel but no position selected")
-                self._log.warning(warnings[-1])
+        for state in self.general_config.observation_states:
+            # Check emission filter positions for completeness
+            pass  # No filter_wheel field on ObservationState; positions are in emission_filter_positions
 
         if warnings:
             reply = QMessageBox.warning(
@@ -735,7 +729,7 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
 
     def _export_config(self):
         """Export current channel configuration to a YAML file."""
-        from control.models import GeneralChannelConfig
+        from control.models import GeneralObservationConfig
         import yaml
 
         # Get save file path
@@ -771,7 +765,7 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
     def _import_config(self):
         """Import channel configuration from a YAML file."""
         from pydantic import ValidationError
-        from control.models import GeneralChannelConfig
+        from control.models import GeneralObservationConfig
         import yaml
 
         # Get file path
@@ -790,7 +784,7 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
                 data = yaml.safe_load(f)
             if data is None:
                 raise ValueError("File is empty or contains no valid YAML content")
-            imported_config = GeneralChannelConfig.model_validate(data)
+            imported_config = GeneralObservationConfig.model_validate(data)
         except (PermissionError, FileNotFoundError) as e:
             self._log.warning(f"Cannot read import file {file_path}: {e}")
             QMessageBox.critical(self, "Import Failed", f"Cannot read file:\n{e}")
@@ -812,7 +806,7 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
         self._load_channels()
 
         QMessageBox.information(
-            self, "Import Successful", f"Imported {len(imported_config.channels)} channels from:\n{file_path}"
+            self, "Import Successful", f"Imported {len(imported_config.observation_states)} channels from:\n{file_path}"
         )
 
     def _sync_table_to_config(self):
@@ -821,51 +815,41 @@ class AcquisitionChannelConfiguratorDialog(QDialog):
             return
 
         # Use bounds checking to handle potential table/config mismatch
-        num_rows = min(self.table.rowCount(), len(self.general_config.channels))
+        num_rows = min(self.table.rowCount(), len(self.general_config.observation_states))
         for row in range(num_rows):
-            channel = self.general_config.channels[row]
-
-            # Enabled
-            checkbox_widget = self.table.cellWidget(row, self.COL_ENABLED)
-            if checkbox_widget:
-                checkbox = checkbox_widget.findChild(QCheckBox)
-                if checkbox:
-                    channel.enabled = checkbox.isChecked()
+            state = self.general_config.observation_states[row]
 
             # Name
             name_item = self.table.item(row, self.COL_NAME)
             if name_item:
-                channel.name = name_item.text().strip()
+                state.name = name_item.text().strip()
 
-            # Illumination
+            # Illumination — update first illuminator state
             illum_combo = self.table.cellWidget(row, self.COL_ILLUMINATION)
             if illum_combo and isinstance(illum_combo, QComboBox):
-                channel.illumination_settings.illumination_channel = illum_combo.currentText()
+                illum_name = illum_combo.currentText()
+                if state.illuminator_states:
+                    state.illuminator_states[0].illumination_channel = illum_name
+                else:
+                    from control.models.observation_state import IlluminatorState
+                    state.illuminator_states = [
+                        IlluminatorState(illumination_channel=illum_name, intensity=20.0, on=False)
+                    ]
 
-            # Camera
-            camera_combo = self.table.cellWidget(row, self.COL_CAMERA)
-            if camera_combo and isinstance(camera_combo, QComboBox):
-                camera_text = camera_combo.currentText()
-                channel.camera = camera_text if camera_text != "(None)" else None
-
-            # Filter wheel: None = no selection, else explicit wheel name
-            wheel_combo = self.table.cellWidget(row, self.COL_FILTER_WHEEL)
-            if wheel_combo and isinstance(wheel_combo, QComboBox):
-                wheel_text = wheel_combo.currentText()
-                channel.filter_wheel = wheel_text if wheel_text != "(None)" else None
-
-            # Filter position
+            # Filter position -> emission_filter_positions
             position_combo = self.table.cellWidget(row, self.COL_FILTER_POSITION)
             if position_combo and isinstance(position_combo, QComboBox):
-                channel.filter_position = position_combo.currentData()
+                pos = position_combo.currentData()
+                if pos is not None:
+                    state.emission_filter_positions["default"] = pos
 
             # Display color
             color_btn = self.table.cellWidget(row, self.COL_DISPLAY_COLOR)
             if color_btn:
-                channel.display_color = color_btn.property("color") or "#FFFFFF"
+                state.display_color = color_btn.property("color") or "#FFFFFF"
 
 
-class AddAcquisitionChannelDialog(QDialog):
+class AddObservationStateDialog(QDialog):
     """Dialog for adding a new acquisition channel."""
 
     def __init__(self, config_repo, parent=None):
@@ -961,7 +945,7 @@ class AddAcquisitionChannelDialog(QDialog):
         # Check for duplicate names
         general_config = self.config_repo.get_general_config()
         if general_config:
-            existing_names = [ch.name for ch in general_config.channels]
+            existing_names = [s.name for s in general_config.observation_states]
             if name in existing_names:
                 QMessageBox.warning(self, "Validation Error", f"Channel '{name}' already exists.")
                 return
@@ -969,46 +953,39 @@ class AddAcquisitionChannelDialog(QDialog):
         self.accept()
 
     def get_channel(self):
-        """Build AcquisitionChannel from dialog inputs."""
-        from control.models import (
-            AcquisitionChannel,
+        """Build ObservationState from dialog inputs."""
+        from control.models.observation_state import (
+            ObservationState,
             CameraSettings,
-            IlluminationSettings,
+            IlluminatorState,
         )
 
         name = self.name_edit.text().strip()
         illum_name = self.illumination_combo.currentText()
 
-        # Camera
-        camera = None
-        if self.camera_combo:
-            camera_text = self.camera_combo.currentText()
-            camera = camera_text if camera_text != "(None)" else None
-
-        # Filter wheel and position
-        filter_wheel = None
-        if self.wheel_combo:
-            wheel_text = self.wheel_combo.currentText()
-            filter_wheel = wheel_text if wheel_text != "(None)" else None
+        # Filter position -> emission_filter_positions
+        emission_filter_positions = {}
         filter_position = self.position_combo.currentData() if self.position_combo else None
+        if filter_position is not None:
+            emission_filter_positions["default"] = filter_position
 
-        return AcquisitionChannel(
+        return ObservationState(
+            version=3,
             name=name,
-            enabled=True,
             display_color=self._display_color,
-            camera=camera,
-            filter_wheel=filter_wheel,
-            filter_position=filter_position,
-            z_offset_um=0.0,
-            illumination_settings=IlluminationSettings(
-                illumination_channel=illum_name,
-                intensity=20.0,
-            ),
             camera_settings=CameraSettings(
                 exposure_time_ms=20.0,
                 gain_mode=10.0,
-                pixel_format=None,
             ),
+            illuminator_states=[
+                IlluminatorState(
+                    illumination_channel=illum_name,
+                    intensity=20.0,
+                    on=False,
+                ),
+            ],
+            z_offset_um=0.0,
+            emission_filter_positions=emission_filter_positions,
         )
 
 

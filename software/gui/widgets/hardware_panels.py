@@ -2206,7 +2206,6 @@ class LiveControlWidget(QFrame):
                 # update the exposure time and analog gain settings according to the selected configuration
                 self.entry_exposureTime.setValue(self.currentConfiguration.exposure_time)
                 self.entry_analogGain.setValue(self.currentConfiguration.analog_gain)
-                self.entry_illuminationIntensity.setValue(self.currentConfiguration.illumination_intensity)
                 # Sync camera widget controls when acquisition updates the active channel.
                 # (Manual live view does not call set_microscope_mode() from this widget.)
                 self.signal_newExposureTime.emit(self.currentConfiguration.exposure_time)

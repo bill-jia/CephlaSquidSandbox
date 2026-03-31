@@ -51,7 +51,7 @@ from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope, _should_simulate
-from control.models import AcquisitionChannel
+from control.models import ObservationState
 from control.nidaq import AbstractNIDAQ
 from squid.abc import AbstractCamera, AbstractStage
 import control._def
@@ -303,7 +303,7 @@ class HighContentScreeningGui(QMainWindow):
         # Channel Configuration (user-facing acquisition channels)
         acq_channel_config_action = QAction("Channel Configuration...", self)
         acq_channel_config_action.setMenuRole(QAction.NoRole)
-        acq_channel_config_action.triggered.connect(self.openAcquisitionChannelConfigEditor)
+        acq_channel_config_action.triggered.connect(self.openObservationStateConfigEditor)
         settings_menu.addAction(acq_channel_config_action)
 
         save_observation_state_action = QAction("Save Observation State Preset...", self)
@@ -1944,9 +1944,9 @@ class HighContentScreeningGui(QMainWindow):
         dialog.signal_channels_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
 
-    def openAcquisitionChannelConfigEditor(self):
+    def openObservationStateConfigEditor(self):
         """Open the acquisition channel configurator dialog for editing user profiles."""
-        dialog = widgets.AcquisitionChannelConfiguratorDialog(self.microscope.config_repo, self)
+        dialog = widgets.ObservationStateConfiguratorDialog(self.microscope.config_repo, self)
         dialog.signal_channels_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
 

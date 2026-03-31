@@ -112,7 +112,6 @@ def _save_unified_multipoint_acquisition_yaml(
     camera: Any,
     objective_store: "ObjectiveStore",
     recording_start_time: float,
-    selected_configurations: list,
     selected_observation_state_names: list,
     use_manual_focus_map: bool,
     logger: Any,
@@ -150,11 +149,9 @@ def _save_unified_multipoint_acquisition_yaml(
             "contrast_af": params.do_autofocus,
             "laser_af": params.do_reflection_autofocus,
         },
-        "channels": (
-            {"observation_state_names": list(params.selected_observation_state_names)}
-            if params.selected_observation_state_names
-            else [_serialize_for_yaml(ch) for ch in params.selected_configurations]
-        ),
+        "channels": {
+            "observation_state_names": list(params.selected_observation_state_names),
+        },
     }
 
     # Add widget-specific scan section
@@ -222,7 +219,7 @@ def _save_unified_multipoint_acquisition_yaml(
         objective_store=objective_store,
         live_controller=live_controller,
         camera=camera,
-        selected_configurations=list(selected_configurations),
+        selected_configurations=[],
         obs_names=list(selected_observation_state_names or []),
         logger=logger,
     )
@@ -969,7 +966,6 @@ class MultiPointController:
                 camera=self.camera,
                 objective_store=self.objectiveStore,
                 recording_start_time=self.recording_start_time,
-                selected_configurations=self.selected_configurations,
                 selected_observation_state_names=self.selected_observation_state_names,
                 use_manual_focus_map=self.use_manual_focus_map,
                 logger=self._log,
@@ -1067,7 +1063,6 @@ class MultiPointController:
             plate_num_rows=plate_num_rows,
             plate_num_cols=plate_num_cols,
             xy_mode=self.xy_mode,
-            selected_configurations=self.selected_configurations,
             selected_observation_state_names=self.selected_observation_state_names,
         )
 

@@ -6,13 +6,14 @@ Illumination control system for the microscope.
 light source (CoolLED pE-400, Lumencor LDI/CELESTA), IO-routed individual
 lasers, or an LED matrix — exposes a uniform channel-name API.  Consumers
 (LiveController, FastAcquisitionController, widgets) call
-``set_channel_intensity`` / ``turn_on_channel`` / ``turn_off_channel`` without
+``set_channel_intensity`` / ``set_channel_state`` without
 knowing the underlying hardware.
 
 Primary API (channel-name based, device-agnostic)::
 
     controller.set_channel_intensity("Fluorescence 488 nm Ex", 50)
-    controller.turn_on_channel("Fluorescence 488 nm Ex")
+    controller.set_channel_state("Fluorescence 488 nm Ex", True)
+    controller.set_channel_state("Fluorescence 488 nm Ex", False)
     snapshot = controller.snapshot()
     ...
     controller.restore(snapshot)
@@ -164,6 +165,13 @@ class IlluminationDevice(abc.ABC):
                 self.turn_off(ch)
             except Exception as exc:
                 logger.warning(f"[{self.__class__.__name__}] turn_off('{ch}') failed: {exc}")
+
+    def set_on_off_state(self, channel: str, is_on: bool) -> None:
+        """Set the on/off state for a named channel.  Default implementation calls ``turn_on`` or ``turn_off``."""
+        if is_on:
+            self.turn_on(channel)
+        else:
+            self.turn_off(channel)
 
     @abc.abstractmethod
     def get_intensity(self, channel: str) -> float:
@@ -843,8 +851,7 @@ class IlluminationController:
     **Primary channel-name API**::
 
         set_channel_intensity(name, intensity)
-        turn_on_channel(name)
-        turn_off_channel(name)
+        set_channel_state(name, is_on)
         turn_off_all()
         snapshot() -> IlluminationSnapshot
         restore(snapshot)
@@ -1030,7 +1037,7 @@ class IlluminationController:
             return
         for name, st in self._channel_state.items():
             if st.is_on:
-                self.turn_on_channel(name)
+                self.set_channel_state(name, True)
 
     def turn_off_all_hardware_preserving_state(self) -> None:
         """Turn off every device output without changing logical on/off flags."""
@@ -1042,19 +1049,18 @@ class IlluminationController:
         for ch in self._hardware_asserted:
             self._hardware_asserted[ch] = False
 
-    def turn_on_channel(self, channel_name: str, *, force_hardware: bool = False) -> None:
-        """Turn on a named channel.
+    def set_channel_state(self, channel_name: str, is_on: bool, force_hardware: bool = False) -> None:
+        """Set the on/off state for a named channel.
 
         Args:
             channel_name: Logical channel name (or LED matrix alias).
+            is_on: True to turn on, False to turn off.
             force_hardware: If True, always command hardware (acquisition / legacy).
                 If False, hardware is commanded only when :meth:`set_streaming_active`
                 has enabled streaming (live view).
         """
         apply_hw = force_hardware or self._streaming_active
-        self._channel_state[channel_name].is_on = True
-
-
+        self._channel_state[channel_name].is_on = is_on
         if apply_hw and not self._hardware_asserted[channel_name]:
             lm = self._resolve_led_matrix_channel(channel_name)
             if lm is not None:
@@ -1063,47 +1069,15 @@ class IlluminationController:
                 if isinstance(dev, LEDMatrixIlluminationDevice):
                     if mode_key is not None:
                         dev.set_matrix_mode(mode_key)
-                    dev.turn_on(unified_name)
-                    self._hardware_asserted[unified_name] = True
+                    dev.set_on_off_state(unified_name, is_on)
+                    self._hardware_asserted[unified_name] = is_on
                 return
             dev = self._channel_map.get(channel_name)
             if dev is None:
-                logger.warning(f"turn_on_channel: unknown channel '{channel_name}'")
+                logger.warning(f"set_channel_state: unknown channel '{channel_name}'")
                 return
-            dev.turn_on(channel_name)
-            self._hardware_asserted[channel_name] = True
-        else:
-            return
-
-    def turn_off_channel(self, channel_name: str, *, force_hardware: bool = False) -> None:
-        """Turn off a named channel.
-
-        Args:
-            force_hardware: If True, always command hardware. If False, hardware is
-                still turned off when it was previously asserted (e.g. after live view).
-        """
-        apply_hw = force_hardware or self._streaming_active
-        lm = self._resolve_led_matrix_channel(channel_name)
-        if lm is not None:
-            unified_name, _mode_key = lm
-            dev = self._channel_map.get(unified_name)
-            if isinstance(dev, LEDMatrixIlluminationDevice):
-                self._channel_state[unified_name].is_on = False
-                hw_was = self._hardware_asserted.get(unified_name, False)
-                if apply_hw or hw_was:
-                    dev.turn_off(unified_name)
-                    self._hardware_asserted[unified_name] = False
-            return
-
-        dev = self._channel_map.get(channel_name)
-        if dev is None:
-            logger.warning(f"turn_off_channel: unknown channel '{channel_name}'")
-            return
-        self._channel_state[channel_name].is_on = False
-        hw_was = self._hardware_asserted.get(channel_name, False)
-        if apply_hw or hw_was:
-            dev.turn_off(channel_name)
-            self._hardware_asserted[channel_name] = False
+            dev.set_on_off_state(channel_name, is_on)
+            self._hardware_asserted[channel_name] = is_on
 
     def turn_off_all(self, *, preserve_logical_state: bool = False) -> None:
         """Turn off all channels on all devices.
@@ -1146,9 +1120,9 @@ class IlluminationController:
             try:
                 self.set_channel_intensity(name, state.intensity)
                 if state.is_on:
-                    self.turn_on_channel(name, force_hardware=force_hardware)
+                    self.set_channel_state(name, True, force_hardware=force_hardware)
                 else:
-                    self.turn_off_channel(name, force_hardware=force_hardware)
+                    self.set_channel_state(name, False, force_hardware=force_hardware)
             except Exception as exc:
                 logger.warning(f"Failed to restore channel '{name}': {exc}")
 
@@ -1226,13 +1200,13 @@ class IlluminationController:
     def turn_on_illumination(self, channel=None) -> None:
         """Legacy: turn on illumination by wavelength integer.
 
-        Delegates to ``turn_on_channel`` when the wavelength can be resolved
+        Delegates to ``set_channel_state`` when the wavelength can be resolved
         to a channel name.
         """
         if channel is not None:
             name = self._channel_name_for_wavelength(channel)
             if name is not None:
-                self.turn_on_channel(name, force_hardware=True)
+                self.set_channel_state(name, True, force_hardware=True)
                 return
         logger.warning(f"turn_on_illumination: could not resolve channel={channel}")
 
@@ -1241,7 +1215,7 @@ class IlluminationController:
         if channel is not None:
             name = self._channel_name_for_wavelength(channel)
             if name is not None:
-                self.turn_off_channel(name, force_hardware=True)
+                self.set_channel_state(name, False, force_hardware=True)
                 return
         logger.warning(f"turn_off_illumination: could not resolve channel={channel}")
 

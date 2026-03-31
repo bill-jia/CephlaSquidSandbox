@@ -47,16 +47,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import yaml
 
 from control.models import (
-    AcquisitionChannel,
-    AcquisitionChannelOverride,
     CameraSettings,
     ConfocalSettings,
-    GeneralChannelConfig,
     IlluminationChannel,
     IlluminationChannelConfig,
-    IlluminationSettings,
     LaserAFConfig,
-    ObjectiveChannelConfig,
+)
+from control.models.observation_state import (
+    ObservationState,
+    IlluminatorState,
+)
+from control.models.acquisition_config import (
+    GeneralObservationConfig,
+    ObjectiveOverride,
+    ObjectiveOverrideConfig,
 )
 from control.models.confocal_config import ConfocalConfig
 from control.models.illumination_config import IlluminationType
@@ -292,9 +296,9 @@ def convert_xml_channels_to_acquisition_config(
     confocal_channels: Optional[List[Dict[str, Any]]] = None,
     confocal_config: Optional[ConfocalConfig] = None,
     include_illumination_channels: bool = False,
-) -> ObjectiveChannelConfig:
+) -> ObjectiveOverrideConfig:
     """
-    Convert parsed XML channels to ObjectiveChannelConfig (v1.0 schema).
+    Convert parsed XML channels to ObjectiveOverrideConfig.
 
     Args:
         xml_channels: Channels from channel_configurations.xml
@@ -310,79 +314,25 @@ def convert_xml_channels_to_acquisition_config(
         for ch in confocal_channels:
             confocal_by_name[ch["name"]] = ch
 
-    acq_channels = []
+    overrides = []
     for xml_ch in xml_channels:
-        # Use old channel name as the acquisition channel name
         name = xml_ch["name"]
-
-        # Find the illumination channel name to use in illumination_channel field
-        # For fluorescence channels, this extracts wavelength and finds matching channel
-        ill_name = get_illumination_channel_name(
-            xml_channel_name=name,
-            illumination_source=xml_ch["illumination_source"],
-            illumination_config=illumination_config,
-        )
-
-        # Create camera settings (v1.0: single object, no display_color)
         camera_settings = CameraSettings(
             exposure_time_ms=xml_ch["exposure_time_ms"],
             gain_mode=xml_ch["analog_gain"],
         )
-
-        # Display color is now at channel level in v1.0
-        display_color = xml_ch["display_color"]
-
-        # Create illumination settings (v1.0: no z_offset_um here)
-        # illumination_channel only in general.yaml, not in objective files
-        illumination_settings = IlluminationSettings(
-            illumination_channel=ill_name if include_illumination_channels else None,
-            intensity=xml_ch["illumination_intensity"],
-        )
-
-        # filter_wheel/filter_position only in general.yaml (v1.0 format)
-        # filter_wheel="auto" means single wheel (resolved via hardware_bindings), None means no wheel
-        filter_wheel = "auto" if include_illumination_channels else None
-        filter_position = xml_ch["emission_filter_position"] if include_illumination_channels else None
-
-        # z_offset_um at channel level in v1.0
-        z_offset_um = xml_ch["z_offset"] if include_illumination_channels else 0.0
-
-        # Create confocal_override if needed
-        confocal_override = None
         confocal_hardware_settings = None
-
         if include_confocal and name in confocal_by_name:
-            conf_ch = confocal_by_name[name]
-            confocal_override = AcquisitionChannelOverride(
-                illumination_settings=IlluminationSettings(
-                    illumination_channel=None,  # Overrides don't need illumination_channel
-                    intensity=conf_ch["illumination_intensity"],
-                ),
-                camera_settings=CameraSettings(
-                    exposure_time_ms=conf_ch["exposure_time_ms"],
-                    gain_mode=conf_ch["analog_gain"],
-                ),
-            )
-            # Generate default iris values from confocal config
             from control.default_config_generator import build_confocal_settings_from_config
-
             confocal_hardware_settings = build_confocal_settings_from_config(confocal_config)
 
-        # Create acquisition channel (v1.0 format)
-        acq_channel = AcquisitionChannel(
+        overrides.append(ObjectiveOverride(
             name=name,
-            display_color=display_color,
-            illumination_settings=illumination_settings,
             camera_settings=camera_settings,
-            filter_wheel=filter_wheel,
-            filter_position=filter_position,
-            z_offset_um=z_offset_um,  # v1.0: at channel level
             confocal_hardware_settings=confocal_hardware_settings,
-            confocal_override=confocal_override,
-        )
-        acq_channels.append(acq_channel)
+        ))
 
-    return ObjectiveChannelConfig(version=1.0, channels=acq_channels)
+    return ObjectiveOverrideConfig(version=3, overrides=overrides)
 
 
 def convert_laser_af_json_to_yaml(json_path: Path) -> Optional[LaserAFConfig]:
@@ -557,26 +507,25 @@ def migrate_profile(
                 illumination_config=illumination_config,
             )
 
-            # general.yaml has illumination_channel, display_color, z_offset_um
-            # filter_wheel/filter_position (v1.0 format)
-            acq_channel = AcquisitionChannel(
+            obs_state = ObservationState(
                 name=name,
                 display_color=xml_ch["display_color"],
-                illumination_settings=IlluminationSettings(
-                    illumination_channel=ill_name,
-                    intensity=xml_ch["illumination_intensity"],
-                ),
                 camera_settings=CameraSettings(
                     exposure_time_ms=xml_ch["exposure_time_ms"],
                     gain_mode=xml_ch["analog_gain"],
                 ),
-                filter_wheel="auto",  # Single wheel, resolved via hardware_bindings
-                filter_position=xml_ch["emission_filter_position"],
-                z_offset_um=xml_ch["z_offset"],  # v1.0: at channel level
+                illuminator_states=[
+                    IlluminatorState(
+                        illumination_channel=ill_name,
+                        intensity=xml_ch["illumination_intensity"],
+                    ),
+                ],
+                emission_filter_positions={"1": xml_ch["emission_filter_position"]} if xml_ch.get("emission_filter_position") else {},
+                z_offset_um=xml_ch["z_offset"],
             )
-            general_channels.append(acq_channel)
+            general_channels.append(obs_state)
 
-        general_config = GeneralChannelConfig(version=1.0, channels=general_channels, channel_groups=[])
+        general_config = GeneralObservationConfig(version=3, observation_states=general_channels, channel_groups=[])
         save_yaml(target_general, general_config, dry_run)
 
     # Second pass: Create objective-specific override files and laser AF configs

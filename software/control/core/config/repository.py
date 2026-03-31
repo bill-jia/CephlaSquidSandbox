@@ -36,8 +36,6 @@ except ImportError:
 from pydantic import BaseModel, ValidationError
 
 from control.models import (
-    AcquisitionChannel,
-    AcquisitionChannelOverride,
     AcquisitionOutputConfig,
     CameraMappingsConfig,
     CameraRegistryConfig,
@@ -45,13 +43,13 @@ from control.models import (
     FilterWheelDefinition,
     FilterWheelRegistryConfig,
     FilterWheelType,
-    GeneralChannelConfig,
+    GeneralObservationConfig,
+    ObjectiveOverride,
+    ObjectiveOverrideConfig,
     IlluminationChannelConfig,
-    IlluminationSettings,
     CameraSettings,
     LaserAFConfig,
-    ObjectiveChannelConfig,
-    merge_channel_configs,
+    merge_observation_configs,
     IOEndpointConfig,
     build_default_io_endpoint_config,
     MachineConfig,
@@ -748,55 +746,51 @@ class ConfigRepository:
     # Core CRUD operations for acquisition channel settings
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def get_general_config(self, profile: Optional[str] = None) -> Optional[GeneralChannelConfig]:
-        """Load general channel configuration (cached when using current profile)."""
+    def get_general_config(self, profile: Optional[str] = None) -> Optional[GeneralObservationConfig]:
+        """Load general observation configuration (cached when using current profile)."""
         if profile is None or profile == self._current_profile:
             cache_key = "general"
             if cache_key not in self._profile_cache:
                 profile_path = self._get_profile_path()
                 path = profile_path / "channel_configs" / "general.yaml"
-                self._profile_cache[cache_key] = self._load_yaml(path, GeneralChannelConfig)
+                self._profile_cache[cache_key] = self._load_yaml(path, GeneralObservationConfig)
             return self._profile_cache[cache_key]
         else:
-            # Explicit profile - load directly without caching
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
-            return self._load_yaml(path, GeneralChannelConfig)
+            return self._load_yaml(path, GeneralObservationConfig)
 
-    def get_objective_config(self, objective: str, profile: Optional[str] = None) -> Optional[ObjectiveChannelConfig]:
-        """Load objective-specific channel configuration (cached when using current profile)."""
+    def get_objective_config(self, objective: str, profile: Optional[str] = None) -> Optional[ObjectiveOverrideConfig]:
+        """Load objective-specific override configuration (cached when using current profile)."""
         if profile is None or profile == self._current_profile:
             cache_key = f"objective:{objective}"
             if cache_key not in self._profile_cache:
                 profile_path = self._get_profile_path()
                 path = profile_path / "channel_configs" / f"{objective}.yaml"
-                self._profile_cache[cache_key] = self._load_yaml(path, ObjectiveChannelConfig)
+                self._profile_cache[cache_key] = self._load_yaml(path, ObjectiveOverrideConfig)
             return self._profile_cache[cache_key]
         else:
-            # Explicit profile - load directly without caching
             path = self.user_profiles_path / profile / "channel_configs" / f"{objective}.yaml"
-            return self._load_yaml(path, ObjectiveChannelConfig)
+            return self._load_yaml(path, ObjectiveOverrideConfig)
 
-    def save_general_config(self, profile: str, config: GeneralChannelConfig) -> None:
-        """Save general channel configuration and update cache if current profile."""
+    def save_general_config(self, profile: str, config: GeneralObservationConfig) -> None:
+        """Save general observation configuration and update cache if current profile."""
         if profile == self._current_profile:
             profile_path = self._get_profile_path()
             path = profile_path / "channel_configs" / "general.yaml"
             self._save_yaml(path, config)
             self._profile_cache["general"] = config
         else:
-            # Different profile - save without caching
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
             self._save_yaml(path, config)
 
-    def save_objective_config(self, profile: str, objective: str, config: ObjectiveChannelConfig) -> None:
-        """Save objective-specific channel configuration and update cache if current profile."""
+    def save_objective_config(self, profile: str, objective: str, config: ObjectiveOverrideConfig) -> None:
+        """Save objective-specific override configuration and update cache if current profile."""
         if profile == self._current_profile:
             profile_path = self._get_profile_path()
             path = profile_path / "channel_configs" / f"{objective}.yaml"
             self._save_yaml(path, config)
             self._profile_cache[f"objective:{objective}"] = config
         else:
-            # Different profile - save without caching
             path = self.user_profiles_path / profile / "channel_configs" / f"{objective}.yaml"
             self._save_yaml(path, config)
 
@@ -805,24 +799,22 @@ class ConfigRepository:
     # Higher-level helpers for common channel config operations
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def get_merged_channels(
+    def get_merged_observation_states(
         self,
         objective: str,
         profile: Optional[str] = None,
-        confocal_mode: bool = False,
-    ) -> List[AcquisitionChannel]:
+    ) -> List[ObservationState]:
         """
-        Get merged acquisition channels for an objective.
+        Get merged observation states for an objective.
 
-        Merges general.yaml with objective.yaml and optionally applies confocal overrides.
+        Merges general.yaml with objective.yaml overrides.
 
         Args:
             objective: Objective name
             profile: Profile name (defaults to current profile)
-            confocal_mode: Whether to apply confocal overrides
 
         Returns:
-            List of merged AcquisitionChannel objects
+            List of merged ObservationState objects
         """
         general_config = self.get_general_config(profile)
         if not general_config:
@@ -831,14 +823,21 @@ class ConfigRepository:
         obj_config = self.get_objective_config(objective, profile)
 
         if obj_config:
-            channels = merge_channel_configs(general_config, obj_config)
+            return merge_observation_configs(general_config, obj_config)
         else:
-            channels = list(general_config.channels)
+            return list(general_config.observation_states)
 
-        if confocal_mode:
-            channels = [ch.get_effective_settings(confocal_mode=True) for ch in channels]
+    def get_merged_channels(
+        self,
+        objective: str,
+        profile: Optional[str] = None,
+        confocal_mode: bool = False,
+    ) -> List[ObservationState]:
+        """Backward-compatible alias for get_merged_observation_states.
 
-        return channels
+        .. deprecated:: Use :meth:`get_merged_observation_states` instead.
+        """
+        return self.get_merged_observation_states(objective, profile)
 
     def update_channel_setting(
         self,
@@ -858,17 +857,17 @@ class ConfigRepository:
         Supported settings:
         - "ExposureTime" -> camera_settings.exposure_time_ms
         - "AnalogGain" -> camera_settings.gain_mode
-        - "IlluminationIntensity" -> illumination_settings.intensity
+        - "IlluminationIntensity" -> illuminator_states[active].intensity
         - "IlluminationIris" -> confocal_hardware_settings.illumination_iris
         - "EmissionIris" -> confocal_hardware_settings.emission_iris
 
         Args:
             objective: Objective name
-            channel_name: Name of the channel to update
+            channel_name: Name of the observation state to update
             setting: Setting name (see supported settings above)
             value: New value for the setting
             profile: Profile name (defaults to current profile)
-            confocal_mode: If True, write to confocal_override instead of base settings
+            confocal_mode: If True, unused (confocal_mode is on the state itself now)
 
         Returns:
             True if update was successful, False otherwise
@@ -901,76 +900,58 @@ class ConfigRepository:
             if general_config is None:
                 logger.warning("No general config to create objective config from")
                 return False
-            # Create objective config from general config (v1.1 schema)
-            obj_config = ObjectiveChannelConfig(
-                version=1.1,
-                channels=[
-                    AcquisitionChannel(
-                        name=ch.name,
-                        display_color=ch.display_color,
-                        camera=ch.camera,
-                        camera_settings=CameraSettings(
-                            exposure_time_ms=ch.camera_settings.exposure_time_ms,
-                            gain_mode=ch.camera_settings.gain_mode,
-                            pixel_format=ch.camera_settings.pixel_format,
-                        ),
-                        filter_wheel=None,  # Objective files don't include filter wheel
-                        filter_position=None,
-                        illumination_settings=IlluminationSettings(
-                            illumination_channel=None,  # From general.yaml
-                            intensity=ch.illumination_settings.intensity,
+            # Create objective config from general observation states
+            obj_config = ObjectiveOverrideConfig(
+                version=3,
+                overrides=[
+                    ObjectiveOverride(
+                        name=s.name,
+                        camera_settings=s.camera_settings.model_copy() if s.camera_settings else None,
+                        confocal_hardware_settings=(
+                            s.confocal_hardware_settings.model_copy()
+                            if s.confocal_hardware_settings
+                            else None
                         ),
                     )
-                    for ch in general_config.channels
+                    for s in general_config.observation_states
                 ],
             )
 
-        # Find the channel
-        acq_channel = obj_config.get_channel_by_name(channel_name)
-        if not acq_channel:
-            logger.warning(f"Channel '{channel_name}' not found in objective config")
+        # Find the override
+        override = obj_config.get_by_name(channel_name)
+        if not override:
+            logger.warning(f"Observation state '{channel_name}' not found in objective config")
             return False
 
-        # Iris settings go to confocal_hardware_settings (applies in both modes)
+        # Iris settings go to confocal_hardware_settings
         if location == "confocal_hw":
-            if acq_channel.confocal_hardware_settings is None:
+            if override.confocal_hardware_settings is None:
                 from control.default_config_generator import build_confocal_settings_from_config
+                from control.models.observation_state import ConfocalSettings as _CS
 
-                acq_channel.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
-            setattr(acq_channel.confocal_hardware_settings, field, value)
-        elif confocal_mode:
-            # Write to confocal_override — create it if it doesn't exist
-            if acq_channel.confocal_override is None:
-                # Also create confocal_hardware_settings if missing
-                if acq_channel.confocal_hardware_settings is None:
-                    from control.default_config_generator import build_confocal_settings_from_config
-
-                    acq_channel.confocal_hardware_settings = build_confocal_settings_from_config(
-                        self.get_confocal_config()
-                    )
-                acq_channel.confocal_override = AcquisitionChannelOverride(
-                    camera_settings=acq_channel.camera_settings.model_copy(),
-                    illumination_settings=IlluminationSettings(
-                        intensity=acq_channel.illumination_settings.intensity,
-                    ),
+                override.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
+            setattr(override.confocal_hardware_settings, field, value)
+        elif location == "camera":
+            if override.camera_settings is None:
+                override.camera_settings = CameraSettings(
+                    exposure_time_ms=10.0,
+                    gain_mode=0.0,
                 )
-
-            if location == "camera":
-                if acq_channel.confocal_override.camera_settings is None:
-                    acq_channel.confocal_override.camera_settings = acq_channel.camera_settings.model_copy()
-                setattr(acq_channel.confocal_override.camera_settings, field, value)
-            elif location == "illumination":
-                if acq_channel.confocal_override.illumination_settings is None:
-                    acq_channel.confocal_override.illumination_settings = IlluminationSettings(
-                        intensity=acq_channel.illumination_settings.intensity,
-                    )
-                acq_channel.confocal_override.illumination_settings.intensity = value
-        else:
-            # Write to base settings (existing behavior)
-            if location == "camera":
-                setattr(acq_channel.camera_settings, field, value)
-            elif location == "illumination":
-                acq_channel.illumination_settings.intensity = value
+            setattr(override.camera_settings, field, value)
+        elif location == "illumination":
+            # Illumination intensity lives on the general config's observation state,
+            # not on the objective override. Update general config directly.
+            gen_state = general_config.get_by_name(channel_name) if general_config else None
+            if gen_state and gen_state.illuminator_states:
+                # Update intensity on active illuminator states
+                for ist in gen_state.illuminator_states:
+                    if ist.on or len(gen_state.illuminator_states) == 1:
+                        ist.intensity = value
+                if general_config:
+                    self.save_general_config(profile, general_config)
+            else:
+                logger.warning(f"No illuminator states found for '{channel_name}' in general config")
+                return False
 
         # Save
         self.save_objective_config(profile, objective, obj_config)
@@ -1022,9 +1003,8 @@ class ConfigRepository:
         self,
         output_dir: Union[Path, str],
         objective: str,
-        channels: List[AcquisitionChannel],
-        confocal_mode: bool = False,
         observation_state_names: Optional[List[str]] = None,
+        confocal_mode: bool = False,
     ) -> None:
         """
         Save acquisition settings to an experiment output directory.
@@ -1036,15 +1016,13 @@ class ConfigRepository:
         Args:
             output_dir: Experiment output directory
             objective: Objective used for acquisition
-            channels: List of acquisition channels used
+            observation_state_names: Names of observation states used
             confocal_mode: Whether confocal mode was active
-            observation_state_names: When multipoint uses Observation State presets, their names
         """
         output_config = AcquisitionOutputConfig(
             objective=objective,
             confocal_mode=confocal_mode,
-            channels=channels,
-            observation_state_names=observation_state_names,
+            observation_state_names=observation_state_names or [],
         )
         output_path = Path(output_dir) / "acquisition_channels.yaml"
         self._save_yaml(output_path, output_config)

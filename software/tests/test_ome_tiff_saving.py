@@ -30,26 +30,17 @@ def test_ome_tiff_memmap_roundtrip(shape: tuple[int, int]) -> None:
     import control._def as _def
     from control._def import FileSavingOption
     from control.core.job_processing import SaveOMETiffJob, CaptureInfo, JobImage, AcquisitionInfo
-    from control.models import AcquisitionChannel, CameraSettings, IlluminationSettings
+    from control.models.observation_state import ObservationState, CameraSettings, IlluminatorState
     import squid.abc
 
     original_option = _def.FILE_SAVING_OPTION
     _def.FILE_SAVING_OPTION = FileSavingOption.OME_TIFF
 
     channels = [
-        AcquisitionChannel(
+        ObservationState(
             name=name,
-            display_color="#FFFFFF",
-            camera=1,  # v1.0: camera is int ID
-            illumination_settings=IlluminationSettings(
-                illumination_channel=name,
-                intensity=5.0,
-            ),
-            camera_settings=CameraSettings(
-                exposure_time_ms=10.0,
-                gain_mode=1.0,
-            ),
-            z_offset_um=0.0,  # v1.0: at channel level
+            camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+            illuminator_states=[IlluminatorState(illumination_channel=name, intensity=5.0, on=True)],
         )
         for name in ["DAPI", "GFP"]
     ]
@@ -94,7 +85,7 @@ def test_ome_tiff_memmap_roundtrip(shape: tuple[int, int]) -> None:
                             position=next(pos_iter),
                             z_index=z,
                             capture_time=time.time(),
-                            configuration=channel,
+                            observation_state=channel,
                             save_directory=str(time_point_dir),
                             file_id=f"test_{t}_{c}_{z}",
                             region_id=1,
@@ -187,7 +178,7 @@ def test_ome_tiff_memmap_roundtrip(shape: tuple[int, int]) -> None:
 def test_job_runner_injects_acquisition_info() -> None:
     """Test that JobRunner.dispatch() properly injects acquisition_info into SaveOMETiffJob."""
     from control.core.job_processing import SaveOMETiffJob, CaptureInfo, JobImage, AcquisitionInfo, JobRunner
-    from control.models import AcquisitionChannel, CameraSettings, IlluminationSettings
+    from control.models.observation_state import ObservationState, CameraSettings, IlluminatorState
     import squid.abc
 
     # Create test data
@@ -203,26 +194,17 @@ def test_job_runner_injects_acquisition_info() -> None:
         physical_size_y_um=0.5,
     )
 
-    channel = AcquisitionChannel(
+    channel = ObservationState(
         name="DAPI",
-        display_color="#FFFFFF",
-        camera=1,  # v1.0: camera is int ID
-        illumination_settings=IlluminationSettings(
-            illumination_channel="DAPI",
-            intensity=5.0,
-        ),
-        camera_settings=CameraSettings(
-            exposure_time_ms=10.0,
-            gain_mode=1.0,
-        ),
-        z_offset_um=0.0,  # v1.0: at channel level
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[IlluminatorState(illumination_channel="DAPI", intensity=5.0, on=True)],
     )
 
     capture_info = CaptureInfo(
         position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
         z_index=0,
         capture_time=time.time(),
-        configuration=channel,
+        observation_state=channel,
         save_directory=os.path.join(tempfile.gettempdir(), "test"),
         file_id="test_0_0_0",
         region_id=1,

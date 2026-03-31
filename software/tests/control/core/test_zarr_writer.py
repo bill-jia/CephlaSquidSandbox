@@ -23,11 +23,19 @@ from control.core.job_processing import (
     ZarrWriterInfo,
     SaveZarrJob,
 )
-from control.models import AcquisitionChannel, CameraSettings, IlluminationSettings
+from control.models.observation_state import ObservationState, CameraSettings, IlluminatorState
 
 
 # Skip all tests if tensorstore is not installed
 pytest.importorskip("tensorstore")
+
+
+def _make_obs_state(name="BF LED matrix full"):
+    return ObservationState(
+        name=name,
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[IlluminatorState(illumination_channel=name, intensity=50.0, on=True)],
+    )
 
 
 def make_test_capture_info(
@@ -42,20 +50,7 @@ def make_test_capture_info(
         position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
         z_index=z_index,
         capture_time=time.time(),
-        configuration=AcquisitionChannel(
-            name="BF LED matrix full",
-            illumination_settings=IlluminationSettings(
-                illumination_channels=["LED"],
-                intensity={"LED": 50.0},
-                z_offset_um=0.0,
-            ),
-            camera_settings={
-                "main": CameraSettings(
-                    exposure_time_ms=10.0,
-                    gain_mode=1.0,
-                )
-            },
-        ),
+        observation_state=_make_obs_state("BF LED matrix full"),
         save_directory="/tmp/test",
         file_id=f"test_{fov}_{z_index}",
         region_id=region_id,

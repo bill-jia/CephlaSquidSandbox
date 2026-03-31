@@ -53,7 +53,7 @@ from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope, _should_simulate
-from control.models import AcquisitionChannel
+from control.models import ObservationState
 from control.nidaq import AbstractNIDAQ
 from squid.abc import AbstractCamera, AbstractStage
 import control._def
@@ -187,7 +187,7 @@ class QtMultiPointController(MultiPointController, QObject):
     signal_acquisition_start = Signal()
     image_to_display = Signal(np.ndarray)
     image_to_display_multi = Signal(np.ndarray, int)
-    signal_current_configuration = Signal(AcquisitionChannel)
+    signal_current_configuration = Signal(ObservationState)
     signal_register_current_fov = Signal(float, float)
     napari_layers_init = Signal(int, int, object)
     napari_layers_update = Signal(np.ndarray, float, float, int, str)  # image, x_mm, y_mm, k, channel
@@ -270,7 +270,7 @@ class QtMultiPointController(MultiPointController, QObject):
 
         # NDViewer push-based API: emit start_acquisition signal
         scan_info = parameters.scan_position_information
-        channels = [cfg.name for cfg in parameters.selected_configurations]
+        channels = parameters.selected_observation_state_names
         num_z = parameters.NZ
 
         # Build FOV labels and region offset mapping
@@ -349,7 +349,7 @@ class QtMultiPointController(MultiPointController, QObject):
             self.napari_layers_init.emit(frame.frame.shape[0], frame.frame.shape[1], frame.frame.dtype)
 
         objective_magnification = str(int(self.objectiveStore.get_current_objective_info()["magnification"]))
-        napri_layer_name = objective_magnification + "x " + info.configuration.name
+        napri_layer_name = objective_magnification + "x " + info.observation_state.name
         self.napari_layers_update.emit(
             frame.frame, info.position.x_mm, info.position.y_mm, info.z_index, napri_layer_name
         )
@@ -373,13 +373,13 @@ class QtMultiPointController(MultiPointController, QObject):
         else:
             # TIFF mode: register with filepath (synchronous write, notification is correct here)
             filepath = control.utils_acquisition.get_image_filepath(
-                info.save_directory, info.file_id, info.configuration.name, frame.frame.dtype
+                info.save_directory, info.file_id, info.observation_state.name, frame.frame.dtype
             )
             self.ndviewer_register_image.emit(
-                info.time_point, flat_fov_idx, info.z_index, info.configuration.name, filepath
+                info.time_point, flat_fov_idx, info.z_index, info.observation_state.name, filepath
             )
 
-    def _signal_current_configuration_fn(self, config: AcquisitionChannel):
+    def _signal_current_configuration_fn(self, config: ObservationState):
         self.signal_current_configuration.emit(config)
 
     def _signal_current_fov_fn(self, x_mm: float, y_mm: float):

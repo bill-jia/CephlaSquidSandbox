@@ -21,7 +21,7 @@ from control import _def, utils, utils_acquisition
 from control._def import ZProjectionMode, DownsamplingMethod
 import squid.abc
 import squid.logging
-from control.models import AcquisitionChannel
+from control.models.observation_state import ObservationState
 from control.core import utils_ome_tiff_writer as ome_tiff_writer
 from control.core.memory_profiler import (
     start_worker_monitoring,
@@ -80,7 +80,7 @@ class CaptureInfo:
     position: squid.abc.Pos
     z_index: int
     capture_time: float
-    configuration: AcquisitionChannel
+    observation_state: ObservationState
     save_directory: str
     file_id: str
     region_id: int
@@ -89,7 +89,7 @@ class CaptureInfo:
     z_piezo_um: Optional[float] = None
     time_point: Optional[int] = None
     filename_channel_label: Optional[str] = None
-    """If set, used for TIFF basename instead of configuration.name (e.g. observation state name)."""
+    """If set, used for TIFF basename instead of observation_state.name."""
 
 
 @dataclass()
@@ -159,7 +159,7 @@ def append_frame_acquisition_time_csv(
         "unix_time_s",
         "utc_iso",
     ]
-    ch = channel if channel is not None else (info.filename_channel_label or info.configuration.name)
+    ch = channel if channel is not None else (info.filename_channel_label or info.observation_state.name)
     cidx = channel_index if channel_index is not None else info.configuration_idx
     row = {
         "time_point": "" if info.time_point is None else info.time_point,
@@ -226,7 +226,7 @@ class SaveImageJob(Job):
     def save_image(self, image: np.array, info: CaptureInfo, is_color: bool):
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
         if _def.FILE_SAVING_OPTION == _def.FileSavingOption.MULTI_PAGE_TIFF:
-            _ch_label = info.filename_channel_label or info.configuration.name
+            _ch_label = info.filename_channel_label or info.observation_state.name
             metadata = {
                 "z_level": info.z_index,
                 "channel": _ch_label,
@@ -251,7 +251,7 @@ class SaveImageJob(Job):
             # - embedding full metadata as JSON in ImageDescription (description=)
             # - setting PageName (tag 285) to the channel name via extratags
             description = json.dumps(metadata)
-            page_name = str(info.configuration.name)
+            page_name = str(info.observation_state.name)
 
             # extratags format: (code, dtype, count, value, writeonce)
             # PageName (285) expects ASCII; dtype 's' denotes a null-terminated string in tifffile
@@ -270,11 +270,11 @@ class SaveImageJob(Job):
                 image=image,
                 file_id=info.file_id,
                 save_directory=info.save_directory,
-                config=info.configuration,
+                config=info.observation_state,
                 is_color=is_color,
                 filename_channel_label=info.filename_channel_label,
             )
-            _label = info.filename_channel_label or info.configuration.name
+            _label = info.filename_channel_label or info.observation_state.name
             _written = utils_acquisition.get_image_filepath(
                 info.save_directory, info.file_id, _label, image.dtype
             )
@@ -668,7 +668,7 @@ class SaveZarrJob(Job):
             fov=fov,
             time_point=info.time_point or 0,
             z_index=info.z_index,
-            channel_name=info.configuration.name,
+            channel_name=info.observation_state.name,
             region_idx=region_names.index(region_id) if region_id in region_names else 0,
         )
 

@@ -148,7 +148,7 @@ class IlluminationDeviceEntry(BaseModel):
     Represents one physical illumination source (may have multiple channels).
     Channel keys in ``channels`` are the canonical channel names used
     throughout the system (must match ``IlluminationChannelConfig`` names and
-    ``AcquisitionChannel.illumination_settings.illumination_channel``).
+    ``ObservationState.illuminator_states[].illumination_channel``).
 
     Attributes:
         id: Unique identifier for this device (used to prefix IO endpoint names).

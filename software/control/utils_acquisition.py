@@ -11,7 +11,6 @@ import cv2
 import imageio
 
 import control._def
-from control.models import AcquisitionChannel
 
 
 def get_image_filepath(save_directory: str, file_id: str, config_name: str, dtype) -> str:
@@ -41,7 +40,7 @@ def save_image(
     image: np.array,
     file_id: str,
     save_directory: str,
-    config: AcquisitionChannel,
+    config,
     is_color: bool,
     *,
     filename_channel_label: Optional[str] = None,

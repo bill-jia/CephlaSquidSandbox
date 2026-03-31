@@ -5,6 +5,7 @@
 *.log
 hardware_docs/
 .migration_complete
+.claude/worktrees
 
 # PlatformIO
 .pio/

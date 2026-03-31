@@ -41,7 +41,7 @@ def make_capture_info(region_id: str = "A1", fov: int = 0) -> CaptureInfo:
         position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
         z_index=0,
         capture_time=time.time(),
-        configuration=ChannelMode(
+        observation_state=ChannelMode(
             id="0",
             name="BF LED matrix full",
             camera_sn="test",

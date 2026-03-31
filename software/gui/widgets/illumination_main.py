@@ -1,4 +1,5 @@
 from ._bootstrap import *
+from control.lighting import IlluminationController
 
 class IlluminationWidget(QWidget):
     """Standalone widget for manual illumination control.
@@ -10,8 +11,8 @@ class IlluminationWidget(QWidget):
     placed below the channel rows for saving and loading imaging presets.
 
     The widget is controller-agnostic: it calls only
-    ``IlluminationController.set_channel_intensity``, ``turn_on_channel``, and
-    ``turn_off_channel``, regardless of whether the backend is a Teensy MCU,
+    ``IlluminationController.set_channel_intensity`` and ``IlluminationController.set_channel_state``
+    regardless of whether the backend is a Teensy MCU,
     NI-DAQ, or serial light source.
     """
 
@@ -49,7 +50,7 @@ class IlluminationWidget(QWidget):
 
     def __init__(
         self,
-        illumination_controller,
+        illumination_controller: IlluminationController,
         parent=None,
         *,
         config_repo=None,
@@ -70,7 +71,7 @@ class IlluminationWidget(QWidget):
             on_observation_state_changed: Callback after save/load (e.g. refresh channel lists).
         """
         super().__init__(parent)
-        self._controller = illumination_controller
+        self._controller: IlluminationController = illumination_controller
         self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
         self._on_observation_state_changed = on_observation_state_changed
         self.observation_state_widget: Optional["ObservationStateWidget"] = None
@@ -273,10 +274,7 @@ class IlluminationWidget(QWidget):
         btn: QPushButton = row["btn"]
         btn.setText("ON" if checked else "OFF")
         self._apply_shutter_style(btn, checked)
-        if checked:
-            self._controller.turn_on_channel(channel_name)
-        else:
-            self._controller.turn_off_channel(channel_name)
+        self._controller.set_channel_state(channel_name, checked, force_hardware=True)
 
     def _on_led_matrix_mode_changed(self, channel_name: str, index: int):
         row = self._channel_rows.get(channel_name)

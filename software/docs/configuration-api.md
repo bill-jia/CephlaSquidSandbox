@@ -264,9 +264,14 @@ class IlluminationType(str, Enum):
     TRANSILLUMINATION = "transillumination"    # LED matrix
 ```
 
-### AcquisitionChannel
+### AcquisitionChannel (DEPRECATED)
 
-The main model for acquisition channel settings.
+> **Deprecated:** `AcquisitionChannel` has been replaced by `ObservationState` (v3).
+> See [observation-state-migration.md](observation-state-migration.md) for the new model.
+> `AcquisitionChannel` remains only in `GeneralChannelConfig`/`ObjectiveChannelConfig`
+> YAML config containers and will be removed in a future update.
+
+Legacy model for acquisition channel settings.
 
 ```python
 from control.models import AcquisitionChannel
