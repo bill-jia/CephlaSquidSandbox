@@ -1559,8 +1559,6 @@ class MultiPointWorker:
             and self._last_illumination_config_name != config.name
         ):
             self.liveController.turn_off_illumination()
-        with self._timing.get_timer("select_config"):
-            self._select_config(config)
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
@@ -1626,6 +1624,7 @@ class MultiPointWorker:
 
         with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
             if self.liveController.trigger_mode == TriggerMode.HARDWARE:
+                self._log.info(f"Waiting {self.camera.get_total_frame_time() / 1e3} [s] for exposure to complete")
                 exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
                 # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
                 # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
