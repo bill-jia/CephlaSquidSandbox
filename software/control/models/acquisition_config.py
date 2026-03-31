@@ -15,7 +15,6 @@ from pydantic import BaseModel, Field
 
 from control.models.observation_state import (
     CameraSettings,
-    ConfocalSettings,
     ObservationState,
     IlluminatorState,
     SynchronizationMode,
@@ -51,49 +50,6 @@ class GeneralObservationConfig(BaseModel):
 
     def get_group_names(self) -> List[str]:
         return [g.name for g in self.channel_groups]
-
-
-class ObjectiveOverride(BaseModel):
-    """Per-observation-state objective overrides."""
-
-    name: str = Field(..., min_length=1)
-    camera_settings: Optional[CameraSettings] = None
-    confocal_hardware_settings: Optional[ConfocalSettings] = None
-    model_config = {"extra": "forbid"}
-
-
-class ObjectiveOverrideConfig(BaseModel):
-    """{objective}.yaml — per-objective overrides."""
-
-    version: Union[int, float] = Field(3)
-    overrides: List[ObjectiveOverride] = Field(default_factory=list)
-    model_config = {"extra": "forbid"}
-
-    def get_by_name(self, name: str) -> Optional[ObjectiveOverride]:
-        for o in self.overrides:
-            if o.name == name:
-                return o
-        return None
-
-
-def merge_observation_configs(
-    general: GeneralObservationConfig,
-    objective: ObjectiveOverrideConfig,
-) -> List[ObservationState]:
-    """Merge general.yaml and objective.yaml into final ObservationStates."""
-    merged = []
-    for state in general.observation_states:
-        override = objective.get_by_name(state.name)
-        if override is None:
-            merged.append(state)
-            continue
-        updates = {}
-        if override.camera_settings is not None:
-            updates["camera_settings"] = override.camera_settings
-        if override.confocal_hardware_settings is not None:
-            updates["confocal_hardware_settings"] = override.confocal_hardware_settings
-        merged.append(state.model_copy(update=updates) if updates else state)
-    return merged
 
 
 class AcquisitionOutputConfig(BaseModel):

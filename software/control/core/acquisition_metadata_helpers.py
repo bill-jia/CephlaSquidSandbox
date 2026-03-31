@@ -151,7 +151,6 @@ def augment_multipoint_acquisition_yaml_dict(
             obs_state = collect_observation_state(
                 live_controller,
                 repo,
-                objective_store.current_objective,
                 emission_filter_positions=emission or None,
             )
         except Exception as e:

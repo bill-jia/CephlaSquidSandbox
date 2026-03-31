@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from control.microcontroller import Microcontroller
     from squid.abc import LightSource
     from control.serial_peripherals import SciMicroscopyLEDArray
+    from control.models.observation_state import IlluminatorState
 
 logger = logging.getLogger(__name__)
 
@@ -999,9 +1000,14 @@ class IlluminationController:
         Routes to whichever device owns *channel_name*.
         """
         intensity = float(np.clip(intensity, 0, 100))
+
+        # Resolve LED matrix aliases before touching _channel_state so that
+        # alias names like "BF LED matrix full" map to the unified channel key.
         lm = self._resolve_led_matrix_channel(channel_name)
         if lm is not None:
             unified_name, mode_key = lm
+            if abs(intensity - self._channel_state[unified_name].intensity) < 0.1:
+                return
             dev = self._channel_map.get(unified_name)
             if isinstance(dev, LEDMatrixIlluminationDevice):
                 if mode_key is not None:
@@ -1010,6 +1016,8 @@ class IlluminationController:
                 self._channel_state[unified_name].intensity = intensity
             return
 
+        if abs(intensity - self._channel_state[channel_name].intensity) < 0.1:
+            return
         dev = self._channel_map.get(channel_name)
         if dev is None:
             logger.warning(f"set_channel_intensity: unknown channel '{channel_name}'")
@@ -1034,13 +1042,18 @@ class IlluminationController:
         """True when live view has enabled illumination hardware gating."""
         return self._streaming_active
 
-    def apply_logical_state_to_hardware(self) -> None:
-        """Assert hardware for every channel that is logically on (requires streaming active)."""
-        if not self._streaming_active:
+    def apply_logical_state_to_hardware(self, force: bool = False) -> None:
+        """Assert hardware for every channel that is logically on.
+
+        Args:
+            force: If True, bypass the streaming-active gate (used by acquisition workers).
+                   If False (default), only asserts when streaming is active.
+        """
+        if not force and not self._streaming_active:
             return
         for name, st in self._channel_state.items():
             if st.is_on:
-                self.set_channel_state(name, True)
+                self.set_channel_state(name, True, force_hardware=force)
 
     def turn_off_all_hardware_preserving_state(self) -> None:
         """Turn off every device output without changing logical on/off flags."""
@@ -1062,19 +1075,26 @@ class IlluminationController:
                 If False, hardware is commanded only when :meth:`set_streaming_active`
                 has enabled streaming (live view).
         """
+        self._log.info(f"setting channel state for {channel_name} to {is_on} with force_hardware={force_hardware}")
         apply_hw = force_hardware or self._streaming_active
-        self._channel_state[channel_name].is_on = is_on
-        if apply_hw and not self._hardware_asserted[channel_name]:
-            lm = self._resolve_led_matrix_channel(channel_name)
-            if lm is not None:
-                unified_name, mode_key = lm
+
+        # Resolve LED matrix aliases before touching _channel_state so that
+        # alias names like "BF LED matrix full" map to the unified channel key.
+        lm = self._resolve_led_matrix_channel(channel_name)
+        if lm is not None:
+            unified_name, mode_key = lm
+            self._channel_state[unified_name].is_on = is_on
+            if apply_hw and self._hardware_asserted.get(unified_name) != is_on:
                 dev = self._channel_map.get(unified_name)
                 if isinstance(dev, LEDMatrixIlluminationDevice):
                     if mode_key is not None:
                         dev.set_matrix_mode(mode_key)
                     dev.set_on_off_state(unified_name, is_on)
                     self._hardware_asserted[unified_name] = is_on
-                return
+            return
+
+        self._channel_state[channel_name].is_on = is_on
+        if apply_hw and self._hardware_asserted.get(channel_name) != is_on:
             dev = self._channel_map.get(channel_name)
             if dev is None:
                 logger.warning(f"set_channel_state: unknown channel '{channel_name}'")
@@ -1272,6 +1292,34 @@ class IlluminationController:
     def get_shutter_state(self) -> Dict[str, bool]:
         """Legacy: return on/off state dict for all channels."""
         return {ch: s.is_on for ch, s in self._channel_state.items()}
+
+    def is_any_hardware_asserted(self) -> bool:
+        """True if any channel currently has hardware turned on."""
+        return any(self._hardware_asserted.values())
+
+    def apply_observation_illumination(
+        self,
+        illuminator_states: List["IlluminatorState"],
+        turn_on: bool,
+        force_hardware: bool = False,
+    ) -> None:
+        """Apply illumination for a list of IlluminatorStates.
+
+        Consolidates the pattern of iterating active illuminator states, setting
+        LED matrix mode, setting intensity, and turning channels on/off.
+
+        Args:
+            illuminator_states: List of IlluminatorState objects to apply.
+            turn_on: True to set intensity + LED mode + turn on; False to turn off.
+            force_hardware: Passed through to :meth:`set_channel_state`.
+        """
+        for ist in illuminator_states:
+            if turn_on:
+                mode = ist.led_matrix_mode
+                if mode and self.has_unified_led_matrix():
+                    self.set_led_matrix_mode(mode)
+                self.set_channel_intensity(ist.illumination_channel, ist.intensity)
+            self.set_channel_state(ist.illumination_channel, turn_on, force_hardware=force_hardware)
 
     # -- Multi-port forwarding (delegates to IORoutedIlluminationDevice) -----
 

@@ -606,7 +606,7 @@ class MultiPointController:
         if not was_streaming:
             self.camera.start_streaming()
         try:
-            channels = self.liveController.get_channels(self.objectiveStore.current_objective)
+            channels = self.liveController.get_observation_states()
             if not channels:
                 self._log.warning("No channels available in _temporary_get_an_image_hack")
                 return (None, False)
@@ -631,9 +631,9 @@ class MultiPointController:
         when starting this acquisition, it is likely it will fail with an "out of disk space" error.
         """
         # TODO(imo): This needs updating for AbstractCamera
-        if not len(self.liveController.get_channels(self.objectiveStore.current_objective)):
+        if not len(self.liveController.get_observation_states()):
             raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-        first_config = self.liveController.get_channels(self.objectiveStore.current_objective)[0]
+        first_config = self.liveController.get_observation_states()[0]
 
         # Our best bet is to grab an image, and use that for our size estimate.
         test_image = None
@@ -820,19 +820,18 @@ class MultiPointController:
                 _illum_ctrl.snapshot() if _illum_ctrl is not None else None
             )
 
-            # stop live
+            # stop live (also turns off illumination hardware via the streaming gate)
             if self.liveController.is_live:
                 self.liveController_was_live_before_multipoint = True
                 self.liveController.stop_live()  # @@@ to do: also uncheck the live button
             else:
                 self.liveController_was_live_before_multipoint = False
-
-            # Ensure all channels are off before acquisition begins
-            if _illum_ctrl is not None:
-                try:
-                    _illum_ctrl.turn_off_all()
-                except Exception as e:
-                    self._log.warning(f"Failed to turn off all illumination before acquisition: {e}")
+                # If live wasn't running, ensure all channels are off before acquisition begins
+                if _illum_ctrl is not None:
+                    try:
+                        _illum_ctrl.turn_off_all(preserve_logical_state=True)
+                    except Exception as e:
+                        self._log.warning(f"Failed to turn off all illumination before acquisition: {e}")
 
             self.camera_callback_was_enabled_before_multipoint = self.camera.get_callbacks_enabled()
             # We need callbacks, because we trigger and then use callbacks for image processing.  This

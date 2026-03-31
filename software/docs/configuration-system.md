@@ -20,10 +20,11 @@ software/
 └── user_profiles/                      # User preferences (per profile)
     └── {profile_name}/
         ├── channel_configs/
-        │   ├── general.yaml              # Shared channel settings
-        │   └── {objective}.yaml          # Per-objective overrides
+        │   └── general.yaml              # ObservationState definitions
+        ├── observation_presets/
+        │   └── {preset_name}.yaml        # Saved ObservationState presets
         └── laser_af_configs/
-            └── {objective}.yaml          # Laser AF per objective
+            └── {objective}.yaml          # Laser AF per objective (machine calibration)
 ```
 
 ### Design Principles
@@ -31,12 +32,12 @@ software/
 1. **Separation of Concerns**
    - **Machine configs**: Define what hardware exists (rarely changes)
    - **User profiles**: Store user preferences (changes frequently)
-   - **Objective configs**: Fine-tune settings per objective (merged with general)
+   - **Observation presets**: Named snapshots of complete observation configurations
 
-2. **Hierarchical Merge**
-   - `general.yaml` defines channel identity and shared settings
-   - `{objective}.yaml` provides per-objective overrides
-   - Final configuration = merge(general, objective)
+2. **ObservationState as sole observation config**
+   - `general.yaml` defines the available observation states with all settings
+   - No per-objective override layer; users load different presets when switching objectives
+   - Camera settings, illumination, and optical path all live directly on ObservationState
 
 3. **Type Safety**
    - All configs validated with Pydantic models
@@ -304,145 +305,46 @@ User profiles store acquisition settings that vary by user or experiment. Each p
 
 ### channel_configs/general.yaml
 
-Defines channel identity and settings shared across all objectives.
+Defines the available observation states. Each observation state is a complete light-path configuration for one acquisition step, including camera settings, illumination, and optical path.
 
 ```yaml
-version: 1.0
-channels:
+version: 3
+observation_states:
   - name: Fluorescence 488 nm Ex
-    enabled: true
-    display_color: '#1FFF00'        # Green for 488nm
-    camera: null                    # null = single camera, or int ID for multi-camera
-    filter_wheel: auto              # "auto" = use camera's hardware binding
-    filter_position: 2              # Position in filter wheel (resolved via hardware_bindings)
-    z_offset_um: 0.0                # Z offset applied when switching to this channel
-    camera_settings:                # Required: camera exposure and gain
-      exposure_time_ms: 20.0        # Default, overridden by objective
-      gain_mode: 10.0               # Default, overridden by objective
-    illumination_settings:
-      illumination_channel: Fluorescence 488 nm Ex    # References illumination_channel_config.yaml
-      intensity: 20.0               # Default, overridden by objective
-
-  - name: BF LED matrix full
-    enabled: true
-    display_color: '#FFFFFF'        # White for brightfield
-    camera: null
-    filter_wheel: auto
-    filter_position: 1
-    z_offset_um: 0.0
+    version: 3
+    confocal_mode: false
+    display_color: '#1FFF00'
     camera_settings:
       exposure_time_ms: 20.0
       gain_mode: 10.0
-    illumination_settings:
-      illumination_channel: BF LED matrix full
-      intensity: 5.0                # Lower intensity for LED
-```
+    illuminator_states:
+      - illumination_channel: Fluorescence 488 nm Ex
+        intensity: 20.0
+        'on': true
+    emission_filter_positions:
+      default: 2
+    z_offset_um: 0.0
 
-**Camera field:**
-- Single camera: `camera: null` (no `cameras.yaml` needed)
-- Multi-camera: `camera: 1` or `camera: 2` (integer ID from `cameras.yaml`)
-
-**Filter wheel resolution:**
-- `filter_wheel: auto` uses the camera's bound wheel from `hardware_bindings.yaml`
-- Override with specific wheel name if needed (e.g., `filter_wheel: "Emission Wheel"`)
-- `filter_position` specifies which slot in the resolved wheel
-
-**Fields owned by general.yaml:**
-
-| Field | Description |
-|-------|-------------|
-| `name` | Channel name (unique identifier) |
-| `enabled` | Whether channel is available for acquisition |
-| `display_color` | Hex color for UI visualization |
-| `camera` | Camera ID (null = single camera, int for multi-camera) |
-| `filter_wheel` | "auto" (use hardware binding) or wheel name override |
-| `filter_position` | Filter position in the wheel |
-| `z_offset_um` | Z offset applied when switching to this channel |
-| `illumination_channel` | Which illumination channel to use (references machine config) |
-| `camera_settings` | Required: exposure_time_ms and gain_mode (defaults, overridden by objective) |
-| `intensity` | Required: illumination intensity (default, overridden by objective) |
-
-### channel_configs/{objective}.yaml
-
-Per-objective overrides. These settings are merged with `general.yaml`.
-
-```yaml
-version: 1.0
-channels:
-  - name: Fluorescence 488 nm Ex
-    illumination_settings:
-      intensity: 35.0                  # Higher intensity for 20x
+  - name: BF LED matrix full
+    version: 3
+    confocal_mode: false
+    display_color: '#FFFFFF'
     camera_settings:
-      exposure_time_ms: 50.0           # Longer exposure for 20x
-      gain_mode: 5.0                   # Lower gain for 20x
-    confocal_override:                 # Only if confocal present
-      confocal_settings:
-        illumination_iris: 50.0        # Iris aperture (0-100%)
-        emission_iris: 75.0
+      exposure_time_ms: 20.0
+      gain_mode: 10.0
+    illuminator_states:
+      - illumination_channel: BF LED matrix full
+        intensity: 5.0
+        'on': true
+    emission_filter_positions:
+      default: 1
+    z_offset_um: 0.0
+channel_groups: []
 ```
 
-**Fields owned by objective files:**
+### observation_presets/{name}.yaml
 
-| Field | Description |
-|-------|-------------|
-| `intensity` | Illumination intensity (0-100%) |
-| `exposure_time_ms` | Camera exposure time |
-| `gain_mode` | Camera analog gain |
-| `pixel_format` | Camera pixel format |
-| `confocal_override` | Confocal mode settings (iris aperture) |
-
-### Merge Logic
-
-When loading channels for an objective, the system merges `general.yaml` with `{objective}.yaml`:
-
-| Field | Source | Rationale |
-|-------|--------|-----------|
-| `name` | general | Channel identity |
-| `illumination_channel` | general | Hardware reference doesn't change |
-| `display_color` | general | Consistent UI colors |
-| `camera` | general | Camera assignment (ID) |
-| `z_offset_um` | general | Usually constant per channel |
-| `filter_wheel, filter_position` | general | Filter setup (wheel resolved via hardware_bindings) |
-| `intensity` | objective | Varies by magnification |
-| `exposure_time_ms` | objective | Varies by magnification |
-| `gain_mode` | objective | Varies by magnification |
-| `pixel_format` | objective | May vary by objective |
-| `confocal_override` | objective | Objective-specific iris settings |
-
-**Merge process:**
-1. Start with channel from `general.yaml`
-2. Find matching channel in `{objective}.yaml` by name
-3. Replace objective-owned fields with objective values
-4. If `confocal_mode` is active, apply `confocal_override` (iris settings)
-
-### Observation State YAML view (runtime/export-only)
-
-When saving **Observation State** presets and embedding them into multipoint `acquisition.yaml`, the software writes a cleaned **YAML view** (schema v2).
-In this view:
-- `active_channel_name` is not serialized.
-- Per-illumination-channel entries omit UI/camera/filter context (`display_color`, `camera`, `camera_settings`, `filter_wheel`, `filter_position`, `z_offset_um`).
-- Per-illumination-channel on/off is stored as `channels[].illumination_settings.on`.
-- Camera + filter-wheel state is represented under `camera_states` instead (with emission filter wheel positions nested per camera).
-
-### Confocal Override
-
-When the system has a confocal unit and confocal mode is enabled, the `confocal_override` section can override base settings:
-
-```yaml
-- name: Fluorescence 488 nm Ex
-  # ... base settings ...
-  confocal_override:
-    illumination_settings:
-      intensity: 50.0              # Higher intensity for confocal
-    camera_settings:
-      exposure_time_ms: 100.0      # Longer exposure for confocal
-      gain_mode: 2.0
-    confocal_settings:
-      illumination_iris: 50.0      # Confocal iris aperture (0-100%)
-      emission_iris: 75.0
-```
-
-Note: Filter wheel selection is resolved via `hardware_bindings.yaml` based on camera ID. The confocal's filter wheel is used when the camera is bound to a confocal wheel reference (e.g., `confocal.1`).
+Saved ObservationState presets. These are complete snapshots of all settings (camera, illumination, optical path) that can be loaded to restore a specific configuration. Presets are objective-independent — users load different presets when switching objectives if different settings are needed.
 
 ### laser_af_configs/{objective}.yaml
 
@@ -500,10 +402,10 @@ When a profile has no existing configs, the system auto-generates defaults:
 1. **Trigger**: Profile loaded without `general.yaml`
 2. **Source**: Uses `illumination_channel_config.yaml` as template
 3. **Process**:
-   - Creates one acquisition channel per illumination channel
+   - Creates one observation state per illumination channel
    - Sets display colors based on wavelength (fluorescence) or white (LED)
    - Uses default exposure (20ms), gain (10), intensity (20% fluorescence, 5% LED)
-   - Creates objective files for standard objectives (2x, 4x, 10x, 20x, 40x, 50x, 60x)
+   - Generates only `general.yaml` (no per-objective files)
 
 **Note**: Default generation is skipped if legacy XML configs exist (migration should run first).
 
@@ -533,9 +435,9 @@ This file captures the exact settings used, including:
    - Create a profile for each experiment type
    - Use "Save As" to create variants
 
-2. **Tune settings per objective**
-   - Higher magnification typically needs higher intensity/exposure
-   - Lower magnification can use lower gain (less noise)
+2. **Use observation presets for different objectives**
+   - Save a preset for each objective/experiment combination
+   - Load presets when switching objectives to restore optimal settings
 
 3. **Set z_offset for parfocal correction**
    - If channels aren't parfocal, set z_offset in general.yaml
@@ -576,7 +478,7 @@ This file captures the exact settings used, including:
 
 ### Settings not persisting
 
-- Changes to UI update `{objective}.yaml`, not `general.yaml`
+- Changes to UI update `general.yaml` directly
 - Verify the correct profile is active
 - Check file permissions
 

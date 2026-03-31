@@ -3,7 +3,14 @@
     "allow": [
       "Bash(xargs grep:*)",
       "Bash(grep -r \"class.*Widget\" /c/Code/CephlaSquidSandbox/software/gui/widgets/*.py)",
-      "Bash(cmd.exe /c \"conda activate*\")"
+      "Bash(cmd.exe /c \"conda activate*\")",
+      "Bash(C:/ProgramData/miniconda3/condabin/conda.bat run:*)",
+      "Bash(wc:*)",
+      "Bash(for f:*)",
+      "Bash(do C:/ProgramData/miniconda3/condabin/conda.bat run -n squid python -m py_compile \"$f\")",
+      "Bash(echo \"FAILED: $f\")",
+      "Bash(done)",
+      "Bash(find /c/Code/CephlaSquidSandbox/software -name *.py -path */ui/* -o -name *widget* -o -name *gui*)"
     ]
   }
 }

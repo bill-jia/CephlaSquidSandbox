@@ -841,7 +841,6 @@ class FastAcquisitionController:
                     obs_state = collect_observation_state(
                         lc,
                         repo,
-                        scope.objective_store.current_objective,
                         emission_filter_positions=emission or None,
                     )
                 except Exception as e:

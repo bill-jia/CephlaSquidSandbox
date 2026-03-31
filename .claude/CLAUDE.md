@@ -5,6 +5,8 @@
 ## Development
 * Run `conda activate squid` to run any command line code or tests
 
+* Don't keep backward compatibility, ruthlessly remove any unused code.
+
 * Write/update documentation in .md files under software/docs as the last step after you're done with any large changes.
 
 * Don't run all unit and integration tests automatically - ask the user whether to do so.

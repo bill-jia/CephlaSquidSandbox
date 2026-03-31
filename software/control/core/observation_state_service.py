@@ -12,6 +12,7 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from control.lighting import IlluminationController
 import squid.logging
 
 from control.models import GeneralObservationConfig
@@ -303,10 +304,66 @@ def _merge_led_matrix_mode_into_illuminator_states(
     return out
 
 
-def _sync_illumination_hardware(ic: Any, illuminator_states: List[IlluminatorState]) -> None:
+def _reconcile_illuminator_states_with_hardware(
+    states: List[IlluminatorState],
+    ic: Any,
+) -> List[IlluminatorState]:
+    """Filter illuminator states to channels that exist in the IC and add any missing IC channels.
+
+    Config files may list channels (e.g. "Fluorescence 638 nm Ex") that don't
+    exist in the actual hardware, while real channels (e.g. "Fluorescence 635 nm Ex"
+    from CoolLED) may be absent from the config.  This function reconciles the two
+    by keeping only states whose channel exists in the IC, then appending default
+    states for any IC channels not yet covered.
+    """
+    if ic is None:
+        return states
+
+    hw_channels = set(getattr(ic, "channel_names", []))
+    if not hw_channels:
+        return states
+
+    # Helper: resolve a channel name to its IC key (handles LED matrix aliases)
+    resolve = getattr(ic, "snapshot_key_for_acquisition_illumination_channel", None)
+
+    def _ic_key(name: str) -> str | None:
+        if resolve is not None:
+            try:
+                return resolve(name)
+            except Exception:
+                pass
+        return name if name in hw_channels else None
+
+    # Keep only states whose channel resolves to a real IC channel
+    kept: list[IlluminatorState] = []
+    seen_hw: set[str] = set()
+    for ist in states:
+        key = _ic_key(ist.illumination_channel)
+        if key is not None and key in hw_channels:
+            kept.append(ist)
+            seen_hw.add(key)
+
+    # Add default states for IC channels not covered by config
+    for ch in hw_channels:
+        if ch not in seen_hw:
+            try:
+                snap = ic.snapshot()
+                hw_st = snap.channel_states.get(ch)
+                intensity = float(hw_st.intensity) if hw_st else 0.0
+                on = bool(hw_st.is_on) if hw_st else False
+            except Exception:
+                intensity = 0.0
+                on = False
+            kept.append(IlluminatorState(illumination_channel=ch, intensity=intensity, on=on))
+
+    return kept
+
+
+def _sync_illumination_hardware(ic: IlluminationController, illuminator_states: List[IlluminatorState]) -> None:
     """Push saved per-channel intensities and LED matrix mode to the illumination controller."""
     if ic is None:
         return
+    start = time.perf_counter()
     uses_matrix = getattr(ic, "illumination_maps_to_unified_led_matrix", None)
     unified = getattr(ic, "unified_led_matrix_channel_name", lambda: None)()
     if getattr(ic, "has_unified_led_matrix", lambda: False)():
@@ -340,7 +397,7 @@ def _sync_illumination_hardware(ic: Any, illuminator_states: List[IlluminatorSta
             logger.warning("Could not set intensity for %r: %s", hw, e)
 
 
-def _restore_illumination_on_off(ic: Any, illuminator_states: List[IlluminatorState]) -> None:
+def _restore_illumination_on_off(ic: IlluminationController, illuminator_states: List[IlluminatorState]) -> None:
     """
     Restore logical illumination on/off state from IlluminatorState list.
 
@@ -446,7 +503,6 @@ def observation_state_binning_mode_for_metadata(
 def collect_observation_state(
     live_controller: "LiveController",
     config_repo: "ConfigRepository",
-    objective_name: str,
     *,
     emission_filter_positions: Optional[Dict[str, Union[str, int]]] = None,
 ) -> ObservationState:
@@ -456,18 +512,18 @@ def collect_observation_state(
     Args:
         live_controller: Active live controller (current channel + confocal flag).
         config_repo: Repository for the active profile.
-        objective_name: Current software objective (used only to read merged states; not stored).
         emission_filter_positions: Optional wheel positions from hardware/UI.
     """
-    merged = live_controller.get_observation_states(objective_name)
+    merged = live_controller.get_observation_states()
 
     # Build illuminator_states from merged observation states
     illuminator_states = _collect_illuminator_states_from_observation_states(merged)
 
-    # Merge hardware state into illuminator_states
+    # Merge hardware state into illuminator_states and reconcile with actual IC channels
     ic = getattr(live_controller.microscope, "illumination_controller", None)
     illuminator_states = _merge_illumination_hardware_into_illuminator_states(illuminator_states, ic)
     illuminator_states = _merge_led_matrix_mode_into_illuminator_states(illuminator_states, ic)
+    illuminator_states = _reconcile_illuminator_states_with_hardware(illuminator_states, ic)
 
     # Determine the active state for z_offset, confocal_hardware_settings, display_color
     active_name: Optional[str] = None
@@ -528,7 +584,7 @@ def apply_observation_state(
     emission_filter_wheel: Optional[Any] = None,
     persist_general_to_profile: bool = True,
     apply_live_trigger_settings: bool = True,
-    apply_illumination_on_off_state: bool = True,
+    apply_illumination_on_off_state: bool = False,
 ) -> None:
     """
     Persist Observation State into general.yaml and refresh live mode.
@@ -538,8 +594,8 @@ def apply_observation_state(
             ``general.yaml``. When False, apply only to hardware and in-memory live state (no disk write).
         apply_live_trigger_settings: When True (default), restore the preset's saved live trigger mode/FPS.
             Set False for multipoint acquisitions.
-        apply_illumination_on_off_state: When True (default), restore saved illumination channel on/off
-            state through ``IlluminationController``. Set False for multipoint acquisitions.
+        apply_illumination_on_off_state: Deprecated, no longer used. Illumination on/off is now handled
+            entirely by ``LiveController.set_observation_state`` via the streaming gate.
     """
     profile = config_repo.current_profile
     if not profile:
@@ -626,21 +682,10 @@ def apply_observation_state(
             "apply_observation_state: _apply_camera_live_snapshot took %.4fs", time.perf_counter() - _t0
         )
 
-    # ── 7. Sync illumination hardware ──
-    ic = getattr(live_controller.microscope, "illumination_controller", None)
-
-    _t0 = time.perf_counter()
-    _sync_illumination_hardware(ic, state.illuminator_states)
-    logger.info("apply_observation_state: _sync_illumination_hardware took %.4fs", time.perf_counter() - _t0)
-
-    if apply_illumination_on_off_state:
-        _t0 = time.perf_counter()
-        _restore_illumination_on_off(ic, state.illuminator_states)
-        logger.info(
-            "apply_observation_state: _restore_illumination_on_off took %.4fs", time.perf_counter() - _t0
-        )
-
-    # ── 8. Update live controller's current observation state ──
+    # ── 7. Update live controller's current observation state ──
+    # set_observation_state handles all illumination work: intensity, LED matrix mode,
+    # optical path (emission filters, iris), and on/off control during live view.
+    # No separate _sync_illumination_hardware / _restore_illumination_on_off needed.
     _t0 = time.perf_counter()
     live_controller.set_observation_state(state)
     logger.info("apply_observation_state: set_observation_state took %.4fs", time.perf_counter() - _t0)

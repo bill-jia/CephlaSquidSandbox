@@ -48,7 +48,6 @@ def run_save_observation_state_dialog(
         state = collect_observation_state(
             live_controller,
             repo,
-            objective_store.current_objective,
             emission_filter_positions=emission or None,
         )
         repo.save_observation_preset(name.strip(), state)
@@ -109,12 +108,17 @@ def run_load_observation_state(
         QMessageBox.warning(parent, "Observation State", f"Could not load preset '{name}'.")
         return False
     try:
+        if live_controller.is_live:
+            apply_illumination_on_off_state = True
+        else:
+            apply_illumination_on_off_state = False
         apply_observation_state(
             state,
             repo,
             live_controller,
             objective_store,
             emission_filter_wheel=emission_filter_wheel,
+            apply_illumination_on_off_state=apply_illumination_on_off_state,
         )
     except Exception as e:
         QMessageBox.warning(parent, "Observation State", str(e))

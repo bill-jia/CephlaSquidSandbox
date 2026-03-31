@@ -274,7 +274,7 @@ class IlluminationWidget(QWidget):
         btn: QPushButton = row["btn"]
         btn.setText("ON" if checked else "OFF")
         self._apply_shutter_style(btn, checked)
-        self._controller.set_channel_state(channel_name, checked, force_hardware=True)
+        self._controller.set_channel_state(channel_name, checked)
 
     def _on_led_matrix_mode_changed(self, channel_name: str, index: int):
         row = self._channel_rows.get(channel_name)

@@ -53,10 +53,7 @@ from control.models.observation_state import (
 )
 from control.models.acquisition_config import (
     GeneralObservationConfig,
-    ObjectiveOverride,
-    ObjectiveOverrideConfig,
     AcquisitionOutputConfig,
-    merge_observation_configs,
     validate_illumination_references,
     get_illumination_channel_names,
     validate_channel_group,
@@ -117,14 +114,11 @@ __all__ = [
     "CameraSettings",
     "ConfocalSettings",
     "GeneralObservationConfig",
-    "ObjectiveOverride",
-    "ObjectiveOverrideConfig",
     "AcquisitionOutputConfig",
     "AcquisitionMetadata",
     "IlluminatorState",
     "CameraLiveSnapshot",
     "ObservationState",
-    "merge_observation_configs",
     "validate_illumination_references",
     "get_illumination_channel_names",
     # Channel Groups

@@ -71,6 +71,8 @@ class CoolLEDpE400(LightSource):
 
     def _send(self, cmd: str, read_lines: int = 1, read_delay: float = 0.15) -> list[str]:
         """Send an ASCII command and return response lines."""
+        while self.serial_connection.serial.in_waiting:
+            self.serial_connection.serial.readline()
         full = cmd + "\r\n"
         self.serial_connection.serial.write(full.encode("ascii"))
         time.sleep(read_delay)
@@ -101,8 +103,8 @@ class CoolLEDpE400(LightSource):
             self.log.warning(f"Could not auto-discover coolLED channels: {e}")
 
         if not self._channel_wavelengths:
-            self.log.warning("No channels discovered; falling back to A=405,B=488,C=561,D=638")
-            fallback = {"A": 405, "B": 488, "C": 561, "D": 638}
+            self.log.warning("No channels discovered; falling back to A=405,B=488,C=561,D=635")
+            fallback = {"A": 405, "B": 488, "C": 561, "D": 635}
             self._channel_wavelengths = fallback
             self.channel_mappings = {v: k for k, v in fallback.items()}
 
@@ -137,7 +139,7 @@ class CoolLEDpE400(LightSource):
         ch_letter = self._resolve_channel(channel)
         intensity_int = max(0, min(100, int(round(intensity))))
         cmd = f"C{ch_letter}I{intensity_int:03d}"
-        self._send(cmd, read_lines=1)
+        self._send(cmd, read_lines=1, read_delay=0)
         self._intensities[ch_letter] = intensity_int
 
     def get_intensity(self, channel) -> float:
@@ -148,7 +150,7 @@ class CoolLEDpE400(LightSource):
         """Software serial shutter control (fallback when no TTL line configured)."""
         ch_letter = self._resolve_channel(channel)
         state_char = "N" if on else "F"
-        self._send(f"C{ch_letter}{state_char}", read_lines=1)
+        self._send(f"C{ch_letter}{state_char}", read_lines=1, read_delay=0)
         self._shutter_states[ch_letter] = bool(on)
 
     def get_shutter_state(self, channel):

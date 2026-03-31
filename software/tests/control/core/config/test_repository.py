@@ -10,8 +10,6 @@ import shutil
 from control.core.config import ConfigRepository
 from control.models import (
     GeneralObservationConfig,
-    ObjectiveOverride,
-    ObjectiveOverrideConfig,
     CameraSettings,
 )
 from control.models.observation_state import ObservationState, IlluminatorState
@@ -212,19 +210,6 @@ class TestConfigRepositoryProfileConfigs:
 
         assert config1 is config2
 
-    def test_get_objective_config(self, repo_with_profile):
-        """Test loading objective config."""
-        config = repo_with_profile.get_objective_config("20x")
-
-        assert config is not None
-        assert config.overrides[0].camera_settings.exposure_time_ms == 50.0
-
-    def test_get_objective_config_returns_none_when_missing(self, repo_with_profile):
-        """Test that missing objective config returns None."""
-        config = repo_with_profile.get_objective_config("nonexistent")
-
-        assert config is None
-
     def test_save_general_config(self, repo_with_profile, temp_dir):
         """Test saving general config updates cache (schema v3)."""
         new_config = GeneralObservationConfig(
@@ -259,31 +244,6 @@ class TestConfigRepositoryProfileConfigs:
         cached = repo_with_profile.get_general_config()
         assert cached is new_config
         assert cached.version == 3
-
-    def test_save_objective_config(self, repo_with_profile, temp_dir):
-        """Test saving objective config (schema v3)."""
-        new_config = ObjectiveOverrideConfig(
-            version=3,
-            overrides=[
-                ObjectiveOverride(
-                    name="Test",
-                    camera_settings=CameraSettings(
-                        exposure_time_ms=25.0,
-                        gain_mode=2.0,
-                    ),
-                )
-            ],
-        )
-
-        repo_with_profile.save_objective_config("default", "40x", new_config)
-
-        # Check file was written
-        path = temp_dir / "user_profiles" / "default" / "channel_configs" / "40x.yaml"
-        assert path.exists()
-
-        # Check cache was updated
-        cached = repo_with_profile.get_objective_config("40x")
-        assert cached is new_config
 
     def test_get_available_objectives(self, repo_with_profile):
         """Test listing available objectives."""
@@ -1294,7 +1254,7 @@ class TestUpdateChannelSettingV3:
 
     @pytest.fixture
     def repo_v3(self, tmp_path):
-        """ConfigRepository with v3 general and objective configs."""
+        """ConfigRepository with v3 general config."""
         machine = tmp_path / "machine_configs"
         machine.mkdir()
         (machine / "illumination_channel_config.yaml").write_text(
@@ -1325,62 +1285,40 @@ class TestUpdateChannelSettingV3:
             "        'on': true\n"
             "channel_groups: []\n"
         )
-        (profile / "channel_configs" / "20x.yaml").write_text(
-            "version: 3\n"
-            "overrides:\n"
-            '  - name: "488nm"\n'
-            "    camera_settings:\n"
-            "      exposure_time_ms: 25.0\n"
-            "      gain_mode: 5.0\n"
-        )
 
         repo = ConfigRepository(base_path=tmp_path)
         repo.set_profile("default")
         return repo
 
     def test_exposure_update(self, repo_v3):
-        """ExposureTime updates objective override camera_settings."""
-        result = repo_v3.update_channel_setting("20x", "488nm", "ExposureTime", 99.0)
+        """ExposureTime updates general config camera_settings."""
+        result = repo_v3.update_channel_setting("488nm", "ExposureTime", 99.0)
         assert result is True
-        obj = repo_v3.get_objective_config("20x")
-        assert obj.overrides[0].camera_settings.exposure_time_ms == 99.0
+        gen = repo_v3.get_general_config()
+        assert gen.observation_states[0].camera_settings.exposure_time_ms == 99.0
 
     def test_gain_update(self, repo_v3):
-        """AnalogGain updates objective override camera_settings."""
-        result = repo_v3.update_channel_setting("20x", "488nm", "AnalogGain", 8.0)
+        """AnalogGain updates general config camera_settings."""
+        result = repo_v3.update_channel_setting("488nm", "AnalogGain", 8.0)
         assert result is True
-        obj = repo_v3.get_objective_config("20x")
-        assert obj.overrides[0].camera_settings.gain_mode == 8.0
+        gen = repo_v3.get_general_config()
+        assert gen.observation_states[0].camera_settings.gain_mode == 8.0
 
     def test_illumination_intensity_updates_general(self, repo_v3):
         """IlluminationIntensity updates general config illuminator_states."""
-        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIntensity", 55.0)
+        result = repo_v3.update_channel_setting("488nm", "IlluminationIntensity", 55.0)
         assert result is True
         gen = repo_v3.get_general_config()
         assert gen.observation_states[0].illuminator_states[0].intensity == 55.0
 
     def test_iris_creates_confocal_hardware_settings(self, repo_v3):
         """IlluminationIris creates confocal_hardware_settings when None."""
-        obj = repo_v3.get_objective_config("20x")
-        assert obj.overrides[0].confocal_hardware_settings is None
+        gen = repo_v3.get_general_config()
+        assert gen.observation_states[0].confocal_hardware_settings is None
 
-        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIris", 42.0)
+        result = repo_v3.update_channel_setting("488nm", "IlluminationIris", 42.0)
         assert result is True
 
-        obj = repo_v3.get_objective_config("20x")
-        assert obj.overrides[0].confocal_hardware_settings is not None
-        assert obj.overrides[0].confocal_hardware_settings.illumination_iris == 42.0
-
-    def test_iris_update_when_no_objective_config(self, repo_v3):
-        """IlluminationIris auto-creates objective config from general when missing."""
-        profile_path = repo_v3.get_profile_path("default")
-        (profile_path / "channel_configs" / "20x.yaml").unlink()
-        repo_v3.clear_profile_cache()
-
-        result = repo_v3.update_channel_setting("20x", "488nm", "IlluminationIris", 55.0)
-        assert result is True
-
-        obj = repo_v3.get_objective_config("20x")
-        assert obj is not None
-        assert obj.overrides[0].confocal_hardware_settings is not None
-        assert obj.overrides[0].confocal_hardware_settings.illumination_iris == 55.0
+        gen = repo_v3.get_general_config()
+        assert gen.observation_states[0].confocal_hardware_settings is not None
+        assert gen.observation_states[0].confocal_hardware_settings.illumination_iris == 42.0

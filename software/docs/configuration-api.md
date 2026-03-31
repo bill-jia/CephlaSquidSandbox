@@ -8,7 +8,7 @@ The configuration system is built on:
 
 - **ConfigRepository**: Centralized config I/O with caching (pure Python, no Qt)
 - **Pydantic Models**: Type-safe configuration validation
-- **Hierarchical Merge**: Combines general and objective-specific settings
+- **ObservationState**: Single persistent observation configuration (no objective override layer)
 
 ### Key Design Decisions
 
@@ -59,7 +59,7 @@ current = config_repo.current_profile  # May be None
 config_repo.set_profile("my_profile")
 
 # Load profile with default config generation
-config_repo.load_profile("my_profile", objectives=["20x", "40x", "60x"])
+config_repo.load_profile("my_profile")
 # - Creates default configs if profile has none
 # - Sets profile as current
 
@@ -127,44 +127,34 @@ config_repo.save_camera_registry(camera_registry)
 config_repo.save_filter_wheel_registry(filter_wheel_registry)
 ```
 
-### Channel Configs
+### Observation State Configs
 
-Channel configs are cached per-profile. Cache is cleared on profile switch.
+Observation state configs are cached per-profile. Cache is cleared on profile switch.
 
 ```python
-# Get general config (raw, no merge)
+# Get general config (contains observation states)
 general = config_repo.get_general_config()
 
-# Get objective config (raw, no merge)
-obj_config = config_repo.get_objective_config("20x")
+# Get observation states directly
+states = config_repo.get_observation_states()
+# Returns: List[ObservationState]
 
-# Get merged channels for an objective (recommended)
-channels = config_repo.get_merged_channels(
-    objective="20x",
-    profile=None,           # Uses current profile
-    confocal_mode=False     # Apply confocal overrides?
-)
-# Returns: List[AcquisitionChannel]
-
-# Get available objectives for profile
-objectives = config_repo.get_available_objectives()
-# Returns: ['10x', '20x', '40x', '60x']
-
-# Save configs
+# Save general config
 config_repo.save_general_config("my_profile", general)
-config_repo.save_objective_config("my_profile", "20x", obj_config)
+
+# Save/load observation presets
+config_repo.save_observation_preset("my_preset", observation_state)
+state = config_repo.load_observation_preset("my_preset")
 ```
 
 ### Convenience Methods
 
 ```python
-# Update a single channel setting (creates objective config if needed)
+# Update a single setting on an observation state in general.yaml
 success = config_repo.update_channel_setting(
-    objective="20x",
     channel_name="Fluorescence 488 nm Ex",
-    setting="ExposureTime",           # "ExposureTime", "AnalogGain", "IlluminationIntensity"
+    setting="ExposureTime",
     value=50.0,
-    profile=None                      # Uses current profile
 )
 ```
 
@@ -174,7 +164,9 @@ success = config_repo.update_channel_setting(
 |---------|-------------|
 | `"ExposureTime"` | `camera_settings.exposure_time_ms` |
 | `"AnalogGain"` | `camera_settings.gain_mode` |
-| `"IlluminationIntensity"` | `illumination_settings.intensity` |
+| `"IlluminationIntensity"` | `illuminator_states[active].intensity` |
+| `"IlluminationIris"` | `confocal_hardware_settings.illumination_iris` |
+| `"EmissionIris"` | `confocal_hardware_settings.emission_iris` |
 
 ### Laser AF Configs
 

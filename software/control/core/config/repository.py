@@ -44,12 +44,9 @@ from control.models import (
     FilterWheelRegistryConfig,
     FilterWheelType,
     GeneralObservationConfig,
-    ObjectiveOverride,
-    ObjectiveOverrideConfig,
     IlluminationChannelConfig,
     CameraSettings,
     LaserAFConfig,
-    merge_observation_configs,
     IOEndpointConfig,
     build_default_io_endpoint_config,
     MachineConfig,
@@ -266,7 +263,7 @@ class ConfigRepository:
         self._persist_last_active_profile(profile)
         logger.debug(f"Switched to profile: {profile}")
 
-    def load_profile(self, profile: str, objectives: Optional[List[str]] = None) -> None:
+    def load_profile(self, profile: str) -> None:
         """
         Load a profile, ensuring default configs exist.
 
@@ -276,7 +273,6 @@ class ConfigRepository:
 
         Args:
             profile: Profile name
-            objectives: Optional list of objectives for default config generation
 
         Raises:
             ValueError: If profile doesn't exist
@@ -290,9 +286,8 @@ class ConfigRepository:
             from control.default_config_generator import ensure_default_configs
             import control._def
 
-            obj_list = objectives or (list(control._def.OBJECTIVES) if hasattr(control._def, "OBJECTIVES") else None)
             include_confocal = getattr(control._def, "ENABLE_SPINNING_DISK_CONFOCAL", False)
-            if ensure_default_configs(self, profile, obj_list, include_confocal=include_confocal):
+            if ensure_default_configs(self, profile, include_confocal=include_confocal):
                 logger.info(f"Generated default configs for profile '{profile}'")
         except ImportError as e:
             # Expected if running without full dependencies or in test environment
@@ -759,19 +754,6 @@ class ConfigRepository:
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
             return self._load_yaml(path, GeneralObservationConfig)
 
-    def get_objective_config(self, objective: str, profile: Optional[str] = None) -> Optional[ObjectiveOverrideConfig]:
-        """Load objective-specific override configuration (cached when using current profile)."""
-        if profile is None or profile == self._current_profile:
-            cache_key = f"objective:{objective}"
-            if cache_key not in self._profile_cache:
-                profile_path = self._get_profile_path()
-                path = profile_path / "channel_configs" / f"{objective}.yaml"
-                self._profile_cache[cache_key] = self._load_yaml(path, ObjectiveOverrideConfig)
-            return self._profile_cache[cache_key]
-        else:
-            path = self.user_profiles_path / profile / "channel_configs" / f"{objective}.yaml"
-            return self._load_yaml(path, ObjectiveOverrideConfig)
-
     def save_general_config(self, profile: str, config: GeneralObservationConfig) -> None:
         """Save general observation configuration and update cache if current profile."""
         if profile == self._current_profile:
@@ -783,76 +765,34 @@ class ConfigRepository:
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
             self._save_yaml(path, config)
 
-    def save_objective_config(self, profile: str, objective: str, config: ObjectiveOverrideConfig) -> None:
-        """Save objective-specific override configuration and update cache if current profile."""
-        if profile == self._current_profile:
-            profile_path = self._get_profile_path()
-            path = profile_path / "channel_configs" / f"{objective}.yaml"
-            self._save_yaml(path, config)
-            self._profile_cache[f"objective:{objective}"] = config
-        else:
-            path = self.user_profiles_path / profile / "channel_configs" / f"{objective}.yaml"
-            self._save_yaml(path, config)
-
     # ═══════════════════════════════════════════════════════════════════════════
     # CHANNEL CONFIG CONVENIENCE METHODS
     # Higher-level helpers for common channel config operations
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def get_merged_observation_states(
-        self,
-        objective: str,
-        profile: Optional[str] = None,
-    ) -> List[ObservationState]:
-        """
-        Get merged observation states for an objective.
-
-        Merges general.yaml with objective.yaml overrides.
+    def get_observation_states(self, profile: Optional[str] = None) -> List[ObservationState]:
+        """Get observation states from general.yaml.
 
         Args:
-            objective: Objective name
             profile: Profile name (defaults to current profile)
 
         Returns:
-            List of merged ObservationState objects
+            List of ObservationState objects
         """
         general_config = self.get_general_config(profile)
         if not general_config:
             return []
-
-        obj_config = self.get_objective_config(objective, profile)
-
-        if obj_config:
-            return merge_observation_configs(general_config, obj_config)
-        else:
-            return list(general_config.observation_states)
-
-    def get_merged_channels(
-        self,
-        objective: str,
-        profile: Optional[str] = None,
-        confocal_mode: bool = False,
-    ) -> List[ObservationState]:
-        """Backward-compatible alias for get_merged_observation_states.
-
-        .. deprecated:: Use :meth:`get_merged_observation_states` instead.
-        """
-        return self.get_merged_observation_states(objective, profile)
+        return list(general_config.observation_states)
 
     def update_channel_setting(
         self,
-        objective: str,
         channel_name: str,
         setting: str,
         value: Any,
         profile: Optional[str] = None,
-        confocal_mode: bool = False,
     ) -> bool:
         """
-        Update a specific setting of a channel configuration and save.
-
-        This is a convenience method that handles the mapping from UI setting names
-        to model fields, creates objective configs if needed, and saves automatically.
+        Update a specific setting of an observation state in general.yaml and save.
 
         Supported settings:
         - "ExposureTime" -> camera_settings.exposure_time_ms
@@ -862,12 +802,10 @@ class ConfigRepository:
         - "EmissionIris" -> confocal_hardware_settings.emission_iris
 
         Args:
-            objective: Objective name
             channel_name: Name of the observation state to update
             setting: Setting name (see supported settings above)
             value: New value for the setting
             profile: Profile name (defaults to current profile)
-            confocal_mode: If True, unused (confocal_mode is on the state itself now)
 
         Returns:
             True if update was successful, False otherwise
@@ -877,7 +815,6 @@ class ConfigRepository:
             logger.warning("Cannot update: no profile set")
             return False
 
-        # Setting name to model field mapping
         setting_mapping = {
             "ExposureTime": ("camera", "exposure_time_ms"),
             "AnalogGain": ("camera", "gain_mode"),
@@ -892,75 +829,39 @@ class ConfigRepository:
 
         location, field = setting_mapping[setting]
 
-        # Get or create objective config
-        obj_config = self.get_objective_config(objective, profile)
         general_config = self.get_general_config(profile)
-
-        if obj_config is None:
-            if general_config is None:
-                logger.warning("No general config to create objective config from")
-                return False
-            # Create objective config from general observation states
-            obj_config = ObjectiveOverrideConfig(
-                version=3,
-                overrides=[
-                    ObjectiveOverride(
-                        name=s.name,
-                        camera_settings=s.camera_settings.model_copy() if s.camera_settings else None,
-                        confocal_hardware_settings=(
-                            s.confocal_hardware_settings.model_copy()
-                            if s.confocal_hardware_settings
-                            else None
-                        ),
-                    )
-                    for s in general_config.observation_states
-                ],
-            )
-
-        # Find the override
-        override = obj_config.get_by_name(channel_name)
-        if not override:
-            logger.warning(f"Observation state '{channel_name}' not found in objective config")
+        if general_config is None:
+            logger.warning("No general config found")
             return False
 
-        # Iris settings go to confocal_hardware_settings
-        if location == "confocal_hw":
-            if override.confocal_hardware_settings is None:
-                from control.default_config_generator import build_confocal_settings_from_config
-                from control.models.observation_state import ConfocalSettings as _CS
+        state = general_config.get_by_name(channel_name)
+        if not state:
+            logger.warning(f"Observation state '{channel_name}' not found in general config")
+            return False
 
-                override.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
-            setattr(override.confocal_hardware_settings, field, value)
+        if location == "confocal_hw":
+            if state.confocal_hardware_settings is None:
+                from control.default_config_generator import build_confocal_settings_from_config
+
+                state.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
+            setattr(state.confocal_hardware_settings, field, value)
         elif location == "camera":
-            if override.camera_settings is None:
-                override.camera_settings = CameraSettings(
+            if state.camera_settings is None:
+                state.camera_settings = CameraSettings(
                     exposure_time_ms=10.0,
                     gain_mode=0.0,
                 )
-            setattr(override.camera_settings, field, value)
+            setattr(state.camera_settings, field, value)
         elif location == "illumination":
-            # Illumination intensity lives on the general config's observation state,
-            # not on the objective override. Update general config directly.
-            gen_state = general_config.get_by_name(channel_name) if general_config else None
-            if gen_state and gen_state.illuminator_states:
-                # Update intensity on active illuminator states
-                for ist in gen_state.illuminator_states:
-                    if ist.on or len(gen_state.illuminator_states) == 1:
+            if state.illuminator_states:
+                for ist in state.illuminator_states:
+                    if ist.on or len(state.illuminator_states) == 1:
                         ist.intensity = value
-                if general_config:
-                    self.save_general_config(profile, general_config)
             else:
                 logger.warning(f"No illuminator states found for '{channel_name}' in general config")
                 return False
 
-        # Save
-        self.save_objective_config(profile, objective, obj_config)
-
-        # Update cache if current profile
-        effective_profile = profile if profile else self._current_profile
-        if effective_profile == self._current_profile:
-            self._profile_cache[f"objective:{objective}"] = obj_config
-
+        self.save_general_config(profile, general_config)
         return True
 
     # ═══════════════════════════════════════════════════════════════════════════

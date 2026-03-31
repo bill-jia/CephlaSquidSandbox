@@ -1748,7 +1748,7 @@ class LiveControlWidget(QFrame):
         self.fps_display = 10
         self.streamHandler.set_display_fps(self.fps_display)
 
-        channels = self.liveController.get_channels(self.objectiveStore.current_objective)
+        channels = self.liveController.get_observation_states()
         if not channels:
             self._log.error("No channels available - cannot initialize LiveControlWidget")
             self.currentConfiguration = None
@@ -1787,7 +1787,7 @@ class LiveControlWidget(QFrame):
         self.entry_triggerFPS.setDecimals(0)
 
         self.dropdown_modeSelection = QComboBox()
-        for microscope_configuration in self.liveController.get_channels(self.objectiveStore.current_objective):
+        for microscope_configuration in self.liveController.get_observation_states():
             self.dropdown_modeSelection.addItems([microscope_configuration.name])
         self.dropdown_modeSelection.setCurrentText(self.currentConfiguration.name)
         self.dropdown_modeSelection.setSizePolicy(sizePolicy)
@@ -2007,27 +2007,22 @@ class LiveControlWidget(QFrame):
         self.setLayout(self.grid)
 
     def toggle_live(self, pressed):
-        _ic = getattr(self.liveController.microscope, "illumination_controller", None)
         if pressed:
             # Manual live: illumination is controlled by IlluminationWidget.
-            if self._control_illumination_before_live is None:
-                self._control_illumination_before_live = self.liveController.control_illumination
-            self.liveController.control_illumination = False
+            # if self._control_illumination_before_live is None:
+            #     self._control_illumination_before_live = self.liveController.control_illumination
             if self.currentConfiguration is not None:
                 self.liveController.set_active_channel_reference(self.currentConfiguration)
             self.liveController.start_live()
-            if _ic is not None:
-                _ic.set_streaming_active(True)
+            # self.liveController.control_illumination = False
             self.btn_live.setText("Stop Live")
             self.signal_start_live.emit()
         else:
             self.liveController.stop_live()
-            if _ic is not None:
-                _ic.set_streaming_active(False)
             # Restore previous illumination control behavior.
-            if self._control_illumination_before_live is not None:
-                self.liveController.control_illumination = self._control_illumination_before_live
-                self._control_illumination_before_live = None
+            # if self._control_illumination_before_live is not None:
+            #     self.liveController.control_illumination = self._control_illumination_before_live
+            #     self._control_illumination_before_live = None
             self.btn_live.setText("Start Live")
 
     def set_snap_saving_dir(self):
@@ -2058,7 +2053,6 @@ class LiveControlWidget(QFrame):
                 obs_state = collect_observation_state(
                     self.liveController,
                     repo,
-                    self.objectiveStore.current_objective,
                     emission_filter_positions=emission or None,
                 )
             except Exception as e:
@@ -2097,9 +2091,6 @@ class LiveControlWidget(QFrame):
             # If not live, start it
             if not was_live_before_snap:
                 self.liveController.start_live()
-                _ic = getattr(self.liveController.microscope, "illumination_controller", None)
-                if _ic is not None:
-                    _ic.set_streaming_active(True)
                 # Wait for camera to start and capture at least one frame
                 # Wait for exposure time + some buffer
                 exposure_time_ms = float(self.camera.get_exposure_time())
@@ -2148,9 +2139,6 @@ class LiveControlWidget(QFrame):
             # Stop live if it wasn't running before
             if not was_live_before_snap:
                 self.liveController.stop_live()
-                _ic = getattr(self.liveController.microscope, "illumination_controller", None)
-                if _ic is not None:
-                    _ic.set_streaming_active(False)
 
     def toggle_autolevel(self, autolevel_on):
         self.btn_autolevel.setChecked(autolevel_on)
@@ -2165,7 +2153,7 @@ class LiveControlWidget(QFrame):
         self.dropdown_modeSelection.blockSignals(True)
         self.dropdown_modeSelection.clear()
         first_config = None
-        for microscope_configuration in self.liveController.get_channels(self.objectiveStore.current_objective):
+        for microscope_configuration in self.liveController.get_observation_states():
             if not first_config:
                 first_config = microscope_configuration
             self.dropdown_modeSelection.addItem(microscope_configuration.name)
@@ -2220,11 +2208,9 @@ class LiveControlWidget(QFrame):
         if self.is_switching_mode == False:
             self.currentConfiguration.exposure_time = new_value
             self.liveController.microscope.config_repo.update_channel_setting(
-                self.objectiveStore.current_objective,
                 self.currentConfiguration.name,
                 "ExposureTime",
                 new_value,
-                confocal_mode=self.liveController.is_confocal_mode(),
             )
             self.signal_newExposureTime.emit(new_value)
 
@@ -2232,11 +2218,9 @@ class LiveControlWidget(QFrame):
         if self.is_switching_mode == False:
             self.currentConfiguration.analog_gain = new_value
             self.liveController.microscope.config_repo.update_channel_setting(
-                self.objectiveStore.current_objective,
                 self.currentConfiguration.name,
                 "AnalogGain",
                 new_value,
-                confocal_mode=self.liveController.is_confocal_mode(),
             )
             self.signal_newAnalogGain.emit(new_value)
 
@@ -2244,18 +2228,15 @@ class LiveControlWidget(QFrame):
         if self.is_switching_mode == False:
             self.currentConfiguration.illumination_intensity = new_value
             self.liveController.microscope.config_repo.update_channel_setting(
-                self.objectiveStore.current_objective,
                 self.currentConfiguration.name,
                 "IlluminationIntensity",
                 new_value,
-                confocal_mode=self.liveController.is_confocal_mode(),
             )
             self.liveController.update_illumination()
 
     def _persist_iris_config(self, setting_name, new_value):
         if self.currentConfiguration:
             ok = self.liveController.microscope.config_repo.update_channel_setting(
-                self.objectiveStore.current_objective,
                 self.currentConfiguration.name,
                 setting_name,
                 new_value,

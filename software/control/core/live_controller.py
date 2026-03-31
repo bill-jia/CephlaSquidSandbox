@@ -25,9 +25,7 @@ from typing import List, Optional, TYPE_CHECKING
 
 import squid.logging
 from squid.abc import CameraAcquisitionMode, AbstractCamera
-
 from control._def import *
-from control.models import merge_observation_configs
 from control.models.observation_state import (
     ObservationState,
     IlluminatorState,
@@ -71,18 +69,17 @@ class LiveController:
         Args:
             microscope: Microscope instance (for stage, illumination, etc.)
             camera: Camera to use for acquisition
-            control_illumination: If True, automatically control illumination during acquisition
+            control_illumination: If True, automatically control illumination during acquisition (i.e. master camera, but not secondary or focus cameras)
             use_internal_timer_for_hardware_trigger: Use Python timer vs microcontroller timer
             for_displacement_measurement: If True, used for laser autofocus/displacement measurement
         """
-        self._log = squid.logging.get_logger(self.__class__.__name__)
+        self._log = squid.logging.get_logger(self.__class__.__name__ + "/" + camera.__class__.__name__)
         self.microscope = microscope
         self.camera: AbstractCamera = camera
         self.current_observation_state: Optional[ObservationState] = None
         self.trigger_mode: Optional[TriggerMode] = TriggerMode.SOFTWARE  # @@@ change to None
         self.is_live = False
         self.control_illumination = control_illumination
-        self.illumination_on = False
         self.use_internal_timer_for_hardware_trigger = (
             use_internal_timer_for_hardware_trigger  # use Timer vs timer in the MCU
         )
@@ -108,6 +105,7 @@ class LiveController:
 
         # Confocal mode state - when True, use confocal_override from acquisition configs
         self._confocal_mode: bool = False
+        self._log.info(f"Initialized with control_illumination={control_illumination}")
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Backward-compatible property for external callers
@@ -161,11 +159,8 @@ class LiveController:
     # Channel configuration access
     # ─────────────────────────────────────────────────────────────────────────────
 
-    def get_observation_states(self, objective: str) -> List[ObservationState]:
-        """Get observation states for an objective, with objective overrides applied.
-
-        Args:
-            objective: Objective name (e.g., "10x", "20x")
+    def get_observation_states(self) -> List[ObservationState]:
+        """Get observation states from the current profile's general.yaml.
 
         Returns:
             List of ObservationState objects. Returns empty list if no profile
@@ -185,33 +180,18 @@ class LiveController:
             )
             return []
 
-        obj_config = config_repo.get_objective_config(objective)
+        return list(general.observation_states)
 
-        if obj_config:
-            states = merge_observation_configs(general, obj_config)
-        else:
-            states = list(general.observation_states)
-
-        return states
-
-    def get_channels(self, objective: str) -> List[ObservationState]:
-        """Backward-compatible alias for get_observation_states.
-
-        .. deprecated:: Use :meth:`get_observation_states` instead.
-        """
-        return self.get_observation_states(objective)
-
-    def get_observation_state_by_name(self, objective: str, name: str) -> Optional[ObservationState]:
+    def get_observation_state_by_name(self, name: str) -> Optional[ObservationState]:
         """Get a specific observation state by name.
 
         Args:
-            objective: Objective name
             name: Observation state name to find
 
         Returns:
             ObservationState if found, None otherwise
         """
-        states = self.get_observation_states(objective)
+        states = self.get_observation_states()
         return next((s for s in states if s.name == name), None)
 
     def set_active_observation_state(self, state: Optional[ObservationState]) -> None:
@@ -245,11 +225,9 @@ class LiveController:
         """Channel key for ContrastManager / display when only a logical selection exists."""
         if self.current_observation_state is not None:
             return self.current_observation_state.name
-        objective = getattr(getattr(self.microscope, "objective_store", None), "current_objective", None)
-        if objective:
-            states = self.get_observation_states(objective)
-            if states:
-                return states[0].name
+        states = self.get_observation_states()
+        if states:
+            return states[0].name
         return "default"
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -257,10 +235,13 @@ class LiveController:
     # ─────────────────────────────────────────────────────────────────────────────
 
     def turn_on_illumination(self):
-        """Turn on illumination for the current observation state's active illuminators."""
+        """Turn on illumination for the current observation state's active illuminators.
+
+        Hardware is only commanded when the streaming gate is active (live view)
+        or when force_hardware is used by acquisition callers.
+        """
         if self.current_observation_state is None:
             self._log.warning("turn_on_illumination() skipped - no observation state set")
-            self.illumination_on = True
             return
 
         active = self.current_observation_state.active_illuminator_states
@@ -269,22 +250,14 @@ class LiveController:
                 f"turn_on_illumination() skipped - no active illuminators for "
                 f"'{self.current_observation_state.name}'"
             )
-            self.illumination_on = True
             return
 
-        ic = self.microscope.illumination_controller
-        for ist in active:
-            mode = ist.led_matrix_mode
-            if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
-                ic.set_led_matrix_mode(mode)
-            ic.set_channel_state(ist.illumination_channel, True, force_hardware=True)
-        self.illumination_on = True
+        self.microscope.illumination_controller.apply_observation_illumination(active, turn_on=True)
 
     def turn_off_illumination(self):
         """Turn off illumination for the current observation state's active illuminators."""
         if self.current_observation_state is None:
             self._log.warning("turn_off_illumination() skipped - no observation state set")
-            self.illumination_on = False
             return
 
         active = self.current_observation_state.active_illuminator_states
@@ -293,33 +266,39 @@ class LiveController:
                 f"turn_off_illumination() skipped - no active illuminators for "
                 f"'{self.current_observation_state.name}'"
             )
-            self.illumination_on = False
             return
 
-        ic = self.microscope.illumination_controller
-        for ist in active:
-            ic.set_channel_state(ist.illumination_channel, False, force_hardware=True)
-        self.illumination_on = False
+        self.microscope.illumination_controller.apply_observation_illumination(active, turn_on=False)
 
     def update_illumination(self):
-        """Set intensity for the current observation state and apply any device-specific settings."""
+        """Set intensity/LED-matrix mode and optical-path configuration for the current observation state."""
         if self.current_observation_state is None:
             self._log.warning("update_illumination() called with no current_observation_state")
             return
+        self._apply_illumination_parameters()
+        self._apply_optical_path()
 
+    def _apply_illumination_parameters(self):
+        """Set per-channel intensity, LED matrix mode, logical on/off, and NL5/CellX laser power.
+
+        Iterates ALL illuminator states (not just active ones) so that the IC's
+        logical state reflects the full observation state. This ensures the
+        illumination GUI panel shows correct on/off and intensity for every channel.
+        """
         ic = self.microscope.illumination_controller
-        active = self.current_observation_state.active_illuminator_states
 
-        for ist in active:
-            # LED matrix mode
+        for ist in self.current_observation_state.illuminator_states:
             mode = ist.led_matrix_mode
             if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
                 ic.set_led_matrix_mode(mode)
 
-            # Set channel intensity
             ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
+            # Sync the logical on/off state (hardware follows only if streaming gate is open).
+            ic.set_channel_state(ist.illumination_channel, ist.on)
 
             # NL5 / CellX laser power forwarding (wavelength-specific accessories)
+            if not ist.on:
+                continue
             illum_config = self.microscope.config_repo.get_illumination_config()
             wavelength = None
             if illum_config:
@@ -334,7 +313,8 @@ class LiveController:
                 if self.microscope.addons.cellx and ENABLE_CELLX:
                     self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
 
-        # set emission filter position and iris values
+    def _apply_optical_path(self):
+        """Set emission filter positions and confocal iris values for the current observation state."""
         emission_filter_position = self.current_observation_state.emission_filter_positions.get("default")
 
         if ENABLE_SPINNING_DISK_CONFOCAL and self.microscope.addons.xlight and not USE_DRAGONFLY:
@@ -380,7 +360,16 @@ class LiveController:
                 self._log.warning(f"Not setting emission filter position: {e}")
 
     def start_live(self):
+        """Start live streaming."""
         self.is_live = True
+        # Enable the streaming gate so illumination commands reach hardware,
+        # then turn on illumination BEFORE starting the camera so that the
+        # first frame is correctly illuminated.
+        self._log.info("starting live: control_illumination is " + str(self.control_illumination))
+        if self.control_illumination:
+            ic = self.microscope.illumination_controller
+            ic.set_streaming_active(True)
+            self.turn_on_illumination()
         self.camera.start_streaming()
         if self.trigger_mode == TriggerMode.SOFTWARE or (
             self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
@@ -392,7 +381,9 @@ class LiveController:
             self.microscope.low_level_drivers.microcontroller.set_pin_level(MCU_PINS.AF_LASER, 1)
 
     def stop_live(self):
+        self._log.info("stopping live")
         if self.is_live:
+            self._log.info("stopping live: is_live is True")
             self.is_live = False
             if self.trigger_mode == TriggerMode.SOFTWARE:
                 self._stop_triggerred_acquisition()
@@ -402,8 +393,10 @@ class LiveController:
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
                 self._stop_triggerred_acquisition()
-            if self.control_illumination:
-                self.turn_off_illumination()
+            # Disable the streaming gate -- this turns off all hardware while
+            # preserving logical state, replacing the manual turn_off_illumination call.
+            ic = self.microscope.illumination_controller
+            ic.set_streaming_active(False)
             # if controlling the laser displacement measurement camera
             if self.for_displacement_measurement:
                 self.microscope.low_level_drivers.microcontroller.set_pin_level(MCU_PINS.AF_LASER, 0)
@@ -434,17 +427,14 @@ class LiveController:
             return False
 
         self._trigger_skip_count = 0
+        # Ensure illumination is on before triggering (idempotent via IC gate).
         if self.trigger_mode == TriggerMode.SOFTWARE and self.control_illumination:
-            if not self.illumination_on:
+            if not self.microscope.illumination_controller.is_any_hardware_asserted():
                 self.turn_on_illumination()
 
         self.trigger_ID = self.trigger_ID + 1
 
         self.camera.send_trigger(self.camera.get_exposure_time())
-
-        if self.trigger_mode == TriggerMode.SOFTWARE:
-            if self.control_illumination and self.illumination_on == False:
-                self.turn_on_illumination()
 
         return True
 
@@ -523,7 +513,7 @@ class LiveController:
         # Channel switching for acquisition must follow channel configuration
         # (illumination intensity + illumination on/off behavior).
         self.control_illumination = True
-        self._log.info("setting microscope mode to " + state.name)
+        self._log.info("setting Observation state to " + state.name)
 
         _t_total = time.perf_counter()
 
@@ -583,7 +573,7 @@ class LiveController:
     # slot
     def on_new_frame(self):
         if self.fps_trigger <= 5:
-            if self.control_illumination and self.illumination_on == True:
+            if self.control_illumination and self.microscope.illumination_controller.is_any_hardware_asserted():
                 self.turn_off_illumination()
 
     def set_display_resolution_scaling(self, display_resolution_scaling):

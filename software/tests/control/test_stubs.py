@@ -14,7 +14,7 @@ from squid.abc import AbstractStage, AbstractCamera
 def get_test_live_controller(microscope: Microscope, starting_objective) -> LiveController:
     controller = LiveController(microscope=microscope, camera=microscope.camera)
 
-    channels = controller.get_channels(objective=starting_objective)
+    channels = controller.get_observation_states()
     if channels:
         controller.set_microscope_mode(channels[0])
     return controller

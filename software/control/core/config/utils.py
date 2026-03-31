@@ -5,49 +5,21 @@ Pure functions that operate on config models without side effects.
 """
 
 import shutil
-from typing import List, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from control.models import (
-    GeneralObservationConfig,
-    ObjectiveOverrideConfig,
-    merge_observation_configs,
     validate_illumination_references,
     get_illumination_channel_names,
 )
-from control.models.observation_state import ObservationState
 
 if TYPE_CHECKING:
     from control.core.config.repository import ConfigRepository
 
-# Re-export from models for convenience
 __all__ = [
-    # Re-exports from models
-    "merge_observation_configs",
     "validate_illumination_references",
     "get_illumination_channel_names",
-    # New utilities
-    "get_effective_observation_states",
     "copy_profile_configs",
 ]
-
-
-def get_effective_observation_states(
-    general: GeneralObservationConfig,
-    objective: ObjectiveOverrideConfig,
-) -> List[ObservationState]:
-    """
-    Get the effective observation states for a given objective.
-
-    This is a convenience function that calls merge_observation_configs().
-
-    Args:
-        general: General observation configuration
-        objective: Objective-specific override configuration
-
-    Returns:
-        List of merged ObservationState objects
-    """
-    return merge_observation_configs(general, objective)
 
 
 def copy_profile_configs(

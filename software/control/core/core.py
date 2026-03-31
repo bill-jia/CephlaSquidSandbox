@@ -539,10 +539,11 @@ class TrackingWorker(QObject):
 
     def _select_config(self, config):
         self.signal_current_configuration.emit(config)
-        # TODO(imo): replace with illumination controller.
         self.liveController.set_microscope_mode(config)
         self.microcontroller.wait_till_operation_is_completed()
-        self.liveController.turn_on_illumination()  # keep illumination on for single configuration acqusition
+        ic = self.liveController.microscope.illumination_controller
+        active = config.active_illuminator_states if config else []
+        ic.apply_observation_illumination(active, turn_on=True, force_hardware=True)
         self.microcontroller.wait_till_operation_is_completed()
 
     def run(self):
@@ -603,7 +604,7 @@ class TrackingWorker(QObject):
             image = camera_frame.frame
             t = camera_frame.timestamp
             if self.number_of_selected_configurations > 1:
-                self.liveController.turn_off_illumination()  # keep illumination on for single configuration acqusition
+                self.liveController.microscope.illumination_controller.turn_off_all(preserve_logical_state=True)
             image = np.squeeze(image)
             # get image size
             image_shape = image.shape
@@ -615,8 +616,7 @@ class TrackingWorker(QObject):
 
                 self.camera.send_trigger()
                 image_ = self.camera.read_frame()
-                # TODO(imo): use illumination controller
-                self.liveController.turn_off_illumination()
+                self.liveController.microscope.illumination_controller.turn_off_all(preserve_logical_state=True)
                 image_ = np.squeeze(image_)
                 # display image
                 image_to_display_ = utils.crop_image(

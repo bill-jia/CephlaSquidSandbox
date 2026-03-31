@@ -525,10 +525,9 @@ class MicroscopeControlServer:
 
     @schema_method
     def _cmd_get_channels(self) -> Dict[str, Any]:
-        """Get list of available imaging channels for the current objective."""
-        objective = self.microscope.objective_store.current_objective
-        channels = self.microscope.live_controller.get_channels(objective)
-        return {"objective": objective, "channels": [ch.name for ch in channels] if channels else []}
+        """Get list of available imaging channels."""
+        channels = self.microscope.live_controller.get_observation_states()
+        return {"channels": [ch.name for ch in channels] if channels else []}
 
     @schema_method
     def _cmd_set_exposure(
@@ -726,8 +725,7 @@ class MicroscopeControlServer:
             raise ValueError(f"Could not parse wells: {wells}")
 
         # Validate channels exist
-        objective = self.microscope.objective_store.current_objective
-        available_channels = self.microscope.live_controller.get_channels(objective)
+        available_channels = self.microscope.live_controller.get_observation_states()
         available_channel_names = [ch.name for ch in available_channels] if available_channels else []
 
         invalid_channels = [ch for ch in channels if ch not in available_channel_names]
@@ -1018,7 +1016,7 @@ class MicroscopeControlServer:
         Returns the list of available channel names.
         Raises ValueError if any requested channels are invalid.
         """
-        available_channels = self.microscope.config_repo.get_merged_channels(current_objective)
+        available_channels = self.microscope.config_repo.get_observation_states()
         available_channel_names = [ch.name for ch in available_channels] if available_channels else []
 
         invalid_channels = [ch for ch in channel_names if ch not in available_channel_names]

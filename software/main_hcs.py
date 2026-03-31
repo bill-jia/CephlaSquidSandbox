@@ -40,7 +40,7 @@ import control.utils
 import control.microscope
 
 # Import auto-migration function
-from tools.migrate_acquisition_configs import run_auto_migration
+# from tools.migrate_acquisition_configs import run_auto_migration
 
 
 if USE_TERMINAL_CONSOLE:
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     control._def.apply_simulation_mode_defaults(args.simulation)
 
     # Auto-migrate legacy acquisition configurations if present
-    run_auto_migration()
+    # run_auto_migration()
 
     app = QApplication(["Squid"])
     app.setStyle("Fusion")

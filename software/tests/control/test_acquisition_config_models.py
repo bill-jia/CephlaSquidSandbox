@@ -22,8 +22,6 @@ from control.models import (
     FilterWheelDefinition,
     FilterWheelType,
     GeneralObservationConfig,
-    ObjectiveOverride,
-    ObjectiveOverrideConfig,
     LaserAFConfig,
 )
 from control.models.illumination_config import (
@@ -34,7 +32,6 @@ from control.models.observation_state import (
     ObservationState,
     IlluminatorState,
 )
-from control.models.acquisition_config import merge_observation_configs
 from control.models.illumination_config import (
     DEFAULT_LED_COLOR,
     DEFAULT_WAVELENGTH_COLORS,
@@ -500,82 +497,6 @@ class TestAcquisitionConfig:
 
         assert config.get_by_name("Nonexistent") is None
 
-    def test_objective_override_config(self):
-        """Test ObjectiveOverrideConfig creation."""
-        config = ObjectiveOverrideConfig(
-            version=3,
-            overrides=[
-                ObjectiveOverride(
-                    name="Channel A",
-                    camera_settings=CameraSettings(exposure_time_ms=30.0, gain_mode=10.0),
-                ),
-            ],
-        )
-
-        assert config.version == 3
-        found = config.get_by_name("Channel A")
-        assert found is not None
-
-    def test_merge_observation_configs(self):
-        """Test merging general and objective configs."""
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="Channel A",
-                    display_color="#00FF00",
-                    camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[
-                        IlluminatorState(
-                            illumination_channel="488nm",
-                            intensity=50.0,
-                            on=False,
-                        ),
-                    ],
-                    z_offset_um=5.0,
-                ),
-            ],
-        )
-        objective = ObjectiveOverrideConfig(
-            version=3,
-            overrides=[
-                ObjectiveOverride(
-                    name="Channel A",
-                    camera_settings=CameraSettings(exposure_time_ms=50.0, gain_mode=1.0),
-                ),
-            ],
-        )
-
-        merged = merge_observation_configs(general, objective)
-        assert len(merged) == 1
-        s = merged[0]
-        assert s.camera_settings.exposure_time_ms == 50.0
-        assert s.camera_settings.gain_mode == 1.0
-        # Preserved from general
-        assert s.illuminator_states[0].illumination_channel == "488nm"
-        assert s.z_offset_um == 5.0
-        assert s.display_color == "#00FF00"
-
-    def test_merge_no_override_preserves_general(self):
-        """Test that states without override are returned as-is."""
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="Channel A",
-                    camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[],
-                ),
-            ],
-        )
-        objective = ObjectiveOverrideConfig(version=3, overrides=[])
-        merged = merge_observation_configs(general, objective)
-        assert len(merged) == 1
-        assert merged[0].camera_settings.exposure_time_ms == 20.0
-
-
 class TestLaserAFConfig:
     """Tests for LaserAFConfig model."""
 
@@ -630,100 +551,6 @@ class TestLaserAFConfig:
         config = LaserAFConfig(spot_detection_mode="dual_left")
         mode = config.get_spot_detection_mode()
         assert mode == SpotDetectionMode.DUAL_LEFT
-
-
-class TestMergeObservationConfigs:
-    """Tests for merge_observation_configs function."""
-
-    def test_merge_with_override(self):
-        """Test merging with objective override."""
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="488 nm",
-                    display_color="#00FF00",
-                    camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=5.0),
-                    illuminator_states=[
-                        IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=10.0, on=False),
-                    ],
-                    z_offset_um=5.0,
-                ),
-            ],
-        )
-        objective = ObjectiveOverrideConfig(
-            version=3,
-            overrides=[
-                ObjectiveOverride(
-                    name="488 nm",
-                    camera_settings=CameraSettings(exposure_time_ms=30.0, gain_mode=15.0, pixel_format="Mono12"),
-                ),
-            ],
-        )
-        merged = merge_observation_configs(general, objective)
-        assert len(merged) == 1
-        s = merged[0]
-        assert s.illuminator_states[0].illumination_channel == "Fluorescence 488nm"
-        assert s.z_offset_um == 5.0
-        assert s.display_color == "#00FF00"
-        assert s.camera_settings.exposure_time_ms == 30.0
-        assert s.camera_settings.gain_mode == 15.0
-        assert s.camera_settings.pixel_format == "Mono12"
-
-    def test_merge_no_objective_override(self):
-        """Test merge when objective has no override."""
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="405 nm",
-                    display_color="#7700FF",
-                    camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[
-                        IlluminatorState(illumination_channel="Fluorescence 405nm", intensity=20.0, on=False),
-                    ],
-                ),
-            ],
-        )
-        objective = ObjectiveOverrideConfig(version=3, overrides=[])
-        merged = merge_observation_configs(general, objective)
-        assert len(merged) == 1
-        assert merged[0].name == "405 nm"
-        assert merged[0].camera_settings.exposure_time_ms == 20.0
-
-    def test_merge_with_confocal_override(self):
-        """Test merge preserves confocal_hardware_settings from objective."""
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="488 nm",
-                    display_color="#00FF00",
-                    camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[
-                        IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=20.0, on=False),
-                    ],
-                ),
-            ],
-        )
-        objective = ObjectiveOverrideConfig(
-            version=3,
-            overrides=[
-                ObjectiveOverride(
-                    name="488 nm",
-                    camera_settings=CameraSettings(exposure_time_ms=40.0, gain_mode=15.0),
-                    confocal_hardware_settings=ConfocalSettings(illumination_iris=50.0, emission_iris=60.0),
-                ),
-            ],
-        )
-        merged = merge_observation_configs(general, objective)
-        s = merged[0]
-        assert s.confocal_hardware_settings is not None
-        assert s.confocal_hardware_settings.illumination_iris == 50.0
-        assert s.confocal_hardware_settings.emission_iris == 60.0
 
 
 class TestValidateIlluminationReferences:
