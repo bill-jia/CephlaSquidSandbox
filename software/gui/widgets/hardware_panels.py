@@ -1753,7 +1753,26 @@ class LiveControlWidget(QFrame):
             self._log.error("No channels available - cannot initialize LiveControlWidget")
             self.currentConfiguration = None
         else:
-            self.currentConfiguration = channels[0]
+            # Restore the last active channel if available, otherwise use first
+            selected = channels[0]
+            last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
+            if last_name:
+                for s in channels:
+                    if s.name == last_name:
+                        selected = s
+                        break
+            self.currentConfiguration = selected
+
+            # Apply camera exposure/gain from general.yaml
+            if selected.camera_settings is not None:
+                try:
+                    self.liveController.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
+                except Exception:
+                    pass
+                try:
+                    self.liveController.camera.set_analog_gain(selected.camera_settings.gain_mode)
+                except (NotImplementedError, Exception):
+                    pass
 
         # Keep LiveController.currentConfiguration in sync for contrast/LUT and Observation State
         self.liveController.set_active_channel_reference(self.currentConfiguration)
@@ -2169,10 +2188,18 @@ class LiveControlWidget(QFrame):
                     selected = s
                     break
 
-        # Manual live output is controlled by CameraSettingsWidget + IlluminationWidget.
-        # Do not call set_microscope_mode() here, since it would override camera exposure/gain.
         self.currentConfiguration = selected
         self.liveController.set_active_channel_reference(selected)
+        # Apply camera exposure/gain from the observation state in general.yaml
+        if selected.camera_settings is not None:
+            try:
+                self.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
+            except Exception:
+                pass
+            try:
+                self.camera.set_analog_gain(selected.camera_settings.gain_mode)
+            except (NotImplementedError, Exception):
+                pass
         self.dropdown_modeSelection.blockSignals(True)
         self.dropdown_modeSelection.setCurrentText(selected.name)
         self.dropdown_modeSelection.blockSignals(False)

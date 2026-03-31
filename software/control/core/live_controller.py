@@ -79,6 +79,7 @@ class LiveController:
         self.current_observation_state: Optional[ObservationState] = None
         self.trigger_mode: Optional[TriggerMode] = TriggerMode.SOFTWARE  # @@@ change to None
         self.is_live = False
+        self.in_acquisition = False
         self.control_illumination = control_illumination
         self.use_internal_timer_for_hardware_trigger = (
             use_internal_timer_for_hardware_trigger  # use Timer vs timer in the MCU
@@ -166,6 +167,7 @@ class LiveController:
             List of ObservationState objects. Returns empty list if no profile
             is set or no configs are available.
         """
+        self._log.info("get_observation_states: getting observation states from general.yaml")
         config_repo = self.microscope.config_repo
 
         if config_repo.current_profile is None:
@@ -191,6 +193,7 @@ class LiveController:
         Returns:
             ObservationState if found, None otherwise
         """
+        self._log.info(f"get_observation_state_by_name: getting observation state by name: {name}")
         states = self.get_observation_states()
         return next((s for s in states if s.name == name), None)
 
@@ -251,6 +254,7 @@ class LiveController:
                 f"'{self.current_observation_state.name}'"
             )
             return
+        self._log.info(f"State: {self.current_observation_state.name}, Active illuminators: {active}")
 
         self.microscope.illumination_controller.apply_observation_illumination(active, turn_on=True)
 
@@ -275,7 +279,9 @@ class LiveController:
         if self.current_observation_state is None:
             self._log.warning("update_illumination() called with no current_observation_state")
             return
+        self._log.info("update_illumination: updating illumination")
         self._apply_illumination_parameters()
+        self._log.info("update_illumination: applied illumination parameters")
         self._apply_optical_path()
 
     def _apply_illumination_parameters(self):
@@ -288,6 +294,7 @@ class LiveController:
         ic = self.microscope.illumination_controller
 
         for ist in self.current_observation_state.illuminator_states:
+            self._log.info(f"apply_illumination_parameters: {ist.illumination_channel} {ist.on} {ist.intensity}")
             mode = ist.led_matrix_mode
             if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
                 ic.set_led_matrix_mode(mode)
@@ -365,12 +372,15 @@ class LiveController:
         # Enable the streaming gate so illumination commands reach hardware,
         # then turn on illumination BEFORE starting the camera so that the
         # first frame is correctly illuminated.
-        self._log.info("starting live: control_illumination is " + str(self.control_illumination))
         if self.control_illumination:
+            self.turn_on_illumination()
             ic = self.microscope.illumination_controller
             ic.set_streaming_active(True)
-            self.turn_on_illumination()
+            
+
         self.camera.start_streaming()
+        self._log.info(f"starting live with trigger mode {self.trigger_mode}")
+
         if self.trigger_mode == TriggerMode.SOFTWARE or (
             self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
         ):
@@ -385,6 +395,10 @@ class LiveController:
         if self.is_live:
             self._log.info("stopping live: is_live is True")
             self.is_live = False
+            # Close the streaming gate FIRST so any in-flight timer callback
+            # cannot command hardware (apply_hw will be False in set_channel_state).
+            ic = self.microscope.illumination_controller
+            ic.set_streaming_active(False)
             if self.trigger_mode == TriggerMode.SOFTWARE:
                 self._stop_triggered_acquisition()
             if self.trigger_mode == TriggerMode.CONTINUOUS:
@@ -393,10 +407,6 @@ class LiveController:
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
                 self._stop_triggered_acquisition()
-            # Disable the streaming gate -- this turns off all hardware while
-            # preserving logical state, replacing the manual turn_off_illumination call.
-            ic = self.microscope.illumination_controller
-            ic.set_streaming_active(False)
             # if controlling the laser displacement measurement camera
             if self.for_displacement_measurement:
                 self.microscope.low_level_drivers.microcontroller.set_pin_level(MCU_PINS.AF_LASER, 0)
@@ -414,6 +424,8 @@ class LiveController:
 
     # software trigger related
     def trigger_acquisition(self):
+        if not self.is_live:
+            return False
         if not self.camera.get_ready_for_trigger():
             # TODO(imo): Before, send_trigger would pass silently for this case.  Now
             # we do the same here.  Should this warn?  I didn't add a warning because it seems like
@@ -545,6 +557,7 @@ class LiveController:
         # set illumination
         if self.control_illumination:
             _t0 = time.perf_counter()
+            self._log.info("set_observation_state: updating illumination")
             self.update_illumination()
             self._log.info("set_observation_state: update_illumination took %.4fs", time.perf_counter() - _t0)
 
@@ -556,6 +569,8 @@ class LiveController:
                 self._log.info("set_observation_state: turn_on_illumination took %.4fs", time.perf_counter() - _t0)
             self._start_new_timer()
         self._log.info("set_observation_state: TOTAL took %.4fs", time.perf_counter() - _t_total)
+        self._log.info(f"set_observation_state: current_observation_state: {self.current_observation_state.name}")
+        self._log.info(f"Active illuminators: {self.current_observation_state.active_illuminator_states}")
 
     def set_microscope_mode(self, configuration: ObservationState):
         """Backward-compatible alias for set_observation_state.
@@ -572,6 +587,8 @@ class LiveController:
 
     # slot
     def on_new_frame(self):
+        if not self.is_live:
+            return
         if self.fps_trigger <= 5:
             if self.control_illumination and self.microscope.illumination_controller.is_any_hardware_asserted():
                 self.turn_off_illumination()

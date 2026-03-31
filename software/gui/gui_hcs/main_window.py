@@ -250,6 +250,7 @@ class HighContentScreeningGui(QMainWindow):
         # Always-visible controls panel (replaces the old tabbed UI).
         self.cameraTabWidget: QWidget = QWidget()
         self.load_widgets(is_simulation=is_simulation)
+        self._sync_camera_ui_from_observation_state()
         self.setup_layout()
         self.make_connections()
 
@@ -698,6 +699,31 @@ class HighContentScreeningGui(QMainWindow):
                 self.illuminationWidget._refresh_from_state()
             except Exception as e:
                 self.log.warning("Could not refresh illumination widget after cache restore: %s", e)
+
+    def _sync_camera_ui_from_observation_state(self) -> None:
+        """Sync camera settings UI with the active observation state from general.yaml.
+
+        Called once after load_widgets so the exposure/gain spinboxes reflect the
+        values that LiveControlWidget.__init__ applied to camera hardware.
+        """
+        config = getattr(self.liveControlWidget, "currentConfiguration", None)
+        if config is None or config.camera_settings is None:
+            return
+        csw = self.cameraSettingWidget
+        if csw is None:
+            return
+        try:
+            csw.entry_exposureTime.blockSignals(True)
+            csw.entry_exposureTime.setValue(config.camera_settings.exposure_time_ms)
+            csw.entry_exposureTime.blockSignals(False)
+        except Exception as e:
+            self.log.warning("Could not sync exposure time UI: %s", e)
+        try:
+            csw.entry_analogGain.blockSignals(True)
+            csw.entry_analogGain.setValue(config.camera_settings.gain_mode)
+            csw.entry_analogGain.blockSignals(False)
+        except Exception as e:
+            self.log.warning("Could not sync analog gain UI: %s", e)
 
     def _restore_cached_camera_settings(self) -> None:
         """Restore cached camera settings from disk and update UI widgets.

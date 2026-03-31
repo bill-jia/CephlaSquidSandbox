@@ -216,7 +216,7 @@ class MicroscopeAddons:
 
         # ── NI-DAQ ────────────────────────────────────────────────────────
         io_config = mc.collect_io_endpoints()
-        log.info(f"io_config: {io_config}")
+        # log.info(f"io_config: {io_config}")
         nidaq = None
         nidaq_entry = _dev("nidaq")
         if nidaq_entry and not _sim("nidaq"):
