@@ -1051,11 +1051,18 @@ class HighContentScreeningGui(QMainWindow):
         self.illuminationWidget = widgets.IlluminationWidget(
             self.microscope.illumination_controller,
             parent=self,
+        )
+
+        # Observation State preset widget (save/load imaging presets)
+        from gui.widgets.observation_state import ObservationStateWidget
+
+        self.observationStateWidget = ObservationStateWidget(
+            parent=self,
             config_repo=self.microscope.config_repo,
             live_controller=self.liveController,
             objective_store=self.objectiveStore,
             emission_filter_wheel=self.emission_filter_wheel,
-            on_observation_state_changed=self._on_observation_state_changed,
+            on_state_changed=self._on_observation_state_changed_from_widget,
         )
 
         # Stage controls (1/3 width in setup_layout): keep only basic controls here.
@@ -1107,6 +1114,8 @@ class HighContentScreeningGui(QMainWindow):
         top_row_layout.addWidget(self.liveControlWidget, stretch=1)
         top_row_layout.addWidget(self.cameraTabWidget, stretch=1)
         layout.addWidget(top_row)
+
+        layout.addWidget(self.observationStateWidget)
 
         # Bottom row: illumination takes 2/3 width; stage takes 1/3 width.
         bottom_row = QWidget()
@@ -1229,8 +1238,8 @@ class HighContentScreeningGui(QMainWindow):
 
         self.recordingControlWidget.signal_acquisition_started.connect(self.toggleAcquisitionStart)
 
-        self.profileWidget.signal_profile_changed.connect(self.liveControlWidget.refresh_mode_list)
-        self.profileWidget.signal_profile_changed.connect(self.illuminationWidget.refresh_observation_state_presets)
+        self.profileWidget.signal_profile_changed.connect(self._refresh_channel_lists)
+        self.profileWidget.signal_profile_changed.connect(self.observationStateWidget.refresh_presets)
 
         self.liveControlWidget.signal_newExposureTime.connect(self.cameraSettingWidget.set_exposure_time)
         self.liveControlWidget.signal_newAnalogGain.connect(self.cameraSettingWidget.set_analog_gain)
@@ -1987,7 +1996,7 @@ class HighContentScreeningGui(QMainWindow):
             self.liveController,
             self.objectiveStore,
             self.emission_filter_wheel,
-            on_success=self._on_observation_state_changed,
+            on_success=self._on_menu_observation_state_changed,
         )
 
     def loadObservationStatePreset(self):
@@ -2001,7 +2010,7 @@ class HighContentScreeningGui(QMainWindow):
             self.objectiveStore,
             self.emission_filter_wheel,
             preset_name=None,
-            on_success=self._on_observation_state_changed,
+            on_success=self._on_menu_observation_state_changed,
         )
 
     def openAdvancedChannelMapping(self):
@@ -2018,8 +2027,8 @@ class HighContentScreeningGui(QMainWindow):
 
     def _refresh_channel_lists(self):
         """Refresh live mode lists and multipoint observation-preset lists after config or profile changes."""
-        if self.liveControlWidget:
-            self.liveControlWidget.refresh_mode_list()
+        if self.observationStateWidget:
+            self.observationStateWidget.refresh_presets()
         if self.napariLiveWidget:
             self.napariLiveWidget.refresh_mode_list()
         if self.flexibleMultiPointWidget:
@@ -2028,6 +2037,17 @@ class HighContentScreeningGui(QMainWindow):
             self.wellplateMultiPointWidget.refresh_channel_list()
         if getattr(self, "multiPointWithFluidicsWidget", None):
             self.multiPointWithFluidicsWidget.refresh_channel_list()
+
+    def _on_observation_state_changed_from_widget(self):
+        """After ObservationStateWidget save/load: refresh illumination UI, channel lists, and camera."""
+        self.illuminationWidget.update_ui_for_mode()
+        self._on_observation_state_changed()
+
+    def _on_menu_observation_state_changed(self):
+        """After menu Save/Load: refresh preset dropdown, illumination UI, channel lists, and camera."""
+        self.observationStateWidget.refresh_presets()
+        self.illuminationWidget.update_ui_for_mode()
+        self._on_observation_state_changed()
 
     def _on_observation_state_changed(self):
         """After Observation State save/load: refresh channel lists and sync Camera tab to hardware."""

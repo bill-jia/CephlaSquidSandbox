@@ -5,10 +5,7 @@ class IlluminationWidget(QWidget):
     """Standalone widget for manual illumination control.
 
     Displays one row per channel defined in the controller's ``channel_config``,
-    with an intensity slider/spinbox pair and an on/off toggle button. When
-    ``config_repo``, ``live_controller``, and ``objective_store`` are provided,
-    a separate ``ObservationStateWidget`` (``gui.widgets_observation_state``) is
-    placed below the channel rows for saving and loading imaging presets.
+    with an intensity slider/spinbox pair and an on/off toggle button.
 
     The widget is controller-agnostic: it calls only
     ``IlluminationController.set_channel_intensity`` and ``IlluminationController.set_channel_state``
@@ -52,50 +49,25 @@ class IlluminationWidget(QWidget):
         self,
         illumination_controller: IlluminationController,
         parent=None,
-        *,
-        config_repo=None,
-        live_controller=None,
-        objective_store=None,
-        emission_filter_wheel=None,
-        on_observation_state_changed=None,
     ):
         """
         Args:
             illumination_controller: An ``IlluminationController`` instance that must
                 have a non-None ``channel_config`` attribute.
             parent: Optional parent widget.
-            config_repo: ``ConfigRepository`` for Observation State presets (optional).
-            live_controller: ``LiveController`` for collecting/applying Observation State.
-            objective_store: ``ObjectiveStore`` for current objective when applying state.
-            emission_filter_wheel: Optional hardware handle for filter positions in presets.
-            on_observation_state_changed: Callback after save/load (e.g. refresh channel lists).
         """
         super().__init__(parent)
         self._controller: IlluminationController = illumination_controller
         self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
-        self._on_observation_state_changed = on_observation_state_changed
-        self.observation_state_widget: Optional["ObservationStateWidget"] = None
 
-        self._build_ui(
-            config_repo=config_repo,
-            live_controller=live_controller,
-            objective_store=objective_store,
-            emission_filter_wheel=emission_filter_wheel,
-        )
+        self._build_ui()
         self._refresh_from_state()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(
-        self,
-        *,
-        config_repo=None,
-        live_controller=None,
-        objective_store=None,
-        emission_filter_wheel=None,
-    ):
+    def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(4)
@@ -228,19 +200,6 @@ class IlluminationWidget(QWidget):
                 )
 
         root.addWidget(channels_group)
-
-        if config_repo is not None and live_controller is not None and objective_store is not None:
-            from gui.widgets_observation_state import ObservationStateWidget
-
-            self.observation_state_widget = ObservationStateWidget(
-                parent=self,
-                config_repo=config_repo,
-                live_controller=live_controller,
-                objective_store=objective_store,
-                emission_filter_wheel=emission_filter_wheel,
-                on_state_changed=self._on_observation_state_applied,
-            )
-            root.addWidget(self.observation_state_widget)
         root.addStretch()
 
     # ------------------------------------------------------------------
@@ -287,11 +246,6 @@ class IlluminationWidget(QWidget):
         if mode_key is not None and getattr(self._controller, "set_led_matrix_mode", None):
             self._controller.set_led_matrix_mode(mode_key)
 
-    def refresh_observation_state_presets(self) -> None:
-        """Refresh the Observation State preset dropdown (e.g. after profile switch)."""
-        if self.observation_state_widget is not None:
-            self.observation_state_widget.refresh_presets()
-
     def update_ui_for_mode(self, config=None) -> None:
         """Refresh illumination controls to match current hardware state.
 
@@ -300,11 +254,6 @@ class IlluminationWidget(QWidget):
         acquisition code has applied to the hardware.
         """
         self._refresh_from_state()
-
-    def _on_observation_state_applied(self) -> None:
-        self._refresh_from_state()
-        if self._on_observation_state_changed:
-            self._on_observation_state_changed()
 
     # ------------------------------------------------------------------
     # Helpers

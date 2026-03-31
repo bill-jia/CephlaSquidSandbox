@@ -514,6 +514,7 @@ def collect_observation_state(
         config_repo: Repository for the active profile.
         emission_filter_positions: Optional wheel positions from hardware/UI.
     """
+    logger.info("collect_observation_state: collecting observation state from live controller")
     merged = live_controller.get_observation_states()
 
     # Build illuminator_states from merged observation states

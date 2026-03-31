@@ -1930,7 +1930,7 @@ class LiveControlWidget(QFrame):
         self.entry_displayFPS.valueChanged.connect(self.streamHandler.set_display_fps)
         self.slider_resolutionScaling.valueChanged.connect(self.streamHandler.set_display_resolution_scaling)
         self.slider_resolutionScaling.valueChanged.connect(self.liveController.set_display_resolution_scaling)
-        self.dropdown_modeSelection.activated[str].connect(self.select_new_microscope_mode_by_name)
+        # self.dropdown_modeSelection.activated[str].connect(self.select_new_microscope_mode_by_name)
         self.dropdown_triggerManu.currentIndexChanged.connect(self.update_trigger_mode)
         self.btn_live.clicked.connect(self.toggle_live)
         self.entry_exposureTime.valueChanged.connect(self.update_config_exposure_time)
@@ -1943,10 +1943,10 @@ class LiveControlWidget(QFrame):
         self.btn_autolevel.toggled.connect(self.signal_autoLevelSetting.emit)
 
         # layout
-        grid_line1 = QHBoxLayout()
-        grid_line1.addWidget(QLabel("Live Configuration"))
-        grid_line1.addWidget(self.dropdown_modeSelection, 2)
-        grid_line1.addWidget(self.btn_live, 1)
+        # grid_line1 = QHBoxLayout()
+        # grid_line1.addWidget(QLabel("Live Configuration"))
+        # grid_line1.addWidget(self.dropdown_modeSelection, 2)
+        # grid_line1.addWidget(self.btn_live, 1)
 
         grid_line2 = QHBoxLayout()
         grid_line2.addWidget(QLabel("Exposure Time"))
@@ -2167,42 +2167,42 @@ class LiveControlWidget(QFrame):
         # Keep this method to avoid breaking callers, but do nothing.
         return
 
-    def refresh_mode_list(self):
-        # Update the mode selection dropdown (only show enabled channels)
-        self.dropdown_modeSelection.blockSignals(True)
-        self.dropdown_modeSelection.clear()
-        states = self.liveController.get_observation_states()
-        for state in states:
-            self.dropdown_modeSelection.addItem(state.name)
-        self.dropdown_modeSelection.blockSignals(False)
+    # def refresh_mode_list(self):
+    #     # Update the mode selection dropdown (only show enabled channels)
+    #     self.dropdown_modeSelection.blockSignals(True)
+    #     self.dropdown_modeSelection.clear()
+    #     states = self.liveController.get_observation_states()
+    #     for state in states:
+    #         self.dropdown_modeSelection.addItem(state.name)
+    #     self.dropdown_modeSelection.blockSignals(False)
 
-        if not states:
-            return
+    #     if not states:
+    #         return
 
-        # Restore the last active channel if available, otherwise use first
-        selected = states[0]
-        last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
-        if last_name:
-            for s in states:
-                if s.name == last_name:
-                    selected = s
-                    break
+    #     # Restore the last active channel if available, otherwise use first
+    #     selected = states[0]
+    #     last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
+    #     if last_name:
+    #         for s in states:
+    #             if s.name == last_name:
+    #                 selected = s
+    #                 break
 
-        self.currentConfiguration = selected
-        self.liveController.set_active_channel_reference(selected)
-        # Apply camera exposure/gain from the observation state in general.yaml
-        if selected.camera_settings is not None:
-            try:
-                self.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
-            except Exception:
-                pass
-            try:
-                self.camera.set_analog_gain(selected.camera_settings.gain_mode)
-            except (NotImplementedError, Exception):
-                pass
-        self.dropdown_modeSelection.blockSignals(True)
-        self.dropdown_modeSelection.setCurrentText(selected.name)
-        self.dropdown_modeSelection.blockSignals(False)
+    #     self.currentConfiguration = selected
+    #     self.liveController.set_active_channel_reference(selected)
+    #     # Apply camera exposure/gain from the observation state in general.yaml
+    #     if selected.camera_settings is not None:
+    #         try:
+    #             self.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
+    #         except Exception:
+    #             pass
+    #         try:
+    #             self.camera.set_analog_gain(selected.camera_settings.gain_mode)
+    #         except (NotImplementedError, Exception):
+    #             pass
+    #     self.dropdown_modeSelection.blockSignals(True)
+    #     self.dropdown_modeSelection.setCurrentText(selected.name)
+    #     self.dropdown_modeSelection.blockSignals(False)
 
     def select_new_microscope_mode_by_name(self, config_name):
         maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
