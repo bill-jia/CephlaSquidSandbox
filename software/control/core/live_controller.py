@@ -254,7 +254,6 @@ class LiveController:
                 f"'{self.current_observation_state.name}'"
             )
             return
-        self._log.info(f"State: {self.current_observation_state.name}, Active illuminators: {active}")
 
         self.microscope.illumination_controller.apply_observation_illumination(active, turn_on=True)
 

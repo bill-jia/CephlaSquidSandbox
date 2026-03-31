@@ -447,10 +447,10 @@ class FastAcquisitionController:
         self._stop_called = False
         self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
         self._completion_error_message = None
-        expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
+        expected_decode_bytes = None
 
         if not self._daq_only:
-
+            expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
             def frame_callback(
                 frame: Union[bytes, np.ndarray], metadata: Optional[dict] = None
             ):

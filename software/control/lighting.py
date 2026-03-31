@@ -1021,9 +1021,8 @@ class IlluminationController:
                 dev.set_intensity(unified_name, intensity)
                 self._channel_state[unified_name].intensity = intensity
             return
-        self._log.info(f"Current intensity for {channel_name}: {self._channel_state[channel_name].intensity}, new intensity: {intensity}")
         if abs(float(intensity) - float(self._channel_state[channel_name].intensity)) < 0.1:
-            self._log.info(f"set_channel_intensity: intensity for {channel_name} is the same as the current intensity")
+            # self._log.debug(f"set_channel_intensity: intensity for {channel_name} is the same as the current intensity")
             return
         dev = self._channel_map.get(channel_name)
         if dev is None:
@@ -1082,7 +1081,6 @@ class IlluminationController:
                 If False, hardware is commanded only when :meth:`set_streaming_active`
                 has enabled streaming (live view).
         """
-        self._log.info(f"setting channel state for {channel_name} to {is_on} with force_hardware={force_hardware}")
         apply_hw = force_hardware or self._streaming_active
 
         # Resolve LED matrix aliases before touching _channel_state so that
@@ -1103,7 +1101,6 @@ class IlluminationController:
         self._channel_state[channel_name].is_on = is_on
         if apply_hw and self._hardware_asserted.get(channel_name) != is_on:
             dev = self._channel_map.get(channel_name)
-            logger.info(f"dev: {dev}")
             if dev is None:
                 logger.warning(f"set_channel_state: unknown channel '{channel_name}'")
                 return
