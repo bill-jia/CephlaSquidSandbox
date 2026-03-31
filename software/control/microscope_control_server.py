@@ -512,13 +512,16 @@ class MicroscopeControlServer:
         ),
     ) -> Dict[str, Any]:
         """Set the current imaging channel/illumination mode."""
-        objective = self.microscope.objective_store.current_objective
-        channel_config = self.microscope.live_controller.get_channel_by_name(objective, channel_name)
-        if channel_config:
-            self.microscope.live_controller.set_microscope_mode(channel_config)
-            return {"channel": channel_name, "objective": objective}
-        else:
-            raise ValueError(f"Channel '{channel_name}' not found for objective '{objective}'")
+        # TBD: change to use ObservationState
+        return None
+    #     """Set the current imaging channel/illumination mode."""
+    #     objective = self.microscope.objective_store.current_objective
+    #     channel_config = self.microscope.live_controller.get_channel_by_name(objective, channel_name)
+    #     if channel_config:
+    #         self.microscope.live_controller.set_microscope_mode(channel_config)
+    #         return {"channel": channel_name, "objective": objective}
+    #     else:
+    #         raise ValueError(f"Channel '{channel_name}' not found for objective '{objective}'")
 
     @schema_method
     def _cmd_get_channels(self) -> Dict[str, Any]:

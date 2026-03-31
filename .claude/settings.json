@@ -2,9 +2,9 @@
     "permissions": {
       "allow": [
         "Bash(xargs grep:*)",
-        "Bash(grep -r \"class.*Widget\" /c/Code/CephlaSquidSandbox/software/gui/widgets/*.py)"
-        "Bash(cmd.exe /c \"conda activate*\")"
-        "Bash(/c/Users/jialab/anaconda3/envs/squid/python.exe *)"
+        "Bash(grep -r \"class.*Widget\" /c/Code/CephlaSquidSandbox/software/gui/widgets/*.py)",
+        "Bash(cmd.exe /c \"conda activate*\")",
+        "Bash(/c/Users/jialab/anaconda3/envs/squid/python.exe *)",
         "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -c *)"
       ]
     }

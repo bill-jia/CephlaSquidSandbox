@@ -1243,7 +1243,7 @@ class Microscope:
         """
         self.objective_store.set_current_objective(objective)
 
-    def set_illumination_intensity(self, channel: str, intensity: float, objective: Optional[str] = None) -> None:
+    def set_illumination_intensity(self, channel: str, intensity: float) -> None:
         """Set the illumination intensity for a channel.
 
         Args:
@@ -1251,12 +1251,7 @@ class Microscope:
             intensity: Illumination intensity value.
             objective: Objective name. If None, uses current objective.
         """
-        if objective is None:
-            objective = self.objective_store.current_objective
-        channel_config = self.live_controller.get_channel_by_name(objective, channel)
-        if channel_config:
-            channel_config.illumination_intensity = intensity
-            self.live_controller.set_microscope_mode(channel_config)
+        self.illumination_controller.set_channel_intensity(channel, intensity)
 
     def set_exposure_time(self, channel: str, exposure_time: float, objective: Optional[str] = None) -> None:
         """Set the exposure time for a channel.
