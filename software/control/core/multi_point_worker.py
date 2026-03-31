@@ -487,9 +487,7 @@ class MultiPointWorker:
                 repo,
                 self.liveController,
                 self.objectiveStore,
-                emission_filter_wheel=self._emission_filter_wheel,
-                persist_general_to_profile=False,
-                apply_illumination_on_off_state=False,
+                emission_filter_wheel=self._emission_filter_wheel
             )
         return state
 
@@ -1410,9 +1408,7 @@ class MultiPointWorker:
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_channel_by_name(
-                    self.objectiveStore.current_objective, configuration_name_AF
-                )
+                config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
                 self._select_config(config_AF)
                 if (
                     self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0

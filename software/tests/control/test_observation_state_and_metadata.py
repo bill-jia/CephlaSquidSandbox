@@ -185,8 +185,7 @@ def test_apply_observation_state_persist_false_skips_save_general():
         repo,
         lc,
         objective_store,
-        emission_filter_wheel=None,
-        persist_general_to_profile=False,
+        emission_filter_wheel=None
     )
 
     repo.save_general_config.assert_not_called()
@@ -307,8 +306,7 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
         lc,
         objective_store,
         emission_filter_wheel=None,
-        apply_live_trigger_settings=False,
-        apply_illumination_on_off_state=False,
+        apply_live_trigger_settings=False
     )
 
     lc.set_trigger_mode.assert_not_called()

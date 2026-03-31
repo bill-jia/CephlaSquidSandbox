@@ -792,7 +792,10 @@ class ConfigRepository:
         profile: Optional[str] = None,
     ) -> bool:
         """
-        Update a specific setting of an observation state in general.yaml and save.
+        Update a specific setting of an observation state in-memory.
+
+        Changes are held in the cached GeneralObservationConfig and written to
+        general.yaml only at application shutdown (via :meth:`persist_general_config`).
 
         Supported settings:
         - "ExposureTime" -> camera_settings.exposure_time_ms
@@ -861,8 +864,41 @@ class ConfigRepository:
                 logger.warning(f"No illuminator states found for '{channel_name}' in general config")
                 return False
 
-        self.save_general_config(profile, general_config)
         return True
+
+    def persist_general_config(self, active_channel_name: Optional[str] = None) -> None:
+        """Write the in-memory GeneralObservationConfig to general.yaml.
+
+        Call this at application shutdown to persist any changes made via
+        :meth:`update_channel_setting` during the session.
+
+        Args:
+            active_channel_name: If provided, saved to a sidecar file so
+                the same channel can be restored on next startup.
+        """
+        profile = self._current_profile
+        if not profile:
+            return
+        general = self.get_general_config()
+        if general is not None:
+            self.save_general_config(profile, general)
+        if active_channel_name is not None:
+            try:
+                path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
+                path.write_text(active_channel_name)
+            except Exception as exc:
+                logger.warning("Could not persist active channel name: %s", exc)
+
+    def get_last_active_channel_name(self) -> Optional[str]:
+        """Read the channel name that was active when the app last shut down."""
+        try:
+            path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
+            if path.exists():
+                name = path.read_text().strip()
+                return name if name else None
+        except Exception:
+            pass
+        return None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # LASER AF CONFIGS (per-profile)

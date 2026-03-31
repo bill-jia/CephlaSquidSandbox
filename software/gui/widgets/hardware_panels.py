@@ -2152,25 +2152,33 @@ class LiveControlWidget(QFrame):
         # Update the mode selection dropdown (only show enabled channels)
         self.dropdown_modeSelection.blockSignals(True)
         self.dropdown_modeSelection.clear()
-        first_config = None
-        for microscope_configuration in self.liveController.get_observation_states():
-            if not first_config:
-                first_config = microscope_configuration
-            self.dropdown_modeSelection.addItem(microscope_configuration.name)
+        states = self.liveController.get_observation_states()
+        for state in states:
+            self.dropdown_modeSelection.addItem(state.name)
         self.dropdown_modeSelection.blockSignals(False)
+
+        if not states:
+            return
+
+        # Restore the last active channel if available, otherwise use first
+        selected = states[0]
+        last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
+        if last_name:
+            for s in states:
+                if s.name == last_name:
+                    selected = s
+                    break
 
         # Manual live output is controlled by CameraSettingsWidget + IlluminationWidget.
         # Do not call set_microscope_mode() here, since it would override camera exposure/gain.
-        if first_config is not None:
-            self.currentConfiguration = first_config
-            self.liveController.set_active_channel_reference(first_config)
-            # Keep dropdown current text consistent (even if the widget is hidden in the main layout).
-            self.dropdown_modeSelection.blockSignals(True)
-            self.dropdown_modeSelection.setCurrentText(first_config.name)
-            self.dropdown_modeSelection.blockSignals(False)
+        self.currentConfiguration = selected
+        self.liveController.set_active_channel_reference(selected)
+        self.dropdown_modeSelection.blockSignals(True)
+        self.dropdown_modeSelection.setCurrentText(selected.name)
+        self.dropdown_modeSelection.blockSignals(False)
 
     def select_new_microscope_mode_by_name(self, config_name):
-        maybe_new_config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, config_name)
+        maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
 
         if not maybe_new_config:
             self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")

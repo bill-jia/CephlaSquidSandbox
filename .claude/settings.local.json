@@ -10,7 +10,8 @@
       "Bash(do C:/ProgramData/miniconda3/condabin/conda.bat run -n squid python -m py_compile \"$f\")",
       "Bash(echo \"FAILED: $f\")",
       "Bash(done)",
-      "Bash(find /c/Code/CephlaSquidSandbox/software -name *.py -path */ui/* -o -name *widget* -o -name *gui*)"
+      "Bash(find /c/Code/CephlaSquidSandbox/software -name *.py -path */ui/* -o -name *widget* -o -name *gui*)",
+      "Bash(grep -rn \"collect_observation_state\\\\|apply_observation_state\" \"C:\\\\Code\\\\CephlaSquidSandbox\\\\software\"\" --include=\"*.py \")"
     ]
   }
 }

@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 from typing import Dict, List, Optional, Protocol, TYPE_CHECKING, runtime_checkable
+import squid.logging
 
 from control.models.io_endpoint_config import (
     IOControllerType,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from control.nidaq import AbstractNIDAQ
     from squid.abc import LightSource
 
-logger = logging.getLogger(__name__)
+logger = squid.logging.get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

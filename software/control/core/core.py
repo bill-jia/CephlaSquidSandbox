@@ -460,7 +460,7 @@ class TrackingController(QObject):
     def set_selected_configurations(self, selected_configurations_name):
         self.selected_configurations = []
         for configuration_name in selected_configurations_name:
-            config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, configuration_name)
+            config = self.liveController.get_observation_state_by_name(configuration_name)
             if config:
                 self.selected_configurations.append(config)
 

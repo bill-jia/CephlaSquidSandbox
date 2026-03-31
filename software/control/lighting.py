@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from control.serial_peripherals import SciMicroscopyLEDArray
     from control.models.observation_state import IlluminatorState
 
-logger = logging.getLogger(__name__)
+logger = squid.logging.get_logger(__name__)
 
 # Number of illumination ports supported (matches firmware)
 NUM_ILLUMINATION_PORTS = 16
@@ -419,6 +419,7 @@ class NIDAQIlluminationDevice(IlluminationDevice):
         self._shutter_ep.set_digital(True)
         self._shutter_ep.wait()
         self._is_on = True
+        logger.info(f"[NIDAQIlluminationDevice] turn_on called for channel '{channel}'")
 
     def turn_off(self, channel: str) -> None:
         if channel != self._channel_name:
@@ -429,6 +430,7 @@ class NIDAQIlluminationDevice(IlluminationDevice):
         self._shutter_ep.set_digital(False)
         self._shutter_ep.wait()
         self._is_on = False
+        logger.info(f"[NIDAQIlluminationDevice] turn_off called for channel '{channel}'")
 
     def get_intensity(self, channel: str) -> float:
         if channel != self._channel_name:
@@ -1059,6 +1061,7 @@ class IlluminationController:
         """Turn off every device output without changing logical on/off flags."""
         for dev in self._devices:
             try:
+                self._log.info(f"Turning off all hardware for {dev}[{dev.__class__.__name__}]")
                 dev.turn_off_all()
             except Exception as exc:
                 logger.warning(f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} failed: {exc}")

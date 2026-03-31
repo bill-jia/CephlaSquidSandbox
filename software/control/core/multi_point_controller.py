@@ -556,9 +556,7 @@ class MultiPointController:
             self.selected_observation_state_names = names
             return
         for configuration_name in names:
-            config = self.liveController.get_channel_by_name(
-                self.objectiveStore.current_objective, configuration_name
-            )
+            config = self.liveController.get_observation_state_by_name(configuration_name)
             if config:
                 self.selected_configurations.append(config)
 

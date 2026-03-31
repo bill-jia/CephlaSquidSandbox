@@ -216,6 +216,7 @@ class MicroscopeAddons:
 
         # ── NI-DAQ ────────────────────────────────────────────────────────
         io_config = mc.collect_io_endpoints()
+        log.info(f"io_config: {io_config}")
         nidaq = None
         nidaq_entry = _dev("nidaq")
         if nidaq_entry and not _sim("nidaq"):
@@ -1263,7 +1264,7 @@ class Microscope:
         """
         if objective is None:
             objective = self.objective_store.current_objective
-        channel_config = self.live_controller.get_channel_by_name(objective, channel)
+        channel_config = self.live_controller.get_observation_state_by_name(channel)
         if channel_config:
             channel_config.exposure_time = exposure_time
             self.live_controller.set_microscope_mode(channel_config)

@@ -582,7 +582,6 @@ def apply_observation_state(
     objective_store: "ObjectiveStore",
     *,
     emission_filter_wheel: Optional[Any] = None,
-    persist_general_to_profile: bool = True,
     apply_live_trigger_settings: bool = True,
     apply_illumination_on_off_state: bool = False,
 ) -> None:
@@ -590,8 +589,6 @@ def apply_observation_state(
     Persist Observation State into general.yaml and refresh live mode.
 
     Args:
-        persist_general_to_profile: When True (default), write preset channel rows into the profile's
-            ``general.yaml``. When False, apply only to hardware and in-memory live state (no disk write).
         apply_live_trigger_settings: When True (default), restore the preset's saved live trigger mode/FPS.
             Set False for multipoint acquisitions.
         apply_illumination_on_off_state: Deprecated, no longer used. Illumination on/off is now handled
@@ -600,17 +597,6 @@ def apply_observation_state(
     profile = config_repo.current_profile
     if not profile:
         raise ValueError("No profile is set; cannot apply Observation State")
-
-    # ── 1. Persist to general.yaml ──
-    if persist_general_to_profile:
-        general = GeneralObservationConfig(
-            version=3,
-            observation_states=[state],
-            channel_groups=list(state.channel_groups),
-        )
-        existing = config_repo.get_general_config(profile)
-        if existing is None or existing != general:
-            config_repo.save_general_config(profile, general)
 
     # ── 2. Toggle confocal mode ──
     _t0 = time.perf_counter()

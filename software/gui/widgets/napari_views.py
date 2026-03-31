@@ -1209,7 +1209,7 @@ class NapariLiveWidget(QWidget):
 
     def select_new_microscope_mode_by_name(self, config_index):
         config_name = self.dropdown_modeSelection.itemText(config_index)
-        maybe_new_config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, config_name)
+        maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
 
         if not maybe_new_config:
             self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")

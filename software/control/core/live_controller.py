@@ -375,7 +375,7 @@ class LiveController:
             self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
         ):
             self.camera.enable_callbacks(True)  # in case it's disabled e.g. by the laser AF controller
-            self._start_triggerred_acquisition()
+            self._start_triggered_acquisition()
         # if controlling the laser displacement measurement camera
         if self.for_displacement_measurement:
             self.microscope.low_level_drivers.microcontroller.set_pin_level(MCU_PINS.AF_LASER, 1)
@@ -386,13 +386,13 @@ class LiveController:
             self._log.info("stopping live: is_live is True")
             self.is_live = False
             if self.trigger_mode == TriggerMode.SOFTWARE:
-                self._stop_triggerred_acquisition()
+                self._stop_triggered_acquisition()
             if self.trigger_mode == TriggerMode.CONTINUOUS:
                 self.camera.stop_streaming()
             if (self.trigger_mode == TriggerMode.SOFTWARE) or (
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
-                self._stop_triggerred_acquisition()
+                self._stop_triggered_acquisition()
             # Disable the streaming gate -- this turns off all hardware while
             # preserving logical state, replacing the manual turn_off_illumination call.
             ic = self.microscope.illumination_controller
@@ -453,7 +453,7 @@ class LiveController:
         self.timer_trigger.daemon = True
         self.timer_trigger.start()
 
-    def _start_triggerred_acquisition(self):
+    def _start_triggered_acquisition(self):
         self._start_new_timer()
 
     def _set_trigger_fps(self, fps_trigger):
@@ -465,7 +465,7 @@ class LiveController:
         if self.is_live:
             self._start_new_timer()
 
-    def _stop_triggerred_acquisition(self):
+    def _stop_triggered_acquisition(self):
         self._stop_existing_timer()
 
     # trigger mode and settings
@@ -474,19 +474,19 @@ class LiveController:
             if self.is_live and (
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
-                self._stop_triggerred_acquisition()
+                self._stop_triggered_acquisition()
             self.camera.set_acquisition_mode(CameraAcquisitionMode.SOFTWARE_TRIGGER)
             if self.is_live:
-                self._start_triggerred_acquisition()
+                self._start_triggered_acquisition()
             self.microscope.low_level_drivers.microcontroller.set_trigger_mode(0)
         if mode == TriggerMode.HARDWARE:
             if self.trigger_mode == TriggerMode.SOFTWARE and self.is_live:
-                self._stop_triggerred_acquisition()
+                self._stop_triggered_acquisition()
             self.camera.set_acquisition_mode(CameraAcquisitionMode.HARDWARE_TRIGGER)
             self.camera.set_exposure_time(self.current_observation_state.exposure_time)
 
             if self.is_live and self.use_internal_timer_for_hardware_trigger:
-                self._start_triggerred_acquisition()
+                self._start_triggered_acquisition()
 
             self.microscope.low_level_drivers.microcontroller.set_trigger_mode(HARDWARE_TRIGGER_MODE)
 
@@ -494,7 +494,7 @@ class LiveController:
             if (self.trigger_mode == TriggerMode.SOFTWARE) or (
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
-                self._stop_triggerred_acquisition()
+                self._stop_triggered_acquisition()
             self.camera.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
             self.microscope.low_level_drivers.microcontroller.set_trigger_mode(0)
         self.trigger_mode = mode
