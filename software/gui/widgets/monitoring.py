@@ -389,12 +389,10 @@ def _populate_filter_positions_for_combo(
 
 
 class ObservationStateConfiguratorDialog(QDialog):
-    """Dialog for editing acquisition channel configurations.
+    """Dialog for editing acquisition channel configurations (observation presets).
 
-    Edits user_profiles/{profile}/channel_configs/general.yaml.
-    Unlike IlluminationChannelConfiguratorDialog (hardware), this edits
-    user-facing channel settings like enabled state, display color, camera,
-    and filter wheel assignments.
+    Edits user_profiles/{profile}/observation_presets/*.yaml.
+    Each preset is an ObservationState representing one acquisition channel.
     """
 
     signal_channels_updated = Signal()
@@ -412,7 +410,8 @@ class ObservationStateConfiguratorDialog(QDialog):
         super().__init__(parent)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.config_repo = config_repo
-        self.general_config = None
+        self._preset_states: list = []      # List[ObservationState] currently in dialog
+        self._original_names: list = []     # names as loaded, to track deletions
         self.illumination_config = None
         self.setWindowTitle("Acquisition Channel Configuration")
         self.setMinimumSize(700, 400)
@@ -508,23 +507,28 @@ class ObservationStateConfiguratorDialog(QDialog):
         # Cancel is always enabled
 
     def _load_channels(self):
-        """Load acquisition channels from general.yaml into the table."""
-        self.general_config = self.config_repo.get_general_config()
+        """Load acquisition channels from observation presets into the table."""
         self.illumination_config = self.config_repo.get_illumination_config()
 
-        if not self.general_config:
-            self._log.warning("No general config found for current profile")
+        preset_names = self.config_repo.list_observation_presets()
+        self._preset_states = []
+        for name in preset_names:
+            state = self.config_repo.load_observation_preset(name)
+            if state is not None:
+                self._preset_states.append(state)
+        self._original_names = [s.name for s in self._preset_states]
+
+        if not self._preset_states:
+            self._log.warning("No observation presets found for current profile")
             QMessageBox.warning(
                 self,
                 "No Configuration",
                 "No channel configuration found for the current profile.\n"
                 "Please ensure a profile is selected and has been initialized.",
             )
-            # Disable buttons when no config is loaded
             self._set_buttons_enabled(False)
             return
 
-        # Enable buttons when config is loaded
         self._set_buttons_enabled(True)
 
         # Determine column visibility
@@ -532,21 +536,15 @@ class ObservationStateConfiguratorDialog(QDialog):
         wheel_names = self.config_repo.get_filter_wheel_names()
         has_any_wheel = wheel_names or _is_filter_wheel_enabled(self.config_repo)
 
-        # Hide Camera column if single camera (0 or 1)
         if len(camera_names) <= 1:
             self.table.setColumnHidden(self.COL_CAMERA, True)
-
-        # Hide Filter Wheel column if single wheel (auto-assigned)
         if len(wheel_names) <= 1:
             self.table.setColumnHidden(self.COL_FILTER_WHEEL, True)
-
-        # Hide Filter Position column only if NO wheels at all
         if not has_any_wheel:
             self.table.setColumnHidden(self.COL_FILTER_POSITION, True)
 
-        self.table.setRowCount(len(self.general_config.observation_states))
-
-        for row, state in enumerate(self.general_config.observation_states):
+        self.table.setRowCount(len(self._preset_states))
+        for row, state in enumerate(self._preset_states):
             self._populate_row(row, state)
 
     def _populate_row(self, row: int, state):
@@ -626,95 +624,78 @@ class ObservationStateConfiguratorDialog(QDialog):
 
     def _add_channel(self):
         """Add a new observation state."""
-        if self.general_config is None:
-            QMessageBox.warning(self, "Error", "No configuration loaded. Cannot add channel.")
-            return
-
         dialog = AddObservationStateDialog(self.config_repo, self)
         if dialog.exec_() == QDialog.Accepted:
             state = dialog.get_channel()
             if state:
-                self.general_config.observation_states.append(state)
-                # Reload table
-                self._load_channels()
+                self._preset_states.append(state)
+                self.table.setRowCount(len(self._preset_states))
+                self._populate_row(len(self._preset_states) - 1, state)
 
     def _remove_channel(self):
         """Remove selected observation state."""
-        if self.general_config is None:
-            return
-
         current_row = self.table.currentRow()
-        if current_row < 0:
+        if current_row < 0 or current_row >= len(self._preset_states):
             return
 
         name_item = self.table.item(current_row, self.COL_NAME)
-        if name_item:
-            reply = QMessageBox.question(
-                self,
-                "Confirm Removal",
-                f"Remove channel '{name_item.text()}'?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes and current_row < len(self.general_config.observation_states):
-                del self.general_config.observation_states[current_row]
-                self._load_channels()
+        name = name_item.text() if name_item else self._preset_states[current_row].name
+        reply = QMessageBox.question(
+            self,
+            "Confirm Removal",
+            f"Remove channel '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            del self._preset_states[current_row]
+            self.table.setRowCount(len(self._preset_states))
+            for row, state in enumerate(self._preset_states):
+                self._populate_row(row, state)
 
     def _move_up(self):
         """Move selected observation state up."""
-        if self.general_config is None:
-            return
-
         current_row = self.table.currentRow()
-        if current_row <= 0:
+        if current_row <= 0 or current_row >= len(self._preset_states):
             return
 
-        states = self.general_config.observation_states
-        states[current_row - 1], states[current_row] = states[current_row], states[current_row - 1]
-        self._load_channels()
+        self._preset_states[current_row - 1], self._preset_states[current_row] = (
+            self._preset_states[current_row],
+            self._preset_states[current_row - 1],
+        )
+        self._populate_row(current_row - 1, self._preset_states[current_row - 1])
+        self._populate_row(current_row, self._preset_states[current_row])
         self.table.selectRow(current_row - 1)
 
     def _move_down(self):
         """Move selected observation state down."""
-        if self.general_config is None:
-            return
-
         current_row = self.table.currentRow()
-        if current_row < 0 or current_row >= len(self.general_config.observation_states) - 1:
+        if current_row < 0 or current_row >= len(self._preset_states) - 1:
             return
 
-        states = self.general_config.observation_states
-        states[current_row], states[current_row + 1] = states[current_row + 1], states[current_row]
-        self._load_channels()
+        self._preset_states[current_row], self._preset_states[current_row + 1] = (
+            self._preset_states[current_row + 1],
+            self._preset_states[current_row],
+        )
+        self._populate_row(current_row, self._preset_states[current_row])
+        self._populate_row(current_row + 1, self._preset_states[current_row + 1])
         self.table.selectRow(current_row + 1)
 
     def _save_changes(self):
-        """Save changes to general.yaml."""
-        if self.general_config is None:
-            QMessageBox.warning(self, "Error", "No configuration loaded. Cannot save.")
-            return
-
-        # Sync table data to config object
+        """Save changes to observation presets."""
         self._sync_table_to_config()
 
-        # Validate filter wheel/position consistency
-        warnings = []
-        for state in self.general_config.observation_states:
-            # Check emission filter positions for completeness
-            pass  # No filter_wheel field on ObservationState; positions are in emission_filter_positions
-
-        if warnings:
-            reply = QMessageBox.warning(
-                self,
-                "Configuration Warning",
-                "Some channels have incomplete filter settings:\n\n" + "\n".join(warnings) + "\n\nSave anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        # Save to YAML file
         try:
-            self.config_repo.save_general_config(self.config_repo.current_profile, self.general_config)
+            current_names = {s.name for s in self._preset_states}
+            # Delete presets that were removed
+            for name in self._original_names:
+                if name not in current_names:
+                    from control.core.observation_state_service import observation_preset_path
+                    path = observation_preset_path(self.config_repo, name)
+                    if path.exists():
+                        path.unlink()
+            # Save each preset
+            for state in self._preset_states:
+                self.config_repo.save_observation_preset(state.name, state)
         except (PermissionError, OSError) as e:
             self._log.error(f"Failed to save channel configuration: {e}")
             QMessageBox.critical(self, "Save Failed", f"Cannot write configuration file:\n{e}")
@@ -729,10 +710,8 @@ class ObservationStateConfiguratorDialog(QDialog):
 
     def _export_config(self):
         """Export current channel configuration to a YAML file."""
-        from control.models import GeneralObservationConfig
         import yaml
 
-        # Get save file path
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Channel Configuration",
@@ -742,16 +721,14 @@ class ObservationStateConfiguratorDialog(QDialog):
         if not file_path:
             return
 
-        # Build current config from table (same logic as _save_changes but without saving)
         self._sync_table_to_config()
 
-        if not self.general_config:
+        if not self._preset_states:
             QMessageBox.warning(self, "Export Failed", "No configuration loaded to export.")
             return
 
-        # Export to YAML
         try:
-            data = self.general_config.model_dump()
+            data = {"observation_states": [s.model_dump(mode="json", exclude_none=True) for s in self._preset_states]}
             with open(file_path, "w") as f:
                 yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             QMessageBox.information(self, "Export Successful", f"Configuration exported to:\n{file_path}")
@@ -765,10 +742,9 @@ class ObservationStateConfiguratorDialog(QDialog):
     def _import_config(self):
         """Import channel configuration from a YAML file."""
         from pydantic import ValidationError
-        from control.models import GeneralObservationConfig
+        from control.models.observation_state import ObservationState
         import yaml
 
-        # Get file path
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import Channel Configuration",
@@ -778,13 +754,15 @@ class ObservationStateConfiguratorDialog(QDialog):
         if not file_path:
             return
 
-        # Load and validate
         try:
             with open(file_path, "r") as f:
                 data = yaml.safe_load(f)
-            if data is None:
+            if data is None or not isinstance(data, dict):
                 raise ValueError("File is empty or contains no valid YAML content")
-            imported_config = GeneralObservationConfig.model_validate(data)
+            raw_states = data.get("observation_states")
+            if not isinstance(raw_states, list):
+                raise ValueError("Expected 'observation_states' list in import file")
+            imported_states = [ObservationState.model_validate(d) for d in raw_states]
         except (PermissionError, FileNotFoundError) as e:
             self._log.warning(f"Cannot read import file {file_path}: {e}")
             QMessageBox.critical(self, "Import Failed", f"Cannot read file:\n{e}")
@@ -798,33 +776,24 @@ class ObservationStateConfiguratorDialog(QDialog):
             QMessageBox.critical(self, "Import Failed", f"Configuration format error:\n{e}")
             return
 
-        # Replace current config
-        self.general_config = imported_config
-
-        # Refresh the table
+        self._preset_states = imported_states
         self.table.setRowCount(0)
         self._load_channels()
 
         QMessageBox.information(
-            self, "Import Successful", f"Imported {len(imported_config.observation_states)} channels from:\n{file_path}"
+            self, "Import Successful", f"Imported {len(imported_states)} channels from:\n{file_path}"
         )
 
     def _sync_table_to_config(self):
-        """Sync table data back to self.general_config without saving to disk."""
-        if self.general_config is None:
-            return
-
-        # Use bounds checking to handle potential table/config mismatch
-        num_rows = min(self.table.rowCount(), len(self.general_config.observation_states))
+        """Sync table data back to self._preset_states without saving to disk."""
+        num_rows = min(self.table.rowCount(), len(self._preset_states))
         for row in range(num_rows):
-            state = self.general_config.observation_states[row]
+            state = self._preset_states[row]
 
-            # Name
             name_item = self.table.item(row, self.COL_NAME)
             if name_item:
                 state.name = name_item.text().strip()
 
-            # Illumination — update first illuminator state
             illum_combo = self.table.cellWidget(row, self.COL_ILLUMINATION)
             if illum_combo and isinstance(illum_combo, QComboBox):
                 illum_name = illum_combo.currentText()
@@ -836,14 +805,12 @@ class ObservationStateConfiguratorDialog(QDialog):
                         IlluminatorState(illumination_channel=illum_name, intensity=20.0, on=False)
                     ]
 
-            # Filter position -> emission_filter_positions
             position_combo = self.table.cellWidget(row, self.COL_FILTER_POSITION)
             if position_combo and isinstance(position_combo, QComboBox):
                 pos = position_combo.currentData()
                 if pos is not None:
                     state.emission_filter_positions["default"] = pos
 
-            # Display color
             color_btn = self.table.cellWidget(row, self.COL_DISPLAY_COLOR)
             if color_btn:
                 state.display_color = color_btn.property("color") or "#FFFFFF"
@@ -943,12 +910,10 @@ class AddObservationStateDialog(QDialog):
             return
 
         # Check for duplicate names
-        general_config = self.config_repo.get_general_config()
-        if general_config:
-            existing_names = [s.name for s in general_config.observation_states]
-            if name in existing_names:
-                QMessageBox.warning(self, "Validation Error", f"Channel '{name}' already exists.")
-                return
+        existing_names = self.config_repo.list_observation_presets()
+        if name in existing_names:
+            QMessageBox.warning(self, "Validation Error", f"Channel '{name}' already exists.")
+            return
 
         self.accept()
 

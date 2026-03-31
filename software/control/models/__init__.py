@@ -52,7 +52,6 @@ from control.models.observation_state import (
     ObservationState,
 )
 from control.models.acquisition_config import (
-    GeneralObservationConfig,
     AcquisitionOutputConfig,
     validate_illumination_references,
     get_illumination_channel_names,
@@ -113,7 +112,6 @@ __all__ = [
     # Acquisition
     "CameraSettings",
     "ConfocalSettings",
-    "GeneralObservationConfig",
     "AcquisitionOutputConfig",
     "AcquisitionMetadata",
     "IlluminatorState",

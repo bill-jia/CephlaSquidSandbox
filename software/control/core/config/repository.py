@@ -43,7 +43,6 @@ from control.models import (
     FilterWheelDefinition,
     FilterWheelRegistryConfig,
     FilterWheelType,
-    GeneralObservationConfig,
     IlluminationChannelConfig,
     CameraSettings,
     LaserAFConfig,
@@ -741,71 +740,57 @@ class ConfigRepository:
     # Core CRUD operations for acquisition channel settings
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def get_general_config(self, profile: Optional[str] = None) -> Optional[GeneralObservationConfig]:
-        """Load general observation configuration (cached when using current profile)."""
+    def get_observation_state(self, profile: Optional[str] = None) -> Optional[ObservationState]:
+        """Load the observation state from general.yaml (cached when using current profile)."""
         if profile is None or profile == self._current_profile:
             cache_key = "general"
             if cache_key not in self._profile_cache:
                 profile_path = self._get_profile_path()
                 path = profile_path / "channel_configs" / "general.yaml"
-                self._profile_cache[cache_key] = self._load_yaml(path, GeneralObservationConfig)
+                self._profile_cache[cache_key] = self._load_yaml(path, ObservationState)
             return self._profile_cache[cache_key]
         else:
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
-            return self._load_yaml(path, GeneralObservationConfig)
+            return self._load_yaml(path, ObservationState)
 
-    def save_general_config(self, profile: str, config: GeneralObservationConfig) -> None:
-        """Save general observation configuration and update cache if current profile."""
+    def save_observation_state(self, profile: str, state: ObservationState) -> None:
+        """Save the observation state to general.yaml and update cache."""
         if profile == self._current_profile:
             profile_path = self._get_profile_path()
             path = profile_path / "channel_configs" / "general.yaml"
-            self._save_yaml(path, config)
-            self._profile_cache["general"] = config
+            self._save_yaml(path, state)
+            self._profile_cache["general"] = state
         else:
             path = self.user_profiles_path / profile / "channel_configs" / "general.yaml"
-            self._save_yaml(path, config)
+            self._save_yaml(path, state)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # CHANNEL CONFIG CONVENIENCE METHODS
-    # Higher-level helpers for common channel config operations
-    # ═══════════════════════════════════════════════════════════════════════════
+    def get_general_config(self, profile: Optional[str] = None) -> Optional[ObservationState]:
+        """Alias for get_observation_state(). Returns the single ObservationState from general.yaml."""
+        return self.get_observation_state(profile)
 
-    def get_observation_states(self, profile: Optional[str] = None) -> List[ObservationState]:
-        """Get observation states from general.yaml.
-
-        Args:
-            profile: Profile name (defaults to current profile)
-
-        Returns:
-            List of ObservationState objects
-        """
-        general_config = self.get_general_config(profile)
-        if not general_config:
-            return []
-        return list(general_config.observation_states)
+    def save_general_config(self, profile: str, state: ObservationState) -> None:
+        """Alias for save_observation_state()."""
+        self.save_observation_state(profile, state)
 
     def update_channel_setting(
         self,
-        channel_name: str,
         setting: str,
         value: Any,
         profile: Optional[str] = None,
     ) -> bool:
         """
-        Update a specific setting of an observation state in-memory.
+        Update a specific setting of the observation state in-memory.
 
-        Changes are held in the cached GeneralObservationConfig and written to
-        general.yaml only at application shutdown (via :meth:`persist_general_config`).
+        Changes are held in the cached ObservationState and written to
+        general.yaml only at application shutdown (via :meth:`persist_observation_state`).
 
         Supported settings:
         - "ExposureTime" -> camera_settings.exposure_time_ms
         - "AnalogGain" -> camera_settings.gain_mode
-        - "IlluminationIntensity" -> illuminator_states[active].intensity
         - "IlluminationIris" -> confocal_hardware_settings.illumination_iris
         - "EmissionIris" -> confocal_hardware_settings.emission_iris
 
         Args:
-            channel_name: Name of the observation state to update
             setting: Setting name (see supported settings above)
             value: New value for the setting
             profile: Profile name (defaults to current profile)
@@ -821,7 +806,6 @@ class ConfigRepository:
         setting_mapping = {
             "ExposureTime": ("camera", "exposure_time_ms"),
             "AnalogGain": ("camera", "gain_mode"),
-            "IlluminationIntensity": ("illumination", "intensity"),
             "IlluminationIris": ("confocal_hw", "illumination_iris"),
             "EmissionIris": ("confocal_hw", "emission_iris"),
         }
@@ -832,14 +816,9 @@ class ConfigRepository:
 
         location, field = setting_mapping[setting]
 
-        general_config = self.get_general_config(profile)
-        if general_config is None:
-            logger.warning("No general config found")
-            return False
-
-        state = general_config.get_by_name(channel_name)
-        if not state:
-            logger.warning(f"Observation state '{channel_name}' not found in general config")
+        state = self.get_observation_state(profile)
+        if state is None:
+            logger.warning("No observation state found in general.yaml")
             return False
 
         if location == "confocal_hw":
@@ -855,41 +834,20 @@ class ConfigRepository:
                     gain_mode=0.0,
                 )
             setattr(state.camera_settings, field, value)
-        elif location == "illumination":
-            if state.illuminator_states:
-                for ist in state.illuminator_states:
-                    if ist.on or len(state.illuminator_states) == 1:
-                        ist.intensity = value
-            else:
-                logger.warning(f"No illuminator states found for '{channel_name}' in general config")
-                return False
 
         return True
 
-    def persist_general_config(
-        self,
-        current_state: Optional[ObservationState] = None,
-    ) -> None:
-        """Write the current observation state to general.yaml at shutdown.
+    def persist_observation_state(self) -> None:
+        """Write the in-memory ObservationState to general.yaml.
 
-        Args:
-            current_state: The live controller's current observation state.
-                If provided, it replaces the cached general config with a single
-                state named ``"general"``.  If None, falls back to the in-memory
-                cache (legacy behaviour).
+        Call at application shutdown to persist changes made during the session.
         """
         profile = self._current_profile
         if not profile:
             return
-
-        if current_state is not None:
-            general_state = current_state.model_copy(update={"name": "general"})
-            general = GeneralObservationConfig(observation_states=[general_state])
-        else:
-            general = self.get_general_config()
-
-        if general is not None:
-            self.save_general_config(profile, general)
+        state = self.get_observation_state()
+        if state is not None:
+            self.save_observation_state(profile, state)
 
     def get_last_active_channel_name(self) -> Optional[str]:
         """Read the channel name that was active when the app last shut down."""

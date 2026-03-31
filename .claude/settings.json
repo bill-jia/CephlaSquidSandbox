@@ -1,11 +1,31 @@
 {
-    "permissions": {
-      "allow": [
-        "Bash(xargs grep:*)",
-        "Bash(grep -r \"class.*Widget\" /c/Code/CephlaSquidSandbox/software/gui/widgets/*.py)",
-        "Bash(cmd.exe /c \"conda activate*\")",
-        "Bash(/c/Users/jialab/anaconda3/envs/squid/python.exe *)",
-        "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -c *)"
-      ]
-    }
+  "permissions": {
+    "allow": [
+      "Grep",
+      "Glob",
+      "LS",
+      "Read",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "Bash(conda activate *)",
+      "Bash(pixi *)",
+      "Bash(python *)",
+      "Bash(pytest *)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Bash(rm -rf *)",
+      "Bash(del /f /s /q *)"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "Bash(git commit*)"
+    ]
   }
+}

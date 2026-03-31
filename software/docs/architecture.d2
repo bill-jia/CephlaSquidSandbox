@@ -141,14 +141,24 @@ controllers: "Core Controllers" {
     |
   }
 
+  obs_ctrl: "ObservationStateController" {
+    class: controller
+    tooltip: |md
+      Central authority for the current ObservationState.
+      - Owns current_observation_state
+      - Mediates all widget-to-hardware communication
+      - Manages illumination, camera settings, optical path
+      - Handles preset loading and state collection
+    |
+  }
+
   live_ctrl: "LiveController" {
     class: controller
     tooltip: |md
-      Manages live camera streaming.
-      - Holds current_observation_state (ObservationState)
+      Manages live camera streaming and triggering only.
       - Toggles trigger mode (SW / HW / continuous)
-      - Synchronizes illumination on/off with exposure
-      - Controls frame rate
+      - Controls frame rate via internal timer
+      - Manages streaming gate for illumination synchronization
     |
   }
 

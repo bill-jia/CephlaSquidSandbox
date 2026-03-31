@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from control.lighting import IlluminationController
 import squid.logging
 
-from control.models import GeneralObservationConfig
 from control.models.observation_state import (
     CameraLiveSnapshot,
     CameraSettings,
@@ -515,7 +514,7 @@ def collect_observation_state(
         emission_filter_positions: Optional wheel positions from hardware/UI.
     """
     logger.info("collect_observation_state: collecting observation state from live controller")
-    merged = live_controller.get_observation_states()
+    merged = live_controller.obs_controller.get_observation_states()
 
     # Build illuminator_states from merged observation states
     illuminator_states = _collect_illuminator_states_from_observation_states(merged)
@@ -528,10 +527,10 @@ def collect_observation_state(
 
     # Determine the active state for z_offset, confocal_hardware_settings, display_color
     active_name: Optional[str] = None
-    if live_controller.currentConfiguration is not None:
-        active_name = live_controller.currentConfiguration.name
+    if live_controller.obs_controller.current_observation_state is not None:
+        active_name = live_controller.obs_controller.current_observation_state.name
     else:
-        fallback_fn = getattr(live_controller, "get_channel_name_for_contrast", None)
+        fallback_fn = getattr(live_controller.obs_controller, "get_channel_name_for_contrast", None)
         if fallback_fn is not None:
             fallback = fallback_fn()
             if fallback != "default":
@@ -560,7 +559,7 @@ def collect_observation_state(
 
     return ObservationState(
         name="live",
-        confocal_mode=live_controller.is_confocal_mode(),
+        confocal_mode=live_controller.obs_controller.is_confocal_mode(),
         camera_settings=camera_settings,
         illuminator_states=illuminator_states,
         z_offset_um=z_offset_um,
@@ -601,13 +600,13 @@ def apply_observation_state(
 
     # ── 2. Toggle confocal mode ──
     _t0 = time.perf_counter()
-    live_controller.toggle_confocal_widefield(state.confocal_mode)
+    live_controller.obs_controller.toggle_confocal_widefield(state.confocal_mode)
     logger.info("apply_observation_state: toggle_confocal_widefield took %.4fs", time.perf_counter() - _t0)
 
     # ── 3. Auto filter switching ──
     if state.enable_channel_auto_filter_switching is not None:
         try:
-            live_controller.enable_channel_auto_filter_switching = bool(
+            live_controller.obs_controller.enable_channel_auto_filter_switching = bool(
                 state.enable_channel_auto_filter_switching
             )
         except Exception as e:
@@ -675,7 +674,7 @@ def apply_observation_state(
     # No separate _sync_illumination_hardware / _restore_illumination_on_off needed.
     _t0 = time.perf_counter()
     logger.info(f"apply_observation_state: setting observation state: {state.name}")
-    live_controller.set_observation_state(state)
+    live_controller.obs_controller.apply_full_observation_state(state)
     logger.info("apply_observation_state: set_observation_state took %.4fs", time.perf_counter() - _t0)
 
 

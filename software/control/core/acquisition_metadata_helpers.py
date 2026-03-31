@@ -67,7 +67,7 @@ def build_acquisition_metadata(
         recording_start_time=t0,
         objective=current_objective,
         objective_details=objective_details,
-        confocal_mode=live_controller.is_confocal_mode(),
+        confocal_mode=live_controller.obs_controller.is_confocal_mode() if live_controller.obs_controller else False,
         sensor_pixel_size_um=sensor_px,
         tube_lens_mm=TUBE_LENS_MM,
         trigger_mode=trigger_mode,

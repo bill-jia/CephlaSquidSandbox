@@ -21,7 +21,6 @@ from control.models import (
     ConfocalSettings,
     FilterWheelDefinition,
     FilterWheelType,
-    GeneralObservationConfig,
     LaserAFConfig,
 )
 from control.models.illumination_config import (
@@ -467,36 +466,6 @@ class TestAcquisitionConfig:
         assert state.confocal_hardware_settings.illumination_iris == 50.0
         assert state.confocal_hardware_settings.emission_iris == 75.0
 
-    def test_general_observation_config(self):
-        """Test GeneralObservationConfig creation and methods."""
-        config = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="Channel A",
-                    display_color="#00FF00",
-                    camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[
-                        IlluminatorState(
-                            illumination_channel="A",
-                            intensity=20.0,
-                            on=False,
-                        ),
-                    ],
-                ),
-            ],
-        )
-
-        assert config.version == 3
-        assert len(config.observation_states) == 1
-
-        found = config.get_by_name("Channel A")
-        assert found is not None
-        assert found.name == "Channel A"
-
-        assert config.get_by_name("Nonexistent") is None
-
 class TestLaserAFConfig:
     """Tests for LaserAFConfig model."""
 
@@ -567,16 +536,16 @@ class TestValidateIlluminationReferences:
                 IlluminationChannel(name="BF LED full", type=IlluminationType.TRANSILLUMINATION, controller_port="USB1"),
             ],
         )
-        general = GeneralObservationConfig(
+        state = ObservationState(
             version=3,
-            observation_states=[
-                ObservationState(version=3, name="488 nm", camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=20.0, on=False)]),
-                ObservationState(version=3, name="BF", camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=5.0),
-                    illuminator_states=[IlluminatorState(illumination_channel="BF LED full", intensity=5.0, on=False)]),
+            name="live",
+            camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
+            illuminator_states=[
+                IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=20.0, on=False),
+                IlluminatorState(illumination_channel="BF LED full", intensity=5.0, on=False),
             ],
         )
-        errors = validate_illumination_references(general, ill_config)
+        errors = validate_illumination_references(state, ill_config)
         assert len(errors) == 0
 
     def test_invalid_illumination_channel_reference(self):
@@ -589,14 +558,15 @@ class TestValidateIlluminationReferences:
                 IlluminationChannel(name="Fluorescence 488nm", type=IlluminationType.EPI_ILLUMINATION, controller_port="D2", wavelength_nm=488),
             ],
         )
-        general = GeneralObservationConfig(
+        state = ObservationState(
             version=3,
-            observation_states=[
-                ObservationState(version=3, name="561 nm", camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[IlluminatorState(illumination_channel="Fluorescence 561nm", intensity=20.0, on=False)]),
+            name="live",
+            camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
+            illuminator_states=[
+                IlluminatorState(illumination_channel="Fluorescence 561nm", intensity=20.0, on=False),
             ],
         )
-        errors = validate_illumination_references(general, ill_config)
+        errors = validate_illumination_references(state, ill_config)
         assert len(errors) == 1
         assert "Fluorescence 561nm" in errors[0]
 
@@ -608,16 +578,16 @@ class TestGetIlluminationChannelNames:
         """Test extracting illumination channel names from config."""
         from control.models import get_illumination_channel_names
 
-        config = GeneralObservationConfig(
+        state = ObservationState(
             version=3,
-            observation_states=[
-                ObservationState(version=3, name="488 nm", camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
-                    illuminator_states=[IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=20.0, on=False)]),
-                ObservationState(version=3, name="BF", camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=5.0),
-                    illuminator_states=[IlluminatorState(illumination_channel="BF LED full", intensity=5.0, on=False)]),
+            name="live",
+            camera_settings=CameraSettings(exposure_time_ms=20.0, gain_mode=10.0),
+            illuminator_states=[
+                IlluminatorState(illumination_channel="Fluorescence 488nm", intensity=20.0, on=False),
+                IlluminatorState(illumination_channel="BF LED full", intensity=5.0, on=False),
             ],
         )
-        names = get_illumination_channel_names(config)
+        names = get_illumination_channel_names(state)
         assert "Fluorescence 488nm" in names
         assert "BF LED full" in names
         assert len(names) == 2
@@ -697,52 +667,6 @@ class TestFieldValidationConstraints:
         assert settings.gain_mode == 0.0
         with pytest.raises(ValidationError):
             CameraSettings(exposure_time_ms=10.0, gain_mode=-1.0)
-
-
-class TestGeneralObservationConfigGroups:
-    """Tests for GeneralObservationConfig channel group methods."""
-
-    def test_get_group_by_name_found(self):
-        """Test finding a channel group by name."""
-        from control.models import ChannelGroup, ChannelGroupEntry, SynchronizationMode
-
-        config = GeneralObservationConfig(
-            version=3,
-            observation_states=[
-                ObservationState(version=3, name="DAPI", illuminator_states=[]),
-                ObservationState(version=3, name="GFP", illuminator_states=[]),
-            ],
-            channel_groups=[
-                ChannelGroup(name="Nuclear Stain", channels=[ChannelGroupEntry(name="DAPI")], synchronization=SynchronizationMode.SEQUENTIAL),
-            ],
-        )
-        group = config.get_group_by_name("Nuclear Stain")
-        assert group is not None
-        assert group.name == "Nuclear Stain"
-        assert len(group.channels) == 1
-
-    def test_get_group_by_name_not_found(self):
-        """Test returning None when group name not found."""
-        config = GeneralObservationConfig(version=3, observation_states=[], channel_groups=[])
-        group = config.get_group_by_name("Nonexistent Group")
-        assert group is None
-
-    def test_get_group_names(self):
-        """Test getting list of all group names."""
-        from control.models import ChannelGroup, ChannelGroupEntry
-
-        config = GeneralObservationConfig(
-            version=3,
-            observation_states=[],
-            channel_groups=[
-                ChannelGroup(name="Group A", channels=[ChannelGroupEntry(name="Ch1")]),
-                ChannelGroup(name="Group B", channels=[ChannelGroupEntry(name="Ch2")]),
-            ],
-        )
-        names = config.get_group_names()
-        assert "Group A" in names
-        assert "Group B" in names
-        assert len(names) == 2
 
 
 class TestIlluminationChannelValidation:

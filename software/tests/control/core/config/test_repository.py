@@ -9,7 +9,6 @@ import shutil
 
 from control.core.config import ConfigRepository
 from control.models import (
-    GeneralObservationConfig,
     CameraSettings,
 )
 from control.models.observation_state import ObservationState, IlluminatorState
@@ -56,24 +55,21 @@ channels:
 """
     )
 
-    # Create a general config (schema v3)
+    # Create a general config (schema v3 - flat ObservationState)
     general_yaml = default_profile / "channel_configs" / "general.yaml"
     general_yaml.write_text(
         """
 version: 3
-channel_groups: []
-observation_states:
-  - version: 3
-    name: "Fluorescence 488nm"
-    display_color: "#00FF00"
-    z_offset_um: 0.0
-    camera_settings:
-      exposure_time_ms: 100.0
-      gain_mode: 0.0
-    illuminator_states:
-      - illumination_channel: "488nm"
-        intensity: 50.0
-        'on': false
+name: "Fluorescence 488nm"
+display_color: "#00FF00"
+z_offset_um: 0.0
+camera_settings:
+  exposure_time_ms: 100.0
+  gain_mode: 0.0
+illuminator_states:
+  - illumination_channel: "488nm"
+    intensity: 50.0
+    'on': false
 """
     )
 
@@ -195,13 +191,12 @@ class TestConfigRepositoryProfileConfigs:
     """Tests for profile config loading and saving."""
 
     def test_get_general_config(self, repo_with_profile):
-        """Test loading general config (schema v3)."""
+        """Test loading general config (schema v3 flat ObservationState)."""
         config = repo_with_profile.get_general_config()
 
         assert config is not None
         assert config.version == 3
-        assert len(config.observation_states) == 1
-        assert config.observation_states[0].name == "Fluorescence 488nm"
+        assert config.name == "Fluorescence 488nm"
 
     def test_get_general_config_cached(self, repo_with_profile):
         """Test that general config is cached."""
@@ -211,26 +206,21 @@ class TestConfigRepositoryProfileConfigs:
         assert config1 is config2
 
     def test_save_general_config(self, repo_with_profile, temp_dir):
-        """Test saving general config updates cache (schema v3)."""
-        new_config = GeneralObservationConfig(
+        """Test saving general config updates cache (schema v3 flat ObservationState)."""
+        new_config = ObservationState(
             version=3,
-            observation_states=[
-                ObservationState(
-                    version=3,
-                    name="Test Channel",
-                    display_color="#FF0000",
-                    camera_settings=CameraSettings(
-                        exposure_time_ms=200.0,
-                        gain_mode=0.0,
-                    ),
-                    illuminator_states=[
-                        IlluminatorState(
-                            illumination_channel="488nm",
-                            intensity=100.0,
-                            on=False,
-                        ),
-                    ],
-                )
+            name="Test Channel",
+            display_color="#FF0000",
+            camera_settings=CameraSettings(
+                exposure_time_ms=200.0,
+                gain_mode=0.0,
+            ),
+            illuminator_states=[
+                IlluminatorState(
+                    illumination_channel="488nm",
+                    intensity=100.0,
+                    on=False,
+                ),
             ],
         )
 
@@ -267,18 +257,15 @@ class TestConfigRepositoryCacheManagement:
             (profile_path / "general.yaml").write_text(
                 f"""
 version: 3
-channel_groups: []
-observation_states:
-  - version: 3
-    name: "Channel from {profile}"
-    display_color: "#00FF00"
-    camera_settings:
-      exposure_time_ms: 100.0
-      gain_mode: 0.0
-    illuminator_states:
-      - illumination_channel: "488nm"
-        intensity: 50.0
-        'on': false
+name: "Channel from {profile}"
+display_color: "#00FF00"
+camera_settings:
+  exposure_time_ms: 100.0
+  gain_mode: 0.0
+illuminator_states:
+  - illumination_channel: "488nm"
+    intensity: 50.0
+    'on': false
 """
             )
 
@@ -286,11 +273,11 @@ observation_states:
 
         repo.set_profile("profile1")
         config1 = repo.get_general_config()
-        assert "profile1" in config1.observation_states[0].name
+        assert "profile1" in config1.name
 
         repo.set_profile("profile2")
         config2 = repo.get_general_config()
-        assert "profile2" in config2.observation_states[0].name
+        assert "profile2" in config2.name
 
     def test_clear_profile_cache(self, repo_with_profile):
         """Test clearing profile cache."""
@@ -1272,18 +1259,15 @@ class TestUpdateChannelSettingV3:
 
         (profile / "channel_configs" / "general.yaml").write_text(
             "version: 3\n"
-            "observation_states:\n"
-            '  - name: "488nm"\n'
-            "    version: 3\n"
-            '    display_color: "#1FFF00"\n'
-            "    camera_settings:\n"
-            "      exposure_time_ms: 20.0\n"
-            "      gain_mode: 10.0\n"
-            "    illuminator_states:\n"
-            '      - illumination_channel: "488nm"\n'
-            "        intensity: 20.0\n"
-            "        'on': true\n"
-            "channel_groups: []\n"
+            'name: "488nm"\n'
+            'display_color: "#1FFF00"\n'
+            "camera_settings:\n"
+            "  exposure_time_ms: 20.0\n"
+            "  gain_mode: 10.0\n"
+            "illuminator_states:\n"
+            '  - illumination_channel: "488nm"\n'
+            "    intensity: 20.0\n"
+            "    'on': true\n"
         )
 
         repo = ConfigRepository(base_path=tmp_path)
@@ -1295,30 +1279,30 @@ class TestUpdateChannelSettingV3:
         result = repo_v3.update_channel_setting("488nm", "ExposureTime", 99.0)
         assert result is True
         gen = repo_v3.get_general_config()
-        assert gen.observation_states[0].camera_settings.exposure_time_ms == 99.0
+        assert gen.camera_settings.exposure_time_ms == 99.0
 
     def test_gain_update(self, repo_v3):
         """AnalogGain updates general config camera_settings."""
         result = repo_v3.update_channel_setting("488nm", "AnalogGain", 8.0)
         assert result is True
         gen = repo_v3.get_general_config()
-        assert gen.observation_states[0].camera_settings.gain_mode == 8.0
+        assert gen.camera_settings.gain_mode == 8.0
 
     def test_illumination_intensity_updates_general(self, repo_v3):
         """IlluminationIntensity updates general config illuminator_states."""
         result = repo_v3.update_channel_setting("488nm", "IlluminationIntensity", 55.0)
         assert result is True
         gen = repo_v3.get_general_config()
-        assert gen.observation_states[0].illuminator_states[0].intensity == 55.0
+        assert gen.illuminator_states[0].intensity == 55.0
 
     def test_iris_creates_confocal_hardware_settings(self, repo_v3):
         """IlluminationIris creates confocal_hardware_settings when None."""
         gen = repo_v3.get_general_config()
-        assert gen.observation_states[0].confocal_hardware_settings is None
+        assert gen.confocal_hardware_settings is None
 
         result = repo_v3.update_channel_setting("488nm", "IlluminationIris", 42.0)
         assert result is True
 
         gen = repo_v3.get_general_config()
-        assert gen.observation_states[0].confocal_hardware_settings is not None
-        assert gen.observation_states[0].confocal_hardware_settings.illumination_iris == 42.0
+        assert gen.confocal_hardware_settings is not None
+        assert gen.confocal_hardware_settings.illumination_iris == 42.0

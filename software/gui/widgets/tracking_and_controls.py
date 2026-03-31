@@ -51,7 +51,7 @@ class TrackingControllerWidget(QFrame):
         self.entry_tracking_interval.setValue(0)
 
         self.list_configurations = QListWidget()
-        for microscope_configuration in self.trackingController.liveController.get_observation_states():
+        for microscope_configuration in self.trackingController.liveController.obs_controller.get_observation_states():
             self.list_configurations.addItems([microscope_configuration.name])
         self.list_configurations.setSelectionMode(
             QAbstractItemView.MultiSelection

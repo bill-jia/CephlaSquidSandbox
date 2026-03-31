@@ -71,16 +71,14 @@ class AutofocusWorker:
             self.stage.move_z(self.deltaZ)
             steps_moved = steps_moved + 1
             # trigger acquisition (including turning on the illumination) and read frame
-            ic = self.liveController.microscope.illumination_controller
             if self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE:
-                active = self.liveController.current_observation_state.active_illuminator_states if self.liveController.current_observation_state else []
-                ic.apply_observation_illumination(active, turn_on=True, force_hardware=True)
+                self.liveController.obs_controller.turn_on_illumination()
                 self.wait_till_operation_is_completed()
                 self.camera.send_trigger()
                 image = self.camera.read_frame()
             elif self.liveController.trigger_mode == control._def.TriggerMode.HARDWARE:
                 if (
-                    "Fluorescence" in self.liveController.currentConfiguration.name
+                    "Fluorescence" in self.liveController.obs_controller.current_observation_state.name
                     and control._def.ENABLE_NL5
                     and control._def.NL5_USE_DOUT
                 ):
@@ -95,10 +93,9 @@ class AutofocusWorker:
                     image = self.camera.read_frame()
             if image is None:
                 continue
-            # turn off the illumination if using software trigger
+            # tunr of the illumination if using software trigger
             if self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE:
-                active = self.liveController.current_observation_state.active_illuminator_states if self.liveController.current_observation_state else []
-                ic.apply_observation_illumination(active, turn_on=False, force_hardware=True)
+                self.liveController.obs_controller.turn_off_illumination()
 
             image = utils.crop_image(image, self.crop_width, self.crop_height)
             self._image_to_display_fn(image)

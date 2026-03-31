@@ -7,15 +7,46 @@ This document provides a technical reference for developers working with Squid's
 The configuration system is built on:
 
 - **ConfigRepository**: Centralized config I/O with caching (pure Python, no Qt)
+- **ObservationStateController**: Central authority for the current ObservationState — mediates all widget-to-hardware communication
+- **LiveController**: Camera streaming and triggering only
 - **Pydantic Models**: Type-safe configuration validation
-- **ObservationState**: Single persistent observation configuration (no objective override layer)
+- **ObservationState**: Single persistent observation configuration
 
 ### Key Design Decisions
 
 1. **Pure Python**: ConfigRepository has no Qt dependencies, enabling use in subprocesses
 2. **Lazy Loading**: Configs loaded on first access, cached for performance
 3. **Profile Isolation**: Switching profiles clears cache to ensure fresh data
-4. **Single Source of Truth**: All config access should go through ConfigRepository
+4. **Single Source of Truth**: All config access goes through ConfigRepository; all hardware access goes through ObservationStateController
+5. **Widgets don't talk to hardware directly**: UI widgets call ObservationStateController methods, which update ObservationState and apply changes to hardware controllers
+
+### Controller Architecture
+
+```
+ObservationStateController (owns ObservationState)
+├── set_exposure_time(ms) → updates ObservationState + camera hardware
+├── set_analog_gain(v)    → updates ObservationState + camera hardware
+├── set_illumination_intensity(ch, v) → updates ObservationState + IC (always)
+├── set_illumination_on_off(ch, on)   → updates ObservationState + IC (gated by streaming)
+├── apply_full_observation_state(s)   → full apply: camera + illumination + optical path
+├── collect_observation_state()       → snapshot current state from hardware
+└── ...
+
+LiveController (camera streaming/triggering only)
+├── start_live() / stop_live()  → streaming gate + camera + timer
+├── trigger_acquisition()       → software trigger
+├── set_trigger_mode/fps()      → camera acquisition mode
+└── on_new_frame()              → low-FPS illumination toggle
+
+CameraSettingsWidget → obs_controller.set_exposure_time/gain/mode/binning
+IlluminationWidget   → obs_controller.set_illumination_intensity/on_off/led_mode
+```
+
+**Hardware gating rules:**
+- Camera settings (exposure, gain, binning, mode): always applied to hardware
+- Illumination intensity: always applied (IC intensity is ungated)
+- Illumination on/off: gated — logical state always updated; hardware only when streaming
+- Optical path (emission filters, confocal iris): always applied
 
 ---
 
@@ -132,15 +163,11 @@ config_repo.save_filter_wheel_registry(filter_wheel_registry)
 Observation state configs are cached per-profile. Cache is cleared on profile switch.
 
 ```python
-# Get general config (contains observation states)
-general = config_repo.get_general_config()
+# Get the general observation state (single ObservationState from general.yaml)
+state = config_repo.get_observation_state()
 
-# Get observation states directly
-states = config_repo.get_observation_states()
-# Returns: List[ObservationState]
-
-# Save general config
-config_repo.save_general_config("my_profile", general)
+# Save general observation state
+config_repo.save_observation_state("my_profile", state)
 
 # Save/load observation presets
 config_repo.save_observation_preset("my_preset", observation_state)
@@ -355,19 +382,12 @@ from control.models import (
 )
 
 # Load configs
-general = config_repo.get_general_config()
+state = config_repo.get_observation_state()
 objective = config_repo.get_objective_config("20x")
-
-# Get channel by name
-channel = general.get_channel_by_name("Fluorescence 488 nm Ex")
-
-# Merge configs manually
-merged_channels = merge_channel_configs(general, objective)
-# Returns: List[AcquisitionChannel]
 
 # Validate illumination references
 ill_config = config_repo.get_illumination_config()
-errors = validate_illumination_references(general, ill_config)
+errors = validate_illumination_references(state, ill_config)
 if errors:
     for error in errors:
         print(f"Validation error: {error}")
@@ -676,7 +696,7 @@ except FileNotFoundError as e:
 # ValidationError: Invalid YAML structure
 from pydantic import ValidationError
 try:
-    config = config_repo.get_general_config()
+    config = config_repo.get_observation_state()
 except ValidationError as e:
     print(f"Config validation failed: {e}")
 ```
@@ -696,7 +716,7 @@ if confocal is not None:
 obj_config = config_repo.get_objective_config("20x")
 if obj_config is None:
     # Fall back to general-only
-    channels = list(config_repo.get_general_config().channels)
+    state = config_repo.get_observation_state()
 ```
 
 ---

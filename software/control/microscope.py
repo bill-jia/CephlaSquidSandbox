@@ -841,11 +841,21 @@ class Microscope:
                 for_displacement_measurement=True,  # Used for laser spot detection
             )
 
-        # Live controller for main camera
-        # Handles live image streaming, illumination control, and trigger modes
+        # Observation state controller — owns the current ObservationState
+        # and mediates widget-to-hardware communication
+        from control.core.observation_state_controller import ObservationStateController
+        self.obs_controller: ObservationStateController = ObservationStateController(
+            microscope=self, camera=self.camera
+        )
+
+        # Live controller for main camera — handles streaming and triggering only
         self.live_controller: LiveController = LiveController(microscope=self, camera=self.camera)
 
-        # Sync confocal mode from hardware (must be after LiveController creation)
+        # Wire the two controllers together (late binding avoids circular init)
+        self.obs_controller.live_controller = self.live_controller
+        self.live_controller.obs_controller = self.obs_controller
+
+        # Sync confocal mode from hardware (must be after controller creation)
         if control._def.ENABLE_SPINNING_DISK_CONFOCAL:
             self._sync_confocal_mode_from_hardware()
 
@@ -934,7 +944,7 @@ class Microscope:
                 sync_successful = False
 
         if sync_successful:
-            self.live_controller.sync_confocal_mode_from_hardware(confocal_mode)
+            self.obs_controller.sync_confocal_mode_from_hardware(confocal_mode)
         else:
             self._log.warning(
                 "Confocal mode could not be synchronized from hardware; " "keeping existing live controller state."
@@ -973,7 +983,8 @@ class Microscope:
         Returns:
             True if in confocal mode, False if in widefield mode.
         """
-        return self.live_controller.is_confocal_mode()
+        obs = self.live_controller.obs_controller
+        return obs.is_confocal_mode() if obs else False
 
     def update_camera_functions(self, functions: StreamHandlerFunctions) -> None:
         """Update the stream handler callback functions for the main camera.

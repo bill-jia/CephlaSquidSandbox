@@ -13,7 +13,6 @@ from control.core.observation_state_service import (
     sanitize_preset_filename,
 )
 from control.core.acquisition_metadata_helpers import legacy_flat_multipoint_from_acquisition_yaml_dict
-from control.models import GeneralObservationConfig
 from control.models.acquisition_metadata import AcquisitionMetadata
 from control.models.observation_state import (
     CameraLiveSnapshot,
@@ -170,7 +169,7 @@ def test_apply_observation_state_persist_false_skips_save_general():
 
     repo = MagicMock()
     repo.current_profile = "p1"
-    repo.get_general_config.return_value = None
+    repo.get_observation_state.return_value = None
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
@@ -188,7 +187,7 @@ def test_apply_observation_state_persist_false_skips_save_general():
         emission_filter_wheel=None
     )
 
-    repo.save_general_config.assert_not_called()
+    repo.save_observation_state.assert_not_called()
     lc.set_observation_state.assert_called()
 
 
@@ -197,15 +196,10 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
     from control.core.observation_state_service import apply_observation_state
 
     state = _minimal_state(on=True)
-    matching = GeneralObservationConfig(
-        version=3,
-        observation_states=[state],
-        channel_groups=list(state.channel_groups),
-    )
 
     repo = MagicMock()
     repo.current_profile = "p1"
-    repo.get_general_config.return_value = matching
+    repo.get_observation_state.return_value = state
 
     lc = MagicMock()
     lc.is_confocal_mode.return_value = state.confocal_mode
@@ -217,7 +211,7 @@ def test_apply_observation_state_skips_general_yaml_when_unchanged():
 
     apply_observation_state(state, repo, lc, objective_store, emission_filter_wheel=None)
 
-    repo.save_general_config.assert_not_called()
+    repo.save_observation_state.assert_not_called()
 
 
 def test_apply_observation_state_restores_saved_illumination_on_off_state():
@@ -228,7 +222,7 @@ def test_apply_observation_state_restores_saved_illumination_on_off_state():
 
     repo = MagicMock()
     repo.current_profile = "p1"
-    repo.get_general_config.return_value = None
+    repo.get_observation_state.return_value = None
 
     illum = MagicMock()
     illum.channel_names = ["TestLaser", "OtherLaser"]
@@ -287,7 +281,7 @@ def test_apply_observation_state_can_skip_live_trigger_restore():
 
     repo = MagicMock()
     repo.current_profile = "p1"
-    repo.get_general_config.return_value = None
+    repo.get_observation_state.return_value = None
 
     illum = MagicMock()
     illum.channel_names = ["TestLaser"]
@@ -326,7 +320,7 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
         "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
     )
-    # Create a minimal general.yaml with ObservationState
+    # Create a minimal general.yaml as flat ObservationState
     state_for_general = ObservationState(
         version=3,
         name="TestLaser",
@@ -336,9 +330,8 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
             IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
         ],
     )
-    general = GeneralObservationConfig(version=3, observation_states=[state_for_general], channel_groups=[])
     (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
-        yaml.safe_dump(general.model_dump(mode="json")), encoding="utf-8"
+        yaml.safe_dump(state_for_general.model_dump(mode="json", exclude_none=True)), encoding="utf-8"
     )
 
     repo = ConfigRepository(base_path=base)
@@ -371,9 +364,8 @@ def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):
         ],
     )
     for prof in ("alpha", "beta"):
-        gen = GeneralObservationConfig(version=3, observation_states=[state_for_general], channel_groups=[])
         (base / "user_profiles" / prof / "channel_configs" / "general.yaml").write_text(
-            yaml.safe_dump(gen.model_dump(mode="json")), encoding="utf-8"
+            yaml.safe_dump(state_for_general.model_dump(mode="json", exclude_none=True)), encoding="utf-8"
         )
 
     repo = ConfigRepository(base_path=base)

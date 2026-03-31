@@ -11,8 +11,7 @@ Example usage:
     repo = ConfigRepository()
     repo.set_profile("default")
 
-    general = repo.get_general_config()
-    states = general.observation_states
+    state = repo.get_observation_state()
 """
 
 from control.core.config.repository import ConfigRepository

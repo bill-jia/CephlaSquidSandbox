@@ -494,11 +494,18 @@ class MultiPointWorker:
     def _apply_current_illumination_state_to_hardware(self) -> None:
         """Assert the illumination controller's current logical on/off state on hardware."""
         ic = self.microscope.illumination_controller
-        with self._timing.get_timer("apply_shutter_state_to_hardware"):
+        with self._timing.get_timer("get_shutter_state"):
             try:
-                ic.apply_logical_state_to_hardware(force=True)
+                logical_states = ic.get_shutter_state()
             except Exception as e:
-                self._log.warning("Could not apply illumination state to hardware: %s", e)
+                self._log.warning("Could not read illumination logical state for capture: %s", e)
+                return
+        with self._timing.get_timer("apply_shutter_state_to_hardware"):
+            for name, is_on in logical_states.items():
+                try:
+                    ic.set_channel_state(name, is_on, force_hardware=True)
+                except Exception as e:
+                    self._log.warning("Could not apply illumination state for %r: %s", name, e)
 
     def _turn_off_capture_illumination_preserving_logical_state(self) -> None:
         """Clear hardware illumination after a snap without losing the saved logical state."""
@@ -1393,10 +1400,7 @@ class MultiPointWorker:
     def _select_config(self, config):
         """Apply an ObservationState to hardware before capture."""
         self.callbacks.signal_current_configuration(config)
-        if isinstance(config, ObservationState):
-            self.liveController.set_observation_state(config)
-        else:
-            self.liveController.set_microscope_mode(config)
+        self.liveController.obs_controller.apply_full_observation_state(config)
         self.wait_till_operation_is_completed()
 
     def perform_autofocus(self, region_id, fov):
@@ -1408,7 +1412,9 @@ class MultiPointWorker:
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
+                config_AF = self.liveController.get_channel_by_name(
+                    self.objectiveStore.current_objective, configuration_name_AF
+                )
                 self._select_config(config_AF)
                 if (
                     self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
@@ -1542,14 +1548,13 @@ class MultiPointWorker:
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
-        ic = self.microscope.illumination_controller
         if (
             self.liveController.trigger_mode == TriggerMode.SOFTWARE
             and self.keep_illuminators_on_between_captures
             and self._last_illumination_config_name is not None
             and self._last_illumination_config_name != config.name
         ):
-            ic.turn_off_all(preserve_logical_state=True)
+            self.liveController.obs_controller.turn_off_illumination()
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
@@ -1559,9 +1564,8 @@ class MultiPointWorker:
                 self._log.info("Using observation snapshot for capture")
                 self._apply_current_illumination_state_to_hardware()
             else:
-                self._log.info("Using live setting for capture")
-                active = self.liveController.current_observation_state.active_illuminator_states if self.liveController.current_observation_state else []
-                ic.apply_observation_illumination(active, turn_on=True, force_hardware=True)
+                self._log.info("Using legacy illumination for capture")
+                self.liveController.obs_controller.turn_on_illumination()
             self.wait_till_operation_is_completed()
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
@@ -1631,8 +1635,6 @@ class MultiPointWorker:
                 # If we wait for longer than 5x the exposure + 2 seconds, abort the acquisition because something is
                 # wrong.
                 non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
-                self._log.info(f"Waiting {self.camera.get_total_frame_time() / 1e3} [s] for exposure to complete")
-
                 if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
                     self._log.error("Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
                     self.request_abort_fn()
@@ -1654,8 +1656,7 @@ class MultiPointWorker:
         rgb_channels = ["BF LED matrix full_R", "BF LED matrix full_G", "BF LED matrix full_B"]
         images = {}
 
-        ic = self.microscope.illumination_controller
-        for config_ in self.liveController.get_observation_states():
+        for config_ in self.liveController.get_channels(self.objectiveStore.current_objective):
             if config_.name in rgb_channels:
                 if (
                     self.liveController.trigger_mode == TriggerMode.SOFTWARE
@@ -1663,14 +1664,14 @@ class MultiPointWorker:
                     and self._last_illumination_config_name is not None
                     and self._last_illumination_config_name != config_.name
                 ):
-                    ic.turn_off_all(preserve_logical_state=True)
+                    self.liveController.obs_controller.turn_off_illumination()
 
                 self._select_config(config_)
 
                 # trigger acquisition (including turning on the illumination)
                 if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-                    active = config_.active_illuminator_states
-                    ic.apply_observation_illumination(active, turn_on=True, force_hardware=True)
+                    # TODO(imo): use illum controller
+                    self.liveController.obs_controller.turn_on_illumination()
                     self.wait_till_operation_is_completed()
 
                 # read camera frame
@@ -1680,10 +1681,11 @@ class MultiPointWorker:
                     self._log.warning("self.camera.read_frame() returned None")
                     continue
 
+                # TODO(imo): use illum controller
                 # turn off the illumination if using software trigger
                 if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
                     if not self.keep_illuminators_on_between_captures:
-                        ic.turn_off_all(preserve_logical_state=True)
+                        self.liveController.obs_controller.turn_off_illumination()
                 self._last_illumination_config_name = config_.name
 
                 # add the image to dictionary

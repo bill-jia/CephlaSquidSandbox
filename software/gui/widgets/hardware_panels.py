@@ -1075,20 +1075,19 @@ class CameraSettingsWidget(QFrame):
         include_camera_temperature_setting=False,
         include_camera_auto_wb_setting=False,
         include_trigger_controls: bool = False,
-        live_controller: Optional[LiveController] = None,
+        obs_controller=None,
         main=None,
         filter_wheel_controller: Optional[AbstractFilterWheelController] = None,
-        config_repo: Optional[ConfigRepository] = None,
         *args,
         **kwargs,
     ):
 
         super().__init__(*args, **kwargs)
-        self._log = squid.logging.get_logger(self.__class__.__name__)
         self.camera: AbstractCamera = camera
-        self.live_controller: Optional[LiveController] = live_controller
+        self._log = squid.logging.get_logger(f"{self.__class__.__name__}/{self.camera.__class__})")
+        self._obs_controller = obs_controller
+        self.live_controller = obs_controller.live_controller if obs_controller else None
         self._filter_wheel_controller = filter_wheel_controller
-        self._config_repo = config_repo
         self.add_components(
             include_gain_exposure_time,
             include_camera_temperature_setting,
@@ -1189,14 +1188,18 @@ class CameraSettingsWidget(QFrame):
         # self.label_temperature_measured.setNum(0)
         self.label_temperature_measured.setFrameStyle(QFrame.Panel | QFrame.Sunken)
 
-        # connection
-        self.entry_exposureTime.valueChanged.connect(self.camera.set_exposure_time)
-        self.entry_exposureTime.valueChanged.connect(self._persist_exposure_time)
-        self.entry_analogGain.valueChanged.connect(self.set_analog_gain_if_supported)
-        self.entry_analogGain.valueChanged.connect(self._persist_analog_gain)
-        self.dropdown_cameraMode.currentTextChanged.connect(
-            lambda s: self.camera.set_camera_mode(s)
-        )
+        # connection — all mutations go through obs_controller
+        if self._obs_controller is not None:
+            self.entry_exposureTime.valueChanged.connect(self._obs_controller.set_exposure_time)
+            self.entry_analogGain.valueChanged.connect(self._obs_controller.set_analog_gain)
+            self.dropdown_cameraMode.currentTextChanged.connect(self._obs_controller.set_camera_mode)
+        else:
+            # Fallback for secondary cameras without obs_controller
+            self.entry_exposureTime.valueChanged.connect(self.camera.set_exposure_time)
+            self.entry_analogGain.valueChanged.connect(self.camera.set_analog_gain)
+            self.dropdown_cameraMode.currentTextChanged.connect(
+                lambda s: self.camera.set_camera_mode(s)
+            )
         self.entry_ROI_offset_x.valueChanged.connect(self.set_ROI_offset)
         self.entry_ROI_offset_y.valueChanged.connect(self.set_ROI_offset)
         self.entry_ROI_height.valueChanged.connect(self.set_Height)
@@ -1284,8 +1287,12 @@ class CameraSettingsWidget(QFrame):
             self.entry_triggerFPS.blockSignals(False)
 
             # Wire after initial values are set to avoid overriding during construction.
-            self.dropdown_triggerMode.currentTextChanged.connect(lambda s: self.live_controller.set_trigger_mode(s))
-            self.entry_triggerFPS.valueChanged.connect(lambda v: self.live_controller.set_trigger_fps(v))
+            if self._obs_controller is not None:
+                self.dropdown_triggerMode.currentTextChanged.connect(self._obs_controller.set_trigger_mode)
+                self.entry_triggerFPS.valueChanged.connect(self._obs_controller.set_trigger_fps)
+            elif hasattr(self, 'live_controller') and self.live_controller is not None:
+                self.dropdown_triggerMode.currentTextChanged.connect(lambda s: self.live_controller.set_trigger_mode(s))
+                self.entry_triggerFPS.valueChanged.connect(lambda v: self.live_controller.set_trigger_fps(v))
 
             trigger_row = QHBoxLayout()
             trigger_row.setSpacing(6)
@@ -1305,10 +1312,10 @@ class CameraSettingsWidget(QFrame):
         format_row.addStretch()
         left_col.addLayout(format_row)
 
-        if self._config_repo is not None:
+        if self._obs_controller is not None:
             self._emission_filter_panel = EmissionFilterWheelPanel(
                 self.live_controller,
-                config_repo=self._config_repo,
+                config_repo=self._obs_controller.config_repo,
                 filter_controller=self._filter_wheel_controller,
                 parent=self,
             )
@@ -1385,26 +1392,6 @@ class CameraSettingsWidget(QFrame):
             self.camera_layout.addWidget(self.btn_auto_wb)
 
         self.setLayout(self.camera_layout)
-
-    def set_analog_gain_if_supported(self, gain):
-        try:
-            self.camera.set_analog_gain(gain)
-        except NotImplementedError:
-            self._log.warning(f"Cannot set gain to {gain}, gain not supported.")
-
-    def _persist_exposure_time(self, value):
-        """Persist exposure time to the in-memory general config."""
-        if self._config_repo and self.live_controller:
-            name = self.live_controller.get_active_channel_name()
-            if name:
-                self._config_repo.update_channel_setting(name, "ExposureTime", value)
-
-    def _persist_analog_gain(self, value):
-        """Persist analog gain to the in-memory general config."""
-        if self._config_repo and self.live_controller:
-            name = self.live_controller.get_active_channel_name()
-            if name:
-                self._config_repo.update_channel_setting(name, "AnalogGain", value)
 
     def toggle_auto_wb(self, pressed):
         # 0: OFF  1:CONTINUOUS  2:ONCE
@@ -2023,29 +2010,24 @@ class LiveControlWidget(QFrame):
     def toggle_autolevel(self, autolevel_on):
         self.btn_autolevel.setChecked(autolevel_on)
 
-    # def select_new_microscope_mode_by_name(self, config_name):
-    #     maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
+    def select_new_microscope_mode_by_name(self, config_name):
+        maybe_new_config = self.liveController.obs_controller.get_observation_state_by_name(config_name)
+        if not maybe_new_config:
+            self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")
+            return
+        self.liveController.obs_controller.apply_full_observation_state(maybe_new_config)
+        self.update_ui_for_mode(maybe_new_config)
 
-    #     if not maybe_new_config:
-    #         self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")
-    #         return
-
-    #     self.liveController.set_microscope_mode(maybe_new_config)
-    #     self.update_ui_for_mode(maybe_new_config)
-
-    # def update_ui_for_mode(self, config):
-    #     try:
-    #         self.is_switching_mode = True
-    #         self.currentConfiguration = config
-    #         # if self.currentConfiguration is not None:
-    #         #     self.liveController.set_active_channel_reference(self.currentConfiguration)
-    #         # self.dropdown_modeSelection.blockSignals(True)
-    #         # self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
-    #         # self.dropdown_modeSelection.blockSignals(False)
-    #         if self.currentConfiguration:
-    #             self.signal_live_configuration.emit(self.currentConfiguration)
-    #     finally:
-    #         self.is_switching_mode = False
+    def update_ui_for_mode(self, config):
+        try:
+            self.is_switching_mode = True
+            self.currentConfiguration = config
+            if self.currentConfiguration is not None:
+                self.liveController.obs_controller.set_active_observation_state(self.currentConfiguration)
+            if self.currentConfiguration:
+                self.signal_live_configuration.emit(self.currentConfiguration)
+        finally:
+            self.is_switching_mode = False
 
     def _persist_iris_config(self, setting_name, new_value):
         if self.currentConfiguration:

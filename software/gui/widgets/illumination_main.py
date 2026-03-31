@@ -49,15 +49,19 @@ class IlluminationWidget(QWidget):
         self,
         illumination_controller: IlluminationController,
         parent=None,
+        obs_controller=None,
     ):
         """
         Args:
             illumination_controller: An ``IlluminationController`` instance that must
                 have a non-None ``channel_config`` attribute.
             parent: Optional parent widget.
+            obs_controller: ObservationStateController for mediated hardware access.
+                If provided, intensity/on-off/mode changes go through it.
         """
         super().__init__(parent)
         self._controller: IlluminationController = illumination_controller
+        self._obs_controller = obs_controller
         self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
 
         self._build_ui()
@@ -214,7 +218,10 @@ class IlluminationWidget(QWidget):
         spinbox.blockSignals(True)
         spinbox.setValue(float(value))
         spinbox.blockSignals(False)
-        self._controller.set_channel_intensity(channel_name, float(value))
+        if self._obs_controller is not None:
+            self._obs_controller.set_illumination_intensity(channel_name, float(value))
+        else:
+            self._controller.set_channel_intensity(channel_name, float(value))
 
     def _on_spinbox_changed(self, channel_name: str, value: float):
         row = self._channel_rows.get(channel_name)
@@ -224,7 +231,10 @@ class IlluminationWidget(QWidget):
         slider.blockSignals(True)
         slider.setValue(int(round(value)))
         slider.blockSignals(False)
-        self._controller.set_channel_intensity(channel_name, value)
+        if self._obs_controller is not None:
+            self._obs_controller.set_illumination_intensity(channel_name, value)
+        else:
+            self._controller.set_channel_intensity(channel_name, value)
 
     def _on_shutter_toggled(self, channel_name: str, checked: bool):
         row = self._channel_rows.get(channel_name)
@@ -233,7 +243,10 @@ class IlluminationWidget(QWidget):
         btn: QPushButton = row["btn"]
         btn.setText("ON" if checked else "OFF")
         self._apply_shutter_style(btn, checked)
-        self._controller.set_channel_state(channel_name, checked)
+        if self._obs_controller is not None:
+            self._obs_controller.set_illumination_on_off(channel_name, checked)
+        else:
+            self._controller.set_channel_state(channel_name, checked)
 
     def _on_led_matrix_mode_changed(self, channel_name: str, index: int):
         row = self._channel_rows.get(channel_name)
@@ -243,8 +256,11 @@ class IlluminationWidget(QWidget):
         if combo is None:
             return
         mode_key = combo.itemData(index)
-        if mode_key is not None and getattr(self._controller, "set_led_matrix_mode", None):
-            self._controller.set_led_matrix_mode(mode_key)
+        if mode_key is not None:
+            if self._obs_controller is not None:
+                self._obs_controller.set_led_matrix_mode(mode_key)
+            elif getattr(self._controller, "set_led_matrix_mode", None):
+                self._controller.set_led_matrix_mode(mode_key)
 
     def update_ui_for_mode(self, config=None) -> None:
         """Refresh illumination controls to match current hardware state.

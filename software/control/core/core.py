@@ -335,7 +335,7 @@ class TrackingController(QObject):
 
         # save pre-tracking configuration
         self._log.info("start tracking")
-        self.configuration_before_running_tracking = self.liveController.currentConfiguration
+        self.configuration_before_running_tracking = self.liveController.obs_controller.current_observation_state
 
         # stop live
         if self.liveController.is_live:
@@ -387,7 +387,7 @@ class TrackingController(QObject):
 
         # restore the previous selected mode
         self.signal_current_configuration.emit(self.configuration_before_running_tracking)
-        self.liveController.set_microscope_mode(self.configuration_before_running_tracking)
+        self.liveController.obs_controller.apply_full_observation_state(self.configuration_before_running_tracking)
 
         # re-enable callback
         if self.camera_callback_was_enabled_before_tracking:
@@ -418,7 +418,7 @@ class TrackingController(QObject):
                 output_dir=experiment_dir,
                 objective=self.objectiveStore.current_objective,
                 channels=self.selected_configurations,
-                confocal_mode=self.liveController.is_confocal_mode(),
+                confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
             )
             current_objective = self.objectiveStore.current_objective
             objective_details: Dict[str, Any] = {}
@@ -439,7 +439,7 @@ class TrackingController(QObject):
                 recording_start_time=self.recording_start_time,
                 objective=current_objective,
                 objective_details=objective_details,
-                confocal_mode=self.liveController.is_confocal_mode(),
+                confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
                 sensor_pixel_size_um=self.camera.get_pixel_size_binned_um(),
                 tube_lens_mm=control._def.TUBE_LENS_MM,
                 trigger_mode=trigger_mode,
@@ -460,7 +460,7 @@ class TrackingController(QObject):
     def set_selected_configurations(self, selected_configurations_name):
         self.selected_configurations = []
         for configuration_name in selected_configurations_name:
-            config = self.liveController.get_observation_state_by_name(configuration_name)
+            config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, configuration_name)
             if config:
                 self.selected_configurations.append(config)
 
@@ -539,11 +539,10 @@ class TrackingWorker(QObject):
 
     def _select_config(self, config):
         self.signal_current_configuration.emit(config)
-        self.liveController.set_microscope_mode(config)
+        # TODO(imo): replace with illumination controller.
+        self.liveController.obs_controller.apply_full_observation_state(config)
         self.microcontroller.wait_till_operation_is_completed()
-        ic = self.liveController.microscope.illumination_controller
-        active = config.active_illuminator_states if config else []
-        ic.apply_observation_illumination(active, turn_on=True, force_hardware=True)
+        self.liveController.obs_controller.turn_on_illumination()  # keep illumination on for single configuration acqusition
         self.microcontroller.wait_till_operation_is_completed()
 
     def run(self):
@@ -604,7 +603,7 @@ class TrackingWorker(QObject):
             image = camera_frame.frame
             t = camera_frame.timestamp
             if self.number_of_selected_configurations > 1:
-                self.liveController.microscope.illumination_controller.turn_off_all(preserve_logical_state=True)
+                self.liveController.obs_controller.turn_off_illumination()  # keep illumination on for single configuration acqusition
             image = np.squeeze(image)
             # get image size
             image_shape = image.shape
@@ -616,7 +615,8 @@ class TrackingWorker(QObject):
 
                 self.camera.send_trigger()
                 image_ = self.camera.read_frame()
-                self.liveController.microscope.illumination_controller.turn_off_all(preserve_logical_state=True)
+                # TODO(imo): use illumination controller
+                self.liveController.obs_controller.turn_off_illumination()
                 image_ = np.squeeze(image_)
                 # display image
                 image_to_display_ = utils.crop_image(
@@ -1259,7 +1259,7 @@ class ImageDisplayWindow(QMainWindow):
         min_val, max_val = info.min, info.max
 
         if self.liveController is not None and self.contrastManager is not None:
-            channel_name = self.liveController.get_channel_name_for_contrast()
+            channel_name = self.liveController.obs_controller.get_channel_name_for_contrast()
             if self.contrastManager.acquisition_dtype != None and self.contrastManager.acquisition_dtype != np.dtype(
                 image.dtype
             ):
@@ -1325,7 +1325,7 @@ class ImageDisplayWindow(QMainWindow):
     def update_contrast_limits(self):
         if self.show_LUT and self.contrastManager and self.contrastManager.acquisition_dtype:
             min_val, max_val = self.LUTWidget.region.getRegion()
-            self.contrastManager.update_limits(self.liveController.get_channel_name_for_contrast(), min_val, max_val)
+            self.contrastManager.update_limits(self.liveController.obs_controller.get_channel_name_for_contrast(), min_val, max_val)
 
     def update_ROI(self):
         self.roi_pos = self.ROI.pos()

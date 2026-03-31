@@ -14,7 +14,6 @@ from control.core.config import ConfigRepository
 from control.models import (
     CameraSettings,
     ConfocalSettings,
-    GeneralObservationConfig,
 )
 from control.models.observation_state import (
     IlluminatorState,
@@ -120,47 +119,53 @@ def create_general_observation_state(
     )
 
 
-def generate_general_config(
+def generate_default_observation_state(
     illumination_config: IlluminationChannelConfig,
     include_confocal: bool = False,
-    camera_id: Optional[int] = None,
-) -> GeneralObservationConfig:
+) -> ObservationState:
     """
-    Generate a general.yaml configuration from illumination channels.
+    Generate a default ObservationState with all illumination channels.
+
+    Creates a single ObservationState with one IlluminatorState per channel.
+    All channels start with on=False except the first.
 
     Args:
         illumination_config: Available illumination channels
         include_confocal: Whether to include confocal settings
-        camera_id: Camera ID (unused in v3 — kept for signature compatibility)
 
     Returns:
-        GeneralObservationConfig with default observation states
+        ObservationState with default settings for all channels
     """
-    observation_states = []
-    for ill_channel in illumination_config.channels:
-        state = create_general_observation_state(
-            ill_channel, include_confocal=include_confocal
+    illuminator_states = []
+    display_color = "#FFFFFF"
+    for i, ill_channel in enumerate(illumination_config.channels):
+        is_led = ill_channel.type == IlluminationType.TRANSILLUMINATION
+        intensity = DEFAULT_LED_ILLUMINATION_INTENSITY if is_led else DEFAULT_ILLUMINATION_INTENSITY
+        illuminator_states.append(
+            IlluminatorState(
+                illumination_channel=ill_channel.name,
+                intensity=intensity,
+                on=(i == 0),  # First channel on by default
+            )
         )
-        observation_states.append(state)
+        if i == 0:
+            display_color = get_display_color_for_channel(ill_channel)
 
-    return GeneralObservationConfig(version=3, observation_states=observation_states, channel_groups=[])
+    confocal_hw = None
+    if include_confocal:
+        confocal_hw = build_confocal_settings_from_config(None)
 
-
-def generate_default_configs(
-    illumination_config: IlluminationChannelConfig,
-    include_confocal: bool = False,
-) -> GeneralObservationConfig:
-    """
-    Generate default general.yaml config.
-
-    Args:
-        illumination_config: Available illumination channels
-        include_confocal: Whether to include confocal settings
-
-    Returns:
-        GeneralObservationConfig with default observation states
-    """
-    return generate_general_config(illumination_config, include_confocal=include_confocal)
+    return ObservationState(
+        version=3,
+        name="live",
+        display_color=display_color,
+        camera_settings=CameraSettings(
+            exposure_time_ms=DEFAULT_EXPOSURE_TIME_MS,
+            gain_mode=DEFAULT_GAIN_MODE,
+        ),
+        illuminator_states=illuminator_states,
+        confocal_hardware_settings=confocal_hw,
+    )
 
 
 def has_legacy_configs_to_migrate(profile: str, base_path: Optional[Path] = None) -> bool:
@@ -240,10 +245,10 @@ def ensure_default_configs(
         raise FileNotFoundError("illumination_channel_config.yaml is required to generate default configs")
 
     logger.info(f"Generating default configs for profile '{profile}'")
-    general_config = generate_default_configs(illumination_config, include_confocal=include_confocal)
+    general_config = generate_default_observation_state(illumination_config, include_confocal=include_confocal)
 
     config_repo.ensure_profile_directories(profile)
-    config_repo.save_general_config(profile, general_config)
+    config_repo.save_observation_state(profile, general_config)
 
     logger.info(f"Generated default configs for profile '{profile}': general.yaml")
     return True

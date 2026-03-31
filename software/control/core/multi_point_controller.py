@@ -549,16 +549,11 @@ class MultiPointController:
         preset_set = set(repo.list_observation_presets())
         self.selected_configurations = []
         self.selected_observation_state_names = []
-        names = list(selected_configurations_name)
-        if not names:
-            return
-        if all(n in preset_set for n in names):
-            self.selected_observation_state_names = names
-            return
-        for configuration_name in names:
-            config = self.liveController.get_observation_state_by_name(configuration_name)
-            if config:
-                self.selected_configurations.append(config)
+        for name in selected_configurations_name:
+            if name in preset_set:
+                self.selected_observation_state_names.append(name)
+            else:
+                self._log.warning("Channel '%s' not found in observation presets, skipping", name)
 
     def get_acquisition_image_count(self):
         """
@@ -604,12 +599,6 @@ class MultiPointController:
         if not was_streaming:
             self.camera.start_streaming()
         try:
-            channels = self.liveController.get_observation_states()
-            if not channels:
-                self._log.warning("No channels available in _temporary_get_an_image_hack")
-                return (None, False)
-            # Note: config is currently unused but kept for potential future use
-            config = channels[0]
             if (
                 self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE
                 or self.liveController.trigger_mode == control._def.TriggerMode.HARDWARE
@@ -628,10 +617,15 @@ class MultiPointController:
         configured acquisition on disk.  If you don't have at least this amount of disk space available
         when starting this acquisition, it is likely it will fail with an "out of disk space" error.
         """
-        # TODO(imo): This needs updating for AbstractCamera
-        if not len(self.liveController.get_observation_states()):
+        if self.selected_observation_state_names:
+            repo = self.liveController.microscope.config_repo
+            first_config = repo.load_observation_preset(self.selected_observation_state_names[0])
+        elif self.selected_configurations:
+            first_config = self.selected_configurations[0]
+        else:
             raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-        first_config = self.liveController.get_observation_states()[0]
+        if first_config is None:
+            raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
 
         # Our best bet is to grab an image, and use that for our size estimate.
         test_image = None
@@ -810,7 +804,7 @@ class MultiPointController:
 
             self.abort_acqusition_requested = False
 
-            self.configuration_before_running_multipoint = self.liveController.currentConfiguration
+            self.configuration_before_running_multipoint = self.liveController.obs_controller.current_observation_state
 
             # Snapshot illumination state before acquisition so it can be restored afterwards
             _illum_ctrl = getattr(self.liveController.microscope, "illumination_controller", None)
@@ -818,18 +812,19 @@ class MultiPointController:
                 _illum_ctrl.snapshot() if _illum_ctrl is not None else None
             )
 
-            # stop live (also turns off illumination hardware via the streaming gate)
+            # stop live
             if self.liveController.is_live:
                 self.liveController_was_live_before_multipoint = True
                 self.liveController.stop_live()  # @@@ to do: also uncheck the live button
             else:
                 self.liveController_was_live_before_multipoint = False
-                # If live wasn't running, ensure all channels are off before acquisition begins
-                if _illum_ctrl is not None:
-                    try:
-                        _illum_ctrl.turn_off_all(preserve_logical_state=True)
-                    except Exception as e:
-                        self._log.warning(f"Failed to turn off all illumination before acquisition: {e}")
+
+            # Ensure all channels are off before acquisition begins
+            if _illum_ctrl is not None:
+                try:
+                    _illum_ctrl.turn_off_all()
+                except Exception as e:
+                    self._log.warning(f"Failed to turn off all illumination before acquisition: {e}")
 
             self.camera_callback_was_enabled_before_multipoint = self.camera.get_callbacks_enabled()
             # We need callbacks, because we trigger and then use callbacks for image processing.  This
@@ -1074,7 +1069,7 @@ class MultiPointController:
                 self.autofocusController.focus_map_coords.append((x, y, z))
             self.autofocusController.use_focus_map = self.already_using_fmap
         self.callbacks.signal_current_configuration(self.configuration_before_running_multipoint)
-        self.liveController.set_microscope_mode(self.configuration_before_running_multipoint)
+        self.liveController.obs_controller.apply_full_observation_state(self.configuration_before_running_multipoint)
 
         # Restore illumination state that was active before the acquisition
         _illum_snapshot = getattr(self, "_illumination_snapshot_before_acquisition", None)
