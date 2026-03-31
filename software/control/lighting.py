@@ -499,6 +499,8 @@ class SerialIlluminationDevice(IlluminationDevice):
         self._intensity[channel] = intensity
 
     def turn_on(self, channel: str) -> None:
+        if self._is_on_state[channel]:
+            return
         ep = self._shutter_endpoints.get(channel)
         if ep is not None:
             ep.set_digital(True)
@@ -509,6 +511,8 @@ class SerialIlluminationDevice(IlluminationDevice):
         self._is_on_state[channel] = True
 
     def turn_off(self, channel: str) -> None:
+        if not self._is_on_state[channel]:
+            return
         ep = self._shutter_endpoints.get(channel)
         if ep is not None:
             ep.set_digital(False)
@@ -1062,7 +1066,6 @@ class IlluminationController:
         """Turn off every device output without changing logical on/off flags."""
         for dev in self._devices:
             try:
-                self._log.info(f"Turning off all hardware for {dev}[{dev.__class__.__name__}]")
                 dev.turn_off_all()
             except Exception as exc:
                 logger.warning(f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} failed: {exc}")
