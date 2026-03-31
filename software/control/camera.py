@@ -319,6 +319,10 @@ class DefaultCamera(AbstractCamera):
         raise NotImplementedError(f"No pixel format for gx format {gx_pixel=}")
 
     def set_pixel_format(self, pixel_format: CameraPixelFormat):
+        if pixel_format == self._pixel_format:
+            self._log.debug(f"set_pixel_format: already {pixel_format}, skipping")
+            return
+
         with self._pause_streaming():
             if not self._capabilities.settable_pixel_format:
                 raise NotImplementedError("The camera does not support setting pixel format.")
@@ -546,6 +550,10 @@ class DefaultCamera(AbstractCamera):
         # can't just blindly set them.  If the offset is growing, you need to set the width first.  If the
         # offset is decreasing, you need to set the offset first.
         (existing_offset_x, existing_offset_y, existing_width, existing_height) = self.get_region_of_interest()
+
+        if (offset_x, offset_y, width, height) == (existing_offset_x, existing_offset_y, existing_width, existing_height):
+            self._log.debug(f"set_region_of_interest: already {(offset_x, offset_y, width, height)}, skipping")
+            return
 
         with self._pause_streaming():
             if existing_offset_x < offset_x:
