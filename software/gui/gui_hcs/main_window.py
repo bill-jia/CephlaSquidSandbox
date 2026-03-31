@@ -1223,6 +1223,7 @@ class HighContentScreeningGui(QMainWindow):
         self.movement_updater.position_after_move.connect(self.navigationViewer.draw_fov_current_location)
         self.multipointController.signal_register_current_fov.connect(self.navigationViewer.register_fov)
         self.multipointController.signal_current_configuration.connect(self.liveControlWidget.update_ui_for_mode)
+        self.multipointController.signal_current_configuration.connect(self.illuminationWidget.update_ui_for_mode)
         if self.piezoWidget:
             self.movement_updater.piezo_z_um.connect(self.piezoWidget.update_displacement_um_display)
         self.multipointController.signal_set_display_tabs.connect(self.setAcquisitionDisplayTabs)

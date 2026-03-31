@@ -292,6 +292,15 @@ class IlluminationWidget(QWidget):
         if self.observation_state_widget is not None:
             self.observation_state_widget.refresh_presets()
 
+    def update_ui_for_mode(self, config=None) -> None:
+        """Refresh illumination controls to match current hardware state.
+
+        Called during multipoint acquisition when the active channel changes,
+        so the illumination panel reflects the intensity/on-off state the
+        acquisition code has applied to the hardware.
+        """
+        self._refresh_from_state()
+
     def _on_observation_state_applied(self) -> None:
         self._refresh_from_state()
         if self._on_observation_state_changed:
