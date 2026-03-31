@@ -27,10 +27,12 @@ from __future__ import annotations
 import abc
 import logging
 import re
+import squid.logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+import time
 
 import numpy as np
 import pandas as pd
@@ -877,6 +879,7 @@ class IlluminationController:
         """
         self._devices = list(devices)
         self._channel_map: Dict[str, IlluminationDevice] = {}
+        self._log = squid.logging.get_logger(__class__.__name__)
         for dev in devices:
             for ch in dev.channel_names:
                 if ch in self._channel_map:

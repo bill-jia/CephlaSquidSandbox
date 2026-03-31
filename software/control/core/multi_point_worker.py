@@ -1568,7 +1568,7 @@ class MultiPointWorker:
                 self._log.info("Using observation snapshot for capture")
                 self._apply_current_illumination_state_to_hardware()
             else:
-                self._log.info("Using legacy illumination for capture")
+                self._log.info("Using live setting for capture")
                 self.liveController.turn_on_illumination()
             self.wait_till_operation_is_completed()
         # This is some large timeout that we use just so as to not block forever
@@ -1639,6 +1639,8 @@ class MultiPointWorker:
                 # If we wait for longer than 5x the exposure + 2 seconds, abort the acquisition because something is
                 # wrong.
                 non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
+                self._log.info(f"Waiting {self.camera.get_total_frame_time() / 1e3} [s] for exposure to complete")
+
                 if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
                     self._log.error("Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
                     self.request_abort_fn()

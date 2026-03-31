@@ -12,6 +12,7 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+import squid.logging
 
 from control.models import GeneralObservationConfig
 from control.models.observation_state import (
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from control.core.live_controller import LiveController
     from control.core.objective_store import ObjectiveStore
 
-logger = logging.getLogger(__name__)
+logger = squid.logging.get_logger(__name__)
 
 _PRESET_FILENAME_RE = re.compile(r"^[\w\- ]+$")
 
