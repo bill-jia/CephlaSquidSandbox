@@ -1191,7 +1191,9 @@ class CameraSettingsWidget(QFrame):
 
         # connection
         self.entry_exposureTime.valueChanged.connect(self.camera.set_exposure_time)
+        self.entry_exposureTime.valueChanged.connect(self._persist_exposure_time)
         self.entry_analogGain.valueChanged.connect(self.set_analog_gain_if_supported)
+        self.entry_analogGain.valueChanged.connect(self._persist_analog_gain)
         self.dropdown_cameraMode.currentTextChanged.connect(
             lambda s: self.camera.set_camera_mode(s)
         )
@@ -1389,6 +1391,20 @@ class CameraSettingsWidget(QFrame):
             self.camera.set_analog_gain(gain)
         except NotImplementedError:
             self._log.warning(f"Cannot set gain to {gain}, gain not supported.")
+
+    def _persist_exposure_time(self, value):
+        """Persist exposure time to the in-memory general config."""
+        if self._config_repo and self.live_controller:
+            name = self.live_controller.get_active_channel_name()
+            if name:
+                self._config_repo.update_channel_setting(name, "ExposureTime", value)
+
+    def _persist_analog_gain(self, value):
+        """Persist analog gain to the in-memory general config."""
+        if self._config_repo and self.live_controller:
+            name = self.live_controller.get_active_channel_name()
+            if name:
+                self._config_repo.update_channel_setting(name, "AnalogGain", value)
 
     def toggle_auto_wb(self, pressed):
         # 0: OFF  1:CONTINUOUS  2:ONCE
@@ -1716,8 +1732,6 @@ class ProfileWidget(QFrame):
 
 class LiveControlWidget(QFrame):
 
-    signal_newExposureTime = Signal(float)
-    signal_newAnalogGain = Signal(float)
     signal_autoLevelSetting = Signal(bool)
     signal_live_configuration = Signal(object)
     signal_start_live = Signal()
@@ -1727,7 +1741,6 @@ class LiveControlWidget(QFrame):
         streamHandler,
         liveController,
         objectiveStore,
-        show_trigger_options=True,
         show_display_options=False,
         show_autolevel=False,
         autolevel=False,
@@ -1743,73 +1756,38 @@ class LiveControlWidget(QFrame):
         self.camera = self.liveController.microscope.camera
         self.streamHandler = streamHandler
         self.objectiveStore = objectiveStore
-        # Used as the hidden widget default; CameraSettingsWidget now owns trigger FPS.
-        self.fps_trigger = 10
         self.fps_display = 10
         self.streamHandler.set_display_fps(self.fps_display)
 
-        channels = self.liveController.get_observation_states()
-        if not channels:
-            self._log.error("No channels available - cannot initialize LiveControlWidget")
-            self.currentConfiguration = None
-        else:
-            # Restore the last active channel if available, otherwise use first
-            selected = channels[0]
-            last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
-            if last_name:
-                for s in channels:
-                    if s.name == last_name:
-                        selected = s
-                        break
-            self.currentConfiguration = selected
+        # channels = self.liveController.get_observation_states()
+        # if not channels:
+        #     self._log.error("No channels available - cannot initialize LiveControlWidget")
+        #     self.currentConfiguration = None
+        # else:
+        #     # Restore the last active channel if available, otherwise use first
+        #     selected = channels[0]
+        #     last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
+        #     if last_name:
+        #         for s in channels:
+        #             if s.name == last_name:
+        #                 selected = s
+        #                 break
+        #     self.currentConfiguration = selected
 
-            # Apply camera exposure/gain from general.yaml
-            if selected.camera_settings is not None:
-                try:
-                    self.liveController.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
-                except Exception:
-                    pass
-                try:
-                    self.liveController.camera.set_analog_gain(selected.camera_settings.gain_mode)
-                except (NotImplementedError, Exception):
-                    pass
-
-        # Keep LiveController.currentConfiguration in sync for contrast/LUT and Observation State
-        self.liveController.set_active_channel_reference(self.currentConfiguration)
-
-        self.add_components(show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
+        self.add_components(show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        # Manual live output is controlled by camera + illumination widgets.
-        # Avoid calling set_microscope_mode() here, since it would override
-        # camera exposure/gain and illumination intensity from the channel config.
 
-        self.is_switching_mode = False  # flag used to prevent from settings being set by twice - from both mode change slot and value change slot; another way is to use blockSignals(True)
-        # Manual live should not override illumination channel state/levels.
-        # Acquisition code still calls LiveController.set_microscope_mode().
-        self._control_illumination_before_live: Optional[bool] = None
+        self.is_switching_mode = False
 
-    def add_components(self, show_trigger_options, show_display_options, show_autolevel, autolevel, stretch, objectives_widget=None):
-        # line 0: trigger mode
-        self.dropdown_triggerManu = QComboBox()
-        self.dropdown_triggerManu.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
-        self.dropdown_triggerManu.setCurrentText(self.camera.get_acquisition_mode().value)
+    def add_components(self, show_display_options, show_autolevel, autolevel, stretch, objectives_widget=None):
         sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.dropdown_triggerManu.setSizePolicy(sizePolicy)
 
-        # line 1: fps
-        self.entry_triggerFPS = QDoubleSpinBox()
-        self.entry_triggerFPS.setKeyboardTracking(False)
-        self.entry_triggerFPS.setMinimum(0.02)
-        self.entry_triggerFPS.setMaximum(1000)
-        self.entry_triggerFPS.setSingleStep(1)
-        self.entry_triggerFPS.setValue(self.fps_trigger)
-        self.entry_triggerFPS.setDecimals(0)
-
-        self.dropdown_modeSelection = QComboBox()
-        for microscope_configuration in self.liveController.get_observation_states():
-            self.dropdown_modeSelection.addItems([microscope_configuration.name])
-        self.dropdown_modeSelection.setCurrentText(self.currentConfiguration.name)
-        self.dropdown_modeSelection.setSizePolicy(sizePolicy)
+        # self.dropdown_modeSelection = QComboBox()
+        # for state in self.liveController.get_observation_states():
+        #     self.dropdown_modeSelection.addItems([state.name])
+        # if self.currentConfiguration:
+        #     self.dropdown_modeSelection.setCurrentText(self.currentConfiguration.name)
+        # self.dropdown_modeSelection.setSizePolicy(sizePolicy)
 
         self.btn_live = QPushButton("Start Live")
         self.btn_live.setCheckable(True)
@@ -1818,49 +1796,7 @@ class LiveControlWidget(QFrame):
         self.btn_live.setStyleSheet("background-color: #C2C2FF")
         self.btn_live.setSizePolicy(sizePolicy)
 
-        # line 3: exposure time and analog gain associated with the current mode
-        self.entry_exposureTime = QDoubleSpinBox()
-        self.entry_exposureTime.setKeyboardTracking(False)
-        self.entry_exposureTime.setMinimum(self.camera.get_exposure_limits()[0])
-        self.entry_exposureTime.setMaximum(self.camera.get_exposure_limits()[1])
-        self.entry_exposureTime.setSingleStep(1)
-        self.entry_exposureTime.setSuffix(" ms")
-        self.entry_exposureTime.setValue(0)
-        self.entry_exposureTime.setSizePolicy(sizePolicy)
-
-        self.entry_analogGain = QDoubleSpinBox()
-        self.entry_analogGain.setKeyboardTracking(False)
-        # Not all cameras support analog gain, so attempt to get the gain
-        # to check this
-        try:
-            gain_range = self.camera.get_gain_range()
-            self.entry_analogGain.setMinimum(gain_range.min_gain)
-            self.entry_analogGain.setMaximum(gain_range.max_gain)
-            self.entry_analogGain.setSingleStep(gain_range.gain_step)
-            self.entry_analogGain.setValue(gain_range.min_gain)
-            self.entry_analogGain.setSizePolicy(sizePolicy)
-            self.camera.set_analog_gain(gain_range.min_gain)
-        except NotImplementedError:
-            self._log.info("Analog gain not supported,  disabling it in live control widget.")
-            self.entry_analogGain.setValue(0)
-            self.entry_analogGain.setEnabled(False)
-
-        self.slider_illuminationIntensity = QSlider(Qt.Horizontal)
-        self.slider_illuminationIntensity.setTickPosition(QSlider.TicksBelow)
-        self.slider_illuminationIntensity.setMinimum(0)
-        self.slider_illuminationIntensity.setMaximum(100)
-        self.slider_illuminationIntensity.setValue(100)
-        self.slider_illuminationIntensity.setSingleStep(2)
-
-        self.entry_illuminationIntensity = QDoubleSpinBox()
-        self.entry_illuminationIntensity.setKeyboardTracking(False)
-        self.entry_illuminationIntensity.setMinimum(0)
-        self.entry_illuminationIntensity.setMaximum(100)
-        self.entry_illuminationIntensity.setSingleStep(1)
-        self.entry_illuminationIntensity.setSuffix("%")
-        self.entry_illuminationIntensity.setValue(100)
-
-        # line 4: display fps and resolution scaling
+        # display resolution scaling
         self.entry_displayFPS = QDoubleSpinBox()
         self.entry_displayFPS.setKeyboardTracking(False)
         self.entry_displayFPS.setMinimum(1)
@@ -1892,114 +1828,61 @@ class LiveControlWidget(QFrame):
         self.btn_autolevel.setCheckable(True)
         self.btn_autolevel.setChecked(autolevel)
 
-        # Determine the maximum width needed
-        self.entry_illuminationIntensity.setMinimumWidth(self.btn_live.sizeHint().width())
-        self.btn_autolevel.setMinimumWidth(self.btn_autolevel.sizeHint().width())
-
-        max_width = max(self.btn_autolevel.minimumWidth(), self.entry_illuminationIntensity.minimumWidth())
-
-        # Set the fixed width for all three widgets
-        self.entry_illuminationIntensity.setFixedWidth(max_width)
-        self.btn_autolevel.setFixedWidth(max_width)
-
-        # Snap frame grabber UI (similar to FastAcquisitionWidget Output box)
+        # snap frame grabber
         from control._def import DEFAULT_SAVING_PATH
         self.lineEdit_snapSavingDir = QLineEdit()
         self.lineEdit_snapSavingDir.setReadOnly(True)
         self.lineEdit_snapSavingDir.setText(DEFAULT_SAVING_PATH)
         self.snap_saving_path = DEFAULT_SAVING_PATH
-        
+
         self.btn_setSnapSavingDir = QPushButton("Browse")
         self.btn_setSnapSavingDir.setDefault(False)
         try:
             self.btn_setSnapSavingDir.setIcon(QIcon("icon/folder.png"))
         except:
-            pass  # Icon file may not exist
+            pass
         self.btn_setSnapSavingDir.clicked.connect(self.set_snap_saving_dir)
-        
+
         self.lineEdit_snapTag = QLineEdit()
         self.lineEdit_snapTag.setPlaceholderText("Enter tag (optional)")
-        
+
         self.btn_snap = QPushButton("Snap")
         self.btn_snap.setDefault(False)
         self.btn_snap.setStyleSheet("background-color: #FFC2C2")
         self.btn_snap.clicked.connect(self.snap_frame)
 
         # connections
-        self.entry_triggerFPS.valueChanged.connect(self.liveController.set_trigger_fps)
         self.entry_displayFPS.valueChanged.connect(self.streamHandler.set_display_fps)
         self.slider_resolutionScaling.valueChanged.connect(self.streamHandler.set_display_resolution_scaling)
         self.slider_resolutionScaling.valueChanged.connect(self.liveController.set_display_resolution_scaling)
-        # self.dropdown_modeSelection.activated[str].connect(self.select_new_microscope_mode_by_name)
-        self.dropdown_triggerManu.currentIndexChanged.connect(self.update_trigger_mode)
         self.btn_live.clicked.connect(self.toggle_live)
-        self.entry_exposureTime.valueChanged.connect(self.update_config_exposure_time)
-        self.entry_analogGain.valueChanged.connect(self.update_config_analog_gain)
-        self.entry_illuminationIntensity.valueChanged.connect(self.update_config_illumination_intensity)
-        self.entry_illuminationIntensity.valueChanged.connect(
-            lambda x: self.slider_illuminationIntensity.setValue(int(x))
-        )
-        self.slider_illuminationIntensity.valueChanged.connect(self.entry_illuminationIntensity.setValue)
         self.btn_autolevel.toggled.connect(self.signal_autoLevelSetting.emit)
 
         # layout
-        # grid_line1 = QHBoxLayout()
-        # grid_line1.addWidget(QLabel("Live Configuration"))
-        # grid_line1.addWidget(self.dropdown_modeSelection, 2)
-        # grid_line1.addWidget(self.btn_live, 1)
-
-        grid_line2 = QHBoxLayout()
-        grid_line2.addWidget(QLabel("Exposure Time"))
-        grid_line2.addWidget(self.entry_exposureTime)
-        gain_label = QLabel(" Analog Gain")
-        gain_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        grid_line2.addWidget(gain_label)
-        grid_line2.addWidget(self.entry_analogGain)
-        if show_autolevel:
-            grid_line2.addWidget(self.btn_autolevel)
-
-        grid_line4 = QHBoxLayout()
-        grid_line4.addWidget(QLabel("Illumination"))
-        grid_line4.addWidget(self.slider_illuminationIntensity)
-        grid_line4.addWidget(self.entry_illuminationIntensity)
-
-        grid_line0 = QHBoxLayout()
-        if show_trigger_options:
-            grid_line0.addWidget(QLabel("Trigger Mode"))
-            grid_line0.addWidget(self.dropdown_triggerManu)
-            grid_line0.addWidget(QLabel("Trigger FPS"))
-            grid_line0.addWidget(self.entry_triggerFPS)
-
         grid_line05 = QHBoxLayout()
-        show_dislpay_fps = False
         if show_display_options:
             resolution_label = QLabel("Display Resolution")
             resolution_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             grid_line05.addWidget(resolution_label)
             grid_line05.addWidget(self.slider_resolutionScaling)
-            if show_dislpay_fps:
-                grid_line05.addWidget(QLabel("Display FPS"))
-                grid_line05.addWidget(self.entry_displayFPS)
-            else:
-                grid_line05.addWidget(self.label_resolutionScaling)
+            grid_line05.addWidget(self.label_resolutionScaling)
 
-        # Snap frame grabber layout
         snap_group = QGroupBox("Snap")
         snap_layout = QVBoxLayout()
-        
+
         snap_path_layout = QGridLayout()
         snap_path_layout.addWidget(QLabel("Saving Path"), 0, 0)
         snap_path_layout.addWidget(self.lineEdit_snapSavingDir, 0, 1)
         snap_path_layout.addWidget(self.btn_setSnapSavingDir, 0, 2)
-        
+
         snap_tag_layout = QGridLayout()
         snap_tag_layout.addWidget(QLabel("Tag"), 0, 0)
         snap_tag_layout.addWidget(self.lineEdit_snapTag, 0, 1)
-        
+
         snap_button_layout = QHBoxLayout()
         snap_button_layout.addWidget(self.btn_snap)
         snap_button_layout.addStretch()
-        
+
         snap_layout.addLayout(snap_path_layout)
         snap_layout.addLayout(snap_tag_layout)
         snap_layout.addLayout(snap_button_layout)
@@ -2007,8 +1890,6 @@ class LiveControlWidget(QFrame):
         snap_group.setLayout(snap_layout)
 
         self.grid = QVBoxLayout()
-        # Manual live: hide trigger/exposure/gain/illumination and the "Live Configuration" selector.
-        # Camera + Illumination widgets now own those controls.
         top_line = QHBoxLayout()
         top_line.setSpacing(8)
         top_line.addWidget(self.btn_live, 0)
@@ -2027,21 +1908,11 @@ class LiveControlWidget(QFrame):
 
     def toggle_live(self, pressed):
         if pressed:
-            # Manual live: illumination is controlled by IlluminationWidget.
-            # if self._control_illumination_before_live is None:
-            #     self._control_illumination_before_live = self.liveController.control_illumination
-            if self.currentConfiguration is not None:
-                self.liveController.set_active_channel_reference(self.currentConfiguration)
             self.liveController.start_live()
-            # self.liveController.control_illumination = False
             self.btn_live.setText("Stop Live")
             self.signal_start_live.emit()
         else:
             self.liveController.stop_live()
-            # Restore previous illumination control behavior.
-            # if self._control_illumination_before_live is not None:
-            #     self.liveController.control_illumination = self._control_illumination_before_live
-            #     self._control_illumination_before_live = None
             self.btn_live.setText("Start Live")
 
     def set_snap_saving_dir(self):
@@ -2103,20 +1974,16 @@ class LiveControlWidget(QFrame):
         """Capture and save the most recent frame from Live View."""
         import imageio
         from datetime import datetime
-        
+
         was_live_before_snap = self.liveController.is_live
-        
+
         try:
-            # If not live, start it
             if not was_live_before_snap:
                 self.liveController.start_live()
-                # Wait for camera to start and capture at least one frame
-                # Wait for exposure time + some buffer
                 exposure_time_ms = float(self.camera.get_exposure_time())
                 wait_time_s = max(0.5, (exposure_time_ms / 1000.0) * 2)
                 time.sleep(wait_time_s)
-            
-            # Get the most recent frame
+
             frame = self.camera.read_camera_frame()
             if frame is None:
                 self._log.warning("Failed to capture frame for snap")
@@ -2124,28 +1991,23 @@ class LiveControlWidget(QFrame):
                 msg.setText("Failed to capture frame. Please ensure the camera is streaming.")
                 msg.exec_()
                 return
-            
-            # Extract image data
+
             image = np.squeeze(frame.frame)
-            
-            # Display the frame if streamHandler has display function
+
             if hasattr(self.streamHandler, '_fns') and hasattr(self.streamHandler._fns, 'image_to_display'):
                 self.streamHandler._fns.image_to_display(image)
-            
-            # Generate filename with tag and timestamp
+
             tag = self.lineEdit_snapTag.text().strip()
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            
+
             if tag:
                 filename = f"{timestamp}_{tag}.tif"
             else:
                 filename = f"{timestamp}_snap.tif"
-            
-            filepath = os.path.join(self.snap_saving_path, filename)
-            
-            # Save as TIFF
-            imageio.imwrite(filepath, image)
 
+            filepath = os.path.join(self.snap_saving_path, filename)
+
+            imageio.imwrite(filepath, image)
             self._log.info(f"Snap frame saved to: {filepath}")
             self._save_snap_acquisition_metadata(filepath)
 
@@ -2155,119 +2017,35 @@ class LiveControlWidget(QFrame):
             msg.setText(f"Error saving snap frame: {str(e)}")
             msg.exec_()
         finally:
-            # Stop live if it wasn't running before
             if not was_live_before_snap:
                 self.liveController.stop_live()
 
     def toggle_autolevel(self, autolevel_on):
         self.btn_autolevel.setChecked(autolevel_on)
 
-    def update_camera_settings(self):
-        # Manual live is controlled by CameraSettingsWidget + IlluminationWidget.
-        # Keep this method to avoid breaking callers, but do nothing.
-        return
+    # def select_new_microscope_mode_by_name(self, config_name):
+    #     maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
 
-    # def refresh_mode_list(self):
-    #     # Update the mode selection dropdown (only show enabled channels)
-    #     self.dropdown_modeSelection.blockSignals(True)
-    #     self.dropdown_modeSelection.clear()
-    #     states = self.liveController.get_observation_states()
-    #     for state in states:
-    #         self.dropdown_modeSelection.addItem(state.name)
-    #     self.dropdown_modeSelection.blockSignals(False)
-
-    #     if not states:
+    #     if not maybe_new_config:
+    #         self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")
     #         return
 
-    #     # Restore the last active channel if available, otherwise use first
-    #     selected = states[0]
-    #     last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
-    #     if last_name:
-    #         for s in states:
-    #             if s.name == last_name:
-    #                 selected = s
-    #                 break
+    #     self.liveController.set_microscope_mode(maybe_new_config)
+    #     self.update_ui_for_mode(maybe_new_config)
 
-    #     self.currentConfiguration = selected
-    #     self.liveController.set_active_channel_reference(selected)
-    #     # Apply camera exposure/gain from the observation state in general.yaml
-    #     if selected.camera_settings is not None:
-    #         try:
-    #             self.camera.set_exposure_time(selected.camera_settings.exposure_time_ms)
-    #         except Exception:
-    #             pass
-    #         try:
-    #             self.camera.set_analog_gain(selected.camera_settings.gain_mode)
-    #         except (NotImplementedError, Exception):
-    #             pass
-    #     self.dropdown_modeSelection.blockSignals(True)
-    #     self.dropdown_modeSelection.setCurrentText(selected.name)
-    #     self.dropdown_modeSelection.blockSignals(False)
-
-    def select_new_microscope_mode_by_name(self, config_name):
-        maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
-
-        if not maybe_new_config:
-            self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")
-            return
-
-        self.liveController.set_microscope_mode(maybe_new_config)
-        self.update_ui_for_mode(maybe_new_config)
-
-    def update_ui_for_mode(self, config):
-        try:
-            self.is_switching_mode = True
-            self.currentConfiguration = config
-            if self.currentConfiguration is not None:
-                self.liveController.set_active_channel_reference(self.currentConfiguration)
-            self.dropdown_modeSelection.blockSignals(True)
-            self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
-            self.dropdown_modeSelection.blockSignals(False)
-            if self.currentConfiguration:
-                self.signal_live_configuration.emit(self.currentConfiguration)
-
-                # update the exposure time and analog gain settings according to the selected configuration
-                self.entry_exposureTime.setValue(self.currentConfiguration.exposure_time)
-                self.entry_analogGain.setValue(self.currentConfiguration.analog_gain)
-                # Sync camera widget controls when acquisition updates the active channel.
-                # (Manual live view does not call set_microscope_mode() from this widget.)
-                self.signal_newExposureTime.emit(self.currentConfiguration.exposure_time)
-                self.signal_newAnalogGain.emit(self.currentConfiguration.analog_gain)
-        finally:
-            self.is_switching_mode = False
-
-    def update_trigger_mode(self):
-        self.liveController.set_trigger_mode(self.dropdown_triggerManu.currentText())
-
-    def update_config_exposure_time(self, new_value):
-        if self.is_switching_mode == False:
-            self.currentConfiguration.exposure_time = new_value
-            self.liveController.microscope.config_repo.update_channel_setting(
-                self.currentConfiguration.name,
-                "ExposureTime",
-                new_value,
-            )
-            self.signal_newExposureTime.emit(new_value)
-
-    def update_config_analog_gain(self, new_value):
-        if self.is_switching_mode == False:
-            self.currentConfiguration.analog_gain = new_value
-            self.liveController.microscope.config_repo.update_channel_setting(
-                self.currentConfiguration.name,
-                "AnalogGain",
-                new_value,
-            )
-            self.signal_newAnalogGain.emit(new_value)
-
-    def update_config_illumination_intensity(self, new_value):
-        if self.is_switching_mode == False:
-            self.currentConfiguration.illumination_intensity = new_value
-            self.liveController.microscope.config_repo.update_channel_setting(
-                self.currentConfiguration.name,
-                "IlluminationIntensity",
-                new_value,
-            )
-            self.liveController.update_illumination()
+    # def update_ui_for_mode(self, config):
+    #     try:
+    #         self.is_switching_mode = True
+    #         self.currentConfiguration = config
+    #         # if self.currentConfiguration is not None:
+    #         #     self.liveController.set_active_channel_reference(self.currentConfiguration)
+    #         # self.dropdown_modeSelection.blockSignals(True)
+    #         # self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
+    #         # self.dropdown_modeSelection.blockSignals(False)
+    #         if self.currentConfiguration:
+    #             self.signal_live_configuration.emit(self.currentConfiguration)
+    #     finally:
+    #         self.is_switching_mode = False
 
     def _persist_iris_config(self, setting_name, new_value):
         if self.currentConfiguration:
@@ -2284,10 +2062,6 @@ class LiveControlWidget(QFrame):
 
     def update_config_emission_iris(self, new_value):
         self._persist_iris_config("EmissionIris", new_value)
-
-    def set_trigger_mode(self, trigger_mode):
-        self.dropdown_triggerManu.setCurrentText(trigger_mode)
-        self.liveController.set_trigger_mode(self.dropdown_triggerManu.currentText())
 
 
 class PiezoWidget(QFrame):

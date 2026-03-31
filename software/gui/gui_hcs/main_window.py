@@ -250,7 +250,7 @@ class HighContentScreeningGui(QMainWindow):
         # Always-visible controls panel (replaces the old tabbed UI).
         self.cameraTabWidget: QWidget = QWidget()
         self.load_widgets(is_simulation=is_simulation)
-        self._sync_camera_ui_from_observation_state()
+        self._init_observation_state_from_general_yaml()
         self.setup_layout()
         self.make_connections()
 
@@ -700,30 +700,34 @@ class HighContentScreeningGui(QMainWindow):
             except Exception as e:
                 self.log.warning("Could not refresh illumination widget after cache restore: %s", e)
 
-    def _sync_camera_ui_from_observation_state(self) -> None:
-        """Sync camera settings UI with the active observation state from general.yaml.
+    def _init_observation_state_from_general_yaml(self) -> None:
+        """Load the observation state from general.yaml and apply it to liveController + UI.
 
-        Called once after load_widgets so the exposure/gain spinboxes reflect the
-        values that LiveControlWidget.__init__ applied to camera hardware.
+        Called once after load_widgets. The liveController becomes the authoritative
+        owner of the observation state; widgets only read from it.
         """
-        config = getattr(self.liveControlWidget, "currentConfiguration", None)
-        if config is None or config.camera_settings is None:
+        general = self.microscope.config_repo.get_general_config()
+        if general is None or not general.observation_states:
+            self.log.warning("No observation states in general.yaml — skipping initialization")
             return
+        state = general.observation_states[0]
+        self.liveController.set_observation_state(state)
+
+        # Sync camera UI widgets to match
         csw = self.cameraSettingWidget
-        if csw is None:
-            return
-        try:
-            csw.entry_exposureTime.blockSignals(True)
-            csw.entry_exposureTime.setValue(config.camera_settings.exposure_time_ms)
-            csw.entry_exposureTime.blockSignals(False)
-        except Exception as e:
-            self.log.warning("Could not sync exposure time UI: %s", e)
-        try:
-            csw.entry_analogGain.blockSignals(True)
-            csw.entry_analogGain.setValue(config.camera_settings.gain_mode)
-            csw.entry_analogGain.blockSignals(False)
-        except Exception as e:
-            self.log.warning("Could not sync analog gain UI: %s", e)
+        if csw is not None and state.camera_settings is not None:
+            try:
+                csw.entry_exposureTime.blockSignals(True)
+                csw.entry_exposureTime.setValue(state.camera_settings.exposure_time_ms)
+                csw.entry_exposureTime.blockSignals(False)
+            except Exception as e:
+                self.log.warning("Could not sync exposure time UI: %s", e)
+            try:
+                csw.entry_analogGain.blockSignals(True)
+                csw.entry_analogGain.setValue(state.camera_settings.gain_mode)
+                csw.entry_analogGain.blockSignals(False)
+            except Exception as e:
+                self.log.warning("Could not sync analog gain UI: %s", e)
 
     def _restore_cached_camera_settings(self) -> None:
         """Restore cached camera settings from disk and update UI widgets.
@@ -1241,8 +1245,6 @@ class HighContentScreeningGui(QMainWindow):
         self.profileWidget.signal_profile_changed.connect(self._refresh_channel_lists)
         self.profileWidget.signal_profile_changed.connect(self.observationStateWidget.refresh_presets)
 
-        self.liveControlWidget.signal_newExposureTime.connect(self.cameraSettingWidget.set_exposure_time)
-        self.liveControlWidget.signal_newAnalogGain.connect(self.cameraSettingWidget.set_analog_gain)
         if not self.live_only_mode:
             self.liveControlWidget.signal_start_live.connect(self.onStartLive)
         # LiveControlWidget no longer owns exposure/gain/trigger/illumination for manual live.
@@ -1257,7 +1259,7 @@ class HighContentScreeningGui(QMainWindow):
         # TODO(imo): Fix position updates after removal of navigation controller
         self.movement_updater.position_after_move.connect(self.navigationViewer.draw_fov_current_location)
         self.multipointController.signal_register_current_fov.connect(self.navigationViewer.register_fov)
-        self.multipointController.signal_current_configuration.connect(self.liveControlWidget.update_ui_for_mode)
+        # self.multipointController.signal_current_configuration.connect(self.liveControlWidget.update_ui_for_mode)
         self.multipointController.signal_current_configuration.connect(self.illuminationWidget.update_ui_for_mode)
         if self.piezoWidget:
             self.movement_updater.piezo_z_um.connect(self.piezoWidget.update_displacement_um_display)
@@ -1331,16 +1333,17 @@ class HighContentScreeningGui(QMainWindow):
                 self.wellplateMultiPointWidget.handle_objective_change
             )
 
-        self.profileWidget.signal_profile_changed.connect(
-            lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-                self.liveControlWidget.currentConfiguration.name
-            )
-        )
-        self.objectivesWidget.signal_objective_changed.connect(
-            lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-                self.liveControlWidget.currentConfiguration.name
-            )
-        )
+        # TBD: replace with ObservationState refreshing
+        # self.profileWidget.signal_profile_changed.connect(
+        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
+        #         self.liveControlWidget.currentConfiguration.name
+        #     )
+        # )
+        # self.objectivesWidget.signal_objective_changed.connect(
+        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
+        #         self.liveControlWidget.currentConfiguration.name
+        #     )
+        # )
 
         if self.microscope.addons.camera_focus:
             self.log.info(f"laser autofocus controller: {self.laserAutofocusController}, camera: {self.camera_focus}, setting up connections")
