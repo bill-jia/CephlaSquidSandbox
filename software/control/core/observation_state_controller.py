@@ -368,7 +368,7 @@ class ObservationStateController:
             lc._start_new_timer()
 
     # ─────────────────────────────────────────────────────────────────────
-    # Preset apply (moved from observation_state_service.apply_observation_state)
+    # Preset apply
     # ─────────────────────────────────────────────────────────────────────
 
     def apply_observation_state_preset(

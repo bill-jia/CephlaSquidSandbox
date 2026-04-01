@@ -138,7 +138,7 @@ def augment_multipoint_acquisition_yaml_dict(
     Merge layout YAML (grid, objective, z-stack, …) with a non-duplicative ``manifest`` slice
     and ``observation_states_used`` (full preset snapshots for selected names only).
     """
-    from control.core.observation_state_service import collect_emission_filter_positions, collect_observation_state
+    from control.core.observation_state_service import collect_emission_filter_positions
 
     _log = logger or logging.getLogger(__name__)
     uses_presets = bool(obs_names)
@@ -148,9 +148,7 @@ def augment_multipoint_acquisition_yaml_dict(
         try:
             wheel = getattr(live_controller.microscope, "emission_filter_wheel", None)
             emission = collect_emission_filter_positions(wheel)
-            obs_state = collect_observation_state(
-                live_controller,
-                repo,
+            obs_state = live_controller.obs_controller.collect_observation_state(
                 emission_filter_positions=emission or None,
             )
         except Exception as e:

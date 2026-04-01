@@ -11,11 +11,7 @@ from typing import Callable, Optional
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QInputDialog, QMessageBox
 
-from control.core.observation_state_service import (
-    apply_observation_state,
-    collect_emission_filter_positions,
-    collect_observation_state,
-)
+from control.core.observation_state_service import collect_emission_filter_positions
 
 
 def run_save_observation_state_dialog(
@@ -45,9 +41,7 @@ def run_save_observation_state_dialog(
         return False
     emission = collect_emission_filter_positions(emission_filter_wheel)
     try:
-        state = collect_observation_state(
-            live_controller,
-            repo,
+        state = live_controller.obs_controller.collect_observation_state(
             emission_filter_positions=emission or None,
         )
         repo.save_observation_preset(name.strip(), state)
@@ -108,12 +102,9 @@ def run_load_observation_state(
         QMessageBox.warning(parent, "Observation State", f"Could not load preset '{name}'.")
         return False
     try:
-        apply_observation_state(
+        live_controller.obs_controller.apply_observation_state_preset(
             state,
-            repo,
-            live_controller,
-            objective_store,
-            emission_filter_wheel=emission_filter_wheel
+            emission_filter_wheel=emission_filter_wheel,
         )
     except Exception as e:
         QMessageBox.warning(parent, "Observation State", str(e))

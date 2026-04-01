@@ -826,10 +826,7 @@ class FastAcquisitionController:
             return
         try:
             from control.core.acquisition_metadata_helpers import build_acquisition_metadata
-            from control.core.observation_state_service import (
-                collect_emission_filter_positions,
-                collect_observation_state,
-            )
+            from control.core.observation_state_service import collect_emission_filter_positions
 
             repo = scope.config_repo
             exp_id = os.path.basename(self._output_path.rstrip(os.sep))
@@ -838,9 +835,7 @@ class FastAcquisitionController:
                 try:
                     wheel = getattr(scope, "emission_filter_wheel", None)
                     emission = collect_emission_filter_positions(wheel)
-                    obs_state = collect_observation_state(
-                        lc,
-                        repo,
+                    obs_state = lc.obs_controller.collect_observation_state(
                         emission_filter_positions=emission or None,
                     )
                 except Exception as e:

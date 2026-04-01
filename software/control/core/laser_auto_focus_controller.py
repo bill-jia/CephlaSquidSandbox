@@ -132,7 +132,7 @@ class LaserAutofocusController(QObject):
         config = self._config_repo.get_laser_af_config(current_objective)
         if config is None:
             return
-        self._log.info(f"Loaded cached configuration successfully: {config}")
+        # self._log.info(f"Loaded cached configuration successfully: {config}")
 
         # Update camera settings
         self.camera.set_exposure_time(config.focus_camera_exposure_time_ms)

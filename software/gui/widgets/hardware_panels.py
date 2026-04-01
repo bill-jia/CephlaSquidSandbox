@@ -1915,7 +1915,7 @@ class LiveControlWidget(QFrame):
         from pathlib import Path
 
         from control.core.acquisition_metadata_helpers import build_acquisition_metadata
-        from control.core.observation_state_service import collect_emission_filter_positions, collect_observation_state
+        from control.core.observation_state_service import collect_emission_filter_positions
 
         path = Path(filepath)
         stem = path.stem
@@ -1927,9 +1927,7 @@ class LiveControlWidget(QFrame):
             try:
                 wheel = getattr(self.liveController.microscope, "emission_filter_wheel", None)
                 emission = collect_emission_filter_positions(wheel)
-                obs_state = collect_observation_state(
-                    self.liveController,
-                    repo,
+                obs_state = self.liveController.obs_controller.collect_observation_state(
                     emission_filter_positions=emission or None,
                 )
             except Exception as e:

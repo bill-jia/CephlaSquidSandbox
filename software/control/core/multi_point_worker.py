@@ -25,7 +25,6 @@ from control.core.multi_point_utils import (
     PlateViewInit,
     PlateViewUpdate,
 )
-from control.core.observation_state_service import apply_observation_state
 from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope
@@ -482,12 +481,9 @@ class MultiPointWorker:
         if state is None:
             raise ValueError(f"observation state not found: {preset_name!r}")
         with self._timing.get_timer("apply_observation_state_to_hardware"):
-            apply_observation_state(
+            self.liveController.obs_controller.apply_observation_state_preset(
                 state,
-                repo,
-                self.liveController,
-                self.objectiveStore,
-                emission_filter_wheel=self._emission_filter_wheel
+                emission_filter_wheel=self._emission_filter_wheel,
             )
         return state
 
