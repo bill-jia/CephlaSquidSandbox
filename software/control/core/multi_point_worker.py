@@ -134,6 +134,7 @@ class MultiPointWorker:
         self.experiment_path = os.path.join(self.base_path or "", self.experiment_ID or "")
         self.observation_state_names = list(acquisition_parameters.selected_observation_state_names or [])
         self._use_observation_presets = bool(self.observation_state_names)
+        self.region_observation_state_map = acquisition_parameters.region_observation_state_map
         self._emission_filter_wheel = getattr(scope.addons, "emission_filter_wheel", None)
 
         # Pre-compute acquisition metadata that remains constant throughout the run.
@@ -473,6 +474,12 @@ class MultiPointWorker:
 
     def _channel_step_count(self) -> int:
         return len(self.observation_state_names)
+
+    def _get_observation_states_for_region(self, region_id: str) -> list:
+        """Return the list of observation state names active for this region."""
+        if self.region_observation_state_map is None:
+            return self.observation_state_names
+        return self.region_observation_state_map.get(region_id, self.observation_state_names)
 
     def _apply_observation_state(self, preset_name: str) -> ObservationState:
         repo = self.microscope.config_repo
@@ -1285,7 +1292,8 @@ class MultiPointWorker:
                 )
             )
             self.num_fovs = len(coordinates)
-            self.total_scans = self.num_fovs * self.NZ * self._channel_step_count()
+            active_channel_count = len(self._get_observation_states_for_region(region_id))
+            self.total_scans = self.num_fovs * self.NZ * active_channel_count
 
             for fov, coordinate_mm in enumerate(coordinates):
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
@@ -1334,10 +1342,15 @@ class MultiPointWorker:
                 iio.imwrite(saving_path, image)
 
             current_round_images = {}
-            n_steps = self._channel_step_count()
-            # iterate through observation states or legacy channel configurations
+            # Get the active observation states for this region (may be a subset)
+            active_states = set(self._get_observation_states_for_region(region_id))
+            n_active = len(active_states)
+            # iterate through observation states
             if self.observation_state_names:
+                active_step = 0
                 for config_idx, preset_name in enumerate(self.observation_state_names):
+                    if preset_name not in active_states:
+                        continue
                     try:
                         with self._timing.get_timer("apply_observation_state"):
                             config = self._apply_observation_state(preset_name)
@@ -1366,7 +1379,8 @@ class MultiPointWorker:
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
 
-                    current_image = fov * self.NZ * n_steps + z_level * n_steps + config_idx + 1
+                    current_image = fov * self.NZ * n_active + z_level * n_active + active_step + 1
+                    active_step += 1
                     self.callbacks.signal_region_progress(
                         RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
                     )

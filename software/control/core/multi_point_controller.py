@@ -97,6 +97,31 @@ def _serialize_for_yaml(obj):
         return obj
 
 
+def _save_region_observation_state_csv(experiment_path, region_observation_state_map, observation_state_names, logger=None):
+    """Write a CSV recording the per-region observation state matrix.
+
+    Rows = regions, columns = observation state preset names.
+    Cell value is 1 (acquire) or 0 (skip).
+    Only written when region_observation_state_map is not None (i.e. the user customised it).
+    """
+    if region_observation_state_map is None:
+        return
+    rows = []
+    for region_id, active_names in region_observation_state_map.items():
+        active_set = set(active_names)
+        row = {"region": region_id}
+        for obs_name in observation_state_names:
+            row[obs_name] = 1 if obs_name in active_set else 0
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(experiment_path, "region_observation_states.csv")
+    try:
+        df.to_csv(csv_path, index=False)
+    except Exception as e:
+        if logger:
+            logger.error("Failed to write region_observation_states.csv: %s", e, exc_info=True)
+
+
 def _save_unified_multipoint_acquisition_yaml(
     params: "AcquisitionParameters",
     experiment_path: str,
@@ -327,6 +352,7 @@ class MultiPointController:
         self.already_using_fmap = False
         self.selected_configurations = []
         self.selected_observation_state_names = []
+        self.region_observation_state_map = None
         self.scanCoordinates = scan_coordinates
         self._log.info(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}")
         self._log.info(f"Scan coordinates format: {self.scanCoordinates.format}")
@@ -554,6 +580,10 @@ class MultiPointController:
                 self.selected_observation_state_names.append(name)
             else:
                 self._log.warning("Channel '%s' not found in observation presets, skipping", name)
+
+    def set_region_observation_state_map(self, mapping):
+        """Set per-region observation state overrides. None means all regions use the global list."""
+        self.region_observation_state_map = mapping
 
     def get_acquisition_image_count(self):
         """
@@ -963,6 +993,14 @@ class MultiPointController:
                 logger=self._log,
             )
 
+            # Save per-region observation state matrix CSV if customised
+            _save_region_observation_state_csv(
+                experiment_path,
+                acquisition_params.region_observation_state_map,
+                acquisition_params.selected_observation_state_names,
+                logger=self._log,
+            )
+
             # Get pre-warmed job runner and its shared backpressure values
             # (starts a new one warming for next acquisition)
             prewarmed_runner, prewarmed_bp_values = self.get_prewarmed_job_runner()
@@ -1056,6 +1094,7 @@ class MultiPointController:
             plate_num_cols=plate_num_cols,
             xy_mode=self.xy_mode,
             selected_observation_state_names=self.selected_observation_state_names,
+            region_observation_state_map=self.region_observation_state_map,
         )
 
     def _on_acquisition_completed(self):

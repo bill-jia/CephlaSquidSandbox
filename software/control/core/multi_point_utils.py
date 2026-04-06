@@ -71,6 +71,10 @@ class AcquisitionParameters:
     xy_mode: str = "Current Position"  # "Current Position", "Select Wells", "Manual", "Load Coordinates"
     # Observation State preset names (profile observation_presets/).
     selected_observation_state_names: List[str] = field(default_factory=list)
+    # Per-region observation state override. Keys are region IDs (e.g. "R0"),
+    # values are lists of preset names to acquire at that region.
+    # None means all regions use selected_observation_state_names.
+    region_observation_state_map: Optional[Dict[str, List[str]]] = None
 
 
 @dataclass

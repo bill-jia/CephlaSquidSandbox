@@ -15,6 +15,205 @@ def _multipoint_observation_preset_display_names(microscope) -> list:
     return sorted(microscope.config_repo.list_observation_presets())
 
 
+def _create_checkbox_list_item(name: str, checked: bool = False) -> QListWidgetItem:
+    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight."""
+    item = QListWidgetItem(name)
+    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+    return item
+
+
+def _get_checked_names(list_widget: QListWidget) -> list:
+    """Return the text of all checked items in a checkbox-style QListWidget."""
+    return [
+        list_widget.item(i).text()
+        for i in range(list_widget.count())
+        if list_widget.item(i).checkState() == Qt.Checked
+    ]
+
+
+def _has_checked_items(list_widget: QListWidget) -> bool:
+    """Return True if any item in the list is checked."""
+    for i in range(list_widget.count()):
+        if list_widget.item(i).checkState() == Qt.Checked:
+            return True
+    return False
+
+
+class _DragToggleTableWidget(QTableWidget):
+    """QTableWidget that supports click-and-drag toggling of checkboxes.
+
+    On mouse press, the clicked cell's checkbox is toggled and the new state is recorded.
+    While dragging, every cell the cursor enters is set to that same state, allowing the
+    user to "paint" a rectangular selection of on/off states.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dragging = False
+        self._drag_state = None  # Qt.Checked or Qt.Unchecked
+
+    def _toggle_cell(self, row, col):
+        item = self.item(row, col)
+        if item is None or not (item.flags() & Qt.ItemIsUserCheckable):
+            return None
+        new_state = Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+        item.setCheckState(new_state)
+        return new_state
+
+    def _set_cell(self, row, col, state):
+        item = self.item(row, col)
+        if item is not None and (item.flags() & Qt.ItemIsUserCheckable):
+            item.setCheckState(state)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.pos())
+            if index.isValid():
+                new_state = self._toggle_cell(index.row(), index.column())
+                if new_state is not None:
+                    self._dragging = True
+                    self._drag_state = new_state
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._drag_state is not None:
+            index = self.indexAt(event.pos())
+            if index.isValid():
+                self._set_cell(index.row(), index.column(), self._drag_state)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._drag_state = None
+            return
+        super().mouseReleaseEvent(event)
+
+
+class RegionObservationStateDialog(QDialog):
+    """Popup matrix for selecting which observation states to acquire at each region.
+
+    Rows = region IDs with coordinates, columns = observation state presets.
+    Cells are checkboxes supporting click-and-drag toggling.
+    Returns a Dict[str, List[str]] mapping region_id -> active preset names, or None if all checked.
+    """
+
+    def __init__(self, region_ids, region_coords, observation_state_names, existing_map=None, parent=None):
+        """
+        Args:
+            region_ids: list of region ID strings (e.g. ["R0", "R1"])
+            region_coords: list of (x, y, z) tuples matching region_ids
+            observation_state_names: list of preset name strings
+            existing_map: optional Dict[str, List[str]] to pre-populate
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Per-Point Observation States")
+        self._region_ids = list(region_ids)
+        self._obs_names = list(observation_state_names)
+        self._result_map = None
+
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        layout.addWidget(QLabel("Click and drag to toggle observation states per region:"))
+
+        # Matrix table
+        self._table = _DragToggleTableWidget(len(self._region_ids), len(self._obs_names))
+        self._table.setHorizontalHeaderLabels(self._obs_names)
+
+        # Build row labels with coordinate info
+        row_labels = []
+        for i, rid in enumerate(self._region_ids):
+            if i < len(region_coords):
+                x, y, z = region_coords[i]
+                row_labels.append(f"{rid} ({x:.2f}, {y:.2f})")
+            else:
+                row_labels.append(rid)
+        self._table.setVerticalHeaderLabels(row_labels)
+
+        # Populate cells with checkboxes
+        existing_map = existing_map or {}
+        for row, rid in enumerate(self._region_ids):
+            active_set = set(existing_map.get(rid, self._obs_names))
+            for col, obs_name in enumerate(self._obs_names):
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Checked if obs_name in active_set else Qt.Unchecked)
+                self._table.setItem(row, col, item)
+
+        self._table.resizeColumnsToContents()
+        self._table.resizeRowsToContents()
+        layout.addWidget(self._table)
+
+        # Row/column toggle buttons
+        toggle_layout = QHBoxLayout()
+        btn_check_all = QPushButton("Check All")
+        btn_check_all.clicked.connect(lambda: self._set_all(Qt.Checked))
+        btn_uncheck_all = QPushButton("Uncheck All")
+        btn_uncheck_all.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        toggle_layout.addWidget(btn_check_all)
+        toggle_layout.addWidget(btn_uncheck_all)
+        layout.addLayout(toggle_layout)
+
+        # Header click to toggle entire row/column
+        self._table.horizontalHeader().sectionClicked.connect(self._toggle_column)
+        self._table.verticalHeader().sectionClicked.connect(self._toggle_row)
+
+        # OK / Cancel
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+        self.resize(max(600, 120 * len(self._obs_names)), max(300, 40 * len(self._region_ids)))
+
+    def _set_all(self, state):
+        for row in range(self._table.rowCount()):
+            for col in range(self._table.columnCount()):
+                self._table.item(row, col).setCheckState(state)
+
+    def _toggle_column(self, col):
+        # If any unchecked in column, check all; otherwise uncheck all
+        any_unchecked = any(
+            self._table.item(row, col).checkState() == Qt.Unchecked
+            for row in range(self._table.rowCount())
+        )
+        state = Qt.Checked if any_unchecked else Qt.Unchecked
+        for row in range(self._table.rowCount()):
+            self._table.item(row, col).setCheckState(state)
+
+    def _toggle_row(self, row):
+        any_unchecked = any(
+            self._table.item(row, col).checkState() == Qt.Unchecked
+            for col in range(self._table.columnCount())
+        )
+        state = Qt.Checked if any_unchecked else Qt.Unchecked
+        for col in range(self._table.columnCount()):
+            self._table.item(row, col).setCheckState(state)
+
+    def get_result(self):
+        """Return the mapping, or None if everything is checked (no subsetting)."""
+        mapping = {}
+        all_checked = True
+        for row, rid in enumerate(self._region_ids):
+            active = []
+            for col, obs_name in enumerate(self._obs_names):
+                if self._table.item(row, col).checkState() == Qt.Checked:
+                    active.append(obs_name)
+                else:
+                    all_checked = False
+            mapping[rid] = active
+        return None if all_checked else mapping
+
+
 class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
@@ -208,11 +407,12 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(preset_name)
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
-        self.list_configurations.setSelectionMode(
-            QAbstractItemView.MultiSelection
-        )  # ref: https://doc.qt.io/qt-5/qabstractitemview.html#SelectionMode-enum
+
+        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_per_point_channels.setToolTip("Configure which observation states to acquire at each registered point")
+        self._region_obs_state_map = None
 
         self.checkbox_withAutofocus = QCheckBox("Contrast AF")
         self.checkbox_withAutofocus.setChecked(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
@@ -417,6 +617,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         grid_config = QHBoxLayout()
         grid_config.addWidget(self.list_configurations)
+        grid_config.addWidget(self.btn_per_point_channels)
         grid_config.addSpacerItem(edge_spacer)
 
         button_layout = QVBoxLayout()
@@ -491,8 +692,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         )
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
+        self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
-        self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
+        self.list_configurations.itemChanged.connect(self._on_channel_list_changed)
         # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
@@ -771,26 +973,51 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.base_path_is_set = True
             save_last_used_saving_path(save_dir_base)
 
+    def _on_channel_list_changed(self):
+        self.emit_selected_channels()
+        # Reset per-point mapping when global channel selection changes
+        self._region_obs_state_map = None
+        self._update_per_point_button_text()
+
     def emit_selected_channels(self):
-        selected_channels = [item.text() for item in self.list_configurations.selectedItems()]
+        selected_channels = _get_checked_names(self.list_configurations)
         self.signal_acquisition_channels.emit(selected_channels)
+
+    def _update_per_point_button_text(self):
+        if self._region_obs_state_map is not None:
+            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+        else:
+            self.btn_per_point_channels.setText("Per-Point\nChannels")
+
+    def open_per_point_channels_dialog(self):
+        obs_names = _get_checked_names(self.list_configurations)
+        if not obs_names:
+            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            return
+        if len(self.location_ids) == 0:
+            QMessageBox.warning(self, "Warning", "Please add at least one location first")
+            return
+
+        coords = [(self.location_list[i, 0], self.location_list[i, 1], self.location_list[i, 2])
+                   for i in range(len(self.location_ids))]
+        dialog = RegionObservationStateDialog(
+            self.location_ids, coords, obs_names,
+            existing_map=self._region_obs_state_map, parent=self
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self._region_obs_state_map = dialog.get_result()
+            self._update_per_point_button_text()
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        # Remember currently selected channels
-        selected_names = [item.text() for item in self.list_configurations.selectedItems()]
+        # Remember currently checked channels
+        checked_names = _get_checked_names(self.list_configurations)
 
         # Clear and repopulate
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(name)
-
-        # Restore selection where possible
-        for i in range(self.list_configurations.count()):
-            item = self.list_configurations.item(i)
-            if item.text() in selected_names:
-                item.setSelected(True)
+            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
         self.list_configurations.blockSignals(False)
 
     def toggle_acquisition(self, pressed):
@@ -799,7 +1026,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.btn_startAcquisition.setChecked(False)
             error_dialog("Please choose base saving directory first")
             return
-        if not self.list_configurations.selectedItems():  # no channel selected
+        if not _has_checked_items(self.list_configurations):  # no channel selected
             self.btn_startAcquisition.setChecked(False)
             error_dialog("Please select at least one observation state first")
             return
@@ -849,8 +1076,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             )
             self.multipointController.set_widget_type("flexible")
             self.multipointController.set_selected_configurations(
-                (item.text() for item in self.list_configurations.selectedItems())
+                _get_checked_names(self.list_configurations)
             )
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -977,6 +1205,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.blockSignals(False)
             self.dropdown_location_list.blockSignals(False)
             print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
+            self._region_obs_state_map = None
+            self._update_per_point_button_text()
         else:
             print("Invalid Region: Duplicate Location")
 
@@ -1036,6 +1266,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             # Re-enable signals
             self.table_location_list.blockSignals(False)
             self.dropdown_location_list.blockSignals(False)
+            self._region_obs_state_map = None
+            self._update_per_point_button_text()
 
     def next(self):
         index = self.dropdown_location_list.currentIndex()
@@ -1073,6 +1305,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
         self.navigationViewer.clear_overlay()
+        self._region_obs_state_map = None
+        self._update_per_point_button_text()
 
         self._log.info("Cleared all locations and overlays.")
 
@@ -1270,13 +1504,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
-        if not self.list_configurations.selectedItems():
+        if not _has_checked_items(self.list_configurations):
             QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
 
         # Set the selected channels for acquisition
         self.multipointController.set_selected_configurations(
-            [item.text() for item in self.list_configurations.selectedItems()]
+            _get_checked_names(self.list_configurations)
         )
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
@@ -1332,6 +1566,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         else:
             self.entry_overlap.setEnabled(enabled)
         self.list_configurations.setEnabled(enabled)
+        self.btn_per_point_channels.setEnabled(enabled)
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
@@ -1430,11 +1665,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Channels
             if yaml_data.channel_names:
-                self.list_configurations.clearSelection()
+                self.list_configurations.blockSignals(True)
                 for i in range(self.list_configurations.count()):
                     item = self.list_configurations.item(i)
-                    if item.text() in yaml_data.channel_names:
-                        item.setSelected(True)
+                    item.setCheckState(Qt.Checked if item.text() in yaml_data.channel_names else Qt.Unchecked)
+                self.list_configurations.blockSignals(False)
 
             # Autofocus
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
@@ -1717,9 +1952,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(preset_name)
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
-        self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
 
         # Add a combo box for shape selection
         self.combobox_shape = QComboBox()
@@ -2071,7 +2305,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
         )
-        self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
+        self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
@@ -2107,7 +2341,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_Nt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_deltaZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_NZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
-        self.list_configurations.itemSelectionChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.list_configurations.itemChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_withAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
@@ -2139,7 +2373,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
                 "nz": self.entry_NZ.value(),
-                "selected_observation_states": [item.text() for item in self.list_configurations.selectedItems()],
+                "selected_observation_states": _get_checked_names(self.list_configurations),
                 "contrast_af": self.checkbox_withAutofocus.isChecked(),
                 "laser_af": (
                     self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
@@ -2214,11 +2448,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             # Restore selected observation states (legacy key: selected_channels)
             selected_channels = settings.get("selected_observation_states") or settings.get("selected_channels", [])
             if selected_channels:
-                self.list_configurations.clearSelection()
+                self.list_configurations.blockSignals(True)
                 for i in range(self.list_configurations.count()):
                     item = self.list_configurations.item(i)
-                    if item.text() in selected_channels:
-                        item.setSelected(True)
+                    item.setCheckState(Qt.Checked if item.text() in selected_channels else Qt.Unchecked)
+                self.list_configurations.blockSignals(False)
 
             # Restore autofocus settings
             self.checkbox_withAutofocus.setChecked(settings.get("contrast_af", False))
@@ -3168,7 +3402,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             QMessageBox.warning(self, "Warning", "Please choose base saving directory first")
             return
 
-        if not self.list_configurations.selectedItems():
+        if not _has_checked_items(self.list_configurations):
             self.btn_startAcquisition.setChecked(False)
             QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
@@ -3230,8 +3464,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self.multipointController.set_selected_configurations(
-                [item.text() for item in self.list_configurations.selectedItems()]
+                _get_checked_names(self.list_configurations)
             )
+            self.multipointController.set_region_observation_state_map(None)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -3367,13 +3602,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             save_last_used_saving_path(save_dir_base)
 
     def on_snap_images(self):
-        if not self.list_configurations.selectedItems():
+        if not _has_checked_items(self.list_configurations):
             QMessageBox.warning(self, "Warning", "Please select at least one observation state")
             return
 
         # Set the selected channels for acquisition
         self.multipointController.set_selected_configurations(
-            [item.text() for item in self.list_configurations.selectedItems()]
+            _get_checked_names(self.list_configurations)
         )
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
@@ -3401,25 +3636,17 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.multipointController.set_deltaZ(deltaZ)
 
     def emit_selected_channels(self):
-        selected_channels = [item.text() for item in self.list_configurations.selectedItems()]
+        selected_channels = _get_checked_names(self.list_configurations)
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        # Remember currently selected channels
-        selected_names = [item.text() for item in self.list_configurations.selectedItems()]
+        checked_names = _get_checked_names(self.list_configurations)
 
-        # Clear and repopulate
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(name)
-
-        # Restore selection where possible
-        for i in range(self.list_configurations.count()):
-            item = self.list_configurations.item(i)
-            if item.text() in selected_names:
-                item.setSelected(True)
+            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
         self.list_configurations.blockSignals(False)
 
     def toggle_coordinate_controls(self, has_coordinates: bool):
@@ -3661,11 +3888,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Channels
             if yaml_data.channel_names:
-                self.list_configurations.clearSelection()
+                self.list_configurations.blockSignals(True)
                 for i in range(self.list_configurations.count()):
                     item = self.list_configurations.item(i)
-                    if item.text() in yaml_data.channel_names:
-                        item.setSelected(True)
+                    item.setCheckState(Qt.Checked if item.text() in yaml_data.channel_names else Qt.Unchecked)
+                self.list_configurations.blockSignals(False)
 
             # Autofocus
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
@@ -3829,9 +4056,8 @@ class MultiPointWithFluidicsWidget(QFrame):
         # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(preset_name)
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
-        self.list_configurations.setSelectionMode(QAbstractItemView.MultiSelection)
 
         # Laser AF checkbox
         self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
@@ -3957,7 +4183,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
-        self.list_configurations.itemSelectionChanged.connect(self.emit_selected_channels)
+        self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
@@ -3973,7 +4199,7 @@ class MultiPointWithFluidicsWidget(QFrame):
                 QMessageBox.warning(self, "Warning", "Please choose base saving directory first")
                 return
 
-            if not self.list_configurations.selectedItems():
+            if not _has_checked_items(self.list_configurations):
                 self.btn_startAcquisition.setChecked(False)
                 QMessageBox.warning(self, "Warning", "Please select at least one observation state")
                 return
@@ -4025,8 +4251,9 @@ class MultiPointWithFluidicsWidget(QFrame):
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_configurations(
-                [item.text() for item in self.list_configurations.selectedItems()]
+                _get_checked_names(self.list_configurations)
             )
+            self.multipointController.set_region_observation_state_map(None)
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
@@ -4077,20 +4304,16 @@ class MultiPointWithFluidicsWidget(QFrame):
 
     def emit_selected_channels(self):
         """Emit signal with list of selected channel names"""
-        selected_channels = [item.text() for item in self.list_configurations.selectedItems()]
+        selected_channels = _get_checked_names(self.list_configurations)
         self.signal_acquisition_channels.emit(selected_channels)
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        selected_names = [item.text() for item in self.list_configurations.selectedItems()]
+        checked_names = _get_checked_names(self.list_configurations)
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(name)
-        for i in range(self.list_configurations.count()):
-            item = self.list_configurations.item(i)
-            if item.text() in selected_names:
-                item.setSelected(True)
+            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
         self.list_configurations.blockSignals(False)
 
     def acquisition_is_finished(self):
