@@ -14,7 +14,17 @@
       "Bash(pytest *)",
       "Bash(git status)",
       "Bash(git diff*)",
-      "Bash(git log*)"
+      "Bash(git log*)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(awk *)",
+      "Bash(cut *)",
+      "Bash(sed *)",
+      "Bash(wc *)",
+      "Bash(for *)",
+      "Bash(do *)",
+      "Bash(done *)",
+      "Bash(ls *)"
     ],
     "deny": [
       "Read(./.env)",
