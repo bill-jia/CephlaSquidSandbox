@@ -120,6 +120,20 @@ Shape: `(FOV, T, C, Z, Y, X)` where:
 }
 ```
 
+## Multiscale Pyramids
+
+On finalization, each zarr writer generates downsampled pyramid levels (2x and 4x) alongside the full-resolution `/0` array. These are written as `/1` and `/2` sibling arrays using `cv2.INTER_AREA` downsampling and registered in the `multiscales.datasets` metadata.
+
+This enables interactive browsing in OME-NGFF-compatible viewers (napari, neuroglancer, OMERO) without manual pyramid generation. Pyramid generation is skipped for 6D mode (where the array path is `.` rather than `/0`).
+
+## Embedded Frame Timestamps
+
+Per-frame capture timestamps are written as `frame_timestamps.json` inside each zarr group during finalization. Each entry contains `t`, `c`, `z`, `unix_time_s`, and `channel_name` (plus `fov` for 6D mode). This supplements the `frame_acquisition_times.csv` written per timepoint directory, making the zarr store self-describing.
+
+## Pipelined Writes
+
+The `ZarrWriter` submits TensorStore writes non-blockingly, accumulating up to 32 in-flight futures before draining completed ones. This allows TensorStore to overlap compression and disk I/O across frames, improving throughput for fast cameras. All pending writes are flushed during finalization.
+
 ## Sharding and Chunks
 
 Zarr v3 uses sharding to optimize both read and write performance:

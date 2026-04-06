@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import threading
@@ -728,6 +729,30 @@ class MultiPointWorker:
                     utils.ensure_directory_exists(str(self.experiment_path))
                 current_path = os.path.join(self.experiment_path, f"{self.time_point:0{FILE_ID_PADDING}}")
                 utils.ensure_directory_exists(str(current_path))
+
+                # Write acquisition metadata sidecar for individual TIFF saving modes.
+                # This makes per-timepoint folders self-describing without parsing filenames.
+                if (
+                    not self.skip_saving
+                    and FILE_SAVING_OPTION in (FileSavingOption.INDIVIDUAL_IMAGES, FileSavingOption.MULTI_PAGE_TIFF)
+                ):
+                    metadata_path = os.path.join(current_path, "metadata.json")
+                    if not os.path.exists(metadata_path):
+                        sidecar = {
+                            "channel_names": list(self.observation_state_names),
+                            "num_time_points": self.Nt,
+                            "num_z_levels": self.NZ,
+                            "num_channels": len(self.observation_state_names),
+                            "pixel_size_um": self._pixel_size_um,
+                            "z_step_um": self._physical_size_z_um,
+                            "time_increment_s": self._time_increment_s,
+                            "file_saving_option": FILE_SAVING_OPTION.value,
+                        }
+                        try:
+                            with open(metadata_path, "w") as f:
+                                json.dump(sidecar, f, indent=2)
+                        except OSError as e:
+                            self._log.warning(f"Failed to write metadata sidecar: {e}")
             # create a dataframe to save coordinates
             with self._timing.get_timer("initialize_coordinates_dataframe"):
                 self.initialize_coordinates_dataframe()

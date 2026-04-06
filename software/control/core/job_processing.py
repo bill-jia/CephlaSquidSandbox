@@ -806,14 +806,17 @@ class SaveZarrJob(Job):
         t = info.time_point or 0
         c = info.configuration_idx
         z = info.z_index
+        channel_name = info.filename_channel_label or info.observation_state.name
 
         if is_hcs or not use_6d_fov:
             # 5D write
             writer.write_frame(image, t=t, c=c, z=z)
+            writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name)
             self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path}")
         else:
             # 6D write with FOV index
             writer.write_frame(image, t=t, c=c, z=z, fov=fov)
+            writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name, fov=fov)
             self._log.debug(f"Wrote frame t={t}, c={c}, z={z}, fov={fov} to {output_path}")
 
 
@@ -1100,6 +1103,11 @@ class DownsampledViewJob(Job):
             self._well_accumulators.pop(self.well_id, None)
 
 
+# TODO: For Zarr with FULL_FRAME chunks, writes to different FOVs/regions are
+# independent.  A future optimization is to run N JobRunner processes partitioned
+# by FOV or region, giving linear throughput scaling when disk bandwidth allows.
+# The backpressure counters already use shared multiprocessing.Value and would
+# work across multiple workers without changes.
 class JobRunner(multiprocessing.Process):
     def __init__(
         self,

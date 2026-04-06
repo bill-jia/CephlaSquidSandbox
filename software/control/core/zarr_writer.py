@@ -358,6 +358,9 @@ class ZarrWriter:
         self._finalized = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._owns_loop = False  # True if we created the loop ourselves
+        # Per-frame timestamps collected during acquisition, written to zarr on finalize.
+        # Each entry is a dict with keys: t, c, z, fov (optional), unix_time_s, channel_name.
+        self._frame_timestamps: List[Dict[str, Any]] = []
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Get or create the event loop (only used for init/finalize)."""
@@ -651,17 +654,17 @@ class ZarrWriter:
                 log.error(f"Failed to write zarr metadata to {zarr_json_path}: {e}")
                 raise RuntimeError(f"Failed to write zarr metadata: {e}") from e
 
+    # Maximum number of TensorStore write futures to accumulate before draining.
+    # Keeps memory bounded while allowing pipelined I/O.
+    MAX_PENDING_WRITES = 32
+
     def write_frame(self, image: np.ndarray, t: int, c: int, z: int, fov: Optional[int] = None) -> None:
-        """Write a single frame and block until the TensorStore write completes.
+        """Submit a frame write to TensorStore without blocking.
 
-        This method submits an asynchronous write via TensorStore's write API and
-        then waits on the resulting future (via future.result()) before returning.
-        This blocks the calling thread until the write has finished. The underlying
-        disk I/O is handled asynchronously by TensorStore; this method synchronously
-        waits for that async operation to complete.
-
-        This ensures data is visible to other processes reading the same zarr store
-        before this method returns.
+        Writes are pipelined: each call submits an async write and appends the
+        future to an internal list.  When the list exceeds MAX_PENDING_WRITES,
+        completed futures are drained (and any that raised are re-raised).
+        Call wait_for_pending() or finalize() to flush all remaining writes.
 
         Args:
             image: 2D image array (Y, X)
@@ -695,25 +698,107 @@ class ZarrWriter:
         if image.dtype != config.dtype:
             image = image.astype(config.dtype)
 
-        # Write using TensorStore and wait for completion
-        # This ensures data is flushed before we notify the viewer
+        # Submit async write — TensorStore handles I/O in the background
         if config.ndim == 5:
             future = self._dataset[t, c, z, :, :].write(image)
-            log.debug(f"Writing frame t={t}, c={c}, z={z}")
+            log.debug(f"Submitted write for frame t={t}, c={c}, z={z}")
         else:
             future = self._dataset[fov, t, c, z, :, :].write(image)
-            log.debug(f"Writing frame fov={fov}, t={t}, c={c}, z={z}")
+            log.debug(f"Submitted write for frame fov={fov}, t={t}, c={c}, z={z}")
 
-        # Wait for write to complete (blocking)
-        # TensorStore futures have a .result() method that blocks until complete
-        future.result()
-        if config.ndim == 5:
-            log.debug(f"Write complete for frame t={t}, c={c}, z={z}")
+        self._pending_futures.append(future)
+
+        # Drain completed futures when the pipeline is full
+        if len(self._pending_futures) >= self.MAX_PENDING_WRITES:
+            self._drain_completed_futures()
+
+    def _drain_completed_futures(self) -> int:
+        """Remove completed futures from the pending list, re-raising any errors.
+
+        Futures that are still in-flight are kept.  If any completed future
+        raised an exception, it is re-raised here so the caller can handle it.
+
+        Returns:
+            Number of futures that were completed and removed.
+        """
+        still_pending = []
+        drained = 0
+        for f in self._pending_futures:
+            if f.done():
+                # .result() on an already-done future returns immediately;
+                # it re-raises if the write failed.
+                f.result()
+                drained += 1
+            else:
+                still_pending.append(f)
+        self._pending_futures = still_pending
+        if drained:
+            log.debug(f"Drained {drained} completed writes, {len(still_pending)} still pending")
+        return drained
+
+    def record_frame_time(
+        self,
+        t: int,
+        c: int,
+        z: int,
+        unix_time_s: float,
+        channel_name: str,
+        fov: Optional[int] = None,
+    ) -> None:
+        """Record a per-frame timestamp for later embedding in the zarr store.
+
+        Call this alongside write_frame().  Timestamps are accumulated in memory
+        and written as a structured zarr array during finalize().
+
+        Args:
+            t: Time point index
+            c: Channel index
+            z: Z-slice index
+            unix_time_s: Unix timestamp of frame capture
+            channel_name: Channel/observation state name
+            fov: FOV index (for 6D datasets)
+        """
+        entry: Dict[str, Any] = {
+            "t": t,
+            "c": c,
+            "z": z,
+            "unix_time_s": unix_time_s,
+            "channel_name": channel_name,
+        }
+        if fov is not None:
+            entry["fov"] = fov
+        self._frame_timestamps.append(entry)
+
+    def _write_frame_timestamps(self) -> None:
+        """Write accumulated frame timestamps as a JSON file in the zarr store.
+
+        Writes ``frame_timestamps.json`` next to the zarr.json metadata file so
+        that downstream readers can find per-frame timing without a separate CSV.
+        """
+        if not self._frame_timestamps:
+            return
+
+        # Write next to the group-level zarr.json (same directory as OME metadata)
+        if self._is_ome_ngff_array_path():
+            parent = os.path.dirname(self._config.output_path)
         else:
-            log.debug(f"Write complete for frame fov={fov}, t={t}, c={c}, z={z}")
+            parent = self._config.output_path
+        ts_path = os.path.join(parent, "frame_timestamps.json")
+
+        try:
+            # Sort by (t, c, z) for deterministic ordering
+            sorted_ts = sorted(self._frame_timestamps, key=lambda e: (e["t"], e["c"], e["z"]))
+            with open(ts_path, "w") as f:
+                json.dump(sorted_ts, f, indent=1)
+            log.info(f"Wrote {len(sorted_ts)} frame timestamps to {ts_path}")
+        except OSError as e:
+            log.error(f"Failed to write frame timestamps to {ts_path}: {e}")
 
     def wait_for_pending(self, timeout_s: Optional[float] = None) -> int:
-        """Wait for pending writes (blocking).
+        """Wait for all pending writes to complete (blocking).
+
+        Blocks on each outstanding TensorStore future via .result().
+        Re-raises the first write error encountered.
 
         Args:
             timeout_s: Optional timeout in seconds (not currently enforced)
@@ -727,13 +812,8 @@ class ZarrWriter:
         count = len(self._pending_futures)
         log.debug(f"Waiting for {count} pending writes...")
 
-        # Wait for all TensorStore futures in parallel using asyncio.gather
-        # This is more efficient than waiting sequentially
-        async def _wait_all():
-            await asyncio.gather(*self._pending_futures)
-
-        loop = self._get_loop()
-        loop.run_until_complete(_wait_all())
+        for f in self._pending_futures:
+            f.result()
 
         self._pending_futures.clear()
         log.debug(f"Completed {count} pending writes")
@@ -743,6 +823,145 @@ class ZarrWriter:
     def pending_write_count(self) -> int:
         """Number of writes currently pending."""
         return len(self._pending_futures)
+
+    def _generate_multiscale_pyramid(self, num_levels: int = 2) -> List[dict]:
+        """Generate downsampled pyramid levels from the full-resolution dataset.
+
+        Reads the level-0 dataset plane-by-plane, downsamples by powers of 2
+        using cv2.INTER_AREA, and writes each level as a sibling zarr array.
+
+        Only works for OME-NGFF array paths (ending in /0) where sibling
+        directories /1, /2, ... can be created.  Silently skips if the path
+        structure doesn't support it (e.g. 6D mode with path = ".").
+
+        Args:
+            num_levels: Number of additional pyramid levels (default 2 -> /1, /2).
+
+        Returns:
+            List of dataset entries for OME-NGFF multiscales metadata, one per
+            generated level.  Empty if pyramid generation was skipped.
+        """
+        try:
+            import cv2
+        except ImportError:
+            log.warning("cv2 not available — skipping multiscale pyramid generation")
+            return []
+
+        if not self._is_ome_ngff_array_path():
+            log.info("Skipping pyramid generation for non-array path (6D mode)")
+            return []
+
+        config = self._config
+        parent_dir = os.path.dirname(config.output_path)  # e.g. plate.ome.zarr/A/1/0
+        ts = _get_tensorstore()
+
+        dataset_entries = []
+
+        for level in range(1, num_levels + 1):
+            scale_factor = 2 ** level
+            new_y = config.y_size // scale_factor
+            new_x = config.x_size // scale_factor
+
+            if new_y < 1 or new_x < 1:
+                log.info(f"Image too small for pyramid level {level}, stopping at level {level - 1}")
+                break
+
+            level_path = os.path.join(parent_dir, str(level))
+
+            if config.ndim == 5:
+                level_shape = (config.t_size, config.c_size, config.z_size, new_y, new_x)
+            else:
+                level_shape = (config.fov_size, config.t_size, config.c_size, config.z_size, new_y, new_x)
+
+            # Use simple uncompressed chunks for pyramid levels (they're small)
+            if config.ndim == 5:
+                chunk_shape = [1, 1, 1, new_y, new_x]
+            else:
+                chunk_shape = [1, 1, 1, 1, new_y, new_x]
+
+            spec = {
+                "driver": "zarr3",
+                "kvstore": {"driver": "file", "path": level_path},
+                "metadata": {
+                    "shape": list(level_shape),
+                    "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": chunk_shape}},
+                    "chunk_key_encoding": {"name": "default"},
+                    "data_type": _dtype_to_zarr(config.dtype),
+                    "codecs": [
+                        {"name": "transpose", "configuration": {"order": list(reversed(range(len(level_shape))))}},
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                    ],
+                    "fill_value": 0,
+                },
+            }
+
+            try:
+                async def _open_level():
+                    return await ts.open(spec, create=True, delete_existing=True)
+
+                loop = self._get_loop()
+                level_ds = loop.run_until_complete(_open_level())
+            except Exception as e:
+                log.error(f"Failed to create pyramid level {level}: {e}")
+                break
+
+            log.info(f"Generating pyramid level {level} ({scale_factor}x downsample, shape={level_shape})...")
+
+            # Downsample plane-by-plane from level 0
+            frames_written = 0
+            try:
+                if config.ndim == 5:
+                    for t_idx in range(config.t_size):
+                        for c_idx in range(config.c_size):
+                            for z_idx in range(config.z_size):
+                                plane = self._dataset[t_idx, c_idx, z_idx, :, :].read().result()
+                                downsampled = cv2.resize(
+                                    np.asarray(plane), (new_x, new_y), interpolation=cv2.INTER_AREA
+                                )
+                                level_ds[t_idx, c_idx, z_idx, :, :].write(downsampled).result()
+                                frames_written += 1
+                else:
+                    for f_idx in range(config.fov_size):
+                        for t_idx in range(config.t_size):
+                            for c_idx in range(config.c_size):
+                                for z_idx in range(config.z_size):
+                                    plane = self._dataset[f_idx, t_idx, c_idx, z_idx, :, :].read().result()
+                                    downsampled = cv2.resize(
+                                        np.asarray(plane), (new_x, new_y), interpolation=cv2.INTER_AREA
+                                    )
+                                    level_ds[f_idx, t_idx, c_idx, z_idx, :, :].write(downsampled).result()
+                                    frames_written += 1
+            except Exception as e:
+                log.error(f"Error generating pyramid level {level} after {frames_written} frames: {e}")
+                break
+
+            log.info(f"Pyramid level {level} complete: {frames_written} frames written")
+
+            # Build coordinate transforms for this level
+            if config.ndim == 5:
+                scale = [
+                    config.time_increment_s or 1.0,
+                    1.0,
+                    config.z_step_um or 1.0,
+                    config.pixel_size_um * scale_factor,
+                    config.pixel_size_um * scale_factor,
+                ]
+            else:
+                scale = [
+                    1.0,
+                    config.time_increment_s or 1.0,
+                    1.0,
+                    config.z_step_um or 1.0,
+                    config.pixel_size_um * scale_factor,
+                    config.pixel_size_um * scale_factor,
+                ]
+
+            dataset_entries.append({
+                "path": str(level),
+                "coordinateTransformations": [{"type": "scale", "scale": scale}],
+            })
+
+        return dataset_entries
 
     def finalize(self) -> None:
         """Finalize the dataset (blocking)."""
@@ -755,13 +974,28 @@ class ZarrWriter:
         # Wait for all pending writes
         self.wait_for_pending()
 
-        # Update metadata with completion status (in zarr.json attributes)
+        # Generate multiscale pyramid levels
+        pyramid_datasets = self._generate_multiscale_pyramid(num_levels=2)
+
+        # Write per-frame timestamps collected during acquisition
+        self._write_frame_timestamps()
+
+        # Update metadata with completion status and pyramid levels (in zarr.json attributes)
         zarr_json_path = self._get_metadata_zarr_json_path()
         try:
             if os.path.exists(zarr_json_path):
                 with open(zarr_json_path, "r") as f:
                     zarr_json = json.load(f)
                 attrs = zarr_json.get("attributes", {})
+
+                # Append pyramid datasets to multiscales metadata
+                if pyramid_datasets:
+                    ome = attrs.get("ome", {})
+                    multiscales = ome.get("multiscales", [])
+                    if multiscales:
+                        multiscales[0]["datasets"].extend(pyramid_datasets)
+                        log.info(f"Added {len(pyramid_datasets)} pyramid levels to multiscales metadata")
+
                 if "_squid" in attrs:
                     attrs["_squid"]["acquisition_complete"] = True
                     zarr_json["attributes"] = attrs
