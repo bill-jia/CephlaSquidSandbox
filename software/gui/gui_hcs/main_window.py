@@ -1573,19 +1573,8 @@ class HighContentScreeningGui(QMainWindow):
             dialog.exec_()
 
     def openPreferences(self):
-        if CACHED_CONFIG_FILE_PATH and os.path.exists(CACHED_CONFIG_FILE_PATH):
-            config = ConfigParser()
-            config.read(CACHED_CONFIG_FILE_PATH)
-            dialog = widgets.PreferencesDialog(
-                config,
-                CACHED_CONFIG_FILE_PATH,
-                parent=self,
-                on_restart=self.restart_application,
-            )
-            dialog.signal_config_changed.connect(self._update_ram_monitor_visibility)
-            dialog.exec_()
-        else:
-            self.log.warning("No configuration file found")
+        # TODO: rewrite PreferencesDialog to use MachineConfig instead of INI files
+        self.log.warning("Preferences dialog is being updated to use the new configuration system")
 
     def _setup_slack_notifier(self):
         """Initialize the Slack notifier and wire up connections."""

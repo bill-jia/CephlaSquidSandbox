@@ -81,14 +81,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
             "piezo", "flip_direction", False
         )
 
-    # Illumination / light source flags
-    illum = mc.get_device("illumination")
-    if illum and illum.enabled:
-        drv = illum.driver
-        control._def.USE_LDI_SERIAL_CONTROL = drv == "ldi"
-        control._def.USE_CELESTA_ETHERNET_CONTROL = drv == "celesta"
-        control._def.USE_ANDOR_LASER_CONTROL = drv == "andor_laser"
-
     # Spinning disk confocal
     xlight_enabled = _dev_enabled("xlight")
     dragonfly_enabled = _dev_enabled("dragonfly")
@@ -139,9 +131,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
         legacy_type = _DRIVER_TO_CAMERA_TYPE.get(main_cam.driver)
         if legacy_type:
             control._def.CAMERA_TYPE = legacy_type
-        model = main_cam.config.get("model")
-        if model:
-            control._def.MAIN_CAMERA_MODEL = model
 
     # NI-DAQ digital logic family: allow MachineConfig to override camera-based default.
     nidaq_dev = mc.get_device("nidaq")
@@ -149,17 +138,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
         logic_family = nidaq_dev.config.get("logic_family")
         if logic_family:
             control._def.NI_DAQ_LOGIC_FAMILY = str(logic_family)
-
-    focus_cam = mc.get_device("focus_camera")
-    if focus_cam and focus_cam.enabled:
-        legacy_type = _DRIVER_TO_CAMERA_TYPE.get(focus_cam.driver, "Default")
-        control._def.FOCUS_CAMERA_TYPE = legacy_type
-        model = focus_cam.config.get("model")
-        if model:
-            control._def.FOCUS_CAMERA_MODEL = model
-        exp = focus_cam.config.get("exposure_time_ms")
-        if exp is not None:
-            control._def.FOCUS_CAMERA_EXPOSURE_TIME_MS = exp
 
     # ── Microcontroller ──────────────────────────────────────────────────────
 
@@ -196,7 +174,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
         control._def.DEFAULT_SAVING_PATH = sw.default_saving_path
     control._def.USE_NAPARI_FOR_LIVE_VIEW = sw.display.use_napari_for_live_view
     control._def.USE_NAPARI_FOR_MOSAIC_DISPLAY = sw.display.use_napari_for_mosaic
-    control._def.DEFAULT_DISPLAY_CROP = sw.display.default_crop
 
     # Acquisition
     acq = sw.acquisition
@@ -209,8 +186,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.ENABLE_FLEXIBLE_MULTIPOINT = acq.flexible_multipoint
     control._def.ENABLE_WELLPLATE_MULTIPOINT = acq.wellplate_multipoint
     control._def.ENABLE_RECORDING = acq.recording
-    control._def.DEFAULT_MULTIPOINT_NX = acq.default_nx
-    control._def.DEFAULT_MULTIPOINT_NY = acq.default_ny
 
     # Autofocus
     af = sw.autofocus
@@ -245,7 +220,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
             lim = s.get("software_limits", {}).get(axis, {})
 
             setattr(control._def, f"STAGE_MOVEMENT_SIGN_{uc}", a.get("movement_sign", 1))
-            setattr(control._def, f"STAGE_POS_SIGN_{uc}", a.get("pos_sign", a.get("movement_sign", 1)))
             setattr(control._def, f"FULLSTEPS_PER_REV_{uc}", a.get("fullsteps_per_rev", 200))
             setattr(control._def, f"SCREW_PITCH_{uc}_MM", a.get("screw_pitch_mm", 1))
             setattr(control._def, f"MICROSTEPPING_DEFAULT_{uc}", a.get("microstepping", 8))
@@ -277,7 +251,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
         if scanning:
             control._def.SLIDE_POSITION.SCANNING_X_MM = scanning.get("x_mm", 20)
             control._def.SLIDE_POSITION.SCANNING_Y_MM = scanning.get("y_mm", 20)
-        control._def.DEFAULT_Z_POS_MM = pos.get("default_z_mm", 2)
 
     # ── Camera config overrides ───────────────────────────────────────────────
 

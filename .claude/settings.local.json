@@ -17,7 +17,15 @@
       "Bash(sed 's/.*def //')",
       "Bash(cp software/control/core/auto_focus_worker.py software/control/core/core.py software/control/core/multi_point_controller.py software/control/core/multi_point_worker.py C:/Code/CephlaSquidSandbox/software/control/core/)",
       "Bash(cp software/gui/widgets/napari_views.py C:/Code/CephlaSquidSandbox/software/gui/widgets/)",
-      "Bash(find /c/Code/CephlaSquidSandbox -name \"*.py\" -type f -exec grep -l \"class.*Channel\\\\|IlluminationChannel\" {})"
+      "Bash(find /c/Code/CephlaSquidSandbox -name \"*.py\" -type f -exec grep -l \"class.*Channel\\\\|IlluminationChannel\" {})",
+      "Bash(find /c/Code/CephlaSquidSandbox -name *CLAUDE* -o -name *claude*)",
+      "Bash(grep:*)",
+      "Bash(ls -la /c/Code/CephlaSquidSandbox/software/control/*.py)",
+      "Bash(ls -1 /c/Code/CephlaSquidSandbox/software/tests/control/test_*.py)",
+      "Bash(conda activate:*)",
+      "Bash(python -c \"import control._def; print\\(''OK''\\)\")",
+      "Bash(/c/Users/jialab/miniforge3/envs/squid/python.exe -c \"import control._def; print\\(''OK''\\)\")",
+      "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -m pytest tests/control/test_def.py -v 2>&1)"
     ]
   }
 }

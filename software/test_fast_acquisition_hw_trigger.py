@@ -29,7 +29,6 @@ from control.camera_flir import FLIRCamera
 from squid.config import CameraConfig, CameraVariant
 from squid.abc import CameraAcquisitionMode, CameraPixelFormat
 import squid.camera.utils
-from control._def import CACHED_CONFIG_FILE_PATH
 from control._def import USE_TERMINAL_CONSOLE
 from control.camera_flir import get_enumeration_node_and_current_entry
 
@@ -51,7 +50,7 @@ def test_hw_trigger_frame_collection():
     cf_editor_parser = ConfigParser()
     config_files = glob.glob("." + "/" + "configuration*.ini")
     if config_files:
-        cf_editor_parser.read(CACHED_CONFIG_FILE_PATH)
+        cf_editor_parser.read(config_files[0])
     else:
         print("configuration*.ini file not found, defaulting to legacy configuration")
         legacy_config = True

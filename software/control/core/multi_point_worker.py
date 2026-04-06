@@ -180,8 +180,6 @@ class MultiPointWorker:
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
 
-        self.crop = SEGMENTATION_CROP
-
         self.t_dpc = []
         self.t_inf = []
         self.t_over = []

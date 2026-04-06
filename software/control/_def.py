@@ -13,90 +13,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 log = squid.logging.get_logger(__name__)
 
 
-def conf_attribute_reader(string_value):
-    """
-    :brief: standardized way for reading config entries
-    that are strings, in priority order
-    JSON (with comments stripped if needed) -> None -> bool -> int -> float -> string
-    Inline comments (# ...) are stripped, but # inside valid JSON is preserved.
-    REMEMBER TO ENCLOSE PROPERTY NAMES IN LISTS/DICTS IN DOUBLE QUOTES
-    """
-    actualvalue = str(string_value).strip()
-
-    # Try JSON first - handles valid JSON with # inside (like {"color": "#FF0000"})
-    try:
-        return json.loads(actualvalue)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # JSON failed - strip inline comments if present
-    # Only treat # as comment if preceded by whitespace (e.g., "value  # comment")
-    if "#" in actualvalue:
-        # For JSON-like values, try stripping from rightmost # positions
-        # This handles cases like {"color": "#FF0000"}  # comment
-        if actualvalue.startswith("[") or actualvalue.startswith("{"):
-            hash_positions = [i for i, c in enumerate(actualvalue) if c == "#"]
-            for pos in reversed(hash_positions):
-                candidate = actualvalue[:pos].strip()
-                try:
-                    return json.loads(candidate)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        # For non-JSON or if all JSON attempts failed, strip comments with whitespace before #
-        # This preserves values like "my#tag" while stripping "value  # comment"
-        # Find the earliest comment separator to handle "value\t# c1  # c2" correctly
-        comment_positions = [actualvalue.find(sep) for sep in (" #", "\t#") if sep in actualvalue]
-        if comment_positions:
-            cut_pos = min(comment_positions)
-            actualvalue = actualvalue[:cut_pos].rstrip()
-
-    # Parse the (possibly stripped) value
-    if actualvalue == "None":
-        return None
-    if actualvalue in ("True", "true"):
-        return True
-    if actualvalue in ("False", "false"):
-        return False
-
-    # Try JSON again (for cases like [1,2,3] # comment -> [1,2,3])
-    try:
-        return json.loads(actualvalue)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Try int
-    try:
-        return int(actualvalue)
-    except ValueError:
-        pass
-
-    # Try float
-    try:
-        return float(actualvalue)
-    except ValueError:
-        pass
-
-    return actualvalue
-
-
-def populate_class_from_dict(myclass, options):
-    """
-    :brief: helper function to establish a compatibility
-        layer between new way of storing config and current
-        way of accessing it. assumes all class attributes are
-        all-uppercase, and pattern-matches attributes in
-        priority order dict/list (json) -> -> int -> float-> string
-    REMEMBER TO ENCLOSE PROPERTY NAMES IN LISTS IN DOUBLE QUOTES
-    """
-    for key, value in options:
-        if key.startswith("_") and key.endswith("options"):
-            continue
-        actualkey = key.upper()
-        actualvalue = conf_attribute_reader(value)
-        setattr(myclass, actualkey, actualvalue)
-
-
-HARDWARE_TRIGGERING_ENABLED = True
 class TriggerMode:
     SOFTWARE = "Software Trigger"
     HARDWARE = "Hardware Trigger"
@@ -126,10 +42,6 @@ class Acquisition:
     NX = 1
     NY = 1
     USE_MULTIPROCESSING = True
-
-
-class PosUpdate:
-    INTERVAL_MS = 25
 
 
 class MicrocontrollerDef:
@@ -594,16 +506,6 @@ STAGE_MOVEMENT_SIGN_Z = -1
 STAGE_MOVEMENT_SIGN_THETA = 1
 STAGE_MOVEMENT_SIGN_W = 1
 
-STAGE_POS_SIGN_X = STAGE_MOVEMENT_SIGN_X
-STAGE_POS_SIGN_Y = STAGE_MOVEMENT_SIGN_Y
-STAGE_POS_SIGN_Z = STAGE_MOVEMENT_SIGN_Z
-STAGE_POS_SIGN_THETA = STAGE_MOVEMENT_SIGN_THETA
-
-TRACKING_MOVEMENT_SIGN_X = 1
-TRACKING_MOVEMENT_SIGN_Y = 1
-TRACKING_MOVEMENT_SIGN_Z = 1
-TRACKING_MOVEMENT_SIGN_THETA = 1
-
 USE_ENCODER_X = False
 USE_ENCODER_Y = False
 USE_ENCODER_Z = False
@@ -823,9 +725,6 @@ MULTIPOINT_BF_SAVING_OPTION = "Raw"
 # MULTIPOINT_BF_SAVING_OPTION = 'RGB2GRAY'
 # MULTIPOINT_BF_SAVING_OPTION = 'Green Channel Only'
 
-DEFAULT_MULTIPOINT_NX = 1
-DEFAULT_MULTIPOINT_NY = 1
-
 ENABLE_FLEXIBLE_MULTIPOINT = True
 USE_OVERLAP_FOR_FLEXIBLE = True
 ENABLE_WELLPLATE_MULTIPOINT = True
@@ -869,17 +768,11 @@ ACQUISITION_MAX_PENDING_JOBS = 10  # Max jobs in flight before throttling
 ACQUISITION_MAX_PENDING_MB = 2000.0  # Max pending MB before throttling
 ACQUISITION_THROTTLE_TIMEOUT_S = 30.0  # Max wait time when throttled
 
-CAMERA_SN = {"ch 1": "SN1", "ch 2": "SN2"}  # for multiple cameras, to be overwritten in the configuration file
-
-ENABLE_STROBE_OUTPUT = False
-
 ACQUISITION_PATTERN = "S-Pattern"  # 'S-Pattern', 'Unidirectional'
 FOV_PATTERN = "Unidirectional"  # 'S-Pattern', 'Unidirectional'
 
 Z_STACKING_CONFIG = "FROM BOTTOM"  # 'FROM BOTTOM', 'FROM TOP'
 Z_STACKING_CONFIG_MAP = {0: "FROM BOTTOM", 1: "FROM CENTER", 2: "FROM TOP"}
-
-DEFAULT_Z_POS_MM = 2
 
 WELLPLATE_OFFSET_X_mm = 0  # x offset adjustment for using different plates
 WELLPLATE_OFFSET_Y_mm = 0  # y offset adjustment for using different plates
@@ -893,13 +786,6 @@ CONTROLLER_VERSION = "Arduino Due"  # 'Teensy'
 # How to read Spinnaker nodemaps, options are INDIVIDUAL or VALUE
 CHOSEN_READ = "INDIVIDUAL"
 
-# laser autofocus — legacy toggle (unused by GUI). Multipoint widgets use
-# ``microscope.addons.camera_focus`` instead; kept for any external/scripts still reading it.
-SUPPORT_LASER_AUTOFOCUS = False
-MAIN_CAMERA_MODEL = "MER2-1220-32U3M"
-FOCUS_CAMERA_MODEL = "MER2-630-60U3M"
-FOCUS_CAMERA_EXPOSURE_TIME_MS = 2
-FOCUS_CAMERA_ANALOG_GAIN = 0
 LASER_AF_AVERAGING_N = 3
 LASER_AF_DISPLAY_SPOT_IMAGE = True
 LASER_AF_CROP_WIDTH = 1536
@@ -927,20 +813,6 @@ MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 RETRACT_OBJECTIVE_BEFORE_MOVING_TO_LOADING_POSITION = True
 OBJECTIVE_RETRACTED_POS_MM = 0.1
 
-TWO_CLASSIFICATION_MODELS = False
-CLASSIFICATION_MODEL_PATH = "models/resnet18_en/version1/best.pt"
-CLASSIFICATION_MODEL_PATH2 = "models/resnet18_en/version2/best.pt"
-CLASSIFICATION_TEST_MODE = False
-CLASSIFICATION_TH = 0.3
-
-SEGMENTATION_MODEL_PATH = "models/m2unet_model_flat_erode1_wdecay5_smallbatch/model_4000_11.pth"
-ENABLE_SEGMENTATION = True
-USE_TRT_SEGMENTATION = False
-SEGMENTATION_CROP = 1500
-
-DISP_TH_DURING_MULTIPOINT = 0.95
-SORT_DURING_MULTIPOINT = False
-
 INVERTED_OBJECTIVE = False
 
 # Illumination intensity scaling factor - scales DAC output for different hardware:
@@ -951,15 +823,11 @@ INVERTED_OBJECTIVE = False
 ILLUMINATION_INTENSITY_FACTOR = 0.6
 
 CAMERA_TYPE = "Default"
-FOCUS_CAMERA_TYPE = "Default"
 
 # Spinning disk confocal integration
 ENABLE_SPINNING_DISK_CONFOCAL = False
-USE_LDI_SERIAL_CONTROL = False
 LDI_INTENSITY_MODE = "PC"
 LDI_SHUTTER_MODE = "PC"
-USE_CELESTA_ETHERNET_CONTROL = False
-USE_ANDOR_LASER_CONTROL = False
 ANDOR_LASER_VID = 0x1BDB
 ANDOR_LASER_PID = 0x0300
 
@@ -1251,7 +1119,6 @@ ZARR_USE_6D_FOV_DIMENSION = False
 ##########################################################
 #### start of loading machine specific configurations ####
 ##########################################################
-CACHED_CONFIG_FILE_PATH = None
 
 # Piezo configuration items
 Z_MOTOR_CONFIG = ZMotorConfig.STEPPER
