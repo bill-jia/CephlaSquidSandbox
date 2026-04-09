@@ -615,7 +615,7 @@ LED_MATRIX_R_FACTOR = 1
 LED_MATRIX_G_FACTOR = 1
 LED_MATRIX_B_FACTOR = 1
 
-DEFAULT_SAVING_PATH = str(Path.home() / "Downloads")
+DEFAULT_SAVING_PATH = "C:/Microscope_Data"
 ACQUISITION_CONFIGURATIONS_PATH = Path("user_profiles")
 FILE_ID_PADDING = 0
 
@@ -1085,7 +1085,7 @@ Z_HOME_SAFETY_MARGIN_UM = 100
 # safety point
 X_HOME_SAFETY_POINT = 0
 Y_HOME_SAFETY_POINT = 0
-Z_HOME_SAFETY_POINT = 600
+Z_HOME_SAFETY_POINT = 400
 
 # When the last stage position cache is missing or unreadable, move here after homing (mm).
 STARTUP_DEFAULT_STAGE_X_MM = 30.0

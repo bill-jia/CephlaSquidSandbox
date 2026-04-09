@@ -72,6 +72,9 @@ def main():
         print(f"Loaded frame timestamps from {os.path.join(args.folder, 'frame_timestamps_ms.npy')}")
     else:
         frame_timestamps_ms = None
+    
+    print(h5f.attrs)
+    print(h5f.keys())
 
     # Read metadata for timing
     sample_rate = h5f.attrs.get("sample_rate_hz", None)
@@ -101,6 +104,7 @@ def main():
         exposure_ds = np.zeros_like(trigger_ds)
 
     try:
+        print(f"AI lines: {ai_lines}")
         ai_line = pick_line(args.ai_line, ai_lines, "analog input (AI)")
         ai_ds = h5f["analog_input"][f"ai{ai_line}"][:]
     except:

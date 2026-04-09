@@ -37,11 +37,11 @@ devices:
     role: main
     io:
       trigger:
-        controller: teensy
+        controller: nidaq
         signal_type: digital
         direction: output
-        channel_id: "trigger:0"
-        display_name: "Main camera trigger"
+        channel_id: "port0/line12"
+        display_name: "camera_trigger"
     config:
       model: "ITR3CMOS26000KMA"
       pixel_format: MONO16
@@ -239,7 +239,7 @@ illumination_devices:
             signal_type: digital
             direction: output
             channel_id: "port0/line3"
-            display_name: "coolled_shutter_638_nidaq3"
+            display_name: "coolled_shutter_635_nidaq3"
 
   - id: led_matrix
     driver: led_matrix

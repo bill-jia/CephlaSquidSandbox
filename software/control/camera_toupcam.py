@@ -1,6 +1,6 @@
 import math
 import time
-from typing import List, Optional, Tuple, Sequence, Dict
+from typing import Callable, List, Optional, Tuple, Sequence, Dict
 
 import numpy as np
 import pydantic
@@ -48,6 +48,7 @@ def get_sn_by_model(camera_model: ToupcamCameraModel):
         if dev.displayname == camera_model.value:
             return dev.id
     return None  # return None if no device with the specified model_name is connected
+
 
 
 class ToupcamCamera(AbstractCamera):
@@ -237,6 +238,11 @@ class ToupcamCamera(AbstractCamera):
         # is what the camera driver calls when a new frame is available.
         self._raw_camera_stream_started = False
         self._raw_frame_callback_lock = threading.Lock()
+
+        # Fast acquisition state (protected by _raw_frame_callback_lock)
+        self._fast_acquisition_active = False
+        self._fast_acquisition_callback: Optional[Callable] = None
+        self._fast_acquisition_frame_index = 0
         (self._camera, self._capabilities) = ToupcamCamera._open(index=0)
         self._pixel_format = self._config.default_pixel_format
         self._binning = self._config.default_binning
@@ -249,6 +255,7 @@ class ToupcamCamera(AbstractCamera):
         # Because it is better than nothing, we initialize our stored value to whatever is on the
         # camera at startup (but then set_exposure_time will modify it when a user sets exposure time)
         self._exposure_time = self._get_raw_exposure_time()
+        self._trigger_duration_us = 40
 
         # toupcam temperature
         self.temperature_reading_callback = None
@@ -256,9 +263,24 @@ class ToupcamCamera(AbstractCamera):
         self.thread_read_temperature = threading.Thread(target=self._check_temperature, daemon=True)
         self.thread_read_temperature.start()
 
+
+        self._byte_decoding_fn = lambda raw, meta: self.toupcam_raw_bytes_to_np(raw, meta)
         self._configure_camera()
         self._start_raw_camera_stream()
         self._update_internal_settings()
+
+
+    def toupcam_raw_bytes_to_np(self, raw: bytes, meta: dict) -> np.ndarray:
+        """Decode one frame; packing comes from the camera (see byte_decoding_fn closure), not metadata."""
+        height = int(meta["height"])
+        width = int(meta["width"])
+        px_size_bytes = self._get_pixel_size_in_bytes()
+        if px_size_bytes == 1:
+            return np.frombuffer(raw, dtype="uint8").reshape(height, width)
+        elif px_size_bytes == 2:
+            return np.frombuffer(raw, dtype="uint16").reshape(height, width)
+        else:
+            raise ValueError(f"Unknown pixel size for fast-acquisition decode: {px_size_bytes!r}")
 
     def _start_raw_camera_stream(self):
         """
@@ -277,6 +299,11 @@ class ToupcamCamera(AbstractCamera):
         """
         This is the callback that we have the toupcam software call when a frame is ready.  It should always be running.
         """
+        fast_acq_callback = None
+        fast_acq_frame_bytes = None
+        fast_acq_metadata = None
+        current_frame = None
+
         with self._raw_frame_callback_lock:
             # Since we are receiving a frame callback, we know things are setup properly.
             self._raw_camera_stream_started = True
@@ -291,40 +318,61 @@ class ToupcamCamera(AbstractCamera):
                     self._internal_read_buffer, self._get_pixel_size_in_bytes() * 8, None
                 )  # the second camera is number of bits per pixel - ignored in RAW mode
             except toupcam.HRESULTException as ex:
-                # TODO(imo): Propagate error in some way and handle
                 self._log.error("pull image failed, hr=0x{:x}".format(ex.hr))
-
-            this_frame_id = (self._current_frame.frame_id if self._current_frame else 0) + 1
-            this_timestamp = time.time()
-            this_frame_format = self.get_frame_format()
-            this_pixel_format = self.get_pixel_format()
-
-            if this_frame_format != CameraFrameFormat.RAW:
-                self._log.error("Only RAW CameraFrameFormat are supported, cannot handle frame.")
                 return
 
-            (x_offset, y_offset, width, height) = self.get_region_of_interest()
-            if self._get_pixel_size_in_bytes() == 1:
-                raw_image = np.frombuffer(self._internal_read_buffer, dtype="uint8")
-            elif self._get_pixel_size_in_bytes() == 2:
-                raw_image = np.frombuffer(self._internal_read_buffer, dtype="uint16")
-            current_raw_image = raw_image.reshape(height, width)
+            # Fast acquisition path: pass raw bytes + metadata, skip normal processing
+            if self._fast_acquisition_active and self._fast_acquisition_callback is not None:
+                (x_offset, y_offset, width, height) = self.get_region_of_interest()
+                fast_acq_metadata = {
+                    "height": height,
+                    "width": width,
+                    "timestamp": time.time(),
+                    "frame_index": self._fast_acquisition_frame_index,
+                    "pixel_size_bytes": self._get_pixel_size_in_bytes(),
+                }
+                self._fast_acquisition_frame_index += 1
+                fast_acq_callback = self._fast_acquisition_callback
+                fast_acq_frame_bytes = bytes(self._internal_read_buffer)
+            else:
+                # Normal frame processing path
+                this_frame_id = (self._current_frame.frame_id if self._current_frame else 0) + 1
+                this_timestamp = time.time()
+                this_frame_format = self.get_frame_format()
+                this_pixel_format = self.get_pixel_format()
 
-            current_frame = CameraFrame(
-                frame_id=this_frame_id,
-                timestamp=this_timestamp,
-                frame=self._process_raw_frame(current_raw_image),
-                frame_format=this_frame_format,
-                frame_pixel_format=this_pixel_format,
-            )
+                if this_frame_format != CameraFrameFormat.RAW:
+                    self._log.error("Only RAW CameraFrameFormat are supported, cannot handle frame.")
+                    return
 
-            # Before releasing the lock, set the new current fram with the incremented frame id so other methods can
-            # see we have a new frame. This should be the only place we modify _current_frame outside of init, and
-            # since we hold a lock this whole time, we know that the frame id is still correct.
-            self._current_frame = current_frame
+                (x_offset, y_offset, width, height) = self.get_region_of_interest()
+                if self._get_pixel_size_in_bytes() == 1:
+                    raw_image = np.frombuffer(self._internal_read_buffer, dtype="uint8")
+                elif self._get_pixel_size_in_bytes() == 2:
+                    raw_image = np.frombuffer(self._internal_read_buffer, dtype="uint16")
+                current_raw_image = raw_image.reshape(height, width)
 
-        # Propagate the local copy so we are sure it's the correct frame that goes out.
-        self._propogate_frame(current_frame)
+                current_frame = CameraFrame(
+                    frame_id=this_frame_id,
+                    timestamp=this_timestamp,
+                    frame=self._process_raw_frame(current_raw_image),
+                    frame_format=this_frame_format,
+                    frame_pixel_format=this_pixel_format,
+                )
+
+                # Before releasing the lock, set the new current frame with the incremented frame id so other methods can
+                # see we have a new frame. This should be the only place we modify _current_frame outside of init, and
+                # since we hold a lock this whole time, we know that the frame id is still correct.
+                self._current_frame = current_frame
+
+        # Outside the lock: invoke callbacks
+        if fast_acq_callback is not None:
+            try:
+                fast_acq_callback(fast_acq_frame_bytes, fast_acq_metadata)
+            except Exception:
+                self._log.exception("Fast acquisition frame callback error")
+        elif current_frame is not None:
+            self._propogate_frame(current_frame)
 
     def _update_internal_settings(self, send_exposure=True):
         """
@@ -687,7 +735,10 @@ class ToupcamCamera(AbstractCamera):
             self._camera.put_Option(toupcam.TOUPCAM_OPTION_CG, 1)
         elif mode == "HDR":
             self._camera.put_Option(toupcam.TOUPCAM_OPTION_CG, 2)
-
+    
+    def set_trigger_duration_us(self, trigger_duration_us: int):
+        self._trigger_duration_us = trigger_duration_us
+        
     def send_trigger(self, illumination_time: Optional[float] = None):
         if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
             raise RuntimeError("In HARDWARE_TRIGGER mode, but no hw trigger function given.")
@@ -916,7 +967,8 @@ class ToupcamCamera(AbstractCamera):
                     self._log.exception("Unable to set GPIO1 for trigger ready: " + error_type)
                     raise
         # Re-set exposure time to force strobe to get set to the remote.
-        self.set_exposure_time(self.get_exposure_time())
+        if self._raw_camera_stream_started:
+            self.set_exposure_time(self.get_exposure_time())
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
         trigger_option_value = self._camera.get_Option(toupcam.TOUPCAM_OPTION_TRIGGER)
@@ -931,3 +983,61 @@ class ToupcamCamera(AbstractCamera):
 
     def get_region_of_interest(self) -> Tuple[int, int, int, int]:
         return self._camera.get_Roi()
+
+    def start_fast_acquisition_frame_grabbing(
+        self,
+        frame_rate_hz: float,
+        n_frames_expected: int = 0,
+        frame_callback: Optional[Callable] = None,
+        acquisition_mode: Optional[CameraAcquisitionMode] = None,
+    ):
+        """Start fast acquisition frame grabbing for FastAcquisitionController.
+
+        Puts the camera into hardware trigger mode and diverts incoming frames
+        to frame_callback instead of the normal CameraFrame propagation path.
+
+        Args:
+            frame_rate_hz: Expected frame rate (informational for ToupCam).
+            n_frames_expected: Expected number of frames (informational).
+            frame_callback: Receives (frame_bytes: bytes, metadata: dict).
+            acquisition_mode: If provided and differs from current mode, switches to it.
+        """
+        if frame_callback is None:
+            raise ValueError("frame_callback is required for fast acquisition")
+
+        if acquisition_mode is not None and acquisition_mode != self.get_acquisition_mode():
+            self._set_acquisition_mode_imp(acquisition_mode)
+            self._log.info(f"Acquisition mode changed to {acquisition_mode} for fast acquisition")
+
+        current_mode = self.get_acquisition_mode()
+        if current_mode != CameraAcquisitionMode.HARDWARE_TRIGGER:
+            raise ValueError(
+                f"Fast acquisition requires HARDWARE_TRIGGER mode, but camera is in {current_mode}"
+            )
+
+        with self._raw_frame_callback_lock:
+            self._fast_acquisition_callback = frame_callback
+            self._fast_acquisition_frame_index = 0
+            self._fast_acquisition_active = True
+
+        self._log.info(
+            f"Fast acquisition frame grabbing started "
+            f"(frame_rate_hz={frame_rate_hz}, n_frames_expected={n_frames_expected})"
+        )
+
+    def stop_fast_acquisition_frame_grabbing(self):
+        """Stop fast acquisition frame grabbing.
+
+        Clears the fast acquisition flag so subsequent frames go through
+        the normal CameraFrame propagation path again.
+        """
+        with self._raw_frame_callback_lock:
+            was_active = self._fast_acquisition_active
+            self._fast_acquisition_active = False
+            self._fast_acquisition_callback = None
+            self._fast_acquisition_frame_index = 0
+
+        if was_active:
+            self._log.info("Fast acquisition frame grabbing stopped")
+        else:
+            self._log.debug("stop_fast_acquisition_frame_grabbing called but was not active")

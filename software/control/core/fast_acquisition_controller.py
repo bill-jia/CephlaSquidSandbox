@@ -20,6 +20,7 @@ import squid.logging
 import matplotlib.pyplot as plt
 
 from squid.abc import AbstractCamera, CameraAcquisitionMode
+from squid.config import CameraVariant
 from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.nidaq import AbstractNIDAQ, WaveformData, TriggerSource
@@ -427,6 +428,9 @@ class FastAcquisitionController:
             except (NotImplementedError, ValueError) as e:
                 self._log.error(f"Camera does not support {acquisition_mode.value} mode: {e}")
                 raise
+            if self._camera._config.camera_type == CameraVariant.TOUPCAM:
+                self._camera.start_streaming()
+
             self._camera.set_exposure_time(exposure_time_ms)
             self._camera.fast_acquisition_timeout_ms = int(np.ceil(1 / frame_rate_hz * 1000 * 1.1))
             if hasattr(self._camera, '_optimize_for_fast_acquisition'):
@@ -561,6 +565,9 @@ class FastAcquisitionController:
                     completion_error = f"DAQ did not complete within timeout ({timeout_s:.2f}s)"
                 
                 self._daq_result = self._ni_daq.get_acquired_data()
+
+                # Release acquisition tasks so DO/AO lines are free for live output.
+                self._ni_daq.release_tasks()
 
                 # Restore any live-output state that was active before this acquisition.
                 restore_fn = getattr(self._ni_daq, "restore_after_acquisition", None)
@@ -722,24 +729,37 @@ class FastAcquisitionController:
             import h5py
             
             h5_path = os.path.join(waveforms_dir, "daq_data.h5")
+            # Channel descriptions for HDF5 dataset attributes
+            descriptions = {}
+            if self._ni_daq and hasattr(self._ni_daq, "get_channel_descriptions"):
+                descriptions = self._ni_daq.get_channel_descriptions()
+
             with h5py.File(h5_path, 'w') as f:
                 # Save analog input
                 for channel, data in self._daq_result.analog_input.items():
-                    f.create_dataset(f'analog_input/{channel}', data=data)
-                
+                    ds = f.create_dataset(f'analog_input/{channel}', data=data)
+                    if channel in descriptions:
+                        ds.attrs['description'] = descriptions[channel]
+
                 # Save digital input
                 for line, data in self._daq_result.digital_input.items():
-                    f.create_dataset(f'digital_input/line{line}', data=data)
-                
+                    ds = f.create_dataset(f'digital_input/line{line}', data=data)
+                    if f"line{line}" in descriptions:
+                        ds.attrs['description'] = descriptions[f"line{line}"]
+
                 # Save frame sample indices
                 if self._frame_sample_indices:
                     f.create_dataset('frame_sample_indices', data=np.array(self._frame_sample_indices))
 
                 for channel, data in self._daq_result.analog_output.items():
-                    f.create_dataset(f'analog_output/{channel}', data=data)
+                    ds = f.create_dataset(f'analog_output/{channel}', data=data)
+                    if channel in descriptions:
+                        ds.attrs['description'] = descriptions[channel]
 
                 for line, data in self._daq_result.digital_output.items():
-                    f.create_dataset(f'digital_output/line{line}', data=data)
+                    ds = f.create_dataset(f'digital_output/line{line}', data=data)
+                    if f"line{line}" in descriptions:
+                        ds.attrs['description'] = descriptions[f"line{line}"]
                 
                 # Save metadata
                 f.attrs['sample_rate_hz'] = self._daq_result.sample_rate_hz

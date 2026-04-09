@@ -185,6 +185,10 @@ class AbstractNIDAQ(abc.ABC):
         self._live_ao_overrides_for_acquisition: Dict[str, float] = {}
         self._live_do_overrides_for_acquisition: Dict[int, bool] = {}
 
+        # Human-readable descriptions for channels/lines (e.g. from machine config display_name).
+        # Keys use the same identifiers as task IO: "ao0", "ai0", "line3", etc.
+        self._channel_descriptions: Dict[str, str] = {}
+
         # Backwards-compat alias: config/_config refer to the instance
         self._config = self
 
@@ -318,6 +322,18 @@ class AbstractNIDAQ(abc.ABC):
             "di_lines": list(self._task_di_lines),
             "ai_channels": list(self._task_ai_channels),
         }
+
+    def set_channel_descriptions(self, descriptions: Dict[str, str]) -> None:
+        """Set human-readable descriptions for channels/lines.
+
+        Keys should match the identifiers used in task IO and HDF5 datasets,
+        e.g. ``"ao0"``, ``"ai0"``, ``"line3"``.
+        """
+        self._channel_descriptions.update(descriptions)
+
+    def get_channel_descriptions(self) -> Dict[str, str]:
+        """Return the current channel/line description mapping."""
+        return dict(self._channel_descriptions)
 
     def get_live_output_state(self) -> Dict[str, Dict[Union[str, int], Union[float, bool]]]:
         """
@@ -1074,10 +1090,10 @@ class NIDAQ(AbstractNIDAQ):
                         trigger_edge=constants.Edge.RISING,
                     )
         
-        # Set up Analog Input task
-        if len(self._config.ai_channels) > 0:
+        # Set up Analog Input task for the current task IO set
+        if len(self._task_ai_channels) > 0:
             self._ai_task = nidaqmx.Task("ai_task")
-            
+
             # Get terminal configuration
             terminal_config_map = {
                 "RSE": constants.TerminalConfiguration.RSE,
@@ -1089,8 +1105,8 @@ class NIDAQ(AbstractNIDAQ):
                 self._config.ai_terminal_config,
                 constants.TerminalConfiguration.RSE
             )
-            
-            for channel in self._config.ai_channels:
+
+            for channel in self._task_ai_channels:
                 physical_channel = f"{device}/{channel}"
                 self._ai_task.ai_channels.add_ai_voltage_chan(
                     physical_channel,

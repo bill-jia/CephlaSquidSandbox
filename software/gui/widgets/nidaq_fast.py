@@ -38,14 +38,22 @@ class NIDAQWidget(QWidget):
         # Import NI DAQ module
 
         self._ni_daq_module = __import__('control.nidaq', fromlist=[''])
+
+        # Endpoint label caches for plot legends (populated in _update_device_info)
+        self._endpoint_labels_ao: dict[str, str] = {}
+        self._endpoint_labels_ai: dict[str, str] = {}
+        self._endpoint_labels_do: dict[tuple[str, int], str] = {}
         
         self.is_simulation = is_simulation
 
         # Cache IO endpoint config so we can show human-readable labels for
         # NIDAQ-controlled endpoints when available in the machine config.
+        # Use MachineConfig.collect_io_endpoints() (which walks device io: blocks
+        # with display_name) rather than io_endpoints.yaml (which lacks them).
         try:
             repo = ConfigRepository()
-            self._io_endpoint_config = repo.get_io_endpoint_config()
+            mc = repo.get_machine_config()
+            self._io_endpoint_config = mc.collect_io_endpoints()
         except Exception as e:
             self._log.warning(f"Could not load IO endpoint config for NIDAQWidget: {e}", exc_info=True)
             self._io_endpoint_config = None
@@ -482,9 +490,12 @@ class NIDAQWidget(QWidget):
             info = self._ni_daq.get_device_info(device_name)
 
             # Build a mapping from NIDAQ physical channel IDs to IO endpoint display names
-            endpoint_labels_ao: dict[str, str] = {}
-            endpoint_labels_ai: dict[str, str] = {}
-            endpoint_labels_do: dict[tuple[str, int], str] = {}
+            self._endpoint_labels_ao = {}
+            self._endpoint_labels_ai = {}
+            self._endpoint_labels_do = {}
+            endpoint_labels_ao = self._endpoint_labels_ao
+            endpoint_labels_ai = self._endpoint_labels_ai
+            endpoint_labels_do = self._endpoint_labels_do
             if self._io_endpoint_config is not None:
                 try:
                     for ep in self._io_endpoint_config.get_controller_endpoints(IOControllerType.NIDAQ):
@@ -570,9 +581,23 @@ class NIDAQWidget(QWidget):
                     self.do_port_combo.setCurrentIndex(idx)
 
             selected_do_lines = set(getattr(self._ni_daq, "do_lines", []) or [])
+            port = self.do_port_combo.currentText() or "port0"
             for i in range(self.do_lines_list.count()):
                 item = self.do_lines_list.item(i)
                 item.setCheckState(Qt.Checked if i in selected_do_lines else Qt.Unchecked)
+                label = endpoint_labels_do.get((port, i))
+                item.setText(f"Line {i} — {label}" if label else f"Line {i}")
+
+            # Push descriptions to NIDAQ so they're available for HDF5 saving
+            descriptions: dict[str, str] = {}
+            for ch, name in endpoint_labels_ao.items():
+                descriptions[ch] = name
+            for ch, name in endpoint_labels_ai.items():
+                descriptions[ch] = name
+            for (_, line_idx), name in endpoint_labels_do.items():
+                descriptions[f"line{line_idx}"] = name
+            if descriptions and hasattr(self._ni_daq, "set_channel_descriptions"):
+                self._ni_daq.set_channel_descriptions(descriptions)
     
     def on_config_changed(self):
         """Handle configuration changes."""
@@ -702,7 +727,8 @@ class NIDAQWidget(QWidget):
         self.ax_ao.set_ylabel("Voltage (V)")
         for channel, data in self._ao_waveforms.items():
             if len(data) == len(t):
-                self.ax_ao.plot(t, data, label=channel)
+                ao_label = self._endpoint_labels_ao.get(channel, channel)
+                self.ax_ao.plot(t, data, label=ao_label)
         if self._ao_waveforms:
             self.ax_ao.legend(loc='upper right')
             self.ax_ao.grid(True, alpha=0.3)
@@ -713,7 +739,9 @@ class NIDAQWidget(QWidget):
         offset = 0
         for line, data in self._do_patterns.items():
             if len(data) == len(t):
-                self.ax_do.plot(t, data.astype(float) + offset * 1.2, label=f"Line {line}")
+                port = self.do_port_combo.currentText() or "port0"
+                do_label = self._endpoint_labels_do.get((port, line), f"Line {line}")
+                self.ax_do.plot(t, data.astype(float) + offset * 1.2, label=do_label)
                 offset += 1
         if self._do_patterns:
             self.ax_do.legend(loc='upper right')
@@ -1162,7 +1190,7 @@ class NIDAQWidget(QWidget):
                 pass
             
             # Configure and set zero waveforms
-            self._ni_daq.configure(zero_config)
+            self._ni_daq.configure(**zero_config)
             self._ni_daq.set_waveforms(zero_waveforms)
             
             # Arm and trigger to write zeros
@@ -1301,7 +1329,8 @@ class NIDAQWidget(QWidget):
         
         if result.timestamps is not None and len(result.analog_input) > 0:
             for channel, data in result.analog_input.items():
-                self.ax_ai.plot(result.timestamps, data, label=channel)
+                ai_label = self._endpoint_labels_ai.get(channel, channel)
+                self.ax_ai.plot(result.timestamps, data, label=ai_label)
             self.ax_ai.legend(loc='upper right')
             self.ax_ai.grid(True, alpha=0.3)
         
@@ -1639,6 +1668,7 @@ class CameraState:
     roi_offset_y: int
     roi_width: int
     roi_height: int
+    camera_live: bool
 
 
 class FastAcquisitionWidget(QWidget):
@@ -1805,7 +1835,7 @@ class FastAcquisitionWidget(QWidget):
         daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 2)
         self.camera_trigger_dio_line_spinbox = QSpinBox()
         self.camera_trigger_dio_line_spinbox.setRange(0, 31)
-        self.camera_trigger_dio_line_spinbox.setValue(6)
+        self.camera_trigger_dio_line_spinbox.setValue(12)
         self.camera_trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
         daq_layout.addWidget(self.camera_trigger_dio_line_spinbox, 0, 3)
 
@@ -2057,8 +2087,9 @@ class FastAcquisitionWidget(QWidget):
             pixel_format = self.camera.get_pixel_format()
             binning_x, binning_y = self.camera.get_binning()
             roi_offset_x, roi_offset_y, roi_width, roi_height = self.camera.get_region_of_interest()
-            
+            camera_live = self.camera.get_is_streaming()
             self._camera_state_before_acquisition = CameraState(
+                camera_live=camera_live,
                 acquisition_mode=acquisition_mode,
                 exposure_time_ms=live_exposure_time_ms,
                 pixel_format=pixel_format,
@@ -2156,6 +2187,7 @@ class FastAcquisitionWidget(QWidget):
             ai_channels = task_io.get("ai_channels")
             ao_channels = task_io.get("ao_channels")
             self._log.info(f"AO channels (task IO): {ao_channels}")
+            self._log.info(f"AI channels (task IO): {ai_channels}")
             
             # Calculate acquisition duration
             num_frames = self.num_frames_spinbox.value() if self.num_frames_spinbox.value() > 0 else None
@@ -2385,8 +2417,8 @@ class FastAcquisitionWidget(QWidget):
             
             # Restore binning
             try:
-                target_bx = state.camera_live.binning_x if state.camera_live else 1
-                target_by = state.camera_live.binning_y if state.camera_live else 1
+                target_bx = state.binning_x
+                target_by = state.binning_y
                 current_binning_x, current_binning_y = self.camera.get_binning()
                 if current_binning_x != target_bx or current_binning_y != target_by:
                     self._log.info(f"Restoring binning from ({current_binning_x},{current_binning_y}) to ({target_bx},{target_by})")
