@@ -184,6 +184,7 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.Acquisition.DZ = acq.dz
     control._def.Acquisition.NUMBER_OF_FOVS_PER_AF = acq.fovs_per_af
     control._def.Acquisition.ILLUMINATION_SETTLE_MS = float(acq.illumination_settle_ms)
+    control._def.Acquisition.MOSAIC_FLIP_Y = bool(acq.mosaic_flip_y)
     control._def.ENABLE_FLEXIBLE_MULTIPOINT = acq.flexible_multipoint
     control._def.ENABLE_WELLPLATE_MULTIPOINT = acq.wellplate_multipoint
     control._def.ENABLE_RECORDING = acq.recording

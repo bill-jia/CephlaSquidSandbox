@@ -1705,6 +1705,7 @@ class NapariMosaicDisplayWidget(QWidget):
         shape_data_mm = []
         # Scale factor: viewer uses um (mm * 1000), so data coords = world coords / (pixel_size_mm * 1000)
         scale = self.viewer_pixel_size_mm * 1000
+        flip_y = control._def.Acquisition.MOSAIC_FLIP_Y
         for point in shape_data:
             # Convert world coordinates (um) to data coordinates (pixels)
             y_data = point[0] / scale
@@ -1712,6 +1713,9 @@ class NapariMosaicDisplayWidget(QWidget):
             # Convert data coordinates to mm
             x_mm = self.top_left_coordinate[1] + x_data * self.viewer_pixel_size_mm
             y_mm = self.top_left_coordinate[0] + y_data * self.viewer_pixel_size_mm
+            # Viewer y = -stage y when MOSAIC_FLIP_Y is set; convert back to stage y.
+            if flip_y:
+                y_mm = -y_mm
             shape_data_mm.append([x_mm, y_mm])
         return np.array(shape_data_mm)
 
@@ -1719,12 +1723,15 @@ class NapariMosaicDisplayWidget(QWidget):
         viewer_shapes = []
         # Scale factor: viewer uses um (mm * 1000), so world coords = data coords * (pixel_size_mm * 1000)
         scale = self.viewer_pixel_size_mm * 1000
+        flip_y = control._def.Acquisition.MOSAIC_FLIP_Y
         for shape_mm in shapes_mm:
             viewer_shape = []
             for point_mm in shape_mm:
+                # Stage y -> viewer y: negate when MOSAIC_FLIP_Y is set.
+                y_mm_viewer = -point_mm[1] if flip_y else point_mm[1]
                 # Convert mm to data coordinates (pixels)
                 x_data = (point_mm[0] - self.top_left_coordinate[1]) / self.viewer_pixel_size_mm
-                y_data = (point_mm[1] - self.top_left_coordinate[0]) / self.viewer_pixel_size_mm
+                y_data = (y_mm_viewer - self.top_left_coordinate[0]) / self.viewer_pixel_size_mm
                 # Convert data coordinates to world coordinates (um)
                 world_coords = [y_data * scale, x_data * scale]
                 viewer_shape.append(world_coords)
@@ -1798,6 +1805,14 @@ class NapariMosaicDisplayWidget(QWidget):
                 (image.shape[1] // downsample_factor, image.shape[0] // downsample_factor),
                 interpolation=cv2.INTER_AREA,
             )
+
+        # When the camera's image Y-axis runs opposite to the stage's Y-axis, flip
+        # both the tile content (row 0 ↔ row N) and the placement coordinate so that
+        # tiles captured at higher stage Y appear at smaller mosaic row indices (top
+        # of the napari view). The internal viewer coordinate is thus -stage_y.
+        if control._def.Acquisition.MOSAIC_FLIP_Y:
+            image = np.flipud(image)
+            y_mm = -y_mm
 
         # adjust image position
         x_mm -= (image.shape[1] * image_pixel_size_mm) / 2
@@ -1982,6 +1997,9 @@ class NapariMosaicDisplayWidget(QWidget):
         if coords is not None:
             x_mm = self.top_left_coordinate[1] + coords[-1] * self.viewer_pixel_size_mm
             y_mm = self.top_left_coordinate[0] + coords[-2] * self.viewer_pixel_size_mm
+            # Viewer y = -stage y when MOSAIC_FLIP_Y is set; convert back to stage y.
+            if control._def.Acquisition.MOSAIC_FLIP_Y:
+                y_mm = -y_mm
             print(f"move from click: ({x_mm:.6f}, {y_mm:.6f})")
             self.signal_coordinates_clicked.emit(x_mm, y_mm)
 

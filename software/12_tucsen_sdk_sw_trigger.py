@@ -78,9 +78,18 @@ EXPOSURE_US = 20_000  # 20 ms
 # ---------------------------------------------------------------------------- #
 
 
+# TUCam.dll is loaded via OleDLL, so ctypes auto-raises OSError whenever a
+# function returns a high-bit-set "HRESULT-style" code (e.g. TIMEOUT=0x80000208).
+# Don't override restype — instead catch OSError in wait_one_frame and extract
+# the raw code via .winerror.
+
+
 def retname(ret) -> str:
     try:
-        val = ret.value if isinstance(ret, TUCAMRET) else int(ret)
+        if isinstance(ret, TUCAMRET):
+            val = ret.value
+        else:
+            val = int(ret) & 0xFFFFFFFF
         return f"{TUCAMRET(val).name}(0x{val:08X})"
     except Exception:
         return f"0x{val:08X}"
@@ -196,9 +205,22 @@ def stop_and_release(handle) -> None:
 
 
 def wait_one_frame(handle, frame: TUCAM_FRAME, timeout_ms: int) -> tuple[int, float | None]:
-    """Returns (sdk_return_code, frame_mean). frame_mean is None on error."""
-    ret = TUCAM_Buf_WaitForFrame(handle, pointer(frame), c_int32(timeout_ms))
-    if ret != TUCAMRET.TUCAMRET_SUCCESS:
+    """Returns (sdk_return_code, frame_mean). frame_mean is None on non-SUCCESS.
+
+    OleDLL auto-raises OSError for SDK error codes; we translate that back into
+    an unsigned 32-bit code so Test A/B can distinguish TIMEOUT from other errors.
+    """
+    try:
+        ret_enum = TUCAM_Buf_WaitForFrame(handle, pointer(frame), c_int32(timeout_ms))
+        ret = ret_enum.value if isinstance(ret_enum, TUCAMRET) else int(ret_enum) & 0xFFFFFFFF
+    except OSError as e:
+        # OleDLL converts high-bit-set HRESULTs into OSError; extract the raw code.
+        ret = int(e.winerror) & 0xFFFFFFFF
+        return ret, None
+    except ValueError:
+        # Enum restype conversion failed on an unknown code — report as 0 (unknown).
+        return 0, None
+    if ret != TUCAMRET.TUCAMRET_SUCCESS.value:
         return ret, None
     if not frame.pBuffer or frame.uiImgSize == 0:
         return ret, None
@@ -263,7 +285,7 @@ def try_variant(
             t0 = time.time()
             fret, fmean = wait_one_frame(handle, frame, frame_timeout_ms)
             dt_ms = (time.time() - t0) * 1000
-            if fret == TUCAMRET.TUCAMRET_SUCCESS:
+            if fret == TUCAMRET.TUCAMRET_SUCCESS.value:
                 print(
                     f"    trigger {i + 1}: wait={retname(fret)}"
                     f" dt={dt_ms:6.1f}ms mean={fmean:.1f} (size={frame.usWidth}x{frame.usHeight})"
@@ -275,10 +297,17 @@ def try_variant(
                 )
         stop_and_release(handle)
         return
-    # Drain any pending frame that may be sitting in the buffer from a prior variant.
-    # drain_ret, _ = wait_one_frame(handle, frame, 50)
-    # if drain_ret == TUCAMRET.TUCAMRET_SUCCESS.value or drain_ret == TUCAMRET.TUCAMRET_SUCCESS:
-    #     print("    (drained a pre-existing frame before test)")
+
+    # Test B: idle gating — after Cap_Start, before any triggers, frames should NOT arrive.
+    print("  [Test B: idle gating] wait for frames without triggering (expect all timeouts):")
+    for i in range(5):
+        t0 = time.time()
+        fret, fmean = wait_one_frame(handle, frame, 200)
+        dt_ms = (time.time() - t0) * 1000
+        if fret == TUCAMRET.TUCAMRET_SUCCESS.value:
+            print(f"    idle-wait {i + 1}: wait={retname(fret)} dt={dt_ms:6.1f}ms mean={fmean:.1f}  !! STRAY FRAME !!")
+        else:
+            print(f"    idle-wait {i + 1}: wait={retname(fret)} dt={dt_ms:6.1f}ms  (expected timeout)")
 
     try:
         for i in range(n_triggers):
@@ -288,7 +317,7 @@ def try_variant(
             dret = dispatch_fn(handle)
             fret, fmean = wait_one_frame(handle, frame, frame_timeout_ms)
             dt_ms = (time.time() - t0) * 1000
-            if fret == TUCAMRET.TUCAMRET_SUCCESS:
+            if fret == TUCAMRET.TUCAMRET_SUCCESS.value:
                 print(
                     f"    trigger {i + 1}: dispatch={retname(dret)} wait={retname(fret)}"
                     f" dt={dt_ms:6.1f}ms mean={fmean:.1f} (size={frame.usWidth}x{frame.usHeight})"
@@ -298,6 +327,29 @@ def try_variant(
                     f"    trigger {i + 1}: dispatch={retname(dret)} wait={retname(fret)}"
                     f" dt={dt_ms:6.1f}ms  NO FRAME"
                 )
+
+            # Test A: one-trigger-one-frame — after each received frame, wait again with no
+            # new trigger. Any further SUCCESS means the camera produced >1 frame per trigger.
+            extra_count = 0
+            while True:
+                t1 = time.time()
+                fret2, fmean2 = wait_one_frame(handle, frame, 300)
+                dt2_ms = (time.time() - t1) * 1000
+                if fret2 == TUCAMRET.TUCAMRET_SUCCESS.value:
+                    extra_count += 1
+                    print(
+                        f"      extra #{extra_count}: wait={retname(fret2)} dt={dt2_ms:6.1f}ms"
+                        f" mean={fmean2:.1f}  !! EXTRA FRAME (no trigger sent) !!"
+                    )
+                    if extra_count >= 10:
+                        print("      (capping extra-frame drain at 10)")
+                        break
+                else:
+                    if extra_count == 0:
+                        print(f"      post-trigger drain clean: wait={retname(fret2)} dt={dt2_ms:6.1f}ms")
+                    else:
+                        print(f"      drain done after {extra_count} extras: wait={retname(fret2)} dt={dt2_ms:6.1f}ms")
+                    break
     finally:
         stop_and_release(handle)
 

@@ -229,6 +229,11 @@ class AcquisitionSettings(BaseModel):
     # on the LED's rising edge — otherwise the top rows undershoot and show a
     # brightness gradient. 0 disables the delay.
     illumination_settle_ms: float = 0.0
+    # Set True when the camera's image Y-axis runs opposite to the stage's Y-axis
+    # (i.e. increasing stage Y maps to decreasing image row). The mosaic view then
+    # flips tile placement vertically so tiles captured at higher stage Y appear
+    # above those captured at lower stage Y, and flips each tile's content to match.
+    mosaic_flip_y: bool = False
 
     model_config = {"extra": "allow"}
 

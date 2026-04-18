@@ -47,6 +47,10 @@ class Acquisition:
     # integrating on the LED's rising edge. Overridden per-rig by
     # ``software.acquisition.illumination_settle_ms`` in the machine config.
     ILLUMINATION_SETTLE_MS = 0.0
+    # When True, the mosaic view flips tile Y placement + content so that
+    # increasing stage Y appears upward on screen. Set per-rig via
+    # ``software.acquisition.mosaic_flip_y`` in the machine config.
+    MOSAIC_FLIP_Y = False
 
 
 class MicrocontrollerDef:

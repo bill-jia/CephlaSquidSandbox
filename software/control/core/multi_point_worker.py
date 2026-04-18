@@ -487,9 +487,12 @@ class MultiPointWorker:
         if state is None:
             raise ValueError(f"observation state not found: {preset_name!r}")
         with self._timing.get_timer("apply_observation_state_to_hardware"):
+            # self._log.info(f"Applying observation state preset '{preset_name}' to hardware")
+            # self._log.info(str(state))
             self.liveController.obs_controller.apply_observation_state_preset(
                 state,
                 emission_filter_wheel=self._emission_filter_wheel,
+                apply_live_trigger_settings=False,  # Don't apply trigger settings from presets during acquisition, as they may interfere with our configured triggers
             )
         return state
 
@@ -521,7 +524,11 @@ class MultiPointWorker:
         self._last_illumination_config_name = None
         try:
             start_time = time.perf_counter_ns()
+            # Force a clean stop→start so any streaming state left by live mode (queued
+            # frames, stale trigger config) is discarded before acquisition begins.
+            self.camera.stop_streaming()
             self.camera.start_streaming()
+            self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
             sleep_time = min(self.dt / 20.0, 0.5)
 
@@ -602,6 +609,7 @@ class MultiPointWorker:
             self._wait_for_outstanding_callback_images()
             self._log.info(self._timing.get_report())
             if this_image_callback_id:
+                self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
                 self.camera.remove_frame_callback(this_image_callback_id)
 
             self._finish_jobs()
@@ -1657,6 +1665,7 @@ class MultiPointWorker:
                 filename_channel_label=filename_channel_label,
             )
             self._current_capture_info = current_capture_info
+        self._log.info(f"Triggering camera for capture: {current_capture_info.observation_state.name}, position={current_capture_info.position}, z_index={k}")
         if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
             with self._timing.get_timer("send_trigger"):
                 self.camera.send_trigger(illumination_time=camera_illumination_time)

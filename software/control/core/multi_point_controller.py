@@ -848,6 +848,7 @@ class MultiPointController:
                 self.liveController.stop_live()  # @@@ to do: also uncheck the live button
             else:
                 self.liveController_was_live_before_multipoint = False
+            self.camera.stop_streaming()  # Ensure streaming is stopped before acquisition (important for some camera models)
 
             # TODO: Multipoint acquisition only supports software trigger for now (hardware trigger TBD).
             # Snapshot the prior mode so it can be restored when the acquisition completes.

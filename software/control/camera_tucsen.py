@@ -406,6 +406,8 @@ class TucsenCamera(AbstractCamera):
         self._trigger_sent = threading.Event()
         self._is_streaming = threading.Event()
 
+        self._acquisition_mode = None
+
         # Fast acquisition support
         self._fast_acquisition_callback: Optional[Callable[[np.ndarray, Optional[dict]], None]] = None
         self._fast_acquisition_thread: Optional[threading.Thread] = None
@@ -445,6 +447,11 @@ class TucsenCamera(AbstractCamera):
 
         self._m_frame = None
         self.frames_polled = 0
+        # Stray-frame diagnostic counters — reset at every start_streaming.
+        # When frames_received_since_start > triggers_sent_since_start in software-trigger
+        # mode, the camera produced frames we didn't ask for.
+        self._frames_received_since_start = 0
+        self._triggers_sent_since_start = 0
         self._trigger_duration_us = 40
         self._trigger_attr = TUCAM_TRIGGER_ATTR()
         self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
@@ -461,8 +468,10 @@ class TucsenCamera(AbstractCamera):
         self._strobe_delay_ms: float = 0.0
         self._rolling_shutter_readout_ms: float = 0.0
         self.temperature_reading_callback = None
+        # GenICam ExposureTime is an integer in microseconds; all other code
+        # in this class treats _exposure_time_ms as milliseconds, so convert.
         self._exposure_time_ms: float = (
-            self._get_genicam_parameter("ExposureTime")["value"]
+            self._get_genicam_parameter("ExposureTime")["value"] / 1000.0
             if self._model_properties.is_genicam
             else 20.0
         )
@@ -601,13 +610,15 @@ class TucsenCamera(AbstractCamera):
         if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
             TUCAM_Buf_Release(self._camera)
             raise CameraError("Failed to start streaming")
-
+        self._log.info(f"Starting streaming with camera mode: {self.get_camera_mode()}, acquisition mode: {self.get_acquisition_mode()}, trigger mode: {trigger_mode}")
         self._update_internal_settings()
 
 
         self._ensure_read_thread_running()
 
         self._trigger_sent.clear()
+        self._frames_received_since_start = 0
+        self._triggers_sent_since_start = 0
         self._is_streaming.set()
         self._log.info(
             f"TUCam Camera starts streaming in camera mode: {self.get_camera_mode()}, "
@@ -874,6 +885,13 @@ class TucsenCamera(AbstractCamera):
                 if self._m_frame is None or self._m_frame.pBuffer is None or self._m_frame.pBuffer == 0:
                     self._log.error("Invalid frame buffer")
                     continue
+                # self._frames_received_since_start += 1
+                # if self._frames_received_since_start > self._triggers_sent_since_start:
+                #     self._log.warning(
+                #         f"STRAY FRAME: frames_received={self._frames_received_since_start} "
+                #         f"> triggers_sent={self._triggers_sent_since_start} "
+                #         f"(acq_mode={self.get_acquisition_mode()})"
+                #     )
                 np_image = self._convert_frame_to_numpy(self._m_frame)
                 # self._log.info(f"Frame buffer is valid, mean value: {np.mean(np_image)}")
                 processed_frame = self._process_raw_frame(np_image)
@@ -942,28 +960,40 @@ class TucsenCamera(AbstractCamera):
     # =========================================================================
 
     def set_exposure_time(self, exposure_time_ms: float):
-        # Rolling-shutter compensation: when the sensor is actually being hardware-
-        # triggered (real HW, HW_FIRST, or virtualized-from-SW), the LED pulse fired
-        # by the microcontroller only produces a uniform image if it lands on the
-        # global co-exposure window (when every row is simultaneously integrating).
-        # To achieve that we:
-        #   1. Extend the on-sensor exposure by the rolling-shutter readout time so
-        #      row 0 is still exposing when the last row starts.
-        #   2. Tell the microcontroller to delay the LED pulse by the full
-        #      readout + trigger-input delay after the trigger, so the pulse (width
-        #      == user's exposure time) lines up with the global window.
-        if self._uses_hw_trigger_timing():
-            adjusted_exposure_time = exposure_time_ms + self._rolling_shutter_readout_ms
-            if self._hw_set_strobe_delay_ms_fn is not None:
-                self._log.debug(f"Setting hw strobe delay to {self._strobe_delay_ms} [ms]")
-                self._hw_set_strobe_delay_ms_fn(self._strobe_delay_ms)
-        else:
-            adjusted_exposure_time = exposure_time_ms
+        # Rolling-shutter / MCU-strobe compensation is currently disabled — fast
+        # acquisitions run under continuous illumination, so we want the camera to
+        # use exactly the user-requested exposure and leave the microcontroller's
+        # strobe delay untouched. Re-enable the block below if LED pulsing
+        # synchronised with the hw-trigger co-exposure window is reintroduced.
+        # See _uses_hw_trigger_timing / _calculate_strobe_delay / get_strobe_time.
+        #
+        # if self._uses_hw_trigger_timing():
+        #     adjusted_exposure_time = exposure_time_ms + self._rolling_shutter_readout_ms
+        #     if self._hw_set_strobe_delay_ms_fn is not None:
+        #         self._log.debug(f"Setting hw strobe delay to {self._strobe_delay_ms} [ms]")
+        #         self._hw_set_strobe_delay_ms_fn(self._strobe_delay_ms)
+        # else:
+        #     adjusted_exposure_time = exposure_time_ms
+        adjusted_exposure_time = exposure_time_ms
+
+        # Skip the GenICam write (and its Cap_Stop/Cap_Start cycle) when the
+        # requested value matches the current one at the microsecond resolution
+        # the parameter is written at. Multipoint revisits the same channels
+        # across positions and time points — without this, every revisit incurs
+        # the ~50ms pause cost on the Aries.
+        if int(adjusted_exposure_time * 1000) == int(self._exposure_time_ms * 1000):
+            self._log.debug(f"set_exposure_time: already {exposure_time_ms} ms, skipping")
+            return
 
         if self._model_properties.is_genicam:
-            self._set_genicam_parameter(
-                "ExposureTime", int(adjusted_exposure_time * 1000), TUELEM_TYPE.TU_ElemInteger.value
-            )
+            # Writing ExposureTime mid-stream on the Aries silently breaks
+            # subsequent TriggerSoftwarePulse commands — the camera keeps streaming
+            # but stops responding to software triggers until Cap_Stop/Cap_Start.
+            # Reproduced deterministically in 13_tucsen_multipoint_sequence.py.
+            with self._pause_streaming():
+                self._set_genicam_parameter(
+                    "ExposureTime", int(adjusted_exposure_time * 1000), TUELEM_TYPE.TU_ElemInteger.value
+                )
         else:
             if (
                 TUCAM_Prop_SetValue(
@@ -975,6 +1005,7 @@ class TucsenCamera(AbstractCamera):
 
         self._exposure_time_ms = exposure_time_ms
         self._trigger_sent.clear()
+        self._log.info(f"Exposure time set to {exposure_time_ms} ms (adjusted: {adjusted_exposure_time} ms)")
 
     def _uses_hw_trigger_timing(self) -> bool:
         """True when the LED is pulsed by the microcontroller synchronously with the
@@ -1402,39 +1433,59 @@ class TucsenCamera(AbstractCamera):
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value
             else:
                 raise ValueError(f"Unhandled {acquisition_mode=}")
-            if not self._model_properties.is_genicam:
+            if self._model_properties.is_genicam:
+                # Read back TriggerMode and fail loudly if the camera silently ignored the write.
+                # The Aries GenICam layer can reject a write done too close to Cap_Stop, which
+                # otherwise leaves the camera in free-running mode — every frame then arrives
+                # in the acquisition callback without a trigger having been sent.
+                expected_trigger_mode = {
+                    CameraAcquisitionMode.SOFTWARE_TRIGGER: "Standard" if virtualize_sw_trigger else "Software",
+                    CameraAcquisitionMode.CONTINUOUS: "FreeRunning",
+                    CameraAcquisitionMode.HARDWARE_TRIGGER: "Standard",
+                    CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST: "Standard",
+                }[acquisition_mode]
+                actual_trigger_mode = self._get_genicam_parameter("TriggerMode")["value"]
+                if actual_trigger_mode != expected_trigger_mode:
+                    raise CameraError(
+                        f"Tucsen ignored TriggerMode write: wrote {expected_trigger_mode!r}, "
+                        f"camera reports {actual_trigger_mode!r} (acquisition_mode={acquisition_mode})"
+                    )
+                self._log.debug(f"TriggerMode readback OK: {actual_trigger_mode!r}")
+            else:
                 self._trigger_attr.nBufFrames = 1
                 if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError("Failed to set acquisition mode")
+            self._acquisition_mode = acquisition_mode
             self._update_internal_settings()
             self.set_exposure_time(self._exposure_time_ms)
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
         # When we're virtualizing software trigger on top of the hardware trigger
         # line, keep reporting SOFTWARE_TRIGGER to the outside world.
-        if self._virt_sw_trigger:
-            return CameraAcquisitionMode.SOFTWARE_TRIGGER
-        if self._model_properties.is_genicam:
-            trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
-            if trigger_value == "Software":
-                return CameraAcquisitionMode.SOFTWARE_TRIGGER
-            if trigger_value == "FreeRunning":
-                return CameraAcquisitionMode.CONTINUOUS
-            if trigger_value == "Standard":
-                return CameraAcquisitionMode.HARDWARE_TRIGGER
-            raise ValueError(f"Unknown Tucsen GenICam trigger mode: {trigger_value}")
-        trigger_attr = TUCAM_TRIGGER_ATTR()
-        if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError("Failed to get acquisition mode")
-        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
-            return CameraAcquisitionMode.SOFTWARE_TRIGGER
-        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
-            return CameraAcquisitionMode.CONTINUOUS
-        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
-            return CameraAcquisitionMode.HARDWARE_TRIGGER
-        if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value:
-            return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
-        raise ValueError(f"Unknown Tucsen trigger mode: {trigger_attr.nTgrMode=}")
+        return self._acquisition_mode
+        # if self._virt_sw_trigger:
+        #     return CameraAcquisitionMode.SOFTWARE_TRIGGER
+        # if self._model_properties.is_genicam:
+        #     trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
+        #     if trigger_value == "Software":
+        #         return CameraAcquisitionMode.SOFTWARE_TRIGGER
+        #     if trigger_value == "FreeRunning":
+        #         return CameraAcquisitionMode.CONTINUOUS
+        #     if trigger_value == "Standard":
+        #         return CameraAcquisitionMode.HARDWARE_TRIGGER
+        #     raise ValueError(f"Unknown Tucsen GenICam trigger mode: {trigger_value}")
+        # trigger_attr = TUCAM_TRIGGER_ATTR()
+        # if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
+        #     raise CameraError("Failed to get acquisition mode")
+        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
+        #     return CameraAcquisitionMode.SOFTWARE_TRIGGER
+        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
+        #     return CameraAcquisitionMode.CONTINUOUS
+        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
+        #     return CameraAcquisitionMode.HARDWARE_TRIGGER
+        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value:
+        #     return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+        # raise ValueError(f"Unknown Tucsen trigger mode: {trigger_attr.nTgrMode=}")
 
     def set_temperature_reading_callback(self, func: Callable):
         self.temperature_reading_callback = func
@@ -1487,7 +1538,6 @@ class TucsenCamera(AbstractCamera):
         self._update_internal_settings()
 
     def send_trigger(self, illumination_time: Optional[float] = None):
-        mode = self.get_acquisition_mode()
         if mode == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
             raise CameraError("In HARDWARE_TRIGGER mode, but no hw trigger function given.")
 
@@ -1510,11 +1560,14 @@ class TucsenCamera(AbstractCamera):
             # software.acquisition.illumination_settle_ms in the machine config.)
             self._hw_trigger_fn(None)
             self._last_trigger_timestamp = time.time()
+            self._triggers_sent_since_start += 1
             self._trigger_sent.set()
             return
         if mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
+            self._triggers_sent_since_start += 1
             self._hw_trigger_fn(illumination_time)
         elif mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            self._triggers_sent_since_start += 1
             if self._model_properties.is_genicam:
                 self._set_genicam_parameter("TriggerSoftwarePulse", 1, TUELEM_TYPE.TU_ElemCommand.value)
             else:
