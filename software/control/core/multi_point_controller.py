@@ -849,6 +849,12 @@ class MultiPointController:
             else:
                 self.liveController_was_live_before_multipoint = False
 
+            # TODO: Multipoint acquisition only supports software trigger for now (hardware trigger TBD).
+            # Snapshot the prior mode so it can be restored when the acquisition completes.
+            self._trigger_mode_before_multipoint = self.liveController.trigger_mode
+            if self._trigger_mode_before_multipoint != control._def.TriggerMode.SOFTWARE:
+                self.liveController.set_trigger_mode(control._def.TriggerMode.SOFTWARE)
+
             # Ensure all channels are off before acquisition begins
             if _illum_ctrl is not None:
                 try:
@@ -1101,14 +1107,31 @@ class MultiPointController:
         self._log.debug("MultiPointController._on_acquisition_completed called")
         # Note: Plate views are saved per timepoint in the worker's run_single_time_point method
 
+        try:
+            self._restore_state_after_acquisition()
+        finally:
+            # Always notify the UI that the acquisition is done, even if restoration
+            # raised — otherwise the UI hangs waiting for the finished signal.
+            try:
+                self.callbacks.signal_acquisition_finished()
+            except Exception:
+                self._log.exception("Failed to emit signal_acquisition_finished")
+
+    def _restore_state_after_acquisition(self):
         # restore the previous selected mode
         if self.gen_focus_map:
             self.autofocusController.clear_focus_map()
             for x, y, z in self.focus_map_storage:
                 self.autofocusController.focus_map_coords.append((x, y, z))
             self.autofocusController.use_focus_map = self.already_using_fmap
-        self.callbacks.signal_current_configuration(self.configuration_before_running_multipoint)
-        self.liveController.obs_controller.apply_full_observation_state(self.configuration_before_running_multipoint)
+
+        # Only restore prior observation state if one was actually selected at acquisition start.
+        # The Qt signal for signal_current_configuration is typed as Signal(ObservationState)
+        # and will reject None.
+        prior_config = self.configuration_before_running_multipoint
+        if prior_config is not None:
+            self.callbacks.signal_current_configuration(prior_config)
+            self.liveController.obs_controller.apply_full_observation_state(prior_config)
 
         # Restore illumination state that was active before the acquisition
         _illum_snapshot = getattr(self, "_illumination_snapshot_before_acquisition", None)
@@ -1123,6 +1146,15 @@ class MultiPointController:
 
         # Restore callbacks to pre-acquisition state
         self.camera.enable_callbacks(self.camera_callback_was_enabled_before_multipoint)
+
+        # Restore trigger mode that was active before the acquisition
+        prior_trigger_mode = getattr(self, "_trigger_mode_before_multipoint", None)
+        if prior_trigger_mode is not None and prior_trigger_mode != self.liveController.trigger_mode:
+            try:
+                self.liveController.set_trigger_mode(prior_trigger_mode)
+            except Exception as e:
+                self._log.warning(f"Failed to restore trigger mode after acquisition: {e}")
+        self._trigger_mode_before_multipoint = None
 
         # re-enable live if it's previously on
         if self.liveController_was_live_before_multipoint and control._def.RESUME_LIVE_AFTER_ACQUISITION:
@@ -1143,7 +1175,6 @@ class MultiPointController:
 
             Thread(target=_stop_monitor_background, daemon=True).start()
 
-        # emit the acquisition finished signal to enable the UI
         self._log.info(f"total time for acquisition + processing + reset: {time.time() - self.recording_start_time}")
         utils.create_done_file(os.path.join(self.base_path, self.experiment_ID))
 
@@ -1162,8 +1193,6 @@ class MultiPointController:
 
         ending_pos = self.stage.get_pos()
         self.callbacks.signal_current_fov(ending_pos.x_mm, ending_pos.y_mm)
-
-        self.callbacks.signal_acquisition_finished()
 
     def request_abort_aquisition(self):
         self.abort_acqusition_requested = True

@@ -1252,13 +1252,13 @@ class CameraSettingsWidget(QFrame):
             self.dropdown_triggerMode.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
             self.dropdown_triggerMode.setMaximumWidth(160)
 
-            initial_trigger_mode = self.camera.get_acquisition_mode().value
+            initial_trigger_mode = TriggerMode.CONTINUOUS
             self.dropdown_triggerMode.blockSignals(True)
             idx = self.dropdown_triggerMode.findText(initial_trigger_mode)
             if idx >= 0:
                 self.dropdown_triggerMode.setCurrentIndex(idx)
             self.dropdown_triggerMode.blockSignals(False)
-            # Ensure LiveController.trigger_mode matches the camera acquisition mode.
+            # Drive LiveController + camera into the default mode so they agree with the UI.
             try:
                 self.live_controller.set_trigger_mode(initial_trigger_mode)
             except Exception:

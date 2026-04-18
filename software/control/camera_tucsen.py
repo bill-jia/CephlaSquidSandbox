@@ -448,6 +448,12 @@ class TucsenCamera(AbstractCamera):
         self._trigger_duration_us = 40
         self._trigger_attr = TUCAM_TRIGGER_ATTR()
         self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
+        # When true, the camera SDK is actually in HARDWARE_TRIGGER but the driver
+        # masquerades as SOFTWARE_TRIGGER — send_trigger() fires an NI-DAQ / Teensy
+        # pulse via _hw_trigger_fn. The GenICam software trigger path is unreliable
+        # on Aries, so we reroute through the hardware trigger line that already
+        # works. See set_acquisition_mode / send_trigger.
+        self._virt_sw_trigger = False
         self.temperature_reading_callback = None
         self._exposure_time_ms: float = (
             self._get_genicam_parameter("ExposureTime")["value"]
@@ -581,8 +587,6 @@ class TucsenCamera(AbstractCamera):
         if self._is_streaming.is_set():
             self._log.debug("Already streaming, start_streaming is noop")
             return
-
-        self._set_acquisition_mode_imp(CameraAcquisitionMode.CONTINUOUS)
 
         if self._m_frame is None:
             self._allocate_buffer()
@@ -851,16 +855,21 @@ class TucsenCamera(AbstractCamera):
             try:
                 wait_time_ms = int(self._read_thread_wait_period_s * 1000)  # ms, convert to int
                 try:
-                    TUCAM_Buf_WaitForFrame(self._camera, pointer(self._m_frame), c_int32(wait_time_ms))
+                    ret = TUCAM_Buf_WaitForFrame(self._camera, pointer(self._m_frame), c_int32(wait_time_ms))
+                    self._log.info(f"TUCAM_Buf_WaitForFrame returned {ret}")
                 except Exception:
-                    pass
+                    continue
+                # On timeout (common in SOFTWARE_TRIGGER between triggers) _m_frame holds stale
+                # data from the previous successful read. Skip rather than propagate garbage.
+                if ret != TUCAMRET.TUCAMRET_SUCCESS:
+                    self._log.error(f"TUCAM_Buf_WaitForFrame returned {ret}")
+                    continue
 
                 if self._m_frame is None or self._m_frame.pBuffer is None or self._m_frame.pBuffer == 0:
                     self._log.error("Invalid frame buffer")
                     continue
-
                 np_image = self._convert_frame_to_numpy(self._m_frame)
-
+                # self._log.info(f"Frame buffer is valid, mean value: {np.mean(np_image)}")
                 processed_frame = self._process_raw_frame(np_image)
                 with self._frame_lock:
                     camera_frame = CameraFrame(
@@ -1310,18 +1319,35 @@ class TucsenCamera(AbstractCamera):
 
     def _set_acquisition_mode_imp(self, acquisition_mode: CameraAcquisitionMode):
         self._log.debug(f"Setting acquisition mode to {acquisition_mode}")
+        # If the user wants software trigger but we have a hardware-trigger line wired
+        # up, masquerade: configure the camera for HARDWARE_TRIGGER and let send_trigger
+        # fire the DAQ pulse. The native Tucsen GenICam software-trigger command does
+        # not reliably fire exposures on the Aries, so we route through the hardware
+        # line that is already proven to work.
+        virtualize_sw_trigger = (
+            acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._hw_trigger_fn is not None
+        )
+        self._virt_sw_trigger = virtualize_sw_trigger
         with self._pause_streaming():
             if (
                 not self._model_properties.is_genicam
                 and TUCAM_Cap_GetTrigger(self._camera, pointer(self._trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS
             ):
                 raise CameraError("Failed to get trigger attributes")
-            if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and not virtualize_sw_trigger:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 2, TUELEM_TYPE.TU_ElemEnumeration.value)
                     self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
+            elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and virtualize_sw_trigger:
+                # Program the camera for hardware trigger; the driver will keep reporting
+                # SOFTWARE_TRIGGER externally via get_acquisition_mode.
+                if self._model_properties.is_genicam:
+                    self._set_genicam_parameter("TriggerMode", 1, TUELEM_TYPE.TU_ElemEnumeration.value)
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
+                else:
+                    self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value
             elif acquisition_mode == CameraAcquisitionMode.CONTINUOUS:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 0, TUELEM_TYPE.TU_ElemEnumeration.value)
@@ -1350,6 +1376,10 @@ class TucsenCamera(AbstractCamera):
             self.set_exposure_time(self._exposure_time_ms)
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
+        # When we're virtualizing software trigger on top of the hardware trigger
+        # line, keep reporting SOFTWARE_TRIGGER to the outside world.
+        if self._virt_sw_trigger:
+            return CameraAcquisitionMode.SOFTWARE_TRIGGER
         if self._model_properties.is_genicam:
             trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
             if trigger_value == "Software":
@@ -1423,7 +1453,8 @@ class TucsenCamera(AbstractCamera):
         self._update_internal_settings()
 
     def send_trigger(self, illumination_time: Optional[float] = None):
-        if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
+        mode = self.get_acquisition_mode()
+        if mode == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
             raise CameraError("In HARDWARE_TRIGGER mode, but no hw trigger function given.")
 
         if not self.get_is_streaming():
@@ -1433,9 +1464,17 @@ class TucsenCamera(AbstractCamera):
             raise CameraError(
                 f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
             )
-        if self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER:
+        # Virtualized SW trigger -> fire the hardware trigger line; camera is actually in hw mode.
+        if mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
+            if not self._hw_trigger_fn:
+                raise CameraError("Virtualized software trigger requires _hw_trigger_fn.")
             self._hw_trigger_fn(illumination_time)
-        elif self.get_acquisition_mode() == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            self._last_trigger_timestamp = time.time()
+            self._trigger_sent.set()
+            return
+        if mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
+            self._hw_trigger_fn(illumination_time)
+        elif mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
             if self._model_properties.is_genicam:
                 self._set_genicam_parameter("TriggerSoftwarePulse", 1, TUELEM_TYPE.TU_ElemCommand.value)
             else:
