@@ -588,6 +588,20 @@ class TucsenCamera(AbstractCamera):
                     self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
                 self._set_genicam_parameter("TriggerOutputWidth", self._trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
 
+        # Horizontal flip applied at the sensor/SDK layer so every frame
+        # (live, fast-acquisition callback, multipoint) is mirrored
+        # left-to-right without needing to touch each frame-handling path.
+        # Persists through the close/reopen vendor workaround because
+        # _configure_camera runs on every reopen. GenICam: ReverseX boolean;
+        # TUCAM legacy: TUIDC_HORIZONTAL capability (0/1).
+        if self._model_properties.is_genicam:
+            self._set_genicam_parameter("ReverseX", True, TUELEM_TYPE.TU_ElemBoolean.value)
+        else:
+            if TUCAM_Capa_SetValue(
+                self._camera, TUCAM_IDCAPA.TUIDC_HORIZONTAL.value, 1
+            ) != TUCAMRET.TUCAMRET_SUCCESS:
+                self._log.warning("Failed to enable horizontal flip (TUIDC_HORIZONTAL)")
+
         self.get_region_of_interest(force_update=True)
         self.set_binning(*self._config.default_binning)
         self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
