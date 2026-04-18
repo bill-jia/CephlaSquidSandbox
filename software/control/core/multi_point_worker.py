@@ -1606,6 +1606,7 @@ class MultiPointWorker:
         # top-bright gradient. Configured per-rig via
         # software.acquisition.illumination_settle_ms in the machine config.
         settle_ms = control._def.Acquisition.ILLUMINATION_SETTLE_MS
+        self._log.info(f"Acquisition settle ms: {settle_ms}")
         if settle_ms > 0:
             with self._timing.get_timer("illumination_settle"):
                 self._sleep(settle_ms / 1000.0)
