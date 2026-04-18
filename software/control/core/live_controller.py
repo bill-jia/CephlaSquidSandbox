@@ -162,7 +162,14 @@ class LiveController:
             raise ValueError(f"fps_trigger must be > 0, but {fps_trigger=}")
         self.fps_trigger = fps_trigger
         self.timer_trigger_interval = (1 / self.fps_trigger) * 1000
-        if self.is_live:
+        # Only (re)start the trigger timer when we're actually running a triggered
+        # acquisition. In CONTINUOUS the timer is meaningless, but fps_trigger itself
+        # is still consulted by on_new_frame and is persisted into observation-state
+        # snapshots, so we must keep the attribute up to date in every mode.
+        if self.is_live and (
+            self.trigger_mode == TriggerMode.SOFTWARE
+            or (self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger)
+        ):
             self._start_new_timer()
 
     def _stop_triggered_acquisition(self):
@@ -198,10 +205,7 @@ class LiveController:
         self.trigger_mode = mode
 
     def set_trigger_fps(self, fps):
-        if (self.trigger_mode == TriggerMode.SOFTWARE) or (
-            self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
-        ):
-            self._set_trigger_fps(fps)
+        self._set_trigger_fps(fps)
 
     def get_trigger_mode(self):
         return self.trigger_mode
@@ -212,6 +216,11 @@ class LiveController:
 
     def on_new_frame(self):
         if not self.is_live:
+            return
+        # The LED-off-between-shots behaviour only makes sense in triggered live mode,
+        # where the trigger timer will turn the LED back on for the next frame. In
+        # CONTINUOUS there is no such timer, so the illumination must stay asserted.
+        if self.trigger_mode == TriggerMode.CONTINUOUS:
             return
         if self.fps_trigger <= 5:
             if self.control_illumination and self.microscope.illumination_controller.is_any_hardware_asserted():

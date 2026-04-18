@@ -208,29 +208,29 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
     if len(raw) < expected:
         # Extend the raw bytes to the expected length
         raw = raw + b'\x00' * (expected - len(raw))
-    
+
     # Calculate how many full pairs of pixels we have
     pairs = n // 2
-    
+
     # 1. Map the relevant raw bytes directly into a fast, read-only 1D uint8 array
     # 2. Reshape it into a 2D array where each row is a 3-byte chunk [b0, b1, b2]
     data = np.frombuffer(raw[:pairs * 3], dtype=np.uint8).reshape(-1, 3)
-    
+
     # Cast the columns to uint16 BEFORE bit-shifting to prevent 8-bit overflow
     b0 = data[:, 0].astype(np.uint16)
     b1 = data[:, 1].astype(np.uint16)
     b2 = data[:, 2].astype(np.uint16)
-    
+
     # Allocate a 2D array for the output pixel pairs
     out = np.empty((pairs, 2), dtype=np.uint16)
-    
+
     # Perform the bitwise operations on all pixels at once
     out[:, 0] = (b0 << 4) | (b1 >> 4)
     out[:, 1] = (b2 << 4) | (b1 & 0x0F)
-    
+
     # Flatten the array back to 1D
     out_flat = out.ravel()
-    
+
     # Handle the odd trailing pixel if the total pixel count 'n' is not an even number
     if n % 2 != 0:
         out_final = np.empty(n, dtype=np.uint16)
@@ -238,14 +238,14 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
         i = pairs * 3
         out_final[-1] = int.from_bytes(raw[i : i + 2], "little") & 0xFFF
         return out_final.reshape(height, width)
-    
+
     return out_flat.reshape(height, width)
 
 
 def decode_tucsen_hs11(raw: bytes, height: int, width: int) -> np.ndarray:
     """11-bit values in 12-bit packing with LSB zero; unpack as CMS12 then shift right by one."""
     u12 = decode_tucsen_cms12(raw, height, width)
-    return u12.astype(np.uint16) 
+    return u12.astype(np.uint16)
     # return (u12 >> 1).astype(np.uint16)
 
 def tucsen_raw_bytes_to_uint16(raw: bytes, meta: dict, packing: str = "hdr16") -> np.ndarray:
@@ -595,7 +595,7 @@ class TucsenCamera(AbstractCamera):
         if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
             TUCAM_Buf_Release(self._camera)
             raise CameraError("Failed to start streaming")
-        
+
         self._update_internal_settings()
 
 
@@ -1441,7 +1441,7 @@ class TucsenCamera(AbstractCamera):
             except Exception as e:
                 self._log.exception(f"Failed to read temperature in callback: {e}")
                 pass
-    
+
     def set_trigger_duration_us(self, trigger_duration_us: int):
         self._trigger_duration_us = trigger_duration_us
         if self._model_properties.is_genicam:
@@ -1755,6 +1755,6 @@ class TucsenCamera(AbstractCamera):
 
         if log_info:
             self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {value}")
-        
+
         time.sleep(0.1) # Sleep to avoid sequential parameter setting from causing errors
         return True
