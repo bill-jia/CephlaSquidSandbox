@@ -407,6 +407,7 @@ class TucsenCamera(AbstractCamera):
         self._is_streaming = threading.Event()
 
         self._acquisition_mode = None
+        self._region_of_interest = None
 
         # Fast acquisition support
         self._fast_acquisition_callback: Optional[Callable[[np.ndarray, Optional[dict]], None]] = None
@@ -587,8 +588,10 @@ class TucsenCamera(AbstractCamera):
                     self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
                 self._set_genicam_parameter("TriggerOutputWidth", self._trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
 
+        self.get_region_of_interest(force_update=True)
         self.set_binning(*self._config.default_binning)
         self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
+        
 
         self._terminate_temperature_event = threading.Event()
         self.temperature_reading_thread = threading.Thread(target=self._check_temperature, daemon=True)
@@ -1260,13 +1263,40 @@ class TucsenCamera(AbstractCamera):
         # TODO: Add support for FL26BW model
         if not (binning_factor_x, binning_factor_y) in self._model_properties.binning_to_set_value:
             raise CameraError(f"No binning option exists for {binning_factor_x}x{binning_factor_y}")
+
+        old_binning = self._binning
+        old_roi = self._region_of_interest
+        new_binning = (binning_factor_x, binning_factor_y)
+
         if self._model_properties.is_genicam:
             self._raw_set_binning_genicam(
-                self._model_properties.binning_to_set_value[(binning_factor_x, binning_factor_y)]
+                self._model_properties.binning_to_set_value[new_binning]
             )
         else:
-            self._raw_set_resolution(self._model_properties.binning_to_set_value[(binning_factor_x, binning_factor_y)])
-        self._binning = (binning_factor_x, binning_factor_y)
+            self._raw_set_resolution(self._model_properties.binning_to_set_value[new_binning])
+        self._binning = new_binning
+
+        # The Tucsen SDK — both the Aries GenICam layer (see Aries manual §5.4.2:
+        # OffsetX/Width "under the current resolution", WidthMax "affected by
+        # BinningSelector") and the legacy TUCAM_Cap_SetROI path — expresses
+        # the ROI in *current-resolution* pixels, i.e. binned units. When the
+        # binning factor changes, the cached ROI is no longer valid: the
+        # numeric values now describe a different physical-sensor window and
+        # may overflow the new WidthMax/HeightMax. Rescale the cached ROI to
+        # the new binning so the physical FOV is preserved, and push it back
+        # to hardware so the cache stays in sync with whatever the SDK did
+        # internally to the old values on the binning switch.
+        if old_roi is not None and old_binning != new_binning:
+            scaled_roi = AbstractCamera.calculate_new_roi_for_binning(old_binning, old_roi, new_binning)
+            new_roi = tuple(int(round(v)) for v in scaled_roi)
+            # Refresh the cache from hardware once so set_region_of_interest's
+            # per-axis write-order logic can compare the new Width/Height
+            # against the actual post-binning values the SDK settled on. The
+            # pre-binning cache is in the old binning's pixel units and no
+            # longer reflects anything real. One poll per binning change is
+            # acceptable — set_binning is not a hot path.
+            self.get_region_of_interest(force_update=True)
+            self.set_region_of_interest(*new_roi)
 
     def get_binning(self) -> Tuple[int, int]:
         return self._binning
@@ -1326,55 +1356,109 @@ class TucsenCamera(AbstractCamera):
         raise NotImplementedError("Black levels are not implemented for the Tucsen driver.")
 
     def set_region_of_interest(self, offset_x: int, offset_y: int, width: int, height: int):
-        # TODO: limit range of values to be within the camera's capabilities
         self._log.info(f"Setting region of interest to {offset_x}, {offset_y}, {width}, {height}")
-        if self._model_properties.is_genicam:
-            nHOffset = control.utils.truncate_to_interval(offset_x, 8)
-            nVOffset = control.utils.truncate_to_interval(offset_y, 2)
-            nWidth = control.utils.truncate_to_interval(width, 8)
-            nHeight = control.utils.truncate_to_interval(height, 2)
-        else:
-            roi_attr = TUCAM_ROI_ATTR()
-            roi_attr.bEnable = 1
-            # These values must be a multiple of 4. When using 11bit mode, they must be a multiple of 32 (not supported yet).
-            roi_attr.nHOffset = control.utils.truncate_to_interval(offset_x, 4)
-            roi_attr.nVOffset = control.utils.truncate_to_interval(offset_y, 4)
-            roi_attr.nWidth = control.utils.truncate_to_interval(width, 4)
-            roi_attr.nHeight = control.utils.truncate_to_interval(height, 4)
 
+        # Step-alignment requirements (binned units — see Aries manual §5.4.2):
+        #   GenICam (Aries): OffsetX/Width step 8, OffsetY/Height step 2
+        #   TUCAM legacy (Dhyana/FL26/Libra): all step 4 (step 32 in 11-bit mode
+        #   is not supported yet)
         if self._model_properties.is_genicam:
-            truncated_roi = (nHOffset, nVOffset, nWidth, nHeight)
+            x_step, y_step = 8, 2
         else:
-            truncated_roi = (roi_attr.nHOffset, roi_attr.nVOffset, roi_attr.nWidth, roi_attr.nHeight)
-        if truncated_roi == self.get_region_of_interest():
-            self._log.debug(f"set_region_of_interest: already {truncated_roi}, skipping")
+            x_step = y_step = 4
+
+        nHOffset = control.utils.truncate_to_interval(offset_x, x_step)
+        nVOffset = control.utils.truncate_to_interval(offset_y, y_step)
+        nWidth = control.utils.truncate_to_interval(width, x_step)
+        nHeight = control.utils.truncate_to_interval(height, y_step)
+
+        # Prioritize preserving the caller's Width/Height: if the window runs
+        # past the right/bottom edge of the sensor at the current binning,
+        # slide the offset back rather than shrinking the aperture. Only clamp
+        # Width/Height when they exceed the sensor itself (e.g. stale values
+        # left over from a coarser binning that haven't been rescaled yet).
+        max_x, max_y = self._model_properties.binning_to_resolution[self._binning]
+        if nWidth > max_x:
+            nWidth = control.utils.truncate_to_interval(max_x, x_step)
+        if nHeight > max_y:
+            nHeight = control.utils.truncate_to_interval(max_y, y_step)
+        if nHOffset + nWidth > max_x:
+            nHOffset = max(0, control.utils.truncate_to_interval(max_x - nWidth, x_step))
+        if nVOffset + nHeight > max_y:
+            nVOffset = max(0, control.utils.truncate_to_interval(max_y - nHeight, y_step))
+
+        truncated_roi = (nHOffset, nVOffset, nWidth, nHeight)
+        if (nHOffset, nVOffset, nWidth, nHeight) != (offset_x, offset_y, width, height):
+            self._log.info(
+                f"Adjusted ROI from requested ({offset_x}, {offset_y}, {width}, {height}) "
+                f"to {truncated_roi} to satisfy step alignment and sensor bounds "
+                f"(max {max_x}x{max_y} at binning {self._binning})"
+            )
+        if truncated_roi == self._region_of_interest:
+            self._log.info(f"set_region_of_interest: already {truncated_roi}, skipping")
             return
 
         with self._pause_streaming():
             if self._model_properties.is_genicam:
-                self._set_genicam_parameter("OffsetX", nHOffset, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("OffsetY", nVOffset, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("Width", nWidth, TUELEM_TYPE.TU_ElemInteger.value)
-                self._set_genicam_parameter("Height", nHeight, TUELEM_TYPE.TU_ElemInteger.value)
+                # GenICam couples Offset and Dim via `Offset + Dim <= DimMax`
+                # on every single write, so the order in which we update the
+                # two matters. Pick the order per-axis from the master cache
+                # (X and Y constraints are independent):
+                #   - Dim shrinking/unchanged: write Dim first — the smaller
+                #     Dim always fits under the old Offset.
+                #   - Dim growing: write Offset first — the (presumably
+                #     smaller) new Offset always fits under the old Dim.
+                # See Aries manual §5.4.2 items 10-13. The non-GenICam path
+                # uses TUCAM_Cap_SetROI with a single struct and has no
+                # intermediate-state problem.
+                old_roi = self._region_of_interest
+                old_W = old_roi[2] if old_roi is not None else nWidth
+                old_H = old_roi[3] if old_roi is not None else nHeight
+                if nWidth <= old_W:
+                    self._set_genicam_parameter("Width", nWidth, TUELEM_TYPE.TU_ElemInteger.value)
+                    self._set_genicam_parameter("OffsetX", nHOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                else:
+                    self._set_genicam_parameter("OffsetX", nHOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                    self._set_genicam_parameter("Width", nWidth, TUELEM_TYPE.TU_ElemInteger.value)
+                if nHeight <= old_H:
+                    self._set_genicam_parameter("Height", nHeight, TUELEM_TYPE.TU_ElemInteger.value)
+                    self._set_genicam_parameter("OffsetY", nVOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                else:
+                    self._set_genicam_parameter("OffsetY", nVOffset, TUELEM_TYPE.TU_ElemInteger.value)
+                    self._set_genicam_parameter("Height", nHeight, TUELEM_TYPE.TU_ElemInteger.value)
             else:
+                roi_attr = TUCAM_ROI_ATTR()
+                roi_attr.bEnable = 1
+                roi_attr.nHOffset = nHOffset
+                roi_attr.nVOffset = nVOffset
+                roi_attr.nWidth = nWidth
+                roi_attr.nHeight = nHeight
                 if TUCAM_Cap_SetROI(self._camera, roi_attr) != TUCAMRET.TUCAMRET_SUCCESS:
                     raise CameraError(
-                        f"Failed to set ROI: {roi_attr.nHOffset}, {roi_attr.nVOffset}, {roi_attr.nWidth}, {roi_attr.nHeight}"
+                        f"Failed to set ROI: {nHOffset}, {nVOffset}, {nWidth}, {nHeight}"
                     )
+            # Master record of the device ROI. Downstream code (fast-acq
+            # controller, live controller, raw-to-tiff) reads this via
+            # get_region_of_interest() without polling the SDK; it must match
+            # what we just pushed to hardware or the next acquisition will
+            # allocate the wrong frame size.
+            self._region_of_interest = truncated_roi
             self._update_internal_settings()
 
-    def get_region_of_interest(self) -> Tuple[int, int, int, int]:
-        if self._model_properties.is_genicam:
-            h_offset = self._get_genicam_parameter("OffsetX")["value"]
-            v_offset = self._get_genicam_parameter("OffsetY")["value"]
-            width = self._get_genicam_parameter("Width")["value"]
-            height = self._get_genicam_parameter("Height")["value"]
-            return (h_offset, v_offset, width, height)
-        else:
-            roi_attr = TUCAM_ROI_ATTR()
-            if TUCAM_Cap_GetROI(self._camera, pointer(roi_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
-                raise CameraError("Failed to get ROI")
-            return (roi_attr.nHOffset, roi_attr.nVOffset, roi_attr.nWidth, roi_attr.nHeight)
+    def get_region_of_interest(self, force_update=False) -> Tuple[int, int, int, int]:
+        if force_update:
+            if self._model_properties.is_genicam:
+                h_offset = self._get_genicam_parameter("OffsetX")["value"]
+                v_offset = self._get_genicam_parameter("OffsetY")["value"]
+                width = self._get_genicam_parameter("Width")["value"]
+                height = self._get_genicam_parameter("Height")["value"]
+                self._region_of_interest = (h_offset, v_offset, width, height)
+            else:
+                roi_attr = TUCAM_ROI_ATTR()
+                if TUCAM_Cap_GetROI(self._camera, pointer(roi_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to get ROI")
+                self._region_of_interest = (roi_attr.nHOffset, roi_attr.nVOffset, roi_attr.nWidth, roi_attr.nHeight)
+        return self._region_of_interest
 
     # =========================================================================
     # Acquisition Mode
@@ -1459,33 +1543,39 @@ class TucsenCamera(AbstractCamera):
             self._update_internal_settings()
             self.set_exposure_time(self._exposure_time_ms)
 
-    def get_acquisition_mode(self) -> CameraAcquisitionMode:
+    def get_acquisition_mode(self, force_update=False) -> CameraAcquisitionMode:
         # When we're virtualizing software trigger on top of the hardware trigger
         # line, keep reporting SOFTWARE_TRIGGER to the outside world.
+        if force_update:
+            if self._model_properties.is_genicam:
+                trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
+                if trigger_value == "Software":
+                    self._acquisition_mode = CameraAcquisitionMode.SOFTWARE_TRIGGER
+                elif trigger_value == "FreeRunning":
+                    self._acquisition_mode = CameraAcquisitionMode.CONTINUOUS
+                elif trigger_value == "Standard":
+                    # Standard mode can be either hardware trigger or virtualized software trigger; disambiguate based on the capture mode.
+                    if self._capture_mode_genicam == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
+                        self._acquisition_mode = CameraAcquisitionMode.CONTINUOUS
+                    else:
+                        self._acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER
+                else:
+                    raise ValueError(f"Unknown Tucsen GenICam trigger mode: {trigger_value}")
+            else:
+                trigger_attr = TUCAM_TRIGGER_ATTR()
+                if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
+                    raise CameraError("Failed to get acquisition mode")
+                if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
+                    self._acquisition_mode = CameraAcquisitionMode.SOFTWARE_TRIGGER
+                elif trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
+                    self._acquisition_mode = CameraAcquisitionMode.CONTINUOUS
+                elif trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
+                    self._acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER
+                elif trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value:
+                    self._acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
+                else:
+                    raise ValueError(f"Unknown Tucsen trigger mode: {trigger_attr.nTgrMode=}")
         return self._acquisition_mode
-        # if self._virt_sw_trigger:
-        #     return CameraAcquisitionMode.SOFTWARE_TRIGGER
-        # if self._model_properties.is_genicam:
-        #     trigger_value = self._get_genicam_parameter("TriggerMode")["value"]
-        #     if trigger_value == "Software":
-        #         return CameraAcquisitionMode.SOFTWARE_TRIGGER
-        #     if trigger_value == "FreeRunning":
-        #         return CameraAcquisitionMode.CONTINUOUS
-        #     if trigger_value == "Standard":
-        #         return CameraAcquisitionMode.HARDWARE_TRIGGER
-        #     raise ValueError(f"Unknown Tucsen GenICam trigger mode: {trigger_value}")
-        # trigger_attr = TUCAM_TRIGGER_ATTR()
-        # if TUCAM_Cap_GetTrigger(self._camera, pointer(trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS:
-        #     raise CameraError("Failed to get acquisition mode")
-        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value:
-        #     return CameraAcquisitionMode.SOFTWARE_TRIGGER
-        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value:
-        #     return CameraAcquisitionMode.CONTINUOUS
-        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value:
-        #     return CameraAcquisitionMode.HARDWARE_TRIGGER
-        # if trigger_attr.nTgrMode == TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_GLOBAL.value:
-        #     return CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST
-        # raise ValueError(f"Unknown Tucsen trigger mode: {trigger_attr.nTgrMode=}")
 
     def set_temperature_reading_callback(self, func: Callable):
         self.temperature_reading_callback = func
@@ -1538,7 +1628,8 @@ class TucsenCamera(AbstractCamera):
         self._update_internal_settings()
 
     def send_trigger(self, illumination_time: Optional[float] = None):
-        if mode == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
+
+        if self._acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER and not self._hw_trigger_fn:
             raise CameraError("In HARDWARE_TRIGGER mode, but no hw trigger function given.")
 
         if not self.get_is_streaming():
@@ -1549,7 +1640,7 @@ class TucsenCamera(AbstractCamera):
                 f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
             )
         # Virtualized SW trigger -> fire the hardware trigger line; camera is actually in hw mode.
-        if mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
+        if self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
             if not self._hw_trigger_fn:
                 raise CameraError("Virtualized software trigger requires _hw_trigger_fn.")
             # Pass None so the hw_trigger_fn fires only the camera trigger line;
@@ -1563,10 +1654,10 @@ class TucsenCamera(AbstractCamera):
             self._triggers_sent_since_start += 1
             self._trigger_sent.set()
             return
-        if mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
+        if self._acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
             self._triggers_sent_since_start += 1
             self._hw_trigger_fn(illumination_time)
-        elif mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+        elif self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
             self._triggers_sent_since_start += 1
             if self._model_properties.is_genicam:
                 self._set_genicam_parameter("TriggerSoftwarePulse", 1, TUELEM_TYPE.TU_ElemCommand.value)

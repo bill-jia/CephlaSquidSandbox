@@ -26,12 +26,7 @@
       "Bash(python -c \"import control._def; print\\(''OK''\\)\")",
       "Bash(/c/Users/jialab/miniforge3/envs/squid/python.exe -c \"import control._def; print\\(''OK''\\)\")",
       "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -m pytest tests/control/test_def.py -v 2>&1)",
-<<<<<<< Updated upstream
       "Bash(git *)"
-=======
-      "Bash(git -C /c/Code/CephlaSquidSandbox log --oneline -- software/control/core/live_controller.py)",
-      "Bash(git -C /c/Code/CephlaSquidSandbox log --oneline --all -- software/control/core/live_controller.py)"
->>>>>>> Stashed changes
     ]
   }
 }

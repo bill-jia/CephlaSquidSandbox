@@ -631,7 +631,7 @@ class MemoryMonitor:
                 with self._lock:
                     if all_python_mb > self._all_python_peak_mb:
                         self._all_python_peak_mb = all_python_mb
-            self._log.info(
+            self._log.debug(
                 f"[MEM] PERIODIC {self._process_name}: "
                 f"footprint={footprint_mb:.1f}MB, rss={main_mb:.1f}MB, "
                 f"peak_footprint={current_footprint_peak:.1f}MB"

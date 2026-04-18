@@ -718,11 +718,18 @@ class NIDAQWidget(QWidget):
     
     def show_do_pattern_dialog(self):
         """Show dialog to configure digital output pattern."""
+        port = self.do_port_combo.currentText() or "port0"
+        available_lines = list(range(8))
+        line_labels = {
+            line: self._endpoint_labels_do.get((port, line))
+            for line in available_lines
+        }
         dialog = DOPatternDialog(
             self._ni_daq.sample_rate_hz,
             self._ni_daq.samples_per_channel,
-            self._ni_daq.do_lines,
-            self
+            available_lines,
+            self,
+            line_labels=line_labels,
         )
         if dialog.exec_() == QDialog.Accepted:
             line, pattern = dialog.get_pattern()
@@ -919,11 +926,19 @@ class NIDAQWidget(QWidget):
     
     def _rebuild_live_output_controls(self):
         """Rebuild the Live output panel from current _ao_waveforms and _do_patterns."""
-        # Clear existing
-        while self._live_output_layout.count():
-            item = self._live_output_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # Clear existing (handles both widgets and nested layouts/rows)
+        def _clear_layout(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+                    continue
+                child_layout = item.layout()
+                if child_layout is not None:
+                    _clear_layout(child_layout)
+                    child_layout.deleteLater()
+        _clear_layout(self._live_output_layout)
         self._live_ao_controls.clear()
         self._live_do_controls.clear()
         if self._ni_daq is None:
@@ -1537,28 +1552,32 @@ class AOWaveformDialog(QDialog):
 class DOPatternDialog(QDialog):
     """Dialog for configuring digital output patterns."""
     
-    def __init__(self, sample_rate: float, num_samples: int, lines: list, parent=None):
+    def __init__(self, sample_rate: float, num_samples: int, lines: list, parent=None,
+                 line_labels: Optional[dict] = None):
         super().__init__(parent)
         self.sample_rate = sample_rate
         self.num_samples = num_samples
-        self.lines = lines
+        self.lines = lines if lines else list(range(8))
+        self.line_labels = line_labels or {}
         self._pattern = None
         self._line = None
-        
+
         self.setWindowTitle("Configure Digital Output Pattern")
         self.setMinimumSize(400, 250)
         self.init_ui()
-    
+
     def init_ui(self):
         layout = QVBoxLayout()
         self.setLayout(layout)
-        
+
         # Line selection
         line_row = QHBoxLayout()
         line_row.addWidget(QLabel("Line:"))
         self.line_combo = QComboBox()
-        for line in (self.lines if self.lines else range(8)):
-            self.line_combo.addItem(f"Line {line}", line)
+        for line in self.lines:
+            label = self.line_labels.get(line)
+            text = f"Line {line} — {label}" if label else f"Line {line}"
+            self.line_combo.addItem(text, line)
         line_row.addWidget(self.line_combo)
         layout.addLayout(line_row)
         
