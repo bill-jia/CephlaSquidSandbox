@@ -33,26 +33,32 @@ devices:
       logic_family: "THREE_POINT_THREE_V"
 
   main_camera:
-    driver: tucsen
+    driver: toupcam
     role: main
     io:
       trigger:
         controller: nidaq
         signal_type: digital
         direction: output
-        channel_id: "port0/line6"
-        display_name: "Main camera trigger"
+        channel_id: "port0/line12"
+        display_name: "camera_trigger"
     config:
-      model: "ARIES-6506"
+      model: "ITR3CMOS26000KMA"
       pixel_format: MONO16
-      binning: 1
-      roi: { offset_x: 0, offset_y: 0, width: 2400, height: 2400 }
-      crop: { width: 2400, height: 2400 }
+      binning: 2
+      roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
+      crop: { width: 4168, height: 4168 }
       rotate_angle: 0
       flip: null
-      temperature: 0
+      temperature: 20
+      fan_speed: 1
+      black_level: 3
+      awb_ratios:
+        r: 1.375
+        g: 1
+        b: 1.4141
       hardware_triggering_enabled: true
-      readout_mode: "ROLLING"
+      readout_mode: "GLOBAL"
 
   focus_camera:
     driver: daheng
@@ -184,56 +190,44 @@ illumination_channels_file: illumination_channel_config.yaml
 
 illumination_devices:
 
-  - id: coolled_pe400
-    driver: coolled_pe400
-    # Update COM port / connection details to match your setup.
-    connection:
-      serial_number: "3065377C3433"
+  # Epi fluorescence driven entirely by the Teensy:
+  #   - Intensity: MCU analog output on illumination port N (D1..D5 = port:0..port:4)
+  #   - Shutter:   MCU digital gate on the same port
+  # Port → wavelength mapping matches controller_port_mapping in
+  # illumination_channel_config.yaml (D1=405, D2=488, D3=561, D4=638, D5=730).
+  - id: squid_lasers
+    driver: squid_builtin
     channels:
       "Fluorescence 405 nm Ex":
         wavelength_nm: 405
         type: epi_illumination
-        serial_key: "B"
         io:
-          shutter:
-            controller: nidaq
-            signal_type: digital
-            direction: output
-            channel_id: "port0/line0"
-            display_name: "coolled_shutter_405_nidaq0"
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:0" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:0" }
       "Fluorescence 488 nm Ex":
         wavelength_nm: 488
         type: epi_illumination
-        serial_key: "C"
         io:
-          shutter:
-            controller: nidaq
-            signal_type: digital
-            direction: output
-            channel_id: "port0/line1"
-            display_name: "coolled_shutter_488_nidaq1"
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:1" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:1" }
       "Fluorescence 561 nm Ex":
         wavelength_nm: 561
         type: epi_illumination
-        serial_key: "D"
         io:
-          shutter:
-            controller: nidaq
-            signal_type: digital
-            direction: output
-            channel_id: "port0/line2"
-            display_name: "coolled_shutter_561_nidaq2"
-      "Fluorescence 635 nm Ex":
-        wavelength_nm: 635
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:2" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:2" }
+      "Fluorescence 638 nm Ex":
+        wavelength_nm: 638
         type: epi_illumination
-        serial_key: "A"
         io:
-          shutter:
-            controller: nidaq
-            signal_type: digital
-            direction: output
-            channel_id: "port0/line3"
-            display_name: "coolled_shutter_638_nidaq3"
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:3" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:3" }
+      "Fluorescence 730 nm Ex":
+        wavelength_nm: 730
+        type: epi_illumination
+        io:
+          intensity: { controller: teensy, signal_type: analog,  direction: output, channel_id: "port:4" }
+          shutter:   { controller: teensy, signal_type: digital, direction: output, channel_id: "port:4" }
 
   - id: led_matrix
     driver: led_matrix
@@ -246,7 +240,7 @@ illumination_devices:
 software:
   is_hcs: true
   wellplate_format: 96
-  default_saving_path: "C:/Microscope_Data"
+  default_saving_path: "/Downloads"
   display:
     default_crop: 85
     use_napari_for_live_view: false
