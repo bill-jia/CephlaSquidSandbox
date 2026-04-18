@@ -224,6 +224,11 @@ class AcquisitionSettings(BaseModel):
     fast_acquisition: bool = False
     default_nx: int = 1
     default_ny: int = 1
+    # Delay (ms) between asserting the illumination shutter and firing the camera
+    # trigger. Needed on rolling-shutter sensors so row 0 does not start integrating
+    # on the LED's rising edge — otherwise the top rows undershoot and show a
+    # brightness gradient. 0 disables the delay.
+    illumination_settle_ms: float = 0.0
 
     model_config = {"extra": "allow"}
 

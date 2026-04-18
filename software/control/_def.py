@@ -42,6 +42,11 @@ class Acquisition:
     NX = 1
     NY = 1
     USE_MULTIPROCESSING = True
+    # Delay (ms) between asserting the illumination shutter and firing the camera
+    # trigger. Needed on rolling-shutter sensors so the top rows don't start
+    # integrating on the LED's rising edge. Overridden per-rig by
+    # ``software.acquisition.illumination_settle_ms`` in the machine config.
+    ILLUMINATION_SETTLE_MS = 0.0
 
 
 class MicrocontrollerDef:

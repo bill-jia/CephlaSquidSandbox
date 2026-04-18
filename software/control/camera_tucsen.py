@@ -454,6 +454,12 @@ class TucsenCamera(AbstractCamera):
         # on Aries, so we reroute through the hardware trigger line that already
         # works. See set_acquisition_mode / send_trigger.
         self._virt_sw_trigger = False
+        # Rolling-shutter timing. Populated by _calculate_strobe_delay; used by
+        # set_exposure_time to compensate when the LED is pulsed by the microcontroller
+        # synchronously with the sensor's global co-exposure window (real HARDWARE_TRIGGER
+        # path only — the virtualized path drives the LED steady-on via the worker).
+        self._strobe_delay_ms: float = 0.0
+        self._rolling_shutter_readout_ms: float = 0.0
         self.temperature_reading_callback = None
         self._exposure_time_ms: float = (
             self._get_genicam_parameter("ExposureTime")["value"]
@@ -856,7 +862,7 @@ class TucsenCamera(AbstractCamera):
                 wait_time_ms = int(self._read_thread_wait_period_s * 1000)  # ms, convert to int
                 try:
                     ret = TUCAM_Buf_WaitForFrame(self._camera, pointer(self._m_frame), c_int32(wait_time_ms))
-                    self._log.info(f"TUCAM_Buf_WaitForFrame returned {ret}")
+                    # self._log.info(f"TUCAM_Buf_WaitForFrame returned {ret}")
                 except Exception:
                     continue
                 # On timeout (common in SOFTWARE_TRIGGER between triggers) _m_frame holds stale
@@ -936,18 +942,23 @@ class TucsenCamera(AbstractCamera):
     # =========================================================================
 
     def set_exposure_time(self, exposure_time_ms: float):
-        # TBD: properly handle hardware strobing, for now just asusme that user is giving some buffer time for strobing.
-        # if self.get_acquisition_mode() in (
-        #     CameraAcquisitionMode.HARDWARE_TRIGGER,
-        #     CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST,
-        # ):
-        #     strobe_time_ms = self.get_strobe_time()
-        #     adjusted_exposure_time = exposure_time_ms + strobe_time_ms
-        #     if self._hw_set_strobe_delay_ms_fn:
-        #         self._log.debug(f"Setting hw strobe time to {strobe_time_ms} [ms]")
-        #         self._hw_set_strobe_delay_ms_fn(strobe_time_ms)
-        # else:
-        adjusted_exposure_time = exposure_time_ms
+        # Rolling-shutter compensation: when the sensor is actually being hardware-
+        # triggered (real HW, HW_FIRST, or virtualized-from-SW), the LED pulse fired
+        # by the microcontroller only produces a uniform image if it lands on the
+        # global co-exposure window (when every row is simultaneously integrating).
+        # To achieve that we:
+        #   1. Extend the on-sensor exposure by the rolling-shutter readout time so
+        #      row 0 is still exposing when the last row starts.
+        #   2. Tell the microcontroller to delay the LED pulse by the full
+        #      readout + trigger-input delay after the trigger, so the pulse (width
+        #      == user's exposure time) lines up with the global window.
+        if self._uses_hw_trigger_timing():
+            adjusted_exposure_time = exposure_time_ms + self._rolling_shutter_readout_ms
+            if self._hw_set_strobe_delay_ms_fn is not None:
+                self._log.debug(f"Setting hw strobe delay to {self._strobe_delay_ms} [ms]")
+                self._hw_set_strobe_delay_ms_fn(self._strobe_delay_ms)
+        else:
+            adjusted_exposure_time = exposure_time_ms
 
         if self._model_properties.is_genicam:
             self._set_genicam_parameter(
@@ -964,6 +975,22 @@ class TucsenCamera(AbstractCamera):
 
         self._exposure_time_ms = exposure_time_ms
         self._trigger_sent.clear()
+
+    def _uses_hw_trigger_timing(self) -> bool:
+        """True when the LED is pulsed by the microcontroller synchronously with the
+        sensor's global co-exposure window, so we need to (a) extend the sensor
+        exposure by the readout time and (b) push the strobe delay to the MCU.
+
+        The virtualized software-trigger path does **not** qualify: on that path the
+        worker asserts the LED steady-on across the whole frame via the illumination
+        controller, and the NI-DAQ hw_trigger_fn only pulses the camera trigger line
+        (it does not pulse the LED). Treating it as hw-triggered here would
+        over-extend the exposure and produce a brightness gradient.
+        """
+        if self._virt_sw_trigger:
+            return False
+        mode = self.get_acquisition_mode()
+        return mode in (CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST)
         self._update_internal_settings()
 
     def get_exposure_time(self) -> float:
@@ -1016,6 +1043,11 @@ class TucsenCamera(AbstractCamera):
                 raise CameraError("Failed to get trigger delay")
             trigger_delay_ms = trigger_attr.nDelayTm
 
+        # readout = time from row-0-start to last-row-start (rolling shutter). Exposure
+        # must be extended by this to keep row 0 integrating while the last row begins.
+        self._rolling_shutter_readout_ms = readout_time_ms
+        # Total delay after trigger until every row is co-exposing; the LED pulse should
+        # start here so all rows receive the same illumination.
         self._strobe_delay_ms = readout_time_ms + trigger_delay_ms
 
     def get_strobe_time(self) -> float:
@@ -1324,9 +1356,11 @@ class TucsenCamera(AbstractCamera):
         # fire the DAQ pulse. The native Tucsen GenICam software-trigger command does
         # not reliably fire exposures on the Aries, so we route through the hardware
         # line that is already proven to work.
-        virtualize_sw_trigger = (
-            acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._hw_trigger_fn is not None
-        )
+
+        # virtualize_sw_trigger = (
+        #     acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._hw_trigger_fn is not None
+        # )
+        virtualize_sw_trigger = False
         self._virt_sw_trigger = virtualize_sw_trigger
         with self._pause_streaming():
             if (
@@ -1337,7 +1371,7 @@ class TucsenCamera(AbstractCamera):
             if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and not virtualize_sw_trigger:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 2, TUELEM_TYPE.TU_ElemEnumeration.value)
-                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
+                    self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
             elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and virtualize_sw_trigger:
@@ -1468,7 +1502,13 @@ class TucsenCamera(AbstractCamera):
         if mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
             if not self._hw_trigger_fn:
                 raise CameraError("Virtualized software trigger requires _hw_trigger_fn.")
-            self._hw_trigger_fn(illumination_time)
+            # Pass None so the hw_trigger_fn fires only the camera trigger line;
+            # the worker already has the LED shutter asserted steady-on via the
+            # illumination controller, and having the MCU drive a second LED pulse
+            # on top would either conflict (MCU path) or be a no-op (NI-DAQ path).
+            # (LED settle before firing is applied worker-side, see
+            # software.acquisition.illumination_settle_ms in the machine config.)
+            self._hw_trigger_fn(None)
             self._last_trigger_timestamp = time.time()
             self._trigger_sent.set()
             return

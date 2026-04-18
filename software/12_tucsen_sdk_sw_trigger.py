@@ -259,18 +259,20 @@ def try_variant(
         return
 
     if dispatch_fn is None:
-        fret, fmean = wait_one_frame(handle, frame, frame_timeout_ms)
-        dt_ms = (time.time() - t0) * 1000
-        if fret == TUCAMRET.TUCAMRET_SUCCESS:
-            print(
-                f"    trigger {i + 1}: dispatch={retname(dret)} wait={retname(fret)}"
-                f" dt={dt_ms:6.1f}ms mean={fmean:.1f} (size={frame.usWidth}x{frame.usHeight})"
-            )
-        else:
-            print(
-                f"    trigger {i + 1}: dispatch={retname(dret)} wait={retname(fret)}"
-                f" dt={dt_ms:6.1f}ms  NO FRAME"
-            )
+        for i in range(n_triggers):
+            t0 = time.time()
+            fret, fmean = wait_one_frame(handle, frame, frame_timeout_ms)
+            dt_ms = (time.time() - t0) * 1000
+            if fret == TUCAMRET.TUCAMRET_SUCCESS:
+                print(
+                    f"    trigger {i + 1}: wait={retname(fret)}"
+                    f" dt={dt_ms:6.1f}ms mean={fmean:.1f} (size={frame.usWidth}x{frame.usHeight})"
+                )
+            else:
+                print(
+                    f"    trigger {i + 1}: wait={retname(fret)}"
+                    f" dt={dt_ms:6.1f}ms  NO FRAME"
+                )
         stop_and_release(handle)
         return
     # Drain any pending frame that may be sitting in the buffer from a prior variant.
@@ -347,7 +349,7 @@ def main() -> int:
         combos = [
             # Classic TUCAM_Cap_DoSoftwareTrigger, cap_start=TRIGGER_SOFTWARE (driver's current choice)
             ("classic DoSoftwareTrigger + TUCCM_TRIGGER_SOFTWARE",
-             sw_idx, TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value, trigger_classic),
+             sw_idx, TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value, trigger_cmd("TriggerSoftwarePulse")),
             # ("classic DoSoftwareTrigger + TUCCM_TRIGGER_SOFTWARE",
             #  sw_idx, TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value, trigger_classic),
             # # Classic, cap_start=SEQUENCE (what GenICam typically expects)

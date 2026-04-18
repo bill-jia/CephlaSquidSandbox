@@ -1600,6 +1600,15 @@ class MultiPointWorker:
                 self._log.info("Using legacy illumination for capture")
                 self.liveController.obs_controller.turn_on_illumination()
             self.wait_till_operation_is_completed()
+        # Give the LED shutter time to reach stable brightness before the camera
+        # begins integrating. Needed on rolling-shutter sensors — without this the
+        # top rows start exposing on the shutter's rising edge and show a
+        # top-bright gradient. Configured per-rig via
+        # software.acquisition.illumination_settle_ms in the machine config.
+        settle_ms = control._def.Acquisition.ILLUMINATION_SETTLE_MS
+        if settle_ms > 0:
+            with self._timing.get_timer("illumination_settle"):
+                self._sleep(settle_ms / 1000.0)
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
@@ -1669,7 +1678,7 @@ class MultiPointWorker:
                 # wrong.
                 non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
                 if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                    self._log.error("Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                    self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
                     self.request_abort_fn()
                     # Let this fall through so we still turn off illumination.  Let the caller actually break out
                     # of the acquisition.
