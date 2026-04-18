@@ -42,6 +42,12 @@ devices:
         direction: output
         channel_id: "port0/line6"
         display_name: "Main camera trigger"
+      frame_readout:
+        controller: nidaq
+        signal_type: digital
+        direction: input
+        channel_id: "port0/line7"
+        display_name: "Main camera frame readout"
     config:
       model: "ARIES-6506"
       pixel_format: MONO16
@@ -246,7 +252,7 @@ illumination_devices:
 software:
   is_hcs: true
   wellplate_format: 96
-  default_saving_path: "/Downloads"
+  default_saving_path: "C:/Microscope_Data"
   display:
     default_crop: 85
     use_napari_for_live_view: false

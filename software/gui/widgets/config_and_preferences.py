@@ -487,7 +487,7 @@ class PreferencesDialog(QDialog):
         path_layout.setContentsMargins(0, 0, 0, 0)
         self.saving_path_edit = QLineEdit()
         self.saving_path_edit.setText(
-            self._get_config_value("GENERAL", "default_saving_path", str(Path.home() / "Downloads"))
+            self._get_config_value("GENERAL", "default_saving_path", control._def.DEFAULT_SAVING_PATH)
         )
         browse_button = QPushButton("Browse...")
         browse_button.clicked.connect(self._browse_saving_path)
@@ -1458,7 +1458,7 @@ class PreferencesDialog(QDialog):
         if old_val != new_val:
             changes.append(("Use 6D FOV Dimension", str(old_val), str(new_val), False))
 
-        old_val = self._get_config_value("GENERAL", "default_saving_path", str(Path.home() / "Downloads"))
+        old_val = self._get_config_value("GENERAL", "default_saving_path", control._def.DEFAULT_SAVING_PATH)
         new_val = self.saving_path_edit.text()
         if old_val != new_val:
             changes.append(("Default Saving Path", old_val, new_val, False))

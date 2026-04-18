@@ -94,7 +94,24 @@ class NIDAQWidget(QWidget):
         
         # Initialize UI
         self.init_ui()
-    
+
+    def _get_dio_line_from_config(self, endpoint_name: str, default: int) -> int:
+        """Return the NI DAQ DIO line index declared for ``endpoint_name`` in the
+        machine config (e.g. ``main_camera.trigger``), falling back to ``default``
+        when the endpoint is missing or its channel_id is not parseable."""
+        if self._io_endpoint_config is None:
+            return default
+        ep = self._io_endpoint_config.get(endpoint_name)
+        if ep is None:
+            return default
+        cid = ep.channel_id or ""
+        if "line" not in cid:
+            return default
+        try:
+            return int(cid.rsplit("line", 1)[-1])
+        except ValueError:
+            return default
+
     def init_ui(self):
         """Initialize the user interface."""
         main_layout = QHBoxLayout()
@@ -1835,16 +1852,24 @@ class FastAcquisitionWidget(QWidget):
         daq_layout.addWidget(QLabel("Trigger DIO Line:"), 0, 2)
         self.camera_trigger_dio_line_spinbox = QSpinBox()
         self.camera_trigger_dio_line_spinbox.setRange(0, 31)
-        self.camera_trigger_dio_line_spinbox.setValue(12)
-        self.camera_trigger_dio_line_spinbox.setToolTip("NI DAQ digital output line for camera triggers (default: 1)")
+        self.camera_trigger_dio_line_spinbox.setValue(
+            self.ni_daq_widget._get_dio_line_from_config("main_camera.trigger", 12)
+        )
+        self.camera_trigger_dio_line_spinbox.setToolTip(
+            "NI DAQ digital output line for camera triggers "
+            "(default read from machine config main_camera.io.trigger)"
+        )
         daq_layout.addWidget(self.camera_trigger_dio_line_spinbox, 0, 3)
 
         daq_layout.addWidget(QLabel("Camera Frame DIO Line:"), 1, 0)
         self.camera_dio_line_spinbox = QSpinBox()
         self.camera_dio_line_spinbox.setRange(0, 31)
-        self.camera_dio_line_spinbox.setValue(7)
+        self.camera_dio_line_spinbox.setValue(
+            self.ni_daq_widget._get_dio_line_from_config("main_camera.frame_readout", 7)
+        )
         self.camera_dio_line_spinbox.setToolTip(
-            "NI DAQ digital input line connected to camera frame signal (default: 0)"
+            "NI DAQ digital input line connected to camera frame signal "
+            "(default read from machine config main_camera.io.frame_readout)"
         )
         daq_layout.addWidget(self.camera_dio_line_spinbox, 1, 1)
 
