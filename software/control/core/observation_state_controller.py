@@ -205,9 +205,6 @@ class ObservationStateController:
         """Channel key for ContrastManager / display."""
         if self._current_state is not None:
             return self._current_state.name
-        states = self.get_observation_states()
-        if states:
-            return states[0].name
         return "default"
 
     # ─────────────────────────────────────────────────────────────────────
