@@ -1299,6 +1299,7 @@ class TucsenCamera(AbstractCamera):
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
         packing = camera_mode_name_to_packing(self.get_camera_mode())
         self._byte_decoding_fn = lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
+        self.update_config_crop()
 
     def _raw_set_resolution(self, bin_value: int):
         with self._pause_streaming():
@@ -1366,6 +1367,8 @@ class TucsenCamera(AbstractCamera):
             if self._m_frame is not None:
                 with self._pause_streaming():
                     self._reset_buffer()
+        
+        self.update_config_crop()
 
     def get_binning(self) -> Tuple[int, int]:
         return self._binning
@@ -1373,6 +1376,12 @@ class TucsenCamera(AbstractCamera):
     def get_binning_options(self) -> Sequence[Tuple[int, int]]:
         # TODO: Add support for FL26BW model
         return self._model_properties.binning_to_set_value.keys()
+
+    
+    def update_config_crop(self):
+        # The Tucsen SDK expresses the ROI in current-resolution pixels, i.e. binned units. The crop dimensions are in unbinned pixels, so multiply by the binning factor to convert.
+        self._config.crop_height = self._region_of_interest[3] * self._binning[1]
+        self._config.crop_width = self._region_of_interest[2] * self._binning[0]
 
     def get_resolution(self) -> Tuple[int, int]:
         # TODO: Add support for FL26BW model
@@ -1388,6 +1397,8 @@ class TucsenCamera(AbstractCamera):
             return self._model_properties.binning_to_resolution[self._binning]
 
     def get_pixel_size_unbinned_um(self) -> float:
+        if self._config.pixel_size_um is not None:
+            return self._config.pixel_size_um
         return self._model_properties.pixel_size_um
 
     def get_pixel_size_binned_um(self) -> float:
@@ -1512,6 +1523,7 @@ class TucsenCamera(AbstractCamera):
             # what we just pushed to hardware or the next acquisition will
             # allocate the wrong frame size.
             self._region_of_interest = truncated_roi
+
             self._update_internal_settings()
 
     def get_region_of_interest(self, force_update=False) -> Tuple[int, int, int, int]:
@@ -1522,6 +1534,7 @@ class TucsenCamera(AbstractCamera):
                 width = self._get_genicam_parameter("Width")["value"]
                 height = self._get_genicam_parameter("Height")["value"]
                 self._region_of_interest = (h_offset, v_offset, width, height)
+                self.update_config_crop()
             else:
                 roi_attr = TUCAM_ROI_ATTR()
                 if TUCAM_Cap_GetROI(self._camera, pointer(roi_attr)) != TUCAMRET.TUCAMRET_SUCCESS:

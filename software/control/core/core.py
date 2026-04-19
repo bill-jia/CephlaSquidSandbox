@@ -1511,7 +1511,12 @@ class NavigationViewer(QFrame):
         self.update_fov_size()
 
     def update_fov_size(self):
-        self.fov_size_mm = self.camera.get_fov_size_mm() * self.objectiveStore.get_pixel_size_factor()
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
+        self.fov_width_mm = pixel_size_factor * fov_w_mm_sensor
+        self.fov_height_mm = pixel_size_factor * fov_h_mm_sensor
+        # fov_size_mm kept for call sites that expect a single characteristic dimension.
+        self.fov_size_mm = min(self.fov_width_mm, self.fov_height_mm)
 
     def redraw_fov(self):
         self.clear_overlay()
@@ -1583,31 +1588,25 @@ class NavigationViewer(QFrame):
             self.y_mm = y_mm
 
     def get_FOV_pixel_coordinates(self, x_mm, y_mm):
+        half_w_px = self.fov_width_mm / 2 / self.mm_per_pixel
+        half_h_px = self.fov_height_mm / 2 / self.mm_per_pixel
         if self.sample == "glass slide":
             current_FOV_top_left = (
-                round(self.origin_x_pixel + x_mm / self.mm_per_pixel - self.fov_size_mm / 2 / self.mm_per_pixel),
-                round(
-                    self.image_height
-                    - (self.origin_y_pixel + y_mm / self.mm_per_pixel)
-                    - self.fov_size_mm / 2 / self.mm_per_pixel
-                ),
+                round(self.origin_x_pixel + x_mm / self.mm_per_pixel - half_w_px),
+                round(self.image_height - (self.origin_y_pixel + y_mm / self.mm_per_pixel) - half_h_px),
             )
             current_FOV_bottom_right = (
-                round(self.origin_x_pixel + x_mm / self.mm_per_pixel + self.fov_size_mm / 2 / self.mm_per_pixel),
-                round(
-                    self.image_height
-                    - (self.origin_y_pixel + y_mm / self.mm_per_pixel)
-                    + self.fov_size_mm / 2 / self.mm_per_pixel
-                ),
+                round(self.origin_x_pixel + x_mm / self.mm_per_pixel + half_w_px),
+                round(self.image_height - (self.origin_y_pixel + y_mm / self.mm_per_pixel) + half_h_px),
             )
         else:
             current_FOV_top_left = (
-                round(self.origin_x_pixel + x_mm / self.mm_per_pixel - self.fov_size_mm / 2 / self.mm_per_pixel),
-                round((self.origin_y_pixel + y_mm / self.mm_per_pixel) - self.fov_size_mm / 2 / self.mm_per_pixel),
+                round(self.origin_x_pixel + x_mm / self.mm_per_pixel - half_w_px),
+                round((self.origin_y_pixel + y_mm / self.mm_per_pixel) - half_h_px),
             )
             current_FOV_bottom_right = (
-                round(self.origin_x_pixel + x_mm / self.mm_per_pixel + self.fov_size_mm / 2 / self.mm_per_pixel),
-                round((self.origin_y_pixel + y_mm / self.mm_per_pixel) + self.fov_size_mm / 2 / self.mm_per_pixel),
+                round(self.origin_x_pixel + x_mm / self.mm_per_pixel + half_w_px),
+                round((self.origin_y_pixel + y_mm / self.mm_per_pixel) + half_h_px),
             )
         return current_FOV_top_left, current_FOV_bottom_right
 

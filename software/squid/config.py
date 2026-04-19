@@ -678,6 +678,11 @@ class CameraConfig(pydantic.BaseModel):
     # If None, the camera will use its default readout mode or the mode will be set from _def.py.
     default_readout_mode: Optional[str] = None  # String representation to avoid circular imports
 
+    # Physical (unbinned) pixel size of the camera sensor in microns. When set,
+    # the driver uses this value instead of its hardcoded model/sensor lookup.
+    # Required for cameras whose model isn't known to the driver's lookup tables.
+    pixel_size_um: Optional[float] = None
+
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
     if old_string == "Toupcam":
@@ -869,6 +874,7 @@ def _build_camera_config_from_device(
         default_white_balance_gains=wb_gains,
         hardware_triggering_enabled=cfg.get("hardware_triggering_enabled", True),
         default_readout_mode=cfg.get("readout_mode"),
+        pixel_size_um=cfg.get("pixel_size_um"),
     )
 
 

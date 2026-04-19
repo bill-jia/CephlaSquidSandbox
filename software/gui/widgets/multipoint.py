@@ -3184,7 +3184,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         well_size = self.scanCoordinates.well_size_mm
         shape = self.combobox_shape.currentText()
         is_round_well = self.scanCoordinates.format not in ["384 well plate", "1536 well plate"]
-        fov_size_mm = self.navigationViewer.camera.get_fov_size_mm() * self.objectiveStore.get_pixel_size_factor()
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_sensor, fov_h_sensor = self.navigationViewer.camera.get_fov_size_mm()
+        # get_effective_well_size assumes a square FOV; use the smaller dimension so coverage
+        # calcs don't claim FOV area the camera can't actually capture on the short axis.
+        fov_size_mm = pixel_size_factor * min(fov_w_sensor, fov_h_sensor)
         return get_effective_well_size(well_size, fov_size_mm, shape, is_round_well)
 
     def reset_coordinates(self):
@@ -3226,7 +3230,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             well_size_mm = self.scanCoordinates.well_size_mm
             scan_size = self.entry_scan_size.value()
             overlap_percent = self.entry_overlap.value()
-            fov_size_mm = self.navigationViewer.camera.get_fov_size_mm() * self.objectiveStore.get_pixel_size_factor()
+            pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+            fov_w_sensor, fov_h_sensor = self.navigationViewer.camera.get_fov_size_mm()
+            # calculate_well_coverage assumes a square FOV; use the smaller dimension for a
+            # conservative (non-overestimating) coverage readout on non-square crops.
+            fov_size_mm = pixel_size_factor * min(fov_w_sensor, fov_h_sensor)
             shape = self.combobox_shape.currentText()
             is_round_well = self.scanCoordinates.format not in ["384 well plate", "1536 well plate"]
 

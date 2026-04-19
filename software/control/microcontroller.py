@@ -36,6 +36,7 @@ from crc import CrcCalculator, Crc8
 from serial.serialutil import SerialException
 
 import squid.logging
+import control._def as _def
 from control._def import *
 
 # Add user to the dialout group to avoid the need to use sudo for serial access
@@ -1448,38 +1449,48 @@ class Microcontroller:
         self.send_command(cmd)
 
     def configure_actuators(self):
+        # X and Y values go through ``_def.`` attribute access so they pick up
+        # the yaml-sourced overrides applied by ``config_bridge.apply_machine_config``.
+        # The star-imported names bound at module import time stay frozen at the
+        # pre-yaml defaults and caused a 2x scaling error between commanded and
+        # physical motion. Z still uses the star-imported names (scalings are
+        # not yet trusted); see software/docs/pending/stage-control-refactor.md.
         # lead screw pitch
-        self.set_leadscrew_pitch(AXIS.X, SCREW_PITCH_X_MM)
+        self.set_leadscrew_pitch(AXIS.X, _def.SCREW_PITCH_X_MM)
         self.wait_till_operation_is_completed()
-        self.set_leadscrew_pitch(AXIS.Y, SCREW_PITCH_Y_MM)
+        self.set_leadscrew_pitch(AXIS.Y, _def.SCREW_PITCH_Y_MM)
         self.wait_till_operation_is_completed()
         self.set_leadscrew_pitch(AXIS.Z, SCREW_PITCH_Z_MM)
         self.wait_till_operation_is_completed()
         # stepper driver (microstepping,rms current and I_hold)
-        self.configure_motor_driver(AXIS.X, MICROSTEPPING_DEFAULT_X, X_MOTOR_RMS_CURRENT_mA, X_MOTOR_I_HOLD)
+        self.configure_motor_driver(
+            AXIS.X, _def.MICROSTEPPING_DEFAULT_X, _def.X_MOTOR_RMS_CURRENT_mA, _def.X_MOTOR_I_HOLD
+        )
         self.wait_till_operation_is_completed()
-        self.configure_motor_driver(AXIS.Y, MICROSTEPPING_DEFAULT_Y, Y_MOTOR_RMS_CURRENT_mA, Y_MOTOR_I_HOLD)
+        self.configure_motor_driver(
+            AXIS.Y, _def.MICROSTEPPING_DEFAULT_Y, _def.Y_MOTOR_RMS_CURRENT_mA, _def.Y_MOTOR_I_HOLD
+        )
         self.wait_till_operation_is_completed()
         self.configure_motor_driver(AXIS.Z, MICROSTEPPING_DEFAULT_Z, Z_MOTOR_RMS_CURRENT_mA, Z_MOTOR_I_HOLD)
         self.wait_till_operation_is_completed()
         # max velocity and acceleration
-        self.set_max_velocity_acceleration(AXIS.X, MAX_VELOCITY_X_mm, MAX_ACCELERATION_X_mm)
+        self.set_max_velocity_acceleration(AXIS.X, _def.MAX_VELOCITY_X_mm, _def.MAX_ACCELERATION_X_mm)
         self.wait_till_operation_is_completed()
-        self.set_max_velocity_acceleration(AXIS.Y, MAX_VELOCITY_Y_mm, MAX_ACCELERATION_Y_mm)
+        self.set_max_velocity_acceleration(AXIS.Y, _def.MAX_VELOCITY_Y_mm, _def.MAX_ACCELERATION_Y_mm)
         self.wait_till_operation_is_completed()
         self.set_max_velocity_acceleration(AXIS.Z, MAX_VELOCITY_Z_mm, MAX_ACCELERATION_Z_mm)
         self.wait_till_operation_is_completed()
         # home switch
-        self.set_limit_switch_polarity(AXIS.X, X_HOME_SWITCH_POLARITY)
+        self.set_limit_switch_polarity(AXIS.X, _def.X_HOME_SWITCH_POLARITY)
         self.wait_till_operation_is_completed()
-        self.set_limit_switch_polarity(AXIS.Y, Y_HOME_SWITCH_POLARITY)
+        self.set_limit_switch_polarity(AXIS.Y, _def.Y_HOME_SWITCH_POLARITY)
         self.wait_till_operation_is_completed()
         self.set_limit_switch_polarity(AXIS.Z, Z_HOME_SWITCH_POLARITY)
         self.wait_till_operation_is_completed()
         # home safety margin
-        self.set_home_safety_margin(AXIS.X, int(X_HOME_SAFETY_MARGIN_UM))
+        self.set_home_safety_margin(AXIS.X, int(_def.X_HOME_SAFETY_MARGIN_UM))
         self.wait_till_operation_is_completed()
-        self.set_home_safety_margin(AXIS.Y, int(Y_HOME_SAFETY_MARGIN_UM))
+        self.set_home_safety_margin(AXIS.Y, int(_def.Y_HOME_SAFETY_MARGIN_UM))
         self.wait_till_operation_is_completed()
         self.set_home_safety_margin(AXIS.Z, int(Z_HOME_SAFETY_MARGIN_UM))
         self.wait_till_operation_is_completed()

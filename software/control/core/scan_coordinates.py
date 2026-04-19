@@ -181,8 +181,13 @@ class ScanCoordinates:
 
     def add_region(self, well_id, center_x, center_y, scan_size_mm, overlap_percent=10, shape="Square"):
         """add region based on user inputs"""
-        fov_size_mm = self.objectiveStore.get_pixel_size_factor() * self.camera.get_fov_size_mm()
-        step_size_mm = fov_size_mm * (1 - overlap_percent / 100)
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
+        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
+        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        overlap_frac = 1 - overlap_percent / 100
+        step_x_mm = fov_w_mm * overlap_frac
+        step_y_mm = fov_h_mm * overlap_frac
         scan_coordinates = []
 
         if shape == "Rectangle":
@@ -191,12 +196,12 @@ class ScanCoordinates:
             width_mm = scan_size_mm * 0.6
 
             # Calculate steps for height and width separately
-            steps_height = math.floor(height_mm / step_size_mm)
-            steps_width = math.floor(width_mm / step_size_mm)
+            steps_height = math.floor(height_mm / step_y_mm)
+            steps_width = math.floor(width_mm / step_x_mm)
 
             # Calculate actual dimensions
-            actual_scan_height_mm = (steps_height - 1) * step_size_mm + fov_size_mm
-            actual_scan_width_mm = (steps_width - 1) * step_size_mm + fov_size_mm
+            actual_scan_height_mm = (steps_height - 1) * step_y_mm + fov_h_mm
+            actual_scan_width_mm = (steps_width - 1) * step_x_mm + fov_w_mm
 
             steps_height = max(1, steps_height)
             steps_width = max(1, steps_width)
@@ -206,23 +211,26 @@ class ScanCoordinates:
 
             for i in range(steps_height):
                 row = []
-                y = center_y + (i - half_steps_height) * step_size_mm
+                y = center_y + (i - half_steps_height) * step_y_mm
                 for j in range(steps_width):
-                    x = center_x + (j - half_steps_width) * step_size_mm
+                    x = center_x + (j - half_steps_width) * step_x_mm
                     if self.validate_coordinates(x, y):
                         row.append((x, y))
                 if self.fov_pattern == "S-Pattern" and i % 2 == 1:
                     row.reverse()
                 scan_coordinates.extend(row)
         else:
+            # Square / Circle: use the smaller step so no axis under-samples when FOV is non-square.
+            step_size_mm = min(step_x_mm, step_y_mm)
+            fov_size_mm = min(fov_w_mm, fov_h_mm)
             steps = math.floor(scan_size_mm / step_size_mm)
             if shape == "Circle":
-                tile_diagonal = math.sqrt(2) * fov_size_mm
+                tile_diagonal = math.sqrt(fov_w_mm**2 + fov_h_mm**2)
                 if steps % 2 == 1:  # for odd steps
                     actual_scan_size_mm = (steps - 1) * step_size_mm + tile_diagonal
                 else:  # for even steps
                     actual_scan_size_mm = math.sqrt(
-                        ((steps - 1) * step_size_mm + fov_size_mm) ** 2 + (step_size_mm + fov_size_mm) ** 2
+                        ((steps - 1) * step_size_mm + fov_w_mm) ** 2 + (step_size_mm + fov_h_mm) ** 2
                     )
 
                 if actual_scan_size_mm > scan_size_mm:
@@ -232,18 +240,15 @@ class ScanCoordinates:
                 actual_scan_size_mm = (steps - 1) * step_size_mm + fov_size_mm
 
             steps = max(1, steps)  # Ensure at least one step
-            # print("steps:", steps)
-            # print("scan size mm:", scan_size_mm)
-            # print("actual scan size mm:", actual_scan_size_mm)
             half_steps = (steps - 1) / 2
             radius_squared = (scan_size_mm / 2) ** 2
             fov_size_mm_half = fov_size_mm / 2
 
             for i in range(steps):
                 row = []
-                y = center_y + (i - half_steps) * step_size_mm
+                y = center_y + (i - half_steps) * step_y_mm
                 for j in range(steps):
-                    x = center_x + (j - half_steps) * step_size_mm
+                    x = center_x + (j - half_steps) * step_x_mm
                     if (
                         shape == "Square"
                         or shape == "Rectangle"
@@ -294,19 +299,25 @@ class ScanCoordinates:
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
-        fov_size_mm = self.objectiveStore.get_pixel_size_factor() * self.camera.get_fov_size_mm()
-        step_size_mm = fov_size_mm * (1 - overlap_percent / 100)
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
+        self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
+        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
+        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        overlap_frac = 1 - overlap_percent / 100
+        step_x_mm = fov_w_mm * overlap_frac
+        step_y_mm = fov_h_mm * overlap_frac
 
         # Calculate total grid size
-        grid_width_mm = (Nx - 1) * step_size_mm
-        grid_height_mm = (Ny - 1) * step_size_mm
+        grid_width_mm = (Nx - 1) * step_x_mm
+        grid_height_mm = (Ny - 1) * step_y_mm
 
         scan_coordinates = []
         for i in range(Ny):
             row = []
-            y = center_y - grid_height_mm / 2 + i * step_size_mm
+            y = center_y - grid_height_mm / 2 + i * step_y_mm
             for j in range(Nx):
-                x = center_x - grid_width_mm / 2 + j * step_size_mm
+                x = center_x - grid_width_mm / 2 + j * step_x_mm
                 if self.validate_coordinates(x, y):
                     row.append((x, y, center_z))
 
@@ -367,8 +378,13 @@ class ScanCoordinates:
             self._log.error("Invalid manual ROI data")
             return []
 
-        fov_size_mm = self.objectiveStore.get_pixel_size_factor() * self.camera.get_fov_size_mm()
-        step_size_mm = fov_size_mm * (1 - overlap_percent / 100)
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
+        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
+        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        overlap_frac = 1 - overlap_percent / 100
+        step_x_mm = fov_w_mm * overlap_frac
+        step_y_mm = fov_h_mm * overlap_frac
 
         # Ensure shape_coords is a numpy array
         shape_coords = np.array(shape_coords)
@@ -382,9 +398,9 @@ class ScanCoordinates:
         x_min, y_min = np.min(shape_coords, axis=0)
         x_max, y_max = np.max(shape_coords, axis=0)
 
-        # Create a grid of points within the bounding box
-        x_range = np.arange(x_min, x_max + step_size_mm, step_size_mm)
-        y_range = np.arange(y_min, y_max + step_size_mm, step_size_mm)
+        # Create a grid of points within the bounding box using per-axis steps
+        x_range = np.arange(x_min, x_max + step_x_mm, step_x_mm)
+        y_range = np.arange(y_min, y_max + step_y_mm, step_y_mm)
         xx, yy = np.meshgrid(x_range, y_range)
         grid_points = np.column_stack((xx.ravel(), yy.ravel()))
 
@@ -398,13 +414,14 @@ class ScanCoordinates:
         # # Filter points inside the polygon
         # valid_points = grid_points[mask]
 
-        def corners(x_mm, y_mm, fov):
-            center_to_corner = fov / 2
+        def corners(x_mm, y_mm, fov_w, fov_h):
+            half_w = fov_w / 2
+            half_h = fov_h / 2
             return (
-                (x_mm + center_to_corner, y_mm + center_to_corner),
-                (x_mm - center_to_corner, y_mm + center_to_corner),
-                (x_mm - center_to_corner, y_mm - center_to_corner),
-                (x_mm + center_to_corner, y_mm - center_to_corner),
+                (x_mm + half_w, y_mm + half_h),
+                (x_mm - half_w, y_mm + half_h),
+                (x_mm - half_w, y_mm - half_h),
+                (x_mm + half_w, y_mm - half_h),
             )
 
         valid_points = []
@@ -417,11 +434,12 @@ class ScanCoordinates:
             if not self._is_in_polygon(x_center, y_center, shape_coords) and not any(
                 [
                     self._is_in_polygon(x_corner, y_corner, shape_coords)
-                    for (x_corner, y_corner) in corners(x_center, y_center, fov_size_mm)
+                    for (x_corner, y_corner) in corners(x_center, y_center, fov_w_mm, fov_h_mm)
                 ]
             ):
                 self._log.debug(
-                    f"Manual coords: ignoring {x_center=},{y_center=} because no corners or center are in poly. (corners={corners(x_center, y_center, fov_size_mm)}"
+                    f"Manual coords: ignoring {x_center=},{y_center=} because no corners or center are in poly. "
+                    f"(corners={corners(x_center, y_center, fov_w_mm, fov_h_mm)})"
                 )
                 continue
 
@@ -760,18 +778,27 @@ class ScanCoordinatesSiLA2(ScanCoordinates):
                 raise ValueError(f"Invalid well format: {desc}. Expected format is 'A1' or 'A1:B2' for ranges.")
 
     def create_region_coordinates(self, center_x, center_y, scan_size_mm, overlap_percent=10, shape="Square"):
-        fov_size_mm = self.camera.get_fov_size_mm()
-        # We are not taking software cropping into account here. Need to fix it when we merge this into ScanCoordinates.
-        step_size_mm = fov_size_mm * (1 - overlap_percent / 100)
+        # Sample-frame FOV is the sensor-frame FOV (post-crop, via camera.get_crop_size) scaled by
+        # the objective's lens factor. scan_size_mm is in sample frame, so fov and step must match.
+        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
+        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
+        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
+        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        overlap_frac = 1 - overlap_percent / 100
+        step_x_mm = fov_w_mm * overlap_frac
+        step_y_mm = fov_h_mm * overlap_frac
+        # Use the smaller step for the square grid loop so no axis under-samples when FOV is non-square.
+        step_size_mm = min(step_x_mm, step_y_mm)
+        fov_size_mm = min(fov_w_mm, fov_h_mm)
 
         steps = math.floor(scan_size_mm / step_size_mm)
         if shape == "Circle":
-            tile_diagonal = math.sqrt(2) * fov_size_mm
+            tile_diagonal = math.sqrt(fov_w_mm**2 + fov_h_mm**2)
             if steps % 2 == 1:  # for odd steps
                 actual_scan_size_mm = (steps - 1) * step_size_mm + tile_diagonal
             else:  # for even steps
                 actual_scan_size_mm = math.sqrt(
-                    ((steps - 1) * step_size_mm + fov_size_mm) ** 2 + (step_size_mm + fov_size_mm) ** 2
+                    ((steps - 1) * step_size_mm + fov_w_mm) ** 2 + (step_size_mm + fov_h_mm) ** 2
                 )
 
             if actual_scan_size_mm > scan_size_mm:
@@ -785,24 +812,25 @@ class ScanCoordinatesSiLA2(ScanCoordinates):
         scan_coordinates = []
         half_steps = (steps - 1) / 2
         radius_squared = (scan_size_mm / 2) ** 2
-        fov_size_mm_half = fov_size_mm / 2
 
-        def is_in_circle(x, y, center_x, center_y, radius_squared, fov_size_mm_half):
+        def is_in_circle(x, y, center_x, center_y, radius_squared, fov_w, fov_h):
+            half_w = fov_w / 2
+            half_h = fov_h / 2
             corners = [
-                (x - fov_size_mm_half, y - fov_size_mm_half),
-                (x + fov_size_mm_half, y - fov_size_mm_half),
-                (x - fov_size_mm_half, y + fov_size_mm_half),
-                (x + fov_size_mm_half, y + fov_size_mm_half),
+                (x - half_w, y - half_h),
+                (x + half_w, y - half_h),
+                (x - half_w, y + half_h),
+                (x + half_w, y + half_h),
             ]
             return all((cx - center_x) ** 2 + (cy - center_y) ** 2 <= radius_squared for cx, cy in corners)
 
         for i in range(steps):
             row = []
-            y = center_y + (i - half_steps) * step_size_mm
+            y = center_y + (i - half_steps) * step_y_mm
             for j in range(steps):
-                x = center_x + (j - half_steps) * step_size_mm
+                x = center_x + (j - half_steps) * step_x_mm
                 if shape == "Square" or (
-                    shape == "Circle" and is_in_circle(x, y, center_x, center_y, radius_squared, fov_size_mm_half)
+                    shape == "Circle" and is_in_circle(x, y, center_x, center_y, radius_squared, fov_w_mm, fov_h_mm)
                 ):
                     row.append((x, y))
 

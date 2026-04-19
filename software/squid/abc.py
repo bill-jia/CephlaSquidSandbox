@@ -710,20 +710,27 @@ class AbstractCamera(metaclass=abc.ABCMeta):
 
     def get_crop_size(self) -> Tuple[int, int]:
         """
-        Returns the final crop size of the image (after software crop).
+        Returns the final (width, height) pixel size of the image after ROI and software crop.
+        Falls back to the camera's current-binning resolution if no crop is configured, so
+        downstream FOV math always gets real dimensions instead of None.
         """
         binning_x, binning_y = self.get_binning()
-        crop_width = int(self._config.crop_width / binning_x) if self._config.crop_width else None
-        crop_height = int(self._config.crop_height / binning_y) if self._config.crop_height else None
-        crop_width = int(crop_width * self._software_crop_width_ratio) if crop_width is not None else None
-        crop_height = int(crop_height * self._software_crop_height_ratio) if crop_height is not None else None
+        res_w, res_h = self.get_resolution()
+        crop_width = int(self._config.crop_width / binning_x) if self._config.crop_width else res_w
+        crop_height = int(self._config.crop_height / binning_y) if self._config.crop_height else res_h
+        crop_width = int(crop_width * self._software_crop_width_ratio)
+        crop_height = int(crop_height * self._software_crop_height_ratio)
         return crop_width, crop_height
 
-    def get_fov_size_mm(self) -> float:
+    def get_fov_size_mm(self) -> Tuple[float, float]:
         """
-        Returns the size of the camera field of view in millimeters (after ROI and software crop).
+        Returns the (width_mm, height_mm) of the camera field of view after ROI and software
+        crop. Per-axis so tile stepping stays correct when the crop is non-square.
         """
-        return self.get_crop_size()[0] * self.get_pixel_size_binned_um() / 1000
+        crop_width, crop_height = self.get_crop_size()
+        pixel_size_mm = self.get_pixel_size_binned_um() / 1000
+        self._log.info(f"Calculating FOV size with crop_width={crop_width}, crop_height={crop_height}, pixel_size_mm={pixel_size_mm}")
+        return crop_width * pixel_size_mm, crop_height * pixel_size_mm
 
     def set_software_crop_ratio(self, width_ratio: float, height_ratio: float):
         """

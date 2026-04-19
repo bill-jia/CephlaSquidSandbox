@@ -44,6 +44,7 @@ devices:
         display_name: "Main camera trigger"
     config:
       model: "ARIES-6506"
+      pixel_size_um: 6.5
       pixel_format: MONO16
       binning: 1
       roi: { offset_x: 0, offset_y: 0, width: 2400, height: 2400 }
