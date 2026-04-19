@@ -2671,6 +2671,47 @@ class StatsDisplayWidget(QFrame):
             row += 1
 
 
+class _WellShapeDelegate(QStyledItemDelegate):
+    """Paints a circle or rectangle inside each cell matching the well shape.
+
+    Qt's default cell rendering draws square cells only, which misrepresents
+    round wells. This delegate overlays the correct silhouette on top of the
+    standard background (so selection highlighting still works).
+    """
+
+    def __init__(self, parent, widget):
+        super().__init__(parent)
+        self._widget = widget
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if not (index.flags() & Qt.ItemIsSelectable):
+            return  # Skipped wells stay blank.
+        shape = getattr(self._widget, "well_shape", "circle")
+        rect = option.rect.adjusted(2, 2, -2, -2)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor("#444444"))
+        pen.setWidth(1)
+        painter.setPen(pen)
+        if option.state & QStyle.State_Selected:
+            painter.setBrush(option.palette.highlight())
+        else:
+            painter.setBrush(QColor("white"))
+        if shape == "rectangle":
+            corner_px = max(0, int(min(rect.width(), rect.height()) * 0.08))
+            painter.drawRoundedRect(rect, corner_px, corner_px)
+        else:
+            # Inscribe the well in a square inside the cell.
+            side = min(rect.width(), rect.height())
+            cx = rect.center().x()
+            cy = rect.center().y()
+            painter.drawEllipse(cx - side // 2, cy - side // 2, side, side)
+        painter.restore()
+
+
 class WellSelectionWidget(QTableWidget):
     signal_wellSelected = Signal(bool)
     signal_wellSelectedPos = Signal(float, float)
@@ -2681,6 +2722,8 @@ class WellSelectionWidget(QTableWidget):
         self.cellDoubleClicked.connect(self.onDoubleClick)
         self.itemSelectionChanged.connect(self.onSelectionChanged)
         self.fixed_height = 400
+        self._shape_delegate = _WellShapeDelegate(self, self)
+        self.setItemDelegate(self._shape_delegate)
         self.setFormat(format_)
 
     def setFormat(self, format_):
@@ -2695,6 +2738,7 @@ class WellSelectionWidget(QTableWidget):
         self.a1_x_pixel = settings["a1_x_pixel"]
         self.a1_y_pixel = settings["a1_y_pixel"]
         self.well_size_mm = settings["well_size_mm"]
+        self.well_shape = settings.get("well_shape", "circle")
 
         self.setRowCount(self.rows)
         self.setColumnCount(self.columns)

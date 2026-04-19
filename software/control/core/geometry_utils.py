@@ -7,6 +7,36 @@ These functions are pure geometry calculations with no UI dependencies.
 import math
 
 
+def is_in_circle(x, y, center_x, center_y, radius_squared, fov_w, fov_h):
+    """Return True iff every corner of the FOV at (x, y) lies inside the circle."""
+    half_w = fov_w / 2
+    half_h = fov_h / 2
+    corners = [
+        (x - half_w, y - half_h),
+        (x + half_w, y - half_h),
+        (x - half_w, y + half_h),
+        (x + half_w, y + half_h),
+    ]
+    return all((cx - center_x) ** 2 + (cy - center_y) ** 2 <= radius_squared for cx, cy in corners)
+
+
+def is_in_rectangle(x, y, center_x, center_y, rect_w, rect_h, fov_w, fov_h):
+    """Return True iff every corner of the FOV at (x, y) lies inside the rectangle.
+
+    Rectangle is axis-aligned, centered at (center_x, center_y), with the given
+    outer dimensions.
+    """
+    half_rw = rect_w / 2
+    half_rh = rect_h / 2
+    half_fw = fov_w / 2
+    half_fh = fov_h / 2
+    # If the FOV bounding box fits inside the rectangle bounding box, every corner is in.
+    return (
+        abs(x - center_x) + half_fw <= half_rw
+        and abs(y - center_y) + half_fh <= half_rh
+    )
+
+
 def get_effective_well_size(well_size_mm, fov_size_mm, shape, is_round_well=True):
     """Calculate the default scan size for a well based on shape.
 

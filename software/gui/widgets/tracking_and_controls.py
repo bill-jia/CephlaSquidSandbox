@@ -697,7 +697,7 @@ class WellplateFormatWidget(QWidget):
         self.streamHandler = streamHandler
         self.liveController = liveController
         self.wellplate_format = WELLPLATE_FORMAT
-        self.csv_path = SAMPLE_FORMATS_CSV_PATH  # 'sample_formats.csv'
+        self.yaml_path = SAMPLE_FORMATS_YAML_PATH  # 'sample_formats.yaml'
         self.initUI()
 
     def initUI(self):
@@ -801,16 +801,15 @@ class WellplateFormatWidget(QWidget):
 
         del WELLPLATE_FORMAT_SETTINGS[format_id]
         image_basename = f"{str(format_id).replace(' ', '_')}.png"
-        for images_dir in ("images", os.path.join("software", "images")):
-            path = os.path.join(images_dir, image_basename)
-            if os.path.isfile(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        cache_image_path = os.path.join("cache", "plate_images", image_basename)
+        if os.path.isfile(cache_image_path):
+            try:
+                os.remove(cache_image_path)
+            except OSError:
+                pass
 
         was_current = self.wellplate_format == format_id
-        self.save_formats_to_csv()
+        self.save_formats_to_yaml()
         self.populate_combo_box()
 
         if was_current:
@@ -832,41 +831,42 @@ class WellplateFormatWidget(QWidget):
 
         return True
 
-    def save_formats_to_csv(self):
-        cache_path = os.path.join("cache", self.csv_path)
+    def save_formats_to_yaml(self):
+        cache_path = os.path.join("cache", self.yaml_path)
         os.makedirs("cache", exist_ok=True)
 
-        fieldnames = [
-            "format",
-            "a1_x_mm",
-            "a1_y_mm",
-            "a1_x_pixel",
-            "a1_y_pixel",
-            "well_size_mm",
-            "well_spacing_mm",
-            "number_of_skip",
-            "rows",
-            "cols",
-        ]
-        with open(cache_path, "w", newline="") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for format_, settings in WELLPLATE_FORMAT_SETTINGS.items():
-                writer.writerow({**{"format": format_}, **settings})
+        formats_list = []
+        for format_id, s in WELLPLATE_FORMAT_SETTINGS.items():
+            shape = s.get("well_shape", "circle")
+            well_block = {"shape": shape}
+            if shape == "circle":
+                well_block["diameter_mm"] = float(s.get("well_diameter_mm", s.get("well_size_mm", 0.0)))
+            else:
+                well_block["width_mm"] = float(s.get("well_width_mm", s.get("well_size_mm", 0.0)))
+                well_block["height_mm"] = float(s.get("well_height_mm", s.get("well_size_mm", 0.0)))
+                if s.get("well_corner_radius_mm"):
+                    well_block["corner_radius_mm"] = float(s["well_corner_radius_mm"])
 
-    @staticmethod
-    def parse_csv_row(row):
-        return {
-            "a1_x_mm": float(row["a1_x_mm"]),
-            "a1_y_mm": float(row["a1_y_mm"]),
-            "a1_x_pixel": int(row["a1_x_pixel"]),
-            "a1_y_pixel": int(row["a1_y_pixel"]),
-            "well_size_mm": float(row["well_size_mm"]),
-            "well_spacing_mm": float(row["well_spacing_mm"]),
-            "number_of_skip": int(row["number_of_skip"]),
-            "rows": int(row["rows"]),
-            "cols": int(row["cols"]),
-        }
+            formats_list.append({
+                "id": format_id,
+                "display_name": s.get("display_name", format_id),
+                "plate_dimensions_mm": [float(s["plate_dimensions_mm"][0]),
+                                        float(s["plate_dimensions_mm"][1])],
+                "plate_corner_radius_mm": float(s.get("plate_corner_radius_mm", 0.0)),
+                "a1_chamfer": bool(s.get("a1_chamfer", False)),
+                "a1_offset_mm": [float(s["a1_offset_mm"][0]), float(s["a1_offset_mm"][1])],
+                "grid": {
+                    "rows": int(s["rows"]),
+                    "cols": int(s["cols"]),
+                    "row_spacing_mm": float(s.get("row_spacing_mm", s.get("well_spacing_mm", 0.0))),
+                    "col_spacing_mm": float(s.get("col_spacing_mm", s.get("well_spacing_mm", 0.0))),
+                },
+                "well": well_block,
+                "number_of_skip": int(s.get("number_of_skip", 0)),
+            })
+
+        with open(cache_path, "w") as f:
+            yaml.safe_dump({"formats": formats_list}, f, sort_keys=False)
 
 
 class WellplateCalibration(QDialog):
@@ -967,6 +967,11 @@ class WellplateCalibration(QDialog):
         self.wellSpacingInput.setSuffix(" mm")
         self.form_layout.addRow("Well Spacing:", self.wellSpacingInput)
 
+        self.wellShapeInput = QComboBox(self)
+        self.wellShapeInput.addItems(["Circle", "Rectangle"])
+        self.form_layout.addRow("Well Shape:", self.wellShapeInput)
+        self.wellShapeInput.currentTextChanged.connect(self._on_new_format_shape_changed)
+
         self.new_format_well_size_input = QDoubleSpinBox(self)
         self.new_format_well_size_input.setKeyboardTracking(False)
         self.new_format_well_size_input.setRange(0.1, 50)
@@ -974,7 +979,28 @@ class WellplateCalibration(QDialog):
         self.new_format_well_size_input.setDecimals(3)
         self.new_format_well_size_input.setValue(6.21)
         self.new_format_well_size_input.setSuffix(" mm")
-        self.form_layout.addRow("Well diameter (3-point):", self.new_format_well_size_input)
+        self._well_size_label = "Well diameter (3-point):"
+        self.form_layout.addRow(self._well_size_label, self.new_format_well_size_input)
+
+        self.new_format_well_height_input = QDoubleSpinBox(self)
+        self.new_format_well_height_input.setKeyboardTracking(False)
+        self.new_format_well_height_input.setRange(0.1, 50)
+        self.new_format_well_height_input.setSingleStep(0.1)
+        self.new_format_well_height_input.setDecimals(3)
+        self.new_format_well_height_input.setValue(6.21)
+        self.new_format_well_height_input.setSuffix(" mm")
+        self.form_layout.addRow("Well height:", self.new_format_well_height_input)
+        self.new_format_well_height_input.setEnabled(False)  # enabled when shape == Rectangle
+
+        self.new_format_corner_radius_input = QDoubleSpinBox(self)
+        self.new_format_corner_radius_input.setKeyboardTracking(False)
+        self.new_format_corner_radius_input.setRange(0.0, 25.0)
+        self.new_format_corner_radius_input.setSingleStep(0.1)
+        self.new_format_corner_radius_input.setDecimals(3)
+        self.new_format_corner_radius_input.setValue(0.0)
+        self.new_format_corner_radius_input.setSuffix(" mm")
+        self.form_layout.addRow("Corner radius (rect):", self.new_format_corner_radius_input)
+        self.new_format_corner_radius_input.setEnabled(False)
 
         left_layout.addWidget(self.new_format_widget)
 
@@ -1449,7 +1475,7 @@ class WellplateCalibration(QDialog):
             )
 
             # Save and refresh
-            self.wellplateFormatWidget.save_formats_to_csv()
+            self.wellplateFormatWidget.save_formats_to_yaml()
             self.wellplateFormatWidget.populate_combo_box()
 
             # Re-select the format (triggers wellplateChanged which calls setWellplateSettings)
@@ -1517,22 +1543,51 @@ class WellplateCalibration(QDialog):
         plate_width_mm = self.plateWidthInput.value()
         plate_height_mm = self.plateHeightInput.value()
 
-        scale = 1 / 0.084665
+        well_spacing_mm = self.wellSpacingInput.value()
+        rows = self.rowsInput.value()
+        cols = self.colsInput.value()
+        shape_text = self.wellShapeInput.currentText()
+        shape = "circle" if shape_text == "Circle" else "rectangle"
+        if shape == "circle":
+            well_diameter_mm = well_size_mm
+            well_width_mm = well_diameter_mm
+            well_height_mm = well_diameter_mm
+            well_corner_radius_mm = 0.0
+        else:
+            well_diameter_mm = well_size_mm  # legacy alias
+            well_width_mm = well_size_mm
+            well_height_mm = self.new_format_well_height_input.value()
+            well_corner_radius_mm = self.new_format_corner_radius_input.value()
+
+        scale = 1 / PLATE_IMAGE_MM_PER_PX
         new_format = {
-            "a1_x_mm": a1_x_mm,
-            "a1_y_mm": a1_y_mm,
-            "a1_x_pixel": round(a1_x_mm * scale),
-            "a1_y_pixel": round(a1_y_mm * scale),
-            "well_size_mm": well_size_mm,
-            "well_spacing_mm": self.wellSpacingInput.value(),
+            "display_name": name,
+            "plate_dimensions_mm": [float(plate_width_mm), float(plate_height_mm)],
+            "plate_corner_radius_mm": 3.18,
+            "a1_chamfer": False,
+            "a1_offset_mm": [float(a1_x_mm), float(a1_y_mm)],
+            "rows": int(rows),
+            "cols": int(cols),
+            "row_spacing_mm": float(well_spacing_mm),
+            "col_spacing_mm": float(well_spacing_mm),
             "number_of_skip": 0,
-            "rows": self.rowsInput.value(),
-            "cols": self.colsInput.value(),
+            "well_shape": shape,
+            "well_diameter_mm": float(well_diameter_mm),
+            "well_width_mm": float(well_width_mm),
+            "well_height_mm": float(well_height_mm),
+            "well_corner_radius_mm": float(well_corner_radius_mm),
+            "a1_x_mm": float(a1_x_mm),
+            "a1_y_mm": float(a1_y_mm),
+            "a1_x_pixel": round(float(a1_x_mm) * scale),
+            "a1_y_pixel": round(float(a1_y_mm) * scale),
+            "well_size_mm": float(well_width_mm),
+            "well_spacing_mm": float(well_spacing_mm),
         }
 
         self.wellplateFormatWidget.add_custom_format(name, new_format)
-        self.wellplateFormatWidget.save_formats_to_csv()
-        self.create_wellplate_image(name, new_format, plate_width_mm, plate_height_mm)
+        self.wellplateFormatWidget.save_formats_to_yaml()
+        from control.core import wellplate_image_generator
+        wellplate_image_generator.ensure_plate_image(name)
 
         self._finish_calibration(name, f"New format '{name}' has been successfully created and calibrated.")
 
@@ -1563,7 +1618,17 @@ class WellplateCalibration(QDialog):
             }
         )
 
-        self.wellplateFormatWidget.save_formats_to_csv()
+        # Sync a1_offset_mm (plate-intrinsic field consumed by the YAML serializer
+        # and the image generator) with the newly calibrated A1 position.
+        if "a1_offset_mm" in WELLPLATE_FORMAT_SETTINGS[selected_format]:
+            WELLPLATE_FORMAT_SETTINGS[selected_format]["a1_offset_mm"] = [a1_x_mm, a1_y_mm]
+            scale = 1 / PLATE_IMAGE_MM_PER_PX
+            WELLPLATE_FORMAT_SETTINGS[selected_format]["a1_x_pixel"] = round(a1_x_mm * scale)
+            WELLPLATE_FORMAT_SETTINGS[selected_format]["a1_y_pixel"] = round(a1_y_mm * scale)
+
+        self.wellplateFormatWidget.save_formats_to_yaml()
+        from control.core import wellplate_image_generator
+        wellplate_image_generator.ensure_plate_image(selected_format)
 
         self._finish_calibration(selected_format, f"Format '{display_name}' has been successfully recalibrated.")
 
@@ -1576,93 +1641,6 @@ class WellplateCalibration(QDialog):
 
         QMessageBox.information(self, "Calibration Successful", success_message)
         self.accept()
-
-    def create_wellplate_image(self, name, format_data, plate_width_mm, plate_height_mm):
-
-        scale = 1 / 0.084665
-
-        def mm_to_px(mm):
-            return round(mm * scale)
-
-        width = mm_to_px(plate_width_mm)
-        height = mm_to_px(plate_height_mm)
-        image = Image.new("RGB", (width, height), color="white")
-        draw = ImageDraw.Draw(image)
-
-        rows, cols = format_data["rows"], format_data["cols"]
-        well_spacing_mm = format_data["well_spacing_mm"]
-        well_size_mm = format_data["well_size_mm"]
-        a1_x_mm, a1_y_mm = format_data["a1_x_mm"], format_data["a1_y_mm"]
-
-        def draw_left_slanted_rectangle(draw, xy, slant, width=4, outline="black", fill=None):
-            x1, y1, x2, y2 = xy
-
-            # Define the polygon points
-            points = [
-                (x1 + slant, y1),  # Top-left after slant
-                (x2, y1),  # Top-right
-                (x2, y2),  # Bottom-right
-                (x1 + slant, y2),  # Bottom-left after slant
-                (x1, y2 - slant),  # Bottom of left slant
-                (x1, y1 + slant),  # Top of left slant
-            ]
-
-            # Draw the filled polygon with outline
-            draw.polygon(points, fill=fill, outline=outline, width=width)
-
-        # Draw the outer rectangle with rounded corners
-        corner_radius = 20
-        draw.rounded_rectangle(
-            [0, 0, width - 1, height - 1], radius=corner_radius, outline="black", width=4, fill="grey"
-        )
-
-        # Draw the inner rectangle with left slanted corners
-        margin = 20
-        slant = 40
-        draw_left_slanted_rectangle(
-            draw, [margin, margin, width - margin, height - margin], slant, width=4, outline="black", fill="lightgrey"
-        )
-
-        # Function to draw a circle
-        def draw_circle(x, y, diameter):
-            radius = diameter / 2
-            draw.ellipse([x - radius, y - radius, x + radius, y + radius], outline="black", width=4, fill="white")
-
-        # Draw the wells
-        for row in range(rows):
-            for col in range(cols):
-                x = mm_to_px(a1_x_mm + col * well_spacing_mm)
-                y = mm_to_px(a1_y_mm + row * well_spacing_mm)
-                draw_circle(x, y, mm_to_px(well_size_mm))
-
-        # Load a default font
-        font_size = 30
-        font = ImageFont.load_default().font_variant(size=font_size)
-
-        # Add column labels
-        for col in range(cols):
-            label = str(col + 1)
-            x = mm_to_px(a1_x_mm + col * well_spacing_mm)
-            y = mm_to_px((a1_y_mm - well_size_mm / 2) / 2)
-            bbox = font.getbbox(label)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            draw.text((x - text_width / 2, y), label, fill="black", font=font)
-
-        # Add row labels
-        for row in range(rows):
-            label = chr(65 + row) if row < 26 else chr(65 + row // 26 - 1) + chr(65 + row % 26)
-            x = mm_to_px((a1_x_mm - well_size_mm / 2) / 2)
-            y = mm_to_px(a1_y_mm + row * well_spacing_mm)
-            bbox = font.getbbox(label)
-            text_height = bbox[3] - bbox[1]
-            text_width = bbox[2] - bbox[0]
-            draw.text((x + 20 - text_width / 2, y - text_height + 1), label, fill="black", font=font)
-
-        image_path = os.path.join("images", f'{name.replace(" ", "_")}.png')
-        image.save(image_path)
-        print(f"Wellplate image saved as {image_path}")
-        return image_path
 
     @staticmethod
     def _fit_circle_unconstrained(points):
@@ -1985,6 +1963,7 @@ class Well1536SelectionWidget(QWidget):
         self.a1_x_pixel = 144  # coordinate on the png - to update
         self.a1_y_pixel = 108  # coordinate on the png - to update
 
+        self.well_shape = "circle"
         if self.wellplateFormatWidget is not None:
             s = self.wellplateFormatWidget.getWellplateSettings(self.format)
             self.rows = s["rows"]
@@ -1996,6 +1975,7 @@ class Well1536SelectionWidget(QWidget):
             self.a1_x_pixel = s["a1_x_pixel"]
             self.a1_y_pixel = s["a1_y_pixel"]
             self.well_size_mm = s["well_size_mm"]
+            self.well_shape = s.get("well_shape", "circle")
 
         self.initUI()
 
@@ -2362,17 +2342,25 @@ class Well1536SelectionWidget(QWidget):
     def redraw_wells(self):
         self.image.fill(QColor("white"))  # Clear the pixmap first
         painter = QPainter(self.image)
+        painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(QColor("white"))
+        use_ellipse = getattr(self, "well_shape", "circle") == "circle"
         # Draw selected cells (blue)
         for (row, col), color in self.selected_cells.items():
             painter.setBrush(QColor(color))
-            painter.drawRect(col * self.a, row * self.a, self.a, self.a)
-        # Draw current cell in green
+            if use_ellipse:
+                painter.drawEllipse(col * self.a, row * self.a, self.a, self.a)
+            else:
+                painter.drawRect(col * self.a, row * self.a, self.a, self.a)
+        # Draw current cell outline (red).
         if self.current_cell:
-            painter.setBrush(Qt.NoBrush)  # No fill
-            painter.setPen(QPen(QColor("red"), 2))  # Red outline, 2 pixels wide
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("red"), 2))
             row, col = self.current_cell
-            painter.drawRect(col * self.a + 2, row * self.a + 2, self.a - 3, self.a - 3)
+            if use_ellipse:
+                painter.drawEllipse(col * self.a + 2, row * self.a + 2, self.a - 3, self.a - 3)
+            else:
+                painter.drawRect(col * self.a + 2, row * self.a + 2, self.a - 3, self.a - 3)
         painter.end()
         self.label.setPixmap(self.image)
 

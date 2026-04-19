@@ -1381,21 +1381,18 @@ class NavigationViewer(QFrame):
         self.x_mm = None
         self.y_mm = None
         self.alignment_widget = None  # Optional AlignmentWidget
+        # Non-wellplate sample holders (multi-slide carriers) still ship as
+        # static PNGs; wellplate background maps are auto-generated from
+        # sample_formats.yaml via wellplate_image_generator.
         self.image_paths = {
             "glass slide": "images/slide carrier_828x662.png",
             "4 glass slide": "images/4 slide carrier_1509x1010.png",
-            "6 well plate": "images/6 well plate_1509x1010.png",
-            "12 well plate": "images/12 well plate_1509x1010.png",
-            "24 well plate": "images/24 well plate_1509x1010.png",
-            "96 well plate": "images/96 well plate_1509x1010.png",
-            "384 well plate": "images/384 well plate_1509x1010.png",
-            "1536 well plate": "images/1536 well plate_1509x1010.png",
         }
 
         print("navigation viewer:", sample)
         self.init_ui(invertX)
 
-        self.load_background_image(self.image_paths.get(sample, "images/4 slide carrier_1509x1010.png"))
+        self.load_background_image(self._resolve_background_image(sample))
         self.create_layers()
         self.update_display_properties(sample)
         # self.update_display()
@@ -1454,6 +1451,24 @@ class NavigationViewer(QFrame):
         super().resizeEvent(event)
         if hasattr(self, "btn_clear_coordinates"):
             self._position_button()
+
+    def _resolve_background_image(self, sample):
+        """Resolve the background PNG path for a sample holder name.
+
+        Non-wellplate carriers (glass slide, 4 glass slide) use static PNGs
+        under software/images/. All wellplates (including user-added custom
+        formats) are auto-generated into software/cache/plate_images/ by the
+        wellplate_image_generator module and regenerated when the source YAML
+        changes.
+        """
+        if sample in self.image_paths:
+            return self.image_paths[sample]
+        try:
+            from control.core import wellplate_image_generator
+            return wellplate_image_generator.ensure_plate_image(sample)
+        except (KeyError, ImportError, OSError) as e:
+            self._log.warning(f"Could not resolve background image for '{sample}': {e}. Falling back to default.")
+            return self.image_paths.get("4 glass slide", self.image_paths.get("glass slide"))
 
     def load_background_image(self, image_path):
         self.view.clear()
@@ -1558,19 +1573,7 @@ class NavigationViewer(QFrame):
         self.rows = rows
         self.cols = cols
 
-        # Try to find the image for the wellplate
-        image_path = self.image_paths.get(sample)
-        if image_path is None or not os.path.exists(image_path):
-            # Look for a custom wellplate image
-            custom_image_path = os.path.join("images", self.sample + ".png")
-            self._log.info(custom_image_path)
-            if os.path.exists(custom_image_path):
-                image_path = custom_image_path
-            else:
-                self._log.warning(f"Image not found for {sample}. Using default image.")
-                image_path = self.image_paths.get("glass slide")  # Use a default image
-
-        self.load_background_image(image_path)
+        self.load_background_image(self._resolve_background_image(sample))
         self.create_layers()
         self.update_display_properties(sample)
         self.draw_current_fov(self.x_mm, self.y_mm)

@@ -551,12 +551,34 @@ config: "Configuration (YAML)" {
     tooltip: "IO endpoint definitions:\ntrigger, intensity, shutter channels\nmapped to controllers + pins."
   }
 
+  sample_formats_yaml: "sample_formats.yaml" {
+    class: storage
+    tooltip: |md
+      Plate-intrinsic geometry for each wellplate / sample holder:
+      plate_dimensions_mm, a1_offset_mm (from plate corner),
+      row/col spacing, well shape (circle or rectangle) + dims,
+      chamfer / plate corner radius. Machine-independent —
+      stage calibration lives in machine_config.yaml.
+    |
+  }
+
+  plate_image_gen: "wellplate_image_generator" {
+    class: controller
+    tooltip: |md
+      Auto-generates PNG background maps for the plate viewer
+      from sample_formats.yaml. Renders circular or rectangular
+      wells, arbitrary grids, plate corner radius, A1 chamfer.
+      Outputs cached under cache/plate_images/ with mtime check.
+    |
+  }
+
   config_repo -> machine_config: reads
   config_repo -> general_yaml: reads/writes
   config_repo -> objective_yaml: reads/writes
   config_repo -> preset_yaml: reads/writes
   config_repo -> illum_yaml: reads
   config_repo -> io_yaml: reads
+  plate_image_gen -> sample_formats_yaml: reads
 }
 
 # ============================================================================
@@ -659,6 +681,9 @@ gui.acquisition_widgets.flex_mp -> controllers.mp_ctrl: "configure &\nstart acqu
   class: signal_style
 }
 gui.acquisition_widgets.wellplate_mp -> controllers.mp_ctrl: "well-based\nacquisition" {
+  class: signal_style
+}
+gui.viewers.plate_view -> config.plate_image_gen: "ensure_plate_image()" {
   class: signal_style
 }
 

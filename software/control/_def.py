@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Union
 import json
 import csv
+import yaml
 import squid.logging
 from enum import Enum, auto
 
@@ -1003,24 +1004,72 @@ def read_objectives_csv(file_path):
     return objectives
 
 
-def read_sample_formats_csv(file_path):
+# Fixed rendering scale for auto-generated plate maps.
+# Kept consistent with NavigationViewer.mm_per_pixel so generated PNGs align
+# with stage-to-pixel transforms without extra calibration.
+PLATE_IMAGE_MM_PER_PX = 0.084665
+
+
+def _flatten_format_entry(entry):
+    """Convert one YAML format entry into the flat dict downstream code expects.
+
+    The YAML schema separates plate outer geometry, grid, and per-well shape,
+    but most call sites still read a flat dict. We flatten here and also derive
+    legacy aliases (`a1_x_mm`, `well_size_mm`, `well_spacing_mm`, and the
+    `a1_*_pixel` coordinates) from the declarative fields.
+    """
+    grid = entry["grid"]
+    well = entry["well"]
+    a1_offset = entry["a1_offset_mm"]
+
+    shape = well["shape"]
+    if shape == "circle":
+        well_width_mm = float(well["diameter_mm"])
+        well_height_mm = float(well["diameter_mm"])
+        well_corner_radius_mm = 0.0
+    elif shape == "rectangle":
+        well_width_mm = float(well["width_mm"])
+        well_height_mm = float(well["height_mm"])
+        well_corner_radius_mm = float(well.get("corner_radius_mm", 0.0))
+    else:
+        raise ValueError(f"Unknown well shape '{shape}' for format '{entry.get('id')}'")
+
+    row_spacing_mm = float(grid["row_spacing_mm"])
+    col_spacing_mm = float(grid["col_spacing_mm"])
+
+    return {
+        "display_name": entry.get("display_name", entry["id"]),
+        "plate_dimensions_mm": [float(entry["plate_dimensions_mm"][0]),
+                                float(entry["plate_dimensions_mm"][1])],
+        "plate_corner_radius_mm": float(entry.get("plate_corner_radius_mm", 0.0)),
+        "a1_chamfer": bool(entry.get("a1_chamfer", False)),
+        "a1_offset_mm": [float(a1_offset[0]), float(a1_offset[1])],
+        "rows": int(grid["rows"]),
+        "cols": int(grid["cols"]),
+        "row_spacing_mm": row_spacing_mm,
+        "col_spacing_mm": col_spacing_mm,
+        "number_of_skip": int(entry.get("number_of_skip", 0)),
+        "well_shape": shape,
+        "well_diameter_mm": float(well["diameter_mm"]) if shape == "circle" else well_width_mm,
+        "well_width_mm": well_width_mm,
+        "well_height_mm": well_height_mm,
+        "well_corner_radius_mm": well_corner_radius_mm,
+        # Legacy aliases consumed by existing call sites.
+        "a1_x_mm": float(a1_offset[0]),
+        "a1_y_mm": float(a1_offset[1]),
+        "a1_x_pixel": round(float(a1_offset[0]) / PLATE_IMAGE_MM_PER_PX),
+        "a1_y_pixel": round(float(a1_offset[1]) / PLATE_IMAGE_MM_PER_PX),
+        "well_size_mm": well_width_mm,
+        "well_spacing_mm": row_spacing_mm,
+    }
+
+
+def read_sample_formats_yaml(file_path):
+    with open(file_path, "r") as f:
+        doc = yaml.safe_load(f)
     sample_formats = {}
-    with open(file_path, "r") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            format_ = str(row["format"])
-            format_key = f"{format_} well plate" if format_.isdigit() else format_
-            sample_formats[format_key] = {
-                "a1_x_mm": float(row["a1_x_mm"]),
-                "a1_y_mm": float(row["a1_y_mm"]),
-                "a1_x_pixel": int(row["a1_x_pixel"]),
-                "a1_y_pixel": int(row["a1_y_pixel"]),
-                "well_size_mm": float(row["well_size_mm"]),
-                "well_spacing_mm": float(row["well_spacing_mm"]),
-                "number_of_skip": int(row["number_of_skip"]),
-                "rows": int(row["rows"]),
-                "cols": int(row["cols"]),
-            }
+    for entry in doc.get("formats", []):
+        sample_formats[entry["id"]] = _flatten_format_entry(entry)
     return sample_formats
 
 
@@ -1029,25 +1078,23 @@ def load_formats():
     cache_path = "cache"
     default_path = "objective_and_sample_formats"
 
-    # Load objectives (from default location)
     objectives = read_objectives_csv(os.path.join(default_path, "objectives.csv"))
 
-    # Try cache first for sample formats, fall back to default if not found
-    cached_formats_path = os.path.join(cache_path, "sample_formats.csv")
-    default_formats_path = os.path.join(default_path, "sample_formats.csv")
+    cached_formats_path = os.path.join(cache_path, "sample_formats.yaml")
+    default_formats_path = os.path.join(default_path, "sample_formats.yaml")
 
     if os.path.exists(cached_formats_path):
         print("Using cached sample formats")
-        sample_formats = read_sample_formats_csv(cached_formats_path)
+        sample_formats = read_sample_formats_yaml(cached_formats_path)
     else:
         print("Using default sample formats")
-        sample_formats = read_sample_formats_csv(default_formats_path)
+        sample_formats = read_sample_formats_yaml(default_formats_path)
 
     return objectives, sample_formats
 
 
 OBJECTIVES_CSV_PATH = "objectives.csv"
-SAMPLE_FORMATS_CSV_PATH = "sample_formats.csv"
+SAMPLE_FORMATS_YAML_PATH = "sample_formats.yaml"
 
 OBJECTIVES, WELLPLATE_FORMAT_SETTINGS = load_formats()
 
@@ -1057,16 +1104,27 @@ def get_wellplate_settings(wellplate_format):
         settings = WELLPLATE_FORMAT_SETTINGS[wellplate_format]
     elif wellplate_format == "0":
         settings = {
-            "format": "0",
+            "display_name": "0",
+            "plate_dimensions_mm": [0.0, 0.0],
+            "plate_corner_radius_mm": 0.0,
+            "a1_chamfer": False,
+            "a1_offset_mm": [0.0, 0.0],
+            "rows": 1,
+            "cols": 1,
+            "row_spacing_mm": 0.0,
+            "col_spacing_mm": 0.0,
+            "number_of_skip": 0,
+            "well_shape": "circle",
+            "well_diameter_mm": 0.0,
+            "well_width_mm": 0.0,
+            "well_height_mm": 0.0,
+            "well_corner_radius_mm": 0.0,
             "a1_x_mm": 0,
             "a1_y_mm": 0,
             "a1_x_pixel": 0,
             "a1_y_pixel": 0,
             "well_size_mm": 0,
             "well_spacing_mm": 0,
-            "number_of_skip": 0,
-            "rows": 1,
-            "cols": 1,
         }
     else:
         raise ValueError(

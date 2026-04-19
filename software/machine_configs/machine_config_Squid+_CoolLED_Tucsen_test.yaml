@@ -112,6 +112,9 @@ devices:
         home_switch_polarity: 0
         scan_stabilization_time_ms: 20
         motor_config: stepper
+      canonical:
+        x: { sign: -1, origin_raw_mm: 121.332}
+        y: { sign: -1, origin_raw_mm: 80.4608}
       encoders:
         x: { enabled: false, has_encoder: false }
         y: { enabled: false, has_encoder: false }

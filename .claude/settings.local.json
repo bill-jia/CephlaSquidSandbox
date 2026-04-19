@@ -26,7 +26,13 @@
       "Bash(python -c \"import control._def; print\\(''OK''\\)\")",
       "Bash(/c/Users/jialab/miniforge3/envs/squid/python.exe -c \"import control._def; print\\(''OK''\\)\")",
       "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -m pytest tests/control/test_def.py -v 2>&1)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(/c/Users/jialab/.conda/envs/squid/python.exe -c \"import os; os.chdir\\('.'\\); import sys; sys.path.insert\\(0, '.'\\); from control._def import WELLPLATE_FORMAT_SETTINGS; import json; print\\(json.dumps\\({k: {kk: vv for kk, vv in v.items\\(\\) if kk in ['a1_x_mm','a1_y_mm','a1_x_pixel','a1_y_pixel','well_size_mm','well_spacing_mm','rows','cols','well_shape','a1_offset_mm','plate_dimensions_mm']} for k, v in WELLPLATE_FORMAT_SETTINGS.items\\(\\)}, indent=2\\)\\)\")",
+      "Bash(/c/Users/jialab/.conda/envs/squid/python.exe *)",
+      "Bash(rm /c/Code/CephlaSquidSandbox/software/objective_and_sample_formats/sample_formats.csv)",
+      "Bash(rm /c/Code/CephlaSquidSandbox/software/cache/plate_images/test_rect_plate.png)",
+      "Bash(command -v d2)",
+      "Bash(d2 architecture.d2 architecture.svg)"
     ]
   }
 }

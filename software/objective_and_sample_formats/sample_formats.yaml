@@ -1,0 +1,139 @@
+# Wellplate / sample-holder format definitions.
+#
+# Plate-intrinsic geometry only — these values describe the physical sample
+# holder and are the same for every machine. Per-machine stage calibration
+# (where the stage finds A1 in its own coordinate frame) lives in
+# machine_config.yaml under `wellplate_calibrations:`.
+#
+# Coordinate system for plate-intrinsic values:
+#   Origin = physical top-left corner of the sample holder (viewed from above,
+#   with column 1 on the left and row A at the top).
+#   +x = toward higher column numbers; +y = toward higher row letters.
+#   All distances in millimeters.
+#
+# `a1_offset_mm`: XY position of the A1 well CENTER measured from that origin.
+# `plate_dimensions_mm`: outer bounding box [width, height].
+# `well.shape`: "circle" or "rectangle".
+#   - circle: specify `diameter_mm`.
+#   - rectangle: specify `width_mm`, `height_mm`, optional `corner_radius_mm`.
+# `grid.row_spacing_mm` / `col_spacing_mm`: center-to-center pitch; independent
+#   so non-square pitches are supported.
+# `number_of_skip`: number of rows/columns on every edge that are unusable
+#   (e.g. 384 well plates with skipped outer wells).
+# `plate_corner_radius_mm` / `a1_chamfer`: visual only (map rendering).
+
+formats:
+
+  - id: "glass slide"
+    display_name: "Glass Slide"
+    plate_dimensions_mm: [75.0, 25.0]
+    plate_corner_radius_mm: 1.0
+    a1_chamfer: false
+    a1_offset_mm: [37.5, 12.5]
+    grid:
+      rows: 1
+      cols: 1
+      row_spacing_mm: 0.0
+      col_spacing_mm: 0.0
+    well:
+      shape: rectangle
+      width_mm: 50.0
+      height_mm: 18.0
+      corner_radius_mm: 0.0
+    number_of_skip: 0
+
+  - id: "6 well plate"
+    display_name: "6 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [24.55, 23.01]
+    grid:
+      rows: 2
+      cols: 3
+      row_spacing_mm: 39.2
+      col_spacing_mm: 39.2
+    well:
+      shape: circle
+      diameter_mm: 34.94
+    number_of_skip: 0
+
+  - id: "12 well plate"
+    display_name: "12 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [24.75, 16.86]
+    grid:
+      rows: 3
+      cols: 4
+      row_spacing_mm: 26.0
+      col_spacing_mm: 26.0
+    well:
+      shape: circle
+      diameter_mm: 22.05
+    number_of_skip: 0
+
+  - id: "24 well plate"
+    display_name: "24 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [24.45, 22.07]
+    grid:
+      rows: 4
+      cols: 6
+      row_spacing_mm: 19.3
+      col_spacing_mm: 19.3
+    well:
+      shape: circle
+      diameter_mm: 15.54
+    number_of_skip: 0
+
+  - id: "96 well plate"
+    display_name: "96 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [11.31, 10.75]
+    grid:
+      rows: 8
+      cols: 12
+      row_spacing_mm: 9.0
+      col_spacing_mm: 9.0
+    well:
+      shape: circle
+      diameter_mm: 6.21
+    number_of_skip: 0
+
+  - id: "384 well plate"
+    display_name: "384 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [12.05, 9.05]
+    grid:
+      rows: 16
+      cols: 24
+      row_spacing_mm: 4.5
+      col_spacing_mm: 4.5
+    well:
+      shape: circle
+      diameter_mm: 3.3
+    number_of_skip: 1
+
+  - id: "1536 well plate"
+    display_name: "1536 Well Plate"
+    plate_dimensions_mm: [127.76, 85.48]
+    plate_corner_radius_mm: 3.18
+    a1_chamfer: true
+    a1_offset_mm: [11.01, 7.87]
+    grid:
+      rows: 32
+      cols: 48
+      row_spacing_mm: 2.25
+      col_spacing_mm: 2.25
+    well:
+      shape: circle
+      diameter_mm: 1.53
+    number_of_skip: 0

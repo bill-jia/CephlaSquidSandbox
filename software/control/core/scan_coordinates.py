@@ -93,6 +93,17 @@ class ScanCoordinates:
         self.well_spacing_mm = spacing_mm
         self.number_of_skip = number_of_skip
 
+        # Pull extended shape/pitch info directly from the loader dict — kept out
+        # of the signal signature to avoid churning the long list of connected
+        # slots. Falls back to square/circle defaults for backwards compatibility
+        # with custom formats that predate the YAML schema.
+        extended = control._def.WELLPLATE_FORMAT_SETTINGS.get(format_, {})
+        self.well_shape = extended.get("well_shape", "circle")
+        self.well_width_mm = extended.get("well_width_mm", size_mm)
+        self.well_height_mm = extended.get("well_height_mm", size_mm)
+        self.row_spacing_mm = extended.get("row_spacing_mm", spacing_mm)
+        self.col_spacing_mm = extended.get("col_spacing_mm", spacing_mm)
+
     def _index_to_row(self, index):
         index += 1
         row = ""
