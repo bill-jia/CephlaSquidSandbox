@@ -268,8 +268,24 @@ class AxisConfig(pydantic.BaseModel):
 
     # The min and maximum position of this axis in its native units.  This means mm for linear axes, and
     # radians for rotary.  `inf` is allowed (for something like a continuous rotary axis)
+    # These are RAW-frame limits (what the microcontroller sees).
     MIN_POSITION: float
     MAX_POSITION: float
+
+    # Canonical-frame mapping.  The "raw" frame is what the microcontroller reports
+    # after MOVEMENT_SIGN conversion; the "canonical" frame is what the Stage public
+    # API (get_pos / move_*_to / move_*) exposes to the rest of the software.
+    #
+    #     canonical = CANONICAL_SIGN * (raw - CANONICAL_ORIGIN_RAW_MM)
+    #     raw      = CANONICAL_ORIGIN_RAW_MM + CANONICAL_SIGN * canonical
+    #
+    # Defaults (+1, 0.0) make the conversion an identity, so every existing rig
+    # behaves exactly as before until its machine-config yaml opts in.  Setting
+    # CANONICAL_SIGN=-1 with CANONICAL_ORIGIN_RAW_MM=MAX_POSITION flips that axis
+    # so canonical 0 lands at the far end of travel (useful for making a stage
+    # homed at the physical bottom-right report as top-left-origin).
+    CANONICAL_SIGN: DirectionSign = DirectionSign.DIRECTION_SIGN_POSITIVE
+    CANONICAL_ORIGIN_RAW_MM: float = 0.0
 
     # Some axes have a PID controller.  This says whether or not to use the PID control loop, and if so what
     # gains to use.
@@ -291,6 +307,18 @@ class AxisConfig(pydantic.BaseModel):
             real_unit
             / (self.MOVEMENT_SIGN.value * self.SCREW_PITCH / (self.MICROSTEPS_PER_STEP * self.FULL_STEPS_PER_REV))
         )
+
+    def raw_to_canonical(self, raw_mm: float) -> float:
+        return self.CANONICAL_SIGN.value * (raw_mm - self.CANONICAL_ORIGIN_RAW_MM)
+
+    def canonical_to_raw(self, canonical_mm: float) -> float:
+        return self.CANONICAL_ORIGIN_RAW_MM + self.CANONICAL_SIGN.value * canonical_mm
+
+    def raw_to_canonical_delta(self, raw_delta_mm: float) -> float:
+        return self.CANONICAL_SIGN.value * raw_delta_mm
+
+    def canonical_to_raw_delta(self, canonical_delta_mm: float) -> float:
+        return self.CANONICAL_SIGN.value * canonical_delta_mm
 
 
 class StageConfig(pydantic.BaseModel):
@@ -683,6 +711,12 @@ class CameraConfig(pydantic.BaseModel):
     # Required for cameras whose model isn't known to the driver's lookup tables.
     pixel_size_um: Optional[float] = None
 
+    # Horizontal / vertical sensor mirror applied at the SDK layer (e.g. GenICam
+    # ReverseX/ReverseY).  Currently only wired to the Tucsen driver.  None means
+    # "use the driver's default" (Tucsen driver applies ReverseX=True historically).
+    reverse_x: Optional[bool] = None
+    reverse_y: Optional[bool] = None
+
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
     if old_string == "Toupcam":
@@ -875,6 +909,8 @@ def _build_camera_config_from_device(
         hardware_triggering_enabled=cfg.get("hardware_triggering_enabled", True),
         default_readout_mode=cfg.get("readout_mode"),
         pixel_size_um=cfg.get("pixel_size_um"),
+        reverse_x=cfg.get("reverse_x"),
+        reverse_y=cfg.get("reverse_y"),
     )
 
 
@@ -888,6 +924,8 @@ def _build_stage_config_from_device(dev: "DeviceEntry") -> StageConfig:  # noqa:
         pid_cfg = cfg.get("pid", {}).get(axis_key, {})
         limits = cfg.get("software_limits", {}).get(axis_key, {})
 
+        canonical_cfg = cfg.get("canonical", {}).get(axis_key, {})
+
         return AxisConfig(
             MOVEMENT_SIGN=a.get("movement_sign", defaults.get("movement_sign", 1)),
             USE_ENCODER=enc_cfg.get("enabled", False),
@@ -900,6 +938,8 @@ def _build_stage_config_from_device(dev: "DeviceEntry") -> StageConfig:  # noqa:
             MAX_ACCELERATION=a.get("max_acceleration_mm", defaults.get("max_acceleration_mm", 500)),
             MIN_POSITION=limits.get("negative", defaults.get("min_pos", -0.5)),
             MAX_POSITION=limits.get("positive", defaults.get("max_pos", 56)),
+            CANONICAL_SIGN=canonical_cfg.get("sign", 1),
+            CANONICAL_ORIGIN_RAW_MM=canonical_cfg.get("origin_raw_mm", 0.0),
             PID=PIDConfig(
                 ENABLED=pid_cfg.get("enabled", False),
                 P=pid_cfg.get("p", 1 << 12),

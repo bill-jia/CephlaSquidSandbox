@@ -53,34 +53,39 @@ class CephlaStage(AbstractStage):
         return self._config.Z_AXIS.convert_real_units_to_ustep(mm)
 
     def move_x(self, rel_mm: float, blocking: bool = True):
-        self._microcontroller.move_x_usteps(self._config.X_AXIS.convert_real_units_to_ustep(rel_mm))
+        rel_mm_raw = self._config.X_AXIS.canonical_to_raw_delta(rel_mm)
+        self._microcontroller.move_x_usteps(self._config.X_AXIS.convert_real_units_to_ustep(rel_mm_raw))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
-                self._calc_move_timeout(rel_mm, self.get_config().X_AXIS.MAX_SPEED)
+                self._calc_move_timeout(rel_mm_raw, self.get_config().X_AXIS.MAX_SPEED)
             )
 
     def move_y(self, rel_mm: float, blocking: bool = True):
-        self._microcontroller.move_y_usteps(self._config.Y_AXIS.convert_real_units_to_ustep(rel_mm))
+        rel_mm_raw = self._config.Y_AXIS.canonical_to_raw_delta(rel_mm)
+        self._microcontroller.move_y_usteps(self._config.Y_AXIS.convert_real_units_to_ustep(rel_mm_raw))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
-                self._calc_move_timeout(rel_mm, self.get_config().Y_AXIS.MAX_SPEED)
+                self._calc_move_timeout(rel_mm_raw, self.get_config().Y_AXIS.MAX_SPEED)
             )
 
     def move_z(self, rel_mm: float, blocking: bool = True):
         # From Hongquan, we want the z axis to rest on the "up" (wrt gravity) direction of gravity. So if we
         # are moving in the negative (down) z direction, we need to move past our mark a bit then
         # back up.  If we are already moving in the "up" position, we can move straight there.
-        need_clear_backlash = rel_mm < 0
+        # Backlash compensation reasons about raw-frame direction (motor drive side), so convert the
+        # canonical rel_mm to raw first.
+        rel_mm_raw = self._config.Z_AXIS.canonical_to_raw_delta(rel_mm)
+        need_clear_backlash = rel_mm_raw < 0
 
         # NOTE(imo): It seems really tricky to only clear backlash if via the blocking call?
-        final_rel_move_mm = rel_mm
+        final_rel_move_raw_mm = rel_mm_raw
         if blocking and need_clear_backlash:
             backlash_offset = -CephlaStage._BACKLASH_COMPENSATION_DISTANCE_MM
-            final_rel_move_mm = -backlash_offset
+            final_rel_move_raw_mm = -backlash_offset
             # Move past our final position, so we can move up to the final position and
             # rest on the downside of the drive mechanism.  But make sure we don't drive past the min position
             # to do this.
-            rel_move_with_backlash_offset_mm = rel_mm + backlash_offset
+            rel_move_with_backlash_offset_mm = rel_mm_raw + backlash_offset
             rel_move_with_backlash_offset_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(
                 rel_move_with_backlash_offset_mm
             )
@@ -90,21 +95,23 @@ class CephlaStage(AbstractStage):
                     self._calc_move_timeout(rel_move_with_backlash_offset_mm, self.get_config().Z_AXIS.MAX_SPEED)
                 )
 
-        self._microcontroller.move_z_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(final_rel_move_mm))
+        self._microcontroller.move_z_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(final_rel_move_raw_mm))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
-                self._calc_move_timeout(final_rel_move_mm, self.get_config().Z_AXIS.MAX_SPEED)
+                self._calc_move_timeout(final_rel_move_raw_mm, self.get_config().Z_AXIS.MAX_SPEED)
             )
 
     def move_x_to(self, abs_mm: float, blocking: bool = True):
-        self._microcontroller.move_x_to_usteps(self._config.X_AXIS.convert_real_units_to_ustep(abs_mm))
+        abs_mm_raw = self._config.X_AXIS.canonical_to_raw(abs_mm)
+        self._microcontroller.move_x_to_usteps(self._config.X_AXIS.convert_real_units_to_ustep(abs_mm_raw))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(abs_mm - self.get_pos().x_mm, self.get_config().X_AXIS.MAX_SPEED)
             )
 
     def move_y_to(self, abs_mm: float, blocking: bool = True):
-        self._microcontroller.move_y_to_usteps(self._config.Y_AXIS.convert_real_units_to_ustep(abs_mm))
+        abs_mm_raw = self._config.Y_AXIS.canonical_to_raw(abs_mm)
+        self._microcontroller.move_y_to_usteps(self._config.Y_AXIS.convert_real_units_to_ustep(abs_mm_raw))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(abs_mm - self.get_pos().y_mm, self.get_config().Y_AXIS.MAX_SPEED)
@@ -114,7 +121,10 @@ class CephlaStage(AbstractStage):
         # From Hongquan, we want the z axis to rest on the "up" (wrt gravity) direction of gravity. So if we
         # are moving in the negative (down) z direction, we need to move past our mark a bit then
         # back up.  If we are already moving in the "up" position, we can move straight there.
-        need_clear_backlash = abs_mm < self.get_pos().z_mm
+        # Backlash compensation and MIN_POSITION clamping operate in the raw frame.
+        abs_mm_raw = self._config.Z_AXIS.canonical_to_raw(abs_mm)
+        current_z_raw = self._config.Z_AXIS.canonical_to_raw(self.get_pos().z_mm)
+        need_clear_backlash = abs_mm_raw < current_z_raw
 
         # NOTE(imo): It seems really tricky to only clear backlash if via the blocking call?
         if blocking and need_clear_backlash:
@@ -122,17 +132,17 @@ class CephlaStage(AbstractStage):
             # Move past our final position, so we can move up to the final position and
             # rest on the downside of the drive mechanism.  But make sure we don't drive past the min position
             # to do this.
-            clamped_z_backlash_pos = max(abs_mm + backlash_offset, self.get_config().Z_AXIS.MIN_POSITION)
-            clamped_z_backlash_pos_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(clamped_z_backlash_pos)
+            clamped_z_backlash_pos_raw = max(abs_mm_raw + backlash_offset, self.get_config().Z_AXIS.MIN_POSITION)
+            clamped_z_backlash_pos_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(clamped_z_backlash_pos_raw)
             self._microcontroller.move_z_to_usteps(clamped_z_backlash_pos_usteps)
             if blocking:
                 self._microcontroller.wait_till_operation_is_completed(
                     self._calc_move_timeout(
-                        clamped_z_backlash_pos - self.get_pos().z_mm, self.get_config().Z_AXIS.MAX_SPEED
+                        clamped_z_backlash_pos_raw - current_z_raw, self.get_config().Z_AXIS.MAX_SPEED
                     )
                 )
 
-        self._microcontroller.move_z_to_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(abs_mm))
+        self._microcontroller.move_z_to_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(abs_mm_raw))
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(abs_mm - self.get_pos().z_mm, self.get_config().Z_AXIS.MAX_SPEED)
@@ -140,9 +150,9 @@ class CephlaStage(AbstractStage):
 
     def get_pos(self) -> Pos:
         pos_usteps = self._microcontroller.get_pos()
-        x_mm = self._config.X_AXIS.convert_to_real_units(pos_usteps[0])
-        y_mm = self._config.Y_AXIS.convert_to_real_units(pos_usteps[1])
-        z_mm = self._config.Z_AXIS.convert_to_real_units(pos_usteps[2])
+        x_mm = self._config.X_AXIS.raw_to_canonical(self._config.X_AXIS.convert_to_real_units(pos_usteps[0]))
+        y_mm = self._config.Y_AXIS.raw_to_canonical(self._config.Y_AXIS.convert_to_real_units(pos_usteps[1]))
+        z_mm = self._config.Z_AXIS.raw_to_canonical(self._config.Z_AXIS.convert_to_real_units(pos_usteps[2]))
         theta_rad = self._config.THETA_AXIS.convert_to_real_units(pos_usteps[3])
 
         return Pos(x_mm=x_mm, y_mm=y_mm, z_mm=z_mm, theta_rad=theta_rad)
@@ -224,6 +234,11 @@ class CephlaStage(AbstractStage):
         theta_pos_rad: Optional[float] = None,
         theta_neg_rad: Optional[float] = None,
     ):
+        # All limits here are in RAW mm — they map directly to the MCU's ustep-counted
+        # frame and must match AxisConfig.MIN_POSITION / MAX_POSITION.  The canonical
+        # frame mapping (AxisConfig.CANONICAL_*) lives above this function and does not
+        # apply to the hardware-level software limits.
+        #
         # Our underlying movement direction might be switched.  If it is, then the positive movements here at
         # the AbstractStage level will result in negative movements on the real hardware (and vice versa).  This means
         # that if our movement sign is swapped, we need to swap pos/neg limits at the lower level here.

@@ -108,6 +108,84 @@ display sites.
 5. Verify with: live navigation (joystick + click-to-move), a multipoint
    acquisition that crosses well boundaries, and an ROI drawn on the mosaic.
 
+## Progress — canonical-frame plumbing landed (2026-04-19)
+
+Pure plumbing only; zero behavior change with default yaml.
+
+- `AxisConfig` (`software/squid/config.py`) now carries two new per-axis
+  fields: `CANONICAL_SIGN` (default `+1`) and `CANONICAL_ORIGIN_RAW_MM`
+  (default `0.0`). These define the affine mapping
+  `canonical = CANONICAL_SIGN * (raw - CANONICAL_ORIGIN_RAW_MM)`.
+  Helper methods: `raw_to_canonical`, `canonical_to_raw`,
+  `raw_to_canonical_delta`, `canonical_to_raw_delta`.
+- `CephlaStage` (`software/squid/stage/cephla.py`) public methods
+  (`get_pos`, `move_{x,y,z}_to`, `move_{x,y,z}`) route through these helpers.
+  `set_limits` stays raw-frame (it talks directly to the MCU limit switches;
+  documented in-line).
+- `_build_stage_config_from_device` in `squid/config.py` reads a new yaml
+  block:
+  ```yaml
+  devices:
+    stage:
+      config:
+        canonical:
+          x: { sign: -1, origin_raw_mm: 56.0 }
+          y: { sign: -1, origin_raw_mm: 56.0 }
+  ```
+  Absent block → defaults → no-op.
+
+**Revertibility.** Nothing activates automatically. The demo rig behaves
+exactly as before until its yaml adds a `canonical:` block. The production
+rig (stage rotated 180°, home already at physical top-left) stays at defaults
+and also behaves identically to today. To undo: delete the yaml block, or
+`git revert` the plumbing commit.
+
+## Still pending (blocked on dedicated test time)
+
+These are the "real" consumer-side changes that must happen to actually
+realise the canonical flip on the demo rig. Each assumes `canonical` yaml is
+set so `Stage.get_pos()` returns true top-left-origin coordinates.
+
+- Remove the four `TEMPORARY:` negations in
+  `software/gui/widgets/napari_views.py` (`NapariMosaicDisplayWidget`
+  methods `updateMosaic`, `convert_shape_to_mm`,
+  `convert_mm_to_viewer_shapes`, `onDoubleClick`).
+- Flip the Y sign in the joystick + click-to-move handlers
+  (`software/gui/widgets/tracking_and_controls.py` `moveStage` and
+  `viewerClicked`) so pushing up / clicking above still pans up in the new
+  Y-grows-down canonical frame.
+- Update `software/control/sample_formats.csv` `a1_x_mm` / `a1_y_mm` to
+  canonical frame (`56 - raw` for both axes on the demo rig).
+- Update `STARTUP_DEFAULT_STAGE_X_MM` / `_Y_MM` in `software/control/_def.py`
+  to canonical values.
+- Decide whether `SOFTWARE_POS_LIMIT` should be canonical or stay raw;
+  today consumers treat it as ambient so the choice ripples.
+- Delete `cache/last_coords.txt` once (format changes from raw to canonical).
+- Flag migration needs for any user-saved `coordinates.csv` / focus-map
+  exports / acquisition yamls — they are in raw frame and will be
+  misinterpreted as canonical after the flip.
+
+## Tucsen ReverseX/ReverseY now yaml-configurable (2026-04-19)
+
+The hardcoded `ReverseX=True` in
+`software/control/camera_tucsen.py:_configure_camera` became yaml-driven:
+
+```yaml
+devices:
+  main_camera:
+    config:
+      reverse_x: true    # default: true (preserves old behavior)
+      reverse_y: true    # default: unset — driver leaves the sensor at its
+                         # default vertical orientation
+```
+
+Plumbed through `CameraConfig.reverse_x` / `reverse_y` in `squid/config.py`
+and `_build_camera_config_from_device`. Both GenICam (ARIES) and legacy
+TUCAM code paths honor the fields. This gives the production unit a clean
+lever to set the correct sensor orientation without touching driver code,
+and pairs naturally with the stage canonical-frame plumbing above when it
+eventually activates.
+
 ## Out of scope (for now)
 
 - Changing the controller firmware's native axis directions.

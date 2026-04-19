@@ -593,19 +593,32 @@ class TucsenCamera(AbstractCamera):
                     self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
                 self._set_genicam_parameter("TriggerOutputWidth", self._trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
 
-        # Horizontal flip applied at the sensor/SDK layer so every frame
-        # (live, fast-acquisition callback, multipoint) is mirrored
-        # left-to-right without needing to touch each frame-handling path.
-        # Persists through the close/reopen vendor workaround because
-        # _configure_camera runs on every reopen. GenICam: ReverseX boolean;
-        # TUCAM legacy: TUIDC_HORIZONTAL capability (0/1).
+        # Horizontal / vertical flip applied at the sensor/SDK layer so every
+        # frame (live, fast-acquisition callback, multipoint) is mirrored
+        # without needing to touch each frame-handling path. Persists through
+        # the close/reopen vendor workaround because _configure_camera runs on
+        # every reopen.
+        #
+        # Machine-config yaml (devices.main_camera.config.reverse_x / reverse_y)
+        # drives this. When unset, the driver keeps the historical behavior:
+        # ReverseX=True (the rig's optical path needs a left-right flip), and
+        # ReverseY is left untouched at whatever the sensor's default is.
+        reverse_x = self._config.reverse_x if self._config.reverse_x is not None else True
+        reverse_y = self._config.reverse_y
         if self._model_properties.is_genicam:
-            self._set_genicam_parameter("ReverseX", True, TUELEM_TYPE.TU_ElemBoolean.value)
+            self._set_genicam_parameter("ReverseX", reverse_x, TUELEM_TYPE.TU_ElemBoolean.value)
+            if reverse_y is not None:
+                self._set_genicam_parameter("ReverseY", reverse_y, TUELEM_TYPE.TU_ElemBoolean.value)
         else:
             if TUCAM_Capa_SetValue(
-                self._camera, TUCAM_IDCAPA.TUIDC_HORIZONTAL.value, 1
+                self._camera, TUCAM_IDCAPA.TUIDC_HORIZONTAL.value, 1 if reverse_x else 0
             ) != TUCAMRET.TUCAMRET_SUCCESS:
-                self._log.warning("Failed to enable horizontal flip (TUIDC_HORIZONTAL)")
+                self._log.warning("Failed to set horizontal flip (TUIDC_HORIZONTAL)")
+            if reverse_y is not None:
+                if TUCAM_Capa_SetValue(
+                    self._camera, TUCAM_IDCAPA.TUIDC_VERTICAL.value, 1 if reverse_y else 0
+                ) != TUCAMRET.TUCAMRET_SUCCESS:
+                    self._log.warning("Failed to set vertical flip (TUIDC_VERTICAL)")
 
         self.get_region_of_interest(force_update=True)
         self.set_binning(*self._config.default_binning)
