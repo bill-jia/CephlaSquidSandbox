@@ -2013,7 +2013,7 @@ class FastAcquisitionWidget(QWidget):
             if max_exposure_time_ms < min_exposure_ms:
                 max_exposure_time_ms = min_exposure_ms
                 self._log.warning(
-                    f"Frame rate {frame_rate_hz} Hz is too high for readout time {readout_time_us:.2f} us ({readout_time_type}). "
+                    f"Frame rate {frame_rate_hz} Hz is too high for readout time {readout_time_us:.2f} us. "
                     f"Maximum exposure time limited to {min_exposure_ms} ms."
                 )
             
@@ -2026,12 +2026,12 @@ class FastAcquisitionWidget(QWidget):
                 self.exposure_time_spinbox.setValue(max_exposure_time_ms)
                 self._log.info(
                     f"Exposure time clamped to {max_exposure_time_ms:.2f} ms "
-                    f"(max for {frame_rate_hz} Hz frame rate with {readout_time_us:.2f} us {readout_time_type} readout)"
+                    f"(max for {frame_rate_hz} Hz frame rate with {readout_time_us:.2f} us readout)"
                 )
             
             self._log.debug(
                 f"Updated max exposure time: {max_exposure_time_ms:.2f} ms "
-                f"(frame rate: {frame_rate_hz} Hz, readout: {readout_time_us:.2f} us {readout_time_type})"
+                f"(frame rate: {frame_rate_hz} Hz, readout: {readout_time_us:.2f} us)"
             )
             
         except Exception as e:

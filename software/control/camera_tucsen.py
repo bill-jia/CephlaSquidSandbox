@@ -418,6 +418,11 @@ class TucsenCamera(AbstractCamera):
         self._fast_acq_buffer_callback_obj: Optional[TucsenCameraCallBack] = None
         self._fast_acq_buffer_callback_fn = None
         self._byte_decoding_fn = None
+        # ROI captured at the start of fast acquisition. Restored in
+        # stop_fast_acquisition_frame_grabbing after the vendor close/reopen
+        # so the user is returned to the live ROI they had before, instead
+        # of whatever hardware default survives the reopen.
+        self._roi_before_fast_acq: Optional[Tuple[int, int, int, int]] = None
 
         self._camera = TucsenCamera._open(index=0)
         self._model_properties = self._get_model_properties(self._config.camera_model)
@@ -642,19 +647,46 @@ class TucsenCamera(AbstractCamera):
             f"max acquisition rate: {self._max_acquisition_rate_hz} Hz"
         )
 
-    def _allocate_buffer(self):
+    def _allocate_buffer(self, max_frame: bool = True):
+        """Allocate the TUCam buffer via TUCAM_Buf_Alloc.
+
+        The SDK sizes the buffer from the hardware ROI at the moment of the
+        Alloc call (no explicit size argument exists).
+
+        max_frame=True (default — used for live streaming): size for the full
+        sensor at the current binning so any smaller ROI the user selects
+        later fits without reallocation. We temporarily push the hardware
+        ROI to (0, 0, max_x, max_y), call Alloc, then restore the cached
+        ROI. The Python-side cache is unchanged.
+
+        max_frame=False (used for fast acquisition): size for the current
+        hardware ROI (tight fit). Smaller transfers, faster per-frame cost.
+        """
         self._m_frame = TUCAM_FRAME()
         self._m_frame.pBuffer = 0
         self._m_frame.ucFormatGet = TUFRM_FORMATS.TUFRM_FMT_USUAl.value
         self._m_frame.uiRsdSize = 1
 
-        if TUCAM_Buf_Alloc(self._camera, pointer(self._m_frame)) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError("Failed to allocate buffer")
+        cached_roi = self._region_of_interest
+        need_restore = False
+        if max_frame and cached_roi is not None:
+            max_x, max_y = self._model_properties.binning_to_resolution[self._binning]
+            full_roi = (0, 0, max_x, max_y)
+            if cached_roi != full_roi:
+                self.set_region_of_interest(*full_roi)
+                need_restore = True
 
-    def _reset_buffer(self):
+        try:
+            if TUCAM_Buf_Alloc(self._camera, pointer(self._m_frame)) != TUCAMRET.TUCAMRET_SUCCESS:
+                raise CameraError("Failed to allocate buffer")
+        finally:
+            if need_restore:
+                self.set_region_of_interest(*cached_roi)
+
+    def _reset_buffer(self, max_frame: bool = True):
         if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError("Failed to release buffer")
-        self._allocate_buffer()
+        self._allocate_buffer(max_frame=max_frame)
 
     def stop_streaming(self):
         if not self._is_streaming.is_set():
@@ -726,9 +758,15 @@ class TucsenCamera(AbstractCamera):
         if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError(f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}")
 
+        # Remember the live ROI so stop_fast_acquisition_frame_grabbing can
+        # restore it after the vendor close/reopen sequence.
+        self._roi_before_fast_acq = self._region_of_interest
+
         if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError("Failed to release buffer")
-        self._allocate_buffer()
+        # Fast acq uses a tight-fit buffer matching the current hardware ROI
+        # so each per-frame transfer is minimal.
+        self._allocate_buffer(max_frame=False)
 
         self._fast_acq_buffer_callback_obj = TucsenCameraCallBack(
             self._camera, frame_callback, log=self._log
@@ -804,6 +842,15 @@ class TucsenCamera(AbstractCamera):
         if self._camera is None:
             raise CameraError("Failed to reopen camera after fast acquisition")
         self._configure_camera()
+
+        # Restore the live ROI the user had before fast acquisition. The
+        # reopen resets hardware state to vendor defaults, which is not what
+        # the user saw in live view — so push the remembered window back.
+        # The next start_streaming allocates a max-frame buffer (live), so
+        # the user can freely resize this restored ROI afterward.
+        if self._roi_before_fast_acq is not None:
+            self.set_region_of_interest(*self._roi_before_fast_acq)
+            self._roi_before_fast_acq = None
 
         self._log.info(f"Fast acquisition frame grabbing stopped, {self.frames_polled} frames polled")
 
@@ -1311,6 +1358,14 @@ class TucsenCamera(AbstractCamera):
             # acceptable — set_binning is not a hot path.
             self.get_region_of_interest(force_update=True)
             self.set_region_of_interest(*new_roi)
+
+            # Binning change alters the max frame size in binned pixels, so
+            # the live buffer (sized for the old binning's full frame) is
+            # now wrong. Re-allocate at the new binning's max so the user
+            # can still enlarge the ROI up to the full sensor.
+            if self._m_frame is not None:
+                with self._pause_streaming():
+                    self._reset_buffer()
 
     def get_binning(self) -> Tuple[int, int]:
         return self._binning
