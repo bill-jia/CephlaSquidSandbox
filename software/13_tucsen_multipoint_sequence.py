@@ -43,7 +43,7 @@ import os
 import sys
 import threading
 import time
-from ctypes import c_char_p, c_int32, c_void_p, create_string_buffer, pointer
+from ctypes import c_char_p, c_int32, c_void_p, create_string_buffer, pointer, memset, cast
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if os.path.basename(_HERE) == "software":
@@ -78,6 +78,7 @@ from control.TUCam import (  # noqa: E402
     TUCAM_Dev_Open,
     TUCAM_GenICam_ElementAttr,
     TUCAM_GenICam_SetElementValue,
+    TUCAM_GenICam_GetElementValue
 )
 
 # ---------- run shape ----------
@@ -97,7 +98,8 @@ WRITE_EXPOSURE_INLOOP = os.environ.get("WRITE_EXPOSURE_INLOOP", "1") == "1"
 # PAUSE_STYLE_EXPOSURE=1 wraps each mid-loop ExposureTime write in a Cap_Stop /
 # Cap_Start cycle (mirrors what TucsenCamera._pause_streaming does for other
 # GenICam writes). This is the proposed fix pattern.
-PAUSE_STYLE_EXPOSURE = os.environ.get("PAUSE_STYLE_EXPOSURE", "0") == "1"
+# PAUSE_STYLE_EXPOSURE = os.environ.get("PAUSE_STYLE_EXPOSURE", "0") == "1"
+PAUSE_STYLE_EXPOSURE = 0
 
 
 # ---------- GenICam helpers (same shape as camera_tucsen) ----------
@@ -211,6 +213,34 @@ def main() -> int:
         return 3
     handle = opn.hIdxTUCam
     print(f"         handle=0x{handle:X}")
+
+    node = TUCAM_ELEMENT()
+    node.pName = c_char_p(b"DeviceModelName")
+    m_xmldevice = TUXML_DEVICE
+    buf = create_string_buffer(128)
+    memset(buf, 0, 128)
+    node.pTransfer = cast(buf, c_char_p)
+    ret = TUCAM_GenICam_GetElementValue(opn.hIdxTUCam, pointer(node), m_xmldevice.TU_CAMERA_XML.value)
+    if TUCAMRET.TUCAMRET_SUCCESS != ret:
+        sys.exit()
+    print('The Camera Name is:%#s' % node.pTransfer)
+
+    # ch:获取相机SN码 | en:Get camera SN
+    node.pName = c_char_p(b"DeviceSerialNumber")
+    node.pTransfer = cast(buf, c_char_p)
+    ret = TUCAM_GenICam_GetElementValue(opn.hIdxTUCam, pointer(node), m_xmldevice.TU_CAMERA_XML.value)
+    if TUCAMRET.TUCAMRET_SUCCESS != ret:
+        sys.exit()
+    print('The SN is:%#s' % node.pTransfer)
+
+    # ch:获取相机固件码 | en:Get firmware version
+    node.pName = c_char_p(b"DeviceVersion")
+    node.pTransfer = cast(buf, c_char_p)
+    ret = TUCAM_GenICam_GetElementValue(opn.hIdxTUCam, pointer(node), m_xmldevice.TU_CAMERA_XML.value)
+    if TUCAMRET.TUCAMRET_SUCCESS != ret:
+        sys.exit()
+    print('The firmware version is:%#s' % node.pTransfer)
+
 
     print("[setup] set TriggerMode <- Software (idx=2)")
     ret = set_enum(handle, "TriggerMode", 2)

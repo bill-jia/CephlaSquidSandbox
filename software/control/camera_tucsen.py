@@ -1054,10 +1054,10 @@ class TucsenCamera(AbstractCamera):
             # subsequent TriggerSoftwarePulse commands — the camera keeps streaming
             # but stops responding to software triggers until Cap_Stop/Cap_Start.
             # Reproduced deterministically in 13_tucsen_multipoint_sequence.py.
-            with self._pause_streaming():
-                self._set_genicam_parameter(
-                    "ExposureTime", int(adjusted_exposure_time * 1000), TUELEM_TYPE.TU_ElemInteger.value
-                )
+            # with self._pause_streaming(): # May be needed on older (<=18022601019) firmware, but seems to be ok on the latest (260305)
+            self._set_genicam_parameter(
+                "ExposureTime", int(adjusted_exposure_time * 1000), TUELEM_TYPE.TU_ElemInteger.value
+            )
         else:
             if (
                 TUCAM_Prop_SetValue(
