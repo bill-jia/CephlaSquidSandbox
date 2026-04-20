@@ -442,6 +442,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.checkbox_snakeScan = QCheckBox("Snake scan")
+        self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
+        self.checkbox_snakeScan.setToolTip(
+            "Alternate tile direction each row (boustrophedon) to minimize stage travel.\n"
+            "When off, every row starts from the same side (unidirectional raster)."
+        )
+
         self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
         self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
 
@@ -613,6 +620,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setVisible(False)
         grid_af.addWidget(self.checkbox_set_z_range)
         grid_af.addWidget(self.checkbox_skipSaving)
+        grid_af.addWidget(self.checkbox_snakeScan)
         grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
         grid_config = QHBoxLayout()
@@ -687,6 +695,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
         )
@@ -923,6 +932,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.acquisition_start_time = None
         else:
             self.eta_timer.stop()
+
+    def _on_snake_toggled(self, enabled: bool) -> None:
+        """Apply snake vs. unidirectional tile order, then rebuild tile positions."""
+        self.scanCoordinates.set_snake_scan(enabled)
+        self.update_fov_positions()
 
     def update_fov_positions(self):
         if not self.isVisible():
@@ -1997,6 +2011,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.checkbox_snakeScan = QCheckBox("Snake scan")
+        self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
+        self.checkbox_snakeScan.setToolTip(
+            "Alternate tile direction each row (boustrophedon) to minimize stage travel.\n"
+            "When off, every row starts from the same side (unidirectional raster)."
+        )
+
         self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
         self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
 
@@ -2229,6 +2250,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
         options_layout.addWidget(self.checkbox_skipSaving)
+        options_layout.addWidget(self.checkbox_snakeScan)
         options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
         button_layout = QVBoxLayout()
@@ -2302,6 +2324,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
         )
@@ -3318,6 +3341,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # reallow updates from entry sinals (signal enforces min <= max when we update either entry)
         self.entry_minZ.blockSignals(False)
         self.entry_maxZ.blockSignals(False)
+
+    def _on_snake_toggled(self, enabled: bool) -> None:
+        """Apply snake vs. unidirectional tile order, then rebuild tile positions."""
+        self.scanCoordinates.set_snake_scan(enabled)
+        self.update_coordinates()
 
     def update_coordinates(self):
         if self.tab_widget and self.tab_widget.currentWidget() != self:

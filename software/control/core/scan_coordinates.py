@@ -81,6 +81,14 @@ class ScanCoordinates:
     def add_well_selector(self, well_selector):
         self.well_selector = well_selector
 
+    def set_snake_scan(self, enabled: bool) -> None:
+        """Toggle snake (S-pattern / boustrophedon) ordering for tiles within a region.
+
+        Enabled = alternate direction each row to minimize stage travel.
+        Disabled = each row starts from the same side (unidirectional raster).
+        """
+        self.fov_pattern = "S-Pattern" if enabled else "Unidirectional"
+
     def update_wellplate_settings(
         self, format_, a1_x_mm, a1_y_mm, a1_x_pixel, a1_y_pixel, size_mm, spacing_mm, number_of_skip
     ):
@@ -845,7 +853,7 @@ class ScanCoordinatesSiLA2(ScanCoordinates):
                 ):
                     row.append((x, y))
 
-            if control._def.FOV_PATTERN == "S-Pattern" and i % 2 == 1:
+            if self.fov_pattern == "S-Pattern" and i % 2 == 1:
                 row.reverse()
             scan_coordinates.extend(row)
 

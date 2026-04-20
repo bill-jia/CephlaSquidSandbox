@@ -1066,6 +1066,10 @@ class EmissionFilterWheelPanel(QWidget):
 
 class CameraSettingsWidget(QFrame):
 
+    # Emitted whenever a setting that changes the captured FOV size on the
+    # sample is applied (binning, ROI width/height/offset). Consumers like the
+    # NavigationViewer refresh their cached fov_width_mm reactively on this
+    # signal instead of polling the camera every frame.
     signal_binning_changed = Signal()
 
     def __init__(
@@ -1424,6 +1428,7 @@ class CameraSettingsWidget(QFrame):
                 self.entry_ROI_width.value(),
                 self.entry_ROI_height.value(),
             )
+            self.signal_binning_changed.emit()
 
     def set_Height(self):
         # round height to an even number so centering works cleanly
@@ -1440,6 +1445,7 @@ class CameraSettingsWidget(QFrame):
                 self.entry_ROI_width.value(),
                 self.entry_ROI_height.value(),
             )
+            self.signal_binning_changed.emit()
         self._log.info(f"Current camera ROI: {self.camera.get_region_of_interest()}")
 
     def set_ROI_offset(self):
@@ -1449,6 +1455,7 @@ class CameraSettingsWidget(QFrame):
             self.entry_ROI_width.value(),
             self.entry_ROI_height.value(),
         )
+        self.signal_binning_changed.emit()
 
     def update_centered_roi(self):
         """
@@ -1490,6 +1497,7 @@ class CameraSettingsWidget(QFrame):
             self.entry_ROI_width.value(),
             self.entry_ROI_height.value(),
         )
+        self.signal_binning_changed.emit()
 
     def on_centered_toggled(self, checked: bool):
         """

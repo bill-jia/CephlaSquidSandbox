@@ -934,7 +934,7 @@ class MultiPointWorker:
                     self._log.warning(f"Failed to send Slack error notification: {e}")
             return False
         else:
-            self._log.info(f"Got result for job {job_result.job_id}, it completed!")
+            self._log.debug(f"Got result for job {job_result.job_id}, it completed!")
             # Handle DownsampledViewResult - update plate view
             if isinstance(job_result.result, DownsampledViewResult) and job_result.result.well_images:
                 self._handle_downsampled_view_result(job_result.result)

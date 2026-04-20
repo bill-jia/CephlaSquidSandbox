@@ -729,7 +729,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         crop_width, crop_height = self.get_crop_size()
         pixel_size_mm = self.get_pixel_size_binned_um() / 1000
-        self._log.info(f"Calculating FOV size with crop_width={crop_width}, crop_height={crop_height}, pixel_size_mm={pixel_size_mm}")
+        # self._log.info(f"Calculating FOV size with crop_width={crop_width}, crop_height={crop_height}, pixel_size_mm={pixel_size_mm}")
         return crop_width * pixel_size_mm, crop_height * pixel_size_mm
 
     def set_software_crop_ratio(self, width_ratio: float, height_ratio: float):

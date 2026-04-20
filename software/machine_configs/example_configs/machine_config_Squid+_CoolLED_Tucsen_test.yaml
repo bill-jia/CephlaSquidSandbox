@@ -42,6 +42,12 @@ devices:
         direction: output
         channel_id: "port0/line6"
         display_name: "Main camera trigger"
+      frame_readout:
+        controller: nidaq
+        signal_type: digital
+        direction: input
+        channel_id: "port0/line7"
+        display_name: "Main camera frame readout"
     config:
       model: "ARIES-6506"
       pixel_size_um: 6.5
@@ -51,6 +57,8 @@ devices:
       crop: { width: 2400, height: 2400 }
       rotate_angle: 0
       flip: null
+      reverse_x: true
+      reverse_y: false
       temperature: 0
       hardware_triggering_enabled: true
       readout_mode: "ROLLING"
@@ -103,6 +111,9 @@ devices:
         home_switch_polarity: 0
         scan_stabilization_time_ms: 20
         motor_config: stepper
+      canonical:
+        x: { sign: -1, origin_raw_mm: 121.332}
+        y: { sign: -1, origin_raw_mm: 80.4608}
       encoders:
         x: { enabled: false, has_encoder: false }
         y: { enabled: false, has_encoder: false }
@@ -244,13 +255,13 @@ illumination_devices:
 software:
   is_hcs: true
   wellplate_format: 96
-  default_saving_path: "/Downloads"
+  default_saving_path: "C:/Microscope_Data"
   display:
     default_crop: 85
     use_napari_for_live_view: false
     use_napari_for_mosaic: true
   acquisition:
-    image_format: bmp
+    image_format: tif
     scaling_factor: 0.85
     dx: 0.9
     dy: 0.9
@@ -262,6 +273,7 @@ software:
     fast_acquisition: true
     default_nx: 1
     default_ny: 1
+    illumination_settle_ms: 5
   autofocus:
     channel: "BF LED matrix full"
     enable_by_default: false

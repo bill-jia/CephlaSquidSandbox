@@ -183,17 +183,31 @@ clamping hits the right sorted bounds.
 - **`movement_sign`** untouched — still the motor-wiring knob that lives
   below the raw-mm boundary.
 
+## Napari mosaic switched to canonical frame (2026-04-19)
+
+The four `TEMPORARY:` negations in `NapariMosaicDisplayWidget`
+(`updateMosaic`, `convert_shape_to_mm`, `convert_mm_to_viewer_shapes`,
+`onDoubleClick`) are gone.  With `Stage.get_pos()` returning canonical
+(top-left origin, X right, Y down) and napari's world frame matching,
+the mosaic now places tiles at `(canonical_x − w/2, canonical_y − h/2)`
+and ROI shapes / double-click emit canonical coords that flow straight
+into `Stage.move_*_to`.
+
+This assumes the rig's yaml has the correct `canonical:` block.  On a demo
+rig whose raw frame has home at the physical bottom-right (e.g. the user's
+current setup: `x: {sign: -1, origin_raw_mm: 121.332}`, `y: {sign: -1,
+origin_raw_mm: 80.4608}`), the mosaic is now right-side-up.  On a
+production rig whose raw is already top-left origin, defaults
+(`sign: 1, origin_raw_mm: 0`) produce the same canonical identity → also
+right-side-up.  **If you run the demo without a canonical yaml block, the
+mosaic will display flipped** — that's the consequence of the canonical
+paradigm: the yaml is the single source of truth for axis orientation.
+
 ## Still pending
 
-These are the "real" consumer-side changes that must happen to actually
-realise the canonical flip visually on the demo rig (stage API and startup
-are already safe). Each assumes `canonical:` yaml is set so `Stage.get_pos()`
-returns true top-left-origin coordinates.
+These are the remaining consumer-side changes.  Each assumes `canonical:`
+yaml is set so `Stage.get_pos()` returns true top-left-origin coordinates.
 
-- Remove the four `TEMPORARY:` negations in
-  `software/gui/widgets/napari_views.py` (`NapariMosaicDisplayWidget`
-  methods `updateMosaic`, `convert_shape_to_mm`,
-  `convert_mm_to_viewer_shapes`, `onDoubleClick`).
 - Flip the Y sign in the joystick + click-to-move handlers
   (`software/gui/widgets/tracking_and_controls.py` `moveStage` and
   `viewerClicked`) so pushing up / clicking above still pans up in the new

@@ -1709,12 +1709,14 @@ class NapariMosaicDisplayWidget(QWidget):
             # Convert world coordinates (um) to data coordinates (pixels)
             y_data = point[0] / scale
             x_data = point[1] / scale
-            # Convert data coordinates to mm (viewer frame)
+            # Convert data coordinates to canonical mm.  ``top_left_coordinate``
+            # stores the mosaic's top-left corner in canonical frame (see
+            # updateMosaic), so adding a pixel offset scaled by the viewer
+            # pixel size gives the canonical coord of this shape vertex
+            # directly — no sign flip needed.
             x_mm = self.top_left_coordinate[1] + x_data * self.viewer_pixel_size_mm
             y_mm = self.top_left_coordinate[0] + y_data * self.viewer_pixel_size_mm
-            # TEMPORARY: viewer axes are negated relative to stage axes on
-            # both X and Y. See software/docs/pending/stage-control-refactor.md.
-            shape_data_mm.append([-x_mm, -y_mm])
+            shape_data_mm.append([x_mm, y_mm])
         return np.array(shape_data_mm)
 
     def convert_mm_to_viewer_shapes(self, shapes_mm):
@@ -1724,13 +1726,11 @@ class NapariMosaicDisplayWidget(QWidget):
         for shape_mm in shapes_mm:
             viewer_shape = []
             for point_mm in shape_mm:
-                # TEMPORARY: stage axes are negated relative to viewer axes on
-                # both X and Y. See software/docs/pending/stage-control-refactor.md.
-                x_mm_viewer = -point_mm[0]
-                y_mm_viewer = -point_mm[1]
-                # Convert mm to data coordinates (pixels)
-                x_data = (x_mm_viewer - self.top_left_coordinate[1]) / self.viewer_pixel_size_mm
-                y_data = (y_mm_viewer - self.top_left_coordinate[0]) / self.viewer_pixel_size_mm
+                # Both ``point_mm`` and ``top_left_coordinate`` are canonical
+                # mm (top-left origin, X right, Y down), which matches napari's
+                # world-frame convention — subtract directly to get pixel offset.
+                x_data = (point_mm[0] - self.top_left_coordinate[1]) / self.viewer_pixel_size_mm
+                y_data = (point_mm[1] - self.top_left_coordinate[0]) / self.viewer_pixel_size_mm
                 # Convert data coordinates to world coordinates (um)
                 world_coords = [y_data * scale, x_data * scale]
                 viewer_shape.append(world_coords)
@@ -1805,14 +1805,11 @@ class NapariMosaicDisplayWidget(QWidget):
                 interpolation=cv2.INTER_AREA,
             )
 
-        # TEMPORARY: stage X/Y as reported by the controller are flipped
-        # relative to the natural viewer frame, so we negate them here. This
-        # is a workaround — the real fix belongs in the Stage abstraction.
-        # See software/docs/pending/stage-control-refactor.md.
-        x_mm = -x_mm
-        y_mm = -y_mm
-
-        # adjust image position
+        # (x_mm, y_mm) arrive in the canonical frame (top-left origin, X grows
+        # right, Y grows down) from Stage.get_pos().  napari's default world
+        # frame matches, so the tile is placed without any flip. The image top-
+        # left corner sits half the image width/height up-and-left of the stage
+        # centre coord.
         x_mm -= (image.shape[1] * image_pixel_size_mm) / 2
         y_mm -= (image.shape[0] * image_pixel_size_mm) / 2
 
@@ -1993,12 +1990,11 @@ class NapariMosaicDisplayWidget(QWidget):
     def onDoubleClick(self, layer, event):
         coords = layer.world_to_data(event.position)
         if coords is not None:
+            # ``top_left_coordinate`` is canonical mm; the pixel offset from it
+            # gives the canonical coord of the click directly.  Stage.move_*_to
+            # (downstream of signal_coordinates_clicked) also takes canonical.
             x_mm = self.top_left_coordinate[1] + coords[-1] * self.viewer_pixel_size_mm
             y_mm = self.top_left_coordinate[0] + coords[-2] * self.viewer_pixel_size_mm
-            # TEMPORARY: viewer axes are negated relative to stage axes on
-            # both X and Y. See software/docs/pending/stage-control-refactor.md.
-            x_mm = -x_mm
-            y_mm = -y_mm
             print(f"move from click: ({x_mm:.6f}, {y_mm:.6f})")
             self.signal_coordinates_clicked.emit(x_mm, y_mm)
 

@@ -1543,6 +1543,12 @@ class NavigationViewer(QFrame):
     def redraw_fov(self):
         self.clear_overlay()
         self.update_fov_size()
+        # Re-render any previously registered scan tiles so their rectangles
+        # match the new FOV size (binning change resizes the FOV on the sample).
+        if getattr(self, "_registered_fovs", None):
+            snapshot = list(self._registered_fovs)
+            self._registered_fovs = []
+            self.register_fovs_to_image(snapshot)
         self.draw_current_fov(self.x_mm, self.y_mm)
 
     def update_wellplate_settings(
@@ -1636,6 +1642,13 @@ class NavigationViewer(QFrame):
         )
         self.background_item.setImage(self.background_image)
 
+    @staticmethod
+    def _fov_xy_mm(fov):
+        """Normalize a tuple/FovCenter to (x_mm, y_mm)."""
+        if isinstance(fov, tuple):
+            return float(fov[0]), float(fov[1])
+        return float(fov.x_mm), float(fov.y_mm)
+
     def register_fovs_to_image(self, fov_list):
         """
         Register FOVs to image with single display update.
@@ -1646,15 +1659,13 @@ class NavigationViewer(QFrame):
         if not fov_list:
             return
 
+        if not hasattr(self, "_registered_fovs"):
+            self._registered_fovs = []
+
         color = (252, 174, 30, 128)  # Yellow RGBA
         for fov in fov_list:
-            # Handle tuple (2D or 3D) and FovCenter object formats
-            if isinstance(fov, tuple):
-                x_mm = fov[0]
-                y_mm = fov[1]
-            else:
-                x_mm = fov.x_mm
-                y_mm = fov.y_mm
+            x_mm, y_mm = self._fov_xy_mm(fov)
+            self._registered_fovs.append((x_mm, y_mm))
             current_FOV_top_left, current_FOV_bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
             cv2.rectangle(
                 self.scan_overlay, current_FOV_top_left, current_FOV_bottom_right, color, self.box_line_thickness
@@ -1672,14 +1683,14 @@ class NavigationViewer(QFrame):
         if not fov_list:
             return
 
+        tracked = getattr(self, "_registered_fovs", None)
         for fov in fov_list:
-            # Handle tuple (2D or 3D) and FovCenter object formats
-            if isinstance(fov, tuple):
-                x_mm = fov[0]
-                y_mm = fov[1]
-            else:
-                x_mm = fov.x_mm
-                y_mm = fov.y_mm
+            x_mm, y_mm = self._fov_xy_mm(fov)
+            if tracked is not None:
+                try:
+                    tracked.remove((x_mm, y_mm))
+                except ValueError:
+                    pass
             current_FOV_top_left, current_FOV_bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
             cv2.rectangle(
                 self.scan_overlay, current_FOV_top_left, current_FOV_bottom_right, (0, 0, 0, 0), self.box_line_thickness
@@ -1707,6 +1718,7 @@ class NavigationViewer(QFrame):
     def clear_slide(self):
         self.background_image = self.background_image_copy.copy()
         self.background_item.setImage(self.background_image)
+        self._registered_fovs = []
         self.draw_current_fov(self.x_mm, self.y_mm)
 
     def clear_overlay(self):
