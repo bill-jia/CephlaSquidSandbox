@@ -80,7 +80,6 @@ devices:
         max_velocity_mm: 30
         max_acceleration_mm: 500
         movement_sign: 1
-        pos_sign: 1
         homing_enabled: true
         home_switch_polarity: 1
         scan_stabilization_time_ms: 25
@@ -93,7 +92,6 @@ devices:
         max_velocity_mm: 30
         max_acceleration_mm: 500
         movement_sign: 1
-        pos_sign: 1
         homing_enabled: true
         home_switch_polarity: 1
         scan_stabilization_time_ms: 25
@@ -106,7 +104,6 @@ devices:
         max_velocity_mm: 3.8
         max_acceleration_mm: 100
         movement_sign: -1
-        pos_sign: -1
         homing_enabled: true
         home_switch_polarity: 0
         scan_stabilization_time_ms: 20

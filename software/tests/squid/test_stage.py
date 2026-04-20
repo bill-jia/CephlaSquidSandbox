@@ -29,9 +29,10 @@ def test_position_caching():
 
     # Use 6 figures after the decimal so we test that we can capture nanometers
     p = squid.abc.Pos(x_mm=11.111111, y_mm=22.222222, z_mm=1.333333, theta_rad=None)
-    squid.stage.utils.cache_position(pos=p, stage_config=squid.config.get_stage_config(), cache_path=temp_cache_path)
+    cfg = squid.config.get_stage_config()
+    squid.stage.utils.cache_position(pos=p, stage_config=cfg, cache_path=temp_cache_path)
 
-    p_read = squid.stage.utils.get_cached_position(cache_path=temp_cache_path)
+    p_read = squid.stage.utils.get_cached_position(cache_path=temp_cache_path, stage_config=cfg)
 
     assert p_read == p
 
@@ -41,7 +42,9 @@ def test_get_cached_position_skips_bad_lines():
     with open(temp_cache_path, "w") as f:
         f.write("not,a,valid,extra\n")
         f.write("1.0,2.0,3.0\n")
-    p_read = squid.stage.utils.get_cached_position(cache_path=temp_cache_path)
+    p_read = squid.stage.utils.get_cached_position(
+        cache_path=temp_cache_path, stage_config=squid.config.get_stage_config()
+    )
     assert p_read == squid.abc.Pos(x_mm=1.0, y_mm=2.0, z_mm=3.0, theta_rad=None)
 
 

@@ -236,11 +236,14 @@ def apply_machine_config(mc: MachineConfig) -> None:
             setattr(control._def.SOFTWARE_POS_LIMIT, f"{uc}_POSITIVE", lim.get("positive", 56))
             setattr(control._def.SOFTWARE_POS_LIMIT, f"{uc}_NEGATIVE", lim.get("negative", -0.5))
 
-        # Limit switch polarity
+        # Limit switch polarity.  Readers (microcontroller.py:1484-1488,
+        # _def.py:1137-1139) use the prefix form {X,Y,Z}_HOME_SWITCH_POLARITY,
+        # so write there — earlier versions wrote to the suffix form, which
+        # silently dropped yaml values.
         for axis, uc in [("x", "X"), ("y", "Y"), ("z", "Z")]:
             polarity = s.get(axis, {}).get("home_switch_polarity")
             if polarity is not None:
-                setattr(control._def, f"HOME_SWITCH_POLARITY_{uc}", polarity)
+                setattr(control._def, f"{uc}_HOME_SWITCH_POLARITY", polarity)
 
         # Slide positions
         pos = s.get("positions", {})

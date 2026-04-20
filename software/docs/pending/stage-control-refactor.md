@@ -140,11 +140,55 @@ rig (stage rotated 180°, home already at physical top-left) stays at defaults
 and also behaves identically to today. To undo: delete the yaml block, or
 `git revert` the plumbing commit.
 
-## Still pending (blocked on dedicated test time)
+## Homing + startup path made canonical-safe (2026-04-19)
+
+`home_xyz` and the post-homing position restore are now safe to run with a
+flipped canonical yaml block.  Changes:
+
+- `control/microscope.py` `home_xyz`: `Z_HOME_SAFETY_POINT` and the `+20` mm /
+  `+50` mm clamp-clearance deltas are now projected through
+  `AxisConfig.raw_to_canonical` / `raw_to_canonical_delta` so they still move
+  the physical raw direction they were tuned for.
+- `squid/stage/utils.py`:
+  - `get_cached_position` takes an optional `stage_config` and converts the
+    on-disk raw mm into canonical.  The on-disk format is **raw mm** so old
+    caches survive the flip and toggling the yaml doesn't strand the cache.
+  - `cache_position` writes raw (converting from canonical input) and
+    validates against the raw limits.
+  - `clamp_pos_to_stage_limits` clamps canonical input against
+    `raw_to_canonical`-projected limits (and `sorted()`s them, since
+    `CANONICAL_SIGN=-1` swaps which raw bound is canonical-min vs canonical-max).
+  - `move_to_cached_or_default_startup_position` projects
+    `STARTUP_DEFAULT_STAGE_{X,Y,Z}_MM` and `Z_HOME_SAFETY_POINT` from raw to
+    canonical before handing them to the Stage API.
+  - `move_z_axis_to_safety_position` same conversion.
+- `gui/gui_hcs/main_window.py` Xeryon skip-init path: passes `stage_config`
+  to `get_cached_position` and projects `Z_HOME_SAFETY_POINT` to canonical.
+- Tests in `tests/squid/test_stage.py` updated; all pass.
+
+End-to-end smoke (canonical-flipped + identity): cache round-trips,
+old raw-only caches read back as the correct canonical position, canonical
+clamping hits the right sorted bounds.
+
+## Legacy yaml cleanup (2026-04-19)
+
+- **`pos_sign`** removed from every `machine_configs/*.yaml` — no Python
+  reads it (dead since the transition to the unified machine-config). Its
+  modern equivalent is `canonical.<axis>.sign`.
+- **`home_switch_polarity`** bridge fixed in
+  `control/core/config_bridge.py:240-247`: previously wrote to
+  `HOME_SWITCH_POLARITY_{X,Y,Z}` (suffix form) while every reader expects
+  `{X,Y,Z}_HOME_SWITCH_POLARITY` (prefix form), so yaml values were silently
+  dropped. Now writes to the prefix form.
+- **`movement_sign`** untouched — still the motor-wiring knob that lives
+  below the raw-mm boundary.
+
+## Still pending
 
 These are the "real" consumer-side changes that must happen to actually
-realise the canonical flip on the demo rig. Each assumes `canonical` yaml is
-set so `Stage.get_pos()` returns true top-left-origin coordinates.
+realise the canonical flip visually on the demo rig (stage API and startup
+are already safe). Each assumes `canonical:` yaml is set so `Stage.get_pos()`
+returns true top-left-origin coordinates.
 
 - Remove the four `TEMPORARY:` negations in
   `software/gui/widgets/napari_views.py` (`NapariMosaicDisplayWidget`
@@ -154,16 +198,24 @@ set so `Stage.get_pos()` returns true top-left-origin coordinates.
   (`software/gui/widgets/tracking_and_controls.py` `moveStage` and
   `viewerClicked`) so pushing up / clicking above still pans up in the new
   Y-grows-down canonical frame.
-- Update `software/control/sample_formats.csv` `a1_x_mm` / `a1_y_mm` to
-  canonical frame (`56 - raw` for both axes on the demo rig).
-- Update `STARTUP_DEFAULT_STAGE_X_MM` / `_Y_MM` in `software/control/_def.py`
-  to canonical values.
-- Decide whether `SOFTWARE_POS_LIMIT` should be canonical or stay raw;
-  today consumers treat it as ambient so the choice ripples.
-- Delete `cache/last_coords.txt` once (format changes from raw to canonical).
-- Flag migration needs for any user-saved `coordinates.csv` / focus-map
-  exports / acquisition yamls — they are in raw frame and will be
-  misinterpreted as canonical after the flip.
+- Update `software/control/sample_formats.csv` `a1_x_mm` / `a1_y_mm` semantics
+  or project through the canonical helpers on load.  The wellplate-center
+  math in `scan_coordinates.py` feeds straight into `stage.move_*_to`, which
+  now takes canonical — so either the CSV values become canonical, or the
+  loader calls `raw_to_canonical`.
+- Loading/scanning positions in `squid/stage/utils.py` (`_move_to_loading_position_impl`
+  etc.) — the hardcoded 15 / 35 and `SLIDE_POSITION.LOADING_{X,Y}_MM` are raw;
+  need the same `raw_to_canonical` projection that `home_xyz` now has.
+- `SOFTWARE_POS_LIMIT` — still raw, consumed by GUI clamping and scan bounds
+  in several places. Either keep raw and have consumers project, or move to
+  canonical throughout.
+- Star-imported MCU config values in `microcontroller.py` (`Z_HOME_SWITCH_POLARITY`,
+  `Z_HOME_SAFETY_MARGIN_UM`, `MAX_VELOCITY_Z_mm`, etc.) are frozen at import
+  time so yaml bridges for Z config are still dropped — separate bug from
+  the canonical work.
+- Flag migration needs for user-saved `coordinates.csv` / focus-map exports /
+  acquisition yamls — they are in raw frame (from the old `stage.get_pos()`
+  semantics) and will be misinterpreted as canonical after the flip.
 
 ## Tucsen ReverseX/ReverseY now yaml-configurable (2026-04-19)
 

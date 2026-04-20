@@ -265,10 +265,11 @@ class HighContentScreeningGui(QMainWindow):
         # except Z when using Xeryon (Z was retracted during cleanup).
         if self._skip_init:
             if USE_XERYON and self.objective_changer:
-                if cached_pos := squid.stage.utils.get_cached_position():
-                    safety_z_mm = int(Z_HOME_SAFETY_POINT) / 1000.0
-                    target_z_mm = max(cached_pos.z_mm, safety_z_mm)
-                    self.log.info(f"Restoring cached Z position after Xeryon restart: {target_z_mm} mm")
+                stage_cfg = self.stage.get_config()
+                if cached_pos := squid.stage.utils.get_cached_position(stage_config=stage_cfg):
+                    safety_z_canonical_mm = stage_cfg.Z_AXIS.raw_to_canonical(int(Z_HOME_SAFETY_POINT) / 1000.0)
+                    target_z_mm = max(cached_pos.z_mm, safety_z_canonical_mm)
+                    self.log.info(f"Restoring cached Z position after Xeryon restart: {target_z_mm} mm (canonical)")
                     self.stage.move_z_to(target_z_mm)
             else:
                 self.log.info("Skipping cached position restoration (--skip-init flag set)")

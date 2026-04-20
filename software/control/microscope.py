@@ -1075,16 +1075,27 @@ class Microscope:
         X/Y homing motion so the objective stays clear. Performs a coordinated X/Y
         homing sequence that avoids the plate clamp actuation post by moving Y first,
         homing X, moving X clear, then homing Y.
+
+        Note: ``Z_HOME_SAFETY_POINT`` and the 20 mm / 50 mm clamp-clearance
+        distances below are raw-frame (physical, motor-direction) values.  We
+        translate them through ``AxisConfig.raw_to_canonical[_delta]`` so the
+        physical motion is unchanged whether the rig runs with the default
+        identity canonical frame or a flipped one.
         """
-        safety_z_mm = int(control._def.Z_HOME_SAFETY_POINT) / 1000.0
+        x_axis = self.stage.get_config().X_AXIS
+        y_axis = self.stage.get_config().Y_AXIS
+        z_axis = self.stage.get_config().Z_AXIS
+
+        safety_z_raw_mm = int(control._def.Z_HOME_SAFETY_POINT) / 1000.0
+        safety_z_canonical_mm = z_axis.raw_to_canonical(safety_z_raw_mm)
 
         if control._def.HOMING_ENABLED_Z:
             self.stage.home(x=False, y=False, z=True, theta=False)
 
         # Home X and Y axes with safety movements
         if control._def.HOMING_ENABLED_X and control._def.HOMING_ENABLED_Y:
-            self._log.info(f"Moving Z to Z_HOME_SAFETY_POINT ({safety_z_mm} mm) before X/Y homing.")
-            self.stage.move_z_to(safety_z_mm)
+            self._log.info(f"Moving Z to Z_HOME_SAFETY_POINT ({safety_z_raw_mm} mm raw) before X/Y homing.")
+            self.stage.move_z_to(safety_z_canonical_mm)
             # The plate clamp actuation post can get in the way of homing if we start with
             # the stage in "just the wrong" position.  Blindly moving the Y out 20, then home x
             # and move x over 20 , guarantees we'll clear the post for homing.  If we are <20mm
@@ -1095,12 +1106,12 @@ class Microscope:
             # This doesn't seem to cause problems, and there isn't a clean way to avoid the corner
             # case.
             self._log.info("Moving y+20, then x->home->+50 to make sure system is clear for homing.")
-            # Move Y away from loading position to clear clamp
-            self.stage.move_y(20)
+            # Move Y away from loading position to clear clamp (+20 mm in raw frame).
+            self.stage.move_y(y_axis.raw_to_canonical_delta(20))
             # Home X axis
             self.stage.home(x=True, y=False, z=False, theta=False)
-            # Move X away from home position
-            self.stage.move_x(50)
+            # Move X away from home position (+50 mm in raw frame).
+            self.stage.move_x(x_axis.raw_to_canonical_delta(50))
 
             # Now home Y axis (clamp should be clear)
             self._log.info("Homing the Y axis...")
