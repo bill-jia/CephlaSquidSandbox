@@ -1320,6 +1320,16 @@ class HighContentScreeningGui(QMainWindow):
                 lambda: self.toggleWellSelector(not self.dock_wellSelection.isVisible())
             )
 
+        # Force one FOV-cache refresh after all signal connections are wired up.
+        # The NavigationViewer's cache is seeded during its __init__ using the
+        # ObjectiveStore's default objective, which predates any user selection
+        # / machine_config / cache file override. Subsequent changes re-sync via
+        # signal_objective_changed / signal_binning_changed, but the initial
+        # signal fires during widget construction (before make_connections ran)
+        # and was lost — causing the yellow scan tiles to draw at the
+        # default-objective/binning FOV until the user touched something.
+        self.navigationViewer.redraw_fov()
+
     def setup_movement_updater(self):
         # We provide a few signals about the system's physical movement to other parts of the UI.  Ideally, they other
         # parts would register their interest (instead of us needing to know that they want to hear about the movements

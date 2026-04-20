@@ -17,6 +17,7 @@ Hardware gating rules:
 
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
@@ -59,6 +60,17 @@ class ObservationStateController:
         self.enable_channel_auto_filter_switching: bool = True
         # Set after construction to avoid circular dependency
         self.live_controller: Optional["LiveController"] = None
+        # Optional timing manager for fine-grained profiling of apply paths.
+        # Callers (e.g. MultiPointWorker) may assign a TimingManager here to
+        # collect sub-step timings; None means timers are no-ops.
+        self._timing: Optional[Any] = None
+
+    def _time(self, name: str):
+        """Return a context manager that records elapsed time under ``name`` if
+        a TimingManager has been attached to ``self._timing``; otherwise a no-op."""
+        if self._timing is None:
+            return contextlib.nullcontext()
+        return self._timing.get_timer(name)
 
     # ─────────────────────────────────────────────────────────────────────
     # Properties
@@ -214,7 +226,7 @@ class ObservationStateController:
     def toggle_confocal_widefield(self, confocal: bool) -> None:
         """Toggle between confocal and widefield modes (state only, not hardware)."""
         self._confocal_mode = bool(confocal)
-        self._log.info("Imaging mode set to: %s", "confocal" if self._confocal_mode else "widefield")
+        # self._log.info("Imaging mode set to: %s", "confocal" if self._confocal_mode else "widefield")
 
     def is_confocal_mode(self) -> bool:
         return self._confocal_mode
@@ -254,14 +266,18 @@ class ObservationStateController:
         for ist in self._current_state.illuminator_states:
             mode = ist.led_matrix_mode
             if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
-                ic.set_led_matrix_mode(mode)
+                with self._time("obs:ip:set_led_matrix_mode"):
+                    ic.set_led_matrix_mode(mode)
 
-            ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
-            ic.set_channel_state(ist.illumination_channel, ist.on)
+            with self._time("obs:ip:set_channel_intensity"):
+                ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
+            with self._time("obs:ip:set_channel_state"):
+                ic.set_channel_state(ist.illumination_channel, ist.on)
 
             if not ist.on:
                 continue
-            illum_config = self.config_repo.get_illumination_config()
+            with self._time("obs:ip:get_illumination_config"):
+                illum_config = self.config_repo.get_illumination_config()
             wavelength = None
             if illum_config:
                 ch_def = illum_config.get_channel_by_name(ist.illumination_channel)
@@ -269,11 +285,12 @@ class ObservationStateController:
                     wavelength = ch_def.wavelength_nm
 
             if wavelength and self.microscope.addons.nl5 and NL5_USE_DOUT:
-                self.microscope.addons.nl5.set_active_channel(NL5_WAVENLENGTH_MAP[wavelength])
-                if NL5_USE_AOUT:
-                    self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
-                if self.microscope.addons.cellx and ENABLE_CELLX:
-                    self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
+                with self._time("obs:ip:nl5_cellx"):
+                    self.microscope.addons.nl5.set_active_channel(NL5_WAVENLENGTH_MAP[wavelength])
+                    if NL5_USE_AOUT:
+                        self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
+                    if self.microscope.addons.cellx and ENABLE_CELLX:
+                        self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
 
     def apply_optical_path(self) -> None:
         """Set emission filter positions and confocal iris values."""
@@ -284,29 +301,32 @@ class ObservationStateController:
         if ENABLE_SPINNING_DISK_CONFOCAL and self.microscope.addons.xlight and not USE_DRAGONFLY:
             try:
                 if emission_filter_position is not None:
-                    self.microscope.addons.xlight.set_emission_filter(
-                        emission_filter_position,
-                        extraction=False,
-                        validate=XLIGHT_VALIDATE_WHEEL_POS,
-                    )
+                    with self._time("obs:op:xlight_set_emission_filter"):
+                        self.microscope.addons.xlight.set_emission_filter(
+                            emission_filter_position,
+                            extraction=False,
+                            validate=XLIGHT_VALIDATE_WHEEL_POS,
+                        )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
             hw_settings = self._current_state.confocal_hardware_settings
             if hw_settings is not None:
                 xlight = self.microscope.addons.xlight
                 try:
-                    if hw_settings.illumination_iris is not None and xlight.has_illumination_iris_diaphragm:
-                        xlight.set_illumination_iris(int(hw_settings.illumination_iris))
-                    if hw_settings.emission_iris is not None and xlight.has_emission_iris_diaphragm:
-                        xlight.set_emission_iris(int(hw_settings.emission_iris))
+                    with self._time("obs:op:xlight_iris"):
+                        if hw_settings.illumination_iris is not None and xlight.has_illumination_iris_diaphragm:
+                            xlight.set_illumination_iris(int(hw_settings.illumination_iris))
+                        if hw_settings.emission_iris is not None and xlight.has_emission_iris_diaphragm:
+                            xlight.set_emission_iris(int(hw_settings.emission_iris))
                 except (OSError, ValueError) as e:
                     self._log.warning("Not setting iris values: %s", e)
         elif ENABLE_SPINNING_DISK_CONFOCAL and USE_DRAGONFLY and self.microscope.addons.dragonfly:
             try:
-                self.microscope.addons.dragonfly.set_emission_filter(
-                    self.microscope.addons.dragonfly.get_camera_port(),
-                    emission_filter_position,
-                )
+                with self._time("obs:op:dragonfly_set_emission_filter"):
+                    self.microscope.addons.dragonfly.set_emission_filter(
+                        self.microscope.addons.dragonfly.get_camera_port(),
+                        emission_filter_position,
+                    )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
 
@@ -314,15 +334,17 @@ class ObservationStateController:
             lc = self.live_controller
             trigger_mode = lc.trigger_mode if lc else None
             try:
-                if trigger_mode == TriggerMode.SOFTWARE:
-                    self.microscope.addons.emission_filter_wheel.set_delay_offset_ms(0)
-                elif trigger_mode == TriggerMode.HARDWARE:
-                    self.microscope.addons.emission_filter_wheel.set_delay_offset_ms(
-                        -self.camera.get_strobe_time()
+                with self._time("obs:op:efw_set_delay_offset"):
+                    if trigger_mode == TriggerMode.SOFTWARE:
+                        self.microscope.addons.emission_filter_wheel.set_delay_offset_ms(0)
+                    elif trigger_mode == TriggerMode.HARDWARE:
+                        self.microscope.addons.emission_filter_wheel.set_delay_offset_ms(
+                            -self.camera.get_strobe_time()
+                        )
+                with self._time("obs:op:efw_set_position"):
+                    self.microscope.addons.emission_filter_wheel.set_filter_wheel_position(
+                        {1: emission_filter_position}
                     )
-                self.microscope.addons.emission_filter_wheel.set_filter_wheel_position(
-                    {1: emission_filter_position}
-                )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
 
@@ -350,15 +372,19 @@ class ObservationStateController:
         self._current_state = state
 
         # Camera settings
-        self.camera.set_exposure_time(state.exposure_time)
+        with self._time("obs:fos:set_exposure_time"):
+            self.camera.set_exposure_time(state.exposure_time)
         try:
-            self.camera.set_analog_gain(state.analog_gain)
+            with self._time("obs:fos:set_analog_gain"):
+                self.camera.set_analog_gain(state.analog_gain)
         except NotImplementedError:
             pass
 
         # Illumination + optical path
-        self.apply_illumination_parameters()
-        self.apply_optical_path()
+        with self._time("obs:fos:apply_illumination_parameters"):
+            self.apply_illumination_parameters()
+        with self._time("obs:fos:apply_optical_path"):
+            self.apply_optical_path()
 
         if is_live and lc:
             self.turn_on_illumination()
@@ -380,7 +406,8 @@ class ObservationStateController:
         Handles confocal mode, emission filters, camera_live snapshot (ROI, binning, trigger),
         then delegates to apply_full_observation_state for camera + illumination + optical path.
         """
-        self.toggle_confocal_widefield(state.confocal_mode)
+        with self._time("obs:preset:toggle_confocal_widefield"):
+            self.toggle_confocal_widefield(state.confocal_mode)
 
         if state.enable_channel_auto_filter_switching is not None:
             self.enable_channel_auto_filter_switching = bool(state.enable_channel_auto_filter_switching)
@@ -393,18 +420,21 @@ class ObservationStateController:
         ):
             try:
                 pos = {int(k): int(v) for k, v in state.emission_filter_positions.items()}
-                emission_filter_wheel.set_filter_wheel_position(pos)
+                with self._time("obs:preset:efw_set_position"):
+                    emission_filter_wheel.set_filter_wheel_position(pos)
             except Exception as e:
                 self._log.warning("Could not apply emission filter positions: %s", e)
 
         # Camera settings from camera_settings block
         if state.camera_settings is not None:
             try:
-                self.camera.set_exposure_time(state.camera_settings.exposure_time_ms)
+                with self._time("obs:preset:cs_set_exposure_time"):
+                    self.camera.set_exposure_time(state.camera_settings.exposure_time_ms)
             except Exception as e:
                 self._log.warning("Could not set exposure: %s", e)
             try:
-                self.camera.set_analog_gain(state.camera_settings.gain_mode)
+                with self._time("obs:preset:cs_set_analog_gain"):
+                    self.camera.set_analog_gain(state.camera_settings.gain_mode)
             except Exception:
                 pass
             if state.camera_settings.pixel_format:
@@ -418,19 +448,22 @@ class ObservationStateController:
                                 pf = e
                                 break
                     if pf is not None:
-                        self.camera.set_pixel_format(pf)
+                        with self._time("obs:preset:cs_set_pixel_format"):
+                            self.camera.set_pixel_format(pf)
                 except Exception as e:
                     self._log.warning("Could not set pixel format: %s", e)
 
         # Camera live snapshot (ROI, binning, trigger)
         if state.camera_live is not None:
-            self._apply_camera_live_snapshot(
-                state.camera_live,
-                apply_live_trigger_settings=apply_live_trigger_settings,
-            )
+            with self._time("obs:preset:apply_camera_live_snapshot"):
+                self._apply_camera_live_snapshot(
+                    state.camera_live,
+                    apply_live_trigger_settings=apply_live_trigger_settings,
+                )
 
         # Full apply (illumination + optical path + state switch)
-        self.apply_full_observation_state(state)
+        with self._time("obs:preset:apply_full_observation_state"):
+            self.apply_full_observation_state(state)
 
     # ─────────────────────────────────────────────────────────────────────
     # Collection (moved from observation_state_service)
@@ -563,11 +596,13 @@ class ObservationStateController:
     ) -> None:
         """Apply ROI/binning/mode/trigger saved with the preset."""
         try:
-            self.camera.set_exposure_time(snap.exposure_time_ms)
+            with self._time("obs:cls:set_exposure_time"):
+                self.camera.set_exposure_time(snap.exposure_time_ms)
         except Exception as e:
             self._log.warning("Could not set exposure: %s", e)
         try:
-            self.camera.set_analog_gain(snap.analog_gain)
+            with self._time("obs:cls:set_analog_gain"):
+                self.camera.set_analog_gain(snap.analog_gain)
         except Exception:
             pass
         if snap.pixel_format:
@@ -580,23 +615,27 @@ class ObservationStateController:
                             pf = e
                             break
                 if pf is not None:
-                    self.camera.set_pixel_format(pf)
+                    with self._time("obs:cls:set_pixel_format"):
+                        self.camera.set_pixel_format(pf)
             except Exception as e:
                 self._log.warning("Could not set pixel format: %s", e)
         if snap.camera_mode is not None:
             try:
-                self.camera.set_camera_mode(snap.camera_mode)
+                with self._time("obs:cls:set_camera_mode"):
+                    self.camera.set_camera_mode(snap.camera_mode)
             except Exception as e:
                 self._log.warning("Could not set camera mode: %s", e)
         try:
-            self.camera.set_binning(snap.binning_x, snap.binning_y)
+            with self._time("obs:cls:set_binning"):
+                self.camera.set_binning(snap.binning_x, snap.binning_y)
         except Exception as e:
             self._log.warning("Could not set binning: %s", e)
         if snap.roi_width > 0 and snap.roi_height > 0:
             try:
-                self.camera.set_region_of_interest(
-                    snap.roi_offset_x, snap.roi_offset_y, snap.roi_width, snap.roi_height
-                )
+                with self._time("obs:cls:set_region_of_interest"):
+                    self.camera.set_region_of_interest(
+                        snap.roi_offset_x, snap.roi_offset_y, snap.roi_width, snap.roi_height
+                    )
             except Exception as e:
                 self._log.warning("Could not set ROI: %s", e)
 
@@ -604,12 +643,14 @@ class ObservationStateController:
         if lc is not None and apply_live_trigger_settings:
             if snap.trigger_mode:
                 try:
-                    lc.set_trigger_mode(snap.trigger_mode)
+                    with self._time("obs:cls:set_trigger_mode"):
+                        lc.set_trigger_mode(snap.trigger_mode)
                 except Exception as e:
                     self._log.warning("Could not set trigger mode: %s", e)
             if snap.trigger_fps is not None and snap.trigger_fps > 0:
                 try:
-                    lc.set_trigger_fps(snap.trigger_fps)
+                    with self._time("obs:cls:set_trigger_fps"):
+                        lc.set_trigger_fps(snap.trigger_fps)
                 except Exception as e:
                     self._log.warning("Could not set trigger FPS: %s", e)
 

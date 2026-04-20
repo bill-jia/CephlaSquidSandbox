@@ -1325,7 +1325,7 @@ class JobRunner(multiprocessing.Process):
                 if job is None:
                     continue
 
-                self._log.info(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
+                self._log.debug(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
 
                 # Set operation context for memory tracking
                 if isinstance(job, DownsampledViewJob):
@@ -1339,14 +1339,14 @@ class JobRunner(multiprocessing.Process):
 
                 # Only queue non-None results (DownsampledViewJob returns None for intermediate FOVs)
                 if result is not None:
-                    self._log.info(
+                    self._log.debug(
                         f"Job {job.job_id} returned in {(t_run_end - t_run_start)*1000:.1f}ms. "
                         f"Sending result to output queue."
                     )
                     self._output_queue.put_nowait(JobResult(job_id=job.job_id, result=result, exception=None))
                     self._log.debug(f"Result for {job.job_id} is on output queue.")
                 else:
-                    self._log.debug(
+                    self._log.warning(
                         f"Job {job.job_id} returned None in {(t_run_end - t_run_start)*1000:.1f}ms, not queuing."
                     )
             except queue.Empty:

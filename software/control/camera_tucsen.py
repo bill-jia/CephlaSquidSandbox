@@ -474,6 +474,10 @@ class TucsenCamera(AbstractCamera):
         self._strobe_delay_ms: float = 0.0
         self._rolling_shutter_readout_ms: float = 0.0
         self.temperature_reading_callback = None
+        # GenICam writes need ≥100 ms between them or the camera returns errors.
+        # Track the last write so _set_genicam_parameter can gate only when
+        # natural inter-write work hasn't already filled that gap.
+        self._last_genicam_write_ts: float = 0.0
         # GenICam ExposureTime is an integer in microseconds; all other code
         # in this class treats _exposure_time_ms as milliseconds, so convert.
         self._exposure_time_ms: float = (
@@ -1082,7 +1086,7 @@ class TucsenCamera(AbstractCamera):
 
         self._exposure_time_ms = exposure_time_ms
         self._trigger_sent.clear()
-        self._log.info(f"Exposure time set to {exposure_time_ms} ms (adjusted: {adjusted_exposure_time} ms)")
+        # self._log.info(f"Exposure time set to {exposure_time_ms} ms (adjusted: {adjusted_exposure_time} ms)")
 
     def _uses_hw_trigger_timing(self) -> bool:
         """True when the LED is pulsed by the microcontroller synchronously with the
@@ -1746,18 +1750,18 @@ class TucsenCamera(AbstractCamera):
             self._last_trigger_timestamp = time.time()
             self._triggers_sent_since_start += 1
             self._trigger_sent.set()
-            return
-        if self._acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
-            self._triggers_sent_since_start += 1
-            self._hw_trigger_fn(illumination_time)
         elif self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
-            self._triggers_sent_since_start += 1
-            if self._model_properties.is_genicam:
-                self._set_genicam_parameter("TriggerSoftwarePulse", 1, TUELEM_TYPE.TU_ElemCommand.value)
-            else:
-                TUCAM_Cap_DoSoftwareTrigger(self._camera)
+            # self._triggers_sent_since_start += 1
+            # if self._model_properties.is_genicam:
+            self._set_genicam_parameter("TriggerSoftwarePulse", 1, TUELEM_TYPE.TU_ElemCommand.value)
+            # else:
+                # TUCAM_Cap_DoSoftwareTrigger(self._camera)
             self._last_trigger_timestamp = time.time()
             self._trigger_sent.set()
+        elif self._acquisition_mode == CameraAcquisitionMode.HARDWARE_TRIGGER:
+            self._triggers_sent_since_start += 1
+            self._hw_trigger_fn(illumination_time)
+
 
     def get_ready_for_trigger(self) -> bool:
         if time.time() - self._last_trigger_timestamp > 1.5 * ((self.get_total_frame_time() + 4) / 1000.0):
@@ -1947,6 +1951,15 @@ class TucsenCamera(AbstractCamera):
         if not self._model_properties.is_genicam:
             raise CameraError("This camera model does not support GenICam interface")
 
+        # Ensure ≥100 ms since the previous GenICam write. Sequential writes
+        # with no gap cause the camera to return errors; we used to pay a flat
+        # 100 ms after every write, but during multipoint most of that gap is
+        # already filled by moves, captures, illumination setup, etc.
+        _GENICAM_WRITE_GAP_S = 0.001
+        elapsed_since_last_write = time.perf_counter() - self._last_genicam_write_ts
+        if elapsed_since_last_write < _GENICAM_WRITE_GAP_S:
+            time.sleep(_GENICAM_WRITE_GAP_S - elapsed_since_last_write)
+
         # Element type names for logging
         elem_type_names = [
             "Value",
@@ -2033,5 +2046,5 @@ class TucsenCamera(AbstractCamera):
         if log_info:
             self._log.info(f"[{elem_type_names[node.Type]}] Set {param_name} = {value}")
 
-        time.sleep(0.1) # Sleep to avoid sequential parameter setting from causing errors
+        self._last_genicam_write_ts = time.perf_counter()
         return True

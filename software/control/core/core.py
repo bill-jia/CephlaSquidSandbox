@@ -1541,14 +1541,11 @@ class NavigationViewer(QFrame):
         self.fov_size_mm = min(self.fov_width_mm, self.fov_height_mm)
 
     def redraw_fov(self):
-        self.clear_overlay()
-        self.update_fov_size()
-        # Re-render any previously registered scan tiles so their rectangles
-        # match the new FOV size (binning change resizes the FOV on the sample).
-        if getattr(self, "_registered_fovs", None):
-            snapshot = list(self._registered_fovs)
-            self._registered_fovs = []
-            self.register_fovs_to_image(snapshot)
+        # _rebuild_scan_overlay refreshes the FOV cache; draw_current_fov then
+        # reads that fresh cache. Clear stale focus-point markers too.
+        self._rebuild_scan_overlay()
+        self.focus_point_overlay.fill(0)
+        self.focus_point_overlay_item.setImage(self.focus_point_overlay)
         self.draw_current_fov(self.x_mm, self.y_mm)
 
     def update_wellplate_settings(
@@ -1592,6 +1589,15 @@ class NavigationViewer(QFrame):
         self.draw_current_fov(self.x_mm, self.y_mm)
 
     def draw_fov_current_location(self, pos: squid.abc.Pos):
+        # First valid position update primes the FOV cache once. The cache
+        # was seeded in __init__ using whatever ObjectiveStore.current_objective
+        # was at that moment (DEFAULT_OBJECTIVE), which predates the user's
+        # actual selection applied via ObjectivesWidget.__init__. Signal-driven
+        # refreshes cover every later change; this just catches the startup
+        # window before any user-facing change has occurred.
+        if not getattr(self, "_fov_cache_primed", False):
+            self.update_fov_size()
+            self._fov_cache_primed = True
         if not pos:
             if self.x_mm is None and self.y_mm is None:
                 return
@@ -1628,6 +1634,11 @@ class NavigationViewer(QFrame):
 
     def draw_current_fov(self, x_mm, y_mm):
         self.fov_overlay.fill(0)
+        if x_mm is None or y_mm is None:
+            # No stage position yet (early startup) — leave the overlay blank
+            # until position_after_move fires.
+            self.fov_overlay_item.setImage(self.fov_overlay)
+            return
         current_FOV_top_left, current_FOV_bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
         cv2.rectangle(
             self.fov_overlay, current_FOV_top_left, current_FOV_bottom_right, (255, 0, 0, 255), self.box_line_thickness
@@ -1649,6 +1660,33 @@ class NavigationViewer(QFrame):
             return float(fov[0]), float(fov[1])
         return float(fov.x_mm), float(fov.y_mm)
 
+    def _rebuild_scan_overlay(self):
+        """Wipe the scan overlay and redraw every tracked FOV rectangle.
+
+        Used whenever the set of rendered FOVs shrinks or the FOV geometry
+        changes (binning/ROI). Attempting to erase individual rectangles by
+        drawing transparent outlines was fragile because (a) outlines of
+        different-sized rectangles don't cover the previous outline pixels,
+        leaving stale lines behind, and (b) adjacent rectangles share edge
+        pixels so erasing one partially wipes its neighbor. Rebuilding from
+        the tracked list is O(n) but always correct.
+        """
+        # Overlay rebuilds are low-frequency (binning/ROI change, region
+        # add/remove). Refresh the cached FOV size here so the rectangles
+        # match what the camera will actually capture — even if an upstream
+        # signal path was missed. Note: draw_current_fov is intentionally
+        # NOT on this path; it fires at stage-poll rate and relies on the
+        # signal-driven cache to avoid hitting the camera every frame.
+        self.update_fov_size()
+        self.scan_overlay.fill(0)
+        tracked = getattr(self, "_registered_fovs", None)
+        if tracked:
+            color = (252, 174, 30, 128)  # Yellow RGBA
+            for x_mm, y_mm in tracked:
+                top_left, bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
+                cv2.rectangle(self.scan_overlay, top_left, bottom_right, color, self.box_line_thickness)
+        self.scan_overlay_item.setImage(self.scan_overlay)
+
     def register_fovs_to_image(self, fov_list):
         """
         Register FOVs to image with single display update.
@@ -1662,41 +1700,32 @@ class NavigationViewer(QFrame):
         if not hasattr(self, "_registered_fovs"):
             self._registered_fovs = []
 
+        # Low-frequency path — refresh the cache so new tiles render at the
+        # current binning/ROI even if we missed a setter-side signal.
+        self.update_fov_size()
         color = (252, 174, 30, 128)  # Yellow RGBA
         for fov in fov_list:
             x_mm, y_mm = self._fov_xy_mm(fov)
             self._registered_fovs.append((x_mm, y_mm))
-            current_FOV_top_left, current_FOV_bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
-            cv2.rectangle(
-                self.scan_overlay, current_FOV_top_left, current_FOV_bottom_right, color, self.box_line_thickness
-            )
-        # Single update after all rectangles are drawn
+            top_left, bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
+            cv2.rectangle(self.scan_overlay, top_left, bottom_right, color, self.box_line_thickness)
         self.scan_overlay_item.setImage(self.scan_overlay)
 
     def deregister_fovs_from_image(self, fov_list):
-        """
-        Deregister FOVs from image with single display update.
-
-        Args:
-            fov_list: List of tuples (x_mm, y_mm) or (x_mm, y_mm, z_mm), or list of FovCenter objects
-        """
+        """Remove FOVs from the tracked list and rebuild the overlay."""
         if not fov_list:
             return
 
         tracked = getattr(self, "_registered_fovs", None)
+        if tracked is None:
+            return
         for fov in fov_list:
             x_mm, y_mm = self._fov_xy_mm(fov)
-            if tracked is not None:
-                try:
-                    tracked.remove((x_mm, y_mm))
-                except ValueError:
-                    pass
-            current_FOV_top_left, current_FOV_bottom_right = self.get_FOV_pixel_coordinates(x_mm, y_mm)
-            cv2.rectangle(
-                self.scan_overlay, current_FOV_top_left, current_FOV_bottom_right, (0, 0, 0, 0), self.box_line_thickness
-            )
-        # Single update after all rectangles are cleared
-        self.scan_overlay_item.setImage(self.scan_overlay)
+            try:
+                tracked.remove((x_mm, y_mm))
+            except ValueError:
+                pass
+        self._rebuild_scan_overlay()
 
     def register_focus_point(self, x_mm, y_mm):
         """Draw focus point marker as filled circle centered on the FOV"""
@@ -1722,6 +1751,7 @@ class NavigationViewer(QFrame):
         self.draw_current_fov(self.x_mm, self.y_mm)
 
     def clear_overlay(self):
+        self._registered_fovs = []
         self.scan_overlay.fill(0)
         self.scan_overlay_item.setImage(self.scan_overlay)
         self.focus_point_overlay.fill(0)

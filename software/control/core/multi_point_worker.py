@@ -522,6 +522,10 @@ class MultiPointWorker:
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
+        # Share the timing manager with the observation state controller so
+        # apply_observation_state_preset's sub-steps contribute to the report.
+        obs_controller = self.liveController.obs_controller
+        obs_controller._timing = self._timing
         try:
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
@@ -608,6 +612,10 @@ class MultiPointWorker:
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
             self._log.info(self._timing.get_report())
+            # Detach the timing manager from the obs controller so live-mode
+            # calls from widgets don't keep writing into the acquisition's
+            # timing report.
+            obs_controller._timing = None
             if this_image_callback_id:
                 self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
                 self.camera.remove_frame_callback(this_image_callback_id)
@@ -1345,10 +1353,11 @@ class MultiPointWorker:
                     return
 
     def acquire_at_position(self, region_id, current_path, fov):
-        if not self.perform_autofocus(region_id, fov):
-            self._log.error(
-                f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
-            )
+        with self._timing.get_timer("perform_autofocus"):
+            if not self.perform_autofocus(region_id, fov):
+                self._log.error(
+                    f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+                )
 
         if self.NZ > 1:
             self.prepare_z_stack()
@@ -1602,7 +1611,6 @@ class MultiPointWorker:
         using_preset_obs_state = self._use_observation_presets
         with self._timing.get_timer("illuminate_for_capture"):
             if using_preset_obs_state:
-                self._log.info("Using observation snapshot for capture")
                 self._apply_current_illumination_state_to_hardware()
             else:
                 self._log.info("Using legacy illumination for capture")
@@ -1614,7 +1622,7 @@ class MultiPointWorker:
         # top-bright gradient. Configured per-rig via
         # software.acquisition.illumination_settle_ms in the machine config.
         settle_ms = control._def.Acquisition.ILLUMINATION_SETTLE_MS
-        self._log.info(f"Acquisition settle ms: {settle_ms}")
+        # self._log.info(f"Acquisition settle ms: {settle_ms}")
         if settle_ms > 0:
             with self._timing.get_timer("illumination_settle"):
                 self._sleep(settle_ms / 1000.0)
