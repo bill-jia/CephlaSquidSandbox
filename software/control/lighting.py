@@ -234,14 +234,24 @@ class IORoutedIlluminationDevice(IlluminationDevice):
         self.turn_off_all()
 
     def set_intensity(self, channel: str, intensity: float) -> None:
+        """Store the logical intensity and, if the channel is ON, push it to the DAC.
+
+        Many IO-routed laser drivers (e.g. Squid+ SquidLED) use the DAC output
+        as both the current setpoint AND the emission enable — the GPIO shutter
+        line is either unused or only a hardware-trigger input. Writing a
+        non-zero DAC value to such a driver causes immediate emission regardless
+        of the shutter GPIO state. To keep intensity and on/off independent at
+        the widget/API level, we gate the DAC write by ``_is_on_state``: while
+        the channel is logically OFF, the DAC stays at 0; when the user turns
+        the channel ON, :meth:`turn_on` pushes the stored intensity to the DAC.
+        """
         intensity = float(np.clip(intensity, 0, 100))
-        intensity_ep, _ = self._channel_endpoints[channel]
-        effective = self._apply_lut(channel, intensity)
-        if intensity_ep is not None:
-            intensity_ep.set_analog(effective)
         self._intensity[channel] = intensity
+        if self._is_on_state.get(channel, False):
+            self._write_dac(channel, intensity)
 
     def turn_on(self, channel: str) -> None:
+        self._write_dac(channel, self._intensity.get(channel, 0.0))
         _, shutter_ep = self._channel_endpoints[channel]
         if shutter_ep is not None:
             shutter_ep.set_digital(True)
@@ -259,7 +269,16 @@ class IORoutedIlluminationDevice(IlluminationDevice):
         elif self._microcontroller is not None:
             self._microcontroller.turn_off_illumination()
             self._microcontroller.wait_till_operation_is_completed()
+        self._write_dac(channel, 0.0)
         self._is_on_state[channel] = False
+
+    def _write_dac(self, channel: str, intensity: float) -> None:
+        """Push *intensity* (0-100, logical) to the channel's analog endpoint."""
+        intensity_ep, _ = self._channel_endpoints[channel]
+        if intensity_ep is None:
+            return
+        effective = self._apply_lut(channel, float(np.clip(intensity, 0, 100)))
+        intensity_ep.set_analog(effective)
 
     def get_intensity(self, channel: str) -> float:
         return self._intensity.get(channel, 0.0)

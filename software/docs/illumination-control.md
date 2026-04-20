@@ -8,6 +8,8 @@ The Squid microscope controller supports up to 16 illumination ports (D1-D16), w
 - **DAC output** - Analog voltage for intensity control (0-2.5V range)
 - **GPIO output** - Digital on/off control
 
+**DAC as the effective enable.** On Squid+ SquidLED drivers the DAC voltage is what actually makes the laser emit — the per-port GPIO does not gate emission. To keep intensity and on/off independent at the widget/API level, `IORoutedIlluminationDevice` holds the DAC at 0 while the channel is logically OFF and pushes the user-set intensity on `turn_on`. Slider moves therefore never turn the LED on by themselves; the on/off button is always the emission gate. The GPIO shutter line is still toggled in lockstep so hardware that does gate with it (external shutters, third-party laser drivers) still works.
+
 Two software APIs are available:
 - **Legacy API** - Single channel at a time (standard acquisition)
 - **Multi-port API** - Multiple channels ON simultaneously (firmware v1.0+)
