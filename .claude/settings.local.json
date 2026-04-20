@@ -32,7 +32,11 @@
       "Bash(rm /c/Code/CephlaSquidSandbox/software/objective_and_sample_formats/sample_formats.csv)",
       "Bash(rm /c/Code/CephlaSquidSandbox/software/cache/plate_images/test_rect_plate.png)",
       "Bash(command -v d2)",
-      "Bash(d2 architecture.d2 architecture.svg)"
+      "Bash(d2 architecture.d2 architecture.svg)",
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(git -C /c/Code/CephlaSquidSandbox show \"HEAD:software/images/96 well plate_1509x1010.png\")",
+      "Read(//c/Users/jialab/AppData/Local/Temp/**)"
     ]
   }
 }

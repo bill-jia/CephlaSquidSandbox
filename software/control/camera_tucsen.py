@@ -1449,7 +1449,6 @@ class TucsenCamera(AbstractCamera):
         raise NotImplementedError("Black levels are not implemented for the Tucsen driver.")
 
     def set_region_of_interest(self, offset_x: int, offset_y: int, width: int, height: int):
-        self._log.info(f"Setting region of interest to {offset_x}, {offset_y}, {width}, {height}")
 
         # Step-alignment requirements (binned units — see Aries manual §5.4.2):
         #   GenICam (Aries): OffsetX/Width step 8, OffsetY/Height step 2
@@ -1488,7 +1487,6 @@ class TucsenCamera(AbstractCamera):
                 f"(max {max_x}x{max_y} at binning {self._binning})"
             )
         if truncated_roi == self._region_of_interest:
-            self._log.info(f"set_region_of_interest: already {truncated_roi}, skipping")
             return
 
         with self._pause_streaming():

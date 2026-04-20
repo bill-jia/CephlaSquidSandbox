@@ -1403,7 +1403,14 @@ class NavigationViewer(QFrame):
         self.graphics_widget = pg.GraphicsLayoutWidget()
         self.graphics_widget.setBackground("w")
 
-        self.view = self.graphics_widget.addViewBox(invertX=not INVERTED_OBJECTIVE, invertY=True)
+        # Read INVERTED_OBJECTIVE via the module at runtime rather than using the
+        # star-imported name: apply_machine_config() (which sets the true value
+        # from machine_config.yaml) runs AFTER core.py is imported, so the
+        # star-imported copy is frozen at its default (False) and would
+        # mis-flip the viewport for every inverted-objective setup.
+        self.view = self.graphics_widget.addViewBox(
+            invertX=not control._def.INVERTED_OBJECTIVE, invertY=True
+        )
         self.view.setAspectLocked(True)
 
         # Create Clear Coordinates button with seamless styling

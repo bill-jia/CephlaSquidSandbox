@@ -958,6 +958,34 @@ class WellplateCalibration(QDialog):
         self.plateHeightInput.setSuffix(" mm")
         self.form_layout.addRow("Plate Height:", self.plateHeightInput)
 
+        # A1 offset from plate top-left corner (plate-intrinsic; drives the
+        # rendering of the auto-generated navigator map). SBS 96-well defaults.
+        self.a1OffsetXInput = QDoubleSpinBox(self)
+        self.a1OffsetXInput.setKeyboardTracking(False)
+        self.a1OffsetXInput.setRange(0.0, 500.0)
+        self.a1OffsetXInput.setSingleStep(0.1)
+        self.a1OffsetXInput.setDecimals(3)
+        self.a1OffsetXInput.setValue(14.38)
+        self.a1OffsetXInput.setSuffix(" mm")
+        self.a1OffsetXInput.setToolTip(
+            "X distance from the plate's physical top-left corner to the A1 well center.\n"
+            "Affects navigator map aesthetics only; stage positioning uses the calibrated A1."
+        )
+        self.form_layout.addRow("A1 X offset (drawing):", self.a1OffsetXInput)
+
+        self.a1OffsetYInput = QDoubleSpinBox(self)
+        self.a1OffsetYInput.setKeyboardTracking(False)
+        self.a1OffsetYInput.setRange(0.0, 500.0)
+        self.a1OffsetYInput.setSingleStep(0.1)
+        self.a1OffsetYInput.setDecimals(3)
+        self.a1OffsetYInput.setValue(11.24)
+        self.a1OffsetYInput.setSuffix(" mm")
+        self.a1OffsetYInput.setToolTip(
+            "Y distance from the plate's physical top-left corner to the A1 well center.\n"
+            "Affects navigator map aesthetics only; stage positioning uses the calibrated A1."
+        )
+        self.form_layout.addRow("A1 Y offset (drawing):", self.a1OffsetYInput)
+
         self.wellSpacingInput = QDoubleSpinBox(self)
         self.wellSpacingInput.setKeyboardTracking(False)
         self.wellSpacingInput.setRange(0.1, 100)
@@ -1023,6 +1051,30 @@ class WellplateCalibration(QDialog):
         self.existing_well_size_input.setDecimals(3)
         self.existing_well_size_input.setSuffix(" mm")
         existing_params_layout.addRow("Well Size:", self.existing_well_size_input)
+
+        self.existing_a1_offset_x_input = QDoubleSpinBox(self)
+        self.existing_a1_offset_x_input.setKeyboardTracking(False)
+        self.existing_a1_offset_x_input.setRange(0.0, 500.0)
+        self.existing_a1_offset_x_input.setSingleStep(0.1)
+        self.existing_a1_offset_x_input.setDecimals(3)
+        self.existing_a1_offset_x_input.setSuffix(" mm")
+        self.existing_a1_offset_x_input.setToolTip(
+            "X distance from the plate's physical top-left corner to A1 center.\n"
+            "Drawing-only: controls navigator map layout, not stage positioning."
+        )
+        existing_params_layout.addRow("A1 X offset (drawing):", self.existing_a1_offset_x_input)
+
+        self.existing_a1_offset_y_input = QDoubleSpinBox(self)
+        self.existing_a1_offset_y_input.setKeyboardTracking(False)
+        self.existing_a1_offset_y_input.setRange(0.0, 500.0)
+        self.existing_a1_offset_y_input.setSingleStep(0.1)
+        self.existing_a1_offset_y_input.setDecimals(3)
+        self.existing_a1_offset_y_input.setSuffix(" mm")
+        self.existing_a1_offset_y_input.setToolTip(
+            "Y distance from the plate's physical top-left corner to A1 center.\n"
+            "Drawing-only: controls navigator map layout, not stage positioning."
+        )
+        existing_params_layout.addRow("A1 Y offset (drawing):", self.existing_a1_offset_y_input)
 
         self.existing_params_group.setLayout(existing_params_layout)
 
@@ -1338,6 +1390,12 @@ class WellplateCalibration(QDialog):
         self.existing_well_size_input.setValue(well_size)
         self.center_well_size_input.setValue(well_size)
 
+        # A1 offset from plate edge (drawing / navigator map only).
+        a1_offset = settings.get("a1_offset_mm", [settings.get("a1_x_mm", 0.0),
+                                                   settings.get("a1_y_mm", 0.0)])
+        self.existing_a1_offset_x_input.setValue(float(a1_offset[0]))
+        self.existing_a1_offset_y_input.setValue(float(a1_offset[1]))
+
         # Auto-select center point method for 384 and 1536 well plates because their
         # small well diameters make it difficult to reliably set 3 distinct points
         # on the well edge under a microscope
@@ -1453,6 +1511,8 @@ class WellplateCalibration(QDialog):
             # Get the new values
             new_spacing = self.existing_spacing_input.value()
             new_well_size = self.existing_well_size_input.value()
+            new_a1_offset_x = self.existing_a1_offset_x_input.value()
+            new_a1_offset_y = self.existing_a1_offset_y_input.value()
 
             # Get existing settings
             existing_settings = WELLPLATE_FORMAT_SETTINGS.get(selected_format)
@@ -1462,20 +1522,39 @@ class WellplateCalibration(QDialog):
 
             print(f"Updating parameters for {self._format_display_name(selected_format)}")
             print(
-                f"OLD: spacing={existing_settings.get('well_spacing_mm')}, well_size={existing_settings.get('well_size_mm')}"
+                f"OLD: spacing={existing_settings.get('well_spacing_mm')}, well_size={existing_settings.get('well_size_mm')}, "
+                f"a1_offset={existing_settings.get('a1_offset_mm')}"
             )
-            print(f"NEW: spacing={new_spacing}, well_size={new_well_size}")
-
-            # Update the settings
-            WELLPLATE_FORMAT_SETTINGS[selected_format].update(
-                {
-                    "well_spacing_mm": new_spacing,
-                    "well_size_mm": new_well_size,
-                }
+            print(
+                f"NEW: spacing={new_spacing}, well_size={new_well_size}, "
+                f"a1_offset=({new_a1_offset_x}, {new_a1_offset_y})"
             )
 
-            # Save and refresh
+            # Update the settings — well shape-specific fields follow the current
+            # shape so the generator picks up the new size correctly.
+            shape = existing_settings.get("well_shape", "circle")
+            scale = 1 / PLATE_IMAGE_MM_PER_PX
+            updates = {
+                "well_spacing_mm": new_spacing,
+                "row_spacing_mm": new_spacing,
+                "col_spacing_mm": new_spacing,
+                "well_size_mm": new_well_size,
+                "a1_offset_mm": [float(new_a1_offset_x), float(new_a1_offset_y)],
+                "a1_x_pixel": round(float(new_a1_offset_x) * scale),
+                "a1_y_pixel": round(float(new_a1_offset_y) * scale),
+            }
+            if shape == "circle":
+                updates["well_diameter_mm"] = new_well_size
+                updates["well_width_mm"] = new_well_size
+                updates["well_height_mm"] = new_well_size
+            else:
+                updates["well_width_mm"] = new_well_size
+            WELLPLATE_FORMAT_SETTINGS[selected_format].update(updates)
+
+            # Save, regenerate the navigator map, and refresh.
             self.wellplateFormatWidget.save_formats_to_yaml()
+            from control.core import wellplate_image_generator
+            wellplate_image_generator.ensure_plate_image(selected_format)
             self.wellplateFormatWidget.populate_combo_box()
 
             # Re-select the format (triggers wellplateChanged which calls setWellplateSettings)
@@ -1528,6 +1607,20 @@ class WellplateCalibration(QDialog):
             traceback.print_exc()
             QMessageBox.critical(self, "Calibration Error", f"An error occurred during calibration: {str(e)}")
 
+    def _on_new_format_shape_changed(self, shape_text):
+        """Enable/disable rectangle-only fields and update the size-field label."""
+        is_rect = shape_text == "Rectangle"
+        self.new_format_well_height_input.setEnabled(is_rect)
+        self.new_format_corner_radius_input.setEnabled(is_rect)
+        new_label = "Well width:" if is_rect else "Well diameter (3-point):"
+        for i in range(self.form_layout.rowCount()):
+            field_item = self.form_layout.itemAt(i, QFormLayout.FieldRole)
+            if field_item and field_item.widget() is self.new_format_well_size_input:
+                label_item = self.form_layout.itemAt(i, QFormLayout.LabelRole)
+                if label_item and isinstance(label_item.widget(), QLabel):
+                    label_item.widget().setText(new_label)
+                break
+
     def _calibrate_new_format(self):
         """Create and calibrate a new wellplate format."""
         if not self.nameInput.text():
@@ -1559,13 +1652,19 @@ class WellplateCalibration(QDialog):
             well_height_mm = self.new_format_well_height_input.value()
             well_corner_radius_mm = self.new_format_corner_radius_input.value()
 
+        a1_offset_x_mm = self.a1OffsetXInput.value()
+        a1_offset_y_mm = self.a1OffsetYInput.value()
         scale = 1 / PLATE_IMAGE_MM_PER_PX
         new_format = {
             "display_name": name,
             "plate_dimensions_mm": [float(plate_width_mm), float(plate_height_mm)],
             "plate_corner_radius_mm": 3.18,
             "a1_chamfer": False,
-            "a1_offset_mm": [float(a1_x_mm), float(a1_y_mm)],
+            # Plate-intrinsic offset drives the navigator map drawing; stage
+            # calibration (below) drives moves. They are distinct concepts but
+            # currently alias the same legacy field on reload — re-calibrate A1
+            # after changing machines.
+            "a1_offset_mm": [float(a1_offset_x_mm), float(a1_offset_y_mm)],
             "rows": int(rows),
             "cols": int(cols),
             "row_spacing_mm": float(well_spacing_mm),
@@ -1578,8 +1677,8 @@ class WellplateCalibration(QDialog):
             "well_corner_radius_mm": float(well_corner_radius_mm),
             "a1_x_mm": float(a1_x_mm),
             "a1_y_mm": float(a1_y_mm),
-            "a1_x_pixel": round(float(a1_x_mm) * scale),
-            "a1_y_pixel": round(float(a1_y_mm) * scale),
+            "a1_x_pixel": round(float(a1_offset_x_mm) * scale),
+            "a1_y_pixel": round(float(a1_offset_y_mm) * scale),
             "well_size_mm": float(well_width_mm),
             "well_spacing_mm": float(well_spacing_mm),
         }
