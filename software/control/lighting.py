@@ -1081,13 +1081,28 @@ class IlluminationController:
                 self.set_channel_state(name, True, force_hardware=force)
 
     def turn_off_all_hardware_preserving_state(self) -> None:
-        """Turn off every device output without changing logical on/off flags."""
-        for dev in self._devices:
-            try:
-                dev.turn_off_all()
-            except Exception as exc:
-                logger.warning(f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} failed: {exc}")
-        for ch in self._hardware_asserted:
+        """Turn off every hardware-asserted channel without changing logical on/off flags.
+
+        Only channels currently tracked as asserted in ``_hardware_asserted`` are
+        commanded off — every ``set_channel_state`` update maintains that flag,
+        so it is the authoritative record of which channels are actually driving
+        hardware. Iterating only those avoids paying per-channel serial/MCU
+        round-trips for channels that were never on (during multipoint
+        acquisition with one active channel per FOV, this collapses from
+        O(num channels) to O(1)).
+        """
+        for ch, asserted in list(self._hardware_asserted.items()):
+            if not asserted:
+                continue
+            dev = self._channel_map.get(ch)
+            if dev is not None:
+                try:
+                    dev.turn_off(ch)
+                except Exception as exc:
+                    logger.warning(
+                        f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} "
+                        f"channel '{ch}' failed: {exc}"
+                    )
             self._hardware_asserted[ch] = False
 
     def set_channel_state(self, channel_name: str, is_on: bool, force_hardware: bool = False) -> None:

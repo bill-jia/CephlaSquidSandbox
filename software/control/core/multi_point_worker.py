@@ -1405,16 +1405,17 @@ class MultiPointWorker:
                         if "RGB" in config.name:
                             self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
                         else:
-                            self.acquire_camera_image(
-                                config,
-                                file_ID,
-                                current_path,
-                                z_level,
-                                region_id=region_id,
-                                fov=fov,
-                                config_idx=config_idx,
-                                filename_channel_label=preset_name,
-                            )
+                            with self._timing.get_timer("acquire_camera_image_inner"):
+                                self.acquire_camera_image(
+                                    config,
+                                    file_ID,
+                                    current_path,
+                                    z_level,
+                                    region_id=region_id,
+                                    fov=fov,
+                                    config_idx=config_idx,
+                                    filename_channel_label=preset_name,
+                                )
 
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
@@ -1604,7 +1605,8 @@ class MultiPointWorker:
             and self._last_illumination_config_name is not None
             and self._last_illumination_config_name != config.name
         ):
-            self.liveController.obs_controller.turn_off_illumination()
+            with self._timing.get_timer("turn_off_prev_channel_illumination"):
+                self.liveController.obs_controller.turn_off_illumination()
 
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
@@ -1703,7 +1705,8 @@ class MultiPointWorker:
 
         # Turn off capture illumination after a one-frame snap unless the user explicitly keeps it on.
         if not self.keep_illuminators_on_between_captures:
-            self._turn_off_capture_illumination_preserving_logical_state()
+            with self._timing.get_timer("turn_off_capture_illumination"):
+                self._turn_off_capture_illumination_preserving_logical_state()
         self._last_illumination_config_name = config.name
 
     def _sleep(self, sec):
