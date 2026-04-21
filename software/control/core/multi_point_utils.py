@@ -131,3 +131,7 @@ class MultiPointControllerFunctions:
     # Zarr frame written callback - called when subprocess completes writing a frame
     # Args: (fov, time_point, z_index, channel_name, region_idx)
     signal_zarr_frame_written: Callable[[int, int, int, str, int], None] = lambda *a, **kw: None
+    # Fires at the start of each timepoint (arg: time_point index). Used by napari
+    # views to flush per-timepoint state so peak RAM tracks a single timepoint
+    # rather than accumulating across the run.
+    signal_new_time_point: Callable[[int], None] = lambda *a, **kw: None

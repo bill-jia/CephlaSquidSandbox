@@ -1390,6 +1390,11 @@ class HighContentScreeningGui(QMainWindow):
             self.napari_connections["napariMultiChannelWidget"] = [
                 (self.multipointController.napari_layers_init, self.napariMultiChannelWidget.initLayers),
                 (self.multipointController.napari_layers_update, self.napariMultiChannelWidget.updateLayers),
+                # Flush layer caches at each new timepoint so RAM doesn't creep across the run.
+                (
+                    self.multipointController.signal_new_time_point,
+                    lambda _tp: self.napariMultiChannelWidget.clearAllLayers(),
+                ),
             ]
 
             if ENABLE_FLEXIBLE_MULTIPOINT:
@@ -1439,6 +1444,12 @@ class HighContentScreeningGui(QMainWindow):
                     (self.multipointController.napari_layers_update, self.napariMosaicDisplayWidget.updateMosaic),
                     (self.napariMosaicDisplayWidget.signal_coordinates_clicked, self.move_from_click_mm),
                     (self.napariMosaicDisplayWidget.signal_clear_viewer, self.navigationViewer.clear_slide),
+                    # Flush mosaic canvas at each new timepoint. emit_signal=False so the
+                    # navigation viewer's FOV rectangles are preserved across timepoints.
+                    (
+                        self.multipointController.signal_new_time_point,
+                        lambda _tp: self.napariMosaicDisplayWidget.clearAllLayers(emit_signal=False),
+                    ),
                 ]
 
                 if ENABLE_FLEXIBLE_MULTIPOINT:

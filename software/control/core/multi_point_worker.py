@@ -151,6 +151,7 @@ class MultiPointWorker:
         self._time_increment_s = self.dt if self.Nt > 1 and self.dt > 0 else None
         self._physical_size_z_um = self.deltaZ if self.NZ > 1 else None
         self.timestamp_acquisition_started = acquisition_parameters.acquisition_start_time
+        self.timestamp_prev_timepoint_started = None
 
         _channel_display_names = list(self.observation_state_names)
         _n_channels = len(_channel_display_names)
@@ -533,6 +534,9 @@ class MultiPointWorker:
         if laser_af is not None:
             laser_af._timing = self._timing
         try:
+            first_region, first_region_coords = list(self.scan_region_fov_coords_mm.items())[0]
+            first_coords_mm = first_region_coords[0]
+            self._log.info(f"Moving to first region '{first_region}' first FOV coordinates {first_coords_mm} mm to start acquisition")
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
             # frames, stale trigger config) is discarded before acquisition begins.
@@ -572,6 +576,7 @@ class MultiPointWorker:
                         break
 
                 with self._timing.get_timer("run_single_time_point"):
+                    self.timestamp_prev_timepoint_started = time.time()
                     self.run_single_time_point()
 
                 if self.fluidics and self.use_fluidics:
@@ -584,17 +589,24 @@ class MultiPointWorker:
                     pass
                 else:  # timed acquisition
 
-                    # check if the aquisition has taken longer than dt or integer multiples of dt, if so skip the next time point(s)
-                    while time.time() > self.timestamp_acquisition_started + self.time_point * self.dt:
-                        self._log.info("skip time point " + str(self.time_point + 1))
-                        self.time_point = self.time_point + 1
+                    # check if the aquisition has taken longer than dt or integer multiples of dt, if so immediately start the next time point without waiting to catch up (but still check for abort request to allow user to stop if acquisition is running too long)
+                    while time.time() > self.timestamp_prev_timepoint_started + self.dt:
+                        self._log.info("Acquisition is running behind schedule (time since last time point start: %.2f [s])")
+                        if self.abort_requested_fn():
+                            self._log.debug("In run wait loop, abort_acquisition_requested=True")
+                            break
+                        pass
 
                     # check if it has reached Nt
                     if self.time_point == self.Nt:
                         break  # no waiting after taking the last time point
 
+                    if time.time() < self.timestamp_prev_timepoint_started + self.dt:
+                        self._log.info("Waiting for next time point (%.2f [s] until next time point start)", (self.timestamp_prev_timepoint_started + self.dt) - time.time())
+                        self.move_to_coordinate(first_coords_mm, first_region, 0)  # Move to the first coordinate of the first region while waiting for the next time point to start, to save time on stage movement and allow for any necessary settling to occur during the wait
+
                     # wait until it's time to do the next acquisition
-                    while time.time() < self.timestamp_acquisition_started + self.time_point * self.dt:
+                    while time.time() < self.timestamp_prev_timepoint_started + self.dt:
                         if self.abort_requested_fn():
                             self._log.debug("In run wait loop, abort_acquisition_requested=True")
                             break
@@ -744,6 +756,10 @@ class MultiPointWorker:
             self.microcontroller.enable_joystick(False)
 
             self._log.info("multipoint acquisition - time point " + str(self.time_point + 1))
+
+            # Notify listeners (napari views flush their per-timepoint caches on
+            # this signal so peak RAM tracks a single timepoint, not the whole run).
+            self.callbacks.signal_new_time_point(self.time_point)
 
             # for each time point, create a new folder
             with self._timing.get_timer("create_new_timepoint"):

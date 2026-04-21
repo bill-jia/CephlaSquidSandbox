@@ -213,6 +213,8 @@ class QtMultiPointController(MultiPointController, QObject):
     )  # region_paths, channels, num_z, fovs_per_region, height, width, region_labels
     ndviewer_notify_zarr_frame = Signal(int, int, int, str, int)  # t, fov_idx, z, channel, region_idx
     ndviewer_end_zarr_acquisition = Signal()
+    # Fires at the start of each timepoint so napari views can flush per-timepoint caches.
+    signal_new_time_point = Signal(int)  # time_point index
 
     def __init__(
         self,
@@ -244,6 +246,7 @@ class QtMultiPointController(MultiPointController, QObject):
                 signal_slack_timepoint_notification=self._signal_slack_timepoint_notification_fn,
                 signal_slack_acquisition_finished=self._signal_slack_acquisition_finished_fn,
                 signal_zarr_frame_written=self._signal_zarr_frame_written_fn,
+                signal_new_time_point=self._signal_new_time_point_fn,
             ),
             scan_coordinates=scan_coordinates,
             laser_autofocus_controller=laser_autofocus_controller,
@@ -411,6 +414,9 @@ class QtMultiPointController(MultiPointController, QObject):
 
     def _signal_slack_acquisition_finished_fn(self, stats: AcquisitionStats):
         self.signal_slack_acq_finished.emit(stats)
+
+    def _signal_new_time_point_fn(self, time_point: int):
+        self.signal_new_time_point.emit(time_point)
 
     def _signal_zarr_frame_written_fn(
         self, fov: int, time_point: int, z_index: int, channel_name: str, region_idx: int

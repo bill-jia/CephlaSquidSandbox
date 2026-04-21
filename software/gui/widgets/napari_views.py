@@ -1432,6 +1432,35 @@ class NapariLiveWidget(QWidget):
         self.viewer.window.activate()
 
 
+_CACHEABLE_IMAGE_LAYER_ATTRS = ("colormap", "contrast_limits", "gamma", "opacity", "visible", "blending")
+
+
+def _snapshot_image_layer(layer) -> dict:
+    """Capture user-tweakable napari image-layer attributes so they can be
+    restored when a layer is recreated with the same name (e.g. after the
+    viewer is cleared between timepoints)."""
+    cfg = {}
+    for attr in _CACHEABLE_IMAGE_LAYER_ATTRS:
+        if not hasattr(layer, attr):
+            continue
+        try:
+            val = getattr(layer, attr)
+            if attr == "contrast_limits":
+                val = tuple(val)
+            cfg[attr] = val
+        except Exception:
+            pass
+    return cfg
+
+
+def _restore_image_layer(layer, cfg: dict) -> None:
+    for attr, val in cfg.items():
+        try:
+            setattr(layer, attr, val)
+        except Exception:
+            pass
+
+
 class NapariMultiChannelWidget(QWidget):
 
     def __init__(self, objectiveStore, camera, contrastManager, grid_enabled=False, parent=None):
@@ -1452,6 +1481,9 @@ class NapariMultiChannelWidget(QWidget):
         self.viewer_scale_initialized = False
         self.update_layer_count = 0
         self.grid_enabled = grid_enabled
+        # Per-channel config cache so recreated layers remember user adjustments
+        # (colormap, gamma, etc.) across clearAllLayers.
+        self._layer_config_cache: dict = {}
 
         # Initialize a napari Viewer without showing its standalone window.
         self.initNapariViewer()
@@ -1577,6 +1609,12 @@ class NapariMultiChannelWidget(QWidget):
             layer.contrast_limits = self.contrastManager.get_limits(channel_name)
             layer.events.contrast_limits.connect(self.signalContrastLimits)
 
+            # Restore user adjustments (colormap, gamma, etc.) carried over from
+            # the layer that had this name before the viewer was cleared.
+            cached_cfg = self._layer_config_cache.get(channel_name)
+            if cached_cfg:
+                _restore_image_layer(layer, cached_cfg)
+
             if not self.viewer_scale_initialized:
                 self.resetView()
                 self.viewer_scale_initialized = True
@@ -1608,6 +1646,20 @@ class NapariMultiChannelWidget(QWidget):
 
     def activate(self):
         self.viewer.window.activate()
+
+    def clearAllLayers(self):
+        """Remove all napari layers and reset state. Called between timepoints
+        to flush napari's per-layer caches (thumbnails, vispy textures) so RAM
+        tracks a single-timepoint high-water mark instead of accumulating."""
+        # Snapshot per-layer user adjustments so they carry across the flush.
+        for layer in self.viewer.layers:
+            if hasattr(layer, "colormap"):
+                self._layer_config_cache[layer.name] = _snapshot_image_layer(layer)
+        self.viewer.layers.clear()
+        self.acquisition_initialized = False
+        self.layers_initialized = False
+        self.update_layer_count = 0
+        gc.collect()
 
 
 class NapariMosaicDisplayWidget(QWidget):
@@ -1644,6 +1696,9 @@ class NapariMosaicDisplayWidget(QWidget):
         self.viewer_extents = []  # [min_y, max_y, min_x, max_x]
         self.top_left_coordinate = None  # [y, x] in mm
         self.mosaic_dtype = None
+        # Per-channel config cache so recreated layers remember user adjustments
+        # (colormap, gamma, etc.) across clearAllLayers.
+        self._layer_config_cache: dict = {}
 
     def customizeViewer(self):
         # # hide status bar
@@ -1864,6 +1919,12 @@ class NapariMosaicDisplayWidget(QWidget):
             layer.mouse_double_click_callbacks.append(self.onDoubleClick)
             layer.events.contrast_limits.connect(self.signalContrastLimits)
 
+            # Restore user adjustments (colormap, gamma, etc.) carried over from
+            # the layer that had this name before the viewer was cleared.
+            cached_cfg = self._layer_config_cache.get(channel_name)
+            if cached_cfg:
+                _restore_image_layer(layer, cached_cfg)
+
         # get layer for channel
         layer = self.viewer.layers[channel_name]
 
@@ -2010,7 +2071,22 @@ class NapariMosaicDisplayWidget(QWidget):
             self.is_drawing_shape = False
             self.signal_shape_drawn.emit([])
 
-    def clearAllLayers(self):
+    def clearAllLayers(self, emit_signal: bool = True):
+        """Remove all layers (except Manual ROI) and reset mosaic state.
+
+        Args:
+            emit_signal: When True (user-initiated clear), also emits
+                signal_clear_viewer so the navigation viewer clears its FOV
+                rectangles. Per-timepoint auto-flushes pass False to keep the
+                slide overview intact.
+        """
+        # Snapshot per-layer user adjustments so they carry across the flush.
+        for layer in self.viewer.layers:
+            if layer.name == "Manual ROI":
+                continue
+            if hasattr(layer, "colormap"):
+                self._layer_config_cache[layer.name] = _snapshot_image_layer(layer)
+
         # Remove all layers except Manual ROI to free memory and allow proper reinitialization
         layers_to_remove = [layer for layer in self.viewer.layers if layer.name != "Manual ROI"]
         for layer in layers_to_remove:
@@ -2026,7 +2102,8 @@ class NapariMosaicDisplayWidget(QWidget):
         # Force garbage collection to return memory to OS
         gc.collect()
 
-        self.signal_clear_viewer.emit()
+        if emit_signal:
+            self.signal_clear_viewer.emit()
 
     def activate(self):
         self.viewer.window.activate()
