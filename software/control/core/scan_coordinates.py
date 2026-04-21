@@ -77,6 +77,10 @@ class ScanCoordinates:
         self.region_centers = {}  # {region_id: [x, y, z]}
         self.region_shapes = {}  # {region_id: "Square"}
         self.region_fov_coordinates = {}  # {region_id: [(x,y,z), ...]}
+        # 2D grid (rows top-to-bottom, each row left-to-right) for regions that were generated
+        # from a rectangular lattice. Kept alongside the flat list so sort_coordinates can
+        # re-snake each region from the corner nearest the previous region's exit.
+        self.region_fov_rows = {}  # {region_id: [[(x,y), ...], ...]}
 
     def add_well_selector(self, well_selector):
         self.well_selector = well_selector
@@ -88,6 +92,64 @@ class ScanCoordinates:
         Disabled = each row starts from the same side (unidirectional raster).
         """
         self.fov_pattern = "S-Pattern" if enabled else "Unidirectional"
+
+    @staticmethod
+    def _snake_from_rows(rows, start_top: bool = True, start_left: bool = True):
+        """Flatten a 2D grid of FOVs into a boustrophedon path from the chosen corner.
+
+        `rows` is ordered top-to-bottom; each row is ordered left-to-right. Empty rows
+        (e.g., from Circle filtering) are skipped so the alternation lands on real FOVs.
+        """
+        ordered = rows if start_top else list(reversed(rows))
+        result = []
+        row_idx = 0
+        for row in ordered:
+            if not row:
+                continue
+            go_left_to_right = start_left if row_idx % 2 == 0 else not start_left
+            result.extend(row if go_left_to_right else list(reversed(row)))
+            row_idx += 1
+        return result
+
+    def _flatten_fov_rows(self, rows):
+        """Flatten the 2D row grid honoring the current fov_pattern. Defaults to TL start."""
+        if self.fov_pattern == "S-Pattern":
+            return self._snake_from_rows(rows, start_top=True, start_left=True)
+        return [fov for row in rows for fov in row]
+
+    def _apply_snake_continuity(self):
+        """Re-snake each rectangular region so its entry corner is closest to the
+        previous region's exit FOV. The first region keeps its top-left start.
+        Regions without a stored 2D grid (manual, single-FOV, template) are left
+        untouched, but their trailing FOV still seeds the next region's corner pick.
+        """
+        if self.fov_pattern != "S-Pattern":
+            return
+
+        prev_exit = None
+        for region_id in list(self.region_fov_coordinates.keys()):
+            rows = self.region_fov_rows.get(region_id)
+            non_empty = [r for r in rows if r] if rows else []
+
+            if non_empty:
+                if prev_exit is None:
+                    start_top, start_left = True, True
+                else:
+                    corners = [
+                        (True, True, non_empty[0][0]),
+                        (True, False, non_empty[0][-1]),
+                        (False, True, non_empty[-1][0]),
+                        (False, False, non_empty[-1][-1]),
+                    ]
+                    start_top, start_left, _ = min(
+                        corners,
+                        key=lambda c: (c[2][0] - prev_exit[0]) ** 2 + (c[2][1] - prev_exit[1]) ** 2,
+                    )
+                self.region_fov_coordinates[region_id] = self._snake_from_rows(rows, start_top, start_left)
+
+            fovs = self.region_fov_coordinates.get(region_id, [])
+            if fovs:
+                prev_exit = (fovs[-1][0], fovs[-1][1])
 
     def update_wellplate_settings(
         self, format_, a1_x_mm, a1_y_mm, a1_x_pixel, a1_y_pixel, size_mm, spacing_mm, number_of_skip
@@ -207,23 +269,16 @@ class ScanCoordinates:
         overlap_frac = 1 - overlap_percent / 100
         step_x_mm = fov_w_mm * overlap_frac
         step_y_mm = fov_h_mm * overlap_frac
-        scan_coordinates = []
+
+        rows: List[List[Tuple[float, float]]] = []
 
         if shape == "Rectangle":
             # Use scan_size_mm as height, width is 0.6 * height
             height_mm = scan_size_mm
             width_mm = scan_size_mm * 0.6
 
-            # Calculate steps for height and width separately
-            steps_height = math.floor(height_mm / step_y_mm)
-            steps_width = math.floor(width_mm / step_x_mm)
-
-            # Calculate actual dimensions
-            actual_scan_height_mm = (steps_height - 1) * step_y_mm + fov_h_mm
-            actual_scan_width_mm = (steps_width - 1) * step_x_mm + fov_w_mm
-
-            steps_height = max(1, steps_height)
-            steps_width = max(1, steps_width)
+            steps_height = max(1, math.floor(height_mm / step_y_mm))
+            steps_width = max(1, math.floor(width_mm / step_x_mm))
 
             half_steps_height = (steps_height - 1) / 2
             half_steps_width = (steps_width - 1) / 2
@@ -235,9 +290,7 @@ class ScanCoordinates:
                     x = center_x + (j - half_steps_width) * step_x_mm
                     if self.validate_coordinates(x, y):
                         row.append((x, y))
-                if self.fov_pattern == "S-Pattern" and i % 2 == 1:
-                    row.reverse()
-                scan_coordinates.extend(row)
+                rows.append(row)
         else:
             # Square / Circle: use the smaller step so no axis under-samples when FOV is non-square.
             step_size_mm = min(step_x_mm, step_y_mm)
@@ -253,10 +306,7 @@ class ScanCoordinates:
                     )
 
                 if actual_scan_size_mm > scan_size_mm:
-                    actual_scan_size_mm -= step_size_mm
                     steps -= 1
-            else:
-                actual_scan_size_mm = (steps - 1) * step_size_mm + fov_size_mm
 
             steps = max(1, steps)  # Ensure at least one step
             half_steps = (steps - 1) / 2
@@ -270,7 +320,6 @@ class ScanCoordinates:
                     x = center_x + (j - half_steps) * step_x_mm
                     if (
                         shape == "Square"
-                        or shape == "Rectangle"
                         or (
                             shape == "Circle"
                             and self._is_in_circle(x, y, center_x, center_y, radius_squared, fov_size_mm_half)
@@ -278,17 +327,18 @@ class ScanCoordinates:
                     ):
                         if self.validate_coordinates(x, y):
                             row.append((x, y))
+                rows.append(row)
 
-                if self.fov_pattern == "S-Pattern" and i % 2 == 1:
-                    row.reverse()
-                scan_coordinates.extend(row)
+        scan_coordinates = self._flatten_fov_rows(rows)
 
         if not scan_coordinates and shape == "Circle":
             if self.validate_coordinates(center_x, center_y):
-                scan_coordinates.append((center_x, center_y))
+                rows = [[(center_x, center_y)]]
+                scan_coordinates = [(center_x, center_y)]
 
         self.region_shapes[well_id] = shape
         self.region_centers[well_id] = [float(center_x), float(center_y), float(self.stage.get_pos().z_mm)]
+        self.region_fov_rows[well_id] = rows
         self.region_fov_coordinates[well_id] = scan_coordinates
         self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
         self._log.info(f"Added Region: {well_id}")
@@ -301,6 +351,8 @@ class ScanCoordinates:
             if well_id in self.region_shapes:
                 del self.region_shapes[well_id]
 
+            self.region_fov_rows.pop(well_id, None)
+
             if well_id in self.region_fov_coordinates:
                 region_scan_coordinates = self.region_fov_coordinates.pop(well_id)
                 for coord in region_scan_coordinates:
@@ -312,6 +364,7 @@ class ScanCoordinates:
     def clear_regions(self):
         self.region_centers.clear()
         self.region_shapes.clear()
+        self.region_fov_rows.clear()
         self.region_fov_coordinates.clear()
         self._update_callback(ClearedScanCoordinates())
         self._log.info("Cleared All Regions")
@@ -331,7 +384,7 @@ class ScanCoordinates:
         grid_width_mm = (Nx - 1) * step_x_mm
         grid_height_mm = (Ny - 1) * step_y_mm
 
-        scan_coordinates = []
+        rows: List[List[Tuple[float, float, float]]] = []
         for i in range(Ny):
             row = []
             y = center_y - grid_height_mm / 2 + i * step_y_mm
@@ -339,15 +392,15 @@ class ScanCoordinates:
                 x = center_x - grid_width_mm / 2 + j * step_x_mm
                 if self.validate_coordinates(x, y):
                     row.append((x, y, center_z))
+            rows.append(row)
 
-            if self.fov_pattern == "S-Pattern" and i % 2 == 1:  # reverse even rows
-                row.reverse()
-            scan_coordinates.extend(row)
+        scan_coordinates = self._flatten_fov_rows(rows)
 
         # Region coordinates are already centered since center_x, center_y is grid center
         if scan_coordinates:  # Only add region if there are valid coordinates
             self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
+            self.region_fov_rows[region_id] = rows
             self.region_fov_coordinates[region_id] = scan_coordinates
             self._update_callback(
                 AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
@@ -368,22 +421,20 @@ class ScanCoordinates:
         grid_width_mm = (Nx - 1) * dx
         grid_height_mm = (Ny - 1) * dy
 
-        # Pre-calculate step sizes and ranges
         x_steps = [center_x - grid_width_mm / 2 + j * dx for j in range(Nx)]
         y_steps = [center_y - grid_height_mm / 2 + i * dy for i in range(Ny)]
 
-        scan_coordinates = []
-        for i, y in enumerate(y_steps):
-            row = []
-            x_range = x_steps if i % 2 == 0 else reversed(x_steps)
-            for x in x_range:
-                if self.validate_coordinates(x, y):
-                    row.append((x, y))
-            scan_coordinates.extend(row)
+        rows: List[List[Tuple[float, float]]] = []
+        for y in y_steps:
+            row = [(x, y) for x in x_steps if self.validate_coordinates(x, y)]
+            rows.append(row)
+
+        scan_coordinates = self._flatten_fov_rows(rows)
 
         if scan_coordinates:  # Only add region if there are valid coordinates
             self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
+            self.region_fov_rows[region_id] = rows
             self.region_fov_coordinates[region_id] = scan_coordinates
             self._update_callback(
                 AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
@@ -584,6 +635,10 @@ class ScanCoordinates:
         if len(self.region_centers) <= 1:
             return
 
+        self._sort_region_order()
+        self._apply_snake_continuity()
+
+    def _sort_region_order(self):
         def sort_key(item):
             key, coord = item
             if self._is_manual_region(key):
@@ -626,6 +681,9 @@ class ScanCoordinates:
         self.region_centers = {k: v for k, v in sorted_items}
         self.region_fov_coordinates = {
             k: self.region_fov_coordinates[k] for k, _ in sorted_items if k in self.region_fov_coordinates
+        }
+        self.region_fov_rows = {
+            k: self.region_fov_rows[k] for k, _ in sorted_items if k in self.region_fov_rows
         }
 
     def get_region_bounds(self, region_id):
