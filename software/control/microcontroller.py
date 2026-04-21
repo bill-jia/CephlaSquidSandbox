@@ -638,7 +638,8 @@ class Microcontroller:
     MAX_RECONNECT_COUNT = 3          # Maximum reconnection attempts
     # The micro sends status packets every ~10ms. This timeout should be > that.
     # As of 2025-04-28, it's 10ms on the micro. So 0.1s (10x) is a reasonable timeout.
-    STALE_READ_TIMEOUT = 0.1  # Warn if no status packets received for this long
+    # STALE_READ_TIMEOUT = 0.1  # Warn if no status packets received for this long
+    STALE_READ_TIMEOUT = 0.3 # Increased to 300ms to reduce false positives on slow systems or during heavy load
 
     def __init__(self, serial_device: AbstractCephlaMicroSerial, reset_and_initialize=True):
         """

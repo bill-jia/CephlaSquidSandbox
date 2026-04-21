@@ -526,6 +526,12 @@ class MultiPointWorker:
         # apply_observation_state_preset's sub-steps contribute to the report.
         obs_controller = self.liveController.obs_controller
         obs_controller._timing = self._timing
+        # Same wiring for the laser autofocus controller so move_to_target's
+        # sub-steps (laser toggles, frame capture, spot detection, cross-corr)
+        # contribute to the report.
+        laser_af = self.laser_auto_focus_controller
+        if laser_af is not None:
+            laser_af._timing = self._timing
         try:
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
@@ -616,6 +622,8 @@ class MultiPointWorker:
             # calls from widgets don't keep writing into the acquisition's
             # timing report.
             obs_controller._timing = None
+            if laser_af is not None:
+                laser_af._timing = None
             if this_image_callback_id:
                 self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
                 self.camera.remove_frame_callback(this_image_callback_id)
