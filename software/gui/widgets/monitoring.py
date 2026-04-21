@@ -1426,6 +1426,7 @@ class WarningErrorWidget(QWidget):
         """Create a single item widget for the popup list."""
         level = msg["level"]
         message = msg["message"]
+        logger_name = msg.get("logger_name", "")
         count = msg["count"]
         dt = msg["datetime"]
         msg_id = msg["id"]
@@ -1452,8 +1453,18 @@ class WarningErrorWidget(QWidget):
         time_label.setStyleSheet("color: #666; font-size: 11px; font-family: monospace;")
         time_label.setFixedWidth(90)
 
-        # Message (allow wrapping)
-        core_msg = self._extract_core_message(message)
+        # Message (allow wrapping), prefixed with the logger/class name and source location
+        core_msg = html.escape(self._extract_core_message(message))
+        short_name = self._format_logger_name(logger_name)
+        location = self._extract_file_location(message)
+        header_parts = []
+        if short_name:
+            # html.escape so logger names with special chars (e.g. "<locals>") render safely
+            header_parts.append(f"<b style='color: #555;'>{html.escape(short_name)}</b>")
+        if location:
+            header_parts.append(f"<span style='color: #888; font-size: 11px;'>{html.escape(location)}</span>")
+        if header_parts:
+            core_msg = f"{' '.join(header_parts)}: {core_msg}"
         if count > 1:
             core_msg = f"{core_msg} <b style='color: #666;'>(×{count})</b>"
         msg_label = QLabel(core_msg)
@@ -1574,6 +1585,7 @@ class WarningErrorWidget(QWidget):
         msg = self._messages[-1]
         level = msg["level"]
         message = msg["message"]
+        logger_name = msg.get("logger_name", "")
         count = msg["count"]
         dt = msg["datetime"]
         is_error = level >= logging.ERROR
@@ -1600,7 +1612,7 @@ class WarningErrorWidget(QWidget):
 
         # Format message with compact time (HH:MM only)
         time_str = dt.strftime("%H:%M")
-        display_msg = self._format_display_message(message)
+        display_msg = self._format_display_message(logger_name, message)
         if count > 1:
             display_msg = f"[{time_str}] {display_msg} (×{count})"
         else:
@@ -1608,9 +1620,14 @@ class WarningErrorWidget(QWidget):
         self.label_text.setText(display_msg)
         self.label_text.setStyleSheet(f"color: {text_color}; font-weight: bold;")
 
-        # Tooltip shows full message with date and dropped count if any
+        # Tooltip shows full message with date, logger name, source location, and dropped count if any
         full_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-        tooltip = f"{full_time}\n{self._extract_core_message(message)}"
+        short_name = self._format_logger_name(logger_name)
+        location = self._extract_file_location(message)
+        core = self._extract_core_message(message)
+        header = " ".join(p for p in (short_name, location) if p)
+        tooltip_body = f"{header}: {core}" if header else core
+        tooltip = f"{full_time}\n{tooltip_body}"
         if self._dropped_count > 0:
             tooltip += f"\n\n⚠ {self._dropped_count} message(s) dropped due to rate limiting"
         self.setToolTip(tooltip)
@@ -1661,11 +1678,34 @@ class WarningErrorWidget(QWidget):
                     return msg
         return message
 
-    def _format_display_message(self, message: str) -> str:
-        """Format message for single-line display."""
+    def _extract_file_location(self, message: str) -> str:
+        """Return the trailing "file.py:123" location from a formatted log line, or ""."""
+        match = self._FILE_LOCATION_PATTERN.search(message)
+        if not match:
+            return ""
+        # match.group(0) is " (file.py:123)"; strip the surrounding " (" and ")"
+        return match.group(0).strip()[1:-1]
+
+    def _format_logger_name(self, logger_name: str) -> str:
+        """Format a logger name for display, dropping the redundant 'squid' root prefix."""
+        if not logger_name:
+            return ""
+        if logger_name == "squid":
+            return ""
+        if logger_name.startswith("squid."):
+            return logger_name[len("squid.") :]
+        return logger_name
+
+    def _format_display_message(self, logger_name: str, message: str) -> str:
+        """Format message for single-line display, prefixed with the logger/class name and source location."""
         msg = self._extract_core_message(message)
-        if len(msg) > 60:
-            msg = msg[:57] + "..."
+        short_name = self._format_logger_name(logger_name)
+        location = self._extract_file_location(message)
+        prefix_parts = [p for p in (short_name, location) if p]
+        if prefix_parts:
+            msg = f"{' '.join(prefix_parts)}: {msg}"
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
         return msg
 
 

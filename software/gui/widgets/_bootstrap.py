@@ -1,5 +1,6 @@
 import configparser
 import gc
+import html
 import os
 import json
 import yaml
