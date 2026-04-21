@@ -117,39 +117,88 @@ class ScanCoordinates:
             return self._snake_from_rows(rows, start_top=True, start_left=True)
         return [fov for row in rows for fov in row]
 
+    @staticmethod
+    def _region_corner_options(rows):
+        """Enumerate the 4 (start_top, start_left, entry_fov, exit_fov) snake options
+        for a row grid. Empty rows are skipped so corners land on real FOVs. The exit
+        follows from entry and row-count parity: even row counts exit on the same
+        side as entry (vertical flip), odd row counts exit diagonally opposite.
+        """
+        non_empty = [r for r in rows if r]
+        if not non_empty:
+            return []
+        m = len(non_empty)
+        opts = []
+        for start_top in (True, False):
+            for start_left in (True, False):
+                entry_row = non_empty[0] if start_top else non_empty[-1]
+                entry = entry_row[0] if start_left else entry_row[-1]
+                last_row = non_empty[-1] if start_top else non_empty[0]
+                last_dir_ltr = start_left if m % 2 == 1 else not start_left
+                exit_fov = last_row[-1] if last_dir_ltr else last_row[0]
+                opts.append((start_top, start_left, entry, exit_fov))
+        return opts
+
     def _apply_snake_continuity(self):
-        """Re-snake each rectangular region so its entry corner is closest to the
-        previous region's exit FOV. The first region keeps its top-left start.
-        Regions without a stored 2D grid (manual, single-FOV, template) are left
-        untouched, but their trailing FOV still seeds the next region's corner pick.
+        """Optimal corner assignment via DP across regions.
+
+        For each region with a row grid, there are 4 (entry_corner, exit_corner) pairs;
+        odd row counts give diagonal exits, even row counts give same-column exits.
+        We minimize total squared inter-region stage travel across the fixed region
+        order using a 4-state shortest-path DP — O(16·n). The first region's starting
+        corner is chosen freely (all 4 options seed the DP at zero cost), so "best
+        starting region corner" is part of the optimum. Regions without a row grid
+        (manual, single-FOV, template) contribute a single fixed (entry, exit) option
+        taken from their existing flat FOV list.
         """
         if self.fov_pattern != "S-Pattern":
             return
 
-        prev_exit = None
-        for region_id in list(self.region_fov_coordinates.keys()):
-            rows = self.region_fov_rows.get(region_id)
-            non_empty = [r for r in rows if r] if rows else []
+        region_ids = [rid for rid in self.region_fov_coordinates if self.region_fov_coordinates[rid]]
+        if len(region_ids) < 2:
+            return
 
-            if non_empty:
-                if prev_exit is None:
-                    start_top, start_left = True, True
-                else:
-                    corners = [
-                        (True, True, non_empty[0][0]),
-                        (True, False, non_empty[0][-1]),
-                        (False, True, non_empty[-1][0]),
-                        (False, False, non_empty[-1][-1]),
-                    ]
-                    start_top, start_left, _ = min(
-                        corners,
-                        key=lambda c: (c[2][0] - prev_exit[0]) ** 2 + (c[2][1] - prev_exit[1]) ** 2,
-                    )
-                self.region_fov_coordinates[region_id] = self._snake_from_rows(rows, start_top, start_left)
+        options_per_region = []
+        for rid in region_ids:
+            rows = self.region_fov_rows.get(rid)
+            opts = self._region_corner_options(rows) if rows else []
+            if not opts:
+                fovs = self.region_fov_coordinates[rid]
+                entry = (fovs[0][0], fovs[0][1])
+                exit_fov = (fovs[-1][0], fovs[-1][1])
+                opts = [(None, None, entry, exit_fov)]
+            options_per_region.append(opts)
 
-            fovs = self.region_fov_coordinates.get(region_id, [])
-            if fovs:
-                prev_exit = (fovs[-1][0], fovs[-1][1])
+        def sq_dist(p, q):
+            return (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2
+
+        prev_costs = [0.0] * len(options_per_region[0])
+        backptr = [[0] * len(opts) for opts in options_per_region]
+
+        for i in range(1, len(options_per_region)):
+            curr_opts = options_per_region[i]
+            prev_opts = options_per_region[i - 1]
+            curr_costs = [float("inf")] * len(curr_opts)
+            for k, (_, _, entry, _) in enumerate(curr_opts):
+                for prev_k, (_, _, _, prev_exit) in enumerate(prev_opts):
+                    cost = prev_costs[prev_k] + sq_dist(prev_exit, entry)
+                    if cost < curr_costs[k]:
+                        curr_costs[k] = cost
+                        backptr[i][k] = prev_k
+            prev_costs = curr_costs
+
+        chosen = [0] * len(options_per_region)
+        chosen[-1] = min(range(len(prev_costs)), key=lambda k: prev_costs[k])
+        for i in range(len(options_per_region) - 1, 0, -1):
+            chosen[i - 1] = backptr[i][chosen[i]]
+
+        for i, rid in enumerate(region_ids):
+            start_top, start_left, _, _ = options_per_region[i][chosen[i]]
+            if start_top is None:
+                continue
+            self.region_fov_coordinates[rid] = self._snake_from_rows(
+                self.region_fov_rows[rid], start_top, start_left
+            )
 
     def update_wellplate_settings(
         self, format_, a1_x_mm, a1_y_mm, a1_x_pixel, a1_y_pixel, size_mm, spacing_mm, number_of_skip

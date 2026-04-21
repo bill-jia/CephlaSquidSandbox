@@ -165,24 +165,23 @@ def test_snake_from_rows_skips_empty_rows():
 
 
 def test_apply_snake_continuity_wellplate_grid():
-    """Adjacent wells arranged serpentine should hand off across matching corners.
+    """DP-optimal corners for 2x2 wells in a serpentine region order.
 
-    Each well has a 2x2 FOV grid. Row A (A1, A2) is traversed LTR; row B (B2, B1) is
-    traversed RTL (serpentine across wells). Nested-snake must choose each well's
-    entry corner to be closest to the previous well's exit.
+    Each well has a 2x2 FOV grid (even-row snake: entry and exit are on the same
+    column). Because the DP is forward-looking it picks A1's starting corner with
+    knowledge that A2 sits to the east — greedy TL at A1 would force a longer
+    A1→A2 jump than BR at A1 does.
     """
     sc = _make_scan_coordinates()
     sc.fov_pattern = "S-Pattern"
     sc.acquisition_pattern = "S-Pattern"
 
     def make_rows(cx, cy):
-        # 2x2 grid, unit spacing, centered on (cx, cy)
         return [
             [(cx - 0.5, cy - 0.5), (cx + 0.5, cy - 0.5)],
             [(cx - 0.5, cy + 0.5), (cx + 0.5, cy + 0.5)],
         ]
 
-    # Centers at (0, 0), (10, 0), (0, 10), (10, 10) — four wells, two rows of two.
     wells = {"A1": (0, 0), "A2": (10, 0), "B1": (0, 10), "B2": (10, 10)}
     for wid, (cx, cy) in wells.items():
         rows = make_rows(cx, cy)
@@ -192,31 +191,70 @@ def test_apply_snake_continuity_wellplate_grid():
 
     sc.sort_coordinates()
 
-    order = list(sc.region_centers.keys())
-    assert order == ["A1", "A2", "B2", "B1"]
+    assert list(sc.region_centers.keys()) == ["A1", "A2", "B2", "B1"]
 
-    # A1 is first → top-left start, so it ends at bottom-left (2x2, even rows).
+    # DP solution (total squared inter-region travel = 3*81 = 243):
+    #   A1 BR → exit (0.5, -0.5) → A2 TL (9.5, -0.5)
+    #   A2 exit (9.5,  0.5) → B2 TL (9.5, 9.5)
+    #   B2 exit (9.5, 10.5) → B1 BR (0.5, 10.5)
     a1 = sc.region_fov_coordinates["A1"]
-    assert a1[0] == (-0.5, -0.5)
-    assert a1[-1] == (-0.5, 0.5)
+    assert a1[0] == (0.5, 0.5)
+    assert a1[-1] == (0.5, -0.5)
 
-    # A2 is to the right of A1. Previous exit is at x=-0.5 (left side of A1).
-    # Closest corner of A2 is bottom-left. Entry at bottom-left, exit top-left.
     a2 = sc.region_fov_coordinates["A2"]
-    assert a2[0] == (9.5, 10 - 9.5)  # bottom-left of A2  -> (9.5, 0.5)
-    assert a2[0] == (9.5, 0.5)
-    assert a2[-1] == (9.5, -0.5)
+    assert a2[0] == (9.5, -0.5)
+    assert a2[-1] == (9.5, 0.5)
 
-    # B2 is below A2. Previous exit is top-left of A2 at (9.5, -0.5). B2 is at (10, 10).
-    # Closest corner of B2 is top-left (9.5, 9.5).
     b2 = sc.region_fov_coordinates["B2"]
     assert b2[0] == (9.5, 9.5)
     assert b2[-1] == (9.5, 10.5)
 
-    # B1 is to the left of B2. Previous exit (9.5, 10.5). Closest corner of B1 is bottom-right.
     b1 = sc.region_fov_coordinates["B1"]
     assert b1[0] == (0.5, 10.5)
     assert b1[-1] == (0.5, 9.5)
+
+
+def test_apply_snake_continuity_odd_row_parity():
+    """Odd row counts exit diagonally; DP picks entry corners accordingly.
+
+    With two 3x3 wells side by side, A1's right-side-entry snake exits diagonally
+    at its own left side (odd parity), which the DP exploits so that A2's entry
+    lies closer to A1's exit than a naive same-column choice.
+    """
+    sc = _make_scan_coordinates()
+    sc.fov_pattern = "S-Pattern"
+    sc.acquisition_pattern = "S-Pattern"
+
+    def make_rows(cx, cy):
+        # 3x3 grid, unit step, centered on (cx, cy). Row 0 is y=cy-1, row 2 is y=cy+1.
+        return [
+            [(cx - 1.0, cy + dy), (cx + 0.0, cy + dy), (cx + 1.0, cy + dy)]
+            for dy in (-1.0, 0.0, 1.0)
+        ]
+
+    for wid, (cx, cy) in {"A1": (0.0, 0.0), "A2": (10.0, 0.0)}.items():
+        rows = make_rows(cx, cy)
+        sc.region_centers[wid] = [cx, cy, 0.0]
+        sc.region_fov_rows[wid] = rows
+        sc.region_fov_coordinates[wid] = sc._snake_from_rows(rows, True, True)
+
+    sc.sort_coordinates()
+
+    # A1 optimal entry = TR (1, -1): exits diagonally at BL (-1, 1) is wrong;
+    # odd parity means TR exits at (- to the other corner). Concretely, TR entry
+    # row 0 RTL → row 1 LTR → row 2 RTL, ending at rows[2][0] = (-1, 1).
+    # But the DP will pick the start corner that gets A1's exit CLOSEST to A2.
+    # A2 is to the east, so A1's exit should be on the east side. With odd parity,
+    # the east-side exit comes from a west-side entry: BL entry (-1, 1) exits at
+    # rows[0][-1] = (1, -1), or TL entry (-1, -1) exits at rows[-1][-1] = (1, 1).
+    a1 = sc.region_fov_coordinates["A1"]
+    assert a1[-1][0] == 1.0  # exit on east side of A1
+    # A2's entry is closest to A1's exit (east side of A1 → west side of A2).
+    a2 = sc.region_fov_coordinates["A2"]
+    assert a2[0][0] == 9.0  # entry on west side of A2
+    # A1 exit and A2 entry have same y (diagonal snake preserves y parity of column),
+    # so the inter-region jump is purely horizontal.
+    assert a1[-1][1] == a2[0][1]
 
 
 def test_apply_snake_continuity_noop_when_unidirectional():
