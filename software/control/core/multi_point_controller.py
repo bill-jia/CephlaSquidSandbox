@@ -333,6 +333,10 @@ class MultiPointController:
 
         self.do_autofocus = False
         self.do_reflection_af = False
+        self.laser_af_seed_mode = control._def.LASER_AF_SEED_MODE
+        self.laser_af_refresh_every_n_fovs = control._def.LASER_AF_REFRESH_EVERY_N_FOVS
+        self.laser_af_consistency_threshold_um = control._def.LASER_AF_CONSISTENCY_THRESHOLD_UM
+        self.laser_af_check_last_fov_per_region = control._def.LASER_AF_CHECK_LAST_FOV_PER_REGION
         self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
         self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS
         self.experiment_ID = None
@@ -526,6 +530,25 @@ class MultiPointController:
 
     def set_reflection_af_flag(self, flag):
         self.do_reflection_af = flag
+
+    def set_laser_af_seed_mode(self, mode: str):
+        """Set laser-AF seed mode: "scan" runs a pre-acquisition pass that
+        laser-AFs every FOV; "lazy" seeds on first visit during acquisition."""
+        if mode not in ("scan", "lazy"):
+            raise ValueError(f"laser_af_seed_mode must be 'scan' or 'lazy', got {mode!r}")
+        self.laser_af_seed_mode = mode
+
+    def set_laser_af_refresh_every_n_fovs(self, n: int):
+        """Max FOVs per region between anchor refreshes (1 = AF every FOV)."""
+        self.laser_af_refresh_every_n_fovs = max(1, int(n))
+
+    def set_laser_af_consistency_threshold_um(self, threshold_um: float):
+        """µm disagreement above which consistency checks emit a warning."""
+        self.laser_af_consistency_threshold_um = float(threshold_um)
+
+    def set_laser_af_check_last_fov_per_region(self, flag: bool):
+        """Enable/disable the end-of-region displacement check for short regions."""
+        self.laser_af_check_last_fov_per_region = bool(flag)
 
     def set_manual_focus_map_flag(self, flag):
         self.use_manual_focus_map = flag
@@ -1102,6 +1125,10 @@ class MultiPointController:
             xy_mode=self.xy_mode,
             selected_observation_state_names=self.selected_observation_state_names,
             region_observation_state_map=self.region_observation_state_map,
+            laser_af_seed_mode=self.laser_af_seed_mode,
+            laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
+            laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
+            laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
         )
 
     def _on_acquisition_completed(self):

@@ -76,6 +76,13 @@ class AcquisitionParameters:
     # None means all regions use selected_observation_state_names.
     region_observation_state_map: Optional[Dict[str, List[str]]] = None
 
+    # Laser-AF per-FOV offset table controls. See _def.LASER_AF_SEED_MODE and
+    # LASER_AF_REFRESH_EVERY_N_FOVS for semantics.
+    laser_af_seed_mode: str = "scan"  # "scan" | "lazy"
+    laser_af_refresh_every_n_fovs: int = 10
+    laser_af_consistency_threshold_um: float = 5.0
+    laser_af_check_last_fov_per_region: bool = True
+
 
 @dataclass
 class OverallProgressUpdate:

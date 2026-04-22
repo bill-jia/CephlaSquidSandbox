@@ -813,6 +813,22 @@ LASER_AF_FILTER_SIGMA = None
 LASER_AF_INITIALIZE_CROP_WIDTH = 1200
 LASER_AF_INITIALIZE_CROP_HEIGHT = 800
 
+# Laser-AF per-FOV offset table controls. Seed mode "scan" runs a dedicated
+# pre-acquisition pass that laser-AFs every FOV to populate an absolute-Z
+# lookup table; during the time-lapse each region re-measures one FOV every
+# REFRESH_EVERY_N_FOVS to track global drift, and uses stage.move_z_to with
+# stored offsets for the rest. Mode "lazy" skips the pre-pass and forces a
+# laser AF the first time an unseeded FOV is visited.
+LASER_AF_SEED_MODE = "scan"  # "scan" | "lazy"
+LASER_AF_REFRESH_EVERY_N_FOVS = 10
+# When a refresh measures a FOV that was predictable from the table, warn if
+# the measurement disagrees with the prediction by more than this (µm). Also
+# used as the end-of-region displacement-check threshold.
+LASER_AF_CONSISTENCY_THRESHOLD_UM = 5.0
+# On regions too small to hit the refresh cadence, take one extra displacement
+# measurement at the last FOV to validate focus. Measurement-only, no Z move.
+LASER_AF_CHECK_LAST_FOV_PER_REGION = True
+
 MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 
