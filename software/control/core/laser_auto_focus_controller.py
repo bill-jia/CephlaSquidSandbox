@@ -593,62 +593,64 @@ class LaserAutofocusController(QObject):
         with self._time("af:spot_centroid_loop"):
             for i in range(self.laser_af_properties.laser_af_averaging_n):
                 try:
-                    image = self.get_new_frame()
-                    if image is None:
-                        self._log.warning(f"Failed to read frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}")
-                        continue
+                    with self._time("af:spot_centroid_loop:get_frame"):
+                        image = self.get_new_frame()
+                        if image is None:
+                            self._log.warning(f"Failed to read frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}")
+                            continue
+                    
+                        self.image = image  # store for debugging # TODO: add to return instead of storing
+                    with self._time("af:spot_centroid_loop:calculations"):
+                        full_height, full_width = image.shape[:2]
 
-                    self.image = image  # store for debugging # TODO: add to return instead of storing
-                    full_height, full_width = image.shape[:2]
+                        if use_center_crop is not None:
+                            image = utils.crop_image(image, use_center_crop[0], use_center_crop[1])
 
-                    if use_center_crop is not None:
-                        image = utils.crop_image(image, use_center_crop[0], use_center_crop[1])
+                        if remove_background:
+                            # remove background using top hat filter
+                            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50, 50))  # TODO: tmp hard coded value
+                            image = cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel)
 
-                    if remove_background:
-                        # remove background using top hat filter
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50, 50))  # TODO: tmp hard coded value
-                        image = cv2.morphologyEx(image, cv2.MORPH_TOPHAT, kernel)
+                        # calculate centroid
+                        spot_detection_params = {
+                            "y_window": self.laser_af_properties.y_window,
+                            "x_window": self.laser_af_properties.x_window,
+                            "peak_width": self.laser_af_properties.min_peak_width,
+                            "peak_distance": self.laser_af_properties.min_peak_distance,
+                            "peak_prominence": self.laser_af_properties.min_peak_prominence,
+                            "spot_spacing": self.laser_af_properties.spot_spacing,
+                        }
+                        with self._time("af:find_spot_location"):
+                            result = utils.find_spot_location(
+                                image,
+                                mode=self.laser_af_properties.get_spot_detection_mode(),
+                                params=spot_detection_params,
+                                filter_sigma=self.laser_af_properties.filter_sigma,
+                            )
+                        if result is None:
+                            self._log.warning(
+                                f"No spot detected in frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}"
+                            )
+                            continue
 
-                    # calculate centroid
-                    spot_detection_params = {
-                        "y_window": self.laser_af_properties.y_window,
-                        "x_window": self.laser_af_properties.x_window,
-                        "peak_width": self.laser_af_properties.min_peak_width,
-                        "peak_distance": self.laser_af_properties.min_peak_distance,
-                        "peak_prominence": self.laser_af_properties.min_peak_prominence,
-                        "spot_spacing": self.laser_af_properties.spot_spacing,
-                    }
-                    with self._time("af:find_spot_location"):
-                        result = utils.find_spot_location(
-                            image,
-                            mode=self.laser_af_properties.get_spot_detection_mode(),
-                            params=spot_detection_params,
-                            filter_sigma=self.laser_af_properties.filter_sigma,
-                        )
-                    if result is None:
-                        self._log.warning(
-                            f"No spot detected in frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}"
-                        )
-                        continue
+                        if use_center_crop is not None:
+                            x, y = (
+                                result[0] + (full_width - use_center_crop[0]) // 2,
+                                result[1] + (full_height - use_center_crop[1]) // 2,
+                            )
+                        else:
+                            x, y = result
 
-                    if use_center_crop is not None:
-                        x, y = (
-                            result[0] + (full_width - use_center_crop[0]) // 2,
-                            result[1] + (full_height - use_center_crop[1]) // 2,
-                        )
-                    else:
-                        x, y = result
-
-                    if (
-                        self.laser_af_properties.has_reference
-                        and self.laser_af_properties.x_reference is not None
-                        and abs(x - self.laser_af_properties.x_reference) * self.laser_af_properties.pixel_to_um
-                        > self.laser_af_properties.laser_af_range
-                    ):
-                        self._log.warning(
-                            f"Spot detected at ({x:.1f}, {y:.1f}) is out of range ({self.laser_af_properties.laser_af_range:.1f} μm), skipping it."
-                        )
-                        continue
+                        if (
+                            self.laser_af_properties.has_reference
+                            and self.laser_af_properties.x_reference is not None
+                            and abs(x - self.laser_af_properties.x_reference) * self.laser_af_properties.pixel_to_um
+                            > self.laser_af_properties.laser_af_range
+                        ):
+                            self._log.warning(
+                                f"Spot detected at ({x:.1f}, {y:.1f}) is out of range ({self.laser_af_properties.laser_af_range:.1f} μm), skipping it."
+                            )
+                            continue
 
                     tmp_x += x
                     tmp_y += y
