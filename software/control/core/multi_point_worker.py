@@ -2088,9 +2088,13 @@ class MultiPointWorker:
             if using_preset_obs_state:
                 self._apply_current_illumination_state_to_hardware()
             else:
-                self._log.info("Using legacy illumination for capture")
                 self.liveController.obs_controller.turn_on_illumination()
-            self.wait_till_operation_is_completed()
+            # Note: no outer `wait_till_operation_is_completed()` — both paths above
+            # route through `IlluminationController.set_channel_state`, which waits
+            # per-device (shutter_ep.wait() for NI-DAQ endpoints, or the MCU's own
+            # wait_till_operation_is_completed for MCU-gated channels) before
+            # returning. An outer wait was redundant and cost ~5 ms/capture in
+            # CV-lock/wait_for overhead.
         # Give the LED shutter time to reach stable brightness before the camera
         # begins integrating. Needed on rolling-shutter sensors — without this the
         # top rows start exposing on the shutter's rising edge and show a
@@ -2118,15 +2122,11 @@ class MultiPointWorker:
                         f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
                     )
 
-        if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
-            with self._timing.get_timer("get_ready_for_trigger re-check"):
-                # This should be a noop - we have the frame already.  Still, check!
-                while not self.camera.get_ready_for_trigger():
-                    self._sleep(0.001)
-
-                self._ready_for_next_trigger.clear()
-        else:
-            self._ready_for_next_trigger.clear()
+        # The prior-frame `_ready_for_next_trigger.wait` above already guarantees
+        # the camera is ready for the next trigger in SW/HW mode. The former
+        # get_ready_for_trigger re-check loop here was a no-op on the hot path
+        # (its own comment said so) but added a 1 ms sleep and another timer.
+        self._ready_for_next_trigger.clear()
         with self._timing.get_timer("current_capture_info ="):
             # Even though the capture time will be slightly after this, we need to capture and set the capture info
             # before the trigger to be 100% sure the callback doesn't stomp on it.
@@ -2150,14 +2150,22 @@ class MultiPointWorker:
                 acquisition_root=self.experiment_path,
             )
             self._current_capture_info = current_capture_info
-        self._log.info(f"Triggering camera for capture: {current_capture_info.observation_state.name}, position={current_capture_info.position}, z_index={k}")
+        # Hot path — demoted to debug so formatting CaptureInfo (dataclass with Pos and
+        # ObservationState) doesn't cost ~10–15 ms per capture when info handlers are attached.
+        # self._log.debug(
+        #     "Triggering camera for capture: %s, position=%s, z_index=%d",
+        #     current_capture_info.observation_state.name,
+        #     current_capture_info.position,
+        #     k,
+        # )
         if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
             with self._timing.get_timer("send_trigger"):
                 self.camera.send_trigger(illumination_time=camera_illumination_time)
 
         with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
             if self.liveController.trigger_mode == TriggerMode.HARDWARE:
-                self._log.info(f"Waiting {self.camera.get_total_frame_time() / 1e3} [s] for exposure to complete")
+                # Per-capture, so keep at debug to avoid log-format overhead on the hot path.
+                self._log.debug("Waiting %.3f [s] for exposure to complete", self.camera.get_total_frame_time() / 1e3)
                 exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
                 # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
                 # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
