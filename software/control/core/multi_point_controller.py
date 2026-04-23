@@ -344,6 +344,7 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
         self.xy_mode = "Current Position"
         self.widget_type = "wellplate"  # "wellplate" or "flexible"
@@ -569,6 +570,15 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_file_saving_option(self, option):
+        """Set the on-disk save format for the next acquisition.
+
+        ``option`` may be a ``FileSavingOption`` enum or its string name.
+        Snapshotted into ``AcquisitionParameters`` in ``build_params()``;
+        no global state changes.
+        """
+        self.file_saving_option = control._def.FileSavingOption.convert_to_enum(option)
 
     def set_keep_illuminators_on_between_captures(self, keep_on: bool):
         self.keep_illuminators_on_between_captures = bool(keep_on)
@@ -1112,6 +1122,7 @@ class MultiPointController:
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving,
+            file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
             # Downsampled view generation parameters
             generate_downsampled_views=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES or control._def.DISPLAY_PLATE_VIEW,

@@ -40,6 +40,53 @@ def _has_checked_items(list_widget: QListWidget) -> bool:
     return False
 
 
+_FILE_SAVING_FORMAT_TOOLTIPS = {
+    "INDIVIDUAL_IMAGES": "One TIFF (or PNG/BMP) per (region, FOV, Z, channel).",
+    "MULTI_PAGE_TIFF": "One multi-page TIFF per FOV, pages = (Z × channel × time).",
+    "OME_TIFF": "OME-TIFF stacks (TZCYX) with embedded XML metadata. Reads in ImageJ/FIJI.",
+    "ZARR_V3": "OME-NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines.",
+}
+
+
+def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox]":
+    """Build a compact ``Save format: [combo]`` row.
+
+    The combo only mirrors local UI state; the caller wires its
+    ``currentTextChanged`` signal to ``MultiPointController.set_file_saving_option``
+    so the choice flows through ``AcquisitionParameters`` to the worker
+    (mirroring how ``Skip Saving`` is plumbed). Compression / chunking knobs
+    live in Settings > Preferences.
+    """
+    label = QLabel("Save format:")
+    combo = QComboBox()
+    for opt in FileSavingOption:
+        combo.addItem(opt.name)
+        combo.setItemData(combo.count() - 1, _FILE_SAVING_FORMAT_TOOLTIPS.get(opt.name, ""), Qt.ToolTipRole)
+    if initial_option is None:
+        initial_option = control._def.FILE_SAVING_OPTION
+    try:
+        current_name = initial_option.name if hasattr(initial_option, "name") else str(initial_option)
+    except AttributeError:
+        current_name = "INDIVIDUAL_IMAGES"
+    idx = combo.findText(current_name)
+    if idx >= 0:
+        combo.setCurrentIndex(idx)
+    combo.setToolTip(
+        "How acquired images are saved. For ZARR_V3 compression and other tuning, "
+        "see Settings > Preferences."
+    )
+
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+    combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addWidget(label)
+    row.addWidget(combo)
+    row.addStretch(1)
+    return row, combo
+
+
 class _DragToggleTableWidget(QTableWidget):
     """QTableWidget that supports click-and-drag toggling of checkboxes.
 
@@ -442,6 +489,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+            initial_option=getattr(self.multipointController, "file_saving_option", None)
+        )
+
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -620,6 +671,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setVisible(False)
         grid_af.addWidget(self.checkbox_set_z_range)
         grid_af.addWidget(self.checkbox_skipSaving)
+        grid_af.addLayout(self.fileSavingFormatRow)
         grid_af.addWidget(self.checkbox_snakeScan)
         grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
@@ -695,6 +747,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
@@ -2011,6 +2064,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+            initial_option=getattr(self.multipointController, "file_saving_option", None)
+        )
+
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -2250,6 +2307,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
         options_layout.addWidget(self.checkbox_skipSaving)
+        options_layout.addLayout(self.fileSavingFormatRow)
         options_layout.addWidget(self.checkbox_snakeScan)
         options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
@@ -2324,6 +2382,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
+        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures

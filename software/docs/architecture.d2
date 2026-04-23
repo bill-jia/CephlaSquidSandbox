@@ -610,10 +610,11 @@ writers: "Data Output" {
   zarr_writer: "Zarr v3 Writer\n(TensorStore)" {
     class: storage
     tooltip: |md
-      OME-NGFF compliant Zarr output.
-      5D HCS: (T, C, Z, Y, X) per well.
-      6D non-HCS: (FOV, T, C, Z, Y, X).
-      Blosc compression, async writes.
+      OME-NGFF v0.5 per-FOV output.
+      5D shape (T, C, Z, Y, X).
+      Shard = (1, C, Z, Y, X) per FOV-timepoint.
+      Streaming multiscale pyramid.
+      frame_times zarr array for timestamps.
     |
   }
 

@@ -1163,9 +1163,6 @@ class HighContentScreeningGui(QMainWindow):
             self.multipointController.acquisition_finished.connect(self.ndviewerTab.end_acquisition)
             # Zarr mode signals
             self.multipointController.ndviewer_start_zarr_acquisition.connect(self.ndviewerTab.start_zarr_acquisition)
-            self.multipointController.ndviewer_start_zarr_acquisition_6d.connect(
-                self.ndviewerTab.start_zarr_acquisition_6d
-            )
             self.multipointController.ndviewer_notify_zarr_frame.connect(self.ndviewerTab.notify_zarr_frame)
             self.multipointController.ndviewer_end_zarr_acquisition.connect(self.ndviewerTab.end_zarr_acquisition)
 

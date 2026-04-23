@@ -17,13 +17,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control.core.zarr_writer import ZarrWriter, ZarrAcquisitionConfig
-from control._def import ZarrChunkMode, ZarrCompression
+from control._def import ZarrCompression
 
 
 def benchmark_zarr_write(num_frames: int, image_shape: tuple, detailed: bool = False) -> float:
     """Benchmark Zarr v3 writes."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_path = os.path.join(tmpdir, "test.zarr")
+        # ZarrWriter writes group metadata next to the array path, so give it a "0" suffix.
+        output_path = os.path.join(tmpdir, "test.ome.zarr", "0")
 
         # Simulate a simple acquisition: 1 timepoint, num_frames channels, 1 z
         config = ZarrAcquisitionConfig(
@@ -31,7 +32,6 @@ def benchmark_zarr_write(num_frames: int, image_shape: tuple, detailed: bool = F
             shape=(1, num_frames, 1, image_shape[0], image_shape[1]),
             dtype=np.uint16,
             pixel_size_um=1.0,
-            chunk_mode=ZarrChunkMode.FULL_FRAME,
             compression=ZarrCompression.FAST,
         )
 
@@ -89,7 +89,8 @@ def benchmark_tiff_write(num_frames: int, image_shape: tuple) -> float:
 def benchmark_zarr_no_compression(num_frames: int, image_shape: tuple, detailed: bool = False) -> float:
     """Benchmark Zarr v3 writes with NONE compression (no compression)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_path = os.path.join(tmpdir, "test.zarr")
+        # ZarrWriter writes group metadata next to the array path, so give it a "0" suffix.
+        output_path = os.path.join(tmpdir, "test.ome.zarr", "0")
 
         # Use the actual NONE compression mode
         config = ZarrAcquisitionConfig(
@@ -97,7 +98,6 @@ def benchmark_zarr_no_compression(num_frames: int, image_shape: tuple, detailed:
             shape=(1, num_frames, 1, image_shape[0], image_shape[1]),
             dtype=np.uint16,
             pixel_size_um=1.0,
-            chunk_mode=ZarrChunkMode.FULL_FRAME,
             compression=ZarrCompression.NONE,
         )
 
@@ -136,7 +136,8 @@ def benchmark_zarr_no_compression(num_frames: int, image_shape: tuple, detailed:
 def benchmark_zarr_no_sharding(num_frames: int, image_shape: tuple) -> float:
     """Benchmark Zarr v3 writes with compression but no sharding."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_path = os.path.join(tmpdir, "test.zarr")
+        # ZarrWriter writes group metadata next to the array path, so give it a "0" suffix.
+        output_path = os.path.join(tmpdir, "test.ome.zarr", "0")
 
         from control.core.zarr_writer import ZarrWriter
         import tensorstore as ts
@@ -147,7 +148,6 @@ def benchmark_zarr_no_sharding(num_frames: int, image_shape: tuple) -> float:
             shape=(1, num_frames, 1, image_shape[0], image_shape[1]),
             dtype=np.uint16,
             pixel_size_um=1.0,
-            chunk_mode=ZarrChunkMode.FULL_FRAME,
             compression=ZarrCompression.FAST,
         )
 

@@ -699,16 +699,3 @@ def build_per_fov_zarr_path(base_path: str, region_id: str, fov: int) -> str:
         Path to zarr store: {base_path}/zarr/{region_id}/fov_{fov}.ome.zarr
     """
     return os.path.join(base_path, "zarr", str(region_id), f"fov_{fov}.ome.zarr")
-
-
-def build_6d_zarr_path(base_path: str, region_id: str) -> str:
-    """Build path for 6D (FOV as dimension) zarr store.
-
-    Args:
-        base_path: Base experiment path (e.g., /data/experiment_001)
-        region_id: Region identifier (e.g., "region_0")
-
-    Returns:
-        Path to zarr store: {base_path}/zarr/{region_id}/acquisition.zarr
-    """
-    return os.path.join(base_path, "zarr", str(region_id), "acquisition.zarr")

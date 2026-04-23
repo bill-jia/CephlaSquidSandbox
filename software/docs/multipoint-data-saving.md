@@ -144,22 +144,16 @@ See [zarr-v3-format.md](zarr-v3-format.md) for full details on output structure,
 
 **Write mechanism:**
 1. On first frame for a given FOV/region, a `ZarrWriter` is lazily initialized with a `ZarrAcquisitionConfig`
-2. TensorStore creates the zarr v3 dataset with configured chunks, sharding, and compression
-3. OME-NGFF 0.5 metadata is written to `zarr.json`
-4. Each frame is submitted as a non-blocking TensorStore async write. Futures are pipelined and drained periodically (up to 32 in-flight) for throughput
-5. Per-frame timestamps are recorded in memory alongside each write
-6. At acquisition end, all writers are finalized:
-   - Pending writes are flushed
-   - Multiscale pyramid levels (2x, 4x downsampled) are generated and written as sibling arrays (`/1`, `/2`)
-   - Per-frame timestamps are written as `frame_timestamps.json` in the zarr group
-   - The `multiscales` metadata is updated with all pyramid levels
-   - Completion flag is set in `_squid` metadata
+2. TensorStore creates the zarr v3 dataset with fixed per-FOV sharding (shard = `(1, C, Z, Y, X)`, chunk = `(1, 1, 1, Y, X)`) and the selected compression codec
+3. All pyramid levels (`/1`..`/5`) are also opened up-front as sibling arrays, and their entries are registered in `multiscales.datasets` at this point
+4. OME-NGFF 0.5 metadata is written to `zarr.json`, including per-level `scale` and per-FOV `translation` transforms and a `_squid.manifest_path` pointer back to `acquisition.yaml`
+5. Each frame is submitted as a non-blocking TensorStore async write, and is also cascaded through `cv2.pyrDown` into every pyramid level. Futures are pipelined and drained when more than 32 are in flight
+6. Per-frame timestamps are written directly into a `(T, C, Z)` float64 zarr array named `frame_times` alongside the resolution levels
+7. At acquisition end, each writer `finalize()` just flushes pending writes and flips `_squid.acquisition_complete = True` — there is no read-back or post-hoc pyramid pass
 
 **Key configuration:**
-- Compression: NONE, FAST (LZ4), BALANCED (Zstd-3), BEST (Zstd-9)
-- Chunks: FULL_FRAME, TILED_512, TILED_256
-- Sharding: automatic based on compression level
-- Modes: HCS (wellplate), per-FOV, or 6D (all FOVs in one array)
+- Compression: NONE, FAST (LZ4), BALANCED (Zstd-3, default), BEST (Zstd-9)
+- Layout: HCS (wellplate) or per-FOV (flexible). Both are OME-NGFF v0.5 5D.
 
 ## Job Processing Subprocess
 
@@ -218,7 +212,7 @@ Additionally, `coordinates.csv` records the stage position for each FOV.
 
 ### Zarr-Embedded Timestamps
 
-For Zarr V3 format, per-frame timestamps are also written as `frame_timestamps.json` inside each zarr group (next to `zarr.json`). This makes the zarr store fully self-describing — downstream consumers can read timestamps without locating a separate CSV. Each entry contains `t`, `c`, `z`, `unix_time_s`, `channel_name`, and optionally `fov` (for 6D mode).
+For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zarr array inside each FOV group (shape `(T, C, Z)`, dtype `float64`, Unix seconds). This makes the zarr store fully self-describing — downstream consumers can read timestamps with the same stack of tools that reads the image data.
 
 ## Fast Acquisition (Separate Path)
 

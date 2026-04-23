@@ -90,6 +90,10 @@ class CaptureInfo:
     time_point: Optional[int] = None
     filename_channel_label: Optional[str] = None
     """If set, used for TIFF basename instead of observation_state.name."""
+    # On-disk save format the worker selected for this acquisition. Travels with
+    # the job through the multiprocessing pickle so subprocess code branches on
+    # this value rather than reading the (stale) global ``_def.FILE_SAVING_OPTION``.
+    file_saving_option: Optional["_def.FileSavingOption"] = None
 
 
 @dataclass()
@@ -225,7 +229,10 @@ class SaveImageJob(Job):
 
     def save_image(self, image: np.array, info: CaptureInfo, is_color: bool):
         # NOTE(imo): We silently fall back to individual image saving here.  We should warn or do something.
-        if _def.FILE_SAVING_OPTION == _def.FileSavingOption.MULTI_PAGE_TIFF:
+        # Prefer the per-acquisition snapshot on the CaptureInfo; fall back to the global only if a job
+        # was constructed outside the worker (e.g. tests).
+        save_format = info.file_saving_option if info.file_saving_option is not None else _def.FILE_SAVING_OPTION
+        if save_format == _def.FileSavingOption.MULTI_PAGE_TIFF:
             _ch_label = info.filename_channel_label or info.observation_state.name
             metadata = {
                 "z_level": info.z_index,
@@ -445,25 +452,27 @@ class SaveOMETiffJob(Job):
 class ZarrWriterInfo:
     """Info for Zarr v3 saving, injected by JobRunner.
 
-    Output path depends on acquisition mode:
-    - HCS mode: {base_path}/plate.ome.zarr/{row}/{col}/{fov}/0  (5D per FOV, OME-NGFF compliant)
-    - Non-HCS default: {base_path}/zarr/{region_id}/fov_{n}.ome.zarr  (5D per FOV, OME-NGFF compliant)
-    - Non-HCS 6D: {base_path}/zarr/{region_id}/acquisition.zarr  (6D with FOV dimension, non-standard)
+    Output is always 5D per FOV under OME-NGFF:
+    - HCS mode:     {base_path}/plate.ome.zarr/{row}/{col}/{fov}/0
+    - Non-HCS:      {base_path}/zarr/{region_id}/fov_{n}.ome.zarr/0
 
     Attributes:
-        base_path: Base path for zarr outputs (e.g., experiment_path)
-        t_size: Total time points
-        c_size: Total channels
-        z_size: Total z levels
-        is_hcs: True for wellplate (HCS) acquisitions
-        use_6d_fov: Use 6D (FOV, T, C, Z, Y, X) instead of per-FOV files (non-standard)
-        region_fov_counts: Map of region_id -> num_fovs (for 6D shape calculation)
-        pixel_size_um: Physical pixel size in micrometers
-        z_step_um: Z step size in micrometers (optional)
-        time_increment_s: Time between timepoints in seconds (optional)
-        channel_names: List of channel names for metadata
-        channel_colors: List of hex colors for channels (e.g., "#FF0000")
-        channel_wavelengths: List of wavelengths in nm (None for brightfield)
+        base_path: Experiment directory where ``acquisition.yaml`` lives.
+        t_size: Total time points.
+        c_size: Total channels.
+        z_size: Total z levels.
+        is_hcs: True for wellplate (HCS) acquisitions.
+        region_fov_counts: Map of ``region_id`` -> number of FOVs (used to
+            enumerate fields for OME-NGFF well metadata and to derive plate
+            row/column layout).
+        fov_translations_um: Per-region per-FOV ``(y_um, x_um)`` stage positions
+            of the FOV origin, embedded as OME-NGFF ``translation`` transforms.
+        pixel_size_um: Physical pixel size in micrometers.
+        z_step_um: Z step size in micrometers (optional).
+        time_increment_s: Time between timepoints in seconds (optional).
+        channel_names: Channel names for the omero metadata block.
+        channel_colors: Hex colors per channel (e.g. ``"#FF0000"``).
+        channel_wavelengths: Emission wavelengths in nm (None for brightfield).
     """
 
     base_path: str
@@ -471,8 +480,8 @@ class ZarrWriterInfo:
     c_size: int
     z_size: int
     is_hcs: bool = False
-    use_6d_fov: bool = False
     region_fov_counts: Dict[str, int] = field(default_factory=dict)
+    fov_translations_um: Dict[str, Dict[int, Tuple[float, float]]] = field(default_factory=dict)
     pixel_size_um: Optional[float] = None
     z_step_um: Optional[float] = None
     time_increment_s: Optional[float] = None
@@ -481,58 +490,61 @@ class ZarrWriterInfo:
     channel_wavelengths: List[Optional[int]] = field(default_factory=list)
 
     def get_output_path(self, region_id: str, fov: int) -> str:
-        """Get output path for writing (array path).
-
-        HCS mode: {base}/plate.ome.zarr/{row}/{col}/{fov}/0  (array at resolution level 0)
-        Non-HCS per-FOV: {base}/zarr/{region_id}/fov_{n}.ome.zarr/0  (array at resolution level 0)
-        Non-HCS 6D: {base}/zarr/{region_id}/acquisition.zarr  (6D with FOV dimension)
-        """
+        """Resolution-0 array path for a given ``(region_id, fov)``."""
         if self.is_hcs:
-            # build_hcs_zarr_fov_path returns group path; append /0 for array
             group_path = utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov)
-            return os.path.join(group_path, "0")
-        elif self.use_6d_fov:
-            return utils.build_6d_zarr_path(self.base_path, region_id)
         else:
-            # build_per_fov_zarr_path returns group path; append /0 for array
             group_path = utils.build_per_fov_zarr_path(self.base_path, region_id, fov)
-            return os.path.join(group_path, "0")
+        return os.path.join(group_path, "0")
+
+    def get_group_path(self, region_id: str, fov: int) -> str:
+        """FOV group directory (parent of the resolution levels)."""
+        if self.is_hcs:
+            return utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov)
+        return utils.build_per_fov_zarr_path(self.base_path, region_id, fov)
 
     def get_fov_count(self, region_id: str) -> int:
-        """Get total FOV count for a region (for 6D shape calculation)."""
+        """Number of FOVs in a region (for HCS well fields metadata)."""
         return self.region_fov_counts.get(str(region_id), 1)
 
     def get_plate_path(self) -> str:
-        """Get path to plate.ome.zarr directory (HCS mode only)."""
+        """Path to ``plate.ome.zarr`` (HCS mode only)."""
         return os.path.join(self.base_path, "plate.ome.zarr")
 
     def get_well_path(self, well_id: str) -> str:
-        """Get path to well directory (HCS mode only)."""
+        """Path to a well directory (HCS mode only)."""
         row_letter, col_num = utils.parse_well_id(well_id)
         return os.path.join(self.base_path, "plate.ome.zarr", row_letter, col_num)
 
     def get_hcs_structure(self) -> Tuple[List[str], List[int], List[Tuple[str, int]]]:
-        """Extract HCS structure from region_fov_counts.
-
-        Returns:
-            Tuple of (rows, cols, wells) where:
-            - rows: sorted unique row letters (e.g., ["A", "B", "C"])
-            - cols: sorted unique column numbers (e.g., [1, 2, 3])
-            - wells: list of (row, col) tuples for all wells
-        """
+        """Return ``(rows, cols, wells)`` for HCS plate metadata."""
         rows_set = set()
         cols_set = set()
         wells = []
-
         for well_id in self.region_fov_counts.keys():
             row_letter, col_num = utils.parse_well_id(well_id)
             rows_set.add(row_letter)
             cols_set.add(int(col_num))
             wells.append((row_letter, int(col_num)))
+        return sorted(rows_set), sorted(cols_set), wells
 
-        rows = sorted(rows_set)
-        cols = sorted(cols_set)
-        return rows, cols, wells
+    def get_fov_translation_um(self, region_id: str, fov: int) -> Tuple[float, float]:
+        """Stage position (y_um, x_um) for the FOV; (0, 0) if unknown."""
+        region_map = self.fov_translations_um.get(str(region_id), {})
+        return region_map.get(int(fov), (0.0, 0.0))
+
+    def get_manifest_path(self, region_id: str, fov: int) -> str:
+        """Relative path from the FOV group to the experiment's acquisition.yaml.
+
+        Used for ``_squid.manifest_path`` inside the FOV's zarr.json.
+        """
+        group_dir = self.get_group_path(region_id, fov)
+        manifest_abs = os.path.join(self.base_path, "acquisition.yaml")
+        try:
+            rel = os.path.relpath(manifest_abs, group_dir)
+        except ValueError:
+            rel = manifest_abs
+        return rel.replace("\\", "/")
 
 
 @dataclass
@@ -657,12 +669,10 @@ class SaveZarrJob(Job):
         image = self.image_array()
         info = self.capture_info
 
-        # Get per-region/FOV output path to avoid overwriting between FOVs
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
         output_path = self.zarr_writer_info.get_output_path(region_id, fov)
 
-        # Build result with frame info for viewer notification
         region_names = list(self.zarr_writer_info.region_fov_counts.keys())
         result = ZarrWriteResult(
             fov=fov,
@@ -672,31 +682,15 @@ class SaveZarrJob(Job):
             region_idx=region_names.index(region_id) if region_id in region_names else 0,
         )
 
-        # Determine shape based on acquisition mode
-        is_hcs = self.zarr_writer_info.is_hcs
-        use_6d_fov = self.zarr_writer_info.use_6d_fov
-        if is_hcs or not use_6d_fov:
-            # 5D shape: (T, C, Z, Y, X) - one writer per FOV
-            shape = (
-                self.zarr_writer_info.t_size,
-                self.zarr_writer_info.c_size,
-                self.zarr_writer_info.z_size,
-                image.shape[0],
-                image.shape[1],
-            )
-        else:
-            # 6D shape: (FOV, T, C, Z, Y, X) - FOV first for contiguous per-FOV data
-            fov_count = self.zarr_writer_info.get_fov_count(region_id)
-            shape = (
-                fov_count,
-                self.zarr_writer_info.t_size,
-                self.zarr_writer_info.c_size,
-                self.zarr_writer_info.z_size,
-                image.shape[0],
-                image.shape[1],
-            )
+        # Always 5D: (T, C, Z, Y, X) per FOV.
+        shape = (
+            self.zarr_writer_info.t_size,
+            self.zarr_writer_info.c_size,
+            self.zarr_writer_info.z_size,
+            image.shape[0],
+            image.shape[1],
+        )
 
-        # Simulated disk I/O mode
         if is_simulation_enabled():
             bytes_written = simulated_zarr_write(
                 image=image,
@@ -721,53 +715,24 @@ class SaveZarrJob(Job):
         return result
 
     def _save_zarr(self, image: np.ndarray, info: CaptureInfo, output_path: str) -> None:
-        """Write image to zarr dataset using TensorStore.
-
-        Args:
-            image: Image array to write
-            info: Capture info with t/c/z indices
-            output_path: Path to the zarr dataset for this region/FOV
-        """
+        """Write one plane to the per-FOV zarr (level 0 + pyramid via ZarrWriter)."""
         from control.core.zarr_writer import ZarrWriter, ZarrAcquisitionConfig
         from control import _def
 
-        is_hcs = self.zarr_writer_info.is_hcs
-        use_6d_fov = self.zarr_writer_info.use_6d_fov
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
-
-        # Key logic:
-        # - HCS: unique per (region, fov) via output_path
-        # - Non-HCS 6D: shared per region (all FOVs in one 6D array)
-        # - Non-HCS default: unique per (region, fov) via output_path
-        if not is_hcs and use_6d_fov:
-            writer_key = f"{self.zarr_writer_info.base_path}:{region_id}"
-        else:
-            writer_key = output_path  # Unique per FOV
+        writer_key = output_path  # One writer per FOV
 
         if writer_key not in self._zarr_writers:
-            if is_hcs or not use_6d_fov:
-                # 5D shape: (T, C, Z, Y, X) - one writer per FOV
-                shape = (
-                    self.zarr_writer_info.t_size,
-                    self.zarr_writer_info.c_size,
-                    self.zarr_writer_info.z_size,
-                    image.shape[0],
-                    image.shape[1],
-                )
-                is_6d = False
-            else:
-                # 6D shape: (FOV, T, C, Z, Y, X) - FOV first for contiguous per-FOV data
-                fov_count = self.zarr_writer_info.get_fov_count(region_id)
-                shape = (
-                    fov_count,
-                    self.zarr_writer_info.t_size,
-                    self.zarr_writer_info.c_size,
-                    self.zarr_writer_info.z_size,
-                    image.shape[0],
-                    image.shape[1],
-                )
-                is_6d = True
+            shape = (
+                self.zarr_writer_info.t_size,
+                self.zarr_writer_info.c_size,
+                self.zarr_writer_info.z_size,
+                image.shape[0],
+                image.shape[1],
+            )
+            translation_um = self.zarr_writer_info.get_fov_translation_um(region_id, fov)
+            manifest_path = self.zarr_writer_info.get_manifest_path(region_id, fov)
 
             config = ZarrAcquisitionConfig(
                 output_path=output_path,
@@ -779,9 +744,9 @@ class SaveZarrJob(Job):
                 channel_names=self.zarr_writer_info.channel_names,
                 channel_colors=self.zarr_writer_info.channel_colors,
                 channel_wavelengths=self.zarr_writer_info.channel_wavelengths,
-                chunk_mode=_def.ZARR_CHUNK_MODE,
                 compression=_def.ZARR_COMPRESSION,
-                is_hcs=is_hcs or not use_6d_fov,  # 5D for HCS and non-HCS default
+                translation_um=translation_um,
+                manifest_path=manifest_path,
             )
             try:
                 writer = ZarrWriter(config)
@@ -790,34 +755,19 @@ class SaveZarrJob(Job):
                 self._log.error(f"Failed to initialize zarr writer for {output_path}: {e}")
                 raise
             self._zarr_writers[writer_key] = writer
-            if is_hcs:
-                mode_str = "HCS 5D"
-                # Write HCS plate and well metadata
+            if self.zarr_writer_info.is_hcs:
                 self._write_hcs_metadata_if_needed(region_id, fov)
-            elif is_6d:
-                mode_str = f"non-HCS 6D (fov_count={fov_count})"
-            else:
-                mode_str = "non-HCS 5D per-FOV"
+            mode_str = "HCS" if self.zarr_writer_info.is_hcs else "per-FOV"
             self._log.info(f"Initialized zarr writer ({mode_str}): {output_path}")
 
         writer = self._zarr_writers[writer_key]
-
-        # Write frame
         t = info.time_point or 0
         c = info.configuration_idx
         z = info.z_index
         channel_name = info.filename_channel_label or info.observation_state.name
-
-        if is_hcs or not use_6d_fov:
-            # 5D write
-            writer.write_frame(image, t=t, c=c, z=z)
-            writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name)
-            self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path}")
-        else:
-            # 6D write with FOV index
-            writer.write_frame(image, t=t, c=c, z=z, fov=fov)
-            writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name, fov=fov)
-            self._log.debug(f"Wrote frame t={t}, c={c}, z={z}, fov={fov} to {output_path}")
+        writer.write_frame(image, t=t, c=c, z=z)
+        writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name)
+        self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path}")
 
 
 # These are debugging jobs - they should not be used in normal usage!

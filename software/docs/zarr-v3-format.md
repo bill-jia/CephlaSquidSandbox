@@ -1,207 +1,258 @@
 # Zarr v3 Output Format
 
-This document describes the Zarr v3 output format for Squid acquisitions.
+Squid writes acquisitions as OME-NGFF v0.5 Zarr v3 stores when
+`FILE_SAVING_OPTION = ZARR_V3`. The layout is always 5D per FOV with plane-level
+chunks and per-FOV sharding, optimized for tile-scan timelapse workloads that
+feed downstream stitching / segmentation / tracking pipelines.
 
-## Overview
+## At a glance
 
-Squid supports saving acquisition data in Zarr v3 format with OME-NGFF 0.5 metadata. This format provides:
+| Axis | Value |
+|------|-------|
+| Array shape | `(T, C, Z, Y, X)` per FOV |
+| Inner chunk | `(1, 1, 1, Y, X)` — one image plane |
+| Outer shard | `(1, C, Z, Y, X)` — one FOV-timepoint bundle |
+| Compression | blosc-zstd clevel 3 + bitshuffle (default, `BALANCED`) |
+| Pyramid | up to 5 extra levels, written inline per frame |
+| Per-frame timestamps | `frame_times` zarr array (shape `T×C×Z`, float64) |
+| Metadata | OME-NGFF `multiscales` + `omero` + `_squid.manifest_path` |
 
-- **High performance**: TensorStore backend with sharding for ~200 MB/s write speed
-- **Compression options**: None, Fast (LZ4), Balanced (Zstd), Best (Zstd level 9)
-- **Streaming support**: Data can be read during acquisition
-- **OME-NGFF 0.5 metadata**: Standard metadata format (note: viewer support for Zarr v3 is still emerging)
+File count per FOV ≈ `T × (num_pyramid_levels + 1)`: shards are written once per
+`(FOV, timepoint)` and never reopened.
 
-## Enabling Zarr v3
+## Output layouts
 
-Settings > Preferences > File Saving Format: **ZARR_V3**
+### HCS (wellplate)
 
-Additional options:
-- **Compression Level**: None (fastest), Fast (LZ4), Balanced (Zstd), Best (Zstd level 9)
-- **Use 6D FOV dimension**: Combine all FOVs in a region into a single 6D array (non-standard)
-
-## Output Structures
-
-### HCS (Wellplate) Mode
-
-When acquiring from wellplate positions (region names match pattern `[A-Z]+\d+`):
+When the xy layout resolves to well IDs (`A1`, `B12`, …), Squid writes the
+OME-NGFF HCS plate hierarchy:
 
 ```
 {experiment}/
 └── plate.ome.zarr/
-    ├── zarr.json          # Plate metadata (ome.plate)
+    ├── zarr.json              # ome.plate
     ├── A/
     │   └── 1/
-    │       ├── zarr.json  # Well metadata (ome.well)
-    │       ├── 0/
-    │       │   ├── zarr.json  # FOV group (ome.multiscales, omero)
-    │       │   └── 0/         # 5D array (T, C, Z, Y, X)
-    │       └── 1/
-    │           └── ...
+    │       ├── zarr.json      # ome.well
+    │       ├── 0/             # FOV 0
+    │       │   ├── zarr.json  # ome.multiscales + ome.omero + _squid.manifest_path
+    │       │   ├── 0/         # resolution level 0 (full resolution)
+    │       │   ├── 1/         # resolution level 1 (2× down)
+    │       │   ├── ...
+    │       │   └── frame_times/  # (T, C, Z) float64 unix timestamps
+    │       └── 1/             # FOV 1
     └── B/
         └── ...
 ```
 
-### Per-FOV Mode (Default)
+### Non-HCS (flexible / large-area)
 
-For non-wellplate acquisitions:
+For non-well xy layouts (custom regions, single-area tile scans, etc.):
 
 ```
 {experiment}/
 └── zarr/
     └── {region}/
         ├── fov_0.ome.zarr/
-        │   ├── zarr.json      # OME metadata
-        │   └── 0/             # 5D array (T, C, Z, Y, X)
+        │   ├── zarr.json
+        │   ├── 0/ .. 5/       # resolution levels
+        │   └── frame_times/
         └── fov_1.ome.zarr/
-            └── ...
 ```
 
-### 6D Mode (ZARR_USE_6D_FOV_DIMENSION=True)
+Each FOV is its own OME-NGFF image group. Both layouts share the same per-FOV
+structure below the FOV group.
 
-Combines all FOVs into a single zarr store per region. **Warning:** This is a non-standard OME-NGFF layout with a 6D (FOV, T, C, Z, Y, X) array structure. Most standard OME-NGFF viewers (napari-ome-zarr, OMERO, etc.) expect 5D arrays and may not read this format correctly. Use only with Squid or tools that explicitly support 6D arrays:
+## Array structure
 
-```
-{experiment}/
-└── zarr/
-    └── {region}/
-        └── acquisition.zarr/     # 6D array at root (FOV, T, C, Z, Y, X)
-            └── zarr.json         # OME metadata (datasets.path = ".")
-```
+- **Shape**: `(T, C, Z, Y, X)`.
+- **Dtype**: whatever the camera produces (usually `uint16`).
+- **Inner chunk** (`chunks` inside the sharding codec): `(1, 1, 1, Y, X)` — a single image plane. Enables per-`(t, c, z)` random access.
+- **Outer shard** (the zarr-v3 chunk-grid chunk, containing the inner chunks): `(1, C, Z, Y, X)`. One shard per `(FOV, timepoint)`: the stitching pattern downstream reads one whole FOV per tile and only needs a single file open per tile. Acquisition writes each shard once and never reopens it.
 
-Note: Unlike HCS/per-FOV modes where the array is in a `/0` subdirectory, 6D mode stores the array at the zarr root with `datasets.path = "."` in the metadata.
+## Compression
 
-## Array Structure
+`ZARR_COMPRESSION` (project setting) selects the blosc preset:
 
-### 5D Arrays (Standard)
+| Value | Codec | Typical ratio | Typical encode |
+|-------|-------|---------------|----------------|
+| `NONE` | no codec | 1× | disk-bound |
+| `FAST` | blosc-lz4 clevel 1, byte shuffle | ~2× | ~1 GB/s |
+| `BALANCED` (default) | blosc-zstd clevel 3, bitshuffle | ~3–5× on 16-bit fluorescence | ~500 MB/s |
+| `BEST` | blosc-zstd clevel 9, bitshuffle | ~5–7× | ~100 MB/s |
 
-Shape: `(T, C, Z, Y, X)` where:
-- T = number of timepoints
-- C = number of channels
-- Z = number of z-levels
-- Y, X = image dimensions
+Sharding is always on regardless of compression; the decisive factor is just
+the codec choice.
 
-### 6D Arrays (Non-standard)
+## Multiscale pyramid (streaming)
 
-Shape: `(FOV, T, C, Z, Y, X)` where:
-- FOV = number of fields of view in the region
-- Other dimensions same as 5D
+Resolution levels `/1` ... `/N` are opened at `ZarrWriter.initialize()` and
+populated inline on every `write_frame(image, t, c, z)` call via a cascade of
+`cv2.pyrDown`. Each level's shape is `((Y+1)//2, (X+1)//2)` relative to the
+previous. Generation stops when `min(Y, X) < 128` or after 5 extra levels
+(defaults on `ZarrAcquisitionConfig`).
 
-## Metadata Structure (OME-NGFF 0.5)
+There is **no serial post-hoc pyramid pass** — `finalize()` does not read back
+or compute anything; it only flushes pending TensorStore writes and flips the
+`_squid.acquisition_complete` flag.
+
+## OME-NGFF metadata
+
+At each FOV group's `zarr.json` (schema v0.5):
 
 ```json
 {
-  "ome": {
-    "version": "0.5",
-    "multiscales": [{
+  "zarr_format": 3,
+  "node_type": "group",
+  "attributes": {
+    "ome": {
       "version": "0.5",
-      "axes": [
-        {"name": "t", "type": "time", "unit": "second"},
-        {"name": "c", "type": "channel"},
-        {"name": "z", "type": "space", "unit": "micrometer"},
-        {"name": "y", "type": "space", "unit": "micrometer"},
-        {"name": "x", "type": "space", "unit": "micrometer"}
-      ],
-      "datasets": [{"path": "0", "coordinateTransformations": [...]}]  // "." for 6D mode
-    }],
-    "omero": {
-      "version": "0.5",
-      "channels": [
-        {"label": "DAPI", "color": "0000FF", "window": {"start": 0, "end": 65535}},
-        {"label": "GFP", "color": "00FF00", "window": {"start": 0, "end": 65535}}
-      ]
+      "multiscales": [{
+        "version": "0.5",
+        "name": "0",
+        "axes": [
+          {"name": "t", "type": "time",    "unit": "second"},
+          {"name": "c", "type": "channel"},
+          {"name": "z", "type": "space",   "unit": "micrometer"},
+          {"name": "y", "type": "space",   "unit": "micrometer"},
+          {"name": "x", "type": "space",   "unit": "micrometer"}
+        ],
+        "datasets": [
+          {
+            "path": "0",
+            "coordinateTransformations": [
+              {"type": "scale",       "scale":       [dt_s, 1, dz_um, px_um, px_um]},
+              {"type": "translation", "translation": [0, 0, 0, stage_y_um, stage_x_um]}
+            ]
+          },
+          { "path": "1", "coordinateTransformations": [ ... scale doubles at each level ... ] }
+        ],
+        "coordinateTransformations": [{"type": "identity"}]
+      }],
+      "omero": {
+        "version": "0.5",
+        "channels": [
+          {"label": "BF", "active": true, "color": "FFFFFF", "window": {...}},
+          {"label": "GFP", "active": true, "color": "00FF00", "emission_wavelength": {"value": 488, "unit": "nanometer"}, "window": {...}}
+        ]
+      }
+    },
+    "_squid": {
+      "manifest_path": "../../../../acquisition.yaml",
+      "acquisition_complete": true
     }
-  },
-  "_squid": {
-    "structure": "5D-TCZYX",
-    "pixel_size_um": 0.5,
-    "compression": "fast",
-    "acquisition_complete": true
   }
 }
 ```
 
-## Multiscale Pyramids
+### What's in each transform
 
-On finalization, each zarr writer generates downsampled pyramid levels (2x and 4x) alongside the full-resolution `/0` array. These are written as `/1` and `/2` sibling arrays using `cv2.INTER_AREA` downsampling and registered in the `multiscales.datasets` metadata.
+- `scale` embeds the physical size of a voxel in µm on spatial axes, the time
+  delta in seconds on `t`, and leaves `c = 1` (channel has no physical scale).
+  For pyramid level `L`, the `y`/`x` scale is multiplied by `2^L`.
+- `translation` embeds the FOV's stage origin in µm on `y` and `x`. Downstream
+  stitchers read this directly from each FOV's zarr; the top-level
+  `coordinates.csv` is kept for human inspection but is no longer the source of
+  truth for positions.
 
-This enables interactive browsing in OME-NGFF-compatible viewers (napari, neuroglancer, OMERO) without manual pyramid generation. Pyramid generation is skipped for 6D mode (where the array path is `.` rather than `/0`).
+### `_squid` pointer
 
-## Embedded Frame Timestamps
+`_squid.manifest_path` is a relative path from the FOV group back to the
+experiment-root `acquisition.yaml`, which holds full provenance (objective,
+wellplate format, channel presets, instrument manifest, etc.). The zarr
+intentionally does not duplicate the manifest.
 
-Per-frame capture timestamps are written as `frame_timestamps.json` inside each zarr group during finalization. Each entry contains `t`, `c`, `z`, `unix_time_s`, and `channel_name` (plus `fov` for 6D mode). This supplements the `frame_acquisition_times.csv` written per timepoint directory, making the zarr store self-describing.
+## Per-frame timestamps
 
-## Pipelined Writes
+Alongside the resolution-level arrays, each FOV group contains a
+`frame_times` zarr array of shape `(T, C, Z)` dtype `float64` holding unix
+timestamps. Values are written via `ZarrWriter.record_frame_time(t, c, z,
+unix_time_s, channel_name=...)`. This replaces the older
+`frame_timestamps.json` sidecar and scales cleanly to long timelapses.
 
-The `ZarrWriter` submits TensorStore writes non-blockingly, accumulating up to 32 in-flight futures before draining completed ones. This allows TensorStore to overlap compression and disk I/O across frames, improving throughput for fast cameras. All pending writes are flushed during finalization.
+A `frame_acquisition_times.csv` is still written under each timepoint folder
+for human-friendly inspection.
 
-## Sharding and Chunks
+## HCS plate + well metadata
 
-Zarr v3 uses sharding to optimize both read and write performance:
+For HCS acquisitions, two extra group-level `zarr.json` files are written:
 
-- **Shard size**: One full frame (all z-levels for one timepoint/channel/FOV)
-- **Chunk size**: Configurable via `ZARR_CHUNK_MODE`:
-  - `full_frame`: Each chunk is a full image plane (simplest)
-  - `tiled_512`: 512x512 pixel chunks for tiled visualization
-  - `tiled_256`: 256x256 pixel chunks for fine-grained streaming
+- `plate.ome.zarr/zarr.json` — OME-NGFF `ome.plate` (rows, columns, wells).
+- `plate.ome.zarr/{row}/{col}/zarr.json` — OME-NGFF `ome.well` (fields list).
 
-## Configuration Options
+Both are written once per acquisition when the first writer for that
+plate / well initializes (see `SaveZarrJob._write_hcs_metadata_if_needed`).
+
+## Pipelined writes
+
+`ZarrWriter` accumulates up to `MAX_PENDING_WRITES = 32` in-flight TensorStore
+futures before draining completed ones. Every `write_frame` also dispatches
+the same number of pyramid-level writes, so the drain threshold is the
+effective pipeline depth. `finalize()` waits for all outstanding futures.
+
+## Configuration
 
 | Setting | Values | Description |
 |---------|--------|-------------|
-| `FILE_SAVING_OPTION` | ZARR_V3 | Enable Zarr v3 format |
-| `ZARR_COMPRESSION` | none, fast, balanced, best | Compression level |
-| `ZARR_CHUNK_MODE` | full_frame, tiled_512, tiled_256 | Chunk size |
-| `ZARR_USE_6D_FOV_DIMENSION` | True/False | 6D array with FOV dimension |
+| `FILE_SAVING_OPTION` | `ZARR_V3` | Enable Zarr v3 output |
+| `ZARR_COMPRESSION` | `none`, `fast`, `balanced`, `best` | Compression preset |
 
-## Live Viewing
+Chunk/shard shape and pyramid depth are fixed by the implementation; they are
+not user-configurable.
 
-When acquiring with Zarr v3 format, the NDViewer automatically uses the zarr push API for live viewing. This requires:
+## Reading the output
 
-1. ndviewer_light with zarr support
-2. The zarr stores to be accessible from the main process
-
-See [NDViewer Tab](ndviewer-tab.md) for details on live viewing.
-
-### Limitations
-
-- **Multi-region 6D mode**: Only the first region is viewable during live acquisition. Reload the dataset after acquisition to view all regions.
-- **Zarr support required**: If ndviewer_light doesn't have zarr support, a placeholder message will be shown instead of the live view.
-
-## Opening Zarr Files
-
-### TensorStore (Recommended)
-
-TensorStore is the recommended library for reading Zarr v3 files. It works with any Python version.
+### TensorStore (Python, any version)
 
 ```python
 import tensorstore as ts
 
-# Open HCS plate array
 spec = {
     "driver": "zarr3",
-    "kvstore": {"driver": "file", "path": "path/to/plate.ome.zarr/A/1/0/0"},
+    "kvstore": {"driver": "file", "path": "exp/plate.ome.zarr/A/1/0/0"},
 }
 store = ts.open(spec, read=True).result()
-print(f"Shape: {store.shape}")  # (T, C, Z, Y, X)
-data = store[0, 0, 0, :, :].read().result()  # Read first frame
+print(store.shape)                   # (T, C, Z, Y, X)
+plane = store[0, 0, 0, :, :].read().result()
 ```
 
-### zarr-python v3
+For stage positions, read the parent group's `zarr.json` and pull the
+`translation` out of `multiscales[0].datasets[0].coordinateTransformations`.
 
-Requires `zarr>=3.0` and **Python >=3.11**.
+### zarr-python ≥ 3
 
 ```python
 import zarr
-
-store = zarr.open_group("path/to/plate.ome.zarr/A/1/0", mode='r')
-data = store["0"][0, 0, 0, :, :]  # Read first frame
+grp = zarr.open_group("exp/plate.ome.zarr/A/1/0", mode="r")
+arr = grp["0"]
+plane = arr[0, 0, 0, :, :]
 ```
 
-### napari
+### napari / OMERO / BiaFlows
 
-> **Note:** napari-ome-zarr does not yet support Zarr v3 format ([ome/napari-ome-zarr#139](https://github.com/ome/napari-ome-zarr/issues/139)). Use TensorStore to read Zarr v3 files until napari adds support.
+Any OME-NGFF v0.5 HCS-plate reader works with the output directory. Pyramid
+levels make scrolling at plate scale practical.
 
-## Related Documentation
+## Repackaging legacy INDIVIDUAL_IMAGES acquisitions
 
-- [NDViewer Tab](ndviewer-tab.md) - Live viewing during acquisition
-- [Downsampled Plate View](downsampled-plate-view.md) - Overview visualization for wellplate acquisitions
+`software/tools/repackage_tiffs_to_zarr.py` converts an existing
+`INDIVIDUAL_IMAGES` acquisition (per-frame TIFFs under per-timepoint folders)
+into this exact layout, including per-FOV pyramids and translation metadata.
+Missing frames are zero-filled by default and logged to `missing_frames.csv`.
+
+```bash
+python software/tools/repackage_tiffs_to_zarr.py \
+    --input /path/to/experiment \
+    --output /path/to/experiment/repackaged \
+    --compression balanced \
+    --jobs 4
+```
+
+See the script `--help` for the full flag set (`--on-missing`,
+`--trim-to-last-observed-t`, `--force`, `--dry-run`).
+
+## Related documentation
+
+- [NDViewer Tab](ndviewer-tab.md) — live viewing during acquisition.
+- [Downsampled Plate View](downsampled-plate-view.md) — overview tile images
+  for wellplate scans (independent of the zarr output).

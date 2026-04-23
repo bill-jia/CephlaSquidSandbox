@@ -230,9 +230,10 @@ class MultiPointWorker:
         self._region_refresh_count_this_entry: int = 0
 
         self.skip_saving = acquisition_parameters.skip_saving
+        self.file_saving_option = acquisition_parameters.file_saving_option
         job_classes = []
-        use_ome_tiff = FILE_SAVING_OPTION == FileSavingOption.OME_TIFF
-        use_zarr_v3 = FILE_SAVING_OPTION == FileSavingOption.ZARR_V3
+        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF
+        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3
         if not self.skip_saving:
             if use_ome_tiff:
                 job_classes.append(SaveOMETiffJob)
@@ -304,36 +305,38 @@ class MultiPointWorker:
         # Get the current log file path to share with subprocess workers
         log_file_path = squid.logging.get_current_log_file_path()
 
-        # Build ZarrWriterInfo if using ZARR_V3 format
-        # Output structure depends on acquisition type and settings:
-        # - HCS (wells): {experiment_path}/plate.ome.zarr/{row}/{col}/{fov}/0  (5D per FOV, OME-NGFF compliant)
-        # - Non-HCS default: {experiment_path}/zarr/{region}/fov_{n}.ome.zarr  (5D per FOV, OME-NGFF compliant)
-        # - Non-HCS 6D: {experiment_path}/zarr/{region}/acquisition.zarr  (6D, non-standard)
+        # Build ZarrWriterInfo if using ZARR_V3 format.
+        # Output is always OME-NGFF 5D per FOV:
+        # - HCS:     {experiment_path}/plate.ome.zarr/{row}/{col}/{fov}/0
+        # - Non-HCS: {experiment_path}/zarr/{region}/fov_{n}.ome.zarr/0
         zarr_writer_info = None
         if use_zarr_v3:
-            # Detect HCS mode using well-based acquisition state.
-            # is_loaded_wells already reflects the result of _is_well_based_acquisition(),
-            # so we only need to combine it with is_select_wells here.
+            # HCS = well-based acquisition (Select Wells or Load Coordinates with well IDs).
             is_hcs = is_select_wells or is_loaded_wells
 
-            # Pre-compute FOV counts per region (needed for 6D shape calculation in non-HCS mode)
-            region_fov_counts = {}
+            # Per-region FOV counts (drives OME-NGFF well fields list).
+            # Per-region per-FOV (y_um, x_um) translations (drives OME-NGFF multiscales translation).
+            region_fov_counts: Dict[str, int] = {}
+            fov_translations_um: Dict[str, Dict[int, Tuple[float, float]]] = {}
             for region_id, coords in self.scan_region_fov_coords_mm.items():
-                region_fov_counts[str(region_id)] = len(coords)
+                region_key = str(region_id)
+                region_fov_counts[region_key] = len(coords)
+                fov_translations_um[region_key] = {
+                    fov_idx: (coord[1] * 1000.0, coord[0] * 1000.0)  # (y_um, x_um) from (x_mm, y_mm, z_mm)
+                    for fov_idx, coord in enumerate(coords)
+                }
 
             # Extract channel metadata for zarr output
             illumination_config = self.microscope.config_repo.get_illumination_config()
             if self._use_observation_presets:
                 channel_names = list(self.observation_state_names)
-                channel_colors = []
-                channel_wavelengths = []
+                channel_colors: List[str] = []
+                channel_wavelengths: List[Optional[int]] = []
                 repo = self.microscope.config_repo
-                objective = self.objectiveStore.current_objective
                 for pname in self.observation_state_names:
                     st = repo.load_observation_preset(pname)
                     if st is not None and st.illuminator_states:
                         channel_colors.append(st.display_color)
-                        # Find wavelength from the first active illuminator
                         active = st.active_illuminator_states
                         ist = active[0] if active else st.illuminator_states[0]
                         wl = None
@@ -342,7 +345,7 @@ class MultiPointWorker:
                             wl = ch_def.wavelength_nm if ch_def else None
                         channel_wavelengths.append(wl)
                     else:
-                        channel_colors.append(0xFFFFFF)
+                        channel_colors.append("#FFFFFF")
                         channel_wavelengths.append(None)
             else:
                 channel_names = []
@@ -355,8 +358,8 @@ class MultiPointWorker:
                 c_size=len(channel_names),
                 z_size=self.NZ,
                 is_hcs=is_hcs,
-                use_6d_fov=control._def.ZARR_USE_6D_FOV_DIMENSION,
                 region_fov_counts=region_fov_counts,
+                fov_translations_um=fov_translations_um,
                 pixel_size_um=self._pixel_size_um,
                 z_step_um=self._physical_size_z_um,
                 time_increment_s=self._time_increment_s,
@@ -364,12 +367,7 @@ class MultiPointWorker:
                 channel_colors=channel_colors,
                 channel_wavelengths=channel_wavelengths,
             )
-            if is_hcs:
-                mode_str = "HCS plate hierarchy"
-            elif control._def.ZARR_USE_6D_FOV_DIMENSION:
-                mode_str = "per-region 6D (non-standard)"
-            else:
-                mode_str = "per-FOV 5D (OME-NGFF compliant)"
+            mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
 
         # Use pre-warmed job runner if available, otherwise create new ones.
@@ -807,7 +805,7 @@ class MultiPointWorker:
                 # This makes per-timepoint folders self-describing without parsing filenames.
                 if (
                     not self.skip_saving
-                    and FILE_SAVING_OPTION in (FileSavingOption.INDIVIDUAL_IMAGES, FileSavingOption.MULTI_PAGE_TIFF)
+                    and self.file_saving_option in (FileSavingOption.INDIVIDUAL_IMAGES, FileSavingOption.MULTI_PAGE_TIFF)
                 ):
                     metadata_path = os.path.join(current_path, "metadata.json")
                     if not os.path.exists(metadata_path):
@@ -819,7 +817,7 @@ class MultiPointWorker:
                             "pixel_size_um": self._pixel_size_um,
                             "z_step_um": self._physical_size_z_um,
                             "time_increment_s": self._time_increment_s,
-                            "file_saving_option": FILE_SAVING_OPTION.value,
+                            "file_saving_option": self.file_saving_option.value,
                         }
                         try:
                             with open(metadata_path, "w") as f:
@@ -1930,6 +1928,7 @@ class MultiPointWorker:
                 configuration_idx=config_idx,
                 time_point=self.time_point,
                 filename_channel_label=filename_channel_label,
+                file_saving_option=self.file_saving_option,
             )
             self._current_capture_info = current_capture_info
         self._log.info(f"Triggering camera for capture: {current_capture_info.observation_state.name}, position={current_capture_info.position}, z_index={k}")
@@ -2026,6 +2025,7 @@ class MultiPointWorker:
             fov=fov,
             configuration_idx=0,
             time_point=self.time_point,
+            file_saving_option=self.file_saving_option,
         )
 
         if len(i_size) == 3:

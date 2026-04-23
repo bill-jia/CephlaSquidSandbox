@@ -208,9 +208,6 @@ class QtMultiPointController(MultiPointController, QObject):
     ndviewer_start_zarr_acquisition = Signal(
         list, list, int, list, int, int
     )  # fov_paths, channels, num_z, fov_labels, height, width
-    ndviewer_start_zarr_acquisition_6d = Signal(
-        list, list, int, list, int, int, list
-    )  # region_paths, channels, num_z, fovs_per_region, height, width, region_labels
     ndviewer_notify_zarr_frame = Signal(int, int, int, str, int)  # t, fov_idx, z, channel, region_idx
     ndviewer_end_zarr_acquisition = Signal()
     # Fires at the start of each timepoint so napari views can flush per-timepoint caches.
@@ -293,37 +290,23 @@ class QtMultiPointController(MultiPointController, QObject):
         # get_crop_size falls back to the camera's current resolution when no crop is set.
         width, height = self.microscope.camera.get_crop_size()
 
-        # Check save format to determine which API to use
-        if control._def.FILE_SAVING_OPTION == control._def.FileSavingOption.ZARR_V3:
-            is_hcs = self._detect_hcs_mode(scan_info)
-            use_6d = control._def.ZARR_USE_6D_FOV_DIMENSION
-
-            if use_6d and not is_hcs:
-                # 6D mode (single or multi-region): use unified 6D regions API
-                self._ndviewer_mode = NDViewerMode.ZARR_6D
-                region_paths, fovs_per_region, region_labels = self._build_6d_region_info(parameters)
-
-                # Build region index map for notify_zarr_frame
-                self._ndviewer_region_index_map = {name: idx for idx, name in enumerate(scan_info.scan_region_names)}
-
-                self.ndviewer_start_zarr_acquisition_6d.emit(
-                    region_paths, channels, num_z, fovs_per_region, height, width, region_labels
-                )
-            else:
-                # HCS or per-FOV modes: use fov_paths API (5D per-FOV)
-                self._ndviewer_mode = NDViewerMode.ZARR_5D
-                fov_paths = self._build_zarr_fov_paths(parameters)
-
-                self.ndviewer_start_zarr_acquisition.emit(
-                    fov_paths or [], channels, num_z, self._ndviewer_fov_labels, height, width
-                )
+        # Check save format to determine which API to use. Pull the per-acquisition value
+        # off the parameters rather than the global so the dropdown in the multipoint widget
+        # takes effect without mutating control._def.
+        if parameters.file_saving_option == control._def.FileSavingOption.ZARR_V3:
+            # Always 5D per-FOV (HCS or non-HCS). Both use the same push API.
+            self._ndviewer_mode = NDViewerMode.ZARR_5D
+            fov_paths = self._build_zarr_fov_paths(parameters)
+            self.ndviewer_start_zarr_acquisition.emit(
+                fov_paths, channels, num_z, self._ndviewer_fov_labels, height, width
+            )
         else:
             self._ndviewer_mode = NDViewerMode.TIFF
             self.ndviewer_start_acquisition.emit(channels, num_z, height, width, self._ndviewer_fov_labels)
 
     def _signal_acquisition_finished_fn(self):
         # End zarr acquisition if active (before general acquisition_finished)
-        if self._ndviewer_mode in (NDViewerMode.ZARR_5D, NDViewerMode.ZARR_6D):
+        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
             self.ndviewer_end_zarr_acquisition.emit()
             self._ndviewer_region_index_map = {}
         self._ndviewer_mode = NDViewerMode.INACTIVE
@@ -366,8 +349,8 @@ class QtMultiPointController(MultiPointController, QObject):
             return
         flat_fov_idx = region_offset + info.fov
 
-        if self._ndviewer_mode in (NDViewerMode.ZARR_6D, NDViewerMode.ZARR_5D):
-            # Zarr modes: notification happens via signal_zarr_frame_written callback
+        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
+            # Zarr mode: notification happens via signal_zarr_frame_written callback
             # when the subprocess completes writing, not here (too early).
             pass
         else:
@@ -432,12 +415,8 @@ class QtMultiPointController(MultiPointController, QObject):
             channel_name: Channel name string
             region_idx: Index of the region in scan order
         """
-        if self._ndviewer_mode == NDViewerMode.ZARR_6D:
-            # 6D mode: pass local FOV index and region_idx
-            self.ndviewer_notify_zarr_frame.emit(time_point, fov, z_index, channel_name, region_idx)
-        elif self._ndviewer_mode == NDViewerMode.ZARR_5D:
-            # 5D mode: compute flat FOV index from local FOV + region offset
-            # fov is the local index within the region, we need the global/flat index
+        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
+            # 5D per-FOV: compute flat FOV index from local FOV + region offset.
             if region_idx < len(self._ndviewer_region_idx_offset):
                 flat_fov = self._ndviewer_region_idx_offset[region_idx] + fov
             else:
@@ -448,55 +427,15 @@ class QtMultiPointController(MultiPointController, QObject):
     # Helper methods for Zarr FOV path building
     # -------------------------------------------------------------------------
 
-    def _build_6d_region_info(self, parameters: AcquisitionParameters) -> Tuple[List[str], List[int], List[str]]:
-        """Build region info for 6D mode (single or multi-region).
+    def _build_zarr_fov_paths(self, parameters: AcquisitionParameters) -> List[str]:
+        """Build the per-FOV OME-NGFF zarr group paths for display.
 
-        Args:
-            parameters: Acquisition parameters containing scan info.
-
-        Returns:
-            Tuple of (region_paths, fovs_per_region, region_labels)
+        Returns one path per FOV in scan order (flattened across regions).
         """
         base_path = os.path.join(parameters.base_path, parameters.experiment_ID)
         scan_info = parameters.scan_position_information
-
-        region_paths: List[str] = []
-        fovs_per_region: List[int] = []
-        region_labels: List[str] = []
-
-        for region_name in scan_info.scan_region_names:
-            path = control.utils.build_6d_zarr_path(base_path, region_name)
-            region_paths.append(path)
-
-            num_fovs = len(scan_info.scan_region_fov_coords_mm.get(region_name, []))
-            fovs_per_region.append(num_fovs)
-
-            region_labels.append(region_name)
-
-        return region_paths, fovs_per_region, region_labels
-
-    def _build_zarr_fov_paths(self, parameters: AcquisitionParameters) -> Optional[List[str]]:
-        """Build list of zarr paths for each FOV.
-
-        Args:
-            parameters: Acquisition parameters containing scan info.
-
-        Returns:
-            List of zarr paths (one per FOV) for HCS/per-FOV modes.
-            None for 6D mode (single zarr store).
-        """
-        base_path = os.path.join(parameters.base_path, parameters.experiment_ID)
-        scan_info = parameters.scan_position_information
-
-        # Detect acquisition mode
         is_hcs = self._detect_hcs_mode(scan_info)
-        use_6d = control._def.ZARR_USE_6D_FOV_DIMENSION
 
-        if use_6d and not is_hcs:
-            # 6D mode: single zarr per region, fov_paths=None
-            return None
-
-        # Build fov_paths for HCS or per-FOV modes
         fov_paths: List[str] = []
         for region_name in scan_info.scan_region_names:
             num_fovs = len(scan_info.scan_region_fov_coords_mm.get(region_name, []))

@@ -1,18 +1,25 @@
 """Zarr v3 saving using TensorStore.
 
-This module provides Zarr v3 saving during acquisition
-with sharding support, enabling direct zarr output without post-acquisition
-conversion.
+This module provides Zarr v3 saving during acquisition with sharding,
+streaming multiscale pyramid generation, and OME-NGFF v0.5 metadata.
 
-Key features:
-- TensorStore-based async writes for high throughput
-- Per-z-level sharding for efficient memory usage
-- OME-NGFF HCS plate hierarchy support
-- Blosc compression with LZ4/Zstd codecs
+Layout (always 5D, always per-FOV, always sharded):
+- HCS:        plate.ome.zarr/{row}/{col}/{fov}/{level}        (level 0..N)
+- Non-HCS:    zarr/{region}/fov_{n}.ome.zarr/{level}          (level 0..N)
+
+Each FOV's group holds:
+- Resolution levels 0..N as sibling zarr v3 arrays of shape (T, C, Z, Y, X).
+- frame_times (optional): float64 array of shape (T, C, Z), unix timestamps.
+- zarr.json with OME-NGFF multiscales + omero + a _squid.manifest_path pointer.
+
+Chunks are always (1, 1, 1, Y, X); shards are always (1, C, Z, Y, X) regardless
+of compression. Pyramid levels are opened at initialize() and written inline
+on every write_frame() so finalize() does no heavy work.
 """
 
 import asyncio
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 import squid.logging
-from control._def import ZarrChunkMode, ZarrCompression
+from control._def import ZarrCompression
 
 log = squid.logging.get_logger(__name__)
 
@@ -47,182 +54,110 @@ class ZarrAcquisitionConfig:
     """Configuration for Zarr v3 saving during acquisition.
 
     Attributes:
-        output_path: Base path for zarr output (e.g., /path/to/experiment.ome.zarr)
-        shape: Full dataset shape as (T, C, Z, Y, X) for 5D or (FOV, T, C, Z, Y, X) for 6D
-        dtype: NumPy dtype for the data
-        pixel_size_um: Physical pixel size in micrometers
-        z_step_um: Z step size in micrometers (optional)
-        time_increment_s: Time between timepoints in seconds (optional)
-        channel_names: List of channel names for metadata
-        chunk_mode: Chunk size mode (FULL_FRAME, TILED_512, TILED_256)
-        compression: Compression preset (FAST, BALANCED, BEST)
-        is_hcs: Whether this is an HCS (5D) or non-HCS (6D with FOV) dataset
-        plate_name: Name for HCS plate (if is_hcs)
+        output_path: Path to the resolution-0 array (e.g. ``.../{fov}/0``).
+        shape: Full array shape ``(T, C, Z, Y, X)``.
+        dtype: NumPy dtype for the data.
+        pixel_size_um: Physical pixel size in micrometers.
+        z_step_um: Z step size in micrometers (optional).
+        time_increment_s: Time between timepoints in seconds (optional).
+        channel_names: Channel names for the omero metadata block.
+        channel_colors: Hex colors per channel (e.g. ``"#FF0000"``).
+        channel_wavelengths: Emission wavelengths in nm; ``None`` for brightfield.
+        compression: Compression preset.
+        translation_um: ``(y_um, x_um)`` stage position of the FOV's origin.
+            Embedded as the OME-NGFF ``translation`` transform alongside ``scale``.
+        manifest_path: Relative path from the FOV's parent group to the
+            experiment's ``acquisition.yaml``. Stored in ``_squid.manifest_path``.
+        max_pyramid_levels: Maximum number of additional resolution levels.
+        min_pyramid_dim_px: Stop generating levels once ``min(Y, X) < this``.
     """
 
     output_path: str
-    shape: Tuple[int, ...]  # T, C, Z, Y, X (5D) or FOV, T, C, Z, Y, X (6D)
+    shape: Tuple[int, int, int, int, int]  # (T, C, Z, Y, X)
     dtype: np.dtype
     pixel_size_um: float
     z_step_um: Optional[float] = None
     time_increment_s: Optional[float] = None
     channel_names: List[str] = field(default_factory=list)
-    channel_colors: List[str] = field(default_factory=list)  # Hex colors (e.g., "#FF0000")
-    channel_wavelengths: List[Optional[int]] = field(default_factory=list)  # Wavelength in nm (None for BF)
-    chunk_mode: ZarrChunkMode = ZarrChunkMode.FULL_FRAME
-    compression: ZarrCompression = ZarrCompression.FAST
-    is_hcs: bool = True  # Default to HCS (5D); non-HCS uses 6D with FOV dimension
-    plate_name: str = "plate"
-
-    @property
-    def ndim(self) -> int:
-        return len(self.shape)
-
-    @property
-    def fov_size(self) -> int:
-        """FOV count for 6D datasets. Returns 1 for 5D datasets."""
-        if self.ndim == 6:
-            return self.shape[0]  # FOV is first dimension in 6D
-        return 1
+    channel_colors: List[str] = field(default_factory=list)
+    channel_wavelengths: List[Optional[int]] = field(default_factory=list)
+    compression: ZarrCompression = ZarrCompression.BALANCED
+    translation_um: Tuple[float, float] = (0.0, 0.0)
+    manifest_path: Optional[str] = None
+    max_pyramid_levels: int = 5
+    min_pyramid_dim_px: int = 128
 
     @property
     def t_size(self) -> int:
-        if self.ndim == 6:
-            return self.shape[1]  # T is second dimension in 6D
         return self.shape[0]
 
     @property
     def c_size(self) -> int:
-        if self.ndim == 6:
-            return self.shape[2]  # C is third dimension in 6D
         return self.shape[1]
 
     @property
     def z_size(self) -> int:
-        if self.ndim == 6:
-            return self.shape[3]  # Z is fourth dimension in 6D
         return self.shape[2]
 
     @property
     def y_size(self) -> int:
-        return self.shape[-2]
+        return self.shape[3]
 
     @property
     def x_size(self) -> int:
-        return self.shape[-1]
+        return self.shape[4]
 
 
-def _get_chunk_shape(config: ZarrAcquisitionConfig) -> Tuple[int, ...]:
-    """Calculate chunk shape based on chunk mode.
+def _chunk_shape() -> Tuple[int, int, int, int, int]:
+    """Inner chunk: one image plane."""
+    # Y, X get filled in per-level; the function returns the (T, C, Z) prefix shape
+    # convention. Callers compose with (y, x) per level.
+    raise NotImplementedError
 
-    Args:
-        config: Zarr acquisition configuration
 
-    Returns:
-        Chunk shape as (T, C, Z, Y, X) for 5D or (FOV, T, C, Z, Y, X) for 6D
+def _level_chunk_shape(y: int, x: int) -> Tuple[int, int, int, int, int]:
+    """Inner chunk for a level of size (Y=y, X=x): one plane."""
+    return (1, 1, 1, y, x)
+
+
+def _level_shard_shape(c: int, z: int, y: int, x: int) -> Tuple[int, int, int, int, int]:
+    """Outer shard: one FOV's single timepoint = (1, C, Z, Y, X).
+
+    Bundles all channels x z-slices for one timepoint into one shard file.
+    File count = T per FOV per resolution level.
     """
-    # Determine Y, X dimensions based on chunk mode
-    if config.chunk_mode == ZarrChunkMode.TILED_512:
-        y, x = 512, 512
-    elif config.chunk_mode == ZarrChunkMode.TILED_256:
-        y, x = 256, 256
-    else:
-        # FULL_FRAME or default: use full image dimensions
-        y, x = config.y_size, config.x_size
-
-    # Return shape based on dimensionality
-    if config.ndim == 5:
-        return (1, 1, 1, y, x)
-    return (1, 1, 1, 1, y, x)  # 6D: (FOV, T, C, Z, Y, X)
-
-
-def _get_shard_shape(config: ZarrAcquisitionConfig) -> Tuple[int, ...]:
-    """Calculate shard shape for sharding configuration.
-
-    For FAST compression: no sharding (shard_shape = chunk_shape) for maximum write speed.
-    For BALANCED/BEST: per-z-level sharding for better file organization.
-
-    Args:
-        config: Zarr acquisition configuration
-
-    Returns:
-        Shard shape as (T, C, Z, Y, X) for 5D or (FOV, T, C, Z, Y, X) for 6D
-    """
-    # NONE/FAST mode: skip sharding for maximum write speed
-    # Each chunk is its own file, eliminating shard coordination overhead
-    if config.compression in (ZarrCompression.NONE, ZarrCompression.FAST):
-        return _get_chunk_shape(config)
-
-    # BALANCED/BEST: use per-z-level sharding for better file organization
-    if config.ndim == 5:
-        return (1, config.c_size, 1, config.y_size, config.x_size)
-    else:  # 6D: (FOV, T, C, Z, Y, X) - shard contains all channels for one (fov, t, z)
-        return (1, 1, config.c_size, 1, config.y_size, config.x_size)
+    return (1, c, z, y, x)
 
 
 def _get_compression_codec(compression: ZarrCompression) -> Optional[Dict[str, Any]]:
-    """Get blosc codec configuration for compression preset.
-
-    Args:
-        compression: Compression preset enum
-
-    Returns:
-        Codec configuration dict for TensorStore, or None for no compression
-    """
+    """Get blosc codec configuration for compression preset."""
     if compression == ZarrCompression.NONE:
         return None
     elif compression == ZarrCompression.FAST:
-        # LZ4 with minimal compression level and byte shuffle (faster than bitshuffle)
-        # for maximum write throughput at ~800-1200 MB/s
         return {
             "name": "blosc",
-            "configuration": {
-                "cname": "lz4",
-                "clevel": 1,
-                "shuffle": "shuffle",
-            },
+            "configuration": {"cname": "lz4", "clevel": 1, "shuffle": "shuffle"},
         }
     elif compression == ZarrCompression.BALANCED:
         return {
             "name": "blosc",
-            "configuration": {
-                "cname": "zstd",
-                "clevel": 3,
-                "shuffle": "bitshuffle",
-            },
+            "configuration": {"cname": "zstd", "clevel": 3, "shuffle": "bitshuffle"},
         }
     elif compression == ZarrCompression.BEST:
         return {
             "name": "blosc",
-            "configuration": {
-                "cname": "zstd",
-                "clevel": 9,
-                "shuffle": "bitshuffle",
-            },
+            "configuration": {"cname": "zstd", "clevel": 9, "shuffle": "bitshuffle"},
         }
     else:
-        # Default to fast
         return {
             "name": "blosc",
-            "configuration": {
-                "cname": "lz4",
-                "clevel": 5,
-                "shuffle": "bitshuffle",
-            },
+            "configuration": {"cname": "lz4", "clevel": 5, "shuffle": "bitshuffle"},
         }
 
 
 def _dtype_to_zarr(dtype: np.dtype) -> str:
-    """Convert numpy dtype to zarr v3 dtype string.
-
-    Args:
-        dtype: NumPy dtype
-
-    Returns:
-        Zarr v3 dtype string
-    """
+    """Convert numpy dtype to zarr v3 dtype string."""
     dtype = np.dtype(dtype)
-    # Map numpy dtypes to zarr v3 format
     dtype_map = {
         np.dtype("uint8"): "uint8",
         np.dtype("uint16"): "uint16",
@@ -240,19 +175,14 @@ def _dtype_to_zarr(dtype: np.dtype) -> str:
     raise ValueError(f"Unsupported dtype for zarr: {dtype}")
 
 
-# HCS Plate Metadata Functions
+# HCS Plate/Well metadata helpers ---------------------------------------------
 
 
 def _write_group_metadata(path: str, ome_metadata: dict, description: str) -> None:
-    """Write OME-NGFF group metadata to zarr.json.
-
-    Args:
-        path: Directory path for the group
-        ome_metadata: Metadata to store under "ome" key in attributes
-        description: Description for logging (e.g., "plate", "well")
+    """Write OME-NGFF group metadata to ``zarr.json``.
 
     Raises:
-        RuntimeError: If metadata files cannot be written
+        RuntimeError: If metadata files cannot be written.
     """
     try:
         os.makedirs(path, exist_ok=True)
@@ -273,20 +203,7 @@ def write_plate_metadata(
     wells: List[Tuple[str, int]],
     plate_name: str = "plate",
 ) -> None:
-    """Write OME-NGFF HCS plate metadata.
-
-    Creates the plate-level zarr.json with well references in attributes.
-
-    Args:
-        plate_path: Path to plate.ome.zarr directory
-        rows: List of row names (e.g., ["A", "B", "C"])
-        cols: List of column numbers (e.g., [1, 2, 3])
-        wells: List of (row, col) tuples for wells with data
-        plate_name: Name for the plate
-
-    Raises:
-        RuntimeError: If metadata files cannot be written
-    """
+    """Write OME-NGFF HCS plate metadata at the plate root."""
     well_entries = [
         {"path": f"{row}/{col}", "rowIndex": rows.index(row), "columnIndex": cols.index(col)} for row, col in wells
     ]
@@ -303,25 +220,11 @@ def write_plate_metadata(
             },
         }
     }
-
     _write_group_metadata(plate_path, plate_metadata, "plate")
 
 
-def write_well_metadata(
-    well_path: str,
-    fields: List[int],
-) -> None:
-    """Write OME-NGFF HCS well metadata.
-
-    Creates the well-level zarr.json with field references in attributes.
-
-    Args:
-        well_path: Path to well directory (e.g., plate.ome.zarr/A/1)
-        fields: List of field indices (FOVs) in this well
-
-    Raises:
-        RuntimeError: If metadata files cannot be written
-    """
+def write_well_metadata(well_path: str, fields: List[int]) -> None:
+    """Write OME-NGFF HCS well metadata."""
     well_metadata = {
         "ome": {
             "version": "0.5",
@@ -331,54 +234,173 @@ def write_well_metadata(
             },
         }
     }
-
     _write_group_metadata(well_path, well_metadata, "well")
 
 
-# Synchronous wrapper for use in job processing
+# Pyramid helpers -------------------------------------------------------------
+
+
+def _compute_pyramid_shapes(y: int, x: int, max_levels: int, min_dim_px: int) -> List[Tuple[int, int]]:
+    """Return [(y0, x0), (y1, x1), ...] for levels 0..N including level 0.
+
+    Levels stop when ``min(y, x) < min_dim_px`` or ``max_levels`` extra levels are produced.
+    cv2.pyrDown halves with ``ceil`` semantics: ``y' = (y + 1) // 2``.
+    """
+    shapes = [(y, x)]
+    cy, cx = y, x
+    for _ in range(max_levels):
+        ny = (cy + 1) // 2
+        nx = (cx + 1) // 2
+        if min(ny, nx) < min_dim_px:
+            break
+        shapes.append((ny, nx))
+        cy, cx = ny, nx
+    return shapes
+
+
+# ZarrWriter ------------------------------------------------------------------
 
 
 class ZarrWriter:
-    """Zarr v3 writer for use in job processing.
+    """Zarr v3 writer for OME-NGFF per-FOV output with streaming pyramid.
 
-    Directly uses TensorStore without asyncio overhead for write operations.
-    Only uses asyncio for initialization and finalization where it's unavoidable.
+    Opens level 0 + N pyramid levels at ``initialize()``. Each ``write_frame()``
+    cascades through ``cv2.pyrDown`` and submits async writes to every level.
+    All pending writes are awaited at ``finalize()``; pyramid generation does no
+    extra read/write work after acquisition.
     """
 
-    def __init__(self, config: ZarrAcquisitionConfig):
-        """Initialize the synchronous writer.
+    # Maximum number of TensorStore write futures to accumulate before draining.
+    MAX_PENDING_WRITES = 32
 
-        Args:
-            config: Zarr acquisition configuration
-        """
+    def __init__(self, config: ZarrAcquisitionConfig):
         self._config = config
-        self._dataset = None
+        self._level_datasets: List[Any] = []  # index = pyramid level, value = TensorStore
+        self._level_shapes: List[Tuple[int, int]] = []  # (y, x) per level
+        self._frame_times_dataset: Optional[Any] = None
         self._pending_futures: List[Any] = []
         self._initialized = False
         self._finalized = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._owns_loop = False  # True if we created the loop ourselves
-        # Per-frame timestamps collected during acquisition, written to zarr on finalize.
-        # Each entry is a dict with keys: t, c, z, fov (optional), unix_time_s, channel_name.
-        self._frame_timestamps: List[Dict[str, Any]] = []
+        self._owns_loop = False
+
+    # Event loop management ---------------------------------------------------
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create the event loop (only used for init/finalize)."""
         if self._loop is None or self._loop.is_closed():
             try:
                 self._loop = asyncio.get_event_loop()
-                self._owns_loop = False  # Using existing loop
+                self._owns_loop = False
             except RuntimeError:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
-                self._owns_loop = True  # We created this loop
+                self._owns_loop = True
         return self._loop
 
-    def initialize(self) -> None:
-        """Initialize the zarr dataset (blocking).
+    def _cleanup_event_loop(self) -> None:
+        if self._loop is not None and self._owns_loop and not self._loop.is_closed():
+            try:
+                self._loop.close()
+            except Exception as e:
+                log.warning(f"Error closing event loop: {e}")
+        self._loop = None
+        self._owns_loop = False
 
-        Uses asyncio only for TensorStore's async open operation.
+    # Path helpers ------------------------------------------------------------
+
+    def _group_dir(self) -> str:
+        """Parent group directory (the FOV group), where zarr.json lives."""
+        return os.path.dirname(self._config.output_path)
+
+    def _level_path(self, level: int) -> str:
+        """Resolution-level array path: ``<group>/<level>``."""
+        return os.path.join(self._group_dir(), str(level))
+
+    def _frame_times_path(self) -> str:
+        return os.path.join(self._group_dir(), "frame_times")
+
+    def _zarr_json_path(self) -> str:
+        return os.path.join(self._group_dir(), "zarr.json")
+
+    # Spec construction -------------------------------------------------------
+
+    def _build_array_spec(
+        self,
+        path: str,
+        y: int,
+        x: int,
+        compression: ZarrCompression,
+    ) -> Dict[str, Any]:
+        config = self._config
+        shape = (config.t_size, config.c_size, config.z_size, y, x)
+        chunk_shape = _level_chunk_shape(y, x)
+        shard_shape = _level_shard_shape(config.c_size, config.z_size, y, x)
+        compression_codec = _get_compression_codec(compression)
+
+        # 5D transpose order for C-contiguous storage of (T, C, Z, Y, X).
+        transpose_order = [4, 3, 2, 1, 0]
+
+        inner_codecs: List[Dict[str, Any]] = [
+            {"name": "transpose", "configuration": {"order": transpose_order}},
+            {"name": "bytes", "configuration": {"endian": "little"}},
+        ]
+        if compression_codec is not None:
+            inner_codecs.append(compression_codec)
+
+        # Always shard: outer chunk = shard = (1, C, Z, Y, X), inner chunk = (1, 1, 1, Y, X).
+        codecs = [
+            {
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": list(chunk_shape),
+                    "codecs": inner_codecs,
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                        {"name": "crc32c"},
+                    ],
+                },
+            }
+        ]
+
+        return {
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": path},
+            "metadata": {
+                "shape": list(shape),
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(shard_shape)}},
+                "chunk_key_encoding": {"name": "default"},
+                "data_type": _dtype_to_zarr(config.dtype),
+                "codecs": codecs,
+                "fill_value": 0,
+            },
+        }
+
+    def _build_frame_times_spec(self) -> Dict[str, Any]:
+        """Spec for the ``frame_times`` array (T, C, Z) float64.
+
+        Single chunk = the whole array; tiny so no compression needed.
         """
+        config = self._config
+        shape = (config.t_size, config.c_size, config.z_size)
+        return {
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": self._frame_times_path()},
+            "metadata": {
+                "shape": list(shape),
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(shape)}},
+                "chunk_key_encoding": {"name": "default"},
+                "data_type": "float64",
+                "codecs": [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                ],
+                "fill_value": 0.0,
+            },
+        }
+
+    # Lifecycle ---------------------------------------------------------------
+
+    def initialize(self) -> None:
+        """Open level 0 + pyramid levels + frame_times array; write zarr.json."""
         if self._initialized:
             log.warning("Writer already initialized")
             return
@@ -387,291 +409,153 @@ class ZarrWriter:
             ts = _get_tensorstore()
             config = self._config
 
-            # Build TensorStore spec
-            os.makedirs(os.path.dirname(config.output_path), exist_ok=True)
+            os.makedirs(self._group_dir(), exist_ok=True)
 
-            chunk_shape = _get_chunk_shape(config)
-            shard_shape = _get_shard_shape(config)
-            compression_codec = _get_compression_codec(config.compression)
-
-            # Dimension names and transpose order depend on 5D vs 6D
-            if config.ndim == 5:
-                transpose_order = [4, 3, 2, 1, 0]  # Reverse order for C-contiguous layout
-            else:
-                transpose_order = [5, 4, 3, 2, 1, 0]  # Reverse order for C-contiguous layout
-
-            # Determine if we need sharding (when chunk != shard)
-            use_sharding = chunk_shape != shard_shape
-
-            # Build inner codec chain (with or without compression)
-            inner_codecs = [
-                {"name": "transpose", "configuration": {"order": transpose_order}},
-                {"name": "bytes", "configuration": {"endian": "little"}},
-            ]
-            if compression_codec is not None:
-                inner_codecs.append(compression_codec)
-
-            if use_sharding:
-                codecs = [
-                    {
-                        "name": "sharding_indexed",
-                        "configuration": {
-                            "chunk_shape": list(chunk_shape),
-                            "codecs": inner_codecs,
-                            "index_codecs": [
-                                {"name": "bytes", "configuration": {"endian": "little"}},
-                                {"name": "crc32c"},
-                            ],
-                        },
-                    }
-                ]
-                chunk_config = list(shard_shape)
-            else:
-                codecs = inner_codecs
-                chunk_config = list(chunk_shape)
-
-            spec = {
-                "driver": "zarr3",
-                "kvstore": {"driver": "file", "path": config.output_path},
-                "metadata": {
-                    "shape": list(config.shape),
-                    "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": chunk_config}},
-                    "chunk_key_encoding": {"name": "default"},
-                    "data_type": _dtype_to_zarr(config.dtype),
-                    "codecs": codecs,
-                    "fill_value": 0,
-                },
-            }
+            self._level_shapes = _compute_pyramid_shapes(
+                config.y_size, config.x_size, config.max_pyramid_levels, config.min_pyramid_dim_px
+            )
 
             log.info(
-                f"Initializing Zarr v3 dataset: {config.output_path}, "
-                f"shape={config.shape}, chunks={chunk_shape}, shards={shard_shape}, "
+                f"Initializing Zarr v3 dataset: {self._group_dir()} "
+                f"levels={len(self._level_shapes)} (sizes={self._level_shapes}) "
                 f"compression={config.compression.value}"
             )
 
-            # Warn if overwriting existing data
-            if os.path.exists(config.output_path):
-                log.warning(
-                    "Zarr v3 dataset path already exists and will be overwritten: %s",
-                    config.output_path,
-                )
-
-            # Use asyncio only for the TensorStore open operation
-            async def _open():
-                return await ts.open(spec, create=True, delete_existing=True)
+            if os.path.exists(self._config.output_path):
+                log.warning("Zarr level-0 path already exists and will be overwritten: %s", self._config.output_path)
 
             loop = self._get_loop()
-            self._dataset = loop.run_until_complete(_open())
+
+            for level, (y, x) in enumerate(self._level_shapes):
+                spec = self._build_array_spec(self._level_path(level), y, x, config.compression)
+
+                async def _open(spec=spec):
+                    return await ts.open(spec, create=True, delete_existing=True)
+
+                ds = loop.run_until_complete(_open())
+                self._level_datasets.append(ds)
+
+            # Frame timestamps array (small, uncompressed)
+            ft_spec = self._build_frame_times_spec()
+
+            async def _open_ft():
+                return await ts.open(ft_spec, create=True, delete_existing=True)
+
+            self._frame_times_dataset = loop.run_until_complete(_open_ft())
+
+            self._write_group_metadata()
+
             self._initialized = True
             log.info("Zarr v3 dataset initialized successfully")
-
-            # Write metadata synchronously (just file I/O)
-            self._write_zarr_metadata()
         except Exception:
-            # Clean up event loop if we created it during failed initialization
             self._cleanup_event_loop()
             raise
 
-    def _is_ome_ngff_array_path(self) -> bool:
-        """Check if output_path is an OME-NGFF array path (needs group-level metadata).
-
-        OME-NGFF array paths end with /0 (resolution level 0) inside a group.
-        E.g., plate.ome.zarr/A/1/0/0 -> True (HCS field array)
-              zarr/region/fov_0.ome.zarr/0 -> True (per-FOV array)
-              zarr/region/acquisition.zarr -> False (6D mode, no nested array)
-        """
-        path_parts = self._config.output_path.rstrip(os.sep).split(os.sep)
-        # Array path ends with /0 (resolution level)
-        return len(path_parts) >= 2 and path_parts[-1] == "0"
-
-    def _get_metadata_zarr_json_path(self) -> str:
-        """Get the path to zarr.json containing OME metadata.
-
-        For HCS (path ends with /0 and parent is field index), metadata is at parent group.
-        For non-HCS, metadata is at the zarr store directly.
-        """
-        if self._is_ome_ngff_array_path():
-            return os.path.join(os.path.dirname(self._config.output_path), "zarr.json")
-        return os.path.join(self._config.output_path, "zarr.json")
-
-    def _write_zarr_metadata(self) -> None:
-        """Write OME-NGFF 0.5 compliant metadata to zarr.json attributes."""
+    def _write_group_metadata(self) -> None:
+        """Write OME-NGFF v0.5 multiscales + omero + _squid pointer to ``zarr.json``."""
         config = self._config
 
-        # Build axes based on dimensionality
-        if config.ndim == 5:
-            axes = [
-                {"name": "t", "type": "time", "unit": "second"},
-                {"name": "c", "type": "channel"},
-                {"name": "z", "type": "space", "unit": "micrometer"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
-            ]
-            coordinate_transforms = [
-                {
-                    "type": "scale",
-                    "scale": [
-                        config.time_increment_s or 1.0,
-                        1.0,
-                        config.z_step_um or 1.0,
-                        config.pixel_size_um,
-                        config.pixel_size_um,
-                    ],
-                }
-            ]
-        else:
-            axes = [
-                {"name": "fov", "type": "fov"},
-                {"name": "t", "type": "time", "unit": "second"},
-                {"name": "c", "type": "channel"},
-                {"name": "z", "type": "space", "unit": "micrometer"},
-                {"name": "y", "type": "space", "unit": "micrometer"},
-                {"name": "x", "type": "space", "unit": "micrometer"},
-            ]
-            coordinate_transforms = [
-                {
-                    "type": "scale",
-                    "scale": [
-                        1.0,
-                        config.time_increment_s or 1.0,
-                        1.0,
-                        config.z_step_um or 1.0,
-                        config.pixel_size_um,
-                        config.pixel_size_um,
-                    ],
-                }
-            ]
+        axes = [
+            {"name": "t", "type": "time", "unit": "second"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
+        ]
 
-        # Build channel metadata (omero)
-        channels_meta = []
+        # One dataset per pyramid level
+        datasets = []
+        for level, (_y, _x) in enumerate(self._level_shapes):
+            scale_factor = 2 ** level
+            scale = [
+                config.time_increment_s or 1.0,
+                1.0,
+                config.z_step_um or 1.0,
+                config.pixel_size_um * scale_factor,
+                config.pixel_size_um * scale_factor,
+            ]
+            translation = [
+                0.0,
+                0.0,
+                0.0,
+                config.translation_um[0],  # y_um
+                config.translation_um[1],  # x_um
+            ]
+            datasets.append(
+                {
+                    "path": str(level),
+                    "coordinateTransformations": [
+                        {"type": "scale", "scale": scale},
+                        {"type": "translation", "translation": translation},
+                    ],
+                }
+            )
+
+        # omero channel metadata
+        channels_meta: List[Dict[str, Any]] = []
         for i, name in enumerate(config.channel_names or []):
-            channel_info: Dict[str, Any] = {
-                "label": name,
-                "active": True,
-            }
+            channel_info: Dict[str, Any] = {"label": name, "active": True}
             if config.channel_colors and i < len(config.channel_colors):
                 color = config.channel_colors[i]
-                if color.startswith("#"):
-                    color = color[1:]
-                channel_info["color"] = color
+                if isinstance(color, str) and color.startswith("#"):
+                    channel_info["color"] = color[1:]
+                elif isinstance(color, str):
+                    channel_info["color"] = color
+                else:
+                    # Tolerate ints (e.g. 0xFFFFFF) as a fallback
+                    channel_info["color"] = f"{int(color):06X}"
             if config.channel_wavelengths and i < len(config.channel_wavelengths):
-                wavelength = config.channel_wavelengths[i]
-                if wavelength is not None:
-                    channel_info["emission_wavelength"] = {
-                        "value": wavelength,
-                        "unit": "nanometer",
-                    }
-            # Add display window based on dtype
+                wl = config.channel_wavelengths[i]
+                if wl is not None:
+                    channel_info["emission_wavelength"] = {"value": wl, "unit": "nanometer"}
             dtype = np.dtype(config.dtype)
             if np.issubdtype(dtype, np.integer):
                 info = np.iinfo(dtype)
-                channel_info["window"] = {
-                    "start": 0,
-                    "end": info.max,
-                    "min": 0,
-                    "max": info.max,
-                }
+                channel_info["window"] = {"start": 0, "end": info.max, "min": 0, "max": info.max}
             elif np.issubdtype(dtype, np.floating):
-                channel_info["window"] = {
-                    "start": 0.0,
-                    "end": 1.0,
-                    "min": 0.0,
-                    "max": 1.0,
-                }
+                channel_info["window"] = {"start": 0.0, "end": 1.0, "min": 0.0, "max": 1.0}
             channels_meta.append(channel_info)
 
-        # Determine structure string for _squid metadata
-        structure = "5D-TCZYX" if config.ndim == 5 else "6D-FTCZYX"
-
-        zattrs = {
+        attrs = {
             "ome": {
                 "version": "0.5",
                 "multiscales": [
                     {
                         "version": "0.5",
-                        "name": os.path.basename(config.output_path),
+                        "name": os.path.basename(self._group_dir()),
                         "axes": axes,
-                        "datasets": [
-                            {
-                                "path": "0" if self._is_ome_ngff_array_path() else ".",
-                                "coordinateTransformations": coordinate_transforms,
-                            }
-                        ],
+                        "datasets": datasets,
                         "coordinateTransformations": [{"type": "identity"}],
                     }
                 ],
                 "omero": {
-                    "name": os.path.basename(config.output_path),
+                    "name": os.path.basename(self._group_dir()),
                     "version": "0.5",
                     "channels": channels_meta,
                 },
             },
             "_squid": {
-                "structure": structure,
-                "pixel_size_um": config.pixel_size_um,
-                "z_step_um": config.z_step_um,
-                "time_increment_s": config.time_increment_s,
-                "chunk_mode": config.chunk_mode.value,
-                "compression": config.compression.value,
-                "shape": list(config.shape),
-                "dtype": str(config.dtype),
-                "is_hcs": config.is_hcs,
+                "manifest_path": config.manifest_path or "",
                 "acquisition_complete": False,
             },
         }
 
-        # Write metadata to zarr.json attributes (strict Zarr v3 compliance)
-        # For HCS, output_path is the array path ({fov}/0), but OME-NGFF metadata
-        # should be at the parent group level ({fov}/zarr.json), not the array level.
-        # For non-HCS, output_path is the zarr store directly (fov_{n}.ome.zarr).
-        zarr_json_path = self._get_metadata_zarr_json_path()
+        zarr_json = {"zarr_format": 3, "node_type": "group", "attributes": attrs}
+        try:
+            with open(self._zarr_json_path(), "w") as f:
+                json.dump(zarr_json, f, indent=2)
+            log.debug(f"Wrote OME-NGFF group metadata to {self._zarr_json_path()}")
+        except OSError as e:
+            log.error(f"Failed to write zarr group metadata: {e}")
+            raise RuntimeError(f"Failed to write zarr group metadata: {e}") from e
 
-        if self._is_ome_ngff_array_path():
-            # HCS: write group metadata to parent directory ({fov}/zarr.json)
-            group_zarr_json = {"zarr_format": 3, "node_type": "group", "attributes": zattrs}
-            try:
-                with open(zarr_json_path, "w") as f:
-                    json.dump(group_zarr_json, f, indent=2)
-                log.debug(f"Wrote OME-NGFF group metadata to {zarr_json_path}")
-            except OSError as e:
-                log.error(f"Failed to write zarr group metadata to {zarr_json_path}: {e}")
-                raise RuntimeError(f"Failed to write zarr group metadata: {e}") from e
-        else:
-            # Non-HCS: write metadata to the zarr store's zarr.json
-            try:
-                # Read existing zarr.json created by TensorStore
-                with open(zarr_json_path, "r") as f:
-                    zarr_json = json.load(f)
+    # Frame writes ------------------------------------------------------------
 
-                # Add OME metadata as attributes
-                zarr_json["attributes"] = zattrs
+    def write_frame(self, image: np.ndarray, t: int, c: int, z: int) -> None:
+        """Submit writes for level 0 + all pyramid levels.
 
-                # Write back
-                with open(zarr_json_path, "w") as f:
-                    json.dump(zarr_json, f, indent=2)
-                log.debug(f"Wrote OME-NGFF metadata to {zarr_json_path}")
-            except (OSError, json.JSONDecodeError) as e:
-                log.error(f"Failed to write zarr metadata to {zarr_json_path}: {e}")
-                raise RuntimeError(f"Failed to write zarr metadata: {e}") from e
-
-    # Maximum number of TensorStore write futures to accumulate before draining.
-    # Keeps memory bounded while allowing pipelined I/O.
-    MAX_PENDING_WRITES = 32
-
-    def write_frame(self, image: np.ndarray, t: int, c: int, z: int, fov: Optional[int] = None) -> None:
-        """Submit a frame write to TensorStore without blocking.
-
-        Writes are pipelined: each call submits an async write and appends the
-        future to an internal list.  When the list exceeds MAX_PENDING_WRITES,
-        completed futures are drained (and any that raised are re-raised).
-        Call wait_for_pending() or finalize() to flush all remaining writes.
-
-        Args:
-            image: 2D image array (Y, X)
-            t: Time point index
-            c: Channel index
-            z: Z-slice index
-            fov: FOV index (required for 6D datasets, ignored for 5D)
+        cv2.pyrDown cascades level-by-level. All writes are async; pending
+        futures are drained when the in-flight pool exceeds MAX_PENDING_WRITES.
         """
         if not self._initialized:
             raise RuntimeError("Writer not initialized. Call initialize() first.")
@@ -679,8 +563,6 @@ class ZarrWriter:
             raise RuntimeError("Writer already finalized.")
 
         config = self._config
-
-        # Validate indices using config properties
         if not (0 <= t < config.t_size):
             raise ValueError(f"Time index {t} out of range [0, {config.t_size})")
         if not (0 <= c < config.c_size):
@@ -688,45 +570,44 @@ class ZarrWriter:
         if not (0 <= z < config.z_size):
             raise ValueError(f"Z index {z} out of range [0, {config.z_size})")
 
-        if config.ndim == 6:
-            if fov is None:
-                raise ValueError("FOV index required for 6D dataset")
-            if not (0 <= fov < config.fov_size):
-                raise ValueError(f"FOV index {fov} out of range [0, {config.fov_size})")
-
-        # Ensure image is correct dtype
         if image.dtype != config.dtype:
             image = image.astype(config.dtype)
 
-        # Submit async write — TensorStore handles I/O in the background
-        if config.ndim == 5:
-            future = self._dataset[t, c, z, :, :].write(image)
-            log.debug(f"Submitted write for frame t={t}, c={c}, z={z}")
-        else:
-            future = self._dataset[fov, t, c, z, :, :].write(image)
-            log.debug(f"Submitted write for frame fov={fov}, t={t}, c={c}, z={z}")
-
+        # Level 0
+        future = self._level_datasets[0][t, c, z, :, :].write(image)
         self._pending_futures.append(future)
 
-        # Drain completed futures when the pipeline is full
+        # Pyramid levels (cascade via cv2.pyrDown)
+        if len(self._level_datasets) > 1:
+            try:
+                import cv2
+            except ImportError:
+                # cv2 unavailable: skip pyramid levels for this frame
+                log.warning("cv2 not available, skipping pyramid generation for this frame")
+            else:
+                current = image
+                for level in range(1, len(self._level_datasets)):
+                    expected_y, expected_x = self._level_shapes[level]
+                    current = cv2.pyrDown(current)
+                    # cv2.pyrDown returns ((H+1)//2, (W+1)//2) which matches our shape calc
+                    if current.shape != (expected_y, expected_x):
+                        # Defensive resize if pyrDown produced an unexpected shape
+                        # (e.g. due to OpenCV border handling differences). Fall back
+                        # to area downsample to the exact expected size.
+                        current = cv2.resize(current, (expected_x, expected_y), interpolation=cv2.INTER_AREA)
+                    if current.dtype != config.dtype:
+                        current = current.astype(config.dtype)
+                    fut = self._level_datasets[level][t, c, z, :, :].write(current)
+                    self._pending_futures.append(fut)
+
         if len(self._pending_futures) >= self.MAX_PENDING_WRITES:
             self._drain_completed_futures()
 
     def _drain_completed_futures(self) -> int:
-        """Remove completed futures from the pending list, re-raising any errors.
-
-        Futures that are still in-flight are kept.  If any completed future
-        raised an exception, it is re-raised here so the caller can handle it.
-
-        Returns:
-            Number of futures that were completed and removed.
-        """
         still_pending = []
         drained = 0
         for f in self._pending_futures:
             if f.done():
-                # .result() on an already-done future returns immediately;
-                # it re-raises if the write failed.
                 f.result()
                 drained += 1
             else:
@@ -742,319 +623,90 @@ class ZarrWriter:
         c: int,
         z: int,
         unix_time_s: float,
-        channel_name: str,
-        fov: Optional[int] = None,
+        channel_name: Optional[str] = None,
     ) -> None:
-        """Record a per-frame timestamp for later embedding in the zarr store.
+        """Write a single timestamp into the ``frame_times[t, c, z]`` slot.
 
-        Call this alongside write_frame().  Timestamps are accumulated in memory
-        and written as a structured zarr array during finalize().
-
-        Args:
-            t: Time point index
-            c: Channel index
-            z: Z-slice index
-            unix_time_s: Unix timestamp of frame capture
-            channel_name: Channel/observation state name
-            fov: FOV index (for 6D datasets)
+        The ``channel_name`` argument is accepted for API compatibility but not
+        stored — channel names live in the omero metadata block.
         """
-        entry: Dict[str, Any] = {
-            "t": t,
-            "c": c,
-            "z": z,
-            "unix_time_s": unix_time_s,
-            "channel_name": channel_name,
-        }
-        if fov is not None:
-            entry["fov"] = fov
-        self._frame_timestamps.append(entry)
-
-    def _write_frame_timestamps(self) -> None:
-        """Write accumulated frame timestamps as a JSON file in the zarr store.
-
-        Writes ``frame_timestamps.json`` next to the zarr.json metadata file so
-        that downstream readers can find per-frame timing without a separate CSV.
-        """
-        if not self._frame_timestamps:
+        if not self._initialized:
+            raise RuntimeError("Writer not initialized. Call initialize() first.")
+        if self._frame_times_dataset is None:
             return
-
-        # Write next to the group-level zarr.json (same directory as OME metadata)
-        if self._is_ome_ngff_array_path():
-            parent = os.path.dirname(self._config.output_path)
-        else:
-            parent = self._config.output_path
-        ts_path = os.path.join(parent, "frame_timestamps.json")
-
+        config = self._config
+        if not (0 <= t < config.t_size and 0 <= c < config.c_size and 0 <= z < config.z_size):
+            log.warning(f"record_frame_time index out of range: t={t}, c={c}, z={z}")
+            return
         try:
-            # Sort by (t, c, z) for deterministic ordering
-            sorted_ts = sorted(self._frame_timestamps, key=lambda e: (e["t"], e["c"], e["z"]))
-            with open(ts_path, "w") as f:
-                json.dump(sorted_ts, f, indent=1)
-            log.info(f"Wrote {len(sorted_ts)} frame timestamps to {ts_path}")
-        except OSError as e:
-            log.error(f"Failed to write frame timestamps to {ts_path}: {e}")
+            value = np.asarray([[[float(unix_time_s)]]], dtype=np.float64)
+            fut = self._frame_times_dataset[t : t + 1, c : c + 1, z : z + 1].write(value)
+            self._pending_futures.append(fut)
+        except Exception as e:
+            log.warning(f"Failed to write frame timestamp at t={t} c={c} z={z}: {e}")
 
     def wait_for_pending(self, timeout_s: Optional[float] = None) -> int:
-        """Wait for all pending writes to complete (blocking).
-
-        Blocks on each outstanding TensorStore future via .result().
-        Re-raises the first write error encountered.
-
-        Args:
-            timeout_s: Optional timeout in seconds (not currently enforced)
-
-        Returns:
-            Number of writes completed
-        """
+        """Block until all pending writes complete; re-raise the first error."""
         if not self._pending_futures:
             return 0
-
         count = len(self._pending_futures)
         log.debug(f"Waiting for {count} pending writes...")
-
         for f in self._pending_futures:
             f.result()
-
         self._pending_futures.clear()
         log.debug(f"Completed {count} pending writes")
         return count
 
     @property
     def pending_write_count(self) -> int:
-        """Number of writes currently pending."""
         return len(self._pending_futures)
 
-    def _generate_multiscale_pyramid(self, num_levels: int = 2) -> List[dict]:
-        """Generate downsampled pyramid levels from the full-resolution dataset.
-
-        Reads the level-0 dataset plane-by-plane, downsamples by powers of 2
-        using cv2.INTER_AREA, and writes each level as a sibling zarr array.
-
-        Only works for OME-NGFF array paths (ending in /0) where sibling
-        directories /1, /2, ... can be created.  Silently skips if the path
-        structure doesn't support it (e.g. 6D mode with path = ".").
-
-        Args:
-            num_levels: Number of additional pyramid levels (default 2 -> /1, /2).
-
-        Returns:
-            List of dataset entries for OME-NGFF multiscales metadata, one per
-            generated level.  Empty if pyramid generation was skipped.
-        """
-        try:
-            import cv2
-        except ImportError:
-            log.warning("cv2 not available — skipping multiscale pyramid generation")
-            return []
-
-        if not self._is_ome_ngff_array_path():
-            log.info("Skipping pyramid generation for non-array path (6D mode)")
-            return []
-
-        config = self._config
-        parent_dir = os.path.dirname(config.output_path)  # e.g. plate.ome.zarr/A/1/0
-        ts = _get_tensorstore()
-
-        dataset_entries = []
-
-        for level in range(1, num_levels + 1):
-            scale_factor = 2 ** level
-            new_y = config.y_size // scale_factor
-            new_x = config.x_size // scale_factor
-
-            if new_y < 1 or new_x < 1:
-                log.info(f"Image too small for pyramid level {level}, stopping at level {level - 1}")
-                break
-
-            level_path = os.path.join(parent_dir, str(level))
-
-            if config.ndim == 5:
-                level_shape = (config.t_size, config.c_size, config.z_size, new_y, new_x)
-            else:
-                level_shape = (config.fov_size, config.t_size, config.c_size, config.z_size, new_y, new_x)
-
-            # Use simple uncompressed chunks for pyramid levels (they're small)
-            if config.ndim == 5:
-                chunk_shape = [1, 1, 1, new_y, new_x]
-            else:
-                chunk_shape = [1, 1, 1, 1, new_y, new_x]
-
-            spec = {
-                "driver": "zarr3",
-                "kvstore": {"driver": "file", "path": level_path},
-                "metadata": {
-                    "shape": list(level_shape),
-                    "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": chunk_shape}},
-                    "chunk_key_encoding": {"name": "default"},
-                    "data_type": _dtype_to_zarr(config.dtype),
-                    "codecs": [
-                        {"name": "transpose", "configuration": {"order": list(reversed(range(len(level_shape))))}},
-                        {"name": "bytes", "configuration": {"endian": "little"}},
-                    ],
-                    "fill_value": 0,
-                },
-            }
-
-            try:
-                async def _open_level():
-                    return await ts.open(spec, create=True, delete_existing=True)
-
-                loop = self._get_loop()
-                level_ds = loop.run_until_complete(_open_level())
-            except Exception as e:
-                log.error(f"Failed to create pyramid level {level}: {e}")
-                break
-
-            log.info(f"Generating pyramid level {level} ({scale_factor}x downsample, shape={level_shape})...")
-
-            # Downsample plane-by-plane from level 0
-            frames_written = 0
-            try:
-                if config.ndim == 5:
-                    for t_idx in range(config.t_size):
-                        for c_idx in range(config.c_size):
-                            for z_idx in range(config.z_size):
-                                plane = self._dataset[t_idx, c_idx, z_idx, :, :].read().result()
-                                downsampled = cv2.resize(
-                                    np.asarray(plane), (new_x, new_y), interpolation=cv2.INTER_AREA
-                                )
-                                level_ds[t_idx, c_idx, z_idx, :, :].write(downsampled).result()
-                                frames_written += 1
-                else:
-                    for f_idx in range(config.fov_size):
-                        for t_idx in range(config.t_size):
-                            for c_idx in range(config.c_size):
-                                for z_idx in range(config.z_size):
-                                    plane = self._dataset[f_idx, t_idx, c_idx, z_idx, :, :].read().result()
-                                    downsampled = cv2.resize(
-                                        np.asarray(plane), (new_x, new_y), interpolation=cv2.INTER_AREA
-                                    )
-                                    level_ds[f_idx, t_idx, c_idx, z_idx, :, :].write(downsampled).result()
-                                    frames_written += 1
-            except Exception as e:
-                log.error(f"Error generating pyramid level {level} after {frames_written} frames: {e}")
-                break
-
-            log.info(f"Pyramid level {level} complete: {frames_written} frames written")
-
-            # Build coordinate transforms for this level
-            if config.ndim == 5:
-                scale = [
-                    config.time_increment_s or 1.0,
-                    1.0,
-                    config.z_step_um or 1.0,
-                    config.pixel_size_um * scale_factor,
-                    config.pixel_size_um * scale_factor,
-                ]
-            else:
-                scale = [
-                    1.0,
-                    config.time_increment_s or 1.0,
-                    1.0,
-                    config.z_step_um or 1.0,
-                    config.pixel_size_um * scale_factor,
-                    config.pixel_size_um * scale_factor,
-                ]
-
-            dataset_entries.append({
-                "path": str(level),
-                "coordinateTransformations": [{"type": "scale", "scale": scale}],
-            })
-
-        return dataset_entries
+    # Finalize / abort --------------------------------------------------------
 
     def finalize(self) -> None:
-        """Finalize the dataset (blocking)."""
+        """Flush pending writes and mark ``acquisition_complete=True``.
+
+        Pyramid is already populated incrementally, so this only awaits I/O
+        and updates the completion flag — no read-back, no extra compute.
+        """
         if self._finalized:
             log.warning("Writer already finalized")
             return
 
         log.info("Finalizing Zarr v3 dataset...")
-
-        # Wait for all pending writes
         self.wait_for_pending()
-
-        # Generate multiscale pyramid levels
-        pyramid_datasets = self._generate_multiscale_pyramid(num_levels=2)
-
-        # Write per-frame timestamps collected during acquisition
-        self._write_frame_timestamps()
-
-        # Update metadata with completion status and pyramid levels (in zarr.json attributes)
-        zarr_json_path = self._get_metadata_zarr_json_path()
-        try:
-            if os.path.exists(zarr_json_path):
-                with open(zarr_json_path, "r") as f:
-                    zarr_json = json.load(f)
-                attrs = zarr_json.get("attributes", {})
-
-                # Append pyramid datasets to multiscales metadata
-                if pyramid_datasets:
-                    ome = attrs.get("ome", {})
-                    multiscales = ome.get("multiscales", [])
-                    if multiscales:
-                        multiscales[0]["datasets"].extend(pyramid_datasets)
-                        log.info(f"Added {len(pyramid_datasets)} pyramid levels to multiscales metadata")
-
-                if "_squid" in attrs:
-                    attrs["_squid"]["acquisition_complete"] = True
-                    zarr_json["attributes"] = attrs
-                with open(zarr_json_path, "w") as f:
-                    json.dump(zarr_json, f, indent=2)
-        except (OSError, json.JSONDecodeError) as e:
-            log.error(f"Failed to finalize zarr metadata at {zarr_json_path}: {e}")
-            # Don't raise - data is already written, just log the metadata issue
-
+        self._set_squid_flag("acquisition_complete", True)
         self._finalized = True
         self._cleanup_event_loop()
-        log.info(f"Zarr v3 dataset finalized: {self._config.output_path}")
+        log.info(f"Zarr v3 dataset finalized: {self._group_dir()}")
 
     def abort(self) -> None:
-        """Abort and clean up (blocking).
-
-        Uses try-finally to ensure cleanup always happens, even if an
-        unexpected exception occurs during abort.
-        """
+        """Abort and clean up; mark ``aborted=True`` in metadata."""
         log.warning("Aborting Zarr writer...")
-
         try:
-            # Clear pending futures (don't wait for them)
             self._pending_futures.clear()
-
-            # Mark as incomplete in metadata (in zarr.json attributes)
-            zarr_json_path = self._get_metadata_zarr_json_path()
-            try:
-                if os.path.exists(zarr_json_path):
-                    with open(zarr_json_path, "r") as f:
-                        zarr_json = json.load(f)
-                    attrs = zarr_json.get("attributes", {})
-                    if "_squid" in attrs:
-                        attrs["_squid"]["acquisition_complete"] = False
-                        attrs["_squid"]["aborted"] = True
-                        zarr_json["attributes"] = attrs
-                    with open(zarr_json_path, "w") as f:
-                        json.dump(zarr_json, f, indent=2)
-            except (OSError, json.JSONDecodeError) as e:
-                log.error(f"Failed to update abort metadata at {zarr_json_path}: {e}")
+            self._set_squid_flag("acquisition_complete", False)
+            self._set_squid_flag("aborted", True)
         finally:
-            # Always mark as finalized and cleanup resources
             self._finalized = True
             self._cleanup_event_loop()
-            log.warning(f"Zarr writer aborted: {self._config.output_path}")
+            log.warning(f"Zarr writer aborted: {self._group_dir()}")
 
-    def _cleanup_event_loop(self) -> None:
-        """Clean up the event loop to prevent resource leaks.
-
-        Only closes the loop if we created it ourselves (via new_event_loop).
-        Loops obtained from get_event_loop() are shared and should not be closed.
-        """
-        if self._loop is not None and self._owns_loop and not self._loop.is_closed():
-            try:
-                self._loop.close()
-            except Exception as e:
-                log.warning(f"Error closing event loop: {e}")
-        self._loop = None
-        self._owns_loop = False
+    def _set_squid_flag(self, key: str, value: Any) -> None:
+        path = self._zarr_json_path()
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r") as f:
+                data = json.load(f)
+            attrs = data.get("attributes", {})
+            squid_block = attrs.setdefault("_squid", {})
+            squid_block[key] = value
+            data["attributes"] = attrs
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except (OSError, json.JSONDecodeError) as e:
+            log.error(f"Failed to update _squid.{key} at {path}: {e}")
 
     @property
     def is_initialized(self) -> bool:

@@ -343,31 +343,6 @@ class FileSavingOption(Enum):
             raise ValueError(f"Invalid file saving option: {option}")
 
 
-class ZarrChunkMode(Enum):
-    """Zarr chunk size configuration.
-
-    FULL_FRAME: Each chunk is a full image plane (simplest, default).
-    TILED_512: 512x512 pixel chunks for tiled visualization.
-    TILED_256: 256x256 pixel chunks for fine-grained streaming.
-    """
-
-    FULL_FRAME = "full_frame"
-    TILED_512 = "tiled_512"
-    TILED_256 = "tiled_256"
-
-    @staticmethod
-    def convert_to_enum(option: Union[str, "ZarrChunkMode"]) -> "ZarrChunkMode":
-        """Convert string or enum to ZarrChunkMode enum."""
-        if isinstance(option, ZarrChunkMode):
-            return option
-        try:
-            return ZarrChunkMode(option.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid zarr chunk mode: '{option}'. Expected 'full_frame', 'tiled_512', or 'tiled_256'."
-            )
-
-
 class ZarrCompression(Enum):
     """Zarr compression presets optimized for different use cases.
 
@@ -1186,14 +1161,10 @@ USE_TEMPLATE_MULTIPOINT = False
 
 FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
 
-# Zarr v3 saving configuration
-ZARR_CHUNK_MODE = ZarrChunkMode.FULL_FRAME
-ZARR_COMPRESSION = ZarrCompression.FAST  # Safe for 10-20 fps, ~1000 MB/s encode
-
-# Use 6D array with FOV dimension for non-HCS acquisitions (non-standard, not OME-NGFF compliant)
-# When False (default): creates per-FOV 5D zarr files (OME-NGFF compliant)
-# When True: creates single 6D zarr with shape (FOV, T, C, Z, Y, X)
-ZARR_USE_6D_FOV_DIMENSION = False
+# Zarr v3 saving configuration.
+# Chunks are always plane-level (1, 1, 1, Y, X); shards are always (1, C, Z, Y, X) per FOV-timepoint.
+# BALANCED (blosc-zstd clevel 3 + bitshuffle) typically yields ~3-5x on fluorescence 16-bit at ~500 MB/s encode.
+ZARR_COMPRESSION = ZarrCompression.BALANCED
 
 ##########################################################
 #### start of loading machine specific configurations ####
@@ -1284,7 +1255,6 @@ MULTIPOINT_USE_PIEZO_FOR_ZSTACKS = HAS_OBJECTIVE_PIEZO
 
 # convert str to enum
 FILE_SAVING_OPTION = FileSavingOption.convert_to_enum(FILE_SAVING_OPTION)
-ZARR_CHUNK_MODE = ZarrChunkMode.convert_to_enum(ZARR_CHUNK_MODE)
 ZARR_COMPRESSION = ZarrCompression.convert_to_enum(ZARR_COMPRESSION)
 FOCUS_MEASURE_OPERATOR = FocusMeasureOperator.convert_to_enum(FOCUS_MEASURE_OPERATOR)
 DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)

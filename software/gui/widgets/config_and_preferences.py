@@ -472,7 +472,7 @@ class PreferencesDialog(QDialog):
             "balanced: blosc-zstd level 3, ~500 MB/s, ~3-4x compression\n"
             "best: blosc-zstd level 9, slower but best compression"
         )
-        zarr_compression_value = self._get_config_value("GENERAL", "zarr_compression", "fast")
+        zarr_compression_value = self._get_config_value("GENERAL", "zarr_compression", "balanced")
         self.zarr_compression_combo.setCurrentText(zarr_compression_value)
         self.zarr_compression_label = QLabel("Zarr Compression:")
         layout.addRow(self.zarr_compression_label, self.zarr_compression_combo)
@@ -651,35 +651,6 @@ class PreferencesDialog(QDialog):
 
         stage_group.content.addLayout(stage_layout)
         layout.addWidget(stage_group)
-
-        # Zarr v3 Options section
-        zarr_group = CollapsibleGroupBox("Zarr v3 Options", collapsed=True)
-        zarr_layout = QFormLayout()
-
-        self.zarr_chunk_mode_combo = QComboBox()
-        self.zarr_chunk_mode_combo.addItems(["full_frame", "tiled_512", "tiled_256"])
-        self.zarr_chunk_mode_combo.setToolTip(
-            "full_frame: Each chunk is a full image plane (simplest, default)\n"
-            "tiled_512: 512x512 pixel chunks for tiled visualization\n"
-            "tiled_256: 256x256 pixel chunks for fine-grained streaming"
-        )
-        zarr_chunk_mode_value = self._get_config_value("GENERAL", "zarr_chunk_mode", "full_frame")
-        self.zarr_chunk_mode_combo.setCurrentText(zarr_chunk_mode_value)
-        zarr_layout.addRow("Chunk Mode:", self.zarr_chunk_mode_combo)
-
-        self.zarr_6d_fov_checkbox = QCheckBox()
-        self.zarr_6d_fov_checkbox.setToolTip(
-            "When enabled, non-HCS acquisitions use a single 6D zarr per region\n"
-            "with shape (FOV, T, C, Z, Y, X). This is non-standard but groups\n"
-            "all FOVs together. When disabled (default), creates separate 5D\n"
-            "OME-NGFF compliant zarr files per FOV."
-        )
-        zarr_6d_fov_value = self._get_config_bool("GENERAL", "zarr_use_6d_fov_dimension", False)
-        self.zarr_6d_fov_checkbox.setChecked(zarr_6d_fov_value)
-        zarr_layout.addRow("Use 6D FOV Dimension:", self.zarr_6d_fov_checkbox)
-
-        zarr_group.content.addLayout(zarr_layout)
-        layout.addWidget(zarr_group)
 
         # Contrast Autofocus section
         af_group = CollapsibleGroupBox("Contrast Autofocus", collapsed=True)
@@ -1183,10 +1154,6 @@ class PreferencesDialog(QDialog):
         # General settings
         self.config.set("GENERAL", "file_saving_option", self.file_saving_combo.currentText())
         self.config.set("GENERAL", "zarr_compression", self.zarr_compression_combo.currentText())
-        self.config.set("GENERAL", "zarr_chunk_mode", self.zarr_chunk_mode_combo.currentText())
-        self.config.set(
-            "GENERAL", "zarr_use_6d_fov_dimension", "true" if self.zarr_6d_fov_checkbox.isChecked() else "false"
-        )
         self.config.set("GENERAL", "default_saving_path", self.saving_path_edit.text())
         self.config.set("GENERAL", "show_dev_tab", "true" if self.show_dev_tab_checkbox.isChecked() else "false")
 
@@ -1363,14 +1330,6 @@ class PreferencesDialog(QDialog):
             self.zarr_compression_combo.currentText()
         )
 
-        # Zarr chunk mode
-        control._def.ZARR_CHUNK_MODE = control._def.ZarrChunkMode.convert_to_enum(
-            self.zarr_chunk_mode_combo.currentText()
-        )
-
-        # Zarr 6D FOV dimension
-        control._def.ZARR_USE_6D_FOV_DIMENSION = self.zarr_6d_fov_checkbox.isChecked()
-
         # Default saving path
         control._def.DEFAULT_SAVING_PATH = self.saving_path_edit.text()
 
@@ -1452,11 +1411,6 @@ class PreferencesDialog(QDialog):
         new_val = self.file_saving_combo.currentText()
         if old_val != new_val:
             changes.append(("File Saving Format", old_val, new_val, False))
-
-        old_val = self._get_config_bool("GENERAL", "zarr_use_6d_fov_dimension", False)
-        new_val = self.zarr_6d_fov_checkbox.isChecked()
-        if old_val != new_val:
-            changes.append(("Use 6D FOV Dimension", str(old_val), str(new_val), False))
 
         old_val = self._get_config_value("GENERAL", "default_saving_path", control._def.DEFAULT_SAVING_PATH)
         new_val = self.saving_path_edit.text()

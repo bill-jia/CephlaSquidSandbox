@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional, Callable, Union, TYPE_CHECKING
 
-from control._def import ZProjectionMode, DownsamplingMethod
+from control._def import FileSavingOption, ZProjectionMode, DownsamplingMethod
 from control.core.job_processing import CaptureInfo
 from control.core.scan_coordinates import ScanCoordinates
 from squid.abc import CameraFrame
@@ -54,6 +54,9 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # On-disk format for saved images (INDIVIDUAL_IMAGES, MULTI_PAGE_TIFF, OME_TIFF, ZARR_V3).
+    # Snapshotted at acquisition start so the worker doesn't depend on a mutable global.
+    file_saving_option: FileSavingOption = FileSavingOption.INDIVIDUAL_IMAGES
     # Software trigger: if True, skip turn_off_illumination after each frame until channel changes
     keep_illuminators_on_between_captures: bool = False
 
