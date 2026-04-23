@@ -231,6 +231,9 @@ class MultiPointWorker:
 
         self.skip_saving = acquisition_parameters.skip_saving
         self.file_saving_option = acquisition_parameters.file_saving_option
+        # Tracks whether the most recent run_single_time_point created a per-timepoint
+        # folder (so we know whether to drop a per-timepoint .done marker into it).
+        self._wrote_per_timepoint_folder = False
         job_classes = []
         use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF
         use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3
@@ -794,12 +797,21 @@ class MultiPointWorker:
             # this signal so peak RAM tracks a single timepoint, not the whole run).
             self.callbacks.signal_new_time_point(self.time_point)
 
-            # for each time point, create a new folder
+            # For each time point, create a per-timepoint folder *only if* something
+            # actually lands in it. ZARR_V3 streams images to its own per-FOV trees and
+            # consolidates the per-frame timing CSV at the experiment root, so the
+            # timepoint folder is otherwise empty in the common case. We still create
+            # it when downsampled views or laser-AF characterization debug images need it.
             with self._timing.get_timer("create_new_timepoint"):
                 if self.experiment_path:
                     utils.ensure_directory_exists(str(self.experiment_path))
-                current_path = os.path.join(self.experiment_path, f"{self.time_point:0{FILE_ID_PADDING}}")
-                utils.ensure_directory_exists(str(current_path))
+                if self._needs_per_timepoint_folder():
+                    current_path = os.path.join(self.experiment_path, f"{self.time_point:0{FILE_ID_PADDING}}")
+                    utils.ensure_directory_exists(str(current_path))
+                    self._wrote_per_timepoint_folder = True
+                else:
+                    current_path = self.experiment_path
+                    self._wrote_per_timepoint_folder = False
 
                 # Write acquisition metadata sidecar for individual TIFF saving modes.
                 # This makes per-timepoint folders self-describing without parsing filenames.
@@ -848,9 +860,13 @@ class MultiPointWorker:
                     # Clear plate view for next timepoint
                     self._downsampled_view_manager.clear()
 
-            # finished region scan
-            with self._timing.get_timer("save_coordinates_csv"):
-                self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+            # finished region scan. Skip the per-timepoint coordinates.csv for ZARR_V3,
+            # since the controller already wrote {exp}/coordinates.csv with the same data.
+            if self.file_saving_option != FileSavingOption.ZARR_V3:
+                with self._timing.get_timer("save_coordinates_csv"):
+                    self.coordinates_pd.to_csv(
+                        os.path.join(current_path, "coordinates.csv"), index=False, header=True
+                    )
 
             # Send Slack timepoint notification via callback (allows main thread to capture screenshot)
             if self._slack_notifier is not None:
@@ -875,10 +891,40 @@ class MultiPointWorker:
                 except Exception as e:
                     self._log.warning(f"Failed to send Slack timepoint notification: {e}")
 
-            utils.create_done_file(current_path)
+            # Per-timepoint .done marker only when we actually have a per-timepoint folder.
+            # Acquisition-level completion is marked separately at experiment root by the
+            # controller in _restore_state_after_acquisition.
+            if self._wrote_per_timepoint_folder:
+                utils.create_done_file(current_path)
             self._log.debug(f"Single time point took: {time.time() - start} [s]")
         finally:
             self.microcontroller.enable_joystick(True)
+
+    def _needs_per_timepoint_folder(self) -> bool:
+        """True when something will write into ``{exp}/{timepoint}/``.
+
+        ZARR_V3 alone does not — its image data lives under ``plate.ome.zarr``
+        / ``zarr/`` and the per-frame CSV is consolidated at the experiment root.
+        We keep the folder when:
+
+        * skip_saving is off and we're using a TIFF mode (images land here)
+        * downsampled views are enabled (``plate_<r>um.tiff`` lands here per timepoint)
+        * laser-AF characterization mode is on (debug bmps land here)
+        """
+        if self.skip_saving:
+            tiff_mode_writes = False
+        else:
+            tiff_mode_writes = self.file_saving_option != FileSavingOption.ZARR_V3
+        if tiff_mode_writes:
+            return True
+        if self._generate_downsampled_views:
+            return True
+        if (
+            self.laser_auto_focus_controller is not None
+            and getattr(self.laser_auto_focus_controller, "characterization_mode", False)
+        ):
+            return True
+        return False
 
     def initialize_z_stack(self):
         # z stacking config
@@ -924,7 +970,6 @@ class MultiPointWorker:
 
         self.stage.move_x_to(x_mm)
         self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
-
         self.stage.move_y_to(y_mm)
         self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
 
@@ -1929,6 +1974,7 @@ class MultiPointWorker:
                 time_point=self.time_point,
                 filename_channel_label=filename_channel_label,
                 file_saving_option=self.file_saving_option,
+                acquisition_root=self.experiment_path,
             )
             self._current_capture_info = current_capture_info
         self._log.info(f"Triggering camera for capture: {current_capture_info.observation_state.name}, position={current_capture_info.position}, z_index={k}")
@@ -2026,6 +2072,7 @@ class MultiPointWorker:
             configuration_idx=0,
             time_point=self.time_point,
             file_saving_option=self.file_saving_option,
+            acquisition_root=self.experiment_path,
         )
 
         if len(i_size) == 3:
@@ -2142,8 +2189,10 @@ class MultiPointWorker:
         )
 
     def handle_acquisition_abort(self, current_path):
-        # Save coordinates.csv
-        self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+        # Save coordinates.csv (skip for ZARR_V3 — the controller's root copy is canonical
+        # and the per-timepoint folder may not exist).
+        if self.file_saving_option != FileSavingOption.ZARR_V3:
+            self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
         self.microcontroller.enable_joystick(True)
 
         self._wait_for_outstanding_callback_images()

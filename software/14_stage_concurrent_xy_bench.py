@@ -17,8 +17,11 @@ ways and comparing wall-clock time and final-position accuracy:
 
 Prereqs:
 - Close any running Squid GUI/acquisition that holds the MCU serial port.
-- Stage must already be homed (script does not home — it only does small
-  round-trip moves around the starting position).
+- Stage must have been homed by a prior GUI session. This script opens the
+  microscope with ``skip_init=True`` so the MCU is not reset, preserving
+  whatever homing + actuator config the GUI session left on the firmware.
+  Without this, the MCU reset would wipe homing state and the firmware
+  silently refuses absolute moves on an unhomed stage.
 - Activate the conda env (``conda activate squid``) before running.
 
 Usage::
@@ -36,7 +39,7 @@ import sys
 import time
 from pathlib import Path
 
-SOFTWARE_DIR = Path(__file__).resolve().parent / "software"
+SOFTWARE_DIR = Path(__file__).resolve().parent
 if str(SOFTWARE_DIR) not in sys.path:
     sys.path.insert(0, str(SOFTWARE_DIR))
 
@@ -144,7 +147,11 @@ def _run_mode(name, stage, mcu, origin_x, origin_y):
 
 
 def main():
-    scope: Microscope = Microscope.build_from_global_config(False)
+    # skip_init=True: connect to the MCU without issuing a RESET + actuator
+    # reconfig. This preserves whatever homing state the previous GUI session
+    # left on the MCU firmware. A RESET (the default) wipes homing, and the
+    # firmware silently refuses absolute moves on an unhomed stage.
+    scope: Microscope = Microscope.build_from_global_config(False, skip_init=True)
     stage = scope.stage
     mcu = scope.low_level_drivers.microcontroller
 
@@ -154,6 +161,25 @@ def main():
     print(f"Round-trip size:   ({DX_MM}, {DY_MM}) mm")
     print(f"N round-trips:     {N_ROUND_TRIPS} (= {2 * N_ROUND_TRIPS} moves per mode)")
     print(f"Dwell per move:    {DWELL_MS} ms")
+
+    # Sanity check: attempt one small move and confirm get_pos reflects it. If
+    # not, the stage is likely unhomed and the firmware is silently rejecting
+    # moves — bail out early rather than time nothing.
+    sanity_target_x = origin_x + 0.1
+    print(f"\nSanity move: X {origin_x:.4f} -> {sanity_target_x:.4f} mm")
+    stage.move_x_to(sanity_target_x)
+    pos_after = stage.get_pos()
+    pos_delta_um = (pos_after.x_mm - origin_x) * 1000.0
+    print(f"  after sanity move: x={pos_after.x_mm:.4f} mm (delta {pos_delta_um:+.1f} um)")
+    if abs(pos_after.x_mm - sanity_target_x) > 0.001:
+        print(
+            "\n  !!! Sanity move did not reach target. Stage is probably unhomed,\n"
+            "  or the MCU rejected the command. Home the stage via the GUI and try\n"
+            "  again. Aborting bench before invalid timing numbers are reported."
+        )
+        return
+    # Return to origin before the timed runs.
+    stage.move_x_to(origin_x)
 
     # Serial (baseline)
     serial = _run_mode("serial", stage, mcu, origin_x, origin_y)

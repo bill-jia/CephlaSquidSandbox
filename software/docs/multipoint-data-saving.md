@@ -194,7 +194,7 @@ If either limit is exceeded, acquisition pauses until the subprocess drains enou
 
 ## Per-Frame Metadata
 
-Every format writes a `frame_acquisition_times.csv` in each timepoint directory:
+Every format writes a per-frame timing CSV with the same column schema:
 
 | Column | Description |
 |--------|-------------|
@@ -208,11 +208,16 @@ Every format writes a `frame_acquisition_times.csv` in each timepoint directory:
 | `unix_time_s` | Unix timestamp of capture |
 | `utc_iso` | UTC ISO 8601 timestamp |
 
-Additionally, `coordinates.csv` records the stage position for each FOV.
+Layout differs by save mode:
+
+- **`INDIVIDUAL_IMAGES`, `MULTI_PAGE_TIFF`, `OME_TIFF`**: one CSV per timepoint at `{exp}/{timepoint}/frame_acquisition_times.csv`, alongside the image files.
+- **`ZARR_V3`**: a single consolidated CSV at `{exp}/acquisition_times.csv`. The `time_point` column distinguishes rows. Image data lives under `plate.ome.zarr/` (HCS) or `zarr/` (non-HCS), so the per-timepoint folder is otherwise empty and is *not created* unless downsampled views or laser-AF characterization need it.
+
+Additionally, `coordinates.csv` records the stage position for each FOV at the experiment root. Non-ZARR modes also write a per-timepoint copy alongside the images.
 
 ### Zarr-Embedded Timestamps
 
-For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zarr array inside each FOV group (shape `(T, C, Z)`, dtype `float64`, Unix seconds). This makes the zarr store fully self-describing — downstream consumers can read timestamps with the same stack of tools that reads the image data.
+For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zarr array inside each FOV group (shape `(T, C, Z)`, dtype `float64`, Unix seconds). This makes the zarr store fully self-describing — downstream consumers can read timestamps with the same stack of tools that reads the image data. The root-level `acquisition_times.csv` covers the same ground in human-readable form.
 
 ## Fast Acquisition (Separate Path)
 

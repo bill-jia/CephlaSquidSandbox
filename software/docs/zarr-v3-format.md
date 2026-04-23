@@ -170,8 +170,29 @@ timestamps. Values are written via `ZarrWriter.record_frame_time(t, c, z,
 unix_time_s, channel_name=...)`. This replaces the older
 `frame_timestamps.json` sidecar and scales cleanly to long timelapses.
 
-A `frame_acquisition_times.csv` is still written under each timepoint folder
-for human-friendly inspection.
+A single human-friendly `acquisition_times.csv` is written at the experiment
+root (`{experiment}/acquisition_times.csv`) consolidating per-frame timestamps
+across every timepoint, region, FOV, channel, and z. Each row carries a
+`time_point` column so all data live in one file rather than scattered across
+per-timepoint folders. (Other save modes — `INDIVIDUAL_IMAGES`,
+`MULTI_PAGE_TIFF`, `OME_TIFF` — keep their per-timepoint
+`{experiment}/{timepoint}/frame_acquisition_times.csv` since their image data
+is also organised per timepoint.)
+
+### No empty per-timepoint folders
+
+Because ZARR_V3 streams image data to its own per-FOV trees and consolidates
+the per-frame CSV at the root, the per-timepoint folder
+(`{experiment}/{timepoint:04d}/`) is **not created** for pure ZARR_V3
+acquisitions. The folder is only created when something else needs it:
+
+- Downsampled views are enabled (`SAVE_DOWNSAMPLED_WELL_IMAGES` or
+  `DISPLAY_PLATE_VIEW`) — `plate_<r>um.tiff` lands per timepoint.
+- Laser-AF characterization mode (`LASER_AF_CHARACTERIZATION_MODE = True`) —
+  per-FOV debug bmps land per timepoint.
+
+Acquisition-level completion is marked by a single `.done` file at
+`{experiment}/.done` written by the controller when the run finishes.
 
 ## HCS plate + well metadata
 

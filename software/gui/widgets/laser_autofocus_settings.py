@@ -192,7 +192,9 @@ class LaserAutofocusButton(QPushButton):
         self._mpc = multipoint_controller
         self._checked_state = False
         # Light red, mirroring btn_startAcquisition's light-blue (#C2C2FF) styling.
-        self.setStyleSheet("background-color: #FFC2C2;")
+        # Scoped to LaserAutofocusButton so it doesn't propagate into the dialog
+        # opened as a child — the dialog should use the normal system palette.
+        self.setStyleSheet("LaserAutofocusButton { background-color: #FFC2C2; }")
         self.clicked.connect(self._open_dialog)
         self._refresh_label()
 

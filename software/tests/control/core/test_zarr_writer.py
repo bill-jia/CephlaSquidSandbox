@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 import squid.abc
-from control._def import ZarrCompression
+from control._def import FileSavingOption, ZarrCompression
 from control.core.job_processing import (
     CaptureInfo,
     JobImage,
@@ -56,6 +56,8 @@ def _capture(
     z: int = 0,
     save_directory: str = "",
     config_name: str = "BF LED matrix full",
+    file_saving_option=None,
+    acquisition_root=None,
 ) -> CaptureInfo:
     return CaptureInfo(
         position=squid.abc.Pos(x_mm=1.0, y_mm=2.0, z_mm=0.0, theta_rad=None),
@@ -68,6 +70,8 @@ def _capture(
         fov=fov,
         configuration_idx=c_idx,
         time_point=t,
+        file_saving_option=file_saving_option,
+        acquisition_root=acquisition_root,
     )
 
 
@@ -518,9 +522,19 @@ class TestSaveZarrJob:
             try:
                 for c_idx in range(2):
                     img = (np.ones((64, 64), dtype=np.uint16) * (10 + c_idx))
-                    save_dir = os.path.join(tmpdir, "0000")
-                    os.makedirs(save_dir, exist_ok=True)
-                    cap = _capture(region_id="A1", fov=0, t=0, c_idx=c_idx, z=0, save_directory=save_dir)
+                    # save_directory normally points at a per-timepoint folder; for ZARR_V3
+                    # it can point at the experiment root since the per-frame CSV is
+                    # consolidated there.
+                    cap = _capture(
+                        region_id="A1",
+                        fov=0,
+                        t=0,
+                        c_idx=c_idx,
+                        z=0,
+                        save_directory=tmpdir,
+                        file_saving_option=FileSavingOption.ZARR_V3,
+                        acquisition_root=tmpdir,
+                    )
                     job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=img))
                     job.zarr_writer_info = info
                     result = job.run()
@@ -545,6 +559,12 @@ class TestSaveZarrJob:
 
                 # Manifest pointer resolves relative to FOV group.
                 assert meta["attributes"]["_squid"]["manifest_path"].endswith("acquisition.yaml")
+
+                # Per-frame CSV is consolidated at the experiment root for ZARR_V3.
+                consolidated = os.path.join(tmpdir, "acquisition_times.csv")
+                assert os.path.isfile(consolidated)
+                # And no per-timepoint frame_acquisition_times.csv was created.
+                assert not os.path.exists(os.path.join(tmpdir, "frame_acquisition_times.csv"))
             finally:
                 SaveZarrJob.clear_writers()
 

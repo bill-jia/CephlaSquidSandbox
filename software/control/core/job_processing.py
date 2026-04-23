@@ -94,6 +94,10 @@ class CaptureInfo:
     # the job through the multiprocessing pickle so subprocess code branches on
     # this value rather than reading the (stale) global ``_def.FILE_SAVING_OPTION``.
     file_saving_option: Optional["_def.FileSavingOption"] = None
+    # Experiment root (``{base_path}/{experiment_ID}``). Used by writers that
+    # consolidate output to a single root-level file (e.g. the ZARR_V3
+    # acquisition_times.csv) instead of per-timepoint sidecars.
+    acquisition_root: Optional[str] = None
 
 
 @dataclass()
@@ -144,13 +148,25 @@ def append_frame_acquisition_time_csv(
     channel: Optional[str] = None,
     channel_index: Optional[int] = None,
 ) -> None:
-    """Append one row to ``frame_acquisition_times.csv`` in ``info.save_directory`` (per timepoint folder).
+    """Append one row to the per-frame acquisition time CSV.
 
-    Records wall-clock time when each frame was committed for saving (``CaptureInfo.capture_time``).
-    Safe across multiprocessing save workers via :class:`filelock.FileLock`.
+    Layout:
+    - ``ZARR_V3``: single ``{acquisition_root}/acquisition_times.csv``
+      consolidating all timepoints. The CSV's ``time_point`` column distinguishes
+      rows. ZARR_V3 stores its image data in its own per-FOV trees, so the
+      per-timepoint folder is otherwise empty in the common case.
+    - All other modes: ``{save_directory}/frame_acquisition_times.csv``,
+      i.e. one CSV per timepoint folder alongside the TIFFs.
+
+    Records wall-clock time when each frame was committed for saving
+    (``CaptureInfo.capture_time``). Safe across multiprocessing save workers
+    via :class:`filelock.FileLock`.
     """
     _log = squid.logging.get_logger("append_frame_acquisition_time_csv")
-    path = os.path.join(info.save_directory, "frame_acquisition_times.csv")
+    if info.file_saving_option == _def.FileSavingOption.ZARR_V3 and info.acquisition_root:
+        path = os.path.join(info.acquisition_root, "acquisition_times.csv")
+    else:
+        path = os.path.join(info.save_directory, "frame_acquisition_times.csv")
     lock_path = _metadata_lock_path(path)
     fieldnames = [
         "time_point",
