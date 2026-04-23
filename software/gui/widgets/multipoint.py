@@ -8,6 +8,7 @@ from .common import (
 )
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
+from .laser_autofocus_settings import LaserAutofocusButton
 
 
 def _multipoint_observation_preset_display_names(microscope) -> list:
@@ -465,7 +466,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_withAutofocus.setChecked(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
         self.multipointController.set_af_flag(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
 
-        self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
+        self.checkbox_withReflectionAutofocus = LaserAutofocusButton(self.multipointController)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
@@ -660,8 +661,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         grid_af = QVBoxLayout()
         grid_af.addWidget(self.checkbox_withAutofocus)
-        if self._enable_laser_autofocus:
-            grid_af.addWidget(self.checkbox_withReflectionAutofocus)
+        # Laser AF has been promoted from a checkbox into a configuration button
+        # and lives in the right-hand button column (above Snap Images) instead.
         # grid_af.addWidget(self.checkbox_genAFMap)  # we are not using auto-focus map for now
         grid_af.addWidget(self.checkbox_useFocusMap)
         if HAS_OBJECTIVE_PIEZO:
@@ -680,9 +681,18 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_config.addWidget(self.btn_per_point_channels)
         grid_config.addSpacerItem(edge_spacer)
 
+        # Button column (bottom-right). Laser AF button sits above Snap Images
+        # and is stretched to match the other two buttons' heights.
         button_layout = QVBoxLayout()
-        button_layout.addWidget(self.btn_snap_images)
-        button_layout.addWidget(self.btn_startAcquisition)
+        for btn in (self.btn_snap_images, self.btn_startAcquisition):
+            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setSizePolicy(
+                QSizePolicy.Preferred, QSizePolicy.Expanding
+            )
+            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
+        button_layout.addWidget(self.btn_snap_images, 1)
+        button_layout.addWidget(self.btn_startAcquisition, 1)
 
         grid_acquisition = QHBoxLayout()
         grid_acquisition.addSpacerItem(edge_spacer)
@@ -2046,7 +2056,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_withAutofocus.setChecked(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
         self.multipointController.set_af_flag(MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT)
 
-        self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
+        self.checkbox_withReflectionAutofocus = LaserAutofocusButton(self.multipointController)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
@@ -2297,8 +2307,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Options and Start button
         options_layout = QVBoxLayout()
         options_layout.addWidget(self.checkbox_withAutofocus)
-        if self._enable_laser_autofocus:
-            options_layout.addWidget(self.checkbox_withReflectionAutofocus)
+        # Laser AF has been promoted from a checkbox into a configuration button
+        # and lives in the right-hand button column (above Snap Images) instead.
         # options_layout.addWidget(self.checkbox_genAFMap)  # We are not using AF map now
         options_layout.addWidget(self.checkbox_useFocusMap)
         if HAS_OBJECTIVE_PIEZO:
@@ -2311,9 +2321,18 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         options_layout.addWidget(self.checkbox_snakeScan)
         options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
 
+        # Button column (bottom-right). Laser AF button sits above Snap Images
+        # and is stretched to match the other two buttons' heights.
         button_layout = QVBoxLayout()
-        button_layout.addWidget(self.btn_snap_images)
-        button_layout.addWidget(self.btn_startAcquisition)
+        for btn in (self.btn_snap_images, self.btn_startAcquisition):
+            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        if self._enable_laser_autofocus:
+            self.checkbox_withReflectionAutofocus.setSizePolicy(
+                QSizePolicy.Preferred, QSizePolicy.Expanding
+            )
+            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
+        button_layout.addWidget(self.btn_snap_images, 1)
+        button_layout.addWidget(self.btn_startAcquisition, 1)
 
         bottom_right = QHBoxLayout()
         bottom_right.addLayout(options_layout)
@@ -2460,6 +2479,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "laser_af": (
                     self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
                 ),
+                # Laser-AF fast-mode parameters (seed mode, refresh N, etc.) are
+                # persisted by MultiPointController to cache/laser_af_settings.yaml
+                # so changes made via the dialog from any multipoint tab survive
+                # restart. Do not duplicate them here — the two caches could
+                # race and overwrite fresh values with stale ones on load.
             }
 
             with open("cache/multipoint_widget_config.yaml", "w") as f:
@@ -2540,6 +2564,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.checkbox_withAutofocus.setChecked(settings.get("contrast_af", False))
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(settings.get("laser_af", False))
+                # Refresh the button label so the cadence loaded by the
+                # controller from cache/laser_af_settings.yaml is reflected.
+                if hasattr(self.checkbox_withReflectionAutofocus, "refresh_label"):
+                    self.checkbox_withReflectionAutofocus.refresh_label()
 
             # Unblock signals
             self.checkbox_xy.blockSignals(False)
@@ -4155,7 +4183,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         # Laser AF checkbox
-        self.checkbox_withReflectionAutofocus = QCheckBox("Laser AF")
+        self.checkbox_withReflectionAutofocus = LaserAutofocusButton(self.multipointController)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.setChecked(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)

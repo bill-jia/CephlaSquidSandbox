@@ -337,6 +337,10 @@ class MultiPointController:
         self.laser_af_refresh_every_n_fovs = control._def.LASER_AF_REFRESH_EVERY_N_FOVS
         self.laser_af_consistency_threshold_um = control._def.LASER_AF_CONSISTENCY_THRESHOLD_UM
         self.laser_af_check_last_fov_per_region = control._def.LASER_AF_CHECK_LAST_FOV_PER_REGION
+        # Override laser-AF fast-mode defaults with whatever the user last
+        # configured via the settings dialog. Load is widget-agnostic so the
+        # values carry regardless of which multipoint tab is in use.
+        self._load_laser_af_settings_from_cache()
         self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
         self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS
         self.experiment_ID = None
@@ -538,18 +542,68 @@ class MultiPointController:
         if mode not in ("scan", "lazy"):
             raise ValueError(f"laser_af_seed_mode must be 'scan' or 'lazy', got {mode!r}")
         self.laser_af_seed_mode = mode
+        self._save_laser_af_settings_to_cache()
 
     def set_laser_af_refresh_every_n_fovs(self, n: int):
         """Max FOVs per region between anchor refreshes (1 = AF every FOV)."""
         self.laser_af_refresh_every_n_fovs = max(1, int(n))
+        self._save_laser_af_settings_to_cache()
 
     def set_laser_af_consistency_threshold_um(self, threshold_um: float):
         """µm disagreement above which consistency checks emit a warning."""
         self.laser_af_consistency_threshold_um = float(threshold_um)
+        self._save_laser_af_settings_to_cache()
 
     def set_laser_af_check_last_fov_per_region(self, flag: bool):
         """Enable/disable the end-of-region displacement check for short regions."""
         self.laser_af_check_last_fov_per_region = bool(flag)
+        self._save_laser_af_settings_to_cache()
+
+    # Dedicated cache for laser-AF fast-mode settings. Lives outside the
+    # wellplate-widget-specific multipoint_widget_config.yaml so that changes
+    # made via the dialog from *any* multipoint widget (Flexible, Wellplate,
+    # Fluidics) persist across restarts.
+    _LASER_AF_SETTINGS_CACHE_PATH = "cache/laser_af_settings.yaml"
+
+    def _save_laser_af_settings_to_cache(self):
+        try:
+            os.makedirs(os.path.dirname(self._LASER_AF_SETTINGS_CACHE_PATH), exist_ok=True)
+            data = {
+                "laser_af_seed_mode": self.laser_af_seed_mode,
+                "laser_af_refresh_every_n_fovs": self.laser_af_refresh_every_n_fovs,
+                "laser_af_consistency_threshold_um": self.laser_af_consistency_threshold_um,
+                "laser_af_check_last_fov_per_region": self.laser_af_check_last_fov_per_region,
+            }
+            with open(self._LASER_AF_SETTINGS_CACHE_PATH, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+        except Exception as e:
+            self._log.warning(f"Failed to persist laser-AF settings: {e}")
+
+    def _load_laser_af_settings_from_cache(self):
+        path = self._LASER_AF_SETTINGS_CACHE_PATH
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as e:
+            self._log.warning(f"Failed to read laser-AF settings cache ({path}): {e}")
+            return
+        seed_mode = data.get("laser_af_seed_mode")
+        if seed_mode in ("scan", "lazy"):
+            self.laser_af_seed_mode = seed_mode
+        if "laser_af_refresh_every_n_fovs" in data:
+            try:
+                self.laser_af_refresh_every_n_fovs = max(1, int(data["laser_af_refresh_every_n_fovs"]))
+            except (TypeError, ValueError):
+                pass
+        if "laser_af_consistency_threshold_um" in data:
+            try:
+                self.laser_af_consistency_threshold_um = float(data["laser_af_consistency_threshold_um"])
+            except (TypeError, ValueError):
+                pass
+        if "laser_af_check_last_fov_per_region" in data:
+            self.laser_af_check_last_fov_per_region = bool(data["laser_af_check_last_fov_per_region"])
 
     def set_manual_focus_map_flag(self, flag):
         self.use_manual_focus_map = flag
