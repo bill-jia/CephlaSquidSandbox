@@ -84,7 +84,7 @@ if __name__ == "__main__":
         squid.logging.set_stdout_log_level(logging.DEBUG)
 
     # Set up file logging for debugging
-    if not squid.logging.add_file_logging(f"{squid.logging.get_default_log_directory()}/main_hcs.log"):
+    if not squid.logging.add_file_logging(f"{squid.logging.get_default_log_directory()}/main_hcs.log", verbose=args.verbose):
         log.error("Couldn't setup logging to file!")
         sys.exit(1)
 

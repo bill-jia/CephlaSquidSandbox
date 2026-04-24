@@ -1367,7 +1367,7 @@ class TucsenCamera(AbstractCamera):
             self._read_thread_running.clear()
 
     def _wait_for_frame(self):
-        self._log.info("Starting Tucsen read thread.")
+        self._log.debug("Starting Tucsen read thread.")
         self._read_thread_running.set()
         iteration = 0
         last_heartbeat_log = time.time()
@@ -1380,7 +1380,7 @@ class TucsenCamera(AbstractCamera):
                 # the thread is stuck or just not seeing triggers).
                 now = time.time()
                 if now - last_heartbeat_log >= 5.0:
-                    self._log.info(
+                    self._log.debug(
                         f"Tucsen read-thread heartbeat: iter={iteration}, "
                         f"frames_received={self._frames_received_since_start}, "
                         f"triggers_sent={self._triggers_sent_since_start}"
@@ -1399,7 +1399,7 @@ class TucsenCamera(AbstractCamera):
                 if ret != TUCAMRET.TUCAMRET_SUCCESS:
                     # Log sparingly so timeouts between triggers don't flood the log.
                     if iteration <= 3 or iteration % 10 == 0:
-                        self._log.info(
+                        self._log.debug(
                             f"TUCAM_Buf_WaitForFrame returned {ret} after "
                             f"{wait_elapsed_ms:.0f} ms (iter={iteration})"
                         )
@@ -2213,7 +2213,7 @@ class TucsenCamera(AbstractCamera):
                 f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
             )
         # Virtualized SW trigger -> fire the hardware trigger line; camera is actually in hw mode.
-        self._log.info(f"Sending trigger with {self._acquisition_mode} (virtualize = {self._virt_sw_trigger})")
+        # self._log.info(f"Sending trigger with {self._acquisition_mode} (virtualize = {self._virt_sw_trigger})")
         if self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
             if not self._hw_trigger_fn:
                 raise CameraError("Virtualized software trigger requires _hw_trigger_fn.")
@@ -2223,7 +2223,7 @@ class TucsenCamera(AbstractCamera):
             # on top would either conflict (MCU path) or be a no-op (NI-DAQ path).
             # (LED settle before firing is applied worker-side, see
             # software.acquisition.illumination_settle_ms in the machine config.)
-            self._log.info("Tucsen: firing virtualized SW trigger via _hw_trigger_fn(None)")
+            # self._log.info("Tucsen: firing virtualized SW trigger via _hw_trigger_fn(None)")
             self._hw_trigger_fn(None)
             self._last_trigger_timestamp = time.time()
             self._triggers_sent_since_start += 1

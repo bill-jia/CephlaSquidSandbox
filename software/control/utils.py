@@ -565,7 +565,6 @@ class TimingManager:
         def start(self):
             if self._last_start:
                 self._log.warning(f"Double start detected for Timer={self._name}")
-            self._log.debug(f"Starting name={self._name}")
             self._last_start = time.perf_counter()
 
         def stop(self):
@@ -574,7 +573,6 @@ class TimingManager:
                 return
             this_pair = TimingManager.TimingPair(self._last_start, time.perf_counter())
             self._timing_pairs.append(this_pair)
-            self._log.debug(f"Stopping name={self._name} with elapsed={this_pair.elapsed()} [s]")
             self._last_start = None
 
         def record(self, start: float, stop: float):
@@ -624,12 +622,17 @@ class TimingManager:
 
         return self._timers[name]
 
-    def get_report(self) -> str:
+    def get_report(self, sort=False) -> str:
         timer_names = sorted(self._timers.keys())
+        report_list = [self._timers[name].get_report() for name in timer_names]
+        report_list = sorted(report_list, key=lambda r: float(r.split("total=")[1].split()[0]), reverse=True)
         report = f"Timings For {self._name}:\n"
-        for name in timer_names:
-            timer = self._timers[name]
-            report += f"  {timer.get_report()}\n"
+        if sort:
+            report += "\n".join(report_list)
+        else:
+            for name in timer_names:
+                timer = self._timers[name]
+                report += f"  {timer.get_report()}\n"
 
         return report
 

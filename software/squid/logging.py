@@ -1,3 +1,4 @@
+from distutils.debug import DEBUG
 import logging as py_logging
 import logging.handlers
 import os.path
@@ -173,7 +174,7 @@ def get_default_log_directory():
     # return platformdirs.user_log_path(_squid_root_logger_name, "cephla")
 
 
-def add_file_logging(log_filename, replace_existing=False):
+def add_file_logging(log_filename, replace_existing=False, verbose=False) -> bool:
     root_logger = get_logger()
     abs_path = os.path.abspath(log_filename)
     for handler in root_logger.handlers:
@@ -197,7 +198,10 @@ def add_file_logging(log_filename, replace_existing=False):
     new_handler = logging.handlers.RotatingFileHandler(
         abs_path, maxBytes=0, backupCount=25, encoding="utf-8", errors="replace"
     )
-    new_handler.setLevel(py_logging.DEBUG)
+    if verbose:
+        new_handler.setLevel(py_logging.DEBUG)
+    else:
+        new_handler.setLevel(py_logging.INFO)
 
     formatter = py_logging.Formatter(fmt=_baseline_log_format, datefmt=_baseline_log_dateformat)
     new_handler.setFormatter(formatter)
