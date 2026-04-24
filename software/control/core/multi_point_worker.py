@@ -216,13 +216,17 @@ class MultiPointWorker:
         # "exposure_time_done_sleep_hw or wait_for_image_sw" window into
         # sub-timers. Reset before each send_trigger.
         self._capture_ts: dict = {}
-        # Phase F — stage-move pipelining. move_to_coordinate now fires both
-        # axes non-blocking and sets _pending_move_settle=True; any operation
-        # that needs the stage physically settled (AF, camera trigger) calls
-        # _wait_for_move_settled() which joins motion via stage.wait_for_idle
-        # and runs the post-move stabilization sleep. Between the fire and
-        # the wait, the worker does useful setup work (apply_observation_state,
-        # illuminate_for_capture) in parallel with in-flight motion.
+        # Stage-move pipelining scaffolding (inactive by default — currently
+        # move_to_coordinate blocks synchronously because MCU serial contention
+        # between stage motion and shutter commands made async moves a wash).
+        # Kept live so a future change can flip move_to_coordinate to fire both
+        # axes non-blocking + set _pending_move_settle=True, and the existing
+        # _wait_for_move_settled() call sites (perform_autofocus top,
+        # acquire_camera_image before trigger) will join motion / run the
+        # stabilization sleep automatically. Primary use case: rigs where
+        # illumination is on NIDAQ (independent bus from the MCU stage motor),
+        # so apply_observation_state / illuminate_for_capture can run in
+        # parallel with in-flight motion.
         self._pending_move_settle: bool = False
         self._pending_move_stabilization_s: float = 0.0
         # This is protected by the threading event above (aka set after clear, take copy before set)
@@ -1012,8 +1016,6 @@ class MultiPointWorker:
                 last_z_mm = self._z_pos_proposal[(region_id, fov)]
                 self.move_to_z_level(last_z_mm, blocking=False)
                 self._log.info(f"Moved to last z position {last_z_mm} [mm]")
-                # No X/Y issued. _pending_move_settle stays unchanged (the
-                # earlier z move will be picked up by the next wait).
                 return
             else:
                 self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
@@ -1021,21 +1023,20 @@ class MultiPointWorker:
             z_mm = coordinate_mm[2]
             self.move_to_z_level(z_mm, blocking=False)
 
-        # Phase F: fire BOTH axes non-blocking and defer the settle wait. Any
-        # operation that requires a physically settled stage (autofocus, the
-        # camera trigger) will call _wait_for_move_settled() — between here
-        # and that wait, the worker runs apply_observation_state /
-        # illuminate_for_capture in parallel with the still-in-flight motion.
-        self.stage.move_x_to(x_mm, blocking=False)
-        self.stage.move_y_to(y_mm, blocking=False)
-        # Stabilization time is the same for both axes (20 ms each, per
-        # control/_def.py). Use one flat value; take it here so if the
-        # constant is configured per-axis later, the move-start site records
-        # the appropriate one.
-        self._pending_move_stabilization_s = max(
-            SCAN_STABILIZATION_TIME_MS_X, SCAN_STABILIZATION_TIME_MS_Y
-        ) / 1000.0
-        self._pending_move_settle = True
+        # Blocking-longer-axis move. Shorter axis fires non-blocking; the
+        # longer axis blocks until motion is complete. Stabilization sleep
+        # runs inline (the rig's MCU serializes motor + shutter commands, so
+        # there is no benefit to deferring the sleep — see the
+        # _pending_move_settle scaffolding in __init__ for the future async
+        # path that _wait_for_move_settled will unlock).
+        if delta_x > delta_y:
+            self.stage.move_y_to(y_mm, blocking=False)
+            self.stage.move_x_to(x_mm)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+        else:
+            self.stage.move_x_to(x_mm, blocking=False)
+            self.stage.move_y_to(y_mm)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
 
     def _wait_for_move_settled(self, timeout_s: float = 30.0) -> None:
         """Join the in-flight stage motion issued by move_to_coordinate and
