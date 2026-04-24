@@ -504,6 +504,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
         self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
 
+        self.checkbox_showLiveDuringAcquisition = QCheckBox("Show live preview during acquisition")
+        self.checkbox_showLiveDuringAcquisition.setChecked(True)
+        self.checkbox_showLiveDuringAcquisition.setToolTip(
+            "When unchecked, skips the per-frame display/napari updates during multipoint and "
+            "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
+        )
+
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
 
@@ -675,6 +682,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_af.addLayout(self.fileSavingFormatRow)
         grid_af.addWidget(self.checkbox_snakeScan)
         grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
 
         grid_config = QHBoxLayout()
         grid_config.addWidget(self.list_configurations)
@@ -761,6 +769,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
+        )
+        self.checkbox_showLiveDuringAcquisition.toggled.connect(
+            self.multipointController.set_show_live_during_acquisition
         )
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
@@ -2088,6 +2099,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_keepIlluminatorsOnBetweenCaptures = QCheckBox("Keep illuminators on between captures")
         self.checkbox_keepIlluminatorsOnBetweenCaptures.setChecked(False)
 
+        self.checkbox_showLiveDuringAcquisition = QCheckBox("Show live preview during acquisition")
+        self.checkbox_showLiveDuringAcquisition.setChecked(True)
+        self.checkbox_showLiveDuringAcquisition.setToolTip(
+            "When unchecked, skips the per-frame display/napari updates during multipoint and "
+            "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
+        )
+
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
@@ -2320,6 +2338,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         options_layout.addLayout(self.fileSavingFormatRow)
         options_layout.addWidget(self.checkbox_snakeScan)
         options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        options_layout.addWidget(self.checkbox_showLiveDuringAcquisition)
 
         # Button column (bottom-right). Laser AF button sits above Snap Images
         # and is stretched to match the other two buttons' heights.
@@ -2405,6 +2424,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
+        )
+        self.checkbox_showLiveDuringAcquisition.toggled.connect(
+            self.multipointController.set_show_live_during_acquisition
         )
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
@@ -3682,6 +3704,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 and widget != self.progress_bar
                 and widget != self.progress_label
                 and widget != self.eta_label
+                # Leave the live-preview toggle active during acquisition so the
+                # user can enable/disable it mid-run without stopping.
+                and widget != self.checkbox_showLiveDuringAcquisition
             ):
                 widget.setEnabled(enabled)
 

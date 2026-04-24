@@ -19,7 +19,7 @@ from control.NL5 import NL5
 os.environ["QT_API"] = "pyqt5"
 import re
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import serial
@@ -212,6 +212,13 @@ class QtMultiPointController(MultiPointController, QObject):
     ndviewer_end_zarr_acquisition = Signal()
     # Fires at the start of each timepoint so napari views can flush per-timepoint caches.
     signal_new_time_point = Signal(int)  # time_point index
+    # Internal plumbing: per-frame hot path is hit from the acquisition worker thread
+    # (plain threading.Thread, not QThread). Qt's AutoConnection can't detect that as
+    # cross-thread and degrades to DirectConnection, so downstream emits/slots would run
+    # inline on the worker thread. Posting via this signal with Qt.QueuedConnection forces
+    # the handler onto the GUI thread's event loop, keeping the worker's per-capture path
+    # lean and restoring Qt thread-affinity invariants for the display/napari slots.
+    _new_image_work_request = Signal(object, object)  # CameraFrame, CaptureInfo
 
     def __init__(
         self,
@@ -258,6 +265,33 @@ class QtMultiPointController(MultiPointController, QObject):
         self._ndviewer_region_idx_offset: list = []  # [0, 5, ...] region_idx -> flat FOV offset
         self._ndviewer_mode: NDViewerMode = NDViewerMode.INACTIVE  # Current viewer mode
         self._ndviewer_region_index_map: dict = {}  # {region_name: region_idx} for 6D mode
+
+        # When False, skip the per-frame display/napari emits during multipoint
+        # and replay one last frame per channel at acquisition end. NDViewer
+        # bookkeeping still runs per-frame (data-tracking, not display).
+        # The flag is read live on every frame, so toggling the checkbox during
+        # an active acquisition takes effect on the next capture.
+        self._show_live_during_acquisition: bool = True
+        # {observation_state_name: (CameraFrame, CaptureInfo)} — last seen frame
+        # per channel while live preview is suppressed. Replayed at acq end so
+        # every viewer layer gets populated with its most recent image.
+        self._last_frames_per_channel: Dict[str, Tuple[Any, CaptureInfo]] = {}
+
+        # Route per-frame work to the GUI thread's event loop. Worker calls
+        # signal_new_image → _signal_new_image_fn emits this signal → queued dispatch
+        # to _handle_new_image_on_gui_thread runs on the GUI thread.
+        self._new_image_work_request.connect(
+            self._handle_new_image_on_gui_thread, Qt.QueuedConnection
+        )
+
+    def set_show_live_during_acquisition(self, enabled: bool) -> None:
+        # Flipping ON mid-run invalidates the off-period cache — the live path
+        # will now handle new frames directly, and we don't want stale frames
+        # from the previous off-period to get replayed at acquisition end.
+        enabled = bool(enabled)
+        if enabled and not self._show_live_during_acquisition:
+            self._last_frames_per_channel.clear()
+        self._show_live_during_acquisition = enabled
 
     def _signal_acquisition_start_fn(self, parameters: AcquisitionParameters):
         # TODO mpc napari signals
@@ -311,11 +345,55 @@ class QtMultiPointController(MultiPointController, QObject):
             self._ndviewer_region_index_map = {}
         self._ndviewer_mode = NDViewerMode.INACTIVE
 
+        # If live preview was suppressed during any part of the run, replay the
+        # cached per-channel frames so every layer in the multichannel / mosaic
+        # viewers gets populated with its most recent image. We replay through
+        # _new_image_work_request so the normal queued path handles layer-init,
+        # napari updates, and ndviewer registration uniformly.
+        if self._last_frames_per_channel:
+            for frame, info in list(self._last_frames_per_channel.values()):
+                try:
+                    self._new_image_work_request.emit(frame, info)
+                except Exception:
+                    self.log.exception("Failed to replay final frame to display")
+            self._last_frames_per_channel.clear()
+
         self.acquisition_finished.emit()
         finish_pos = self.stage.get_pos()
         self.signal_register_current_fov.emit(finish_pos.x_mm, finish_pos.y_mm)
 
     def _signal_new_image_fn(self, frame: squid.abc.CameraFrame, info: CaptureInfo):
+        # Hot path — called on the acquisition worker thread.
+        #
+        # The flag is read on every frame so the user can flip the "Show live
+        # preview" checkbox mid-acquisition and the next capture honours it.
+        # When enabled, hand off via queued signal so all display/napari/ndviewer
+        # work runs on the GUI thread. When disabled, cache the frame per-channel
+        # for end-of-acquisition replay and do only the ndviewer filepath
+        # registration (data-tracking, not display).
+        if self._show_live_during_acquisition:
+            self._new_image_work_request.emit(frame, info)
+            return
+        channel_key = getattr(info.observation_state, "name", "") or ""
+        self._last_frames_per_channel[channel_key] = (frame, info)
+        self._register_ndviewer_filepath(frame, info)
+
+    def _register_ndviewer_filepath(self, frame: squid.abc.CameraFrame, info: CaptureInfo) -> None:
+        region_offset = self._ndviewer_region_fov_offset.get(info.region_id)
+        if region_offset is None:
+            return
+        flat_fov_idx = region_offset + info.fov
+        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
+            # Zarr path notifies via signal_zarr_frame_written on subprocess completion.
+            return
+        filepath = control.utils_acquisition.get_image_filepath(
+            info.save_directory, info.file_id, info.observation_state.name, frame.frame.dtype
+        )
+        self.ndviewer_register_image.emit(
+            info.time_point, flat_fov_idx, info.z_index, info.observation_state.name, filepath
+        )
+
+    def _handle_new_image_on_gui_thread(self, frame: squid.abc.CameraFrame, info: CaptureInfo):
         self.image_to_display.emit(frame.frame)
         # Z for plot in μm: piezo-only uses piezo position, mixed mode combines stepper + piezo
         stepper_z_um = info.position.z_mm * 1000

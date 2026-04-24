@@ -130,9 +130,10 @@ def parse_acquisition_log(log_path: str) -> AcquisitionTiming:
     if match:
         timing.num_regions = int(match.group(1))
 
-    # Count image acquisitions (send_trigger timers)
-    trigger_times = re.findall(r"Stopping name=send_trigger with elapsed=([\d.]+)", content)
-    timing.num_images = len(trigger_times)
+    # Count image acquisitions from the send_trigger timer row in the summary block
+    match = re.search(r"send_trigger:\s+\(N=(\d+),", content)
+    if match:
+        timing.num_images = int(match.group(1))
 
     # Extract file format
     if "ZARR_V3 output" in content:

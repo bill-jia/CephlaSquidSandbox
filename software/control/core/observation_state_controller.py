@@ -14,8 +14,8 @@ Hardware gating rules:
 - Illumination on/off: gated — logical state always updated; hardware only when streaming
 - Optical path (emission filters, confocal iris): always applied
 """
-
 from __future__ import annotations
+from control._def import NL5_USE_DOUT
 
 import contextlib
 import time
@@ -264,33 +264,34 @@ class ObservationStateController:
             return
         ic = self.ic
         for ist in self._current_state.illuminator_states:
-            mode = ist.led_matrix_mode
-            if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
-                with self._time("obs:ip:set_led_matrix_mode"):
+            with self._time("obs:ip:set_led_matrix_mode"):
+                mode = ist.led_matrix_mode
+                if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
                     ic.set_led_matrix_mode(mode)
 
             with self._time("obs:ip:set_channel_intensity"):
                 ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
+            
             with self._time("obs:ip:set_channel_state"):
                 ic.set_channel_state(ist.illumination_channel, ist.on)
 
-            if not ist.on:
-                continue
-            with self._time("obs:ip:get_illumination_config"):
-                illum_config = self.config_repo.get_illumination_config()
-            wavelength = None
-            if illum_config:
-                ch_def = illum_config.get_channel_by_name(ist.illumination_channel)
-                if ch_def:
-                    wavelength = ch_def.wavelength_nm
 
-            if wavelength and self.microscope.addons.nl5 and NL5_USE_DOUT:
-                with self._time("obs:ip:nl5_cellx"):
-                    self.microscope.addons.nl5.set_active_channel(NL5_WAVENLENGTH_MAP[wavelength])
-                    if NL5_USE_AOUT:
-                        self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
-                    if self.microscope.addons.cellx and ENABLE_CELLX:
-                        self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
+            if self.microscope.addons.nl5 and NL5_USE_DOUT:
+                with self._time("obs:ip:get_illumination_config"):
+                    illum_config = self.config_repo.get_illumination_config()
+                wavelength = None
+                if illum_config:
+                    ch_def = illum_config.get_channel_by_name(ist.illumination_channel)
+                    if ch_def:
+                        wavelength = ch_def.wavelength_nm
+
+                if wavelength:
+                    with self._time("obs:ip:nl5_cellx"):
+                        self.microscope.addons.nl5.set_active_channel(NL5_WAVENLENGTH_MAP[wavelength])
+                        if NL5_USE_AOUT:
+                            self.microscope.addons.nl5.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
+                        if self.microscope.addons.cellx and ENABLE_CELLX:
+                            self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
 
     def apply_optical_path(self) -> None:
         """Set emission filter positions and confocal iris values."""

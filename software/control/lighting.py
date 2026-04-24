@@ -176,6 +176,22 @@ class IlluminationDevice(abc.ABC):
         else:
             self.turn_off(channel)
 
+    def set_on_off_state_batch(self, state_map: Dict[str, bool]) -> None:
+        """Apply on/off state to multiple channels, batching the hardware
+        wait. Default implementation iterates ``set_on_off_state`` (no
+        batching). Devices whose backing IO supports coalesced commands
+        (e.g. ``IORoutedIlluminationDevice`` with MCU-port shutters) should
+        override this to issue all commands first and wait once at the end,
+        cutting per-channel-transition round-trips from N to 1.
+        """
+        for ch, is_on in state_map.items():
+            try:
+                self.set_on_off_state(ch, is_on)
+            except Exception as exc:
+                logger.warning(
+                    f"[{self.__class__.__name__}] set_on_off_state_batch('{ch}',{is_on}) failed: {exc}"
+                )
+
     @abc.abstractmethod
     def get_intensity(self, channel: str) -> float:
         """Return last-set intensity for *channel*."""
@@ -271,6 +287,121 @@ class IORoutedIlluminationDevice(IlluminationDevice):
             self._microcontroller.wait_till_operation_is_completed()
         self._write_dac(channel, 0.0)
         self._is_on_state[channel] = False
+
+    def set_on_off_state_batch(self, state_map: Dict[str, bool]) -> None:
+        """Toggle multiple channels with hardware writes coalesced.
+
+        Fast path — when every channel's shutter endpoint is MCU port-kind
+        (``channel_id == "port:N"`` on the same microcontroller that backs
+        this device) AND firmware supports the multi-port API: emit ONE
+        ``set_multi_port_mask(port_mask, on_mask)`` packet covering all
+        channels' state transitions atomically. Off-old + on-new in a single
+        serial command instead of two separate turn_off_port / turn_on_port
+        round-trips. For a 2-channel switch this cuts the shutter portion
+        from ~2 × command-time to ~1 × command-time.
+
+        Slow path — any channel not on MCU port routing (NIDAQ DO, mixed
+        backends, TTL fallback): fall back to per-channel ``set_digital`` /
+        ``turn_on_illumination`` / ``turn_off_illumination`` without
+        per-channel waits, then one wait per unique controller at the end.
+
+        DAC writes: intensity pushed to the DAC BEFORE shutter opens (so the
+        first exposure sees the right level) and zeroed AFTER shutter closes
+        (so we don't back-drive the driver). Same ordering as the per-channel
+        turn_on / turn_off paths.
+        """
+        if not state_map:
+            return
+        # Phase 1: DAC writes for channels turning ON. Cheap (no round-trip wait).
+        for ch, is_on in state_map.items():
+            if is_on and ch in self._channel_endpoints:
+                self._write_dac(ch, self._intensity.get(ch, 0.0))
+
+        # Phase 2: split channels by shutter-routing for fast vs slow path.
+        mcu_port_batch: Dict[int, bool] = {}
+        non_batchable_ops: List[Tuple[Any, bool]] = []  # (shutter_ep, is_on)
+        mcu_fallback_used = False
+        controllers_touched: List[Any] = []
+        controllers_seen: set = set()
+
+        mcu_supports_multi_port = (
+            self._microcontroller is not None
+            and self._microcontroller.supports_multi_port()
+        )
+
+        for ch, is_on in state_map.items():
+            ep_pair = self._channel_endpoints.get(ch)
+            if ep_pair is None:
+                continue
+            _, shutter_ep = ep_pair
+            if shutter_ep is None:
+                # TTL fallback — global on/off, no per-channel selection.
+                if self._microcontroller is not None:
+                    if is_on:
+                        self._microcontroller.turn_on_illumination()
+                    else:
+                        self._microcontroller.turn_off_illumination()
+                    mcu_fallback_used = True
+                continue
+            # Detect MCU port-kind shutter endpoints — those can fold into
+            # a single SET_MULTI_PORT_MASK packet below.
+            port_num: Optional[int] = None
+            if mcu_supports_multi_port:
+                cid = getattr(shutter_ep.endpoint, "channel_id", "") or ""
+                kind, _, num = cid.partition(":")
+                if kind == "port" and num.isdigit():
+                    # Ensure the endpoint's IO controller routes to OUR
+                    # microcontroller (not some other MCU on a multi-MCU
+                    # rig) before batching.
+                    if getattr(shutter_ep.controller, "_mc", None) is self._microcontroller:
+                        port_num = int(num)
+            if port_num is not None:
+                mcu_port_batch[port_num] = is_on
+            else:
+                shutter_ep.set_digital(is_on)
+                if id(shutter_ep.controller) not in controllers_seen:
+                    controllers_seen.add(id(shutter_ep.controller))
+                    controllers_touched.append(shutter_ep.controller)
+                non_batchable_ops.append((shutter_ep, is_on))
+
+        # Emit the single MCU packet for all port-kind shutter transitions.
+        if mcu_port_batch:
+            port_mask = 0
+            on_mask = 0
+            for port, is_on in mcu_port_batch.items():
+                port_mask |= 1 << port
+                if is_on:
+                    on_mask |= 1 << port
+            try:
+                self._microcontroller.set_multi_port_mask(port_mask, on_mask)
+                for port, is_on in mcu_port_batch.items():
+                    self._port_is_on[port] = is_on
+            except Exception as exc:
+                logger.warning(
+                    f"IORouted batch: set_multi_port_mask(0x{port_mask:04x}, 0x{on_mask:04x}) failed: {exc}"
+                )
+
+        # Phase 3: single wait per unique controller (covers port_mask, fallbacks,
+        # and any non-batched set_digital writes queued on the same MCU).
+        for ctrl in controllers_touched:
+            try:
+                ctrl.wait_until_ready()
+            except Exception as exc:
+                logger.warning(f"IORouted batch: wait_until_ready on {ctrl.__class__.__name__} failed: {exc}")
+        if (mcu_port_batch or mcu_fallback_used) and self._microcontroller is not None:
+            try:
+                self._microcontroller.wait_till_operation_is_completed()
+            except Exception as exc:
+                logger.warning(f"IORouted batch: MCU wait_till_operation_is_completed failed: {exc}")
+
+        # Phase 4: DAC zero for channels turning OFF (after shutter closed)
+        # + update per-channel logical state.
+        for ch, is_on in state_map.items():
+            if ch not in self._channel_endpoints:
+                continue
+            if not is_on:
+                self._write_dac(ch, 0.0)
+            self._is_on_state[ch] = is_on
 
     def _write_dac(self, channel: str, intensity: float) -> None:
         """Push *intensity* (0-100, logical) to the channel's analog endpoint."""
@@ -788,7 +919,9 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             )
 
     def turn_on(self, channel: str) -> None:
-        """Activate the LED pattern for *channel*."""
+        """Activate the LED pattern for *channel*. Blocks until the MCU has
+        finished the FastLED.show() pattern write, so callers can trigger the
+        camera immediately on return without exposing through an unlit matrix."""
         if self._unified and channel != self._unified_channel_name:
             logger.warning(f"turn_on: expected unified channel '{self._unified_channel_name}'")
             return
@@ -801,9 +934,12 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             self._sci_array.turn_on_illumination()
         elif self._microcontroller is not None:
             self._microcontroller.turn_on_illumination()
+            self._microcontroller.wait_till_operation_is_completed()
 
     def turn_off(self, channel: str) -> None:
-        """Deactivate LED illumination."""
+        """Deactivate LED illumination. Blocks until the MCU finishes
+        clear_matrix() + FastLED.show() so the next channel's camera trigger
+        doesn't expose through a still-lit matrix."""
         if self._unified and channel != self._unified_channel_name:
             logger.warning(f"turn_off: expected unified channel '{self._unified_channel_name}'")
             return
@@ -811,6 +947,7 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             self._sci_array.turn_off_illumination()
         elif self._microcontroller is not None:
             self._microcontroller.turn_off_illumination()
+            self._microcontroller.wait_till_operation_is_completed()
         self._is_on_state[self._unified_channel_name if self._unified else channel] = False
 
     def get_intensity(self, channel: str) -> float:
@@ -1086,24 +1223,36 @@ class IlluminationController:
         Only channels currently tracked as asserted in ``_hardware_asserted`` are
         commanded off — every ``set_channel_state`` update maintains that flag,
         so it is the authoritative record of which channels are actually driving
-        hardware. Iterating only those avoids paying per-channel serial/MCU
-        round-trips for channels that were never on (during multipoint
-        acquisition with one active channel per FOV, this collapses from
-        O(num channels) to O(1)).
+        hardware.
+
+        Batched per device: all asserted channels on the same IlluminationDevice
+        are handed to ``dev.set_on_off_state_batch`` in one call, which (for
+        backends that support it, e.g. :class:`IORoutedIlluminationDevice`)
+        coalesces the shutter / TTL commands into a single MCU round-trip
+        instead of paying one wait per channel. The per-device ``_is_on_state``
+        is still updated inside the batch call — we intentionally don't touch
+        the higher-level ``_channel_state`` (that's the "preserve logical
+        state" semantic).
         """
+        by_device: Dict[int, Tuple[IlluminationDevice, Dict[str, bool]]] = {}
         for ch, asserted in list(self._hardware_asserted.items()):
             if not asserted:
                 continue
             dev = self._channel_map.get(ch)
-            if dev is not None:
-                try:
-                    dev.turn_off(ch)
-                except Exception as exc:
-                    logger.warning(
-                        f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} "
-                        f"channel '{ch}' failed: {exc}"
-                    )
-            self._hardware_asserted[ch] = False
+            if dev is None:
+                continue
+            by_device.setdefault(id(dev), (dev, {}))[1][ch] = False
+
+        for _dev_id, (dev, ch_map) in by_device.items():
+            try:
+                dev.set_on_off_state_batch(ch_map)
+            except Exception as exc:
+                logger.warning(
+                    f"turn_off_all_hardware_preserving_state on {dev.__class__.__name__} "
+                    f"channels {list(ch_map.keys())} failed: {exc}"
+                )
+            for ch in ch_map:
+                self._hardware_asserted[ch] = False
 
     def set_channel_state(self, channel_name: str, is_on: bool, force_hardware: bool = False) -> None:
         """Set the on/off state for a named channel.
@@ -1140,6 +1289,74 @@ class IlluminationController:
                 return
             dev.set_on_off_state(channel_name, is_on)
             self._hardware_asserted[channel_name] = is_on
+
+    def set_channel_states_batch(
+        self,
+        state_map: Dict[str, bool],
+        *,
+        force_hardware: bool = False,
+    ) -> None:
+        """Apply on/off state for many channels with hardware waits coalesced.
+
+        Logical state is always updated. Hardware is commanded only for
+        channels whose ``_hardware_asserted`` cache doesn't already match the
+        target (same short-circuit as the per-channel ``set_channel_state``),
+        and only when ``force_hardware`` is True or streaming is active.
+
+        For devices that implement ``set_on_off_state_batch`` (e.g.
+        :class:`IORoutedIlluminationDevice`) the cache-miss channels belonging
+        to one device are handed to that method in a single call so the device
+        can queue all shutter / TTL writes before a single wait. For devices
+        without a batched path, falls back to per-channel
+        ``set_on_off_state``.
+
+        LED-matrix alias channels are resolved to their unified name the same
+        way as ``set_channel_state`` and share one entry in ``_hardware_asserted``.
+        """
+        if not state_map:
+            return
+        apply_hw = force_hardware or self._streaming_active
+
+        # Update logical state for every entry (resolves LED-matrix aliases).
+        resolved_targets: Dict[str, bool] = {}
+        for channel_name, is_on in state_map.items():
+            lm = self._resolve_led_matrix_channel(channel_name)
+            if lm is not None:
+                unified_name, _mode_key = lm
+                self._channel_state[unified_name].is_on = is_on
+                resolved_targets[unified_name] = is_on
+            else:
+                self._channel_state[channel_name].is_on = is_on
+                resolved_targets[channel_name] = is_on
+
+        if not apply_hw:
+            return
+
+        # Group cache-miss channels by backing device instance.
+        by_device: Dict[int, Tuple[IlluminationDevice, Dict[str, bool]]] = {}
+        for ch, is_on in resolved_targets.items():
+            if self._hardware_asserted.get(ch) == is_on:
+                continue  # hardware already in desired state
+            dev = self._channel_map.get(ch)
+            if dev is None:
+                logger.warning(f"set_channel_states_batch: unknown channel '{ch}'")
+                continue
+            slot = by_device.setdefault(id(dev), (dev, {}))
+            slot[1][ch] = is_on
+
+        # One batched call per device.
+        for _dev_id, (dev, ch_map) in by_device.items():
+            try:
+                dev.set_on_off_state_batch(ch_map)
+            except Exception:
+                logger.exception(
+                    f"set_channel_states_batch: {dev.__class__.__name__}.set_on_off_state_batch failed"
+                )
+                continue
+            # Cache update mirrors set_channel_state: record what we sent to
+            # hardware, so subsequent cache checks short-circuit correctly.
+            for ch, is_on in ch_map.items():
+                self._hardware_asserted[ch] = is_on
 
     def turn_off_all(self, *, preserve_logical_state: bool = False) -> None:
         """Turn off all channels on all devices.

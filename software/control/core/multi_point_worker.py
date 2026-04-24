@@ -229,6 +229,10 @@ class MultiPointWorker:
         # parallel with in-flight motion.
         self._pending_move_settle: bool = False
         self._pending_move_stabilization_s: float = 0.0
+        # ObservationState preset cache — populated during prewarm, consulted by
+        # _apply_observation_state. Avoids re-parsing the same YAML 27+ times
+        # during a multipoint scan (2 presets × 27 FOVs = 54 redundant loads).
+        self._observation_preset_cache: Dict[str, ObservationState] = {}
         # This is protected by the threading event above (aka set after clear, take copy before set)
         self._current_capture_info: Optional[CaptureInfo] = None
         self._last_illumination_config_name: Optional[str] = None
@@ -536,14 +540,14 @@ class MultiPointWorker:
         return self.region_observation_state_map.get(region_id, self.observation_state_names)
 
     def _apply_observation_state(self, preset_name: str) -> ObservationState:
-        repo = self.microscope.config_repo
-        with self._timing.get_timer("load_observation_preset"):
-            state = repo.load_observation_preset(preset_name)
+        state = self._observation_preset_cache.get(preset_name)
         if state is None:
-            raise ValueError(f"observation state not found: {preset_name!r}")
+            with self._timing.get_timer("load_observation_preset"):
+                state = self.microscope.config_repo.load_observation_preset(preset_name)
+            if state is None:
+                raise ValueError(f"observation state not found: {preset_name!r}")
+            self._observation_preset_cache[preset_name] = state
         with self._timing.get_timer("apply_observation_state_to_hardware"):
-            # self._log.info(f"Applying observation state preset '{preset_name}' to hardware")
-            # self._log.info(str(state))
             self.liveController.obs_controller.apply_observation_state_preset(
                 state,
                 emission_filter_wheel=self._emission_filter_wheel,
@@ -552,7 +556,13 @@ class MultiPointWorker:
         return state
 
     def _apply_current_illumination_state_to_hardware(self) -> None:
-        """Assert the illumination controller's current logical on/off state on hardware."""
+        """Assert the illumination controller's current logical on/off state on hardware.
+
+        Uses the batched path (``set_channel_states_batch``) when available so
+        the shutter off→on transition between two channels on the same MCU is
+        a single ``wait_till_operation_is_completed`` rather than one wait per
+        channel — cuts per-capture cost from ~2× MCU round-trip to ~1×.
+        """
         ic = self.microscope.illumination_controller
         with self._timing.get_timer("get_shutter_state"):
             try:
@@ -561,11 +571,10 @@ class MultiPointWorker:
                 self._log.warning("Could not read illumination logical state for capture: %s", e)
                 return
         with self._timing.get_timer("apply_shutter_state_to_hardware"):
-            for name, is_on in logical_states.items():
-                try:
-                    ic.set_channel_state(name, is_on, force_hardware=True)
-                except Exception as e:
-                    self._log.warning("Could not apply illumination state for %r: %s", name, e)
+            try:
+                ic.set_channel_states_batch(logical_states, force_hardware=True)
+            except Exception as e:
+                self._log.warning("Could not apply illumination state batch: %s", e)
 
     def _turn_off_capture_illumination_preserving_logical_state(self) -> None:
         """Clear hardware illumination after a snap without losing the saved logical state."""
@@ -587,6 +596,11 @@ class MultiPointWorker:
         laser_af = self.laser_auto_focus_controller
         if laser_af is not None:
             laser_af._timing = self._timing
+        # Same wiring for the NIDAQ so send_edge_pulse's sub-segments
+        # (lock acquire vs. DAQmx write, per edge) show up in the report.
+        nidaq = getattr(self.microscope.addons, "nidaq", None)
+        if nidaq is not None and hasattr(nidaq, "_timing"):
+            nidaq._timing = self._timing
         try:
             first_region, first_region_coords = list(self.scan_region_fov_coords_mm.items())[0]
             first_coords_mm = first_region_coords[0]
@@ -705,12 +719,15 @@ class MultiPointWorker:
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
             self._log.info(self._timing.get_report())
+            self._log.info(self._timing.get_report(sort=True))
             # Detach the timing manager from the obs controller so live-mode
             # calls from widgets don't keep writing into the acquisition's
             # timing report.
             obs_controller._timing = None
             if laser_af is not None:
                 laser_af._timing = None
+            if nidaq is not None and hasattr(nidaq, "_timing"):
+                nidaq._timing = None
             if this_image_callback_id:
                 self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
                 self.camera.remove_frame_callback(this_image_callback_id)
@@ -881,7 +898,8 @@ class MultiPointWorker:
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                self.initialize_z_stack()
+                if self.NZ > 1:
+                    self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
                 self.run_coordinate_acquisition(current_path)
@@ -1489,10 +1507,77 @@ class MultiPointWorker:
         if self._downsampled_view_manager is not None:
             self._downsampled_view_manager.save_plate_view(path)
 
+    def _prewarm_observation_states(self) -> None:
+        """Apply each distinct observation state preset once outside the
+        FOV loop so the one-time mode-switch / init costs land in an
+        ``init:prewarm_observation_states`` timer instead of polluting
+        per-capture stats.
+
+        Suppresses the observation-state controller's own sub-timers
+        (``obs:cls:*`` / ``obs:preset:*``) during prewarm by temporarily
+        detaching ``obs_controller._timing`` — those are no-ops when
+        ``_timing`` is None (see ObservationStateController._time). After
+        the main scan loop runs, those sub-timers' ``max`` values reflect
+        real per-capture work, not the one-off init spike.
+        """
+        if not self.observation_state_names:
+            return
+        obs_controller = self.liveController.obs_controller
+        repo = self.microscope.config_repo
+
+        # Determine which presets are actually used by this acquisition.
+        # (Skip presets that are referenced but inactive for every region.)
+        active_states_union: set = set()
+        for region_id in self.scan_region_fov_coords_mm:
+            active_states_union |= set(self._get_observation_states_for_region(region_id))
+        to_warm = [name for name in self.observation_state_names if name in active_states_union]
+        if not to_warm:
+            return
+
+        with self._timing.get_timer("init:prewarm_observation_states"):
+            saved_obs_timing = obs_controller._timing
+            obs_controller._timing = None  # suppress sub-timer noise during prewarm
+            try:
+                seen: set = set()
+                for preset_name in to_warm:
+                    if preset_name in seen:
+                        continue
+                    seen.add(preset_name)
+                    try:
+                        state = repo.load_observation_preset(preset_name)
+                        if state is None:
+                            continue
+                        # Cache so _apply_observation_state can skip the YAML
+                        # load on every FOV (~2.3 ms/capture × 54 captures ≈ 120 ms saved).
+                        self._observation_preset_cache[preset_name] = state
+                        obs_controller.apply_observation_state_preset(
+                            state,
+                            emission_filter_wheel=self._emission_filter_wheel,
+                            apply_live_trigger_settings=False,
+                        )
+                    except Exception as exc:
+                        # Prewarm is an optimization, not a correctness step —
+                        # log and keep going; the actual apply in the FOV loop
+                        # will surface any real issue.
+                        self._log.warning(
+                            "Prewarm of observation state %r failed (non-fatal): %s",
+                            preset_name, exc,
+                        )
+            finally:
+                obs_controller._timing = saved_obs_timing
+
     def run_coordinate_acquisition(self, current_path):
         # Reset backpressure counters at acquisition start
         # IMPORTANT: Must be before any camera triggers
         self._backpressure.reset()
+
+        # Pre-warm every distinct observation state preset once BEFORE the
+        # FOV loop. Absorbs the first-call one-off costs (most notably the
+        # ~1 s GenICam SensorOperationMode write + Cap_Start that
+        # set_camera_mode pays the first time it actually switches modes)
+        # into a dedicated init timer instead of polluting the first FOV's
+        # per-capture stats. Amortizes to ~zero over long runs.
+        self._prewarm_observation_states()
 
         n_regions = len(self.scan_region_coords_mm)
 
@@ -1528,12 +1613,6 @@ class MultiPointWorker:
                     return
 
     def acquire_at_position(self, region_id, current_path, fov):
-        with self._timing.get_timer("perform_autofocus"):
-            if not self.perform_autofocus(region_id, fov):
-                self._log.error(
-                    f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
-                )
-
         if self.NZ > 1:
             self.prepare_z_stack()
 
@@ -1547,14 +1626,11 @@ class MultiPointWorker:
             metadata = {"x": acquire_pos.x_mm, "y": acquire_pos.y_mm, "z": acquire_pos.z_mm}
             self._log.info(f"Acquiring image: ID={file_ID}, Metadata={metadata}")
 
+            # TBD: figure out what this means and how it relates to autofocus
             if z_level == 0 and (self.do_reflection_af or self.do_autofocus) and self.Nt > 1:
                 self._z_pos_proposal[(region_id, fov)] = acquire_pos.z_mm
 
-            # laser af characterization mode
-            if self.laser_auto_focus_controller and self.laser_auto_focus_controller.characterization_mode:
-                image = self.laser_auto_focus_controller.get_image()
-                saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
-                iio.imwrite(saving_path, image)
+
 
             current_round_images = {}
             # Get the active observation states for this region (may be a subset)
@@ -1575,6 +1651,20 @@ class MultiPointWorker:
                         return
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
+
+                    if z_level == 0 and config_idx == 0:
+                        with self._timing.get_timer("perform_autofocus"):
+                            if not self.perform_autofocus(region_id, fov):
+                                self._log.error(
+                                    f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+                                )
+
+                        # laser af characterization mode
+                        if self.laser_auto_focus_controller and self.laser_auto_focus_controller.characterization_mode:
+                            image = self.laser_auto_focus_controller.get_image()
+                            saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
+                            iio.imwrite(saving_path, image)
+
 
                     with self._timing.get_timer("acquire_camera_image"):
                         if "RGB" in config.name:
@@ -2291,13 +2381,6 @@ class MultiPointWorker:
         #     k,
         # )
         if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
-            # Phase F: if an async stage move is still in flight (common at
-            # the first capture of a new FOV — we skipped the blocking wait
-            # in move_to_coordinate so apply_observation_state and
-            # illuminate_for_capture could run in parallel with motion),
-            # join it now. For subsequent captures at the same FOV this is
-            # a no-op since the wait already cleared the flag.
-            self._wait_for_move_settled()
             # Block until the camera reports it's ready for the next trigger
             # before we actually send one. _ready_for_next_trigger above is a
             # worker-side flag set by _image_callback — it tells us the previous
@@ -2321,6 +2404,14 @@ class MultiPointWorker:
             # Reset per-capture timestamps before trigger so stale values from
             # the previous capture can't contaminate the sub-timer breakdown.
             self._capture_ts = {}
+            # Phase F: if an async stage move is still in flight (common at
+            # the first capture of a new FOV — we skipped the blocking wait
+            # in move_to_coordinate so apply_observation_state and
+            # illuminate_for_capture could run in parallel with motion),
+            # join it now. For subsequent captures at the same FOV this is
+            # a no-op since the wait already cleared the flag.
+            self._wait_for_move_settled()
+
             with self._timing.get_timer("send_trigger"):
                 self.camera.send_trigger(illumination_time=camera_illumination_time)
             self._capture_ts["post_trigger"] = time.perf_counter()
