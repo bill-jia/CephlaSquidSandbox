@@ -577,6 +577,13 @@ class TimingManager:
             self._log.debug(f"Stopping name={self._name} with elapsed={this_pair.elapsed()} [s]")
             self._last_start = None
 
+        def record(self, start: float, stop: float):
+            """Record a pre-measured interval without using the context manager.
+            For cross-thread timings where start/stop are captured by different
+            code paths (e.g. SDK callbacks feeding the worker's timer report).
+            """
+            self._timing_pairs.append(TimingManager.TimingPair(start, stop))
+
         def get_intervals(self):
             return [tp.elapsed() for tp in self._timing_pairs]
 

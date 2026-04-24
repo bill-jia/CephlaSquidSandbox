@@ -13,6 +13,7 @@ parameter interface than native TUCam models.
 
 from ctypes import *
 import numpy as np
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -418,6 +419,44 @@ class TucsenCamera(AbstractCamera):
         self._fast_acq_buffer_callback_obj: Optional[TucsenCameraCallBack] = None
         self._fast_acq_buffer_callback_fn = None
         self._byte_decoding_fn = None
+
+        # Trigger-mode SDK callback delivery. When start_streaming enters a
+        # gated trigger capture mode (TUCCM_TRIGGER_STANDARD), the SDK's
+        # TUCAM_Buf_WaitForFrame thread-polling path does not return frames
+        # on the Aries — we have to dequeue via TUCAM_Buf_DataCallBack
+        # instead (same mechanism fast acquisition uses). These refs are
+        # kept alive across frames so the ctypes callback isn't GC'd.
+        self._trigger_cb_obj: Optional[TucsenCameraCallBack] = None
+        self._trigger_cb_fn = None
+        self._trigger_cb_user = None
+        # Deferred-decode infrastructure for the SDK-callback path. The SDK
+        # thread enqueues raw bytes; a dedicated decode thread unpacks (cms12 /
+        # hs11 / hdr16), runs _process_raw_frame, and fires _propogate_frame.
+        # This keeps Python-side decode off the acquisition-pacing critical
+        # path — the worker can issue the next trigger as soon as the SDK
+        # frame-arrived callback fires, in parallel with decoding the previous.
+        # Bounded queue protects against runaway memory if the worker outpaces
+        # decode (shouldn't happen in steady state, but worth the ceiling).
+        self._decode_queue: "queue.Queue[Optional[dict]]" = queue.Queue(maxsize=16)
+        self._decode_thread: Optional[threading.Thread] = None
+        self._decode_thread_stop = threading.Event()
+        # Callbacks fired (fast, SDK thread) the instant frame bytes arrive —
+        # before decode. Used by the multipoint worker to start the next
+        # trigger's illumination / settle / trigger work while decode is in
+        # flight on the background thread.
+        self._frame_arrived_callbacks: List[Callable[[int], None]] = []
+        # Next frame_id to assign on the SDK thread, so frame_arrived callbacks
+        # and the eventual CameraFrame agree. Tracked here (not on
+        # _current_frame) because _current_frame is only updated after decode.
+        self._next_frame_id: int = 1
+        # Per-capture timing breakdown populated by _on_sdk_trigger_frame and
+        # _wait_for_frame for cross-thread diagnostic reporting. Keys:
+        #   'sdk_entry'        — first line of the SDK callback / read-thread read
+        #   'sdk_decoded'      — after decode + _process_raw_frame + CameraFrame build
+        #   'sdk_cleared'      — after clearing _trigger_sent, before _propogate_frame
+        # Reader (the multipoint worker) snapshots these after its wait returns,
+        # so a half-written dict during concurrent callbacks is tolerable.
+        self._last_capture_ts: Dict[str, float] = {}
         # ROI captured at the start of fast acquisition. Restored in
         # stop_fast_acquisition_frame_grabbing after the vendor close/reopen
         # so the user is returned to the live ROI they had before, instead
@@ -471,7 +510,10 @@ class TucsenCamera(AbstractCamera):
         # set_exposure_time to compensate when the LED is pulsed by the microcontroller
         # synchronously with the sensor's global co-exposure window (real HARDWARE_TRIGGER
         # path only — the virtualized path drives the LED steady-on via the worker).
-        self._strobe_delay_ms: float = 0.0
+        
+        self._strobe_delay_ms: float = 11.4
+        # self._strobe_delay_ms: float = 0.0
+
         self._rolling_shutter_readout_ms: float = 0.0
         self.temperature_reading_callback = None
         # GenICam writes need ≥100 ms between them or the camera returns errors.
@@ -486,7 +528,57 @@ class TucsenCamera(AbstractCamera):
             else 20.0
         )
 
+        initial_camera_mode_enum = self._camera_mode
+        initial_exposure_time_ms = self._exposure_time_ms
+
         self._configure_camera()
+
+        # _configure_camera nulled the mode/exposure caches. Re-establish them
+        # through the public setters so the Python cache and the hardware
+        # register stay in lockstep end-to-end.
+        self._re_apply_camera_mode_and_exposure(
+            camera_mode_enum=initial_camera_mode_enum,
+            exposure_time_ms=initial_exposure_time_ms,
+        )
+
+    def _re_apply_camera_mode_and_exposure(
+        self,
+        camera_mode_enum,
+        exposure_time_ms: Optional[float],
+    ) -> None:
+        """Re-install camera mode and exposure time after _configure_camera
+        invalidates their caches. Used by __init__ after the first configure,
+        and by the reopen helper after the vendor close+reopen.
+
+        camera_mode goes through set_camera_mode (which writes hardware +
+        updates cache together). Models without a TUCSEN_CAMERA_MODES entry
+        (e.g. Libra today) have no public mode names to pass to set_camera_mode,
+        so they fall back to a direct cache assignment — same behavior those
+        models had before this refactor.
+
+        exposure_time is either the passed-in value (if known) or a hardware
+        read. Either way it goes through set_exposure_time so the write is
+        explicit and the cache path matches the rest of the code.
+        """
+        modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
+        mode_name = None
+        if modes is not None and camera_mode_enum is not None:
+            for name, (enum_val, _spec) in modes.items():
+                if enum_val == camera_mode_enum:
+                    mode_name = name
+                    break
+        if mode_name is not None:
+            self.set_camera_mode(mode_name)
+        elif camera_mode_enum is not None:
+            # Models with no TUCSEN_CAMERA_MODES entry — keep historical behavior.
+            self._camera_mode = camera_mode_enum
+
+        if exposure_time_ms is None:
+            if self._model_properties.is_genicam:
+                exposure_time_ms = self._get_genicam_parameter("ExposureTime")["value"] / 1000.0
+            else:
+                exposure_time_ms = 20.0
+        self.set_exposure_time(exposure_time_ms)
 
     @staticmethod
     def _get_model_properties(camera_model: TucsenCameraModel) -> TucsenModelProperties:
@@ -627,11 +719,21 @@ class TucsenCamera(AbstractCamera):
         self.get_region_of_interest(force_update=True)
         self.set_binning(*self._config.default_binning)
         self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
-        
 
         self._terminate_temperature_event = threading.Event()
         self.temperature_reading_thread = threading.Thread(target=self._check_temperature, daemon=True)
         self.temperature_reading_thread.start()
+
+        # _configure_camera does NOT push camera mode or exposure time to
+        # hardware — the sensor's SensorOperationMode and ExposureTime registers
+        # sit at factory default on fresh open, and get reset to factory default
+        # on the close+reopen vendor workaround. Invalidate the Python cache for
+        # these two so downstream set_camera_mode / set_exposure_time calls can't
+        # short-circuit on a stale cache match. Callers (__init__, the reopen
+        # helper) are expected to re-apply both via the public setters before
+        # anything else uses them.
+        self._camera_mode = None
+        self._exposure_time_ms = None
 
     # =========================================================================
     # Streaming Control
@@ -642,18 +744,66 @@ class TucsenCamera(AbstractCamera):
             self._log.debug("Already streaming, start_streaming is noop")
             return
 
+        trigger_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+
+        # In gated trigger capture modes (TUCCM_TRIGGER_STANDARD, used by
+        # virtualized SW trigger and real hardware trigger), the SDK's
+        # TUCAM_Buf_WaitForFrame path does not deliver frames on the Aries —
+        # triggered frames only come out through the DataCallBack.
+        use_sdk_callback = self._uses_sdk_buffer_callback(trigger_mode)
+
+        # SDK-callback cleanup is deferred from stop_streaming to here, so
+        # pause_streaming cycles that stay within callback mode (e.g., the
+        # stop/start sandwich inside set_camera_mode during multipoint) avoid
+        # the full close+reopen. Only reopen when we're actually transitioning
+        # OUT of callback mode into a mode where the stale C callback pointer
+        # would fire on frames we didn't expect to come through that path.
+        if self._trigger_cb_obj is not None and not use_sdk_callback:
+            self._log.info(
+                "Tucsen: resetting SDK state before entering non-callback mode"
+            )
+            # Drain any in-flight decoded work before the reopen.
+            self._stop_decode_thread()
+            if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+                self._log.warning(
+                    "TUCAM_Buf_Release failed during callback→non-callback transition"
+                )
+            self._m_frame = None
+            self._uninstall_trigger_buffer_callback()
+            self._reopen_camera_to_reset_sdk_state()
+
         if self._m_frame is None:
             self._allocate_buffer()
 
-        trigger_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+        # Always re-register when entering callback mode — TUCAM_Buf_DataCallBack
+        # overwrites the SDK's stored pointer with our freshly-built refs, so
+        # re-installing across stop/start cycles keeps the C pointer pointing
+        # at live Python objects even though we skipped the reopen in
+        # stop_streaming.
+        # Frame IDs restart on every fresh streaming session so the worker's
+        # frame_id ↔ CaptureInfo dict doesn't collide across runs. Applies to
+        # both SDK-callback and thread-poll paths since both fire
+        # _frame_arrived_callbacks keyed by frame_id.
+        self._next_frame_id = 1
+        if use_sdk_callback:
+            self._install_trigger_buffer_callback()
+            self._start_decode_thread()
+
         if TUCAM_Cap_Start(self._camera, trigger_mode) != TUCAMRET.TUCAMRET_SUCCESS:
             TUCAM_Buf_Release(self._camera)
+            if use_sdk_callback:
+                self._uninstall_trigger_buffer_callback()
             raise CameraError("Failed to start streaming")
-        self._log.info(f"Starting streaming with camera mode: {self.get_camera_mode()}, acquisition mode: {self.get_acquisition_mode()}, trigger mode: {trigger_mode}")
+        self._log.info(
+            f"Starting streaming with camera mode: {self.get_camera_mode()}, "
+            f"acquisition mode: {self.get_acquisition_mode()}, trigger mode: {trigger_mode} "
+            f"(frame delivery: {'SDK callback' if use_sdk_callback else 'WaitForFrame thread'})"
+        )
         self._update_internal_settings()
 
-
-        self._ensure_read_thread_running()
+        if not use_sdk_callback:
+            # Thread-polling path works for TUCCM_SEQUENCE (continuous) modes.
+            self._ensure_read_thread_running()
 
         self._trigger_sent.clear()
         self._frames_received_since_start = 0
@@ -663,6 +813,271 @@ class TucsenCamera(AbstractCamera):
             f"TUCam Camera starts streaming in camera mode: {self.get_camera_mode()}, "
             f"max acquisition rate: {self._max_acquisition_rate_hz} Hz"
         )
+
+    def _uses_sdk_buffer_callback(self, trigger_mode: int) -> bool:
+        """True when frames must be delivered via TUCAM_Buf_DataCallBack
+        (gated trigger modes on GenICam Aries), not the WaitForFrame thread.
+        """
+        if not self._model_properties.is_genicam:
+            return False
+        return trigger_mode in (
+            TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD.value,
+            TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_STANDARD_NONOVERLAP.value,
+        )
+
+    def add_frame_arrived_callback(self, fn: Callable[[int], None]) -> None:
+        """Register a callback fired on the camera's frame-delivery thread
+        AS SOON AS raw bytes arrive — BEFORE Python-side decode.
+
+        The callback receives the frame_id that will be assigned to the
+        eventual CameraFrame. Keep the callback fast (set an event, snapshot
+        state). It runs synchronously on the SDK callback thread in deferred-
+        decode mode, or on the read thread in thread-poll mode.
+
+        Intended for the multipoint worker's pacing: set _ready_for_next_trigger
+        here so the worker can start the next capture in parallel with the
+        still-running decode + job dispatch for this frame.
+        """
+        self._frame_arrived_callbacks.append(fn)
+
+    def _fire_frame_arrived_callbacks(self, frame_id: int) -> None:
+        for cb in self._frame_arrived_callbacks:
+            try:
+                cb(frame_id)
+            except Exception:
+                self._log.exception("frame-arrived callback raised")
+
+    def _start_decode_thread(self) -> None:
+        """Start the background decoder that drains _decode_queue and fires
+        _propogate_frame once each frame's CameraFrame is built. Idempotent.
+        Called from start_streaming when entering SDK-callback mode.
+        """
+        if self._decode_thread is not None and self._decode_thread.is_alive():
+            return
+        self._decode_thread_stop.clear()
+        self._decode_thread = threading.Thread(
+            target=self._decode_loop,
+            daemon=True,
+            name="TucsenDecodeLoop",
+        )
+        self._decode_thread.start()
+
+    def _stop_decode_thread(self, drain_timeout_s: float = 2.0) -> None:
+        """Signal the decode thread to exit and join it. Called when leaving
+        SDK-callback mode (via the reopen path in start_streaming) and on
+        camera close.
+        """
+        if self._decode_thread is None:
+            return
+        self._decode_thread_stop.set()
+        # Wake the thread if it's blocked on queue.get.
+        try:
+            self._decode_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._decode_thread.join(timeout=drain_timeout_s)
+        if self._decode_thread.is_alive():
+            self._log.warning("Tucsen decode thread refused to exit within %.1fs", drain_timeout_s)
+        self._decode_thread = None
+        # Discard any items still queued — they were for frames whose
+        # acquisition is already over.
+        try:
+            while True:
+                self._decode_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _decode_loop(self) -> None:
+        while not self._decode_thread_stop.is_set():
+            try:
+                item = self._decode_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                continue
+            try:
+                self._decode_and_propogate(item)
+            except Exception:
+                self._log.exception("Tucsen decode loop: item processing failed")
+
+    def _decode_and_propogate(self, item: dict) -> None:
+        frame_bytes: bytes = item["frame_bytes"]
+        height: int = item["height"]
+        width: int = item["width"]
+        frame_id: int = item["frame_id"]
+
+        decoder = self._byte_decoding_fn
+        if decoder is None:
+            self._log.error("decode: _byte_decoding_fn is None, dropping frame %d", frame_id)
+            return
+        packing = camera_mode_name_to_packing(self.get_camera_mode())
+        min_bytes = max_frame_bytes_for_tucsen_mode(height, width, packing)
+        if len(frame_bytes) < min_bytes:
+            self._log.error(
+                "decode: frame %d bytes=%d < expected %d (%dx%d packing=%s)",
+                frame_id, len(frame_bytes), min_bytes, width, height, packing,
+            )
+            return
+
+        image_np = decoder(frame_bytes, {"height": height, "width": width})
+        processed = self._process_raw_frame(image_np)
+        sdk_decoded = time.perf_counter()
+
+        camera_frame = CameraFrame(
+            frame_id=frame_id,
+            timestamp=time.time(),
+            frame=processed,
+            frame_format=self.get_frame_format(),
+            frame_pixel_format=self.get_pixel_format(),
+        )
+        with self._frame_lock:
+            self._current_frame = camera_frame
+        self._frames_received_since_start += 1
+        # Update the timing dict written by _on_sdk_trigger_frame so the
+        # worker's sub-timer report picks up the decoded timestamp.
+        self._last_capture_ts["sdk_decoded"] = sdk_decoded
+        self._log.debug(
+            "Tucsen decoded frame %d (%dx%d), total_received=%d",
+            frame_id, width, height, self._frames_received_since_start,
+        )
+        self._propogate_frame(camera_frame)
+
+    def _install_trigger_buffer_callback(self) -> None:
+        """Register TUCAM_Buf_DataCallBack with a handler that converts the
+        raw-bytes frame the SDK hands us into a CameraFrame and routes it
+        through _propogate_frame — same pipeline the WaitForFrame thread uses.
+
+        Refs are stored on self so the ctypes callback isn't GC'd mid-stream.
+        """
+        self._trigger_cb_obj = TucsenCameraCallBack(
+            self._camera, self._on_sdk_trigger_frame, log=self._log
+        )
+        self._trigger_cb_fn = BUFFER_CALLBACK(self._trigger_cb_obj.OnCallbackBuffer)
+        self._trigger_cb_user = CONTEXT_CALLBACK(self._trigger_cb_obj.__class__)
+        TUCAM_Buf_DataCallBack(self._camera, self._trigger_cb_fn, self._trigger_cb_user)
+        self._log.debug("Tucsen: installed SDK buffer callback for trigger-mode frame delivery")
+
+    def _uninstall_trigger_buffer_callback(self) -> None:
+        """Drop Python refs to the SDK-callback wrappers so ctypes can GC them.
+
+        IMPORTANT: the TUCam SDK exposes no unregister for TUCAM_Buf_DataCallBack —
+        once installed, the SDK keeps the raw C function pointer across Cap_Stop.
+        Dropping the Python refs without resetting the SDK side leaves a dangling
+        pointer; any subsequent Cap_Start (even in a different mode) can invoke
+        it and segfault. Only call this AFTER the SDK state has been reset via
+        _reopen_camera_to_reset_sdk_state (device close+reopen).
+        """
+        self._trigger_cb_obj = None
+        self._trigger_cb_fn = None
+        self._trigger_cb_user = None
+
+    def _reopen_camera_to_reset_sdk_state(self) -> None:
+        """Vendor SDK workaround: close and reopen the camera to reset internal
+        state. The only reliable way to invalidate a previously-registered
+        TUCAM_Buf_DataCallBack pointer (no SDK unregister API) and to release
+        any buffer bound to the old capture mode. Used by stop_streaming after
+        callback-mode capture and by stop_fast_acquisition_frame_grabbing.
+
+        To be transparent to callers, snapshots and restores every piece of
+        caller-observable camera configuration across the reopen:
+        ROI, binning, camera mode, exposure time, acquisition mode. Each is
+        restored via the public setter so Python cache and hardware register
+        are written together.
+        """
+        roi_to_restore = self._region_of_interest
+        binning_to_restore = self._binning
+        camera_mode_enum_to_restore = self._camera_mode
+        exposure_to_restore = self._exposure_time_ms
+        acq_mode_to_restore = self._acquisition_mode
+
+        if self.temperature_reading_thread is not None:
+            self._terminate_temperature_event.set()
+            self.temperature_reading_thread.join()
+            self.temperature_reading_thread = None
+
+        if TUCAM_Dev_Close(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            raise CameraError("Failed to close camera for SDK reset")
+        self._log.info("Closed camera for SDK reset")
+        TUCAM_Api_Uninit()
+        time.sleep(1.0)
+        self._camera = TucsenCamera._open(index=0)
+        if self._camera is None:
+            raise CameraError("Failed to reopen camera after SDK reset")
+        self._configure_camera()
+
+        # Restore caller-visible state. Camera mode goes first: set_binning
+        # and set_acquisition_mode both trigger _update_internal_settings →
+        # _calculate_strobe_delay, which needs a valid _camera_mode. After
+        # _configure_camera the mode cache is None (intentionally — see end
+        # of _configure_camera), so restoring it first re-populates before
+        # the other setters run their internal-settings hook.
+        self._re_apply_camera_mode_and_exposure(
+            camera_mode_enum=camera_mode_enum_to_restore,
+            exposure_time_ms=exposure_to_restore,
+        )
+        if binning_to_restore is not None:
+            self.set_binning(*binning_to_restore)
+        if acq_mode_to_restore is not None:
+            self.set_acquisition_mode(acq_mode_to_restore)
+        if roi_to_restore is not None:
+            self.set_region_of_interest(*roi_to_restore)
+
+    def _on_sdk_trigger_frame(self, frame_bytes: bytes, metadata: dict) -> None:
+        """Handler for TUCAM_Buf_DataCallBack in trigger capture mode.
+
+        Unlike TUCAM_Buf_WaitForFrame, the DataCallBack hands us the raw
+        packed bytes straight from the sensor (hdr16 / cms12 / hs11 depending
+        on camera mode) — not pre-unpacked uint16. We route through
+        self._byte_decoding_fn (the same closure fast acquisition uses, built
+        by _update_internal_settings) so the unpack matches the current
+        observation-state camera mode. Then run the same post-processing the
+        thread path uses (rotate/flip/crop via _process_raw_frame), wrap in
+        a CameraFrame, and propagate to registered callbacks.
+        """
+        sdk_entry = time.perf_counter()
+        try:
+            height = int(metadata.get("height", 0)) if metadata else 0
+            width = int(metadata.get("width", 0)) if metadata else 0
+            if height <= 0 or width <= 0:
+                self._log.error(f"SDK trigger frame: invalid dims in metadata={metadata}")
+                return
+
+            # Fast path only: assign frame_id, clear trigger flag, notify the
+            # worker that a frame arrived (so it can issue the next trigger),
+            # then queue the raw bytes for the decode thread. Everything
+            # expensive (CMS12/HS11 unpack, _process_raw_frame, CameraFrame
+            # build, _propogate_frame → worker dispatch) runs on the background
+            # decoder, not on this SDK thread.
+            frame_id = self._next_frame_id
+            self._next_frame_id += 1
+
+            self._trigger_sent.clear()
+            sdk_cleared = time.perf_counter()
+            # Intentionally omit sdk_decoded — the decode thread adds it when
+            # the actual decode finishes. Using a sentinel like 0.0 would be
+            # misread by the sub-timer recorder as a valid (huge) interval
+            # against the perf_counter-based entries.
+            self._last_capture_ts = {
+                "sdk_entry": sdk_entry,
+                "sdk_cleared": sdk_cleared,
+            }
+            self._fire_frame_arrived_callbacks(frame_id)
+
+            try:
+                self._decode_queue.put_nowait({
+                    "frame_bytes": frame_bytes,
+                    "height": height,
+                    "width": width,
+                    "frame_id": frame_id,
+                    "sdk_entry_ts": sdk_entry,
+                })
+            except queue.Full:
+                self._log.error(
+                    "Tucsen decode queue full; dropping frame %d — decoder can't keep up",
+                    frame_id,
+                )
+        except Exception:
+            self._log.exception("SDK trigger-frame callback raised")
 
     def _allocate_buffer(self, max_frame: bool = True):
         """Allocate the TUCam buffer via TUCAM_Buf_Alloc.
@@ -701,6 +1116,12 @@ class TucsenCamera(AbstractCamera):
                 self.set_region_of_interest(*cached_roi)
 
     def _reset_buffer(self, max_frame: bool = True):
+        if self._m_frame is None:
+            # No buffer allocated yet — nothing to reset. start_streaming
+            # allocates on demand. Reached from set_camera_mode() before
+            # the first start_streaming (e.g. during __init__ and the
+            # post-reopen state restore).
+            return
         if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError("Failed to release buffer")
         self._allocate_buffer(max_frame=max_frame)
@@ -715,6 +1136,11 @@ class TucsenCamera(AbstractCamera):
         if TUCAM_Cap_Stop(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
             raise CameraError("Failed to stop streaming")
 
+        # Callback refs and the buffer are kept alive across stop→start cycles.
+        # The SDK's stored C pointer survives Cap_Stop, and the next
+        # start_streaming either (a) overwrites it via TUCAM_Buf_DataCallBack
+        # on re-install (staying in callback mode) or (b) reopens the device
+        # (transitioning out of callback mode). See start_streaming.
         self._trigger_sent.clear()
         self._is_streaming.clear()
         self._log.info("TUCam Camera streaming stopped")
@@ -845,29 +1271,17 @@ class TucsenCamera(AbstractCamera):
                 if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
                     self._log.debug("TUCAM_Cap_SetTrigger restore after fast acq failed")
 
-        # Vendor SDK workaround: close and reopen camera to reset internal state
-        if self.temperature_reading_thread is not None:
-            self._terminate_temperature_event.set()
-            self.temperature_reading_thread.join()
-        if TUCAM_Dev_Close(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError("Failed to close camera")
-        else:
-            self._log.info("Closed camera successfully")
-        TUCAM_Api_Uninit()
-        time.sleep(1.0)
-        self._camera = TucsenCamera._open(index=0)
-        if self._camera is None:
-            raise CameraError("Failed to reopen camera after fast acquisition")
-        self._configure_camera()
-
-        # Restore the live ROI the user had before fast acquisition. The
-        # reopen resets hardware state to vendor defaults, which is not what
-        # the user saw in live view — so push the remembered window back.
-        # The next start_streaming allocates a max-frame buffer (live), so
-        # the user can freely resize this restored ROI afterward.
-        if self._roi_before_fast_acq is not None:
-            self.set_region_of_interest(*self._roi_before_fast_acq)
-            self._roi_before_fast_acq = None
+        # The SDK has no unregister for TUCAM_Buf_DataCallBack; close+reopen is
+        # the only way to clear the stale C pointer and reset SDK internals.
+        # _reopen_camera_to_reset_sdk_state now preserves acquisition mode, but
+        # fast acq explicitly runs in HARDWARE_TRIGGER and expects to hand back
+        # CONTINUOUS for live view. Go through set_acquisition_mode so the
+        # hardware trigger-mode register and the Python cache are written
+        # together — direct _acquisition_mode assignment would desync the two.
+        self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
+        self._region_of_interest = self._roi_before_fast_acq
+        self._reopen_camera_to_reset_sdk_state()
+        self._roi_before_fast_acq = None
 
         self._log.info(f"Fast acquisition frame grabbing stopped, {self.frames_polled} frames polled")
 
@@ -904,6 +1318,12 @@ class TucsenCamera(AbstractCamera):
             self.stop_fast_acquisition_frame_grabbing()
         except Exception:
             pass
+        # Stop the deferred-decode thread before releasing the camera handle
+        # so no in-flight decode tries to touch a closed device.
+        try:
+            self._stop_decode_thread()
+        except Exception:
+            self._log.exception("Failed to stop Tucsen decode thread during close")
         if self.temperature_reading_thread is not None:
             self._terminate_temperature_event.set()
             self.temperature_reading_thread.join()
@@ -949,36 +1369,67 @@ class TucsenCamera(AbstractCamera):
     def _wait_for_frame(self):
         self._log.info("Starting Tucsen read thread.")
         self._read_thread_running.set()
+        iteration = 0
+        last_heartbeat_log = time.time()
         while self._read_thread_keep_running.is_set():
             try:
                 wait_time_ms = int(self._read_thread_wait_period_s * 1000)  # ms, convert to int
+                iteration += 1
+                # Heartbeat: log once every 5 s to confirm the read loop is alive
+                # even when frames aren't arriving (useful for diagnosing whether
+                # the thread is stuck or just not seeing triggers).
+                now = time.time()
+                if now - last_heartbeat_log >= 5.0:
+                    self._log.info(
+                        f"Tucsen read-thread heartbeat: iter={iteration}, "
+                        f"frames_received={self._frames_received_since_start}, "
+                        f"triggers_sent={self._triggers_sent_since_start}"
+                    )
+                    last_heartbeat_log = now
+
+                wait_start = time.time()
                 try:
                     ret = TUCAM_Buf_WaitForFrame(self._camera, pointer(self._m_frame), c_int32(wait_time_ms))
-                    # self._log.info(f"TUCAM_Buf_WaitForFrame returned {ret}")
                 except Exception:
                     continue
+                wait_elapsed_ms = (time.time() - wait_start) * 1000
+
                 # On timeout (common in SOFTWARE_TRIGGER between triggers) _m_frame holds stale
                 # data from the previous successful read. Skip rather than propagate garbage.
                 if ret != TUCAMRET.TUCAMRET_SUCCESS:
-                    self._log.error(f"TUCAM_Buf_WaitForFrame returned {ret}")
+                    # Log sparingly so timeouts between triggers don't flood the log.
+                    if iteration <= 3 or iteration % 10 == 0:
+                        self._log.info(
+                            f"TUCAM_Buf_WaitForFrame returned {ret} after "
+                            f"{wait_elapsed_ms:.0f} ms (iter={iteration})"
+                        )
                     continue
 
                 if self._m_frame is None or self._m_frame.pBuffer is None or self._m_frame.pBuffer == 0:
                     self._log.error("Invalid frame buffer")
                     continue
-                # self._frames_received_since_start += 1
-                # if self._frames_received_since_start > self._triggers_sent_since_start:
-                #     self._log.warning(
-                #         f"STRAY FRAME: frames_received={self._frames_received_since_start} "
-                #         f"> triggers_sent={self._triggers_sent_since_start} "
-                #         f"(acq_mode={self.get_acquisition_mode()})"
-                #     )
+                sdk_entry = time.perf_counter()
+                if self.get_acquisition_mode() == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+                    self._frames_received_since_start += 1
+                # Fire frame-arrived callbacks BEFORE decode so the worker's
+                # pacing (_ready_for_next_trigger) can release and the next
+                # trigger goes out while this thread continues decoding. The
+                # read thread still does the decode in line below — no separate
+                # decode thread needed for this path, since the read thread is
+                # already off the worker's critical path.
+                frame_id = self._next_frame_id
+                self._next_frame_id += 1
+                self._trigger_sent.clear()
+                self._last_capture_ts = {
+                    "sdk_entry": sdk_entry,
+                    "sdk_cleared": time.perf_counter(),
+                }
+                self._fire_frame_arrived_callbacks(frame_id)
                 np_image = self._convert_frame_to_numpy(self._m_frame)
-                # self._log.info(f"Frame buffer is valid, mean value: {np.mean(np_image)}")
                 processed_frame = self._process_raw_frame(np_image)
                 with self._frame_lock:
                     camera_frame = CameraFrame(
-                        frame_id=self._current_frame.frame_id + 1 if self._current_frame else 1,
+                        frame_id=frame_id,
                         timestamp=time.time(),
                         frame=processed_frame,
                         frame_format=self.get_frame_format(),
@@ -986,8 +1437,12 @@ class TucsenCamera(AbstractCamera):
                     )
 
                     self._current_frame = camera_frame
+                # _trigger_sent.clear() and the arrived-callbacks already fired
+                # before decode; the worker's next trigger can have gone out
+                # while we were decoding. Record the decoded timestamp for the
+                # sub-timer report and propagate so job dispatch can happen.
+                self._last_capture_ts["sdk_decoded"] = time.perf_counter()
                 self._propogate_frame(camera_frame)
-                self._trigger_sent.clear()
 
                 time.sleep(0.001)
 
@@ -1062,7 +1517,11 @@ class TucsenCamera(AbstractCamera):
         # the parameter is written at. Multipoint revisits the same channels
         # across positions and time points — without this, every revisit incurs
         # the ~50ms pause cost on the Aries.
-        if int(adjusted_exposure_time * 1000) == int(self._exposure_time_ms * 1000):
+        #
+        # When the cache is None (e.g. just after _configure_camera nulls it
+        # on reopen), we can't short-circuit — the hardware state is unknown
+        # from Python's point of view, so always write.
+        if self._exposure_time_ms is not None and int(adjusted_exposure_time * 1000) == int(self._exposure_time_ms * 1000):
             self._log.debug(f"set_exposure_time: already {exposure_time_ms} ms, skipping")
             return
 
@@ -1256,9 +1715,11 @@ class TucsenCamera(AbstractCamera):
                        e.g. "hdr", "cms", "high_speed" (400BSI V3); "standard", "low_noise", "senbin" (FL26);
                        "hdr", "speed", "sensitivity" (Aries).
         """
+        
         if mode_name == self.get_camera_mode():
-            self._log.debug(f"set_camera_mode: already {mode_name}, skipping")
+            self._log.debug("set_camera_mode: already %s, skipping", mode_name)
             return
+        self._log.info("set_camera_mode: %s -> %s", self.get_camera_mode(), mode_name)
 
         modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
         if modes is None:
@@ -1569,24 +2030,36 @@ class TucsenCamera(AbstractCamera):
         # not reliably fire exposures on the Aries, so we route through the hardware
         # line that is already proven to work.
 
-        # virtualize_sw_trigger = (
-        #     acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._hw_trigger_fn is not None
-        # )
-        virtualize_sw_trigger = False
+        # Phase C1: when the rig has a hardware-trigger line wired up, route
+        # SOFTWARE_TRIGGER requests through it. Camera runs in TUCCM_TRIGGER_STANDARD
+        # (gated single-shot), and send_trigger fires the NI-DAQ / MCU pulse via
+        # _hw_trigger_fn(None) while illumination stays software-controlled by the
+        # worker (LED steady-on for the exposure window). Falls back to the native
+        # GenICam TriggerSoftwarePulse path for rigs without _hw_trigger_fn.
+
+        virtualize_sw_trigger = (
+            acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER
+            and self._hw_trigger_fn is not None
+        )
         self._virt_sw_trigger = virtualize_sw_trigger
+
+        self._log.info(
+            f"Tucsen acquisition mode set to {acquisition_mode} "
+            f"(virtualize_sw_trigger={self._virt_sw_trigger})"
+        )
         with self._pause_streaming():
             if (
                 not self._model_properties.is_genicam
                 and TUCAM_Cap_GetTrigger(self._camera, pointer(self._trigger_attr)) != TUCAMRET.TUCAMRET_SUCCESS
             ):
                 raise CameraError("Failed to get trigger attributes")
-            if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and not virtualize_sw_trigger:
+            if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and not self._virt_sw_trigger:
                 if self._model_properties.is_genicam:
                     self._set_genicam_parameter("TriggerMode", 2, TUELEM_TYPE.TU_ElemEnumeration.value)
                     self._capture_mode_genicam = TUCAM_CAPTURE_MODES.TUCCM_SEQUENCE.value
                 else:
                     self._trigger_attr.nTgrMode = TUCAM_CAPTURE_MODES.TUCCM_TRIGGER_SOFTWARE.value
-            elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and virtualize_sw_trigger:
+            elif acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
                 # Program the camera for hardware trigger; the driver will keep reporting
                 # SOFTWARE_TRIGGER externally via get_acquisition_mode.
                 if self._model_properties.is_genicam:
@@ -1620,7 +2093,7 @@ class TucsenCamera(AbstractCamera):
                 # otherwise leaves the camera in free-running mode — every frame then arrives
                 # in the acquisition callback without a trigger having been sent.
                 expected_trigger_mode = {
-                    CameraAcquisitionMode.SOFTWARE_TRIGGER: "Standard" if virtualize_sw_trigger else "Software",
+                    CameraAcquisitionMode.SOFTWARE_TRIGGER: "Standard" if self._virt_sw_trigger else "Software",
                     CameraAcquisitionMode.CONTINUOUS: "FreeRunning",
                     CameraAcquisitionMode.HARDWARE_TRIGGER: "Standard",
                     CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST: "Standard",
@@ -1732,11 +2205,15 @@ class TucsenCamera(AbstractCamera):
         if not self.get_is_streaming():
             raise CameraError(f"Camera is not streaming, cannot send trigger.")
 
+        # Fail-fast readiness check. Callers that need to block (multipoint worker
+        # in SOFTWARE_TRIGGER) poll get_ready_for_trigger() themselves before
+        # calling this — see acquire_camera_image in multi_point_worker.py.
         if not self.get_ready_for_trigger():
             raise CameraError(
                 f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
             )
         # Virtualized SW trigger -> fire the hardware trigger line; camera is actually in hw mode.
+        self._log.info(f"Sending trigger with {self._acquisition_mode} (virtualize = {self._virt_sw_trigger})")
         if self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:
             if not self._hw_trigger_fn:
                 raise CameraError("Virtualized software trigger requires _hw_trigger_fn.")
@@ -1746,6 +2223,7 @@ class TucsenCamera(AbstractCamera):
             # on top would either conflict (MCU path) or be a no-op (NI-DAQ path).
             # (LED settle before firing is applied worker-side, see
             # software.acquisition.illumination_settle_ms in the machine config.)
+            self._log.info("Tucsen: firing virtualized SW trigger via _hw_trigger_fn(None)")
             self._hw_trigger_fn(None)
             self._last_trigger_timestamp = time.time()
             self._triggers_sent_since_start += 1
@@ -1764,7 +2242,7 @@ class TucsenCamera(AbstractCamera):
 
 
     def get_ready_for_trigger(self) -> bool:
-        if time.time() - self._last_trigger_timestamp > 1.5 * ((self.get_total_frame_time() + 4) / 1000.0):
+        if time.time() - self._last_trigger_timestamp > ((self.get_total_frame_time() + 0.5) / 1000.0):
             self._trigger_sent.clear()
         return not self._trigger_sent.is_set()
 

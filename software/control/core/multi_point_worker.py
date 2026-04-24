@@ -197,10 +197,34 @@ class MultiPointWorker:
         self._ready_for_next_trigger = threading.Event()
         # Set this to true so that the first frame capture can proceed.
         self._ready_for_next_trigger.set()
-        # This is cleared when the image callback is no longer processing an image.  If true, an image is still
-        # in flux and we need to make sure the object doesn't disappear.
+        # This is cleared while ANY frame's image_callback (decode → job
+        # dispatch) is still in flight. With deferred decode, multiple frames
+        # can overlap, so we count outstanding frames under _outstanding_lock
+        # and only set the idle event when the count drops back to zero.
         self._image_callback_idle = threading.Event()
         self._image_callback_idle.set()
+        self._outstanding_frames = 0
+        self._outstanding_lock = threading.Lock()
+        # Frame-id-keyed hand-off of CaptureInfo between _on_frame_arrived
+        # (SDK thread, snapshots the info before the next trigger overwrites
+        # _current_capture_info) and _image_callback (decode thread, reads
+        # the info when dispatching jobs). Without this, deferred decode
+        # would read the NEXT capture's info instead of its own.
+        self._pending_capture_info_by_frame_id: Dict[int, CaptureInfo] = {}
+        # Per-capture timing breakdown populated by acquire_camera_image and
+        # _image_callback; read after the wait returns so we can split the
+        # "exposure_time_done_sleep_hw or wait_for_image_sw" window into
+        # sub-timers. Reset before each send_trigger.
+        self._capture_ts: dict = {}
+        # Phase F — stage-move pipelining. move_to_coordinate now fires both
+        # axes non-blocking and sets _pending_move_settle=True; any operation
+        # that needs the stage physically settled (AF, camera trigger) calls
+        # _wait_for_move_settled() which joins motion via stage.wait_for_idle
+        # and runs the post-move stabilization sleep. Between the fire and
+        # the wait, the worker does useful setup work (apply_observation_state,
+        # illuminate_for_capture) in parallel with in-flight motion.
+        self._pending_move_settle: bool = False
+        self._pending_move_stabilization_s: float = 0.0
         # This is protected by the threading event above (aka set after clear, take copy before set)
         self._current_capture_info: Optional[CaptureInfo] = None
         self._last_illumination_config_name: Optional[str] = None
@@ -570,6 +594,15 @@ class MultiPointWorker:
             self.camera.start_streaming()
             self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
+            # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
+            # soon as raw bytes arrive, before decode. Snapshots capture_info
+            # and signals _ready_for_next_trigger so the worker can issue the
+            # next trigger in parallel with the still-running decode. Cameras
+            # without this API fall back to the synchronous path inside
+            # _image_callback.
+            self._use_deferred_decode_callback = hasattr(self.camera, "add_frame_arrived_callback")
+            if self._use_deferred_decode_callback:
+                self.camera.add_frame_arrived_callback(self._on_frame_arrived)
             sleep_time = min(self.dt / 20.0, 0.5)
 
             # Send Slack acquisition start notification
@@ -660,9 +693,9 @@ class MultiPointWorker:
             self._log.error(f"Operation timed out during acquisition, aborting acquisition!")
             self._log.error(te)
             self.request_abort_fn()
-        except Exception as e:
-            self._log.exception(e)
-            raise
+        # except Exception as e:
+        #     self._log.exception(e)
+        #     raise
         finally:
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
@@ -979,6 +1012,8 @@ class MultiPointWorker:
                 last_z_mm = self._z_pos_proposal[(region_id, fov)]
                 self.move_to_z_level(last_z_mm, blocking=False)
                 self._log.info(f"Moved to last z position {last_z_mm} [mm]")
+                # No X/Y issued. _pending_move_settle stays unchanged (the
+                # earlier z move will be picked up by the next wait).
                 return
             else:
                 self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
@@ -986,16 +1021,40 @@ class MultiPointWorker:
             z_mm = coordinate_mm[2]
             self.move_to_z_level(z_mm, blocking=False)
 
-        # The longer coordinate to travel should block (so that we are all settled before autofocus/acquisition)
+        # Phase F: fire BOTH axes non-blocking and defer the settle wait. Any
+        # operation that requires a physically settled stage (autofocus, the
+        # camera trigger) will call _wait_for_move_settled() — between here
+        # and that wait, the worker runs apply_observation_state /
+        # illuminate_for_capture in parallel with the still-in-flight motion.
+        self.stage.move_x_to(x_mm, blocking=False)
+        self.stage.move_y_to(y_mm, blocking=False)
+        # Stabilization time is the same for both axes (20 ms each, per
+        # control/_def.py). Use one flat value; take it here so if the
+        # constant is configured per-axis later, the move-start site records
+        # the appropriate one.
+        self._pending_move_stabilization_s = max(
+            SCAN_STABILIZATION_TIME_MS_X, SCAN_STABILIZATION_TIME_MS_Y
+        ) / 1000.0
+        self._pending_move_settle = True
 
-        if delta_x > delta_y:
-            self.stage.move_y_to(y_mm, blocking=False)
-            self.stage.move_x_to(x_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
-        else:
-            self.stage.move_x_to(x_mm, blocking=False)
-            self.stage.move_y_to(y_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+    def _wait_for_move_settled(self, timeout_s: float = 30.0) -> None:
+        """Join the in-flight stage motion issued by move_to_coordinate and
+        run the post-motion stabilization sleep. Idempotent — no-op if no
+        pending move. Called by any op that requires the stage physically
+        settled (perform_autofocus, acquire_camera_image right before the
+        camera trigger).
+        """
+        if not self._pending_move_settle:
+            return
+        with self._timing.get_timer("wait_for_move_settled"):
+            try:
+                self.stage.wait_for_idle(timeout_s)
+            except Exception:
+                self._log.exception("Timed out waiting for stage to settle")
+            if self._pending_move_stabilization_s > 0:
+                self._sleep(self._pending_move_stabilization_s)
+        self._pending_move_settle = False
+        self._pending_move_stabilization_s = 0.0
 
 
 
@@ -1652,6 +1711,16 @@ class MultiPointWorker:
             self._z_pos_proposal[key] = anchor_z_current + delta
 
     def perform_autofocus(self, region_id, fov):
+        # Phase F: the stage move that brought us to this FOV was fired async
+        # by move_to_coordinate. When AF will actually touch hardware below,
+        # join the motion here so the AF measurement happens on a settled
+        # stage. When AF will no-op (disabled / skipped this FOV), skip the
+        # wait so apply_observation_state + illuminate_for_capture at the
+        # first capture can continue to run in parallel with motion — the
+        # trigger-site _wait_for_move_settled() in acquire_camera_image is
+        # the final gate.
+        if self.do_reflection_af or self.do_autofocus:
+            self._wait_for_move_settled()
         if not self.do_reflection_af:
             # contrast-based AF; perform AF only if when not taking z stack or doing z stack from center
             if (
@@ -1978,21 +2047,80 @@ class MultiPointWorker:
             self.wait_till_operation_is_completed()
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
+    def _on_frame_arrived(self, frame_id: int) -> None:
+        """Fired on the camera's delivery thread the moment raw bytes arrive,
+        BEFORE decode. Runs once per frame and must stay fast — it's on the
+        pacing-critical path the worker is blocked on.
+
+        Responsibilities:
+          * Snapshot _current_capture_info under `frame_id` so the later (off-
+            thread) _image_callback can correlate. Must happen here, not in
+            _image_callback, because acquire_camera_image sets
+            _current_capture_info for the NEXT capture as soon as the worker
+            wakes.
+          * Bump the in-flight counter and clear _image_callback_idle so the
+            end-of-acquisition wait can't complete until every frame's dispatch
+            has drained.
+          * Record the `ic_entry` / `ic_event_set` sub-timer boundaries.
+          * Set _ready_for_next_trigger so the worker can proceed to the next
+            capture while this frame's decode + dispatch continue in parallel.
+        """
+        ic_entry = time.perf_counter()
+        info = self._current_capture_info
+        self._current_capture_info = None
+        # Only track outstanding for frames we actually expect _image_callback
+        # to dispatch. A None info means the frame arrived without a matching
+        # CaptureInfo — that's an error condition; _image_callback will log+abort,
+        # and we don't want the missing-info case to leak a phantom outstanding
+        # count into the end-of-acquisition wait.
+        if info is not None:
+            self._pending_capture_info_by_frame_id[frame_id] = info
+            with self._outstanding_lock:
+                self._outstanding_frames += 1
+                self._image_callback_idle.clear()
+        self._capture_ts["ic_entry"] = ic_entry
+        self._ready_for_next_trigger.set()
+        self._capture_ts["ic_event_set"] = time.perf_counter()
+
     def _image_callback(self, camera_frame: CameraFrame):
-        try:
+        # Deferred path (Tucsen SDK callback): _on_frame_arrived already
+        # snapshotted the CaptureInfo under this frame_id, signalled the
+        # worker, and bumped the outstanding counter. We just pop the info
+        # and run dispatch. Missing key means the frame arrived without a
+        # matching _on_frame_arrived call (bug or race — log+abort).
+        #
+        # Synchronous path (non-deferred cameras — simulated, thread-poll
+        # cameras without arrived callbacks): _on_frame_arrived wasn't fired
+        # so we do the snapshot + event set + counter bump here, just like
+        # the original single-callback flow.
+        if getattr(self, "_use_deferred_decode_callback", False):
+            if camera_frame.frame_id not in self._pending_capture_info_by_frame_id:
+                self._log.error(
+                    "Deferred image callback fired without a pending CaptureInfo for frame_id=%d. Aborting.",
+                    camera_frame.frame_id,
+                )
+                self.request_abort_fn()
+                return
+            info = self._pending_capture_info_by_frame_id.pop(camera_frame.frame_id)
+        else:
             if self._ready_for_next_trigger.is_set():
                 self._log.warning(
-                    "Got an image in the image callback, but we didn't send a trigger.  Ignoring the image."
+                    "Got an image in the image callback, but we didn't send a trigger. "
+                    "Ignoring the image."
                 )
                 return
-
-            self._image_callback_idle.clear()
+            ic_entry = time.perf_counter()
+            info = self._current_capture_info
+            self._current_capture_info = None
+            self._ready_for_next_trigger.set()
+            with self._outstanding_lock:
+                self._outstanding_frames += 1
+                self._image_callback_idle.clear()
+            self._capture_ts["ic_entry"] = ic_entry
+            self._capture_ts["ic_event_set"] = time.perf_counter()
+        try:
             with self._timing.get_timer("_image_callback"):
                 self._log.debug(f"In Image callback for frame_id={camera_frame.frame_id}")
-                info = self._current_capture_info
-                self._current_capture_info = None
-
-                self._ready_for_next_trigger.set()
                 if not info:
                     self._log.error("In image callback, no current capture info! Something is wrong. Aborting.")
                     self.request_abort_fn()
@@ -2053,7 +2181,10 @@ class MultiPointWorker:
                     self.callbacks.signal_new_image(camera_frame, info)
 
         finally:
-            self._image_callback_idle.set()
+            with self._outstanding_lock:
+                self._outstanding_frames = max(0, self._outstanding_frames - 1)
+                if self._outstanding_frames == 0:
+                    self._image_callback_idle.set()
 
     def _frame_wait_timeout_s(self):
         return (self.camera.get_total_frame_time() / 1e3) + 10
@@ -2159,8 +2290,39 @@ class MultiPointWorker:
         #     k,
         # )
         if self.liveController.trigger_mode != TriggerMode.CONTINUOUS:
+            # Phase F: if an async stage move is still in flight (common at
+            # the first capture of a new FOV — we skipped the blocking wait
+            # in move_to_coordinate so apply_observation_state and
+            # illuminate_for_capture could run in parallel with motion),
+            # join it now. For subsequent captures at the same FOV this is
+            # a no-op since the wait already cleared the flag.
+            self._wait_for_move_settled()
+            # Block until the camera reports it's ready for the next trigger
+            # before we actually send one. _ready_for_next_trigger above is a
+            # worker-side flag set by _image_callback — it tells us the previous
+            # frame arrived, but not that the camera's own _trigger_sent flag has
+            # been cleared (those get updated by different lines in the SDK
+            # callback). Poll get_ready_for_trigger() here so the trigger never
+            # races the flag update. Timeout = frame_time + generous slack;
+            # past that the camera is genuinely stuck and we abort.
+            if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
+                with self._timing.get_timer("wait_camera_ready_for_trigger"):
+                    wait_timeout_s = self.camera.get_total_frame_time() / 1e3 + 0.1
+                    ready_deadline = time.time() + wait_timeout_s
+                    while not self.camera.get_ready_for_trigger():
+                        if time.time() >= ready_deadline:
+                            self._log.error(
+                                f"Camera never became ready for next trigger within {wait_timeout_s:.3f}s. Aborting."
+                            )
+                            self.request_abort_fn()
+                            return
+                        time.sleep(0.0005)
+            # Reset per-capture timestamps before trigger so stale values from
+            # the previous capture can't contaminate the sub-timer breakdown.
+            self._capture_ts = {}
             with self._timing.get_timer("send_trigger"):
                 self.camera.send_trigger(illumination_time=camera_illumination_time)
+            self._capture_ts["post_trigger"] = time.perf_counter()
 
         with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
             if self.liveController.trigger_mode == TriggerMode.HARDWARE:
@@ -2185,12 +2347,60 @@ class MultiPointWorker:
                     self.request_abort_fn()
                     # Let this fall through so we still turn off illumination.  Let the caller actually break out
                     # of the acquisition.
+        # Break the wait window into sub-intervals so we can see where the
+        # ~140 ms/capture goes. Camera-side stamps come from
+        # camera._last_capture_ts (populated by _on_sdk_trigger_frame or
+        # _wait_for_frame). Worker-side stamps come from _image_callback.
+        # Any path that didn't populate a key just skips that sub-timer.
+        self._record_capture_sub_timings()
 
         # Turn off capture illumination after a one-frame snap unless the user explicitly keeps it on.
         if not self.keep_illuminators_on_between_captures:
             with self._timing.get_timer("turn_off_capture_illumination"):
                 self._turn_off_capture_illumination_preserving_logical_state()
         self._last_illumination_config_name = config.name
+
+    def _record_capture_sub_timings(self) -> None:
+        """Break the per-capture "wait for image" window into named sub-timers.
+
+        Timeline (SW trigger, deferred-decode or thread-poll):
+            post_trigger       <- worker: after camera.send_trigger returns
+            sdk_entry          <- camera: top of _on_sdk_trigger_frame / read-thread frame-handle block
+            sdk_cleared        <- camera: after _trigger_sent.clear (before decode / callback fire)
+            ic_entry           <- worker _on_frame_arrived top (sync from sdk_cleared via fire_arrived_callbacks)
+            ic_event_set       <- worker: after _ready_for_next_trigger.set
+            (wait returns)     <- the "exposure_time_done_sleep_hw or wait_for_image_sw" timer stops here
+            sdk_decoded        <- camera: after decode + CameraFrame build (off-critical-path,
+                                   available only AFTER the worker wait returns — set by the
+                                   decode thread in callback mode, inline in thread-poll mode)
+
+        Sub-timers (``wait:*`` are on the worker's critical path):
+            wait:trigger_to_sdk       — camera exposure + readout + SDK dispatch
+            wait:sdk_entry_to_clear   — SDK-callback bookkeeping up to _trigger_sent.clear
+            wait:sdk_clear_to_ic      — _trigger_sent.clear → worker _on_frame_arrived entry
+            wait:ic_event_set         — _on_frame_arrived entry → _ready_for_next_trigger.set
+            wait:event_to_wake        — Event.set → .wait return in worker thread
+        """
+        ts = dict(self._capture_ts)  # snapshot
+        # Pull camera-side stamps now that the wait has returned. sdk_decoded
+        # is intentionally excluded: it's populated on the decode thread AFTER
+        # the wait returns, so reading it here is racy and meaningless on the
+        # critical-path report. A separate decode timer (future) should own it.
+        cam_ts = getattr(self.camera, "_last_capture_ts", None) or {}
+        for key in ("sdk_entry", "sdk_cleared"):
+            if key in cam_ts:
+                ts[key] = cam_ts[key]
+        ts["post_wait"] = time.perf_counter()
+
+        def pair(name: str, a: str, b: str) -> None:
+            if a in ts and b in ts and ts[b] >= ts[a]:
+                self._timing.get_timer(name).record(ts[a], ts[b])
+
+        pair("wait:trigger_to_sdk",     "post_trigger", "sdk_entry")
+        pair("wait:sdk_entry_to_clear", "sdk_entry",    "sdk_cleared")
+        pair("wait:sdk_clear_to_ic",    "sdk_cleared",  "ic_entry")
+        pair("wait:ic_event_set",       "ic_entry",     "ic_event_set")
+        pair("wait:event_to_wake",      "ic_event_set", "post_wait")
 
     def _sleep(self, sec):
         time_to_sleep = max(sec, 1e-6)

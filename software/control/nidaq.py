@@ -92,6 +92,22 @@ class AcquisitionResult:
     samples_acquired: int = 0
 
 
+def _count_rising_edges(samples) -> int:
+    """Count rising edges in a boolean-ish sample sequence.
+
+    Accepts a Python bool / int list (what ``nidaqmx.Task.read`` returns for a
+    single DI channel) or a 1D numpy array. Returns the number of LOW→HIGH
+    transitions.
+    """
+    if samples is None:
+        return 0
+    arr = np.asarray(samples, dtype=bool)
+    if arr.ndim == 0 or arr.size < 2:
+        return 0
+    # Rising edge: previous sample False, current sample True.
+    return int(np.count_nonzero(arr[1:] & ~arr[:-1]))
+
+
 class AbstractNIDAQ(abc.ABC):
     """Abstract base class for NI DAQ interface."""
     
@@ -358,6 +374,10 @@ class AbstractNIDAQ(abc.ABC):
         """Stop constant live output. Override in hardware implementation."""
         pass
 
+    def send_edge_pulse(self, line: int, pulse_width_us: int = 1000) -> None:
+        """Fire a single digital pulse on a DO line. Override in hardware impl."""
+        pass
+
     def release_tasks(self) -> None:
         """Stop and close all tasks so the device is free for new tasks (e.g. live output or re-arm)."""
         pass
@@ -392,7 +412,30 @@ class NIDAQ(AbstractNIDAQ):
         self._di_task = None
         self._ai_task = None
         self._live_ao_task = None
-        self._live_do_task = None
+        # Persistent on-demand DO task shared by every DO operation outside of
+        # fast acquisition: LED shutters (start_live_output / set_digital) and
+        # one-shot camera triggers (send_edge_pulse). One nidaqmx.Task holds
+        # every DO line we ever touch; each operation is just a write() that
+        # updates the state vector. Built lazily on first use, extended in
+        # place when a new line is requested, torn down only when fast
+        # acquisition claims the DO port via its waveform task (via
+        # _stop_live_output in arm() / _cleanup_tasks) and rebuilt via
+        # restore_after_acquisition. Keeps its state across live view →
+        # multipoint transitions so switching modes is zero DAQmx cost.
+        self._persistent_do_task = None
+        self._persistent_do_lines: List[int] = []
+        # DI sample-clock rate reused by the optional readout diagnostic.
+        # (DO pulse emission is on-demand via the persistent task; no
+        # sample-clocked DO task remains.)
+        self._pulse_do_sample_rate_hz: float = 100_000.0
+        # Companion DI task for trigger-readout diagnostics. When a readout_line
+        # is passed to send_edge_pulse, this task samples the line during the
+        # pulse + post-pulse window and logs any rising edges detected — lets
+        # us confirm the camera is actually seeing the trigger.
+        self._pulse_di_task = None
+        self._pulse_di_line: Optional[int] = None
+        self._pulse_di_samples: Optional[int] = None
+        self._pulse_di_window_ms: Optional[float] = None
         
         self._waveforms: Optional[WaveformData] = None
         self._acquired_data: Optional[np.ndarray] = None
@@ -719,10 +762,108 @@ class NIDAQ(AbstractNIDAQ):
             except Exception:
                 pass
             self._di_task = None
+        # _stop_live_output tears down the persistent DO task (freeing the DO
+        # port for fast-acquisition's waveform task). The DI diagnostic task
+        # is released here because it's owned by send_edge_pulse, not by the
+        # live-output machinery.
         self._stop_live_output()
-    
+        self._teardown_pulse_di_task()
+
+    def _teardown_pulse_di_task(self) -> None:
+        """Close the readout-diagnostic DI task. Caller holds self._lock."""
+        if self._pulse_di_task is not None:
+            try:
+                self._pulse_di_task.stop()
+            except Exception:
+                pass
+            try:
+                self._pulse_di_task.close()
+            except Exception:
+                pass
+            self._pulse_di_task = None
+            self._pulse_di_line = None
+            self._pulse_di_samples = None
+            self._pulse_di_window_ms = None
+
+    def _ensure_persistent_do_task_locked(self, needed_lines) -> None:
+        """Build (or extend) the persistent on-demand DO task so it contains
+        every line in ``needed_lines``. Caller must hold self._lock.
+
+        If the task already exists and already includes all requested lines,
+        this is a no-op (the common case). Otherwise the task is torn down
+        and rebuilt with the union of its current lines and the new ones —
+        DAQmx can't add channels to a running task. Rebuilds should happen
+        only at config/startup time, never on the multipoint hot path.
+        """
+        needed = {int(ln) for ln in needed_lines}
+        have = set(self._persistent_do_lines)
+        if self._persistent_do_task is not None and needed.issubset(have):
+            return
+        target = have | needed
+        if not target:
+            return
+        self._teardown_persistent_do_task_locked()
+        device = self._config.device_name
+        try:
+            task = self._nidaqmx.Task("persistent_do")
+            ordered = sorted(target)
+            for ln in ordered:
+                phys = f"{device}/{self._config.do_port}/line{ln}"
+                task.do_channels.add_do_chan(phys)
+            self._persistent_do_task = task
+            self._persistent_do_lines = ordered
+            # Seed state to False for lines we've never seen before so the
+            # initial write matches a "rest" state.
+            for ln in ordered:
+                self._live_do_values.setdefault(ln, False)
+            self._write_persistent_do_state_locked()
+        except Exception:
+            self._log.exception("NIDAQ: failed to build persistent DO task")
+            self._teardown_persistent_do_task_locked()
+
+    def _teardown_persistent_do_task_locked(self) -> None:
+        """Stop and close the persistent DO task. Caller must hold self._lock.
+        Called from _stop_live_output (so fast acquisition can claim the DO
+        port via its waveform task) and on NIDAQ close.
+        """
+        if self._persistent_do_task is not None:
+            try:
+                self._persistent_do_task.stop()
+            except Exception:
+                pass
+            try:
+                self._persistent_do_task.close()
+            except Exception:
+                pass
+        self._persistent_do_task = None
+        self._persistent_do_lines = []
+
+    def _write_persistent_do_state_locked(self) -> None:
+        """Write the current self._live_do_values (projected onto the task's
+        line ordering) to the persistent task. Caller must hold self._lock.
+        Uses auto_start=True — the first write starts the on-demand task, all
+        subsequent writes just update the held output levels.
+        """
+        if self._persistent_do_task is None or not self._persistent_do_lines:
+            return
+        vals = [bool(self._live_do_values.get(ln, False)) for ln in self._persistent_do_lines]
+        try:
+            if len(vals) == 1:
+                self._persistent_do_task.write(vals[0], auto_start=True)
+            else:
+                self._persistent_do_task.write(vals, auto_start=True)
+        except Exception:
+            self._log.exception("NIDAQ: persistent DO write failed")
+
     def _stop_live_output(self) -> None:
-        """Stop and close live output tasks (constant DC output for debugging)."""
+        """Stop and close live output tasks — AO task + the persistent DO task.
+
+        Called by arm() / _cleanup_tasks before fast acquisition claims the DO
+        port for its waveform task. The persistent DO task gets rebuilt via
+        start_live_output / set_digital / send_edge_pulse the next time a DO
+        operation happens, or via restore_after_acquisition if there was live
+        DO state to preserve.
+        """
         if self._live_ao_task is not None:
             try:
                 self._live_ao_task.stop()
@@ -733,16 +874,7 @@ class NIDAQ(AbstractNIDAQ):
             except Exception:
                 pass
             self._live_ao_task = None
-        if self._live_do_task is not None:
-            try:
-                self._live_do_task.stop()
-            except Exception:
-                pass
-            try:
-                self._live_do_task.close()
-            except Exception:
-                pass
-            self._live_do_task = None
+        self._teardown_persistent_do_task_locked()
     
     def start_live_output(
         self,
@@ -750,28 +882,46 @@ class NIDAQ(AbstractNIDAQ):
         do_values: Optional[Dict[int, bool]] = None,
     ) -> None:
         """
-        Output constant values to AO/DO channels for debugging. Does not modify
-        waveform/pattern data. Use stop_live_output() or arm() to clear.
+        Hold DC levels on AO / DO channels.
+
+        AO uses a dedicated FINITE sample-clocked task built fresh each call
+        (analog writes are infrequent — usually one per channel configuration
+        change — so rebuild cost is acceptable, and sample-clocked timing is
+        needed for the AO subsystem).
+
+        DO routes through the persistent on-demand DO task shared by every DO
+        operation (LED shutters and single-pulse camera triggers). Per-call
+        cost is ~200–500 µs — one nidaqmx.Task.write on the already-live task.
         """
         if ao_values is None:
             ao_values = {}
         if do_values is None:
             do_values = {}
         with self._lock:
-            # Update logical live state (do not touch waveform/task definitions)
             self._live_ao_values.update(ao_values)
             self._live_do_values.update(do_values)
 
-            self._stop_live_output()
             if not ao_values and not do_values:
                 return
+
             device = self._config.device_name
             nidaqmx = self._nidaqmx
             constants = self._constants
-            # Many devices require samps_per_chan >= 2; use 2 samples and repeat the value
             LIVE_SAMPS = 2
+
             try:
                 if ao_values:
+                    # AO: still rebuild per call — separate task lifecycle from DO.
+                    if self._live_ao_task is not None:
+                        try:
+                            self._live_ao_task.stop()
+                        except Exception:
+                            pass
+                        try:
+                            self._live_ao_task.close()
+                        except Exception:
+                            pass
+                        self._live_ao_task = None
                     self._live_ao_task = nidaqmx.Task("live_ao")
                     for ch in ao_values:
                         phys = f"{device}/{ch}"
@@ -798,31 +948,8 @@ class NIDAQ(AbstractNIDAQ):
                         )
                     self._live_ao_task.start()
                 if do_values:
-                    self._live_do_task = nidaqmx.Task("live_do")
-                    for line in do_values:
-                        phys = f"{device}/{self._config.do_port}/line{line}"
-                        self._live_do_task.do_channels.add_do_chan(phys)
-                    self._live_do_task.timing.cfg_samp_clk_timing(
-                        rate=1000.0,
-                        sample_mode=constants.AcquisitionType.FINITE,
-                        samps_per_chan=LIVE_SAMPS,
-                    )
-                    vals = [do_values[line] for line in do_values]
-                    if len(vals) == 1:
-                        self._live_do_task.write(
-                            np.full(LIVE_SAMPS, bool(vals[0]), dtype=np.bool_),
-                            auto_start=False,
-                        )
-                    else:
-                        # NIDAQmx expects boolean samples for DO tasks.
-                        # Using uint8 can fail when the number of digital lines
-                        # in the task changes (e.g. 1 -> 2 lines).
-                        per_line = np.array([
-                            np.full(LIVE_SAMPS, bool(v), dtype=np.bool_)
-                            for v in vals
-                        ], dtype=np.bool_)
-                        self._live_do_task.write(per_line, auto_start=False)
-                    self._live_do_task.start()
+                    self._ensure_persistent_do_task_locked(do_values.keys())
+                    self._write_persistent_do_state_locked()
             except Exception as e:
                 self._log.error(f"Failed to start live output: {e}", exc_info=True)
                 self._stop_live_output()
@@ -831,6 +958,208 @@ class NIDAQ(AbstractNIDAQ):
         """Stop constant live output (same as _stop_live_output but acquires lock)."""
         with self._lock:
             self._stop_live_output()
+
+    def send_edge_pulse(
+        self,
+        line: int,
+        pulse_width_us: int = 1000,
+        readout_line: Optional[int] = None,
+        readout_window_ms: float = 200.0,
+    ) -> None:
+        """Fire a rising-then-falling edge on a DO line via the persistent
+        on-demand DO task — no per-fire task build, no arm overhead.
+
+        Two nidaqmx.Task.write calls on the already-live persistent task,
+        back-to-back. Per-fire cost is ~300–800 µs (two DAQmx on-demand writes).
+        The transitions are clean at the output stage; only DAQ-clock
+        synchronization is lost vs. the previous sample-clocked approach, and
+        the Aries's trigger input only cares about the rising edge.
+
+        The line is returned to whatever state it held in ``_live_do_values``
+        before the call (typically False for a dedicated trigger line, but an
+        LED-shutter line would be preserved correctly if, hypothetically, the
+        same line were being used as a trigger source).
+
+        Lock-scope note (Phase D): this function narrows ``self._lock`` to
+        the minimum regions that actually need mutual exclusion — the
+        "already in task?" fast path runs without the lock (atomic reads of
+        ``_persistent_do_task`` and ``_persistent_do_lines`` under GIL), the
+        ensure/DI-rebuild path takes the lock only when needed, and the two
+        edge writes each acquire/release independently. Other concurrent DO
+        ops on different lines can interleave between the edges rather than
+        serializing behind a single multi-millisecond critical section.
+
+        Args:
+            line: DO line number on the device's do_port.
+            pulse_width_us: If > 1000, inserts ``time.sleep`` between the two
+                writes to widen the pulse. Below that, the pulse width is
+                whatever the back-to-back writes produce (typically
+                200–500 µs) — fine for the Aries trigger edge detector.
+            readout_line: Diagnostic-only. DI line number to sample alongside
+                the pulse (e.g. main_camera.frame_readout = port0/line7). When
+                set, a companion DI task samples the line for
+                ``readout_window_ms`` starting at pulse-fire time; rising
+                edges are logged. Adds ``readout_window_ms`` of wait per
+                fire — do NOT enable on the hot path. Pass ``None`` to skip.
+            readout_window_ms: Duration of the DI sampling window when
+                ``readout_line`` is set.
+        """
+        line = int(line)
+
+        # Fast path: line is already part of the persistent task, no rebuild
+        # needed. Reading the list and the task reference is atomic under the
+        # GIL. If another thread is concurrently rebuilding (rare — only
+        # happens when a never-before-seen DO line first shows up), we'll
+        # either see the post-rebuild state (fine) or a transient mismatch
+        # and fall through to the locked ensure below (also fine — it
+        # no-ops when the target line is already present).
+        need_ensure = (
+            self._persistent_do_task is None
+            or line not in self._persistent_do_lines
+        )
+        if need_ensure:
+            with self._lock:
+                self._ensure_persistent_do_task_locked({line})
+                if self._persistent_do_task is None:
+                    return
+
+        # (Re)build the readout-diagnostic DI task when requested. This branch
+        # is opt-in (disabled by default in production) so the lock acquire
+        # here is off the hot path.
+        di_task = None
+        di_samples = 0
+        if readout_line is not None:
+            with self._lock:
+                di_rate = self._pulse_do_sample_rate_hz
+                di_samples = max(int(readout_window_ms * di_rate / 1000.0), 2)
+                di_rebuild = (
+                    self._pulse_di_task is None
+                    or self._pulse_di_line != readout_line
+                    or self._pulse_di_samples != di_samples
+                )
+                if di_rebuild:
+                    self._build_pulse_di_task_locked(readout_line, di_samples, di_rate)
+                di_task = self._pulse_di_task
+
+        original = self._live_do_values.get(line, False)
+        edge_count: Optional[int] = None
+        try:
+            if di_task is not None:
+                di_task.start()
+            # Rising edge: flip to the opposite of rest state. Lock held only
+            # for the dict update + DAQmx write — releases before the sleep.
+            with self._lock:
+                self._live_do_values[line] = not original
+                self._write_persistent_do_state_locked()
+            # Back-to-back writes produce ~200–500 µs of HIGH naturally. Only
+            # sleep if the caller asked for a width substantially longer than
+            # that — Windows sleep granularity is ~1 ms, so sub-ms sleeps aren't
+            # meaningful anyway. The sleep runs outside the lock so other NIDAQ
+            # ops can proceed while we wait.
+            if pulse_width_us > 1000:
+                time.sleep(pulse_width_us / 1e6)
+            # Falling edge: restore rest state. Same narrow-lock pattern.
+            with self._lock:
+                self._live_do_values[line] = original
+                self._write_persistent_do_state_locked()
+            if di_task is not None:
+                di_timeout_s = (readout_window_ms / 1000.0) + 0.5
+                di_task.wait_until_done(timeout=di_timeout_s)
+                try:
+                    samples = di_task.read(number_of_samples_per_channel=di_samples)
+                finally:
+                    di_task.stop()
+                edge_count = _count_rising_edges(samples)
+        except Exception:
+            self._log.exception(f"send_edge_pulse: fire failed on line {line}")
+            # Best-effort: return the line to rest state.
+            try:
+                with self._lock:
+                    self._live_do_values[line] = original
+                    self._write_persistent_do_state_locked()
+            except Exception:
+                pass
+            if di_task is not None:
+                try:
+                    di_task.stop()
+                except Exception:
+                    pass
+
+            if readout_line is not None:
+                if edge_count is None:
+                    self._log.warning(
+                        f"send_edge_pulse: readout-line diagnostic (DI line {readout_line}) "
+                        f"did not complete — camera-trigger link may be broken"
+                    )
+                elif edge_count == 0:
+                    self._log.warning(
+                        f"send_edge_pulse: NO rising edges on DI line {readout_line} "
+                        f"within {readout_window_ms:.0f} ms of trigger — camera is NOT "
+                        f"receiving the pulse (check wiring and trigger line config)"
+                    )
+                else:
+                    self._log.info(
+                        f"send_edge_pulse: {edge_count} rising edge(s) on DI line "
+                        f"{readout_line} within {readout_window_ms:.0f} ms of trigger "
+                        f"— camera is receiving the pulse"
+                    )
+
+    def _build_pulse_di_task_locked(
+        self,
+        line: int,
+        num_samples: int,
+        sample_rate_hz: float,
+    ) -> None:
+        """Build the reusable readout-diagnostic DI task. Caller holds self._lock.
+
+        Finite sample-clocked DI task that captures ``num_samples`` at
+        ``sample_rate_hz`` on the specified DI line. Started by send_edge_pulse
+        to observe whether the camera's readout signal fires following a pulse.
+        Coexists with the DO pulse task because DI/DO are separate resources.
+        """
+        self._teardown_pulse_di_task()
+
+        device = self._config.device_name
+        try:
+            task = self._nidaqmx.Task(f"pulse_di_line{line}")
+            # DI port/line naming mirrors DO. Aries NI-DAQ tests use the same
+            # port for both, e.g. main_camera.frame_readout = port0/line7.
+            phys = f"{device}/{self._config.di_port}/line{line}"
+            task.di_channels.add_di_chan(phys)
+            task.timing.cfg_samp_clk_timing(
+                rate=sample_rate_hz,
+                sample_mode=self._constants.AcquisitionType.FINITE,
+                samps_per_chan=num_samples,
+            )
+            self._pulse_di_task = task
+            self._pulse_di_line = line
+            self._pulse_di_samples = num_samples
+            self._pulse_di_window_ms = num_samples * 1000.0 / sample_rate_hz
+            self._log.info(
+                f"NIDAQ: built readout-diagnostic DI task on line {line} — "
+                f"{num_samples} samples @ {sample_rate_hz:.0f} Hz "
+                f"({self._pulse_di_window_ms:.0f} ms window)"
+            )
+        except Exception:
+            self._log.exception(
+                f"NIDAQ: failed to build readout-diagnostic DI task on line {line}"
+            )
+            self._pulse_di_task = None
+            self._pulse_di_line = None
+            self._pulse_di_samples = None
+            self._pulse_di_window_ms = None
+
+    def _apply_live_do_values_locked(self, do_values: Dict[int, bool]) -> None:
+        """Push a DO state snapshot through the persistent on-demand DO task.
+        Caller holds self._lock. Used by restore_after_acquisition to replay
+        the live-DO state that was captured before fast acquisition tore the
+        persistent task down.
+        """
+        if not do_values:
+            return
+        self._live_do_values.update(do_values)
+        self._ensure_persistent_do_task_locked(do_values.keys())
+        self._write_persistent_do_state_locked()
 
     def prepare_for_acquisition(self) -> None:
         """
@@ -1312,6 +1641,13 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         # For simulation we don't need to do anything beyond existing state,
         # but we keep the method for API symmetry.
         self._log.info("[SIM] stop_live_output called (no hardware tasks to stop)")
+
+    def send_edge_pulse(self, line: int, pulse_width_us: int = 1000) -> None:
+        """Log a simulated pulse — no hardware to toggle."""
+        self._log.debug(
+            "[SIM] send_edge_pulse(line=%d, pulse_width_us=%d) — no hardware DO",
+            line, pulse_width_us,
+        )
 
     def prepare_for_acquisition(self) -> None:
         """

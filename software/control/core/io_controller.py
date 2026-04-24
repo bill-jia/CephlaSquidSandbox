@@ -187,6 +187,28 @@ class NIDAQIOController(AbstractIOController):
         self._daq = nidaq
         self._live_ao: Dict[str, float] = {}
         self._live_do: Dict[int, bool] = {}
+        # Optional DI line for the camera's frame-readout signal. When set by
+        # set_trigger_readout_line() (via IORegistry during startup), every
+        # send_trigger() will also sample this line and log whether the camera
+        # actually responded to the trigger pulse. Useful for diagnosing why
+        # virtualized SW triggers aren't reaching the camera.
+        self._trigger_readout_line: Optional[int] = None
+        self._trigger_readout_window_ms: float = 250.0
+
+    def set_trigger_readout_line(
+        self,
+        line: Optional[int],
+        window_ms: float = 250.0,
+    ) -> None:
+        """Enable or disable the camera-readout diagnostic on send_trigger.
+
+        When ``line`` is an int, every ``send_trigger`` pulse also samples
+        that DI line for ``window_ms`` and logs whether a rising edge is
+        observed (i.e., whether the camera saw the trigger). Pass ``None`` to
+        disable the check.
+        """
+        self._trigger_readout_line = line
+        self._trigger_readout_window_ms = float(window_ms)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -228,14 +250,20 @@ class NIDAQIOController(AbstractIOController):
         illumination_on_time_us: int = 0,
     ) -> None:
         line = self._parse_do_channel(endpoint.channel_id)
-        self._live_do[line] = True
-        self._daq.start_live_output(do_values=self._live_do)
-        # Pulse high then low — for a real timed pulse the acquisition waveform
-        # path should be used instead.
-        import time
-        time.sleep(max(illumination_on_time_us / 1e6, 0.001))
-        self._live_do[line] = False
-        self._daq.start_live_output(do_values=self._live_do)
+        # Route through the NIDAQ's dedicated pulse task (built once, reused
+        # per fire). Uses a FINITE sample-clocked DO task with a preloaded
+        # pulse pattern — same DO mechanism fast acquisition uses, which
+        # produces hardware-clocked edges the Aries trigger input can latch.
+        pulse_width_us = max(illumination_on_time_us, 1000)
+        # When a readout-diagnostic line is wired (IORegistry resolves the
+        # main_camera.frame_readout endpoint at startup), send_edge_pulse also
+        # samples it and logs whether the camera actually saw the pulse.
+        self._daq.send_edge_pulse(
+            line,
+            pulse_width_us=pulse_width_us,
+            readout_line=self._trigger_readout_line,
+            readout_window_ms=self._trigger_readout_window_ms,
+        )
 
     def set_strobe_delay(self, endpoint: IOEndpoint, delay_us: int) -> None:
         # Strobe delay is built into the waveform when using NI-DAQ for
