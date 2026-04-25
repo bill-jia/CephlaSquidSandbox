@@ -544,6 +544,39 @@ class MultiPointWorker:
             return self.observation_state_names
         return self.region_observation_state_map.get(region_id, self.observation_state_names)
 
+    def _seed_camera_for_first_observation_state(self) -> None:
+        """Apply the first observation state's camera_live snapshot once before streaming.
+
+        Per-FOV applies skip the camera_live block (ROI/binning/camera_mode/pixel_format/
+        trigger) for performance and to avoid re-asserting stale fields between channel
+        switches. That block still has to run *once* so streaming starts in the mode the
+        first observation state actually requires; otherwise the camera carries over
+        whatever the live controller left it in.
+        """
+        if not self.observation_state_names:
+            return
+        first_name = self.observation_state_names[0]
+        state = self._observation_preset_cache.get(first_name)
+        if state is None:
+            try:
+                state = self.microscope.config_repo.load_observation_preset(first_name)
+            except Exception as exc:
+                self._log.warning("Could not load first observation state %r: %s", first_name, exc)
+                return
+            if state is None:
+                return
+            self._observation_preset_cache[first_name] = state
+        if state.camera_live is None:
+            return
+        obs_controller = self.liveController.obs_controller
+        try:
+            obs_controller._apply_camera_live_snapshot(
+                state.camera_live,
+                apply_trigger_settings=False,  # multipoint already configured SOFTWARE trigger; preset's saved trigger (e.g. Continuous) would cause auto-fired frames here.
+            )
+        except Exception as exc:
+            self._log.warning("Could not seed camera_live snapshot from %r: %s", first_name, exc)
+
     def _apply_observation_state(self, preset_name: str) -> ObservationState:
         state = self._observation_preset_cache.get(preset_name)
         if state is None:
@@ -609,6 +642,13 @@ class MultiPointWorker:
             # Force a clean stop→start so any streaming state left by live mode (queued
             # frames, stale trigger config) is discarded before acquisition begins.
             self.camera.stop_streaming()
+            # One-time apply of the first observation state's camera_live snapshot
+            # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
+            # stopped — Tucsen camera mode switches while streaming have caused
+            # issues. Per-FOV applies skip this block (apply_camera_live_snapshot=
+            # False below); without this seed, streaming would start in whatever
+            # mode live mode left the camera in.
+            self._seed_camera_for_first_observation_state()
             self.camera.start_streaming()
             self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)

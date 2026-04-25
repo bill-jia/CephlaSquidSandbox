@@ -2006,7 +2006,7 @@ class FastAcquisitionWidget(QWidget):
             # Add a small safety margin (1% of frame period) to account for timing variations
             max_exposure_time_ms = max(frame_period_ms, readout_time_ms)-0.05
 
-            self._log.info(f"Current frame rate: {frame_rate_hz} Hz, frame period: {frame_period_ms:.2f} ms, readout time: {readout_time_ms:.2f} ms, max exposure time: {max_exposure_time_ms:.2f} ms")
+            self._log.debug(f"Current frame rate: {frame_rate_hz} Hz, frame period: {frame_period_ms:.2f} ms, readout time: {readout_time_ms:.2f} ms, max exposure time: {max_exposure_time_ms:.2f} ms")
             
             # Ensure minimum value
             min_exposure_ms = 0.1

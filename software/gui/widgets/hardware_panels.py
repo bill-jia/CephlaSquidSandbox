@@ -2881,7 +2881,6 @@ class WellSelectionWidget(QTableWidget):
 
     def get_selected_cells(self):
         list_of_selected_cells = []
-        print("getting selected cells...")
         if self.format == "glass slide":
             return list_of_selected_cells
         for index in self.selectedIndexes():
@@ -2891,10 +2890,6 @@ class WellSelectionWidget(QTableWidget):
                 col >= 0 + self.number_of_skip and col <= self.columns - 1 - self.number_of_skip
             ):
                 list_of_selected_cells.append((row, col))
-        if list_of_selected_cells:
-            print("cells:", list_of_selected_cells)
-        else:
-            print("no cells")
         return list_of_selected_cells
 
     def resizeEvent(self, event):

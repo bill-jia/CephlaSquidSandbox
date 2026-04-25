@@ -234,7 +234,7 @@ class ScanCoordinates:
 
     def get_selected_wells(self):
         # get selected wells from the widget
-        self._log.info("getting selected wells for acquisition")
+        self._log.debug("getting selected wells for acquisition")
         if not self.well_selector or self.format == "glass slide":
             return None
 
@@ -415,7 +415,7 @@ class ScanCoordinates:
         self.region_fov_rows.clear()
         self.region_fov_coordinates.clear()
         self._update_callback(ClearedScanCoordinates())
-        self._log.info("Cleared All Regions")
+        self._log.debug("Cleared All Regions")
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
@@ -678,7 +678,7 @@ class ScanCoordinates:
         return int(suffix) if suffix else 0
 
     def sort_coordinates(self):
-        self._log.info(f"Acquisition pattern: {self.acquisition_pattern}")
+        self._log.debug(f"Acquisition pattern: {self.acquisition_pattern}")
 
         if len(self.region_centers) <= 1:
             return

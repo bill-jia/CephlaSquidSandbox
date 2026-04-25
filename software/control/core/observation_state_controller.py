@@ -593,8 +593,19 @@ class ObservationStateController:
             roi_centered=infer_roi_centered_from_camera(self.camera),
         )
 
-    def _apply_camera_live_snapshot(self, snap: CameraLiveSnapshot) -> None:
-        """Apply ROI/binning/mode/trigger saved with the preset."""
+    def _apply_camera_live_snapshot(
+        self,
+        snap: CameraLiveSnapshot,
+        *,
+        apply_trigger_settings: bool = True,
+    ) -> None:
+        """Apply ROI/binning/mode/trigger saved with the preset.
+
+        ``apply_trigger_settings=False`` skips the live trigger_mode/trigger_fps
+        write — used when seeding the camera at multipoint start, where the
+        controller has already set SOFTWARE trigger and overriding it from a
+        preset's saved trigger (e.g. Continuous) would cause auto-fired frames.
+        """
         try:
             with self._time("obs:cls:set_exposure_time"):
                 self.camera.set_exposure_time(snap.exposure_time_ms)
@@ -640,7 +651,7 @@ class ObservationStateController:
                 self._log.warning("Could not set ROI: %s", e)
 
         lc = self.live_controller
-        if lc is not None:
+        if lc is not None and apply_trigger_settings:
             if snap.trigger_mode:
                 try:
                     with self._time("obs:cls:set_trigger_mode"):
