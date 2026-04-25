@@ -8,6 +8,7 @@ from squid.abc import CameraFrame
 
 if TYPE_CHECKING:
     from control.slack_notifier import TimepointStats, AcquisitionStats
+    from control.models.observation_state import ObservationState
 
 
 @dataclass
@@ -78,6 +79,13 @@ class AcquisitionParameters:
     # values are lists of preset names to acquire at that region.
     # None means all regions use selected_observation_state_names.
     region_observation_state_map: Optional[Dict[str, List[str]]] = None
+
+    # Run-only ObservationStates not backed by an on-disk preset. Used when no
+    # preset is checked in the GUI: the controller snapshots the current live
+    # state, names it (e.g. "live"), and passes it here. The worker seeds its
+    # preset cache from this dict so disk loads are skipped, and acquisition.yaml
+    # records these states under ``observation_states_used`` just like real presets.
+    inline_observation_states: Dict[str, "ObservationState"] = field(default_factory=dict)
 
     # Laser-AF per-FOV offset table controls. See _def.LASER_AF_SEED_MODE and
     # LASER_AF_REFRESH_EVERY_N_FOVS for semantics.

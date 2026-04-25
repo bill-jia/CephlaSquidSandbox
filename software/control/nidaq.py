@@ -447,12 +447,6 @@ class NIDAQ(AbstractNIDAQ):
         # was prepared. Used so we can restore live outputs after the task completes.
         self._has_live_overrides_for_acquisition: bool = False
 
-        # Optional TimingManager for sub-timer breakdown of send_edge_pulse.
-        # The worker sets this at acquisition start and clears it at end so
-        # sub-timers end up in the acquisition's timing report only when we're
-        # explicitly profiling the NIDAQ path. None → no instrumentation.
-        self._timing = None
-
         # Configure digital port logic family ONCE at initialization
         # This must be done before any tasks are created
         self._configure_digital_port_logic_family()
@@ -1012,10 +1006,6 @@ class NIDAQ(AbstractNIDAQ):
         """
         line = int(line)
 
-        # Sub-timer scaffolding: record each hot segment if a TimingManager was
-        # attached, otherwise no-op. Segments: lock acquire, DAQmx write.
-        tm = self._timing
-
         # Fast path: line is already part of the persistent task, no rebuild
         # needed. Reading the list and the task reference is atomic under the
         # GIL. If another thread is concurrently rebuilding (rare — only
@@ -1058,22 +1048,9 @@ class NIDAQ(AbstractNIDAQ):
                 di_task.start()
             # Rising edge: flip to the opposite of rest state. Lock held only
             # for the dict update + DAQmx write — releases before the sleep.
-            if tm is not None:
-                t0 = time.perf_counter()
-                self._lock.acquire()
-                t1 = time.perf_counter()
-                try:
-                    self._live_do_values[line] = not original
-                    self._write_persistent_do_state_locked()
-                    t2 = time.perf_counter()
-                finally:
-                    self._lock.release()
-                tm.get_timer("nidaq:pulse:lock_acquire").record(t0, t1)
-                tm.get_timer("nidaq:pulse:write_rising").record(t1, t2)
-            else:
-                with self._lock:
-                    self._live_do_values[line] = not original
-                    self._write_persistent_do_state_locked()
+            with self._lock:
+                self._live_do_values[line] = not original
+                self._write_persistent_do_state_locked()
             # Back-to-back writes produce ~200–500 µs of HIGH naturally. Only
             # sleep if the caller asked for a width substantially longer than
             # that — Windows sleep granularity is ~1 ms, so sub-ms sleeps aren't
@@ -1082,22 +1059,9 @@ class NIDAQ(AbstractNIDAQ):
             if pulse_width_us > 1000:
                 time.sleep(pulse_width_us / 1e6)
             # Falling edge: restore rest state. Same narrow-lock pattern.
-            if tm is not None:
-                t0 = time.perf_counter()
-                self._lock.acquire()
-                t1 = time.perf_counter()
-                try:
-                    self._live_do_values[line] = original
-                    self._write_persistent_do_state_locked()
-                    t2 = time.perf_counter()
-                finally:
-                    self._lock.release()
-                tm.get_timer("nidaq:pulse:lock_acquire").record(t0, t1)
-                tm.get_timer("nidaq:pulse:write_falling").record(t1, t2)
-            else:
-                with self._lock:
-                    self._live_do_values[line] = original
-                    self._write_persistent_do_state_locked()
+            with self._lock:
+                self._live_do_values[line] = original
+                self._write_persistent_do_state_locked()
             if di_task is not None:
                 di_timeout_s = (readout_window_ms / 1000.0) + 0.5
                 di_task.wait_until_done(timeout=di_timeout_s)

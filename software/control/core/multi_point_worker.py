@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import os
 import queue
 import threading
@@ -232,7 +233,11 @@ class MultiPointWorker:
         # ObservationState preset cache — populated during prewarm, consulted by
         # _apply_observation_state. Avoids re-parsing the same YAML 27+ times
         # during a multipoint scan (2 presets × 27 FOVs = 54 redundant loads).
-        self._observation_preset_cache: Dict[str, ObservationState] = {}
+        # Seeded here with any inline (run-only) states supplied by the controller
+        # so disk loads are skipped for synthetic states like "live".
+        self._observation_preset_cache: Dict[str, ObservationState] = dict(
+            acquisition_parameters.inline_observation_states or {}
+        )
         # This is protected by the threading event above (aka set after clear, take copy before set)
         self._current_capture_info: Optional[CaptureInfo] = None
         self._last_illumination_config_name: Optional[str] = None
@@ -551,7 +556,7 @@ class MultiPointWorker:
             self.liveController.obs_controller.apply_observation_state_preset(
                 state,
                 emission_filter_wheel=self._emission_filter_wheel,
-                apply_live_trigger_settings=False,  # Don't apply trigger settings from presets during acquisition, as they may interfere with our configured triggers
+                apply_camera_live_snapshot=False,  # ROI/binning/camera_mode/trigger were set up before acquisition started; re-applying them per channel switch is wasteful and risks dragging in stale fields (e.g. a "default" camera_mode saved by a different camera class).
             )
         return state
 
@@ -596,11 +601,6 @@ class MultiPointWorker:
         laser_af = self.laser_auto_focus_controller
         if laser_af is not None:
             laser_af._timing = self._timing
-        # Same wiring for the NIDAQ so send_edge_pulse's sub-segments
-        # (lock acquire vs. DAQmx write, per edge) show up in the report.
-        nidaq = getattr(self.microscope.addons, "nidaq", None)
-        if nidaq is not None and hasattr(nidaq, "_timing"):
-            nidaq._timing = self._timing
         try:
             first_region, first_region_coords = list(self.scan_region_fov_coords_mm.items())[0]
             first_coords_mm = first_region_coords[0]
@@ -645,8 +645,18 @@ class MultiPointWorker:
                 and self._laser_af_seed_mode == "scan"
                 and self.laser_auto_focus_controller is not None
             ):
-                with self._timing.get_timer("laser_af_seed_scan"):
-                    self._seed_fov_z_map()
+                # Suppress laser-AF sub-timers (af:*) during the one-time seed
+                # scan so they reflect only per-FOV acquisition costs. The outer
+                # laser_af_seed_scan bucket still captures the full seed-scan
+                # wall time for a complete breakdown. Matches the
+                # obs_controller._timing=None pattern used by prewarm.
+                saved_af_timing = self.laser_auto_focus_controller._timing
+                self.laser_auto_focus_controller._timing = None
+                try:
+                    with self._timing.get_timer("laser_af_seed_scan"):
+                        self._seed_fov_z_map()
+                finally:
+                    self.laser_auto_focus_controller._timing = saved_af_timing
 
             while self.time_point < self.Nt:
                 # check if abort acquisition has been requested
@@ -718,16 +728,21 @@ class MultiPointWorker:
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
-            self._log.info(self._timing.get_report())
-            self._log.info(self._timing.get_report(sort=True))
+            # Timing collection and report emission are gated by TimingManager's
+            # class-level switch (SQUID_TIMING_REPORT=1 env var). When disabled,
+            # get_timer() returns a null context manager so every `with ...`
+            # site across the worker/obs_controller/laser_af path is a no-op,
+            # and get_report() returns a short "disabled" line. When enabled,
+            # the full report surfaces at INFO.
+            _timing_level = logging.INFO if utils.TimingManager.is_enabled() else logging.DEBUG
+            self._log.log(_timing_level, self._timing.get_report())
+            self._log.log(_timing_level, self._timing.get_report(sort=True))
             # Detach the timing manager from the obs controller so live-mode
             # calls from widgets don't keep writing into the acquisition's
             # timing report.
             obs_controller._timing = None
             if laser_af is not None:
                 laser_af._timing = None
-            if nidaq is not None and hasattr(nidaq, "_timing"):
-                nidaq._timing = None
             if this_image_callback_id:
                 self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
                 self.camera.remove_frame_callback(this_image_callback_id)
@@ -1021,19 +1036,19 @@ class MultiPointWorker:
 
         if self._alignment_widget is not None and self._alignment_widget.has_offset:
             x_mm, y_mm = self._alignment_widget.apply_offset(x_mm, y_mm)
-            self._log.info(
+            self._log.debug(
                 f"moving to coordinate ({x_mm:.4f}, {y_mm:.4f}) "
                 f"[original: ({coordinate_mm[0]:.4f}, {coordinate_mm[1]:.4f}), offset applied]"
             )
         else:
-            self._log.info(f"moving to coordinate {coordinate_mm}")
+            self._log.debug(f"moving to coordinate {coordinate_mm}")
 
         # check if z is included in the coordinate
         if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
             if (region_id, fov) in self._z_pos_proposal:
                 last_z_mm = self._z_pos_proposal[(region_id, fov)]
                 self.move_to_z_level(last_z_mm, blocking=False)
-                self._log.info(f"Moved to last z position {last_z_mm} [mm]")
+                self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
                 return
             else:
                 self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
@@ -1159,7 +1174,7 @@ class MultiPointWorker:
             )
             t_update = time.perf_counter()
 
-            self._log.info(
+            self._log.debug(
                 f"Updated plate view for well {result.well_id} at ({result.well_row}, {result.well_col}) "
                 f"with {len(result.well_images)} channels"
             )
@@ -1553,7 +1568,7 @@ class MultiPointWorker:
                         obs_controller.apply_observation_state_preset(
                             state,
                             emission_filter_wheel=self._emission_filter_wheel,
-                            apply_live_trigger_settings=False,
+                            apply_camera_live_snapshot=False,
                         )
                     except Exception as exc:
                         # Prewarm is an optimization, not a correctness step —
@@ -1624,7 +1639,7 @@ class MultiPointWorker:
 
             acquire_pos = self.stage.get_pos()
             metadata = {"x": acquire_pos.x_mm, "y": acquire_pos.y_mm, "z": acquire_pos.z_mm}
-            self._log.info(f"Acquiring image: ID={file_ID}, Metadata={metadata}")
+            self._log.debug(f"Acquiring image: ID={file_ID}, Metadata={metadata}")
 
             # TBD: figure out what this means and how it relates to autofocus
             if z_level == 0 and (self.do_reflection_af or self.do_autofocus) and self.Nt > 1:
@@ -2074,7 +2089,7 @@ class MultiPointWorker:
         prior anchor AND no table entry to fall back on (mirrors legacy
         "log and continue" behavior otherwise).
         """
-        self._log.info(f"laser AF refresh (region={region_id} fov={fov})")
+        self._log.debug(f"laser AF refresh (region={region_id} fov={fov})")
         measured_ok = False
         try:
             measured_ok = self.laser_auto_focus_controller.move_to_target(0)
@@ -2133,7 +2148,7 @@ class MultiPointWorker:
         z_offset = config.z_offset_um if isinstance(config, ObservationState) else getattr(config, "z_offset", None)
         if z_offset is not None and z_offset != 0.0:
             direction = 1 if not_offset else -1
-            self._log.info("Moving Z offset" + str(z_offset * direction))
+            self._log.debug("Moving Z offset" + str(z_offset * direction))
             self.stage.move_z(z_offset / 1000 * direction)
             self.wait_till_operation_is_completed()
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)

@@ -132,6 +132,7 @@ def augment_multipoint_acquisition_yaml_dict(
     camera: Any,
     selected_configurations: List[Any],
     obs_names: List[str],
+    inline_observation_states: Optional[Dict[str, Any]] = None,
     logger: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
@@ -142,6 +143,13 @@ def augment_multipoint_acquisition_yaml_dict(
 
     _log = logger or logging.getLogger(__name__)
     uses_presets = bool(obs_names)
+    inline_states = inline_observation_states or {}
+
+    def _resolve_state(pname: str):
+        st = inline_states.get(pname)
+        if st is not None:
+            return st
+        return repo.load_observation_preset(pname)
 
     obs_state: Optional[Any] = None
     if not uses_presets and repo.current_profile:
@@ -157,7 +165,7 @@ def augment_multipoint_acquisition_yaml_dict(
     resolved_channel_names: List[str] = []
     if uses_presets:
         for pname in obs_names:
-            st = repo.load_observation_preset(pname)
+            st = _resolve_state(pname)
             if st and st.illuminator_states:
                 active = st.active_illuminator_states
                 ist = active[0] if active else st.illuminator_states[0]
@@ -191,7 +199,7 @@ def augment_multipoint_acquisition_yaml_dict(
 
         camera_label = getattr(camera, "name", None) or getattr(camera, "serial_number", None) or type(camera).__name__ or "camera"
         for pname in obs_names:
-            st = repo.load_observation_preset(pname)
+            st = _resolve_state(pname)
             if st is not None:
                 observation_states_used[pname] = observation_state_to_yaml(st, camera_label=str(camera_label))
 

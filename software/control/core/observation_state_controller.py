@@ -400,12 +400,18 @@ class ObservationStateController:
         state: ObservationState,
         *,
         emission_filter_wheel: Any = None,
-        apply_live_trigger_settings: bool = True,
+        apply_camera_live_snapshot: bool = True,
     ) -> None:
         """Apply a saved observation state preset.
 
         Handles confocal mode, emission filters, camera_live snapshot (ROI, binning, trigger),
         then delegates to apply_full_observation_state for camera + illumination + optical path.
+
+        ``apply_camera_live_snapshot`` gates the entire camera_live block (ROI, binning,
+        camera_mode, pixel_format, trigger). Multipoint acquisition passes ``False``: those
+        settings were established before the run started and must not be re-asserted between
+        channel switches (it both wastes time and risks re-applying stale fields like a
+        ``camera_mode`` saved by a different camera class).
         """
         with self._time("obs:preset:toggle_confocal_widefield"):
             self.toggle_confocal_widefield(state.confocal_mode)
@@ -454,13 +460,11 @@ class ObservationStateController:
                 except Exception as e:
                     self._log.warning("Could not set pixel format: %s", e)
 
-        # Camera live snapshot (ROI, binning, trigger)
-        if state.camera_live is not None:
+        # Camera live snapshot (ROI, binning, camera_mode, trigger). Skipped during
+        # multipoint acquisition — see docstring.
+        if apply_camera_live_snapshot and state.camera_live is not None:
             with self._time("obs:preset:apply_camera_live_snapshot"):
-                self._apply_camera_live_snapshot(
-                    state.camera_live,
-                    apply_live_trigger_settings=apply_live_trigger_settings,
-                )
+                self._apply_camera_live_snapshot(state.camera_live)
 
         # Full apply (illumination + optical path + state switch)
         with self._time("obs:preset:apply_full_observation_state"):
@@ -589,12 +593,7 @@ class ObservationStateController:
             roi_centered=infer_roi_centered_from_camera(self.camera),
         )
 
-    def _apply_camera_live_snapshot(
-        self,
-        snap: CameraLiveSnapshot,
-        *,
-        apply_live_trigger_settings: bool = True,
-    ) -> None:
+    def _apply_camera_live_snapshot(self, snap: CameraLiveSnapshot) -> None:
         """Apply ROI/binning/mode/trigger saved with the preset."""
         try:
             with self._time("obs:cls:set_exposure_time"):
@@ -641,7 +640,7 @@ class ObservationStateController:
                 self._log.warning("Could not set ROI: %s", e)
 
         lc = self.live_controller
-        if lc is not None and apply_live_trigger_settings:
+        if lc is not None:
             if snap.trigger_mode:
                 try:
                     with self._time("obs:cls:set_trigger_mode"):

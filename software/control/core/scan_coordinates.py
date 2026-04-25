@@ -390,7 +390,6 @@ class ScanCoordinates:
         self.region_fov_rows[well_id] = rows
         self.region_fov_coordinates[well_id] = scan_coordinates
         self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
-        self._log.info(f"Added Region: {well_id}")
 
     def remove_region(self, well_id):
         if well_id in self.region_centers:

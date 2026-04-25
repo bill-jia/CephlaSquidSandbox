@@ -1719,7 +1719,7 @@ class TucsenCamera(AbstractCamera):
         if mode_name == self.get_camera_mode():
             self._log.debug("set_camera_mode: already %s, skipping", mode_name)
             return
-        self._log.info("set_camera_mode: %s -> %s", self.get_camera_mode(), mode_name)
+        self._log.debug("set_camera_mode: %s -> %s", self.get_camera_mode(), mode_name)
 
         modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
         if modes is None:

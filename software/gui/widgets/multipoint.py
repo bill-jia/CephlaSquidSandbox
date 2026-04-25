@@ -1114,10 +1114,6 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.btn_startAcquisition.setChecked(False)
             error_dialog("Please choose base saving directory first")
             return
-        if not _has_checked_items(self.list_configurations):  # no channel selected
-            self.btn_startAcquisition.setChecked(False)
-            error_dialog("Please select at least one observation state first")
-            return
         if pressed:
             if self.multipointController.acquisition_in_progress():
                 self._log.warning("Acquisition in progress or aborting, cannot start another yet.")
@@ -1592,11 +1588,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
-        if not _has_checked_items(self.list_configurations):
-            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
-            return
-
-        # Set the selected channels for acquisition
+        # Set the selected channels for acquisition (empty list = use current
+        # live-controller state as a synthetic single observation state).
         self.multipointController.set_selected_configurations(
             _get_checked_names(self.list_configurations)
         )
@@ -3547,11 +3540,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             QMessageBox.warning(self, "Warning", "Please choose base saving directory first")
             return
 
-        if not _has_checked_items(self.list_configurations):
-            self.btn_startAcquisition.setChecked(False)
-            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
-            return
-
         if pressed:
             if self.multipointController.acquisition_in_progress():
                 self._log.warning("Acquisition in progress or aborting, cannot start another yet.")
@@ -3750,11 +3738,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             save_last_used_saving_path(save_dir_base)
 
     def on_snap_images(self):
-        if not _has_checked_items(self.list_configurations):
-            QMessageBox.warning(self, "Warning", "Please select at least one observation state")
-            return
-
-        # Set the selected channels for acquisition
+        # Set the selected channels for acquisition (empty list = use current
+        # live-controller state as a synthetic single observation state).
         self.multipointController.set_selected_configurations(
             _get_checked_names(self.list_configurations)
         )
@@ -4345,11 +4330,6 @@ class MultiPointWithFluidicsWidget(QFrame):
             if not self.base_path_is_set:
                 self.btn_startAcquisition.setChecked(False)
                 QMessageBox.warning(self, "Warning", "Please choose base saving directory first")
-                return
-
-            if not _has_checked_items(self.list_configurations):
-                self.btn_startAcquisition.setChecked(False)
-                QMessageBox.warning(self, "Warning", "Please select at least one observation state")
                 return
 
             if self.multipointController.acquisition_in_progress():

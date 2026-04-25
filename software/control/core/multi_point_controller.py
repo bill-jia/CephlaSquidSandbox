@@ -37,7 +37,9 @@ import yaml
 from datetime import datetime
 from enum import Enum
 from threading import Thread
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from control.models.observation_state import ObservationState
 
 import numpy as np
 import pandas as pd
@@ -246,6 +248,7 @@ def _save_unified_multipoint_acquisition_yaml(
         camera=camera,
         selected_configurations=[],
         obs_names=list(selected_observation_state_names or []),
+        inline_observation_states=dict(params.inline_observation_states or {}),
         logger=logger,
     )
 
@@ -923,6 +926,27 @@ class MultiPointController:
 
             self.configuration_before_running_multipoint = self.liveController.obs_controller.current_observation_state
 
+            # Edge case: nothing checked in the GUI → use the current live-controller
+            # state as a single synthetic observation state for this run only.
+            # Populated via build_params/AcquisitionParameters; NOT written to the
+            # user's profile observation_presets/. Restored at the end of the run.
+            self._inline_observation_states_for_run: Dict[str, ObservationState] = {}
+            self._selected_observation_state_names_before_run = list(self.selected_observation_state_names)
+            if not self.selected_observation_state_names:
+                from control.core.observation_state_service import collect_emission_filter_positions
+                wheel = getattr(self.liveController.microscope.addons, "emission_filter_wheel", None)
+                try:
+                    emission = collect_emission_filter_positions(wheel)
+                except Exception:
+                    emission = None
+                live_state = self.liveController.obs_controller.collect_observation_state(
+                    emission_filter_positions=emission or None,
+                )
+                live_state = live_state.model_copy(update={"name": "live"})
+                self._inline_observation_states_for_run = {"live": live_state}
+                self.selected_observation_state_names = ["live"]
+                self._log.info("No observation states selected; using current live-controller state as 'live'.")
+
             # Snapshot illumination state before acquisition so it can be restored afterwards
             _illum_ctrl = getattr(self.liveController.microscope, "illumination_controller", None)
             self._illumination_snapshot_before_acquisition = (
@@ -1140,6 +1164,14 @@ class MultiPointController:
                 if self._memory_monitor is not None:
                     self._memory_monitor.stop()
                     self._memory_monitor = None
+                # If we mutated selected_observation_state_names with a synthetic
+                # "live" entry but never started the thread, restore now —
+                # _on_acquisition_completed (which normally restores) won't fire.
+                prior_selection = getattr(self, "_selected_observation_state_names_before_run", None)
+                if prior_selection is not None:
+                    self.selected_observation_state_names = list(prior_selection)
+                    self._selected_observation_state_names_before_run = None
+                self._inline_observation_states_for_run = {}
 
     def build_params(self, scan_position_information: ScanPositionInformation) -> AcquisitionParameters:
         # Determine plate dimensions from wellplate format if available
@@ -1190,6 +1222,7 @@ class MultiPointController:
             xy_mode=self.xy_mode,
             selected_observation_state_names=self.selected_observation_state_names,
             region_observation_state_map=self.region_observation_state_map,
+            inline_observation_states=dict(getattr(self, "_inline_observation_states_for_run", {})),
             laser_af_seed_mode=self.laser_af_seed_mode,
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
@@ -1211,6 +1244,14 @@ class MultiPointController:
                 self._log.exception("Failed to emit signal_acquisition_finished")
 
     def _restore_state_after_acquisition(self):
+        # If we synthesized a "live" preset for this run, undo the selection
+        # injection so subsequent runs (or the GUI) see the original list.
+        prior_selection = getattr(self, "_selected_observation_state_names_before_run", None)
+        if prior_selection is not None:
+            self.selected_observation_state_names = list(prior_selection)
+            self._selected_observation_state_names_before_run = None
+        self._inline_observation_states_for_run = {}
+
         # restore the previous selected mode
         if self.gen_focus_map:
             self.autofocusController.clear_focus_map()

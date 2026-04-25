@@ -378,7 +378,7 @@ class LaserAutofocusController(QObject):
                 return False
 
             current_displacement_um = self.measure_displacement()
-            self._log.info(f"Current laser AF displacement: {current_displacement_um:.1f} μm")
+            self._log.debug(f"Current laser AF displacement: {current_displacement_um:.1f} μm")
 
             if math.isnan(current_displacement_um):
                 self._log.error("Cannot move to target: failed to measure current displacement")
@@ -402,7 +402,7 @@ class LaserAutofocusController(QObject):
                 self._move_z(-um_to_move)
                 return False
             else:
-                self._log.info("Cross correlation check passed - spots are well aligned")
+                self._log.debug("Cross correlation check passed - spots are well aligned")
                 return True
 
     def _move_z(self, um_to_move: float) -> None:
@@ -554,7 +554,7 @@ class LaserAutofocusController(QObject):
                 # Calculate normalized cross correlation
                 correlation = np.corrcoef(current_norm.ravel(), self.reference_crop.ravel())[0, 1]
 
-            self._log.info(f"Cross correlation with reference: {correlation:.3f}")
+            self._log.debug(f"Cross correlation with reference: {correlation:.3f}")
 
             # Check if correlation exceeds threshold
             if correlation < self.laser_af_properties.correlation_threshold:
