@@ -366,8 +366,7 @@ class MultiPointController:
         self.selected_observation_state_names = []
         self.region_observation_state_map = None
         self.scanCoordinates = scan_coordinates
-        self._log.info(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}")
-        self._log.info(f"Scan coordinates format: {self.scanCoordinates.format}")
+        self._log.debug(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}, format: {self.scanCoordinates.format}")
         
         # Display settings
         self.old_images_per_page = 1

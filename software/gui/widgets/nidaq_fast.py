@@ -1851,8 +1851,6 @@ class FastAcquisitionWidget(QWidget):
         acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         acq_group.setLayout(acq_layout)
 
-        self._update_acquisition_time_from_frames()
-
         # --- DAQ configuration (2×2 grid, unchanged logic) ---
         daq_group = QGroupBox("DAQ Configuration")
         daq_layout = QGridLayout()
@@ -1901,6 +1899,8 @@ class FastAcquisitionWidget(QWidget):
 
         daq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         daq_group.setLayout(daq_layout)
+
+        self._update_acquisition_time_from_frames()
 
         # --- Control buttons ---
         control_layout = QHBoxLayout()

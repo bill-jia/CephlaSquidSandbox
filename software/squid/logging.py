@@ -149,7 +149,7 @@ def register_crash_handler(handler, call_existing_too=True):
         if call_existing_too:
             old_unraisable_hook(info)
 
-    logger.info(
+    logger.debug(
         f"Registering custom excepthook, threading excepthook, and unraisable hook using handler={handler.__name__}"
     )
     sys.excepthook = new_excepthook

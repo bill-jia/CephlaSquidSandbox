@@ -61,7 +61,7 @@ class ScanCoordinates:
         self.well_selector = None
         self.acquisition_pattern = control._def.ACQUISITION_PATTERN
         self.fov_pattern = control._def.FOV_PATTERN
-        self._log.info(f"Initializing scan coordinates with wellplate format: {control._def.WELLPLATE_FORMAT}")
+        # self._log.info(f"Initializing scan coordinates with wellplate format: {control._def.WELLPLATE_FORMAT}")
         self.format = control._def.WELLPLATE_FORMAT
         self.a1_x_mm = control._def.A1_X_MM
         self.a1_y_mm = control._def.A1_Y_MM
@@ -421,7 +421,7 @@ class ScanCoordinates:
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
         pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
         fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
-        self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
+        # self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
         fov_w_mm = pixel_size_factor * fov_w_mm_sensor
         fov_h_mm = pixel_size_factor * fov_h_mm_sensor
         overlap_frac = 1 - overlap_percent / 100
@@ -446,7 +446,7 @@ class ScanCoordinates:
 
         # Region coordinates are already centered since center_x, center_y is grid center
         if scan_coordinates:  # Only add region if there are valid coordinates
-            self._log.info(f"Added Flexible Region: {region_id}")
+            # self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
             self.region_fov_rows[region_id] = rows
             self.region_fov_coordinates[region_id] = scan_coordinates

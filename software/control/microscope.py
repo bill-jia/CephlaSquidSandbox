@@ -340,7 +340,6 @@ class LowLevelDrivers:
     ) -> "LowLevelDrivers":
         mc = machine_config or ConfigRepository().get_machine_config()
         teensy_entry = mc.get_device("teensy")
-        print(teensy_entry)
         mcu_simulated = _should_simulate(
             simulated, control._def.SIMULATE_MICROCONTROLLER
         )
