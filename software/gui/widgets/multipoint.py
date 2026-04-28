@@ -304,13 +304,9 @@ def _assign_channel_colors(channel_names, existing_index):
 class _ChannelChipDelegate(QStyledItemDelegate):
     """Paints a well silhouette plus chip-dots for the channels active at that well.
 
-    Reads state from the parent dialog via three callbacks:
-      - is_selectable(well_id) -> bool   (dim non-selected wells)
-      - active_channels(well_id) -> list of channel names (in stable order)
-      - color_for(channel_name) -> QColor
+    Dot grid wraps to multiple rows and is sized/laid out to stay inside the well
+    silhouette (for circular wells, inside the inscribed safe square).
     """
-
-    MAX_DOTS = 6
 
     def __init__(self, parent, dialog):
         super().__init__(parent)
@@ -332,7 +328,6 @@ class _ChannelChipDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # Well silhouette
         outline = QColor("#444444") if selectable else QColor("#bbbbbb")
         pen = QPen(outline)
         pen.setWidth(1)
@@ -353,40 +348,201 @@ class _ChannelChipDelegate(QStyledItemDelegate):
             cy = rect.center().y()
             painter.drawEllipse(cx - side // 2, cy - side // 2, side, side)
 
-        # Chip-dots for active channels
         if selectable:
             active = self._dialog.active_channels(well_id)
             if active:
-                self._paint_chips(painter, rect, active)
+                self._paint_chips(painter, rect, active, shape)
 
         painter.restore()
 
-    def _paint_chips(self, painter, rect, active_channels):
+    def _paint_chips(self, painter, rect, active_channels, well_shape):
         n = len(active_channels)
-        overflow = n > self.MAX_DOTS
-        shown = active_channels[: self.MAX_DOTS]
+        if n == 0:
+            return
 
-        # Lay dots in a horizontal row centered in the cell. Dot size scales with cell.
-        cell_min = min(rect.width(), rect.height())
-        dot_d = max(4, int(cell_min * 0.18))
-        spacing = max(2, dot_d // 3)
-        total_w = len(shown) * dot_d + (len(shown) - 1) * spacing
-        x0 = rect.center().x() - total_w // 2
-        y = rect.center().y() - dot_d // 2
+        # Safe area inside the well silhouette. For circles, inscribe a square
+        # scaled to keep dots clear of the curve.
+        if well_shape == "rectangle":
+            safe = rect.adjusted(3, 3, -3, -3)
+        else:
+            side = int(min(rect.width(), rect.height()) * 0.72)
+            safe = QRect(
+                rect.center().x() - side // 2,
+                rect.center().y() - side // 2,
+                side,
+                side,
+            )
+        if safe.width() < 4 or safe.height() < 4:
+            return
+
+        max_d = max(4, int(min(rect.width(), rect.height()) * 0.26))
+        chosen = None  # (dot_d, cols, rows)
+        for d in range(max_d, 2, -1):
+            sp = max(1, d // 4)
+            cols = max(1, (safe.width() + sp) // (d + sp))
+            rows = max(1, (safe.height() + sp) // (d + sp))
+            if cols * rows >= n:
+                cols = min(cols, n)
+                rows_used = (n + cols - 1) // cols
+                chosen = (d, sp, cols, rows_used)
+                break
+
+        overflow = 0
+        if chosen is None:
+            d = 3
+            sp = 1
+            cols = max(1, (safe.width() + sp) // (d + sp))
+            rows_used = max(1, (safe.height() + sp) // (d + sp))
+            capacity = cols * rows_used
+            overflow = max(0, n - (capacity - 1))
+            chosen = (d, sp, cols, rows_used)
+
+        d, sp, cols, rows_used = chosen
+        n_draw = n - overflow
+
+        grid_h = rows_used * d + (rows_used - 1) * sp
+        y0 = safe.top() + (safe.height() - grid_h) // 2
 
         painter.setPen(QPen(QColor("#222222"), 1))
-        for i, name in enumerate(shown):
-            color = self._dialog.color_for(name)
-            painter.setBrush(color)
-            painter.drawEllipse(x0 + i * (dot_d + spacing), y, dot_d, dot_d)
+
+        def _row_x0(row_idx, items_in_row):
+            row_w = items_in_row * d + (items_in_row - 1) * sp
+            return safe.left() + (safe.width() - row_w) // 2
+
+        full_row_count = n_draw // cols
+        last_row_items = n_draw - full_row_count * cols
+
+        for i in range(n_draw):
+            r = i // cols
+            c = i % cols
+            items_in_row = cols if r < full_row_count else last_row_items
+            x = _row_x0(r, items_in_row) + c * (d + sp)
+            y = y0 + r * (d + sp)
+            painter.setBrush(self._dialog.color_for(active_channels[i]))
+            painter.drawEllipse(x, y, d, d)
 
         if overflow:
-            painter.setPen(QPen(QColor("#222222")))
+            r = n_draw // cols
+            c = n_draw % cols
+            items_in_row = (c + 1) if r == rows_used - 1 else cols
+            x = _row_x0(r, items_in_row) + c * (d + sp)
+            y = y0 + r * (d + sp)
+            painter.setBrush(QColor("#dddddd"))
+            painter.drawEllipse(x, y, d, d)
             font = painter.font()
-            font.setPointSizeF(max(6.0, cell_min * 0.16))
+            font.setPointSizeF(max(5.0, d * 0.65))
             font.setBold(True)
             painter.setFont(font)
-            painter.drawText(rect, Qt.AlignBottom | Qt.AlignRight, f"{n - self.MAX_DOTS}+")
+            painter.drawText(QRect(x, y, d, d), Qt.AlignCenter, f"+{overflow}")
+
+
+def _make_swatch_icon(color_hex, size=14):
+    """Build a small filled circle icon used as the leading swatch on a channel chip button."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor(color_hex))
+    p.setPen(QPen(QColor("#222222"), 1))
+    p.drawEllipse(1, 1, size - 2, size - 2)
+    p.end()
+    return QIcon(pix)
+
+
+def _truncate_label(text, max_len=30):
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def _mix_with_white(color_hex, ratio):
+    """Return an opaque hex color: `ratio` parts channel color + `1-ratio` parts white.
+
+    Stylesheet alpha blends against the *parent* background, which here is
+    palette(window) (typically gray), producing muddy colors. Pre-mixing with
+    white in RGB space gives a tint that still reads as the channel hue.
+    """
+    h = color_hex.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    rm = round(r * ratio + 255 * (1 - ratio))
+    gm = round(g * ratio + 255 * (1 - ratio))
+    bm = round(b * ratio + 255 * (1 - ratio))
+    return f"#{rm:02x}{gm:02x}{bm:02x}"
+
+
+class _ChannelChipButton(QPushButton):
+    """Toolbar chip button with on/off/mixed state.
+
+    Looks like a tinted, raised button rather than a checkbox so it's clearly
+    clickable. The leading icon is a colored swatch matching the well dot, the
+    text shows the (truncated) channel name and the current state badge, and
+    the background tint reflects the on/off/mixed state across the current
+    well selection.
+    """
+
+    STATE_OFF = 0
+    STATE_ON = 1
+    STATE_MIXED = 2
+
+    def __init__(self, full_name, color_hex, parent=None):
+        super().__init__(parent)
+        self._full_name = full_name
+        self._truncated = _truncate_label(full_name, 30)
+        self._color = color_hex
+        self._state = self.STATE_OFF
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIcon(_make_swatch_icon(color_hex, 14))
+        self.setIconSize(QSize(14, 14))
+        self.setMinimumHeight(30)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setToolTip(full_name)
+        self._refresh()
+
+    def set_state(self, state):
+        if state != self._state:
+            self._state = state
+            self._refresh()
+
+    def _refresh(self):
+        if self._state == self.STATE_ON:
+            badge = "● ON"
+            bg = self._color
+            text_color = "white"
+            border = "2px solid #1e1e1e"
+        elif self._state == self.STATE_MIXED:
+            badge = "◐ MIXED"
+            bg = _mix_with_white(self._color, 0.45)
+            text_color = "#1e1e1e"
+            border = f"2px dashed {self._color}"
+        else:
+            # OFF keeps the channel's hue at low intensity so the toolbar still
+            # reads as a color legend without requiring a well selection. Mix
+            # opaque (with white) instead of using alpha so the tint doesn't
+            # blend with the dialog's gray background.
+            badge = "○ OFF"
+            bg = _mix_with_white(self._color, 0.18)
+            text_color = "#1e1e1e"
+            border = f"1px solid {_mix_with_white(self._color, 0.55)}"
+
+        self.setText(f"{self._truncated}    {badge}")
+        self.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {text_color};
+                border: {border};
+                border-radius: 5px;
+                padding: 4px 10px;
+                text-align: left;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                border: 2px solid {self._color};
+            }}
+            QPushButton:pressed {{
+                padding-top: 5px;
+                padding-bottom: 3px;
+            }}
+            """
+        )
 
 
 class WellplateObservationStateDialog(QDialog):
@@ -471,28 +627,45 @@ class WellplateObservationStateDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Select wells, then toggle channels in the toolbar to apply to the selection."))
 
-        # Bulk-edit toolbar
+        # Bulk-edit toolbar: 3 chip buttons per row. Each chip toggles the
+        # channel for the currently-selected wells; the button's tinted state
+        # reflects the union (on / off / mixed) across that selection.
         self._toolbar_frame = QFrame()
-        toolbar = QHBoxLayout(self._toolbar_frame)
-        toolbar.setContentsMargins(4, 2, 4, 2)
-        toolbar.addWidget(QLabel("Channels for selection:"))
-        self._channel_checkboxes = {}
-        for name in self._channels:
-            cb = QCheckBox(name)
-            cb.setTristate(True)
-            color = _CHANNEL_COLOR_PALETTE[self._color_index[name] % len(_CHANNEL_COLOR_PALETTE)]
-            cb.setStyleSheet(f"QCheckBox::indicator {{ background-color: {color}; }}")
-            cb.clicked.connect(lambda checked, ch=name: self._on_channel_clicked(ch))
-            toolbar.addWidget(cb)
-            self._channel_checkboxes[name] = cb
-        toolbar.addStretch()
+        self._toolbar_frame.setFrameShape(QFrame.StyledPanel)
+        toolbar_grid = QGridLayout(self._toolbar_frame)
+        toolbar_grid.setContentsMargins(6, 4, 6, 4)
+        toolbar_grid.setHorizontalSpacing(6)
+        toolbar_grid.setVerticalSpacing(4)
 
+        hint = QLabel("Click a channel chip to toggle it for the selected wells:")
+        toolbar_grid.addWidget(hint, 0, 0, 1, 3)
+
+        self._channel_checkboxes = {}
+        per_row = 3
+        for idx, name in enumerate(self._channels):
+            color = _CHANNEL_COLOR_PALETTE[self._color_index[name] % len(_CHANNEL_COLOR_PALETTE)]
+            chip = _ChannelChipButton(name, color)
+            chip.clicked.connect(lambda _checked=False, ch=name: self._on_channel_clicked(ch))
+            toolbar_grid.addWidget(chip, 1 + idx // per_row, idx % per_row)
+            self._channel_checkboxes[name] = chip
+
+        # Distribute the 3 columns evenly so chips share space.
+        for col in range(per_row):
+            toolbar_grid.setColumnStretch(col, 1)
+
+        # All-on / All-off on a final row, right-aligned.
+        chips_rows = (len(self._channels) + per_row - 1) // per_row
+        extras_row = 1 + chips_rows
         btn_all = QPushButton("All on")
         btn_none = QPushButton("All off")
         btn_all.clicked.connect(lambda: self._apply_all_channels(True))
         btn_none.clicked.connect(lambda: self._apply_all_channels(False))
-        toolbar.addWidget(btn_all)
-        toolbar.addWidget(btn_none)
+        extras = QHBoxLayout()
+        extras.addStretch()
+        extras.addWidget(btn_all)
+        extras.addWidget(btn_none)
+        toolbar_grid.addLayout(extras, extras_row, 0, 1, per_row)
+
         layout.addWidget(self._toolbar_frame)
 
         # Plate matrix
@@ -560,22 +733,21 @@ class WellplateObservationStateDialog(QDialog):
     def _refresh_toolbar_state(self):
         sel = self._selected_well_ids()
         empty = len(sel) == 0
-        for name, cb in self._channel_checkboxes.items():
-            cb.blockSignals(True)
+        for name, chip in self._channel_checkboxes.items():
+            # Keep chips enabled even with no selection so the toolbar reads as
+            # a static color legend on first open. Click is a no-op without a
+            # selection (handled in _on_channel_clicked).
             if empty:
-                cb.setEnabled(False)
-                cb.setCheckState(Qt.Unchecked)
+                chip.set_state(_ChannelChipButton.STATE_OFF)
+                continue
+            on_set = self._state[name]
+            on_count = sum(1 for w in sel if w in on_set)
+            if on_count == 0:
+                chip.set_state(_ChannelChipButton.STATE_OFF)
+            elif on_count == len(sel):
+                chip.set_state(_ChannelChipButton.STATE_ON)
             else:
-                cb.setEnabled(True)
-                on_set = self._state[name]
-                on_count = sum(1 for w in sel if w in on_set)
-                if on_count == 0:
-                    cb.setCheckState(Qt.Unchecked)
-                elif on_count == len(sel):
-                    cb.setCheckState(Qt.Checked)
-                else:
-                    cb.setCheckState(Qt.PartiallyChecked)
-            cb.blockSignals(False)
+                chip.set_state(_ChannelChipButton.STATE_MIXED)
 
     def _on_channel_clicked(self, channel_name):
         sel = self._selected_well_ids()
