@@ -262,6 +262,373 @@ class RegionObservationStateDialog(QDialog):
         return None if all_checked else mapping
 
 
+# Palette of visually distinct hues used to color-code channels (observation states)
+# inside the wellplate per-point-channels dialog. Channels are NOT given a color in
+# their hardware config; this palette is purely a UI affordance. Cycle if exhausted.
+_CHANNEL_COLOR_PALETTE = [
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+    "#7f7f7f",  # gray
+]
+
+
+def _assign_channel_colors(channel_names, existing_index):
+    """Stable channel_name -> palette_index assignment.
+
+    Channels already in `existing_index` keep their slot. New channels claim the
+    smallest unused palette index, cycling once the palette is exhausted. The
+    returned mapping is a shallow update of `existing_index`.
+    """
+    palette_size = len(_CHANNEL_COLOR_PALETTE)
+    used = {existing_index[c] for c in channel_names if c in existing_index}
+    new_index = dict(existing_index)
+    next_slot = 0
+    for name in channel_names:
+        if name in new_index:
+            continue
+        while next_slot in used and next_slot < palette_size:
+            next_slot += 1
+        new_index[name] = next_slot % palette_size
+        used.add(next_slot % palette_size)
+        next_slot += 1
+    return new_index
+
+
+class _ChannelChipDelegate(QStyledItemDelegate):
+    """Paints a well silhouette plus chip-dots for the channels active at that well.
+
+    Reads state from the parent dialog via three callbacks:
+      - is_selectable(well_id) -> bool   (dim non-selected wells)
+      - active_channels(well_id) -> list of channel names (in stable order)
+      - color_for(channel_name) -> QColor
+    """
+
+    MAX_DOTS = 6
+
+    def __init__(self, parent, dialog):
+        super().__init__(parent)
+        self._dialog = dialog
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        well_id = self._dialog.well_id_at(index.row(), index.column())
+        if well_id is None:
+            return
+
+        rect = option.rect.adjusted(2, 2, -2, -2)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        selectable = self._dialog.is_well_selectable(well_id)
+        shape = self._dialog.well_shape
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Well silhouette
+        outline = QColor("#444444") if selectable else QColor("#bbbbbb")
+        pen = QPen(outline)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        if option.state & QStyle.State_Selected and selectable:
+            painter.setBrush(option.palette.highlight())
+        elif not selectable:
+            painter.setBrush(QColor("#f2f2f2"))
+        else:
+            painter.setBrush(QColor("white"))
+
+        if shape == "rectangle":
+            corner_px = max(0, int(min(rect.width(), rect.height()) * 0.08))
+            painter.drawRoundedRect(rect, corner_px, corner_px)
+        else:
+            side = min(rect.width(), rect.height())
+            cx = rect.center().x()
+            cy = rect.center().y()
+            painter.drawEllipse(cx - side // 2, cy - side // 2, side, side)
+
+        # Chip-dots for active channels
+        if selectable:
+            active = self._dialog.active_channels(well_id)
+            if active:
+                self._paint_chips(painter, rect, active)
+
+        painter.restore()
+
+    def _paint_chips(self, painter, rect, active_channels):
+        n = len(active_channels)
+        overflow = n > self.MAX_DOTS
+        shown = active_channels[: self.MAX_DOTS]
+
+        # Lay dots in a horizontal row centered in the cell. Dot size scales with cell.
+        cell_min = min(rect.width(), rect.height())
+        dot_d = max(4, int(cell_min * 0.18))
+        spacing = max(2, dot_d // 3)
+        total_w = len(shown) * dot_d + (len(shown) - 1) * spacing
+        x0 = rect.center().x() - total_w // 2
+        y = rect.center().y() - dot_d // 2
+
+        painter.setPen(QPen(QColor("#222222"), 1))
+        for i, name in enumerate(shown):
+            color = self._dialog.color_for(name)
+            painter.setBrush(color)
+            painter.drawEllipse(x0 + i * (dot_d + spacing), y, dot_d, dot_d)
+
+        if overflow:
+            painter.setPen(QPen(QColor("#222222")))
+            font = painter.font()
+            font.setPointSizeF(max(6.0, cell_min * 0.16))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignBottom | Qt.AlignRight, f"{n - self.MAX_DOTS}+")
+
+
+class WellplateObservationStateDialog(QDialog):
+    """Plate-shaped per-well channel selector for the Wellplate Multipoint widget.
+
+    Each cell shows the well silhouette overlaid with chip-dots, one per channel
+    enabled at that well. Color comes from a stable channel->palette index map
+    owned by the dialog (carried in via the parent so colors persist across opens).
+    The current QTableWidget selection drives a tri-state bulk-edit toolbar at top:
+    toggle a channel checkbox to apply on/off across every selected well.
+
+    Returns Dict[well_id, List[channel_name]] via get_result(); None if every
+    selectable well has every channel.
+    """
+
+    def __init__(
+        self,
+        rows,
+        cols,
+        well_shape,
+        selected_well_ids,
+        channel_names,
+        existing_map=None,
+        color_index=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Per-Well Channels")
+        self._rows = rows
+        self._cols = cols
+        self.well_shape = well_shape
+        self._selected = set(selected_well_ids)
+        self._channels = list(channel_names)
+        self._color_index = _assign_channel_colors(self._channels, color_index or {})
+
+        # Internal state: Dict[channel_name, Set[well_id]]
+        existing_map = existing_map or {}
+        self._state = {ch: set() for ch in self._channels}
+        for well_id in self._selected:
+            active_for_well = existing_map.get(well_id, self._channels)
+            for ch in self._channels:
+                if ch in active_for_well:
+                    self._state[ch].add(well_id)
+
+        self._build_ui()
+        self._refresh_toolbar_state()
+        self._refresh_footer()
+
+    # ---- public accessors used by the chip delegate -----------------------------
+    def well_id_at(self, row, col):
+        if row < 0 or row >= self._rows or col < 0 or col >= self._cols:
+            return None
+        return _row_col_to_well_id(row, col)
+
+    def is_well_selectable(self, well_id):
+        return well_id in self._selected
+
+    def active_channels(self, well_id):
+        return [ch for ch in self._channels if well_id in self._state[ch]]
+
+    def color_for(self, channel_name):
+        idx = self._color_index.get(channel_name, 0)
+        return QColor(_CHANNEL_COLOR_PALETTE[idx % len(_CHANNEL_COLOR_PALETTE)])
+
+    # ---- result -----------------------------------------------------------------
+    def get_result(self):
+        """Return Dict[well_id, List[channel_name]] or None if everything is on."""
+        all_on = True
+        mapping = {}
+        for well_id in self._selected:
+            active = [ch for ch in self._channels if well_id in self._state[ch]]
+            mapping[well_id] = active
+            if len(active) != len(self._channels):
+                all_on = False
+        return None if all_on else mapping
+
+    def get_color_index(self):
+        return dict(self._color_index)
+
+    # ---- UI ---------------------------------------------------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select wells, then toggle channels in the toolbar to apply to the selection."))
+
+        # Bulk-edit toolbar
+        self._toolbar_frame = QFrame()
+        toolbar = QHBoxLayout(self._toolbar_frame)
+        toolbar.setContentsMargins(4, 2, 4, 2)
+        toolbar.addWidget(QLabel("Channels for selection:"))
+        self._channel_checkboxes = {}
+        for name in self._channels:
+            cb = QCheckBox(name)
+            cb.setTristate(True)
+            color = _CHANNEL_COLOR_PALETTE[self._color_index[name] % len(_CHANNEL_COLOR_PALETTE)]
+            cb.setStyleSheet(f"QCheckBox::indicator {{ background-color: {color}; }}")
+            cb.clicked.connect(lambda checked, ch=name: self._on_channel_clicked(ch))
+            toolbar.addWidget(cb)
+            self._channel_checkboxes[name] = cb
+        toolbar.addStretch()
+
+        btn_all = QPushButton("All on")
+        btn_none = QPushButton("All off")
+        btn_all.clicked.connect(lambda: self._apply_all_channels(True))
+        btn_none.clicked.connect(lambda: self._apply_all_channels(False))
+        toolbar.addWidget(btn_all)
+        toolbar.addWidget(btn_none)
+        layout.addWidget(self._toolbar_frame)
+
+        # Plate matrix
+        self._table = QTableWidget(self._rows, self._cols)
+        self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self._table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+
+        # Cell size scales with plate density
+        cell_size = max(20, min(48, 600 // max(self._rows, self._cols)))
+        self._table.horizontalHeader().setDefaultSectionSize(cell_size)
+        self._table.verticalHeader().setDefaultSectionSize(cell_size)
+
+        for r in range(self._rows):
+            for c in range(self._cols):
+                item = QTableWidgetItem()
+                well_id = _row_col_to_well_id(r, c)
+                if well_id in self._selected:
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                else:
+                    item.setFlags(Qt.NoItemFlags)
+                self._table.setItem(r, c, item)
+
+        # Headers: A, B, ... and 1, 2, ...
+        self._table.setVerticalHeaderLabels([_index_to_row_label(i) for i in range(self._rows)])
+        self._table.setHorizontalHeaderLabels([str(i + 1) for i in range(self._cols)])
+
+        self._table.setItemDelegate(_ChannelChipDelegate(self._table, self))
+        self._table.itemSelectionChanged.connect(self._refresh_toolbar_state)
+
+        layout.addWidget(self._table)
+
+        # Footer with per-channel counts
+        self._footer = QLabel("")
+        self._footer.setStyleSheet("color: palette(text);")
+        layout.addWidget(self._footer)
+
+        # OK / Cancel
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+        # Best-effort initial size
+        target_w = min(1200, max(500, cell_size * self._cols + 120))
+        target_h = min(900, max(400, cell_size * self._rows + 200))
+        self.resize(target_w, target_h)
+
+    def _selected_well_ids(self):
+        ids = []
+        for index in self._table.selectedIndexes():
+            well_id = _row_col_to_well_id(index.row(), index.column())
+            if well_id in self._selected:
+                ids.append(well_id)
+        return ids
+
+    def _refresh_toolbar_state(self):
+        sel = self._selected_well_ids()
+        empty = len(sel) == 0
+        for name, cb in self._channel_checkboxes.items():
+            cb.blockSignals(True)
+            if empty:
+                cb.setEnabled(False)
+                cb.setCheckState(Qt.Unchecked)
+            else:
+                cb.setEnabled(True)
+                on_set = self._state[name]
+                on_count = sum(1 for w in sel if w in on_set)
+                if on_count == 0:
+                    cb.setCheckState(Qt.Unchecked)
+                elif on_count == len(sel):
+                    cb.setCheckState(Qt.Checked)
+                else:
+                    cb.setCheckState(Qt.PartiallyChecked)
+            cb.blockSignals(False)
+
+    def _on_channel_clicked(self, channel_name):
+        sel = self._selected_well_ids()
+        if not sel:
+            return
+        # Treat the click as a 2-state toggle: if any selected well is off, turn all on; else turn all off.
+        on_set = self._state[channel_name]
+        any_off = any(w not in on_set for w in sel)
+        if any_off:
+            on_set.update(sel)
+        else:
+            on_set.difference_update(sel)
+        self._refresh_toolbar_state()
+        self._refresh_footer()
+        self._table.viewport().update()
+
+    def _apply_all_channels(self, turn_on):
+        sel = self._selected_well_ids()
+        if not sel:
+            return
+        for ch in self._channels:
+            if turn_on:
+                self._state[ch].update(sel)
+            else:
+                self._state[ch].difference_update(sel)
+        self._refresh_toolbar_state()
+        self._refresh_footer()
+        self._table.viewport().update()
+
+    def _refresh_footer(self):
+        total = len(self._selected)
+        parts = []
+        for name in self._channels:
+            on = len(self._state[name] & self._selected)
+            parts.append(f"{name}: {on}/{total}")
+        self._footer.setText("  |  ".join(parts) if parts else "")
+
+
+def _index_to_row_label(index):
+    """0->A, 25->Z, 26->AA, 27->AB, ... (matches scan_coordinates._index_to_row)."""
+    index += 1
+    label = ""
+    while index > 0:
+        index -= 1
+        label = chr(index % 26 + ord("A")) + label
+        index //= 26
+    return label
+
+
+def _row_col_to_well_id(row, col):
+    return f"{_index_to_row_label(row)}{col + 1}"
+
+
 class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
@@ -2036,6 +2403,16 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
+        # Per-point (per-well) channel override. None means "use global selection at every well".
+        self._region_obs_state_map = None
+        # Stable channel_name -> palette index, persists across dialog opens for color continuity.
+        self._channel_color_index = {}
+        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_per_point_channels.setToolTip(
+            "Override which observation states acquire at each selected well. "
+            "Asterisk indicates a custom map is active."
+        )
+
         # Add a combo box for shape selection
         self.combobox_shape = QComboBox()
         self.combobox_shape.addItems(["Square", "Circle", "Rectangle"])
@@ -2312,8 +2689,14 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.z_controls_range_frame.setVisible(False)  # Initially hidden (shown when "Set Range" mode)
         grid.addWidget(self.z_controls_range_frame, 1, 0, 1, 3)  # Span full row (columns 0, 1, 2)
 
-        # Configuration list
-        grid.addWidget(self.list_configurations, 2, 0)
+        # Configuration list + Per-Point Channels button (shares the cell so the
+        # button reclaims vertical space that would otherwise sit empty next to
+        # the Z-stack frames above).
+        config_cell = QVBoxLayout()
+        config_cell.setContentsMargins(0, 0, 0, 0)
+        config_cell.addWidget(self.list_configurations)
+        config_cell.addWidget(self.btn_per_point_channels)
+        grid.addLayout(config_cell, 2, 0)
 
         # Options and Start button
         options_layout = QVBoxLayout()
@@ -2422,6 +2805,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_show_live_during_acquisition
         )
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
+        self.list_configurations.itemChanged.connect(self._reset_per_point_channels_map)
+        self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
@@ -3599,7 +3984,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_selected_configurations(
                 _get_checked_names(self.list_configurations)
             )
-            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -3781,6 +4166,67 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         for name in _multipoint_observation_preset_display_names(self.microscope):
             self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
         self.list_configurations.blockSignals(False)
+        self._reset_per_point_channels_map()
+
+    def _reset_per_point_channels_map(self):
+        """Drop any per-well channel override and refresh the button label.
+
+        Called when the global channel selection or well selection changes,
+        since the stored mapping references channel names / well IDs that may
+        no longer exist.
+        """
+        self._region_obs_state_map = None
+        self._update_per_point_button_text()
+
+    def _update_per_point_button_text(self):
+        if self._region_obs_state_map is not None:
+            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+        else:
+            self.btn_per_point_channels.setText("Per-Point\nChannels")
+
+    def open_per_point_channels_dialog(self):
+        obs_names = _get_checked_names(self.list_configurations)
+        if not obs_names:
+            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            return
+
+        # Region IDs come from the populated scan coordinates (well IDs like "A1").
+        well_ids = sorted(self.scanCoordinates.region_centers.keys())
+        if not well_ids:
+            QMessageBox.warning(self, "Warning", "Please select at least one well first")
+            return
+
+        # Plate geometry: prefer the well-selection widget if available; else fall
+        # back to scanCoordinates' own format (used during glass-slide / manual modes).
+        rows = cols = None
+        well_shape = "circle"
+        if self.well_selection_widget is not None and getattr(self.well_selection_widget, "rows", None):
+            rows = self.well_selection_widget.rows
+            cols = self.well_selection_widget.columns
+            well_shape = getattr(self.well_selection_widget, "well_shape", "circle")
+        else:
+            # Manual / current-position / glass-slide modes have no plate matrix.
+            QMessageBox.information(
+                self,
+                "Per-Point Channels",
+                "Per-Point Channels is only available in 'Select Wells' mode with a wellplate format.",
+            )
+            return
+
+        dialog = WellplateObservationStateDialog(
+            rows=rows,
+            cols=cols,
+            well_shape=well_shape,
+            selected_well_ids=well_ids,
+            channel_names=obs_names,
+            existing_map=self._region_obs_state_map,
+            color_index=self._channel_color_index,
+            parent=self,
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self._region_obs_state_map = dialog.get_result()
+            self._channel_color_index = dialog.get_color_index()
+            self._update_per_point_button_text()
 
     def toggle_coordinate_controls(self, has_coordinates: bool):
         """Toggle button text and control states based on whether coordinates are loaded"""
