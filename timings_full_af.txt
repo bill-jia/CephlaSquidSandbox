@@ -1,4 +1,6 @@
-$env:SQUID_TIMING_REPORT=1 python
+In powershell
+$env:SQUID_TIMING_REPORT=1
+python main_hcs.py
 
 run_single_time_point: (N=1, total=22.1707 [s]): mean=22.1707 [s], median=22.1707 [s], min/max=22.1707/22.1707 [s]
     run_coordinate_acquisition: (N=1, total=22.0776 [s]): mean=22.0776 [s], median=22.0776 [s], min/max=22.0776/22.0776 [s]
