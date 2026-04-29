@@ -251,6 +251,7 @@ class HighContentScreeningGui(QMainWindow):
         self._init_observation_state_from_general_yaml()
         self.setup_layout()
         self.make_connections()
+        self._setup_observation_state_cache_timer()
 
         # Emit initial performance mode state to sync widgets
         self.signal_performance_mode_changed.emit(self.performance_mode)
@@ -681,12 +682,26 @@ class HighContentScreeningGui(QMainWindow):
         Applies ALL illuminator states from ALL observation states to the IC
         (so every channel's intensity/on-off is correct), then sets the active
         observation state for camera settings from the last active channel.
+
+        If general.yaml is missing or unreadable, bootstraps an ObservationState
+        from the current hardware state so widgets work immediately and the
+        next periodic cache write has something to persist.
         """
         obs = self.microscope.obs_controller
         ic = self.microscope.illumination_controller
         state = self.microscope.config_repo.get_observation_state()
         if state is None:
-            self.log.warning("No observation state in general.yaml — skipping initialization")
+            self.log.info("No observation state in general.yaml — bootstrapping from hardware")
+            try:
+                obs.bootstrap_state_from_hardware()
+            except Exception as e:
+                self.log.warning("Could not bootstrap observation state from hardware: %s", e)
+                return
+            try:
+                obs.cache_current_state_to_disk()
+            except Exception as e:
+                self.log.warning("Could not seed general.yaml from bootstrapped state: %s", e)
+            # Bootstrapped state already mirrors hardware — nothing to apply back
             return
 
         # Apply illuminator states to the IC
@@ -731,6 +746,44 @@ class HighContentScreeningGui(QMainWindow):
                 self.illuminationWidget._refresh_from_state()
             except Exception as e:
                 self.log.warning("Could not refresh illumination widget on startup: %s", e)
+
+    def _setup_observation_state_cache_timer(self) -> None:
+        """Start a timer that periodically writes the live ObservationState to general.yaml.
+
+        Skipped while any acquisition (multipoint or fast) is running to avoid
+        disk contention and surprise writes during a run. Shutdown still flushes
+        via ``cache_current_state_to_disk`` in ``_cleanup_common``.
+        """
+        self._observation_state_cache_timer = QTimer(self)
+        self._observation_state_cache_timer.setInterval(30_000)  # 30 s; throttle disk writes
+        self._observation_state_cache_timer.timeout.connect(self._tick_observation_state_cache)
+        self._observation_state_cache_timer.start()
+
+    def _is_acquisition_in_progress(self) -> bool:
+        """True if any acquisition (multipoint or fast) is currently running."""
+        if self.multipointController is not None:
+            try:
+                if self.multipointController.acquisition_in_progress():
+                    return True
+            except Exception:
+                pass
+        # Fast acquisition (camera-driven) and DAQ-only fast acq each own a
+        # FastAcquisitionController; both expose _is_acquiring.
+        fast_widget = getattr(self, "fastAcquisitionWidget", None)
+        if fast_widget is not None and getattr(fast_widget, "_is_acquiring", False):
+            return True
+        nidaq_widget = getattr(self, "niDAQWidget", None)
+        if nidaq_widget is not None and getattr(nidaq_widget, "_daq_only_acquiring", False):
+            return True
+        return False
+
+    def _tick_observation_state_cache(self) -> None:
+        if self._is_acquisition_in_progress():
+            return
+        try:
+            self.microscope.obs_controller.cache_current_state_to_disk()
+        except Exception as e:
+            self.log.warning("Periodic observation state cache failed: %s", e)
 
     def setupImageDisplayTabs(self):
         if USE_NAPARI_FOR_LIVE_VIEW:
@@ -2398,11 +2451,23 @@ class HighContentScreeningGui(QMainWindow):
             else:
                 raise
 
+        timer = getattr(self, "_observation_state_cache_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                if for_restart:
+                    self.log.exception(f"Error stopping observation state cache timer during {context}")
+                else:
+                    raise
+
         try:
-            self.microscope.config_repo.persist_observation_state()
+            # Flush a fresh hardware snapshot to general.yaml on close so the
+            # next startup restores the user's last live configuration.
+            self.microscope.obs_controller.cache_current_state_to_disk()
         except Exception:
             if for_restart:
-                self.log.exception(f"Error persisting general config during {context}")
+                self.log.exception(f"Error persisting observation state during {context}")
             else:
                 raise
 

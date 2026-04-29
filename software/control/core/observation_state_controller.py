@@ -471,6 +471,65 @@ class ObservationStateController:
             self.apply_full_observation_state(state)
 
     # ─────────────────────────────────────────────────────────────────────
+    # Cache / bootstrap (live state ↔ general.yaml)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _collect_live_state_with_emission_filters(self) -> ObservationState:
+        """Collect the current hardware-true state including emission filter positions.
+
+        Falls back to the previously-known emission filter positions if the wheel
+        cannot be queried (e.g. transient hardware error), so they are not wiped.
+        """
+        from control.core.observation_state_service import collect_emission_filter_positions
+
+        wheel = None
+        if self.microscope is not None:
+            wheel = getattr(self.microscope.addons, "emission_filter_wheel", None)
+        try:
+            emission = collect_emission_filter_positions(wheel) if wheel else {}
+        except Exception:
+            emission = {}
+        if not emission and self._current_state is not None:
+            emission = dict(self._current_state.emission_filter_positions or {})
+        return self.collect_observation_state(emission_filter_positions=emission or None)
+
+    def bootstrap_state_from_hardware(self) -> ObservationState:
+        """Build an ObservationState from current hardware and adopt it as the active state.
+
+        Used at startup when no persisted state is available (missing/empty
+        general.yaml) so widgets and live triggering have a valid state immediately.
+        """
+        state = self._collect_live_state_with_emission_filters()
+        self._current_state = state
+        return state
+
+    def cache_current_state_to_disk(self) -> bool:
+        """Snapshot live hardware state and write it to general.yaml.
+
+        Replaces the in-memory ``_current_state`` (and the repository's general
+        cache) with the freshly collected state so subsequent reads stay
+        consistent with what was just persisted.
+
+        Caller is responsible for throttling and gating on acquisition state.
+        Returns True on success, False if no profile is active or save failed.
+        """
+        profile = self.config_repo.current_profile
+        if not profile:
+            return False
+        try:
+            state = self._collect_live_state_with_emission_filters()
+        except Exception as e:
+            self._log.warning("Could not collect observation state for cache: %s", e)
+            return False
+        try:
+            self.config_repo.save_observation_state(profile, state)
+        except Exception as e:
+            self._log.warning("Could not write observation state cache to disk: %s", e)
+            return False
+        self._current_state = state
+        return True
+
+    # ─────────────────────────────────────────────────────────────────────
     # Collection (moved from observation_state_service)
     # ─────────────────────────────────────────────────────────────────────
 

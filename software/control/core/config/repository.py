@@ -781,8 +781,9 @@ class ConfigRepository:
         """
         Update a specific setting of the observation state in-memory.
 
-        Changes are held in the cached ObservationState and written to
-        general.yaml only at application shutdown (via :meth:`persist_observation_state`).
+        Changes are held in the cached ObservationState; flush to general.yaml
+        is driven by the GUI's periodic cache timer and shutdown hook (see
+        ``ObservationStateController.cache_current_state_to_disk``).
 
         Supported settings:
         - "ExposureTime" -> camera_settings.exposure_time_ms
@@ -836,18 +837,6 @@ class ConfigRepository:
             setattr(state.camera_settings, field, value)
 
         return True
-
-    def persist_observation_state(self) -> None:
-        """Write the in-memory ObservationState to general.yaml.
-
-        Call at application shutdown to persist changes made during the session.
-        """
-        profile = self._current_profile
-        if not profile:
-            return
-        state = self.get_observation_state()
-        if state is not None:
-            self.save_observation_state(profile, state)
 
     def get_last_active_channel_name(self) -> Optional[str]:
         """Read the channel name that was active when the app last shut down."""
