@@ -4,6 +4,7 @@ from control.nidaq import (
     AbstractNIDAQ,
     WaveformData,
     AcquisitionResult,
+    NIDAQConfigSnapshot,
     TriggerSource,
     TriggerEdge,
     create_ni_daq,
@@ -11,6 +12,8 @@ from control.nidaq import (
     generate_square_wave,
     generate_ramp_wave,
     generate_pulse_train,
+    save_waveform_config_h5,
+    load_waveform_config_h5,
 )
 from control.models.io_endpoint_config import IOControllerType, IOSignalType, IODirection
 
@@ -263,7 +266,25 @@ class NIDAQWidget(QWidget):
         
         do_group.setLayout(do_layout)
         left_panel.addWidget(do_group)
-        
+
+        # Waveform configuration save/load (HDF5 file format matches the
+        # daq_data.h5 written by FastAcquisitionController, so an experiment's
+        # daq_data.h5 can be loaded directly here).
+        wf_config_group = QGroupBox("Waveform Configuration")
+        wf_config_group.setToolTip(
+            "Save current AO/DO waveforms and trigger settings to an HDF5 file, "
+            "or load from a saved config or experiment's waveforms/daq_data.h5."
+        )
+        wf_config_layout = QHBoxLayout()
+        self.save_waveform_config_btn = QPushButton("Save Config…")
+        self.save_waveform_config_btn.clicked.connect(self._on_save_waveform_config_clicked)
+        wf_config_layout.addWidget(self.save_waveform_config_btn)
+        self.load_waveform_config_btn = QPushButton("Load Config…")
+        self.load_waveform_config_btn.clicked.connect(self._on_load_waveform_config_clicked)
+        wf_config_layout.addWidget(self.load_waveform_config_btn)
+        wf_config_group.setLayout(wf_config_layout)
+        left_panel.addWidget(wf_config_group)
+
         # Live output (constant values for debugging; does not overwrite waveform/pattern data)
         live_group = QGroupBox("Live Output")
         live_group.setToolTip(
@@ -924,6 +945,234 @@ class NIDAQWidget(QWidget):
         # Update waveform plot
         self._update_waveform_plot()
     
+    def build_config_snapshot(self) -> NIDAQConfigSnapshot:
+        """Build a NIDAQConfigSnapshot from current widget state."""
+        # Push UI state into the NI DAQ first so attributes match the controls.
+        self._update_config()
+
+        selected_ao: list[str] = []
+        for i in range(self.ao_channels_list.count()):
+            item = self.ao_channels_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected_ao.append(item.data(Qt.UserRole) or item.text())
+
+        selected_ai: list[str] = []
+        for i in range(self.ai_channels_list.count()):
+            item = self.ai_channels_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected_ai.append(item.data(Qt.UserRole) or item.text())
+
+        selected_do: list[int] = [
+            i for i in range(self.do_lines_list.count())
+            if self.do_lines_list.item(i).checkState() == Qt.Checked
+        ]
+
+        trigger_source = getattr(self._ni_daq, "trigger_source", None)
+        trigger_edge = getattr(self._ni_daq, "trigger_edge", None)
+        return NIDAQConfigSnapshot(
+            device_name=str(getattr(self._ni_daq, "device_name", "") or "") or None,
+            sample_rate_hz=float(self._ni_daq.sample_rate_hz),
+            samples_per_channel=int(self._ni_daq.samples_per_channel),
+            do_port=str(getattr(self._ni_daq, "do_port", "") or "") or None,
+            trigger_source=getattr(trigger_source, "name", None) or (str(trigger_source) if trigger_source else None),
+            trigger_edge=getattr(trigger_edge, "name", None) or (str(trigger_edge) if trigger_edge else None),
+            external_trigger_terminal=str(getattr(self._ni_daq, "external_trigger_terminal", "") or "") or None,
+            ai_terminal_config=str(getattr(self._ni_daq, "ai_terminal_config", "") or "") or None,
+            do_logic_family=str(getattr(self._ni_daq, "do_logic_family", "") or "") or None,
+            continuous=bool(getattr(self._ni_daq, "continuous", False)),
+            selected_ao_channels=selected_ao,
+            selected_ai_channels=selected_ai,
+            selected_do_lines=selected_do,
+            selected_di_lines=[int(x) for x in (getattr(self._ni_daq, "di_lines", []) or [])],
+        )
+
+    def save_waveform_config(self, filepath: str) -> None:
+        """Save current AO/DO waveforms and config snapshot to an HDF5 file."""
+        snapshot = self.build_config_snapshot()
+        waveforms = self.get_waveforms()
+        descriptions = (
+            self._ni_daq.get_channel_descriptions()
+            if self._ni_daq is not None and hasattr(self._ni_daq, "get_channel_descriptions")
+            else None
+        )
+        save_waveform_config_h5(filepath, waveforms, snapshot=snapshot, descriptions=descriptions)
+        self._log.info(f"Saved NIDAQ waveform config to {filepath}")
+
+    def load_waveform_config(self, filepath: str) -> None:
+        """Load AO/DO waveforms and config from an HDF5 file into the widget.
+
+        Accepts both standalone configs and an experiment's
+        ``waveforms/daq_data.h5`` (analog/digital input data, if present, are
+        ignored). The hardware device selection is not changed; only widget
+        state and per-channel selections are applied.
+        """
+        waveforms, snapshot, descriptions = load_waveform_config_h5(filepath)
+
+        if not waveforms.analog_output and not waveforms.digital_output:
+            raise ValueError(
+                f"{filepath} contains no analog_output or digital_output datasets"
+            )
+
+        # Determine sample rate / sample count, falling back to waveform length
+        # when not present in the snapshot (older daq_data.h5 may lack them).
+        any_waveform = next(
+            iter(list(waveforms.analog_output.values()) + list(waveforms.digital_output.values())),
+            None,
+        )
+        derived_samples = int(len(any_waveform)) if any_waveform is not None else None
+        sample_rate_hz = (
+            snapshot.sample_rate_hz
+            if snapshot.sample_rate_hz is not None
+            else float(self._ni_daq.sample_rate_hz)
+        )
+        samples_per_channel = (
+            snapshot.samples_per_channel
+            if snapshot.samples_per_channel is not None
+            else (derived_samples if derived_samples is not None else int(self._ni_daq.samples_per_channel))
+        )
+
+        # Block destructive resampling triggers from sample-rate / samples spinboxes
+        # while we set them to match the loaded waveforms.
+        self._updating_daq_duration_sync = True
+        self.sample_rate_spin.blockSignals(True)
+        self.num_samples_spin.blockSignals(True)
+        self.daq_only_duration_spin.blockSignals(True)
+        try:
+            self._ao_waveforms = dict(waveforms.analog_output)
+            self._do_patterns = dict(waveforms.digital_output)
+            self._ni_daq.sample_rate_hz = float(sample_rate_hz)
+            self._ni_daq.samples_per_channel = int(samples_per_channel)
+            self.sample_rate_spin.setValue(float(sample_rate_hz))
+            self.num_samples_spin.setValue(int(samples_per_channel))
+            if sample_rate_hz > 0:
+                self.daq_only_duration_spin.setValue(samples_per_channel / sample_rate_hz)
+
+            # Apply trigger / port / AI-terminal / continuous from the snapshot.
+            if snapshot.do_port:
+                idx = self.do_port_combo.findText(snapshot.do_port)
+                if idx >= 0:
+                    self.do_port_combo.setCurrentIndex(idx)
+            if snapshot.trigger_source:
+                src = snapshot.trigger_source.upper()
+                if src.startswith("SOFTWARE"):
+                    self.trigger_source_combo.setCurrentText("Software")
+                elif src.startswith("EXTERNAL"):
+                    self.trigger_source_combo.setCurrentText("External")
+                elif src.startswith("INTERNAL"):
+                    self.trigger_source_combo.setCurrentText("Internal")
+            if snapshot.trigger_edge:
+                self.trigger_edge_combo.setCurrentText(
+                    "Rising" if snapshot.trigger_edge.upper().startswith("RISING") else "Falling"
+                )
+            if snapshot.external_trigger_terminal:
+                self.trigger_terminal_edit.setText(snapshot.external_trigger_terminal)
+            if snapshot.ai_terminal_config:
+                idx = self.ai_terminal_combo.findText(snapshot.ai_terminal_config)
+                if idx >= 0:
+                    self.ai_terminal_combo.setCurrentIndex(idx)
+            if snapshot.continuous is not None:
+                self.continuous_checkbox.setChecked(bool(snapshot.continuous))
+            if (
+                snapshot.device_name
+                and snapshot.device_name != self.device_combo.currentText()
+            ):
+                self._log.info(
+                    f"Loaded waveform config was saved for device '{snapshot.device_name}'; "
+                    f"keeping current device '{self.device_combo.currentText()}'."
+                )
+
+            # Apply per-endpoint selection checkboxes.
+            if snapshot.selected_ao_channels is not None:
+                wanted_ao = set(snapshot.selected_ao_channels)
+                for i in range(self.ao_channels_list.count()):
+                    item = self.ao_channels_list.item(i)
+                    ch_name = item.data(Qt.UserRole) or item.text()
+                    item.setCheckState(Qt.Checked if ch_name in wanted_ao else Qt.Unchecked)
+            if snapshot.selected_ai_channels is not None:
+                wanted_ai = set(snapshot.selected_ai_channels)
+                for i in range(self.ai_channels_list.count()):
+                    item = self.ai_channels_list.item(i)
+                    ch_name = item.data(Qt.UserRole) or item.text()
+                    item.setCheckState(Qt.Checked if ch_name in wanted_ai else Qt.Unchecked)
+            if snapshot.selected_do_lines is not None:
+                wanted_do = set(int(x) for x in snapshot.selected_do_lines)
+                for i in range(self.do_lines_list.count()):
+                    self.do_lines_list.item(i).setCheckState(
+                        Qt.Checked if i in wanted_do else Qt.Unchecked
+                    )
+        finally:
+            self.sample_rate_spin.blockSignals(False)
+            self.num_samples_spin.blockSignals(False)
+            self.daq_only_duration_spin.blockSignals(False)
+            self._updating_daq_duration_sync = False
+
+        # Apply channel descriptions and DI selection (no list widget for DI).
+        if descriptions and hasattr(self._ni_daq, "set_channel_descriptions"):
+            try:
+                self._ni_daq.set_channel_descriptions(descriptions)
+            except Exception as e:
+                self._log.warning(f"Failed to apply channel descriptions: {e}")
+        if snapshot.selected_di_lines is not None:
+            try:
+                self._ni_daq.configure_task_io(di_lines=snapshot.selected_di_lines)
+            except Exception as e:
+                self._log.warning(f"Failed to apply DI line selection: {e}")
+
+        # Push the rest into the NI DAQ and refresh dependent UI.
+        self._update_config()
+        self._update_duration_display()
+        self._update_waveform_plot()
+        self._rebuild_live_output_controls()
+        self._log.info(
+            f"Loaded NIDAQ waveform config from {filepath}: "
+            f"{len(self._ao_waveforms)} AO, {len(self._do_patterns)} DO, "
+            f"rate={sample_rate_hz} Hz, samples={samples_per_channel}"
+        )
+
+    def _on_save_waveform_config_clicked(self):
+        """Open a save dialog and persist the current waveform config."""
+        if not self._ao_waveforms and not self._do_patterns:
+            error_dialog(
+                "No analog or digital output waveforms configured. "
+                "Add at least one waveform or pattern before saving.",
+                "Nothing to Save",
+            )
+            return
+        dialog = QFileDialog()
+        default_name = f"nidaq_waveform_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.h5"
+        path, _ = dialog.getSaveFileName(
+            self,
+            "Save NIDAQ Waveform Configuration",
+            default_name,
+            "HDF5 files (*.h5 *.hdf5);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not (path.endswith(".h5") or path.endswith(".hdf5")):
+            path = path + ".h5"
+        try:
+            self.save_waveform_config(path)
+        except Exception as e:
+            self._log.error(f"Failed to save waveform config: {e}", exc_info=True)
+            error_dialog(f"Failed to save waveform config: {e}", "Save Error")
+
+    def _on_load_waveform_config_clicked(self):
+        """Open a load dialog and restore a waveform config from disk."""
+        dialog = QFileDialog()
+        path, _ = dialog.getOpenFileName(
+            self,
+            "Load NIDAQ Waveform Configuration",
+            "",
+            "HDF5 files (*.h5 *.hdf5);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            self.load_waveform_config(path)
+        except Exception as e:
+            self._log.error(f"Failed to load waveform config: {e}", exc_info=True)
+            error_dialog(f"Failed to load waveform config: {e}", "Load Error")
+
     def _rebuild_live_output_controls(self):
         """Rebuild the Live output panel from current _ao_waveforms and _do_patterns."""
         # Clear existing (handles both widgets and nested layouts/rows)

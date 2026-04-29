@@ -69,27 +69,51 @@ class WaveformData:
 @dataclass
 class AcquisitionResult:
     """Container for acquisition results."""
-    
+
     # Analog input data: dict mapping channel name to numpy array
     analog_input: Dict[str, np.ndarray] = field(default_factory=dict)
-    
+
     # Digital input data: dict mapping line index to numpy array of bool
     digital_input: Dict[int, np.ndarray] = field(default_factory=dict)
 
     # Analog output data: dict mapping channel name to numpy array
     analog_output: Dict[str, np.ndarray] = field(default_factory=dict)
-    
+
     # Digital output data: dict mapping line index to numpy array of bool
     digital_output: Dict[int, np.ndarray] = field(default_factory=dict)
-    
+
     # Timestamps for the samples (seconds from start)
     timestamps: Optional[np.ndarray] = None
-    
+
     # Sample rate used for acquisition
     sample_rate_hz: float = 0.0
-    
+
     # Number of samples acquired per channel
     samples_acquired: int = 0
+
+
+@dataclass
+class NIDAQConfigSnapshot:
+    """Persisted subset of NIDAQ widget settings saved alongside waveforms.
+
+    All fields are optional so partial snapshots (e.g. an experiment's
+    ``daq_data.h5`` that pre-dates a particular field) round-trip cleanly.
+    """
+
+    device_name: Optional[str] = None
+    sample_rate_hz: Optional[float] = None
+    samples_per_channel: Optional[int] = None
+    do_port: Optional[str] = None
+    trigger_source: Optional[str] = None  # "SOFTWARE" / "EXTERNAL" / "INTERNAL"
+    trigger_edge: Optional[str] = None  # "RISING" / "FALLING"
+    external_trigger_terminal: Optional[str] = None
+    ai_terminal_config: Optional[str] = None
+    do_logic_family: Optional[str] = None
+    continuous: Optional[bool] = None
+    selected_ao_channels: Optional[List[str]] = None
+    selected_ai_channels: Optional[List[str]] = None
+    selected_do_lines: Optional[List[int]] = None
+    selected_di_lines: Optional[List[int]] = None
 
 
 def _count_rising_edges(samples) -> int:
@@ -1960,5 +1984,225 @@ def generate_pulse_train(
 
     if inverted:
         pattern = ~pattern
-    
+
     return pattern
+
+
+# ============================================================================
+# Waveform Configuration Persistence (HDF5)
+# ============================================================================
+
+# Snapshot fields that are written/read as scalar HDF5 attributes (string-or-
+# scalar typed). Sequence fields (selected_*_channels/lines) are stored as
+# datasets under /widget_config/ to preserve element ordering.
+_SNAPSHOT_SCALAR_ATTRS: Tuple[str, ...] = (
+    "device_name",
+    "sample_rate_hz",
+    "samples_per_channel",
+    "do_port",
+    "trigger_source",
+    "trigger_edge",
+    "external_trigger_terminal",
+    "ai_terminal_config",
+    "do_logic_family",
+    "continuous",
+)
+
+
+def _do_line_index_from_dataset_name(name: str) -> Optional[int]:
+    """Parse the integer line number from a ``"line<N>"`` dataset basename."""
+    if not name.startswith("line"):
+        return None
+    try:
+        return int(name[4:])
+    except ValueError:
+        return None
+
+
+def write_waveform_datasets_h5(
+    h5file,
+    waveforms: WaveformData,
+    descriptions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Write AO/DO waveform arrays to an open HDF5 file/group.
+
+    Layout (matches FastAcquisitionController._save_daq_data):
+
+    - ``/analog_output/<channel>``  (1D float)
+    - ``/digital_output/line<N>``   (1D bool)
+    """
+    descriptions = descriptions or {}
+    for channel, data in waveforms.analog_output.items():
+        ds = h5file.create_dataset(f"analog_output/{channel}", data=np.asarray(data))
+        if channel in descriptions:
+            ds.attrs["description"] = descriptions[channel]
+    for line, data in waveforms.digital_output.items():
+        ds = h5file.create_dataset(
+            f"digital_output/line{int(line)}", data=np.asarray(data, dtype=bool)
+        )
+        key = f"line{int(line)}"
+        if key in descriptions:
+            ds.attrs["description"] = descriptions[key]
+
+
+def write_nidaq_snapshot_h5(h5file, snapshot: NIDAQConfigSnapshot) -> None:
+    """Write a NIDAQConfigSnapshot to an open HDF5 file/group as attrs +
+    sequence datasets under ``/widget_config/``.
+
+    Only fields with a non-None value are written so partial snapshots are
+    well-defined.
+    """
+    for name in _SNAPSHOT_SCALAR_ATTRS:
+        value = getattr(snapshot, name, None)
+        if value is None:
+            continue
+        h5file.attrs[name] = value
+
+    seq_specs = (
+        ("selected_ao_channels", snapshot.selected_ao_channels, "S"),
+        ("selected_ai_channels", snapshot.selected_ai_channels, "S"),
+        ("selected_do_lines", snapshot.selected_do_lines, "I"),
+        ("selected_di_lines", snapshot.selected_di_lines, "I"),
+    )
+    for ds_name, value, kind in seq_specs:
+        if value is None:
+            continue
+        path = f"widget_config/{ds_name}"
+        if path in h5file:
+            del h5file[path]
+        if kind == "S":
+            arr = np.array([str(x) for x in value], dtype=h5py_string_dtype())
+        else:
+            arr = np.array([int(x) for x in value], dtype=np.int32)
+        h5file.create_dataset(path, data=arr)
+
+
+def read_waveform_datasets_h5(h5file) -> Tuple[WaveformData, Dict[str, str]]:
+    """Read AO/DO waveform datasets from an open HDF5 file/group.
+
+    Returns the waveforms and a description dict (keyed the same way as
+    AbstractNIDAQ.set_channel_descriptions: ``"ao0"``, ``"line3"``, ...).
+    """
+    waveforms = WaveformData()
+    descriptions: Dict[str, str] = {}
+
+    if "analog_output" in h5file:
+        ao_grp = h5file["analog_output"]
+        for ch_name in ao_grp:
+            ds = ao_grp[ch_name]
+            waveforms.analog_output[ch_name] = np.asarray(ds[()])
+            desc = ds.attrs.get("description")
+            if desc is not None:
+                descriptions[ch_name] = _decode_h5_str(desc)
+
+    if "digital_output" in h5file:
+        do_grp = h5file["digital_output"]
+        for ds_name in do_grp:
+            line_idx = _do_line_index_from_dataset_name(ds_name)
+            if line_idx is None:
+                continue
+            ds = do_grp[ds_name]
+            waveforms.digital_output[line_idx] = np.asarray(ds[()], dtype=bool)
+            desc = ds.attrs.get("description")
+            if desc is not None:
+                descriptions[ds_name] = _decode_h5_str(desc)
+
+    return waveforms, descriptions
+
+
+def read_nidaq_snapshot_h5(h5file) -> NIDAQConfigSnapshot:
+    """Read a NIDAQConfigSnapshot from an open HDF5 file/group.
+
+    Missing fields remain None. Reads scalar attrs at the file root and
+    sequence datasets under ``/widget_config/``.
+    """
+    snap = NIDAQConfigSnapshot()
+    attrs = h5file.attrs
+    for name in _SNAPSHOT_SCALAR_ATTRS:
+        if name not in attrs:
+            continue
+        value = attrs[name]
+        value = _decode_h5_str(value) if isinstance(value, (bytes, np.bytes_)) else value
+        if name == "sample_rate_hz":
+            setattr(snap, name, float(value))
+        elif name == "samples_per_channel":
+            setattr(snap, name, int(value))
+        elif name == "continuous":
+            setattr(snap, name, bool(value))
+        else:
+            setattr(snap, name, str(value) if not isinstance(value, str) else value)
+
+    cfg_grp = h5file.get("widget_config") if hasattr(h5file, "get") else None
+    if cfg_grp is not None:
+        if "selected_ao_channels" in cfg_grp:
+            snap.selected_ao_channels = [
+                _decode_h5_str(x) for x in cfg_grp["selected_ao_channels"][()]
+            ]
+        if "selected_ai_channels" in cfg_grp:
+            snap.selected_ai_channels = [
+                _decode_h5_str(x) for x in cfg_grp["selected_ai_channels"][()]
+            ]
+        if "selected_do_lines" in cfg_grp:
+            snap.selected_do_lines = [int(x) for x in cfg_grp["selected_do_lines"][()]]
+        if "selected_di_lines" in cfg_grp:
+            snap.selected_di_lines = [int(x) for x in cfg_grp["selected_di_lines"][()]]
+
+    return snap
+
+
+def save_waveform_config_h5(
+    filepath: str,
+    waveforms: WaveformData,
+    snapshot: Optional[NIDAQConfigSnapshot] = None,
+    descriptions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Save a waveform configuration (+ optional widget snapshot) to HDF5.
+
+    The dataset layout matches FastAcquisitionController._save_daq_data so a
+    file produced by either path is loadable by ``load_waveform_config_h5``.
+    """
+    import h5py  # local import keeps top-level import set narrow
+
+    with h5py.File(filepath, "w") as f:
+        write_waveform_datasets_h5(f, waveforms, descriptions=descriptions)
+        if snapshot is not None:
+            write_nidaq_snapshot_h5(f, snapshot)
+        f.attrs["nidaq_waveform_config_version"] = 1
+
+
+def load_waveform_config_h5(
+    filepath: str,
+) -> Tuple[WaveformData, NIDAQConfigSnapshot, Dict[str, str]]:
+    """Load a waveform configuration from an HDF5 file.
+
+    Works with both standalone configs and fast-acquisition ``daq_data.h5``
+    files (analog_input/digital_input groups, if present, are ignored).
+    """
+    import h5py
+
+    with h5py.File(filepath, "r") as f:
+        waveforms, descriptions = read_waveform_datasets_h5(f)
+        snapshot = read_nidaq_snapshot_h5(f)
+    return waveforms, snapshot, descriptions
+
+
+def h5py_string_dtype():
+    """Return an HDF5-friendly variable-length UTF-8 string dtype."""
+    import h5py
+
+    return h5py.string_dtype(encoding="utf-8")
+
+
+def _decode_h5_str(value) -> str:
+    """Best-effort decode of an HDF5 string-like attribute or array element.
+
+    h5py 2.x returns ``bytes`` for string attrs/datasets while h5py 3.x returns
+    ``str``; ``np.bytes_`` (a ``bytes`` subclass) covers vlen-string array
+    elements.
+    """
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("latin-1", errors="replace")
+    return str(value)
