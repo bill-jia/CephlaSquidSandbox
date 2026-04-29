@@ -171,6 +171,7 @@ class MultiPointWorker:
         )
 
         self.time_point = 0
+        self._first_fov_pre_moved = False
         self.af_fov_count = 0
         self.num_fovs = 0
         self.total_scans = 0
@@ -743,6 +744,7 @@ class MultiPointWorker:
                     if time.time() < self.timestamp_prev_timepoint_started + self.dt:
                         self._log.info("Waiting for next time point (%.2f [s] until next time point start)", (self.timestamp_prev_timepoint_started + self.dt) - time.time())
                         self.move_to_coordinate(first_coords_mm, first_region, 0)  # Move to the first coordinate of the first region while waiting for the next time point to start, to save time on stage movement and allow for any necessary settling to occur during the wait
+                        self._first_fov_pre_moved = True
 
                     # wait until it's time to do the next acquisition
                     while time.time() < self.timestamp_prev_timepoint_started + self.dt:
@@ -758,7 +760,17 @@ class MultiPointWorker:
             self._wait_for_outstanding_callback_images()
             self._log.info(f"Time taken for acquisition/processing: {(time.perf_counter_ns() - start_time) / 1e9} [s]")
         except TimeoutError as te:
-            self._log.error(f"Operation timed out during acquisition, aborting acquisition!")
+            origin = None
+            tb = te.__traceback__
+            this_file = os.path.abspath(__file__)
+            while tb is not None:
+                if os.path.abspath(tb.tb_frame.f_code.co_filename) == this_file:
+                    origin = (tb.tb_frame.f_code.co_name, tb.tb_lineno)
+                tb = tb.tb_next
+            if origin:
+                self._log.error(f"Operation timed out during acquisition at {origin[0]}() (multi_point_worker.py:{origin[1]}), aborting acquisition!")
+            else:
+                self._log.error(f"Operation timed out during acquisition, aborting acquisition!")
             self._log.error(te)
             self.request_abort_fn()
         # except Exception as e:
@@ -1662,8 +1674,14 @@ class MultiPointWorker:
                         self.request_abort_fn()
                         return
 
-                with self._timing.get_timer("move_to_coordinate"):
-                    self.move_to_coordinate(coordinate_mm, region_id, fov)
+                # Skip the inter-timepoint pre-move's destination; re-issuing it forces a
+                # 0-distance wait that hits the 3 s floor in _calc_move_timeout, and that wait
+                # races against the routine multi-second MCU read-thread lag at TP starts.
+                if region_index == 0 and fov == 0 and self._first_fov_pre_moved:
+                    self._first_fov_pre_moved = False
+                else:
+                    with self._timing.get_timer("move_to_coordinate"):
+                        self.move_to_coordinate(coordinate_mm, region_id, fov)
                 with self._timing.get_timer("acquire_at_position"):
                     self.acquire_at_position(region_id, current_path, fov)
 
