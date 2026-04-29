@@ -406,7 +406,7 @@ class ScanCoordinates:
                 for coord in region_scan_coordinates:
                     removed_fov_centers.append(FovCenter(x_mm=coord[0], y_mm=coord[1]))
 
-            self._log.info(f"Removed Region: {well_id}")
+            # self._log.info(f"Removed Region: {well_id}")
             self._update_callback(RemovedScanCoordinateRegion(fov_centers=removed_fov_centers))
 
     def clear_regions(self):

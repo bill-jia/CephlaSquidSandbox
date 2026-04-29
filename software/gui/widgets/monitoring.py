@@ -106,7 +106,7 @@ class RAMMonitorWidget(QWidget):
 
             # Get current process memory usage
             footprint_mb = get_memory_footprint_mb(os.getpid())
-            self._log.debug(f"RAM monitor update: footprint={footprint_mb:.1f} MB")
+            # self._log.debug(f"RAM monitor update: footprint={footprint_mb:.1f} MB")
             if footprint_mb > 0:
                 self._session_peak_mb = max(self._session_peak_mb, footprint_mb)
                 current_gb = footprint_mb / 1024

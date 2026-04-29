@@ -918,8 +918,8 @@ class MultiPointController:
                 f"num fovs: {sum(len(coords) for coords in scan_position_information.scan_region_fov_coords_mm)}"
             )
             self._log.info(f"num regions: {len(scan_position_information.scan_region_coords_mm)}")
-            self._log.info(f"region ids: {scan_position_information.scan_region_names}")
-            self._log.info(f"region centers: {scan_position_information.scan_region_coords_mm}")
+            # self._log.info(f"region ids: {scan_position_information.scan_region_names}")
+            # self._log.info(f"region centers: {scan_position_information.scan_region_coords_mm}")
 
             self.abort_acqusition_requested = False
 

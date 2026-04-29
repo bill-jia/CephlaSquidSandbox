@@ -1049,23 +1049,25 @@ class MultiPointWorker:
         self.z_pos = self.stage.get_pos().z_mm  # zpos at the beginning of the scan
 
     def initialize_coordinates_dataframe(self):
-        base_columns = ["z_level", "x (mm)", "y (mm)", "z (um)", "time"]
-        piezo_column = ["z_piezo (um)"] if self.use_piezo else []
-        self.coordinates_pd = pd.DataFrame(columns=["region", "fov"] + base_columns + piezo_column)
+        self._coordinate_rows: list[dict] = []
 
     def update_coordinates_dataframe(self, region_id, z_level, pos: squid.abc.Pos, fov=None):
-        base_data = {
-            "z_level": [z_level],
-            "x (mm)": [pos.x_mm],
-            "y (mm)": [pos.y_mm],
-            "z (um)": [pos.z_mm * 1000],
-            "time": [datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")],
+        row = {
+            "region": region_id,
+            "fov": fov,
+            "z_level": z_level,
+            "x (mm)": pos.x_mm,
+            "y (mm)": pos.y_mm,
+            "z (um)": pos.z_mm * 1000,
+            "time": datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f"),
         }
-        piezo_data = {"z_piezo (um)": [self.z_piezo_um]} if self.use_piezo else {}
+        if self.use_piezo:
+            row["z_piezo (um)"] = self.z_piezo_um
+        self._coordinate_rows.append(row)
 
-        new_row = pd.DataFrame({"region": [region_id], "fov": [fov], **base_data, **piezo_data})
-
-        self.coordinates_pd = pd.concat([self.coordinates_pd, new_row], ignore_index=True)
+    @property
+    def coordinates_pd(self) -> pd.DataFrame:
+        return pd.DataFrame(self._coordinate_rows)
 
     def move_to_coordinate(self, coordinate_mm, region_id, fov):
         curr_pos = self.stage.get_pos()
@@ -1083,13 +1085,15 @@ class MultiPointWorker:
         else:
             self._log.debug(f"moving to coordinate {coordinate_mm}")
 
-        # check if z is included in the coordinate
+        # Pick the Z source. On subsequent timepoints with AF enabled, prefer
+        # the focused Z cached from the previous timepoint over the
+        # coordinate's nominal Z. The X/Y move below must still run — only
+        # the Z source changes here.
         if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
             if (region_id, fov) in self._z_pos_proposal:
                 last_z_mm = self._z_pos_proposal[(region_id, fov)]
                 self.move_to_z_level(last_z_mm, blocking=False)
                 self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
-                return
             else:
                 self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
         elif len(coordinate_mm) == 3:
