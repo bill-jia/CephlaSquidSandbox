@@ -1988,6 +1988,80 @@ def generate_pulse_train(
     return pattern
 
 
+def generate_interleaved_pulse_train(
+    period_samples: int,
+    short_width_samples: int,
+    short_offset_samples: int,
+    long_width_samples: int,
+    long_offset_samples: int,
+    num_samples: int,
+    n_samples_offset: int = 0,
+    inverted: bool = False,
+    max_num_periods: int = None,
+) -> np.ndarray:
+    """
+    Generate a digital waveform that interleaves a "short" and a "long" pulse
+    within a shared period.
+
+    Each cycle of length ``period_samples`` emits two pulses on the same line:
+    a short pulse of ``short_width_samples`` samples starting
+    ``short_offset_samples`` after the cycle start, and a long pulse of
+    ``long_width_samples`` samples starting ``long_offset_samples`` after the
+    cycle start. Both pulses share the period, but their widths and offsets
+    within the period are independent. The cycle is then repeated until
+    ``num_samples`` (or ``max_num_periods``) is reached.
+
+    Args:
+        period_samples: Period of the cycle in samples (shared by both pulses).
+        short_width_samples: Width of the short pulse in samples.
+        short_offset_samples: Offset of the short pulse from the start of each
+            cycle in samples.
+        long_width_samples: Width of the long pulse in samples.
+        long_offset_samples: Offset of the long pulse from the start of each
+            cycle in samples.
+        num_samples: Total number of samples in the output waveform.
+        n_samples_offset: Initial delay (in samples) before the first cycle
+            begins.
+        inverted: If True, the waveform is logically inverted.
+        max_num_periods: If set, stop emitting after this many periods.
+
+    Returns:
+        Boolean array representing the interleaved pulse train.
+    """
+    if period_samples <= 0:
+        raise ValueError("period_samples must be positive")
+    if short_offset_samples < 0 or long_offset_samples < 0:
+        raise ValueError("pulse offsets must be non-negative")
+    if short_width_samples < 0 or long_width_samples < 0:
+        raise ValueError("pulse widths must be non-negative")
+    if short_offset_samples + short_width_samples > period_samples:
+        raise ValueError("short pulse extends past the end of one period")
+    if long_offset_samples + long_width_samples > period_samples:
+        raise ValueError("long pulse extends past the end of one period")
+
+    pattern = np.zeros(num_samples, dtype=bool)
+    num_periods = 0
+    for cycle_start in range(n_samples_offset, num_samples, period_samples):
+        s_start = cycle_start + short_offset_samples
+        if s_start < num_samples and short_width_samples > 0:
+            s_end = min(s_start + short_width_samples, num_samples)
+            pattern[s_start:s_end] = True
+
+        l_start = cycle_start + long_offset_samples
+        if l_start < num_samples and long_width_samples > 0:
+            l_end = min(l_start + long_width_samples, num_samples)
+            pattern[l_start:l_end] = True
+
+        num_periods += 1
+        if max_num_periods is not None and num_periods >= max_num_periods:
+            break
+
+    if inverted:
+        pattern = ~pattern
+
+    return pattern
+
+
 # ============================================================================
 # Waveform Configuration Persistence (HDF5)
 # ============================================================================

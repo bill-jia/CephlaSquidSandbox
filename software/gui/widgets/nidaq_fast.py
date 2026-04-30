@@ -12,6 +12,7 @@ from control.nidaq import (
     generate_square_wave,
     generate_ramp_wave,
     generate_pulse_train,
+    generate_interleaved_pulse_train,
     save_waveform_config_h5,
     load_waveform_config_h5,
 )
@@ -223,15 +224,22 @@ class NIDAQWidget(QWidget):
         ao_layout = QVBoxLayout()
         
         self.ao_channels_list = QListWidget()
-        # Use per-item checkboxes instead of selection to make state more explicit
-        # and less prone to accidental changes.
-        self.ao_channels_list.setSelectionMode(QAbstractItemView.NoSelection)
+        # Checkboxes drive task-IO membership; row selection is a separate concept
+        # used to pre-populate the Add Waveform dialog with the highlighted row.
+        self.ao_channels_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ao_channels_list.itemChanged.connect(self._on_ao_item_changed)
         ao_layout.addWidget(self.ao_channels_list)
         
         ao_btn_row = QHBoxLayout()
         self.add_ao_waveform_btn = QPushButton("Add Waveform")
         self.add_ao_waveform_btn.clicked.connect(self.show_ao_waveform_dialog)
         ao_btn_row.addWidget(self.add_ao_waveform_btn)
+        self.clear_ao_waveform_btn = QPushButton("Clear Waveform")
+        self.clear_ao_waveform_btn.setToolTip(
+            "Clear stored waveforms from all checked analog output channels."
+        )
+        self.clear_ao_waveform_btn.clicked.connect(self.clear_selected_ao_waveforms)
+        ao_btn_row.addWidget(self.clear_ao_waveform_btn)
         ao_layout.addLayout(ao_btn_row)
         
         ao_group.setLayout(ao_layout)
@@ -250,18 +258,26 @@ class NIDAQWidget(QWidget):
         do_layout.addLayout(do_port_row)
         
         self.do_lines_list = QListWidget()
-        self.do_lines_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.do_lines_list.setSelectionMode(QAbstractItemView.SingleSelection)
         for i in range(8):
             item = QListWidgetItem(f"Line {i}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
             self.do_lines_list.addItem(item)
+        # Connect after initial population so the handler does not fire for setup.
+        self.do_lines_list.itemChanged.connect(self._on_do_item_changed)
         do_layout.addWidget(self.do_lines_list)
         
         do_btn_row = QHBoxLayout()
         self.add_do_pattern_btn = QPushButton("Add Pattern")
         self.add_do_pattern_btn.clicked.connect(self.show_do_pattern_dialog)
         do_btn_row.addWidget(self.add_do_pattern_btn)
+        self.clear_do_pattern_btn = QPushButton("Clear Pattern")
+        self.clear_do_pattern_btn.setToolTip(
+            "Clear stored patterns from all checked digital output lines on this port."
+        )
+        self.clear_do_pattern_btn.clicked.connect(self.clear_selected_do_patterns)
+        do_btn_row.addWidget(self.clear_do_pattern_btn)
         do_layout.addLayout(do_btn_row)
         
         do_group.setLayout(do_layout)
@@ -595,36 +611,44 @@ class NIDAQWidget(QWidget):
             # Update trigger terminal default
             self.trigger_terminal_edit.setText(f"/{device_name}/PFI2")
             
-            # Pre-select channels/lines based on current config/state
-            # AO channels: prefer task-IO selection if available, otherwise fall back
-            task_io = self._ni_daq.get_task_io()
-            selected_ao = set(task_io.get("ao_channels", []))
-            for i in range(self.ao_channels_list.count()):
-                item = self.ao_channels_list.item(i)
-                ch_name = item.data(Qt.UserRole) or item.text()
-                item.setCheckState(Qt.Checked if ch_name in selected_ao else Qt.Unchecked)
+            # Pre-select channels/lines based on current config/state.
+            # Block list-widget signals so the auto-clear-on-uncheck handlers
+            # do not fire while we sync from device state.
+            self.ao_channels_list.blockSignals(True)
+            self.do_lines_list.blockSignals(True)
+            try:
+                # AO channels: prefer task-IO selection if available, otherwise fall back
+                task_io = self._ni_daq.get_task_io()
+                selected_ao = set(task_io.get("ao_channels", []))
+                for i in range(self.ao_channels_list.count()):
+                    item = self.ao_channels_list.item(i)
+                    ch_name = item.data(Qt.UserRole) or item.text()
+                    item.setCheckState(Qt.Checked if ch_name in selected_ao else Qt.Unchecked)
 
-            # AI channels: prefer task-IO selection if available
-            selected_ai = set(task_io.get("ai_channels", []))
-            for i in range(self.ai_channels_list.count()):
-                item = self.ai_channels_list.item(i)
-                ch_name = item.data(Qt.UserRole) or item.text()
-                item.setCheckState(Qt.Checked if ch_name in selected_ai else Qt.Unchecked)
+                # AI channels: prefer task-IO selection if available
+                selected_ai = set(task_io.get("ai_channels", []))
+                for i in range(self.ai_channels_list.count()):
+                    item = self.ai_channels_list.item(i)
+                    ch_name = item.data(Qt.UserRole) or item.text()
+                    item.setCheckState(Qt.Checked if ch_name in selected_ai else Qt.Unchecked)
 
-            # DO port and lines
-            cfg_do_port = getattr(self._ni_daq, "do_port", None)
-            if cfg_do_port:
-                idx = self.do_port_combo.findText(str(cfg_do_port))
-                if idx >= 0:
-                    self.do_port_combo.setCurrentIndex(idx)
+                # DO port and lines
+                cfg_do_port = getattr(self._ni_daq, "do_port", None)
+                if cfg_do_port:
+                    idx = self.do_port_combo.findText(str(cfg_do_port))
+                    if idx >= 0:
+                        self.do_port_combo.setCurrentIndex(idx)
 
-            selected_do_lines = set(getattr(self._ni_daq, "do_lines", []) or [])
-            port = self.do_port_combo.currentText() or "port0"
-            for i in range(self.do_lines_list.count()):
-                item = self.do_lines_list.item(i)
-                item.setCheckState(Qt.Checked if i in selected_do_lines else Qt.Unchecked)
-                label = endpoint_labels_do.get((port, i))
-                item.setText(f"Line {i} — {label}" if label else f"Line {i}")
+                selected_do_lines = set(getattr(self._ni_daq, "do_lines", []) or [])
+                port = self.do_port_combo.currentText() or "port0"
+                for i in range(self.do_lines_list.count()):
+                    item = self.do_lines_list.item(i)
+                    item.setCheckState(Qt.Checked if i in selected_do_lines else Qt.Unchecked)
+                    label = endpoint_labels_do.get((port, i))
+                    item.setText(f"Line {i} — {label}" if label else f"Line {i}")
+            finally:
+                self.ao_channels_list.blockSignals(False)
+                self.do_lines_list.blockSignals(False)
 
             # Push descriptions to NIDAQ so they're available for HDF5 saving
             descriptions: dict[str, str] = {}
@@ -723,12 +747,21 @@ class NIDAQWidget(QWidget):
         self.duration_label.setText(f"{duration:.3f}")
     
     def show_ao_waveform_dialog(self):
-        """Show dialog to configure analog output waveform."""
+        """Show dialog to configure analog output waveform.
+
+        Pre-fills the dialog's channel combo with the row currently highlighted
+        in the AO list (selected by mouse click), if any.
+        """
+        initial_channel = None
+        current_item = self.ao_channels_list.currentItem()
+        if current_item is not None and current_item.isSelected():
+            initial_channel = current_item.data(Qt.UserRole) or current_item.text()
         dialog = AOWaveformDialog(
             self._ni_daq.sample_rate_hz,
             self._ni_daq.samples_per_channel,
             self._ni_daq.ao_channels,
-            self
+            self,
+            initial_channel=initial_channel,
         )
         if dialog.exec_() == QDialog.Accepted:
             channel, waveform = dialog.get_waveform()
@@ -736,7 +769,7 @@ class NIDAQWidget(QWidget):
                 self._ao_waveforms[channel] = waveform
                 self._update_waveform_plot()
                 self._rebuild_live_output_controls()
-    
+
     def show_do_pattern_dialog(self):
         """Show dialog to configure digital output pattern."""
         port = self.do_port_combo.currentText() or "port0"
@@ -745,12 +778,17 @@ class NIDAQWidget(QWidget):
             line: self._endpoint_labels_do.get((port, line))
             for line in available_lines
         }
+        initial_line = None
+        current_item = self.do_lines_list.currentItem()
+        if current_item is not None and current_item.isSelected():
+            initial_line = self.do_lines_list.row(current_item)
         dialog = DOPatternDialog(
             self._ni_daq.sample_rate_hz,
             self._ni_daq.samples_per_channel,
             available_lines,
             self,
             line_labels=line_labels,
+            initial_line=initial_line,
         )
         if dialog.exec_() == QDialog.Accepted:
             line, pattern = dialog.get_pattern()
@@ -758,7 +796,64 @@ class NIDAQWidget(QWidget):
                 self._do_patterns[line] = pattern
                 self._update_waveform_plot()
                 self._rebuild_live_output_controls()
-    
+
+    def _on_ao_item_changed(self, item):
+        """Auto-clear an AO waveform when its channel is unchecked by the user.
+
+        Programmatic check-state changes (device sync, config load) wrap their
+        updates in ``blockSignals`` so this handler only fires for user input.
+        """
+        if item.checkState() != Qt.Unchecked:
+            return
+        ch_name = item.data(Qt.UserRole) or item.text()
+        if ch_name in self._ao_waveforms:
+            del self._ao_waveforms[ch_name]
+            self._log.info(f"Cleared AO waveform for unchecked channel {ch_name}")
+            self._update_waveform_plot()
+            self._rebuild_live_output_controls()
+
+    def _on_do_item_changed(self, item):
+        """Auto-clear a DO pattern when its line is unchecked by the user."""
+        if item.checkState() != Qt.Unchecked:
+            return
+        line = self.do_lines_list.row(item)
+        if line in self._do_patterns:
+            del self._do_patterns[line]
+            self._log.info(f"Cleared DO pattern for unchecked line {line}")
+            self._update_waveform_plot()
+            self._rebuild_live_output_controls()
+
+    def clear_selected_ao_waveforms(self):
+        """Remove stored AO waveforms for every checked analog output channel."""
+        cleared: list[str] = []
+        for i in range(self.ao_channels_list.count()):
+            item = self.ao_channels_list.item(i)
+            if item.checkState() != Qt.Checked:
+                continue
+            ch_name = item.data(Qt.UserRole) or item.text()
+            if ch_name in self._ao_waveforms:
+                del self._ao_waveforms[ch_name]
+                cleared.append(ch_name)
+        if cleared:
+            self._log.info(f"Cleared AO waveforms for {len(cleared)} channel(s): {cleared}")
+            self._update_waveform_plot()
+            self._rebuild_live_output_controls()
+
+    def clear_selected_do_patterns(self):
+        """Remove stored DO patterns for every checked digital output line."""
+        cleared: list[int] = []
+        for i in range(self.do_lines_list.count()):
+            item = self.do_lines_list.item(i)
+            if item.checkState() != Qt.Checked:
+                continue
+            if i in self._do_patterns:
+                del self._do_patterns[i]
+                cleared.append(i)
+        if cleared:
+            self._log.info(f"Cleared DO patterns for {len(cleared)} line(s): {cleared}")
+            self._update_waveform_plot()
+            self._rebuild_live_output_controls()
+
     def _update_waveform_plot(self):
         """Update the waveform display plot."""
         # Clear all axes
@@ -1081,25 +1176,32 @@ class NIDAQWidget(QWidget):
                     f"keeping current device '{self.device_combo.currentText()}'."
                 )
 
-            # Apply per-endpoint selection checkboxes.
-            if snapshot.selected_ao_channels is not None:
-                wanted_ao = set(snapshot.selected_ao_channels)
-                for i in range(self.ao_channels_list.count()):
-                    item = self.ao_channels_list.item(i)
-                    ch_name = item.data(Qt.UserRole) or item.text()
-                    item.setCheckState(Qt.Checked if ch_name in wanted_ao else Qt.Unchecked)
-            if snapshot.selected_ai_channels is not None:
-                wanted_ai = set(snapshot.selected_ai_channels)
-                for i in range(self.ai_channels_list.count()):
-                    item = self.ai_channels_list.item(i)
-                    ch_name = item.data(Qt.UserRole) or item.text()
-                    item.setCheckState(Qt.Checked if ch_name in wanted_ai else Qt.Unchecked)
-            if snapshot.selected_do_lines is not None:
-                wanted_do = set(int(x) for x in snapshot.selected_do_lines)
-                for i in range(self.do_lines_list.count()):
-                    self.do_lines_list.item(i).setCheckState(
-                        Qt.Checked if i in wanted_do else Qt.Unchecked
-                    )
+            # Apply per-endpoint selection checkboxes. Block list-widget signals
+            # so the auto-clear-on-uncheck handlers do not fire during config load.
+            self.ao_channels_list.blockSignals(True)
+            self.do_lines_list.blockSignals(True)
+            try:
+                if snapshot.selected_ao_channels is not None:
+                    wanted_ao = set(snapshot.selected_ao_channels)
+                    for i in range(self.ao_channels_list.count()):
+                        item = self.ao_channels_list.item(i)
+                        ch_name = item.data(Qt.UserRole) or item.text()
+                        item.setCheckState(Qt.Checked if ch_name in wanted_ao else Qt.Unchecked)
+                if snapshot.selected_ai_channels is not None:
+                    wanted_ai = set(snapshot.selected_ai_channels)
+                    for i in range(self.ai_channels_list.count()):
+                        item = self.ai_channels_list.item(i)
+                        ch_name = item.data(Qt.UserRole) or item.text()
+                        item.setCheckState(Qt.Checked if ch_name in wanted_ai else Qt.Unchecked)
+                if snapshot.selected_do_lines is not None:
+                    wanted_do = set(int(x) for x in snapshot.selected_do_lines)
+                    for i in range(self.do_lines_list.count()):
+                        self.do_lines_list.item(i).setCheckState(
+                            Qt.Checked if i in wanted_do else Qt.Unchecked
+                        )
+            finally:
+                self.ao_channels_list.blockSignals(False)
+                self.do_lines_list.blockSignals(False)
         finally:
             self.sample_rate_spin.blockSignals(False)
             self.num_samples_spin.blockSignals(False)
@@ -1636,28 +1738,38 @@ class NIDAQWidget(QWidget):
 class AOWaveformDialog(QDialog):
     """Dialog for configuring analog output waveforms."""
     
-    def __init__(self, sample_rate: float, num_samples: int, channels: list, parent=None):
+    def __init__(self, sample_rate: float, num_samples: int, channels: list, parent=None,
+                 initial_channel: Optional[str] = None):
         super().__init__(parent)
         self.sample_rate = sample_rate
         self.num_samples = num_samples
         self.channels = channels
+        self.initial_channel = initial_channel
         self._waveform = None
         self._channel = None
         self.log = squid.logging.get_logger(self.__class__.__name__)
-        
+
         self.setWindowTitle("Configure Analog Output Waveform")
         self.setMinimumSize(400, 300)
         self.init_ui()
-    
+
     def init_ui(self):
         layout = QVBoxLayout()
         self.setLayout(layout)
-        
+
         # Channel selection
         channel_row = QHBoxLayout()
         channel_row.addWidget(QLabel("Channel:"))
         self.channel_combo = QComboBox()
         self.channel_combo.addItems(self.channels if self.channels else ["ao0", "ao1", "ao2", "ao3"])
+        if self.initial_channel:
+            # Match against either the full entry or its suffix (e.g. "ao0" vs "Dev1/ao0").
+            target_suffix = self.initial_channel.split("/")[-1]
+            for i in range(self.channel_combo.count()):
+                entry = self.channel_combo.itemText(i)
+                if entry == self.initial_channel or entry.split("/")[-1] == target_suffix:
+                    self.channel_combo.setCurrentIndex(i)
+                    break
         channel_row.addWidget(self.channel_combo)
         layout.addLayout(channel_row)
         
@@ -1802,12 +1914,13 @@ class DOPatternDialog(QDialog):
     """Dialog for configuring digital output patterns."""
     
     def __init__(self, sample_rate: float, num_samples: int, lines: list, parent=None,
-                 line_labels: Optional[dict] = None):
+                 line_labels: Optional[dict] = None, initial_line: Optional[int] = None):
         super().__init__(parent)
         self.sample_rate = sample_rate
         self.num_samples = num_samples
         self.lines = lines if lines else list(range(8))
         self.line_labels = line_labels or {}
+        self.initial_line = initial_line
         self._pattern = None
         self._line = None
 
@@ -1827,6 +1940,10 @@ class DOPatternDialog(QDialog):
             label = self.line_labels.get(line)
             text = f"Line {line} — {label}" if label else f"Line {line}"
             self.line_combo.addItem(text, line)
+        if self.initial_line is not None:
+            idx = self.line_combo.findData(self.initial_line)
+            if idx >= 0:
+                self.line_combo.setCurrentIndex(idx)
         line_row.addWidget(self.line_combo)
         layout.addLayout(line_row)
         
@@ -1834,36 +1951,74 @@ class DOPatternDialog(QDialog):
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Pattern Type:"))
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["Pulse Train", "Single Pulse", "Always High", "Always Low"])
+        self.type_combo.addItems([
+            "Pulse Train",
+            "Interleaved Pulses",
+            "Single Pulse",
+            "Always High",
+            "Always Low",
+        ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         type_row.addWidget(self.type_combo)
         layout.addLayout(type_row)
-        
+
         # Parameters group
         self.params_group = QGroupBox("Parameters")
         params_layout = QFormLayout()
-        
+
+        max_duration_s = self.num_samples / self.sample_rate
+
         self.period_spin = QDoubleSpinBox()
-        self.period_spin.setRange(0.000001, self.num_samples / self.sample_rate)
+        self.period_spin.setRange(0.000001, max_duration_s)
         self.period_spin.setValue(0.001)
         self.period_spin.setDecimals(6)
         self.period_spin.setSuffix(" s")
         params_layout.addRow("Period:", self.period_spin)
-        
+
         self.pulse_width_spin = QDoubleSpinBox()
-        self.pulse_width_spin.setRange(0.000001, self.num_samples / self.sample_rate)
+        self.pulse_width_spin.setRange(0.000001, max_duration_s)
         self.pulse_width_spin.setValue(0.0005)
         self.pulse_width_spin.setDecimals(6)
         self.pulse_width_spin.setSuffix(" s")
         params_layout.addRow("Pulse Width:", self.pulse_width_spin)
-        
+
+        # Interleaved pulse parameters: short and long pulses share the period
+        # set above; each has its own width and offset within the period.
+        self.short_width_spin = QDoubleSpinBox()
+        self.short_width_spin.setRange(0.0, max_duration_s)
+        self.short_width_spin.setValue(0.0001)
+        self.short_width_spin.setDecimals(6)
+        self.short_width_spin.setSuffix(" s")
+        params_layout.addRow("Short Pulse Width:", self.short_width_spin)
+
+        self.short_offset_spin = QDoubleSpinBox()
+        self.short_offset_spin.setRange(0.0, max_duration_s)
+        self.short_offset_spin.setValue(0.0)
+        self.short_offset_spin.setDecimals(6)
+        self.short_offset_spin.setSuffix(" s")
+        params_layout.addRow("Short Pulse Offset (within period):", self.short_offset_spin)
+
+        self.long_width_spin = QDoubleSpinBox()
+        self.long_width_spin.setRange(0.0, max_duration_s)
+        self.long_width_spin.setValue(0.001)
+        self.long_width_spin.setDecimals(6)
+        self.long_width_spin.setSuffix(" s")
+        params_layout.addRow("Long Pulse Width:", self.long_width_spin)
+
+        self.long_offset_spin = QDoubleSpinBox()
+        self.long_offset_spin.setRange(0.0, max_duration_s)
+        self.long_offset_spin.setValue(0.005)
+        self.long_offset_spin.setDecimals(6)
+        self.long_offset_spin.setSuffix(" s")
+        params_layout.addRow("Long Pulse Offset (within period):", self.long_offset_spin)
+
         self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(0, self.num_samples / self.sample_rate)
+        self.delay_spin.setRange(0, max_duration_s)
         self.delay_spin.setValue(0)
         self.delay_spin.setDecimals(6)
         self.delay_spin.setSuffix(" s")
         params_layout.addRow("Initial Delay:", self.delay_spin)
-        
+
         self.inverted_checkbox = QCheckBox()
         params_layout.addRow("Inverted:", self.inverted_checkbox)
         
@@ -1884,31 +2039,61 @@ class DOPatternDialog(QDialog):
     
     def on_type_changed(self, pattern_type: str):
         """Update UI based on pattern type selection."""
-        show_params = pattern_type in ["Pulse Train", "Single Pulse"]
-        self.period_spin.setEnabled(pattern_type == "Pulse Train")
-        self.pulse_width_spin.setEnabled(show_params)
-        self.delay_spin.setEnabled(show_params)
-    
+        is_pulse_train = pattern_type == "Pulse Train"
+        is_interleaved = pattern_type == "Interleaved Pulses"
+        is_single = pattern_type == "Single Pulse"
+
+        # Period is shared by Pulse Train and Interleaved Pulses
+        self.period_spin.setEnabled(is_pulse_train or is_interleaved)
+        # Single pulse width: used by Pulse Train and Single Pulse
+        self.pulse_width_spin.setEnabled(is_pulse_train or is_single)
+        # Short/long pulse parameters: only Interleaved Pulses
+        self.short_width_spin.setEnabled(is_interleaved)
+        self.short_offset_spin.setEnabled(is_interleaved)
+        self.long_width_spin.setEnabled(is_interleaved)
+        self.long_offset_spin.setEnabled(is_interleaved)
+        # Initial delay: any time-domain pattern
+        self.delay_spin.setEnabled(is_pulse_train or is_interleaved or is_single)
+
     def get_pattern(self) -> tuple:
         """Generate and return the configured pattern."""
-        from control.nidaq import generate_pulse_train
-        
+        from control.nidaq import generate_pulse_train, generate_interleaved_pulse_train
+
         line = self.line_combo.currentData()
         pattern_type = self.type_combo.currentText()
         inverted = self.inverted_checkbox.isChecked()
-        
+
         try:
             if pattern_type == "Pulse Train":
                 period_samples = int(self.period_spin.value() * self.sample_rate)
                 width_samples = int(self.pulse_width_spin.value() * self.sample_rate)
                 delay_samples = int(self.delay_spin.value() * self.sample_rate)
-                
+
                 pattern = generate_pulse_train(width_samples, period_samples, self.num_samples, inverted)
                 # Apply delay by rolling
                 if delay_samples > 0:
                     pattern = np.roll(pattern, delay_samples)
                     pattern[:delay_samples] = inverted  # Fill delay with inverted state
-                    
+
+            elif pattern_type == "Interleaved Pulses":
+                period_samples = int(self.period_spin.value() * self.sample_rate)
+                short_w = int(self.short_width_spin.value() * self.sample_rate)
+                short_o = int(self.short_offset_spin.value() * self.sample_rate)
+                long_w = int(self.long_width_spin.value() * self.sample_rate)
+                long_o = int(self.long_offset_spin.value() * self.sample_rate)
+                delay_samples = int(self.delay_spin.value() * self.sample_rate)
+
+                pattern = generate_interleaved_pulse_train(
+                    period_samples=period_samples,
+                    short_width_samples=short_w,
+                    short_offset_samples=short_o,
+                    long_width_samples=long_w,
+                    long_offset_samples=long_o,
+                    num_samples=self.num_samples,
+                    n_samples_offset=delay_samples,
+                    inverted=inverted,
+                )
+
             elif pattern_type == "Single Pulse":
                 width_samples = int(self.pulse_width_spin.value() * self.sample_rate)
                 delay_samples = int(self.delay_spin.value() * self.sample_rate)
