@@ -74,6 +74,13 @@ if __name__ == "__main__":
         help="Initialize devices but skip mechanical motions (stage/filter wheel homing, etc.)",
         action="store_true",
     )
+    parser.add_argument(
+        "--profile",
+        help="User profile to load (directory name under software/user_profiles/). "
+             "Defaults to the last-active profile, then the first available, "
+             "then a freshly created 'default'.",
+        default=None,
+    )
     args = parser.parse_args()
 
     # Set up logging
@@ -104,7 +111,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     microscope = control.microscope.Microscope.build_from_global_config(
-        args.simulation, skip_init=args.skip_init, skip_homing=args.skip_homing
+        args.simulation,
+        skip_init=args.skip_init,
+        skip_homing=args.skip_homing,
+        profile_name=args.profile,
     )
     win = gui.HighContentScreeningGui(
         microscope=microscope,
@@ -142,7 +152,13 @@ if __name__ == "__main__":
             QMessageBox.Ok,
         )
 
-    win.showMaximized()
+    # Restore last-session window geometry if available; otherwise maximize.
+    gui_state = microscope.config_repo.get_gui_state()
+    if gui_state is not None and gui_state.window_geometry_b64:
+        win.show()
+        win.apply_persisted_window_state()
+    else:
+        win.showMaximized()
 
     # Optionally start interactive console for debugging
     if USE_TERMINAL_CONSOLE:

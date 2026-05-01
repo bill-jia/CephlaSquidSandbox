@@ -651,7 +651,8 @@ class Microscope:
     """
     @staticmethod
     def build_from_global_config(
-        simulated: bool = False, skip_init: bool = False, skip_homing: bool = False
+        simulated: bool = False, skip_init: bool = False, skip_homing: bool = False,
+        profile_name: Optional[str] = None,
     ) -> "Microscope":
         """Build Microscope from ``machine_config.yaml`` via :class:`MachineConfig`.
 
@@ -757,6 +758,7 @@ class Microscope:
             simulated=simulated,
             skip_init=skip_init,
             skip_homing=skip_homing,
+            profile_name=profile_name,
         )
 
     def __init__(
@@ -771,6 +773,7 @@ class Microscope:
         skip_prepare_for_use: bool = False,
         skip_init: bool = False,
         skip_homing: bool = False,
+        profile_name: Optional[str] = None,
     ):
 
         """
@@ -809,9 +812,15 @@ class Microscope:
         # Note: Migration from acquisition_configurations to user_profiles is handled
         # by run_auto_migration() in main_hcs.py before Microscope is created
 
-        # Load profile: restore last session if still valid, else first alphabetically
+        # Load profile: explicit --profile wins, else last session, else first
+        # available, else create 'default'.
         profiles = self.config_repo.get_available_profiles()
-        if profiles:
+        if profile_name:
+            if not self.config_repo.profile_exists(profile_name):
+                self._log.info(f"Profile '{profile_name}' not found, creating it")
+                self.config_repo.create_profile(profile_name)
+            self.config_repo.load_profile(profile_name)
+        elif profiles:
             last = self.config_repo.get_last_active_profile()
             initial = last if last else profiles[0]
             if initial not in profiles:

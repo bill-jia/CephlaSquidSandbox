@@ -52,6 +52,7 @@ from control.lighting import LightSourceType, IntensityControlMode, ShutterContr
 from control.microcontroller import Microcontroller
 from control.microscope import Microscope, _should_simulate
 from control.models import ObservationState
+from control.models.gui_state import GuiState
 from control.nidaq import AbstractNIDAQ
 from squid.abc import AbstractCamera, AbstractStage
 import control._def
@@ -251,6 +252,11 @@ class HighContentScreeningGui(QMainWindow):
         self._init_observation_state_from_general_yaml()
         self.setup_layout()
         self.make_connections()
+
+        # Restore per-profile GUI state (objective, tabs, snap dir, etc.).
+        # Window geometry is restored separately after show() — see
+        # apply_persisted_window_state().
+        self._restore_gui_state()
 
         # Emit initial performance mode state to sync widgets
         self.signal_performance_mode_changed.emit(self.performance_mode)
@@ -2376,6 +2382,153 @@ class HighContentScreeningGui(QMainWindow):
         # Quit the application
         QApplication.instance().quit()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # GUI state persistence (per-profile gui_state.yaml)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _collect_gui_state(self) -> GuiState:
+        """Snapshot transient UI selections for save_gui_state()."""
+        state = GuiState()
+
+        try:
+            state.last_active_objective = self.objectiveStore.current_objective
+        except Exception:
+            pass
+
+        try:
+            obs = self.microscope.obs_controller.current_observation_state
+            if obs is not None and getattr(obs, "name", None):
+                state.last_active_observation_state_name = obs.name
+        except Exception:
+            pass
+
+        try:
+            state.window_geometry_b64 = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            state.window_state_b64 = bytes(self.saveState().toBase64()).decode("ascii")
+        except Exception:
+            pass
+
+        try:
+            state.record_tab_index = int(self.recordTabWidget.currentIndex())
+        except Exception:
+            pass
+
+        lcw = self.liveControlWidget
+        if lcw is not None:
+            try:
+                state.snap_saving_dir = lcw.snap_saving_path
+            except Exception:
+                pass
+            try:
+                state.snap_tag = lcw.lineEdit_snapTag.text()
+            except Exception:
+                pass
+            try:
+                state.live_display_fps = float(lcw.entry_displayFPS.value())
+            except Exception:
+                pass
+            try:
+                state.autolevel_enabled = bool(lcw.btn_autolevel.isChecked())
+            except Exception:
+                pass
+            try:
+                state.display_resolution_scaling = int(lcw.slider_resolutionScaling.value())
+            except Exception:
+                pass
+
+        return state
+
+    def _persist_gui_state(self) -> None:
+        """Write gui_state.yaml for the current profile (called at shutdown)."""
+        try:
+            state = self._collect_gui_state()
+            self.microscope.config_repo.save_gui_state(state)
+        except Exception:
+            self.log.exception("Failed to persist GUI state")
+
+    def apply_persisted_window_state(self) -> None:
+        """Restore window geometry from gui_state.yaml.
+
+        Call AFTER ``show()`` (or instead of ``showMaximized()``) — restoreGeometry
+        only takes effect once the window has been shown by the platform.
+        """
+        try:
+            gui_state = self.microscope.config_repo.get_gui_state()
+        except Exception:
+            self.log.exception("Failed to load gui_state for window restore")
+            return
+        if gui_state is None:
+            return
+        try:
+            if gui_state.window_geometry_b64:
+                self.restoreGeometry(QByteArray.fromBase64(gui_state.window_geometry_b64.encode("ascii")))
+            if gui_state.window_state_b64:
+                self.restoreState(QByteArray.fromBase64(gui_state.window_state_b64.encode("ascii")))
+        except Exception:
+            self.log.exception("Failed to restore window geometry")
+
+    def _restore_gui_state(self) -> None:
+        """Apply saved tabs/objective/snap dir/etc. to widgets after construction.
+
+        Called at the end of ``__init__`` once all widgets exist. Window geometry
+        is handled separately via :meth:`apply_persisted_window_state` because it
+        must run after the window has been shown.
+        """
+        try:
+            gui_state = self.microscope.config_repo.get_gui_state()
+        except Exception:
+            self.log.exception("Failed to load gui_state")
+            return
+        if gui_state is None:
+            return
+
+        # Objective
+        if gui_state.last_active_objective:
+            try:
+                if gui_state.last_active_objective in self.objectiveStore.objectives_dict:
+                    self.objectivesWidget.dropdown.setCurrentText(gui_state.last_active_objective)
+            except Exception:
+                self.log.exception("Failed to restore last objective")
+
+        # Record tab
+        if gui_state.record_tab_index is not None:
+            try:
+                idx = int(gui_state.record_tab_index)
+                if 0 <= idx < self.recordTabWidget.count():
+                    self.recordTabWidget.setCurrentIndex(idx)
+            except Exception:
+                self.log.exception("Failed to restore record tab index")
+
+        # Snap / live settings
+        lcw = self.liveControlWidget
+        if lcw is not None:
+            if gui_state.snap_saving_dir:
+                try:
+                    lcw.snap_saving_path = gui_state.snap_saving_dir
+                    lcw.lineEdit_snapSavingDir.setText(gui_state.snap_saving_dir)
+                except Exception:
+                    pass
+            if gui_state.snap_tag:
+                try:
+                    lcw.lineEdit_snapTag.setText(gui_state.snap_tag)
+                except Exception:
+                    pass
+            if gui_state.live_display_fps is not None:
+                try:
+                    lcw.entry_displayFPS.setValue(gui_state.live_display_fps)
+                except Exception:
+                    pass
+            if gui_state.autolevel_enabled is not None:
+                try:
+                    lcw.btn_autolevel.setChecked(bool(gui_state.autolevel_enabled))
+                except Exception:
+                    pass
+            if gui_state.display_resolution_scaling is not None:
+                try:
+                    lcw.slider_resolutionScaling.setValue(int(gui_state.display_resolution_scaling))
+                except Exception:
+                    pass
+
     def _cleanup_common(self, for_restart: bool = False):
         """Common cleanup logic shared between closeEvent and restart.
 
@@ -2403,6 +2556,14 @@ class HighContentScreeningGui(QMainWindow):
         except Exception:
             if for_restart:
                 self.log.exception(f"Error persisting general config during {context}")
+            else:
+                raise
+
+        try:
+            self._persist_gui_state()
+        except Exception:
+            if for_restart:
+                self.log.exception(f"Error persisting GUI state during {context}")
             else:
                 raise
 
