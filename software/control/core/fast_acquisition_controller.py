@@ -25,6 +25,11 @@ from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.nidaq import AbstractNIDAQ, WaveformData, TriggerSource
 from control.nidaq import generate_pulse_train
+from control.nidaq import (
+    NIDAQConfigSnapshot,
+    write_waveform_datasets_h5,
+    write_nidaq_snapshot_h5,
+)
 
 
 class AcquisitionCompletionStatus(Enum):
@@ -717,17 +722,21 @@ class FastAcquisitionController:
                 self.stop_acquisition(manual_stop=False)
     
     def _save_daq_data(self):
-        """Save DAQ waveform data to file."""
+        """Save DAQ waveform data to file.
+
+        Layout matches what the NIDAQ widget save/load helpers expect, so the
+        resulting ``daq_data.h5`` can be loaded back into the widget.
+        """
         if not self._daq_result:
             return
-        
+
         import os
         waveforms_dir = os.path.join(self._output_path, "waveforms")
         os.makedirs(waveforms_dir, exist_ok=True)
-        
+
         try:
             import h5py
-            
+
             h5_path = os.path.join(waveforms_dir, "daq_data.h5")
             # Channel descriptions for HDF5 dataset attributes
             descriptions = {}
@@ -751,30 +760,69 @@ class FastAcquisitionController:
                 if self._frame_sample_indices:
                     f.create_dataset('frame_sample_indices', data=np.array(self._frame_sample_indices))
 
-                for channel, data in self._daq_result.analog_output.items():
-                    ds = f.create_dataset(f'analog_output/{channel}', data=data)
-                    if channel in descriptions:
-                        ds.attrs['description'] = descriptions[channel]
+                # AO/DO output waveforms (shared helper -> matches widget save format)
+                write_waveform_datasets_h5(
+                    f,
+                    WaveformData(
+                        analog_output=self._daq_result.analog_output,
+                        digital_output=self._daq_result.digital_output,
+                    ),
+                    descriptions=descriptions,
+                )
 
-                for line, data in self._daq_result.digital_output.items():
-                    ds = f.create_dataset(f'digital_output/line{line}', data=data)
-                    if f"line{line}" in descriptions:
-                        ds.attrs['description'] = descriptions[f"line{line}"]
-                
-                # Save metadata
+                # NIDAQ widget snapshot so loading from this file restores
+                # trigger/port/AI-terminal/task-IO selection.
+                snapshot = self._build_nidaq_snapshot()
+                if snapshot is not None:
+                    write_nidaq_snapshot_h5(f, snapshot)
+
+                # Camera-specific & acquisition-level metadata
                 f.attrs['sample_rate_hz'] = self._daq_result.sample_rate_hz
                 f.attrs['samples_acquired'] = self._daq_result.samples_acquired
                 f.attrs['camera_trigger_dio_line'] = self._camera_trigger_dio_line
                 f.attrs['frame_counter_dio_line'] = self._frame_counter_dio_line
                 f.attrs['num_frames_detected'] = len(self._frame_sample_indices)
-            
+
             self._log.info(f"Saved DAQ data to {h5_path}")
-        
+
         except ImportError:
             # Fallback to NumPy format
             np_path = os.path.join(waveforms_dir, "frame_sync_map.npy")
             np.save(np_path, np.array(self._frame_sample_indices))
             self._log.info(f"Saved frame sync map to {np_path} (HDF5 not available)")
+
+    def _build_nidaq_snapshot(self) -> Optional[NIDAQConfigSnapshot]:
+        """Build a NIDAQConfigSnapshot from ``self._ni_daq`` for HDF5 sidecar attrs.
+
+        Returns None when no NIDAQ is attached. Pulls task-IO selections via
+        ``get_task_io()`` so the saved snapshot reflects what was actually used
+        for this acquisition.
+        """
+        if self._ni_daq is None:
+            return None
+        try:
+            task_io = self._ni_daq.get_task_io() if hasattr(self._ni_daq, "get_task_io") else {}
+            trigger_source = getattr(self._ni_daq, "trigger_source", None)
+            trigger_edge = getattr(self._ni_daq, "trigger_edge", None)
+            return NIDAQConfigSnapshot(
+                device_name=str(getattr(self._ni_daq, "device_name", "") or "") or None,
+                sample_rate_hz=float(self._ni_daq.sample_rate_hz),
+                samples_per_channel=int(self._ni_daq.samples_per_channel),
+                do_port=str(getattr(self._ni_daq, "do_port", "") or "") or None,
+                trigger_source=getattr(trigger_source, "name", None) or (str(trigger_source) if trigger_source else None),
+                trigger_edge=getattr(trigger_edge, "name", None) or (str(trigger_edge) if trigger_edge else None),
+                external_trigger_terminal=str(getattr(self._ni_daq, "external_trigger_terminal", "") or "") or None,
+                ai_terminal_config=str(getattr(self._ni_daq, "ai_terminal_config", "") or "") or None,
+                do_logic_family=str(getattr(self._ni_daq, "do_logic_family", "") or "") or None,
+                continuous=bool(getattr(self._ni_daq, "continuous", False)),
+                selected_ao_channels=[str(x) for x in task_io.get("ao_channels", [])] or None,
+                selected_ai_channels=[str(x) for x in task_io.get("ai_channels", [])] or None,
+                selected_do_lines=[int(x) for x in task_io.get("do_lines", [])] or None,
+                selected_di_lines=[int(x) for x in task_io.get("di_lines", [])] or None,
+            )
+        except Exception as e:
+            self._log.warning(f"Could not build NIDAQ config snapshot: {e}", exc_info=True)
+            return None
     
     def _save_metadata(self):
         """Save acquisition metadata."""

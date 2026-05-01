@@ -63,11 +63,12 @@ def get_camera(
     """
 
     def open_if_needed(camera):
-        try:
-            camera.open()
-        except AttributeError as e:
-            _log.error(f"Error: {e}")
-            pass
+        if hasattr(camera, "open"):
+            try:
+                camera.open()
+            except AttributeError as e:
+                _log.error(f"Error: {e}")
+                pass
 
     if simulated:
         return SimulatedCamera(config, hw_trigger_fn=hw_trigger_fn, hw_set_strobe_delay_ms_fn=hw_set_strobe_delay_ms_fn)

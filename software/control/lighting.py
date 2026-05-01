@@ -569,7 +569,7 @@ class NIDAQIlluminationDevice(IlluminationDevice):
         self._shutter_ep.set_digital(True)
         self._shutter_ep.wait()
         self._is_on = True
-        logger.info(f"[NIDAQIlluminationDevice] turn_on called for channel '{channel}'")
+        logger.debug(f"[NIDAQIlluminationDevice] turn_on called for channel '{channel}'")
 
     def turn_off(self, channel: str) -> None:
         if channel != self._channel_name:
@@ -580,7 +580,7 @@ class NIDAQIlluminationDevice(IlluminationDevice):
         self._shutter_ep.set_digital(False)
         self._shutter_ep.wait()
         self._is_on = False
-        logger.info(f"[NIDAQIlluminationDevice] turn_off called for channel '{channel}'")
+        logger.debug(f"[NIDAQIlluminationDevice] turn_off called for channel '{channel}'")
 
     def get_intensity(self, channel: str) -> float:
         if channel != self._channel_name:

@@ -541,6 +541,22 @@ def get_directory_disk_usage(directory: pathlib.Path) -> int:
 
 
 class TimingManager:
+    # Hot-path gate. Every `with self._timing.get_timer(name):` site goes through
+    # get_timer(), so flipping this class-level flag off turns all instrumentation
+    # into ~single-attribute-lookup no-ops without touching call sites. Read once
+    # at import; set SQUID_TIMING_REPORT=1 (or "true"/"yes") in the environment
+    # before launching to enable collection + report emission.
+    _enabled: bool = os.environ.get("SQUID_TIMING_REPORT", "").lower() in ("1", "true", "yes")
+
+    @classmethod
+    def is_enabled(cls) -> bool:
+        return cls._enabled
+
+    @classmethod
+    def set_enabled(cls, enabled: bool) -> None:
+        """Toggle the global timing switch at runtime (e.g. from a test fixture)."""
+        cls._enabled = bool(enabled)
+
     @dataclass
     class TimingPair:
         start: float
@@ -548,6 +564,34 @@ class TimingManager:
 
         def elapsed(self):
             return self.stop - self.start
+
+    class _NullTimer:
+        """Zero-overhead stand-in returned by get_timer() when timing is disabled.
+        Implements the Timer context-manager + record() surface with no-op bodies,
+        so call sites don't need to check an external flag."""
+
+        __slots__ = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def record(self, start: float, stop: float):
+            pass
+
+        def get_intervals(self):
+            return []
+
+        def get_report(self):
+            return ""
 
     class Timer:
         def __init__(self, name):
@@ -614,8 +658,16 @@ class TimingManager:
         self._name = name
         self._timers = collections.OrderedDict()
         self._log = squid.logging.get_logger(self.__class__.__name__)
+        # Bind the null-timer singleton on the instance so the fast-path
+        # get_timer() returns it with a single attribute read.
+        self._null_timer = TimingManager._NullTimer()
 
-    def get_timer(self, name) -> Timer:
+    def get_timer(self, name) -> "TimingManager.Timer":
+        # Fast path when timing is globally disabled: return the null context
+        # manager so `with tm.get_timer(...)` and `tm.get_timer(...).record(...)`
+        # are no-ops. No dict lookup, no Timer instantiation, no log emit.
+        if not TimingManager._enabled:
+            return self._null_timer
         if name not in self._timers:
             self._log.debug(f"Creating timer={name} for manager={self._name}")
             self._timers[name] = TimingManager.Timer(name)
@@ -623,6 +675,8 @@ class TimingManager:
         return self._timers[name]
 
     def get_report(self, sort=False) -> str:
+        if not TimingManager._enabled:
+            return f"Timings For {self._name}: (disabled — set SQUID_TIMING_REPORT=1 to collect)"
         timer_names = sorted(self._timers.keys())
         report_list = [self._timers[name].get_report() for name in timer_names]
         report_list = sorted(report_list, key=lambda r: float(r.split("total=")[1].split()[0]), reverse=True)

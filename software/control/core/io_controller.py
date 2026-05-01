@@ -600,11 +600,11 @@ class IORegistry:
 
     def log_summary(self) -> None:
         """Log a human-readable summary of all endpoint assignments."""
-        logger.info("=== IO Endpoint Routing Summary ===")
+        logger.debug("=== IO Endpoint Routing Summary ===")
         for ep in self._config.get_all():
             available = ep.name in self._bound
             status = "OK" if available else "UNAVAILABLE"
-            logger.info(
+            logger.debug(
                 f"  {ep.name:30s}  {ep.controller.value:6s}  "
                 f"{ep.signal_type.value:7s}  {ep.direction.value:6s}  "
                 f"ch={ep.channel_id:15s}  role={ep.role:15s}  [{status}]"
@@ -614,5 +614,5 @@ class IORegistry:
             for issue in issues:
                 logger.warning(f"  IO CONFIG WARNING: {issue}")
         else:
-            logger.info("  All endpoints validated OK")
-        logger.info("=== End IO Summary ===")
+            logger.debug("  All endpoints validated OK")
+        logger.debug("=== End IO Summary ===")

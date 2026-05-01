@@ -174,6 +174,26 @@ config_repo.save_observation_preset("my_preset", observation_state)
 state = config_repo.load_observation_preset("my_preset")
 ```
 
+#### Live state cache (general.yaml as session cache)
+
+`general.yaml` doubles as the live-state cache: the GUI continuously mirrors
+the current ObservationState (camera + illumination + emission filters + ROI)
+to it so the next startup restores the same configuration.
+
+- **In RAM:** `ObservationStateController._current_state` holds the live state.
+  Per-property mutations from widgets update it in place.
+- **Periodic flush:** the HCS main window runs a 30 s timer that calls
+  `obs_controller.cache_current_state_to_disk()` — collects a fresh hardware
+  snapshot and writes it to `general.yaml`. Skipped while any acquisition is
+  running: multipoint (`multipointController.acquisition_in_progress()`),
+  camera-driven fast acq (`fastAcquisitionWidget._is_acquiring`), or DAQ-only
+  fast acq (`niDAQWidget._daq_only_acquiring`).
+- **Shutdown flush:** `_cleanup_common` calls the same method once on close.
+- **Startup:** `_init_observation_state_from_general_yaml` loads `general.yaml`
+  and applies it. If the file is missing/unreadable the controller bootstraps
+  a state from current hardware (`bootstrap_state_from_hardware`) and seeds
+  `general.yaml` so widgets work immediately.
+
 ### Convenience Methods
 
 ```python

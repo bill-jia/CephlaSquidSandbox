@@ -61,7 +61,7 @@ class ScanCoordinates:
         self.well_selector = None
         self.acquisition_pattern = control._def.ACQUISITION_PATTERN
         self.fov_pattern = control._def.FOV_PATTERN
-        self._log.info(f"Initializing scan coordinates with wellplate format: {control._def.WELLPLATE_FORMAT}")
+        # self._log.info(f"Initializing scan coordinates with wellplate format: {control._def.WELLPLATE_FORMAT}")
         self.format = control._def.WELLPLATE_FORMAT
         self.a1_x_mm = control._def.A1_X_MM
         self.a1_y_mm = control._def.A1_Y_MM
@@ -234,7 +234,7 @@ class ScanCoordinates:
 
     def get_selected_wells(self):
         # get selected wells from the widget
-        self._log.info("getting selected wells for acquisition")
+        self._log.debug("getting selected wells for acquisition")
         if not self.well_selector or self.format == "glass slide":
             return None
 
@@ -390,7 +390,6 @@ class ScanCoordinates:
         self.region_fov_rows[well_id] = rows
         self.region_fov_coordinates[well_id] = scan_coordinates
         self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
-        self._log.info(f"Added Region: {well_id}")
 
     def remove_region(self, well_id):
         if well_id in self.region_centers:
@@ -407,7 +406,7 @@ class ScanCoordinates:
                 for coord in region_scan_coordinates:
                     removed_fov_centers.append(FovCenter(x_mm=coord[0], y_mm=coord[1]))
 
-            self._log.info(f"Removed Region: {well_id}")
+            # self._log.info(f"Removed Region: {well_id}")
             self._update_callback(RemovedScanCoordinateRegion(fov_centers=removed_fov_centers))
 
     def clear_regions(self):
@@ -416,13 +415,13 @@ class ScanCoordinates:
         self.region_fov_rows.clear()
         self.region_fov_coordinates.clear()
         self._update_callback(ClearedScanCoordinates())
-        self._log.info("Cleared All Regions")
+        self._log.debug("Cleared All Regions")
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
         pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
         fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
-        self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
+        # self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
         fov_w_mm = pixel_size_factor * fov_w_mm_sensor
         fov_h_mm = pixel_size_factor * fov_h_mm_sensor
         overlap_frac = 1 - overlap_percent / 100
@@ -447,7 +446,7 @@ class ScanCoordinates:
 
         # Region coordinates are already centered since center_x, center_y is grid center
         if scan_coordinates:  # Only add region if there are valid coordinates
-            self._log.info(f"Added Flexible Region: {region_id}")
+            # self._log.info(f"Added Flexible Region: {region_id}")
             self.region_centers[region_id] = [center_x, center_y, center_z]
             self.region_fov_rows[region_id] = rows
             self.region_fov_coordinates[region_id] = scan_coordinates
@@ -679,7 +678,7 @@ class ScanCoordinates:
         return int(suffix) if suffix else 0
 
     def sort_coordinates(self):
-        self._log.info(f"Acquisition pattern: {self.acquisition_pattern}")
+        self._log.debug(f"Acquisition pattern: {self.acquisition_pattern}")
 
         if len(self.region_centers) <= 1:
             return

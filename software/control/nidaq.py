@@ -69,27 +69,51 @@ class WaveformData:
 @dataclass
 class AcquisitionResult:
     """Container for acquisition results."""
-    
+
     # Analog input data: dict mapping channel name to numpy array
     analog_input: Dict[str, np.ndarray] = field(default_factory=dict)
-    
+
     # Digital input data: dict mapping line index to numpy array of bool
     digital_input: Dict[int, np.ndarray] = field(default_factory=dict)
 
     # Analog output data: dict mapping channel name to numpy array
     analog_output: Dict[str, np.ndarray] = field(default_factory=dict)
-    
+
     # Digital output data: dict mapping line index to numpy array of bool
     digital_output: Dict[int, np.ndarray] = field(default_factory=dict)
-    
+
     # Timestamps for the samples (seconds from start)
     timestamps: Optional[np.ndarray] = None
-    
+
     # Sample rate used for acquisition
     sample_rate_hz: float = 0.0
-    
+
     # Number of samples acquired per channel
     samples_acquired: int = 0
+
+
+@dataclass
+class NIDAQConfigSnapshot:
+    """Persisted subset of NIDAQ widget settings saved alongside waveforms.
+
+    All fields are optional so partial snapshots (e.g. an experiment's
+    ``daq_data.h5`` that pre-dates a particular field) round-trip cleanly.
+    """
+
+    device_name: Optional[str] = None
+    sample_rate_hz: Optional[float] = None
+    samples_per_channel: Optional[int] = None
+    do_port: Optional[str] = None
+    trigger_source: Optional[str] = None  # "SOFTWARE" / "EXTERNAL" / "INTERNAL"
+    trigger_edge: Optional[str] = None  # "RISING" / "FALLING"
+    external_trigger_terminal: Optional[str] = None
+    ai_terminal_config: Optional[str] = None
+    do_logic_family: Optional[str] = None
+    continuous: Optional[bool] = None
+    selected_ao_channels: Optional[List[str]] = None
+    selected_ai_channels: Optional[List[str]] = None
+    selected_do_lines: Optional[List[int]] = None
+    selected_di_lines: Optional[List[int]] = None
 
 
 def _count_rising_edges(samples) -> int:
@@ -446,12 +470,6 @@ class NIDAQ(AbstractNIDAQ):
         # Track whether we have live overrides that were active when an acquisition
         # was prepared. Used so we can restore live outputs after the task completes.
         self._has_live_overrides_for_acquisition: bool = False
-
-        # Optional TimingManager for sub-timer breakdown of send_edge_pulse.
-        # The worker sets this at acquisition start and clears it at end so
-        # sub-timers end up in the acquisition's timing report only when we're
-        # explicitly profiling the NIDAQ path. None → no instrumentation.
-        self._timing = None
 
         # Configure digital port logic family ONCE at initialization
         # This must be done before any tasks are created
@@ -1012,10 +1030,6 @@ class NIDAQ(AbstractNIDAQ):
         """
         line = int(line)
 
-        # Sub-timer scaffolding: record each hot segment if a TimingManager was
-        # attached, otherwise no-op. Segments: lock acquire, DAQmx write.
-        tm = self._timing
-
         # Fast path: line is already part of the persistent task, no rebuild
         # needed. Reading the list and the task reference is atomic under the
         # GIL. If another thread is concurrently rebuilding (rare — only
@@ -1058,22 +1072,9 @@ class NIDAQ(AbstractNIDAQ):
                 di_task.start()
             # Rising edge: flip to the opposite of rest state. Lock held only
             # for the dict update + DAQmx write — releases before the sleep.
-            if tm is not None:
-                t0 = time.perf_counter()
-                self._lock.acquire()
-                t1 = time.perf_counter()
-                try:
-                    self._live_do_values[line] = not original
-                    self._write_persistent_do_state_locked()
-                    t2 = time.perf_counter()
-                finally:
-                    self._lock.release()
-                tm.get_timer("nidaq:pulse:lock_acquire").record(t0, t1)
-                tm.get_timer("nidaq:pulse:write_rising").record(t1, t2)
-            else:
-                with self._lock:
-                    self._live_do_values[line] = not original
-                    self._write_persistent_do_state_locked()
+            with self._lock:
+                self._live_do_values[line] = not original
+                self._write_persistent_do_state_locked()
             # Back-to-back writes produce ~200–500 µs of HIGH naturally. Only
             # sleep if the caller asked for a width substantially longer than
             # that — Windows sleep granularity is ~1 ms, so sub-ms sleeps aren't
@@ -1082,22 +1083,9 @@ class NIDAQ(AbstractNIDAQ):
             if pulse_width_us > 1000:
                 time.sleep(pulse_width_us / 1e6)
             # Falling edge: restore rest state. Same narrow-lock pattern.
-            if tm is not None:
-                t0 = time.perf_counter()
-                self._lock.acquire()
-                t1 = time.perf_counter()
-                try:
-                    self._live_do_values[line] = original
-                    self._write_persistent_do_state_locked()
-                    t2 = time.perf_counter()
-                finally:
-                    self._lock.release()
-                tm.get_timer("nidaq:pulse:lock_acquire").record(t0, t1)
-                tm.get_timer("nidaq:pulse:write_falling").record(t1, t2)
-            else:
-                with self._lock:
-                    self._live_do_values[line] = original
-                    self._write_persistent_do_state_locked()
+            with self._lock:
+                self._live_do_values[line] = original
+                self._write_persistent_do_state_locked()
             if di_task is not None:
                 di_timeout_s = (readout_window_ms / 1000.0) + 0.5
                 di_task.wait_until_done(timeout=di_timeout_s)
@@ -1996,5 +1984,299 @@ def generate_pulse_train(
 
     if inverted:
         pattern = ~pattern
-    
+
     return pattern
+
+
+def generate_interleaved_pulse_train(
+    period_samples: int,
+    short_width_samples: int,
+    short_offset_samples: int,
+    long_width_samples: int,
+    long_offset_samples: int,
+    num_samples: int,
+    n_samples_offset: int = 0,
+    inverted: bool = False,
+    max_num_periods: int = None,
+) -> np.ndarray:
+    """
+    Generate a digital waveform that interleaves a "short" and a "long" pulse
+    within a shared period.
+
+    Each cycle of length ``period_samples`` emits two pulses on the same line:
+    a short pulse of ``short_width_samples`` samples starting
+    ``short_offset_samples`` after the cycle start, and a long pulse of
+    ``long_width_samples`` samples starting ``long_offset_samples`` after the
+    cycle start. Both pulses share the period, but their widths and offsets
+    within the period are independent. The cycle is then repeated until
+    ``num_samples`` (or ``max_num_periods``) is reached.
+
+    Args:
+        period_samples: Period of the cycle in samples (shared by both pulses).
+        short_width_samples: Width of the short pulse in samples.
+        short_offset_samples: Offset of the short pulse from the start of each
+            cycle in samples.
+        long_width_samples: Width of the long pulse in samples.
+        long_offset_samples: Offset of the long pulse from the start of each
+            cycle in samples.
+        num_samples: Total number of samples in the output waveform.
+        n_samples_offset: Initial delay (in samples) before the first cycle
+            begins.
+        inverted: If True, the waveform is logically inverted.
+        max_num_periods: If set, stop emitting after this many periods.
+
+    Returns:
+        Boolean array representing the interleaved pulse train.
+    """
+    if period_samples <= 0:
+        raise ValueError("period_samples must be positive")
+    if short_offset_samples < 0 or long_offset_samples < 0:
+        raise ValueError("pulse offsets must be non-negative")
+    if short_width_samples < 0 or long_width_samples < 0:
+        raise ValueError("pulse widths must be non-negative")
+    if short_offset_samples + short_width_samples > period_samples:
+        raise ValueError("short pulse extends past the end of one period")
+    if long_offset_samples + long_width_samples > period_samples:
+        raise ValueError("long pulse extends past the end of one period")
+
+    pattern = np.zeros(num_samples, dtype=bool)
+    num_periods = 0
+    for cycle_start in range(n_samples_offset, num_samples, period_samples):
+        s_start = cycle_start + short_offset_samples
+        if s_start < num_samples and short_width_samples > 0:
+            s_end = min(s_start + short_width_samples, num_samples)
+            pattern[s_start:s_end] = True
+
+        l_start = cycle_start + long_offset_samples
+        if l_start < num_samples and long_width_samples > 0:
+            l_end = min(l_start + long_width_samples, num_samples)
+            pattern[l_start:l_end] = True
+
+        num_periods += 1
+        if max_num_periods is not None and num_periods >= max_num_periods:
+            break
+
+    if inverted:
+        pattern = ~pattern
+
+    return pattern
+
+
+# ============================================================================
+# Waveform Configuration Persistence (HDF5)
+# ============================================================================
+
+# Snapshot fields that are written/read as scalar HDF5 attributes (string-or-
+# scalar typed). Sequence fields (selected_*_channels/lines) are stored as
+# datasets under /widget_config/ to preserve element ordering.
+_SNAPSHOT_SCALAR_ATTRS: Tuple[str, ...] = (
+    "device_name",
+    "sample_rate_hz",
+    "samples_per_channel",
+    "do_port",
+    "trigger_source",
+    "trigger_edge",
+    "external_trigger_terminal",
+    "ai_terminal_config",
+    "do_logic_family",
+    "continuous",
+)
+
+
+def _do_line_index_from_dataset_name(name: str) -> Optional[int]:
+    """Parse the integer line number from a ``"line<N>"`` dataset basename."""
+    if not name.startswith("line"):
+        return None
+    try:
+        return int(name[4:])
+    except ValueError:
+        return None
+
+
+def write_waveform_datasets_h5(
+    h5file,
+    waveforms: WaveformData,
+    descriptions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Write AO/DO waveform arrays to an open HDF5 file/group.
+
+    Layout (matches FastAcquisitionController._save_daq_data):
+
+    - ``/analog_output/<channel>``  (1D float)
+    - ``/digital_output/line<N>``   (1D bool)
+    """
+    descriptions = descriptions or {}
+    for channel, data in waveforms.analog_output.items():
+        ds = h5file.create_dataset(f"analog_output/{channel}", data=np.asarray(data))
+        if channel in descriptions:
+            ds.attrs["description"] = descriptions[channel]
+    for line, data in waveforms.digital_output.items():
+        ds = h5file.create_dataset(
+            f"digital_output/line{int(line)}", data=np.asarray(data, dtype=bool)
+        )
+        key = f"line{int(line)}"
+        if key in descriptions:
+            ds.attrs["description"] = descriptions[key]
+
+
+def write_nidaq_snapshot_h5(h5file, snapshot: NIDAQConfigSnapshot) -> None:
+    """Write a NIDAQConfigSnapshot to an open HDF5 file/group as attrs +
+    sequence datasets under ``/widget_config/``.
+
+    Only fields with a non-None value are written so partial snapshots are
+    well-defined.
+    """
+    for name in _SNAPSHOT_SCALAR_ATTRS:
+        value = getattr(snapshot, name, None)
+        if value is None:
+            continue
+        h5file.attrs[name] = value
+
+    seq_specs = (
+        ("selected_ao_channels", snapshot.selected_ao_channels, "S"),
+        ("selected_ai_channels", snapshot.selected_ai_channels, "S"),
+        ("selected_do_lines", snapshot.selected_do_lines, "I"),
+        ("selected_di_lines", snapshot.selected_di_lines, "I"),
+    )
+    for ds_name, value, kind in seq_specs:
+        if value is None:
+            continue
+        path = f"widget_config/{ds_name}"
+        if path in h5file:
+            del h5file[path]
+        if kind == "S":
+            arr = np.array([str(x) for x in value], dtype=h5py_string_dtype())
+        else:
+            arr = np.array([int(x) for x in value], dtype=np.int32)
+        h5file.create_dataset(path, data=arr)
+
+
+def read_waveform_datasets_h5(h5file) -> Tuple[WaveformData, Dict[str, str]]:
+    """Read AO/DO waveform datasets from an open HDF5 file/group.
+
+    Returns the waveforms and a description dict (keyed the same way as
+    AbstractNIDAQ.set_channel_descriptions: ``"ao0"``, ``"line3"``, ...).
+    """
+    waveforms = WaveformData()
+    descriptions: Dict[str, str] = {}
+
+    if "analog_output" in h5file:
+        ao_grp = h5file["analog_output"]
+        for ch_name in ao_grp:
+            ds = ao_grp[ch_name]
+            waveforms.analog_output[ch_name] = np.asarray(ds[()])
+            desc = ds.attrs.get("description")
+            if desc is not None:
+                descriptions[ch_name] = _decode_h5_str(desc)
+
+    if "digital_output" in h5file:
+        do_grp = h5file["digital_output"]
+        for ds_name in do_grp:
+            line_idx = _do_line_index_from_dataset_name(ds_name)
+            if line_idx is None:
+                continue
+            ds = do_grp[ds_name]
+            waveforms.digital_output[line_idx] = np.asarray(ds[()], dtype=bool)
+            desc = ds.attrs.get("description")
+            if desc is not None:
+                descriptions[ds_name] = _decode_h5_str(desc)
+
+    return waveforms, descriptions
+
+
+def read_nidaq_snapshot_h5(h5file) -> NIDAQConfigSnapshot:
+    """Read a NIDAQConfigSnapshot from an open HDF5 file/group.
+
+    Missing fields remain None. Reads scalar attrs at the file root and
+    sequence datasets under ``/widget_config/``.
+    """
+    snap = NIDAQConfigSnapshot()
+    attrs = h5file.attrs
+    for name in _SNAPSHOT_SCALAR_ATTRS:
+        if name not in attrs:
+            continue
+        value = attrs[name]
+        value = _decode_h5_str(value) if isinstance(value, (bytes, np.bytes_)) else value
+        if name == "sample_rate_hz":
+            setattr(snap, name, float(value))
+        elif name == "samples_per_channel":
+            setattr(snap, name, int(value))
+        elif name == "continuous":
+            setattr(snap, name, bool(value))
+        else:
+            setattr(snap, name, str(value) if not isinstance(value, str) else value)
+
+    cfg_grp = h5file.get("widget_config") if hasattr(h5file, "get") else None
+    if cfg_grp is not None:
+        if "selected_ao_channels" in cfg_grp:
+            snap.selected_ao_channels = [
+                _decode_h5_str(x) for x in cfg_grp["selected_ao_channels"][()]
+            ]
+        if "selected_ai_channels" in cfg_grp:
+            snap.selected_ai_channels = [
+                _decode_h5_str(x) for x in cfg_grp["selected_ai_channels"][()]
+            ]
+        if "selected_do_lines" in cfg_grp:
+            snap.selected_do_lines = [int(x) for x in cfg_grp["selected_do_lines"][()]]
+        if "selected_di_lines" in cfg_grp:
+            snap.selected_di_lines = [int(x) for x in cfg_grp["selected_di_lines"][()]]
+
+    return snap
+
+
+def save_waveform_config_h5(
+    filepath: str,
+    waveforms: WaveformData,
+    snapshot: Optional[NIDAQConfigSnapshot] = None,
+    descriptions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Save a waveform configuration (+ optional widget snapshot) to HDF5.
+
+    The dataset layout matches FastAcquisitionController._save_daq_data so a
+    file produced by either path is loadable by ``load_waveform_config_h5``.
+    """
+    import h5py  # local import keeps top-level import set narrow
+
+    with h5py.File(filepath, "w") as f:
+        write_waveform_datasets_h5(f, waveforms, descriptions=descriptions)
+        if snapshot is not None:
+            write_nidaq_snapshot_h5(f, snapshot)
+        f.attrs["nidaq_waveform_config_version"] = 1
+
+
+def load_waveform_config_h5(
+    filepath: str,
+) -> Tuple[WaveformData, NIDAQConfigSnapshot, Dict[str, str]]:
+    """Load a waveform configuration from an HDF5 file.
+
+    Works with both standalone configs and fast-acquisition ``daq_data.h5``
+    files (analog_input/digital_input groups, if present, are ignored).
+    """
+    import h5py
+
+    with h5py.File(filepath, "r") as f:
+        waveforms, descriptions = read_waveform_datasets_h5(f)
+        snapshot = read_nidaq_snapshot_h5(f)
+    return waveforms, snapshot, descriptions
+
+
+def h5py_string_dtype():
+    """Return an HDF5-friendly variable-length UTF-8 string dtype."""
+    import h5py
+
+    return h5py.string_dtype(encoding="utf-8")
+
+
+def _decode_h5_str(value) -> str:
+    """Best-effort decode of an HDF5 string-like attribute or array element.
+
+    h5py 2.x returns ``bytes`` for string attrs/datasets while h5py 3.x returns
+    ``str``; ``np.bytes_`` (a ``bytes`` subclass) covers vlen-string array
+    elements.
+    """
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("latin-1", errors="replace")
+    return str(value)

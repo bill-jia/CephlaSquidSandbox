@@ -46,7 +46,6 @@ class ContrastManager:
         return scaled_min, scaled_max
 
     def scale_contrast_limits(self, target_dtype):
-        print(f"{self.acquisition_dtype} -> {target_dtype}")
         for channel in self.contrast_limits.keys():
             self.contrast_limits[channel] = self.get_scaled_limits(channel, target_dtype)
 

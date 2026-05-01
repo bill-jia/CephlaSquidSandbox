@@ -400,12 +400,18 @@ class ObservationStateController:
         state: ObservationState,
         *,
         emission_filter_wheel: Any = None,
-        apply_live_trigger_settings: bool = True,
+        apply_camera_live_snapshot: bool = True,
     ) -> None:
         """Apply a saved observation state preset.
 
         Handles confocal mode, emission filters, camera_live snapshot (ROI, binning, trigger),
         then delegates to apply_full_observation_state for camera + illumination + optical path.
+
+        ``apply_camera_live_snapshot`` gates the entire camera_live block (ROI, binning,
+        camera_mode, pixel_format, trigger). Multipoint acquisition passes ``False``: those
+        settings were established before the run started and must not be re-asserted between
+        channel switches (it both wastes time and risks re-applying stale fields like a
+        ``camera_mode`` saved by a different camera class).
         """
         with self._time("obs:preset:toggle_confocal_widefield"):
             self.toggle_confocal_widefield(state.confocal_mode)
@@ -454,17 +460,74 @@ class ObservationStateController:
                 except Exception as e:
                     self._log.warning("Could not set pixel format: %s", e)
 
-        # Camera live snapshot (ROI, binning, trigger)
-        if state.camera_live is not None:
+        # Camera live snapshot (ROI, binning, camera_mode, trigger). Skipped during
+        # multipoint acquisition — see docstring.
+        if apply_camera_live_snapshot and state.camera_live is not None:
             with self._time("obs:preset:apply_camera_live_snapshot"):
-                self._apply_camera_live_snapshot(
-                    state.camera_live,
-                    apply_live_trigger_settings=apply_live_trigger_settings,
-                )
+                self._apply_camera_live_snapshot(state.camera_live)
 
         # Full apply (illumination + optical path + state switch)
         with self._time("obs:preset:apply_full_observation_state"):
             self.apply_full_observation_state(state)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Cache / bootstrap (live state ↔ general.yaml)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _collect_live_state_with_emission_filters(self) -> ObservationState:
+        """Collect the current hardware-true state including emission filter positions.
+
+        Falls back to the previously-known emission filter positions if the wheel
+        cannot be queried (e.g. transient hardware error), so they are not wiped.
+        """
+        from control.core.observation_state_service import collect_emission_filter_positions
+
+        wheel = None
+        if self.microscope is not None:
+            wheel = getattr(self.microscope.addons, "emission_filter_wheel", None)
+        try:
+            emission = collect_emission_filter_positions(wheel) if wheel else {}
+        except Exception:
+            emission = {}
+        if not emission and self._current_state is not None:
+            emission = dict(self._current_state.emission_filter_positions or {})
+        return self.collect_observation_state(emission_filter_positions=emission or None)
+
+    def bootstrap_state_from_hardware(self) -> ObservationState:
+        """Build an ObservationState from current hardware and adopt it as the active state.
+
+        Used at startup when no persisted state is available (missing/empty
+        general.yaml) so widgets and live triggering have a valid state immediately.
+        """
+        state = self._collect_live_state_with_emission_filters()
+        self._current_state = state
+        return state
+
+    def cache_current_state_to_disk(self) -> bool:
+        """Snapshot live hardware state and write it to general.yaml.
+
+        Replaces the in-memory ``_current_state`` (and the repository's general
+        cache) with the freshly collected state so subsequent reads stay
+        consistent with what was just persisted.
+
+        Caller is responsible for throttling and gating on acquisition state.
+        Returns True on success, False if no profile is active or save failed.
+        """
+        profile = self.config_repo.current_profile
+        if not profile:
+            return False
+        try:
+            state = self._collect_live_state_with_emission_filters()
+        except Exception as e:
+            self._log.warning("Could not collect observation state for cache: %s", e)
+            return False
+        try:
+            self.config_repo.save_observation_state(profile, state)
+        except Exception as e:
+            self._log.warning("Could not write observation state cache to disk: %s", e)
+            return False
+        self._current_state = state
+        return True
 
     # ─────────────────────────────────────────────────────────────────────
     # Collection (moved from observation_state_service)
@@ -593,9 +656,15 @@ class ObservationStateController:
         self,
         snap: CameraLiveSnapshot,
         *,
-        apply_live_trigger_settings: bool = True,
+        apply_trigger_settings: bool = True,
     ) -> None:
-        """Apply ROI/binning/mode/trigger saved with the preset."""
+        """Apply ROI/binning/mode/trigger saved with the preset.
+
+        ``apply_trigger_settings=False`` skips the live trigger_mode/trigger_fps
+        write — used when seeding the camera at multipoint start, where the
+        controller has already set SOFTWARE trigger and overriding it from a
+        preset's saved trigger (e.g. Continuous) would cause auto-fired frames.
+        """
         try:
             with self._time("obs:cls:set_exposure_time"):
                 self.camera.set_exposure_time(snap.exposure_time_ms)
@@ -641,7 +710,7 @@ class ObservationStateController:
                 self._log.warning("Could not set ROI: %s", e)
 
         lc = self.live_controller
-        if lc is not None and apply_live_trigger_settings:
+        if lc is not None and apply_trigger_settings:
             if snap.trigger_mode:
                 try:
                     with self._time("obs:cls:set_trigger_mode"):

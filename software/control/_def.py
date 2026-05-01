@@ -1077,10 +1077,10 @@ def load_formats():
     default_formats_path = os.path.join(default_path, "sample_formats.yaml")
 
     if os.path.exists(cached_formats_path):
-        print("Using cached sample formats")
+        log.info("Using cached sample formats")
         sample_formats = read_sample_formats_yaml(cached_formats_path)
     else:
-        print("Using default sample formats")
+        log.info("Using default sample formats")
         sample_formats = read_sample_formats_yaml(default_formats_path)
 
     return objectives, sample_formats

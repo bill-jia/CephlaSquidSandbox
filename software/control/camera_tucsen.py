@@ -1349,7 +1349,9 @@ class TucsenCamera(AbstractCamera):
         self._log.debug("Cleaning up read thread.")
         with self._read_thread_lock:
             if self._read_thread is None:
-                self._log.warning("No read thread, already not running?")
+                # Normal in SDK-callback mode — frames arrive via TUCAM_Buf_DataCallBack
+                # so no _wait_for_frame thread was ever started.
+                self._log.debug("No read thread to clean up (SDK-callback mode or already stopped).")
                 return True
 
             self._read_thread_keep_running.clear()
@@ -1648,12 +1650,12 @@ class TucsenCamera(AbstractCamera):
     # =========================================================================
 
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
-        """Set readout mode. Tucsen cameras support GLOBAL only."""
+        """Set readout mode."""
         if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
             if readout_mode != CameraReadoutMode.ROLLING:
                 raise ValueError(f"Tucsen camera {self._config.camera_model} does not support readout mode {readout_mode}")
                 # TBD: add support for global with reset (grayed out in SamplePro for some reason, figure it out)
-        if readout_mode != CameraReadoutMode.GLOBAL:
+        elif readout_mode != CameraReadoutMode.GLOBAL:
             raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
 
     def get_readout_mode(self) -> CameraReadoutMode:
@@ -1719,7 +1721,7 @@ class TucsenCamera(AbstractCamera):
         if mode_name == self.get_camera_mode():
             self._log.debug("set_camera_mode: already %s, skipping", mode_name)
             return
-        self._log.info("set_camera_mode: %s -> %s", self.get_camera_mode(), mode_name)
+        self._log.debug("set_camera_mode: %s -> %s", self.get_camera_mode(), mode_name)
 
         modes = TUCSEN_CAMERA_MODES.get(self._config.camera_model)
         if modes is None:
