@@ -48,10 +48,25 @@ user switch profiles. *Save As* duplicates the current profile under a new
 name. Switching emits `signal_profile_changed`, which refreshes channel lists
 and the observation-state preset combo.
 
+## What persists, where
+
+Two complementary mechanisms keep the application reopening in the user's
+last configuration:
+
+1. **Live ObservationState → `channel_configs/general.yaml`.** The HCS main
+   window runs a 30 s timer that calls
+   `ObservationStateController.cache_current_state_to_disk()` to snapshot the
+   live hardware state (camera, illumination, emission filters) into
+   `general.yaml`. The same method is invoked once on shutdown. See
+   `software/docs/configuration-api.md` for details. Acquisition windows are
+   skipped to avoid disk contention.
+2. **Transient UI state → `gui_state.yaml`.** Window geometry, tab selection,
+   last objective, and other widget-level UI selections are persisted only on
+   shutdown; see the table below.
+
 ## Per-profile GUI state (`gui_state.yaml`)
 
-To make sure the application reopens in the same configuration the user left
-it, the following transient UI state is persisted to
+The following transient UI state is persisted to
 `user_profiles/{profile}/gui_state.yaml` on shutdown and restored on startup:
 
 | Field | Source widget |
@@ -64,9 +79,10 @@ it, the following transient UI state is persisted to
 | `live_display_fps`, `autolevel_enabled`, `display_resolution_scaling` | `LiveControlWidget` |
 
 Persistence is wired in `HighContentScreeningGui._cleanup_common`
-(`_persist_gui_state`); restoration runs after widget construction
-(`_restore_gui_state`) and again after `show()` for window geometry
-(`apply_persisted_window_state`, called from `main_hcs.py`).
+(`_persist_gui_state`, runs after the live ObservationState flush);
+restoration runs after widget construction (`_restore_gui_state`) and again
+after `show()` for window geometry (`apply_persisted_window_state`, called
+from `main_hcs.py`).
 
 ## Programmatic access
 
