@@ -1733,7 +1733,7 @@ class MultiPointWorker:
                         with self._timing.get_timer("perform_autofocus"):
                             if not self.perform_autofocus(region_id, fov):
                                 self._log.error(
-                                    f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+                                    f"Autofocus failed at region={region_id} fov={fov}.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
                                 )
 
                         # laser af characterization mode
@@ -2160,7 +2160,7 @@ class MultiPointWorker:
             saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
             iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
             self._log.error(
-                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed at region={region_id} fov={fov} !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
                 exc_info=e,
             )
 
