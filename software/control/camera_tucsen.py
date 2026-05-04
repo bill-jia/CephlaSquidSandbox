@@ -485,7 +485,7 @@ class TucsenCamera(AbstractCamera):
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
 
         packing = camera_mode_name_to_packing(self.get_camera_mode())
-        self._byte_decoding_fn = lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
+        self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
 
         if not hasattr(self, "_max_acquisition_rate_hz"):
             self._max_acquisition_rate_hz = 100.0
@@ -1773,12 +1773,26 @@ class TucsenCamera(AbstractCamera):
             return None
         return modes[mode_name][1]
 
+    def _build_byte_decoding_fn(self, packing: str):
+        # The SDK's ReverseY genicam node only acts on the USUAL pipeline that
+        # WaitForFrame returns (used for live view in continuous mode). The
+        # DataCallBack raw bytes — used by multipoint gated-trigger and fast
+        # acquisition — come from the sensor in native readout order, which is
+        # Y-flipped vs USUAL. Compensate in software when reverse_y is False/None
+        # so every path produces the same orientation as the live view.
+        apply_y_flip = not bool(self._config.reverse_y)
+        if apply_y_flip:
+            return lambda raw, meta: np.ascontiguousarray(
+                tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)[::-1]
+            )
+        return lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
+
     def _update_internal_settings(self):
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
         packing = camera_mode_name_to_packing(self.get_camera_mode())
-        self._byte_decoding_fn = lambda raw, meta: tucsen_raw_bytes_to_uint16(raw, meta, packing=packing)
+        self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
         self.update_config_crop()
 
     def _raw_set_resolution(self, bin_value: int):
