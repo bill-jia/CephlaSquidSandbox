@@ -3041,6 +3041,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_mode.currentTextChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_time.toggled.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_overlap.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.entry_scan_size.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_dt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_Nt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_deltaZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
@@ -3073,6 +3074,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "z_mode": self.combobox_z_mode.currentText(),
                 "time_enabled": self.checkbox_time.isChecked(),
                 "fov_overlap": self.entry_overlap.value(),
+                "scan_size_mm": self.entry_scan_size.value(),
                 "dt": self.entry_dt.value(),
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
@@ -3112,6 +3114,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.combobox_z_mode.blockSignals(True)
             self.checkbox_time.blockSignals(True)
             self.entry_overlap.blockSignals(True)
+            self.entry_scan_size.blockSignals(True)
             self.entry_dt.blockSignals(True)
             self.entry_Nt.blockSignals(True)
             self.entry_deltaZ.blockSignals(True)
@@ -3149,6 +3152,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             self.checkbox_time.setChecked(settings.get("time_enabled", False))
             self.entry_overlap.setValue(settings.get("fov_overlap", 10))
+            cached_scan_size = settings.get("scan_size_mm")
+            if cached_scan_size is not None:
+                self.entry_scan_size.setValue(cached_scan_size)
+                # Keep per-mode stored params in sync so switching XY mode and
+                # back doesn't clobber the restored value with the default.
+                self.stored_xy_params[self.combobox_xy_mode.currentText()]["scan_size"] = cached_scan_size
             self.entry_dt.setValue(settings.get("dt", 0))
             self.entry_Nt.setValue(settings.get("nt", 1))
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
@@ -3179,6 +3188,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.combobox_z_mode.blockSignals(False)
             self.checkbox_time.blockSignals(False)
             self.entry_overlap.blockSignals(False)
+            self.entry_scan_size.blockSignals(False)
             self.entry_dt.blockSignals(False)
             self.entry_Nt.blockSignals(False)
             self.entry_deltaZ.blockSignals(False)
