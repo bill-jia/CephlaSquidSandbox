@@ -1944,7 +1944,12 @@ class MultiPointWorker:
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 
-                    if z_level == 0 and config_idx == 0:
+                    # Run AF on the first ACTIVE channel for this region. Using
+                    # the global ``config_idx`` here misses the AF window
+                    # entirely whenever the per-point channel selection skips
+                    # the global preset 0 — ``active_step`` is the
+                    # per-active-channel counter that survives that subset.
+                    if z_level == 0 and active_step == 0:
                         with self._timing.get_timer("perform_autofocus"):
                             if not self.perform_autofocus(region_id, fov):
                                 self._log.error(
