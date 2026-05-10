@@ -2491,6 +2491,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Track loading from cache
         self._loading_from_cache = False
 
+        # One-shot scan size restored from cache. Consumed by set_default_scan_size
+        # so the first plate-format-change cascade after startup preserves the
+        # user's last value instead of resetting to the effective well size.
+        self._pending_cached_scan_size = None
+
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
         self.set_default_scan_size()
@@ -3158,6 +3163,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 # Keep per-mode stored params in sync so switching XY mode and
                 # back doesn't clobber the restored value with the default.
                 self.stored_xy_params[self.combobox_xy_mode.currentText()]["scan_size"] = cached_scan_size
+                # Survive the wellplate-format-change cascade fired by
+                # main_window during startup (clobbers via set_default_scan_size).
+                self._pending_cached_scan_size = cached_scan_size
             self.entry_dt.setValue(settings.get("dt", 0))
             self.entry_Nt.setValue(settings.get("nt", 1))
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
@@ -3860,7 +3868,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             self.set_default_shape()
 
-            if "glass slide" in self.navigationViewer.sample:
+            if self._pending_cached_scan_size is not None:
+                # Restore user's last scan_size (consumed once on startup).
+                self.entry_scan_size.setValue(self._pending_cached_scan_size)
+                self.entry_scan_size.setEnabled(True)
+                self._pending_cached_scan_size = None
+            elif "glass slide" in self.navigationViewer.sample:
                 self.entry_scan_size.setValue(
                     0.1
                 )  # init to 0.1mm when switching to 'glass slide' (for imaging a single FOV by default)
@@ -3894,6 +3907,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # change scan size to single FOV if XY is checked and mode is "Current Position"
         if self.checkbox_xy.isChecked() and self.combobox_xy_mode.currentText() == "Current Position":
             self.entry_scan_size.setValue(0.1)
+            self._pending_cached_scan_size = None
 
     def set_default_shape(self):
         if self.scanCoordinates.format in ["384 well plate", "1536 well plate"]:
