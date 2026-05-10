@@ -119,6 +119,24 @@ class ChannelGroup(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class IlluminatorTiming(BaseModel):
+    """Pulse-timing relationship between an illuminator and the camera frame.
+
+    When set on an :class:`IlluminatorState`, the illuminator's digital gating
+    line is driven by an NIDAQ one-shot waveform that fires on the camera's
+    exposure-active edge. The DC analog intensity (set via the regular
+    ``intensity`` field) is held high throughout the exposure; only the
+    digital gate is pulsed during the configured offset/duration window.
+    Channels that lack a NIDAQ digital gating line (LED matrix, serial-only)
+    cannot use this and will fail validation when an acquisition runs.
+    """
+
+    offset_ms: float = Field(..., ge=0, description="Pulse start, ms after camera exposure begins")
+    duration_ms: float = Field(..., gt=0, description="Pulse width in ms")
+
+    model_config = {"extra": "forbid"}
+
+
 class IlluminatorState(BaseModel):
     """Runtime state of a single illumination source within an ObservationState.
 
@@ -136,6 +154,10 @@ class IlluminatorState(BaseModel):
     led_matrix_mode: Optional[str] = Field(
         None,
         description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",
+    )
+    timing: Optional[IlluminatorTiming] = Field(
+        None,
+        description="Optional NIDAQ-driven pulse timing within camera exposure (None = on for full exposure)",
     )
 
     model_config = {"extra": "forbid"}
@@ -254,3 +276,8 @@ class ObservationState(BaseModel):
     def active_illuminator_states(self) -> List[IlluminatorState]:
         """IlluminatorStates where on=True."""
         return [ist for ist in self.illuminator_states if ist.on]
+
+    @property
+    def is_waveform_driven(self) -> bool:
+        """True if any active illuminator has NIDAQ pulse timing configured."""
+        return any(ist.on and ist.timing is not None for ist in self.illuminator_states)

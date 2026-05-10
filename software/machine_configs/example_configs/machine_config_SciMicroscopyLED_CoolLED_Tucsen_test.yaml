@@ -162,12 +162,12 @@ devices:
       flip_direction: false
 
   led_matrix:
-    driver: teensy
+    driver: scimicroscopy_led_array
     enabled: true
     connection:
-      serial_number: null
+      serial_number: "12732490"
     config:
-      distance: 50
+      distance: 65
       default_na: 0.8
       turn_on_delay: 0.03
       default_color: [1, 1, 1]
@@ -197,7 +197,7 @@ illumination_devices:
     driver: coolled_pe400
     # Update COM port / connection details to match your setup.
     connection:
-      serial_number: "3065377C3433"
+      serial_number: "388335613133"
     channels:
       "Fluorescence 405 nm Ex":
         wavelength_nm: 405
@@ -243,7 +243,7 @@ illumination_devices:
             direction: output
             channel_id: "port0/line3"
             display_name: "coolled_shutter_635_nidaq3"
-
+          
   - id: led_matrix
     driver: led_matrix
     # Single logical channel + mode (BF / DF / halves / RGB) — see lighting.LEDMatrixIlluminationDevice

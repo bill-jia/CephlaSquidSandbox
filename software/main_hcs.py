@@ -103,9 +103,11 @@ if __name__ == "__main__":
     # This allows shutdown via ctrl+C even after the gui has popped up.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+    # Build the microscope object from the global configuration. This will initialize all hardware components
     microscope = control.microscope.Microscope.build_from_global_config(
         args.simulation, skip_init=args.skip_init, skip_homing=args.skip_homing
     )
+
     win = gui.HighContentScreeningGui(
         microscope=microscope,
         is_simulation=args.simulation,

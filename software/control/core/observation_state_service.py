@@ -169,6 +169,11 @@ def observation_state_to_yaml(
         }
         if ist.led_matrix_mode is not None:
             entry["led_matrix_mode"] = ist.led_matrix_mode
+        if ist.timing is not None:
+            entry["timing"] = {
+                "offset_ms": ist.timing.offset_ms,
+                "duration_ms": ist.timing.duration_ms,
+            }
         illuminator_out.append(entry)
 
     # Confocal hardware settings

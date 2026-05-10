@@ -1079,6 +1079,46 @@ class IlluminationController:
         """Return the device that owns *channel_name*, or None."""
         return self._channel_map.get(channel_name)
 
+    def get_nidaq_do_line_for_channel(self, channel_name: str) -> Optional[int]:
+        """Return the NI-DAQ digital-output line gating *channel_name*, or None.
+
+        Used by waveform-driven observation states to drive the LED gate from
+        an NIDAQ pulse pattern. Returns None for channels routed via MCU,
+        serial light sources, the LED matrix, or anything else without a
+        dedicated NIDAQ DO line.
+        """
+        from control.models.io_endpoint_config import IOControllerType, IOSignalType
+
+        device = self._channel_map.get(channel_name)
+        if device is None:
+            return None
+
+        shutter_ep = None
+        if isinstance(device, IORoutedIlluminationDevice):
+            ep_pair = device._channel_endpoints.get(channel_name)
+            if ep_pair is not None:
+                _, shutter_ep = ep_pair
+        elif isinstance(device, NIDAQIlluminationDevice):
+            shutter_ep = device._shutter_ep
+        # SerialIlluminationDevice may have an optional NIDAQ shutter; honour it.
+        elif isinstance(device, SerialIlluminationDevice):
+            shutter_ep = getattr(device, "_shutter_endpoints", {}).get(channel_name)
+
+        if shutter_ep is None:
+            return None
+        endpoint = getattr(shutter_ep, "endpoint", None)
+        if endpoint is None:
+            return None
+        if endpoint.controller != IOControllerType.NIDAQ or endpoint.signal_type != IOSignalType.DIGITAL:
+            return None
+        # NIDAQ DO channel_id format is "portP/lineL"; the integer line index is what we want.
+        cid = endpoint.channel_id or ""
+        _, _, line_part = cid.partition("/line")
+        try:
+            return int(line_part)
+        except (TypeError, ValueError):
+            return None
+
     def has_unified_led_matrix(self) -> bool:
         """True when the LED matrix is configured as one channel + mode switching."""
         return self._led_matrix_unified is not None
@@ -1558,6 +1598,7 @@ class IlluminationController:
         illuminator_states: List["IlluminatorState"],
         turn_on: bool,
         force_hardware: bool = False,
+        gate_timed_illuminators: bool = True,
     ) -> None:
         """Apply illumination for a list of IlluminatorStates.
 
@@ -1568,13 +1609,26 @@ class IlluminationController:
             illuminator_states: List of IlluminatorState objects to apply.
             turn_on: True to set intensity + LED mode + turn on; False to turn off.
             force_hardware: Passed through to :meth:`set_channel_state`.
+            gate_timed_illuminators: When False, illuminators with a ``timing``
+                block have their DC intensity set but the digital gate is left
+                off — the NIDAQ pulse waveform is the sole gate driver during
+                a waveform-driven capture. Default True keeps the existing
+                "gate stays on for full exposure" behaviour.
         """
         for ist in illuminator_states:
+            timed = ist.timing is not None
             if turn_on:
                 mode = ist.led_matrix_mode
                 if mode and self.has_unified_led_matrix():
                     self.set_led_matrix_mode(mode)
                 self.set_channel_intensity(ist.illumination_channel, ist.intensity)
+                if timed and not gate_timed_illuminators:
+                    # Skip the digital ON; NIDAQ waveform will drive it.
+                    continue
+            else:
+                if timed and not gate_timed_illuminators:
+                    # The digital line was never gated on by us — nothing to turn off.
+                    continue
             self.set_channel_state(ist.illumination_channel, turn_on, force_hardware=force_hardware)
 
     # -- Multi-port forwarding (delegates to IORoutedIlluminationDevice) -----

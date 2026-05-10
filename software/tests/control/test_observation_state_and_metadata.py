@@ -18,6 +18,7 @@ from control.models.observation_state import (
     CameraLiveSnapshot,
     CameraSettings,
     IlluminatorState,
+    IlluminatorTiming,
     ObservationState,
 )
 
@@ -134,6 +135,62 @@ def test_observation_state_yaml_v3_format():
         assert "camera_settings" not in ist_view
         assert "filter_wheel" not in ist_view
         assert "filter_position" not in ist_view
+
+
+def test_illuminator_timing_round_trip_yaml():
+    """An ObservationState with IlluminatorTiming round-trips through observation_state_to_yaml + load."""
+    state = ObservationState(
+        name="pulsed_561",
+        camera_settings=CameraSettings(exposure_time_ms=50.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(
+                illumination_channel="Fluorescence 561 nm Ex",
+                intensity=50.0,
+                on=True,
+                timing=IlluminatorTiming(offset_ms=24.5, duration_ms=1.0),
+            ),
+            IlluminatorState(
+                illumination_channel="Fluorescence 488 nm Ex",
+                intensity=30.0,
+                on=True,
+            ),  # untimed — should round-trip without a timing block
+        ],
+        display_color="#FF00FF",
+    )
+
+    view = observation_state_to_yaml(state, camera_label="camera")
+    pulsed = view["illuminator_states"][0]
+    assert pulsed["timing"] == {"offset_ms": 24.5, "duration_ms": 1.0}
+    untimed = view["illuminator_states"][1]
+    assert "timing" not in untimed
+
+    # Re-load via the model and confirm fields survived.
+    serialized = yaml.safe_dump(state.model_dump(mode="json"))
+    back = ObservationState.model_validate(yaml.safe_load(serialized))
+    assert back.illuminator_states[0].timing is not None
+    assert back.illuminator_states[0].timing.offset_ms == 24.5
+    assert back.illuminator_states[0].timing.duration_ms == 1.0
+    assert back.illuminator_states[1].timing is None
+    assert back.is_waveform_driven is True
+
+
+def test_is_waveform_driven_only_for_active_timed_illuminators():
+    """A timing block on an inactive illuminator must NOT make the state waveform-driven."""
+    state = ObservationState(
+        name="inactive_pulsed",
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(
+                illumination_channel="LaserA",
+                intensity=50.0,
+                on=False,
+                timing=IlluminatorTiming(offset_ms=1.0, duration_ms=1.0),
+            ),
+        ],
+    )
+    assert state.is_waveform_driven is False
+    state.illuminator_states[0] = state.illuminator_states[0].model_copy(update={"on": True})
+    assert state.is_waveform_driven is True
 
 
 def test_observation_state_binning_mode_from_camera_live():

@@ -16,11 +16,40 @@ def _multipoint_observation_preset_display_names(microscope) -> list:
     return sorted(microscope.config_repo.list_observation_presets())
 
 
-def _create_checkbox_list_item(name: str, checked: bool = False) -> QListWidgetItem:
-    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight."""
+def _is_preset_waveform_driven(microscope, name: str) -> bool:
+    """Return True when the named preset has any timed illuminator (NIDAQ pulse).
+
+    Best-effort: returns False if the preset cannot be loaded for any reason
+    so the visual decoration never blocks list rendering.
+    """
+    if microscope is None:
+        return False
+    try:
+        preset = microscope.config_repo.load_observation_preset(name)
+    except Exception:
+        return False
+    return bool(preset and getattr(preset, "is_waveform_driven", False))
+
+
+def _create_checkbox_list_item(name: str, checked: bool = False, *, microscope=None) -> QListWidgetItem:
+    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight.
+
+    When ``microscope`` is supplied and the named preset uses NIDAQ pulse
+    timing, the row is rendered in italic with a tooltip flagging the
+    requirement. ``item.text()`` remains the canonical preset name so
+    callers comparing against ``item.text()`` are not affected.
+    """
     item = QListWidgetItem(name)
     item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
     item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+    if _is_preset_waveform_driven(microscope, name):
+        font = item.font()
+        font.setItalic(True)
+        item.setFont(font)
+        item.setToolTip(
+            "Uses NIDAQ pulse timing — illumination is delivered as a precisely "
+            "timed pulse during the camera exposure. Requires an NIDAQ on this rig."
+        )
     return item
 
 
@@ -994,7 +1023,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
@@ -1644,7 +1673,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
 
     def toggle_acquisition(self, pressed):
@@ -2572,7 +2603,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         # Per-point (per-well) channel override. None means "use global selection at every well".
@@ -4336,7 +4367,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
         self._reset_per_point_channels_map()
 
@@ -4807,7 +4840,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         # Laser AF checkbox
@@ -5059,7 +5092,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
 
     def acquisition_is_finished(self):
