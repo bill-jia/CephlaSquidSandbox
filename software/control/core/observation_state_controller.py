@@ -259,21 +259,62 @@ class ObservationStateController:
         self.ic.apply_observation_illumination(active, turn_on=False)
 
     def apply_illumination_parameters(self) -> None:
-        """Set per-channel intensity, LED matrix mode, logical on/off, and NL5/CellX laser power."""
+        """Set per-channel intensity, LED matrix mode, logical on/off, and NL5/CellX laser power.
+
+        Three per-illuminator regimes:
+
+        * ``ist.on == False`` (inactive): only assert the digital gate OFF
+          on hardware — belt-and-suspenders so a previously-on channel
+          can't stay HIGH while software thinks it's off. Skip every other
+          write so we don't perturb analog DACs or send serial commands for
+          channels the user hasn't selected.
+
+        * ``ist.on == True`` with ``ist.timing is None`` (standard channel):
+          full path — LED matrix mode → analog/serial intensity → digital
+          gate ON → NL5/CellX laser power.
+
+        * ``ist.on == True`` with ``ist.timing is not None`` (NIDAQ
+          pulse-driven channel): write the LED matrix mode, intensity, and
+          NL5/CellX laser power so the LED sits at the right brightness
+          ahead of the camera frame, but do NOT drive the digital gate from
+          software. The per-frame NIDAQ waveform is the only thing that
+          should pull the gate HIGH, and only during the configured pulse
+          window. The gate is held LOW between the prior ``turn_off_all``
+          and the camera's exposure-active edge.
+        """
         if self._current_state is None:
             return
         ic = self.ic
         for ist in self._current_state.illuminator_states:
+            if not ist.on:
+                # Inactive: ensure hardware matches the off intent without
+                # re-asserting intensity / matrix mode / laser power.
+                with self._time("obs:ip:set_channel_state"):
+                    ic.set_channel_state(ist.illumination_channel, False)
+                continue
+
+            timed = ist.timing is not None
+
             with self._time("obs:ip:set_led_matrix_mode"):
                 mode = ist.led_matrix_mode
                 if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
                     ic.set_led_matrix_mode(mode)
 
+            # Always send the intensity command (serial for CoolLED-like
+            # devices, DAC for IORouted) so the LED is at the right level
+            # when the gate opens — for timed illuminators the gate opens
+            # via the NIDAQ pulse, so the intensity must already be live.
             with self._time("obs:ip:set_channel_intensity"):
                 ic.set_channel_intensity(ist.illumination_channel, ist.intensity)
-            
-            with self._time("obs:ip:set_channel_state"):
-                ic.set_channel_state(ist.illumination_channel, ist.on)
+
+            # Drive the digital gate from software only for non-timed
+            # channels. Timed channels delegate gate control to the NIDAQ
+            # pulse waveform; pulling the gate HIGH here would leave the
+            # LED on for the full exposure (and during AF / settle) instead
+            # of just the configured pulse window.
+            if not timed:
+                with self._time("obs:ip:set_channel_state"):
+                    ic.set_channel_state(ist.illumination_channel, True)
 
 
             if self.microscope.addons.nl5 and NL5_USE_DOUT:
