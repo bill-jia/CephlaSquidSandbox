@@ -98,14 +98,16 @@ def test_scan_coordinates_basic_operation():
 
 
 def test_sort_coordinates_manual_regions_preserve_drawing_order():
-    """Manual regions stay in drawing order, come before wells, and ignore S-Pattern."""
+    """Manual regions stay in drawing order and come before wells. The well sweep
+    starts at the corner closest to the last manual exit, so a manual region in
+    the bottom-right makes the well order start there too."""
     sc = _make_scan_coordinates()
     sc.acquisition_pattern = "S-Pattern"
 
     # Set up regions directly (bypass coordinate validation)
     sc.region_centers = {
         "A1": [10.0, 10.0],
-        "manual1": [99.0, 99.0],  # Drawn second, far position
+        "manual1": [99.0, 99.0],  # Drawn second, far position (bottom-right)
         "B1": [10.0, 20.0],
         "manual0": [10.0, 10.0],  # Drawn first, same position as A1
         "B2": [20.0, 20.0],
@@ -116,8 +118,34 @@ def test_sort_coordinates_manual_regions_preserve_drawing_order():
     sc.sort_coordinates()
 
     keys = list(sc.region_centers.keys())
-    # Manual regions first (drawing order), then wells (S-Pattern: row B reversed)
-    assert keys == ["manual0", "manual1", "A1", "A2", "B2", "B1"]
+    # Manuals first (drawing order). Wells: closest corner to manual1's exit
+    # (99, 99) is B2 (20, 20), so the optimizer picks bottom-right row-major.
+    assert keys == ["manual0", "manual1", "B2", "B1", "A1", "A2"]
+
+
+def test_sort_coordinates_picks_column_major_for_tall_narrow_selection():
+    """When wells are stacked tall-and-narrow with column spacing >> row spacing,
+    sweeping each column top-to-bottom and snaking back is much shorter than
+    crossing the long horizontal gap on every row."""
+    sc = _make_scan_coordinates()
+    sc.acquisition_pattern = "S-Pattern"
+
+    # Two columns 100mm apart, 4 rows 10mm apart. Row-major would cross the 100mm
+    # gap 4 times; col-major crosses it once and walks short rungs in between.
+    cols = (10.0, 110.0)
+    rows = (0.0, 10.0, 20.0, 30.0)
+    for r_idx, y in enumerate(rows):
+        for c_idx, x in enumerate(cols):
+            wid = f"{chr(ord('A') + r_idx)}{c_idx + 1}"
+            sc.region_centers[wid] = [x, y]
+            sc.region_fov_coordinates[wid] = [(x, y, 0.0)]
+
+    sc.sort_coordinates()
+
+    keys = list(sc.region_centers.keys())
+    # Col-major TL: col 1 top->bottom, then col 2 bottom->top.
+    expected = ["A1", "B1", "C1", "D1", "D2", "C2", "B2", "A2"]
+    assert keys == expected
 
 
 def test_snake_from_rows_four_corners():

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import itertools
 import math
 import re
 from typing import Callable, List, Tuple
@@ -139,29 +138,24 @@ class ScanCoordinates:
                 opts.append((start_top, start_left, entry, exit_fov))
         return opts
 
-    def _apply_snake_continuity(self):
-        """Optimal corner assignment via DP across regions.
+    def _evaluate_region_order(self, region_ids):
+        """Run the snake-continuity DP for a fixed region order.
 
-        For each region with a row grid, there are 4 (entry_corner, exit_corner) pairs;
-        odd row counts give diagonal exits, even row counts give same-column exits.
-        We minimize total squared inter-region stage travel across the fixed region
-        order using a 4-state shortest-path DP — O(16·n). The first region's starting
-        corner is chosen freely (all 4 options seed the DP at zero cost), so "best
-        starting region corner" is part of the optimum. Regions without a row grid
-        (manual, single-FOV, template) contribute a single fixed (entry, exit) option
-        taken from their existing flat FOV list.
+        For each region with a row grid (S-Pattern only), enumerate 4 entry/exit
+        corner options; otherwise use the flat FOV list's first/last as fixed
+        entry/exit. A 4-state shortest-path DP minimizes total squared
+        inter-region stage travel — O(16·n). The first region's options seed
+        the DP at zero cost, so its starting corner is also chosen optimally.
+        Returns (total_cost, chosen_options) where chosen_options[i] is the
+        (start_top, start_left, entry, exit) tuple selected for region_ids[i].
         """
-        if self.fov_pattern != "S-Pattern":
-            return
-
-        region_ids = [rid for rid in self.region_fov_coordinates if self.region_fov_coordinates[rid]]
-        if len(region_ids) < 2:
-            return
+        if not region_ids:
+            return 0.0, []
 
         options_per_region = []
         for rid in region_ids:
             rows = self.region_fov_rows.get(rid)
-            opts = self._region_corner_options(rows) if rows else []
+            opts = self._region_corner_options(rows) if (rows and self.fov_pattern == "S-Pattern") else []
             if not opts:
                 fovs = self.region_fov_coordinates[rid]
                 entry = (fovs[0][0], fovs[0][1])
@@ -192,8 +186,21 @@ class ScanCoordinates:
         for i in range(len(options_per_region) - 1, 0, -1):
             chosen[i - 1] = backptr[i][chosen[i]]
 
-        for i, rid in enumerate(region_ids):
-            start_top, start_left, _, _ = options_per_region[i][chosen[i]]
+        total_cost = prev_costs[chosen[-1]]
+        chosen_options = [options_per_region[i][chosen[i]] for i in range(len(options_per_region))]
+        return total_cost, chosen_options
+
+    def _apply_snake_continuity(self):
+        """Apply DP-optimal FOV-level entry corners for the current region order."""
+        if self.fov_pattern != "S-Pattern":
+            return
+
+        region_ids = [rid for rid in self.region_fov_coordinates if self.region_fov_coordinates[rid]]
+        if len(region_ids) < 2:
+            return
+
+        _, chosen_options = self._evaluate_region_order(region_ids)
+        for rid, (start_top, start_left, _, _) in zip(region_ids, chosen_options):
             if start_top is None:
                 continue
             self.region_fov_coordinates[rid] = self._snake_from_rows(
@@ -686,44 +693,85 @@ class ScanCoordinates:
         self._sort_region_order()
         self._apply_snake_continuity()
 
+    @staticmethod
+    def _parse_well_id(key):
+        """Parse a well id (e.g. "A1", "AA12") into (row_index, col_index)."""
+        letters = "".join(c for c in key if c.isalpha())
+        numbers = "".join(c for c in key if c.isdigit())
+        letter_value = 0
+        for i, letter in enumerate(reversed(letters)):
+            letter_value += (ord(letter) - ord("A")) * (26**i)
+        return letter_value, int(numbers)
+
+    def _well_order_candidates(self, well_items):
+        """Enumerate 8 boustrophedon orderings of well items.
+
+        2 axis choices (rows-then-cols vs cols-then-rows) x 4 starting corners
+        (top/bottom x left/right). Within each variant, the outer axis groups
+        wells and the inner axis snakes (alternates direction every stripe).
+        Returns a list of orderings; each ordering is a list of (well_id, value).
+        """
+        if len(well_items) <= 1:
+            return [list(well_items)]
+
+        indexed = [(self._parse_well_id(k), k, v) for k, v in well_items]
+        candidates = []
+
+        # Row-major: outer = row letter (top->bottom or reversed),
+        # inner = column number (alternating left->right / right->left).
+        for start_top in (True, False):
+            for start_left in (True, False):
+                unique_rows = sorted({r for (r, _), _, _ in indexed}, reverse=not start_top)
+                ordering = []
+                for stripe_idx, row in enumerate(unique_rows):
+                    row_items = [(c, k, v) for (r, c), k, v in indexed if r == row]
+                    go_ltr = start_left if stripe_idx % 2 == 0 else not start_left
+                    row_items.sort(key=lambda t: t[0], reverse=not go_ltr)
+                    ordering.extend([(k, v) for _, k, v in row_items])
+                candidates.append(ordering)
+
+        # Col-major: outer = column number (left->right or reversed),
+        # inner = row letter (alternating top->bottom / bottom->top).
+        for start_left in (True, False):
+            for start_top in (True, False):
+                unique_cols = sorted({c for (_, c), _, _ in indexed}, reverse=not start_left)
+                ordering = []
+                for stripe_idx, col in enumerate(unique_cols):
+                    col_items = [(r, k, v) for (r, c), k, v in indexed if c == col]
+                    go_ttb = start_top if stripe_idx % 2 == 0 else not start_top
+                    col_items.sort(key=lambda t: t[0], reverse=not go_ttb)
+                    ordering.extend([(k, v) for _, k, v in col_items])
+                candidates.append(ordering)
+
+        return candidates
+
     def _sort_region_order(self):
-        def sort_key(item):
-            key, coord = item
-            if self._is_manual_region(key):
-                # Manual regions preserve drawing order (the index from region name)
-                # They sort before wells (priority 0 vs 1)
-                return (0, self._get_manual_region_index(key), 0)
+        items = list(self.region_centers.items())
+        manual_items = sorted(
+            [(k, v) for k, v in items if self._is_manual_region(k)],
+            key=lambda x: self._get_manual_region_index(x[0]),
+        )
+        well_items = [(k, v) for k, v in items if not self._is_manual_region(k)]
 
-            # Well regions sort by row letter, then column number (e.g., A1, A2, B1, B2)
-            letters = "".join(c for c in key if c.isalpha())
-            numbers = "".join(c for c in key if c.isdigit())
+        if self.acquisition_pattern == "S-Pattern" and len(well_items) > 1:
+            # Pick the boustrophedon variant whose total stage travel is shortest,
+            # measured through the per-region snake-continuity DP. Manual regions
+            # come first in drawing order and seed the cost via their last FOV,
+            # so the chosen well-corner respects where the manual sweep ends.
+            manual_ids = [k for k, _ in manual_items]
+            best_ordering = well_items
+            best_cost = float("inf")
+            for ordering in self._well_order_candidates(well_items):
+                full_order_ids = manual_ids + [k for k, _ in ordering]
+                cost, _ = self._evaluate_region_order(full_order_ids)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_ordering = ordering
+            well_items = best_ordering
+        else:
+            well_items.sort(key=lambda item: self._parse_well_id(item[0]))
 
-            # Convert multi-letter row (e.g., "AA") to numeric value
-            letter_value = 0
-            for i, letter in enumerate(reversed(letters)):
-                letter_value += (ord(letter) - ord("A")) * (26**i)
-
-            return (1, letter_value, int(numbers))
-
-        sorted_items = sorted(self.region_centers.items(), key=sort_key)
-
-        if self.acquisition_pattern == "S-Pattern":
-            # S-Pattern only applies to well plates - manual regions stay in drawing order
-            # because the user's drawing order already represents their intended path
-            manual_items = [(k, v) for k, v in sorted_items if self._is_manual_region(k)]
-            well_items = [(k, v) for k, v in sorted_items if not self._is_manual_region(k)]
-
-            # Reverse alternate rows to create serpentine path (reduces stage travel)
-            if well_items:
-                rows = itertools.groupby(well_items, key=lambda x: x[0][0])
-                well_items = []
-                for i, (_, group) in enumerate(rows):
-                    row = list(group)
-                    if i % 2 == 1:
-                        row.reverse()
-                    well_items.extend(row)
-
-            sorted_items = manual_items + well_items
+        sorted_items = manual_items + well_items
 
         # Update dictionaries efficiently
         self.region_centers = {k: v for k, v in sorted_items}
