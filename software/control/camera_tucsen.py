@@ -683,10 +683,11 @@ class TucsenCamera(AbstractCamera):
         if self._model_properties.is_genicam:
             for port in TUCAM_OUTPUTTRG_PORT:
                 self._set_genicam_parameter("TriggerPort", port.value, TUELEM_TYPE.TU_ElemInteger.value)
-                if port == TUCAM_OUTPUTTRG_PORT.TUPORT_OUT_ONE:
-                    self._set_genicam_parameter("TriggerPortEnable", 1, TUELEM_TYPE.TU_ElemInteger.value)
-                else:
-                    self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
+                # if port == TUCAM_OUTPUTTRG_PORT.TUPORT_OUT_ONE:
+                #     self._set_genicam_parameter("TriggerPortEnable", 1, TUELEM_TYPE.TU_ElemInteger.value)
+                # else:
+                    # self._set_genicam_parameter("TriggerPortEnable", 0, TUELEM_TYPE.TU_ElemInteger.value)
+                self._set_genicam_parameter("TriggerPortEnable", 1, TUELEM_TYPE.TU_ElemInteger.value)
                 self._set_genicam_parameter("TriggerOutputWidth", self._trigger_duration_us, TUELEM_TYPE.TU_ElemInteger.value)
 
         # Horizontal / vertical flip applied at the sensor/SDK layer so every

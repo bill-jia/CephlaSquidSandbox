@@ -651,6 +651,46 @@ class MultiPointWorker:
         except Exception as e:
             self._log.warning("Could not apply waveform-capture illumination: %s", e)
 
+    def _resolve_camera_frame_signal_terminal(self, nidaq) -> str:
+        """Resolve the NIDAQ terminal carrying the camera's frame readout edge.
+
+        Reads the ``main_camera.frame_readout`` endpoint from the machine
+        config's ``io:`` declarations (e.g. ``port0/line7``), then translates
+        the channel id into a form ``cfg_dig_edge_start_trig`` accepts. NI-DAQ
+        won't take ``port0/lineN`` as a start-trigger source on X-series
+        devices — for triggering you need the corresponding ``PFIN`` alias
+        (same physical pin for N=0..7). Read/write paths still address the
+        line as ``port0/lineN``; only the trigger source needs translation.
+        Falls back to ``control._def.NIDAQ_FRAME_SIGNAL_TERMINAL`` when the
+        endpoint is missing.
+        """
+        try:
+            mc = self.microscope.config_repo.get_machine_config()
+            io_config = mc.collect_io_endpoints()
+            ep = io_config.get("main_camera.frame_readout")
+            if ep is not None and ep.channel_id:
+                device = getattr(nidaq, "device_name", None) or "Dev1"
+                cid = ep.channel_id.strip()
+                # Translate "port0/lineN" -> "PFIN" for the trigger-source path.
+                if cid.startswith("port0/line"):
+                    try:
+                        n = int(cid.rsplit("line", 1)[-1])
+                        return f"/{device}/PFI{n}"
+                    except ValueError:
+                        pass
+                # Already a PFI/PXI/internal terminal — use as-is.
+                return f"/{device}/{cid}"
+            self._log.debug(
+                "main_camera.frame_readout not declared in machine config; "
+                "using NIDAQ_FRAME_SIGNAL_TERMINAL fallback %s",
+                control._def.NIDAQ_FRAME_SIGNAL_TERMINAL,
+            )
+        except Exception:
+            self._log.exception(
+                "Failed to resolve camera frame signal terminal; using fallback"
+            )
+        return control._def.NIDAQ_FRAME_SIGNAL_TERMINAL
+
     def _arm_nidaq_pulse_for_capture(self, config: ObservationState) -> Optional[Callable[[], None]]:
         """Arm an NIDAQ one-shot pulse waveform for a waveform-driven capture.
 
@@ -659,8 +699,10 @@ class MultiPointWorker:
         trigger latched on the camera's exposure-active line, and arms the
         task. Returns a cleanup closure that callers must invoke after the
         camera frame has been read; the closure waits for the waveform to
-        finish, releases the tasks, and restores any prior live-output
-        state. Returns ``None`` (and logs a warning) when the NIDAQ is not
+        finish, releases the tasks, restores any prior live-output state,
+        and rewrites the NIDAQ timing/trigger config back to whatever the
+        previous user (fast acquisition, DAQ-only widget, etc.) had set.
+        Returns ``None`` (and logs a warning) when the NIDAQ is not
         configured on this rig — the surrounding controller validation
         should prevent this from happening in practice.
         """
@@ -674,18 +716,35 @@ class MultiPointWorker:
             return None
 
         ic = self.microscope.illumination_controller
+        sample_rate_hz = float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ)
         try:
             waveform = build_pulse_waveform_for_state(
-                config, ic, sample_rate_hz=control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ,
+                config, ic, sample_rate_hz=sample_rate_hz,
             )
             do_lines = nidaq_lines_for_state(config, ic)
         except ValueError:
             self._log.exception("Failed to build NIDAQ pulse waveform for state '%s'", config.name)
             raise
 
-        terminal = control._def.NIDAQ_FRAME_SIGNAL_TERMINAL
+        terminal = self._resolve_camera_frame_signal_terminal(nidaq)
+        # The NIDAQ instance is shared with the fast-acquisition widget and the
+        # DAQ-only acquisition controller — both write sample_rate_hz /
+        # samples_per_channel / trigger_source / external_trigger_terminal
+        # directly. Snapshot those values now so we can put them back when our
+        # one-shot waveform is done.
+        prev_sample_rate_hz = float(getattr(nidaq, "sample_rate_hz", sample_rate_hz))
+        prev_samples_per_channel = int(getattr(nidaq, "samples_per_channel", 0))
+        prev_trigger_source = getattr(nidaq, "trigger_source", TriggerSource.SOFTWARE)
+        prev_external_terminal = getattr(nidaq, "external_trigger_terminal", terminal)
+
+        # Pick our own task length to match the per-frame waveform — never
+        # inherit whatever the previous run left behind.
+        per_frame_samples = next(iter(waveform.digital_output.values())).size
+
         with self._timing.get_timer("nidaq_waveform_arm"):
             try:
+                nidaq.sample_rate_hz = sample_rate_hz
+                nidaq.samples_per_channel = per_frame_samples
                 nidaq.trigger_source = TriggerSource.EXTERNAL
                 nidaq.external_trigger_terminal = terminal
                 nidaq.configure_task_io(
@@ -710,17 +769,43 @@ class MultiPointWorker:
                         restore_fn()
                 except Exception:
                     pass
+                # Put the NIDAQ timing/trigger config back to whatever it was.
+                try:
+                    nidaq.sample_rate_hz = prev_sample_rate_hz
+                    if prev_samples_per_channel:
+                        nidaq.samples_per_channel = prev_samples_per_channel
+                    nidaq.trigger_source = prev_trigger_source
+                    nidaq.external_trigger_terminal = prev_external_terminal
+                except Exception:
+                    pass
                 raise
 
         exposure_s = float(config.exposure_time) / 1000.0
-        timeout_s = exposure_s + 1.0
+        # Just enough to cover exposure + camera readout + DMA dispatch. A long
+        # wait here only delays surfacing a wiring problem (e.g. the configured
+        # NIDAQ_FRAME_SIGNAL_TERMINAL doesn't match where the camera signal is
+        # actually wired) and stretches every FOV needlessly.
+        timeout_s = max(exposure_s + 0.2, 0.3)
 
         def _cleanup() -> None:
             with self._timing.get_timer("nidaq_waveform_done"):
+                wait_failed = False
                 try:
                     nidaq.wait_until_done(timeout_s=timeout_s)
                 except Exception as e:
-                    self._log.warning("NIDAQ wait_until_done failed for '%s': %s", config.name, e)
+                    wait_failed = True
+                    if not getattr(self, "_nidaq_pulse_failure_logged", False):
+                        self._log.error(
+                            "NIDAQ pulse waveform did not fire for state '%s' within %.2fs. "
+                            "Check that NIDAQ_FRAME_SIGNAL_TERMINAL (%s) is wired to the "
+                            "camera's exposure-active / frame-signal output on this rig. "
+                            "Aborting acquisition to avoid producing dark frames on every FOV.",
+                            config.name,
+                            timeout_s,
+                            terminal,
+                        )
+                        self._log.debug("NIDAQ wait_until_done error detail: %s", e)
+                        self._nidaq_pulse_failure_logged = True
                 try:
                     nidaq.release_tasks()
                 except Exception as e:
@@ -731,6 +816,24 @@ class MultiPointWorker:
                         restore_fn()
                 except Exception as e:
                     self._log.warning("NIDAQ restore_after_acquisition failed for '%s': %s", config.name, e)
+                # Restore the timing/trigger config snapshot so the next user
+                # (fast acquisition widget, DAQ-only acquisition) sees the
+                # NIDAQ in the same shape it was before the multipoint run.
+                try:
+                    nidaq.sample_rate_hz = prev_sample_rate_hz
+                    if prev_samples_per_channel:
+                        nidaq.samples_per_channel = prev_samples_per_channel
+                    nidaq.trigger_source = prev_trigger_source
+                    nidaq.external_trigger_terminal = prev_external_terminal
+                except Exception as e:
+                    self._log.warning("NIDAQ config restore failed for '%s': %s", config.name, e)
+                if wait_failed:
+                    # One failure is enough — abort so the user can fix the
+                    # wiring rather than watching every subsequent FOV time out.
+                    try:
+                        self.request_abort_fn()
+                    except Exception:
+                        pass
 
         return _cleanup
 
