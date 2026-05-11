@@ -581,6 +581,13 @@ def run_backfill(
             log.warning("UploadWorker did not exit cleanly; terminating")
             worker.terminate()
             worker.join(timeout=5.0)
+        # Release feeder-thread resources so Python can exit (see comment in
+        # ``UploadWorker.release_queue_resources``).
+        worker.release_queue_resources()
+        try:
+            worker.close()
+        except Exception:
+            pass
 
         # Final size report so the operator sees the net effect of the run.
         try:
@@ -674,6 +681,8 @@ def run_backfill_follow(
     delete_after_verify: bool,
     poll_interval_s: float,
     max_idle_s: float,
+    drain_stall_window_s: float = 300.0,
+    drain_timeout_s: float = 0.0,
 ) -> int:
     """Follow-mode loop: scan, submit, drain, sleep — until done.
 
@@ -964,29 +973,41 @@ def run_backfill_follow(
         #     nothing left to do, brief drain is sufficient.
         #   * max_idle / loop-break with pending tasks: the worker MAY
         #     still be doing real work — keep draining as long as new
-        #     results land. Only give up after a stall window. This avoids
-        #     killing an actively-uploading worker just because the loop
-        #     decided to exit.
+        #     results land. The stall-window is the only criterion that
+        #     abandons work; the wallclock budget defaults to "no cap" so
+        #     a large backlog at modest upload speed is allowed to finish
+        #     instead of being truncated. If the user wants a hard cap
+        #     they pass ``--drain-timeout``.
         #   * Ctrl-C / SIGTERM: the subprocess got the same signal and is
         #     likely already dying; do a short drain to pick up anything
         #     already enqueued, then shut down.
-        stall_window_s = 30.0 if interrupted else 300.0  # 5 min for soft exits
-        drain_total_budget_s = 60.0 if interrupted else (60 * 60.0)  # 1 hr max
+        if interrupted:
+            stall_window_s = 30.0
+            drain_budget_s = 60.0
+        else:
+            stall_window_s = drain_stall_window_s
+            drain_budget_s = drain_timeout_s  # 0 = unbounded
         try:
             if pending_task_ids:
+                budget_str = (
+                    f"{drain_budget_s:.0f}s wallclock"
+                    if drain_budget_s > 0
+                    else "no wallclock cap"
+                )
                 log.info(
                     f"Draining {len(pending_task_ids)} pending task(s) "
-                    f"(stall window {stall_window_s:.0f}s, "
-                    f"max {drain_total_budget_s:.0f}s)..."
+                    f"(stall window {stall_window_s:.0f}s, {budget_str})..."
                 )
             t_drain_start = time.time()
             t_last_drained = time.time()
             while pending_task_ids:
                 now = time.time()
-                if now - t_drain_start > drain_total_budget_s:
+                if drain_budget_s > 0 and now - t_drain_start > drain_budget_s:
                     log.warning(
-                        f"Drain budget exhausted ({drain_total_budget_s:.0f}s); "
-                        f"{len(pending_task_ids)} task(s) abandoned."
+                        f"Drain budget exhausted ({drain_budget_s:.0f}s); "
+                        f"{len(pending_task_ids)} task(s) abandoned. "
+                        f"Re-run the script to retry; remote-side atomic renames "
+                        f"mean re-uploads overwrite cleanly without torn state."
                     )
                     break
                 if now - t_last_drained > stall_window_s:
@@ -1010,6 +1031,17 @@ def run_backfill_follow(
             log.warning("UploadWorker did not exit within 60s; terminating")
             worker.terminate()
             worker.join(timeout=5.0)
+        # Release feeder-thread resources so the Python interpreter can
+        # exit. Without this, abandoned items in the input queue (e.g.
+        # 22k tasks after a drain-budget abandonment) prevent the parent's
+        # feeder thread from joining and Python hangs at shutdown.
+        worker.release_queue_resources()
+        try:
+            # Available on Python 3.7+. Releases process handle resources;
+            # silently ignore on older builds.
+            worker.close()
+        except Exception:
+            pass
 
         # Final size report so the operator sees the net effect of the run.
         try:
@@ -1054,6 +1086,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-idle", type=float, default=600.0,
                         help="Exit --follow mode after this many seconds without progress "
                              "(default 600; 0 = wait forever).")
+    parser.add_argument("--drain-stall-window", type=float, default=300.0,
+                        help="During shutdown drain, abandon pending uploads after this "
+                             "many seconds with no new completed results (default 300; "
+                             "i.e. the worker is considered stalled after 5 min of silence). "
+                             "Active uploads keep this window fresh.")
+    parser.add_argument("--drain-timeout", type=float, default=0.0,
+                        help="Hard wallclock cap on the shutdown drain in seconds "
+                             "(default 0 = no cap; the stall window is the only "
+                             "criterion). Set this if you want the script to give up "
+                             "on a backlog after a known time regardless of progress.")
     parser.add_argument("--dry-run", action="store_true", help="List planned uploads and exit.")
     args = parser.parse_args(argv)
 
@@ -1067,6 +1109,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             delete_after_verify=args.delete_after_verify,
             poll_interval_s=args.poll_interval,
             max_idle_s=args.max_idle,
+            drain_stall_window_s=args.drain_stall_window,
+            drain_timeout_s=args.drain_timeout,
         )
 
     return run_backfill(

@@ -393,6 +393,29 @@ class UploadWorker(multiprocessing.Process):
         except (OSError, ValueError):
             pass
 
+    def release_queue_resources(self) -> None:
+        """Release the parent-side feeder threads of both queues.
+
+        ``multiprocessing.Queue`` has a background pickling/feeder thread in
+        the parent process that pushes buffered items down a pipe to the
+        subprocess. After we terminate the worker (e.g. on drain timeout
+        with a large backlog), those items have nowhere to go but the
+        feeder thread still tries to flush them — and Python's interpreter
+        shutdown will block waiting on that thread, leaving the script
+        unable to exit. Calling ``close()`` + ``cancel_join_thread()`` on
+        each queue says "abandon any buffered items at exit", which lets
+        the interpreter terminate promptly.
+        """
+        for q in (self._input_queue, self._output_queue):
+            try:
+                q.close()
+            except Exception:
+                pass
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
+
     def run(self) -> None:
         log = squid.logging.get_logger("UploadWorker")
         log.info(
