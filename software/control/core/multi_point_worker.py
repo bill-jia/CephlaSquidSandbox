@@ -915,6 +915,130 @@ class MultiPointWorker:
 
         return _cleanup
 
+    def _run_nidaq_stimulus(self, config: ObservationState) -> None:
+        """Fire an NIDAQ pulse-comb stimulus step (no camera capture).
+
+        Builds the same kind of ``WaveformData`` the capture-pulse path uses,
+        but arms with ``TriggerSource.SOFTWARE`` and a total task length of
+        ``config.stimulus_duration_ms``. ``start_trigger()`` fires the comb
+        immediately; this method blocks until the comb completes (or aborts
+        with a clear error if it doesn't). Designed to share the per-FOV
+        channel loop with capture steps — the per-FOV ``active_step`` counter
+        still increments, so the AF guard fires on the first active step
+        regardless of whether that step is a capture or a stimulus.
+        """
+        nidaq = getattr(self.microscope.addons, "nidaq", None)
+        if nidaq is None:
+            self._log.warning(
+                "Stimulus-only state '%s' selected but no NIDAQ is configured; skipping",
+                config.name,
+            )
+            return
+
+        if config.stimulus_duration_ms is None or config.stimulus_duration_ms <= 0:
+            self._log.error(
+                "Stimulus-only state '%s' has no positive stimulus_duration_ms; skipping",
+                config.name,
+            )
+            return
+
+        ic = self.microscope.illumination_controller
+        sample_rate_hz = float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ)
+
+        # DC intensity / serial laser power / NL5+CellX must be live before the
+        # NIDAQ comb fires the gate. Standard (non-timed) active illuminators in
+        # the same state get gated ON normally; timed channels stay LOW until
+        # the per-step waveform drives them.
+        self._apply_illumination_for_waveform_capture(config)
+
+        try:
+            waveform = build_pulse_waveform_for_state(
+                config, ic, sample_rate_hz=sample_rate_hz,
+            )
+            do_lines = nidaq_lines_for_state(config, ic)
+        except ValueError:
+            self._log.exception("Failed to build NIDAQ stimulus waveform for state '%s'", config.name)
+            # Make sure illumination doesn't stay on if the build failed mid-way.
+            self._turn_off_capture_illumination_preserving_logical_state()
+            raise
+
+        prev_sample_rate_hz = float(getattr(nidaq, "sample_rate_hz", sample_rate_hz))
+        prev_samples_per_channel = int(getattr(nidaq, "samples_per_channel", 0))
+        prev_trigger_source = getattr(nidaq, "trigger_source", TriggerSource.SOFTWARE)
+        prev_external_terminal = getattr(nidaq, "external_trigger_terminal", "")
+
+        per_step_samples = next(iter(waveform.digital_output.values())).size
+        stimulus_duration_s = float(config.stimulus_duration_ms) / 1000.0
+        timeout_s = stimulus_duration_s + 0.5
+
+        armed_ok = False
+        with self._timing.get_timer("nidaq_stimulus_arm"):
+            try:
+                nidaq.sample_rate_hz = sample_rate_hz
+                nidaq.samples_per_channel = per_step_samples
+                nidaq.trigger_source = TriggerSource.SOFTWARE
+                nidaq.configure_task_io(
+                    ao_channels=[],
+                    do_lines=do_lines,
+                    di_lines=[],
+                    ai_channels=[],
+                )
+                nidaq.prepare_for_acquisition()
+                nidaq.set_waveforms(waveform)
+                nidaq.arm()
+                nidaq.start_trigger()  # SOFTWARE trigger -> fires immediately
+                armed_ok = True
+            except Exception:
+                self._log.exception("Failed to arm NIDAQ stimulus for '%s'", config.name)
+                try:
+                    nidaq.release_tasks()
+                except Exception:
+                    pass
+                try:
+                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
+                    if callable(restore_fn):
+                        restore_fn()
+                except Exception:
+                    pass
+
+        try:
+            if armed_ok:
+                with self._timing.get_timer("nidaq_stimulus_wait"):
+                    try:
+                        nidaq.wait_until_done(timeout_s=timeout_s)
+                    except Exception as e:
+                        self._log.error(
+                            "NIDAQ stimulus '%s' did not complete within %.2fs: %s",
+                            config.name, timeout_s, e,
+                        )
+                try:
+                    nidaq.release_tasks()
+                except Exception as e:
+                    self._log.warning("NIDAQ release_tasks failed for stimulus '%s': %s", config.name, e)
+                try:
+                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
+                    if callable(restore_fn):
+                        restore_fn()
+                except Exception as e:
+                    self._log.warning(
+                        "NIDAQ restore_after_acquisition failed for stimulus '%s': %s",
+                        config.name, e,
+                    )
+        finally:
+            # Restore knob snapshot so the next NIDAQ user (capture pulse,
+            # fast acquisition, DAQ-only widget) sees the device unchanged.
+            try:
+                nidaq.sample_rate_hz = prev_sample_rate_hz
+                if prev_samples_per_channel:
+                    nidaq.samples_per_channel = prev_samples_per_channel
+                nidaq.trigger_source = prev_trigger_source
+                nidaq.external_trigger_terminal = prev_external_terminal
+            except Exception as e:
+                self._log.warning("NIDAQ knob restore failed after stimulus '%s': %s", config.name, e)
+
+            # Per-capture illumination off invariant — applies to stimulus steps too.
+            self._turn_off_capture_illumination_preserving_logical_state()
+
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
@@ -1331,7 +1455,10 @@ class MultiPointWorker:
                 f"local files for the affected timepoints have NOT been deleted."
             )
         # Send shutdown sentinel and join (best-effort; non-daemon process
-        # exits cleanly once it drains its own queue).
+        # exits cleanly once it drains its own queue). After the worker is
+        # gone, release its queues' parent-side feeder threads so the host
+        # Python process doesn't hang at exit waiting on items that have
+        # nowhere to go.
         try:
             self._upload_worker.shutdown()
             self._upload_worker.join(timeout=10.0)
@@ -1339,6 +1466,14 @@ class MultiPointWorker:
                 self._log.warning("UploadWorker did not exit within 10s; terminating")
                 self._upload_worker.terminate()
                 self._upload_worker.join(timeout=5.0)
+            try:
+                self._upload_worker.release_queue_resources()
+            except Exception as e:
+                self._log.debug(f"release_queue_resources: {e}")
+            try:
+                self._upload_worker.close()
+            except Exception:
+                pass
         except Exception as e:
             self._log.error(f"Error shutting down UploadWorker: {e}")
 
@@ -2341,21 +2476,25 @@ class MultiPointWorker:
                             iio.imwrite(saving_path, image)
 
 
-                    with self._timing.get_timer("acquire_camera_image"):
-                        if "RGB" in config.name:
-                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
-                        else:
-                            with self._timing.get_timer("acquire_camera_image_inner"):
-                                self.acquire_camera_image(
-                                    config,
-                                    file_ID,
-                                    current_path,
-                                    z_level,
-                                    region_id=region_id,
-                                    fov=fov,
-                                    config_idx=config_idx,
-                                    filename_channel_label=preset_name,
-                                )
+                    if config.is_stimulus_only:
+                        with self._timing.get_timer("run_nidaq_stimulus"):
+                            self._run_nidaq_stimulus(config)
+                    else:
+                        with self._timing.get_timer("acquire_camera_image"):
+                            if "RGB" in config.name:
+                                self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
+                            else:
+                                with self._timing.get_timer("acquire_camera_image_inner"):
+                                    self.acquire_camera_image(
+                                        config,
+                                        file_ID,
+                                        current_path,
+                                        z_level,
+                                        region_id=region_id,
+                                        fov=fov,
+                                        config_idx=config_idx,
+                                        filename_channel_label=preset_name,
+                                    )
 
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)

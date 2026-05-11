@@ -1071,6 +1071,13 @@ class ConfigRepository:
                     illuminator_states.append(IlluminatorState.model_validate(ist_dict))
             if not illuminator_states:
                 raise ValueError("v3 observation state had no valid illuminator_states")
+
+            is_stimulus_only = bool(data.get("is_stimulus_only", False))
+            stimulus_duration_ms_raw = data.get("stimulus_duration_ms")
+            stimulus_duration_ms = (
+                float(stimulus_duration_ms_raw) if stimulus_duration_ms_raw is not None else None
+            )
+
             return ObservationState(
                 version=3,
                 name=loaded_name,
@@ -1084,6 +1091,8 @@ class ConfigRepository:
                 display_color=display_color,
                 channel_groups=channel_groups,
                 enable_channel_auto_filter_switching=enable_auto_filter,
+                is_stimulus_only=is_stimulus_only,
+                stimulus_duration_ms=stimulus_duration_ms,
             )
         except (yaml.YAMLError, ValidationError, OSError, ValueError, TypeError) as e:
             logger.warning("Failed to load Observation State preset %s: %s", path, e)

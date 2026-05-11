@@ -16,40 +16,58 @@ def _multipoint_observation_preset_display_names(microscope) -> list:
     return sorted(microscope.config_repo.list_observation_presets())
 
 
-def _is_preset_waveform_driven(microscope, name: str) -> bool:
-    """Return True when the named preset has any timed illuminator (NIDAQ pulse).
+def _preset_nidaq_kind(microscope, name: str) -> Optional[str]:
+    """Classify a preset's relationship to the NIDAQ pulse pathway.
 
-    Best-effort: returns False if the preset cannot be loaded for any reason
-    so the visual decoration never blocks list rendering.
+    Returns ``None`` for ordinary captures, ``"stimulus"`` for stimulus-only
+    steps (no camera frame, comb runs at the FOV), and ``"capture_pulse"``
+    when timed illumination overlays a normal camera exposure. Used to
+    decorate multipoint list rows so the user can see which presets require
+    a working NIDAQ. Best-effort: returns None if the preset can't be loaded.
     """
     if microscope is None:
-        return False
+        return None
     try:
         preset = microscope.config_repo.load_observation_preset(name)
     except Exception:
-        return False
-    return bool(preset and getattr(preset, "is_waveform_driven", False))
+        return None
+    if preset is None:
+        return None
+    if getattr(preset, "is_stimulus_only", False):
+        return "stimulus"
+    if getattr(preset, "is_waveform_driven", False):
+        return "capture_pulse"
+    return None
 
 
 def _create_checkbox_list_item(name: str, checked: bool = False, *, microscope=None) -> QListWidgetItem:
     """Create a QListWidgetItem with a checkbox instead of relying on selection highlight.
 
     When ``microscope`` is supplied and the named preset uses NIDAQ pulse
-    timing, the row is rendered in italic with a tooltip flagging the
-    requirement. ``item.text()`` remains the canonical preset name so
-    callers comparing against ``item.text()`` are not affected.
+    timing, the row is rendered in italic with a tooltip describing the
+    type (capture-window pulse vs stimulus-only). ``item.text()`` remains
+    the canonical preset name so callers comparing against ``item.text()``
+    are not affected.
     """
     item = QListWidgetItem(name)
     item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
     item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-    if _is_preset_waveform_driven(microscope, name):
+    kind = _preset_nidaq_kind(microscope, name)
+    if kind is not None:
         font = item.font()
         font.setItalic(True)
         item.setFont(font)
-        item.setToolTip(
-            "Uses NIDAQ pulse timing — illumination is delivered as a precisely "
-            "timed pulse during the camera exposure. Requires an NIDAQ on this rig."
-        )
+        if kind == "stimulus":
+            item.setToolTip(
+                "Stimulus-only step — NIDAQ pulse comb, no camera frame. "
+                "Requires a working NIDAQ on this rig."
+            )
+        else:
+            item.setToolTip(
+                "Uses NIDAQ pulse timing during the camera exposure — "
+                "illumination is delivered as a precisely timed pulse. "
+                "Requires a working NIDAQ on this rig."
+            )
     return item
 
 

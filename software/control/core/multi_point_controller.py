@@ -715,11 +715,20 @@ class MultiPointController:
             ]
             all_regions_coord_count = sum(coords_per_region)
 
-            n_ch = (
-                len(self.selected_observation_state_names)
-                if self.selected_observation_state_names
-                else len(self.selected_configurations)
-            )
+            # Stimulus-only states fire an NIDAQ pulse comb but produce no
+            # camera frame — exclude them from the image count so disk-space
+            # estimates stay correct.
+            if self.selected_observation_state_names:
+                repo = self.liveController.microscope.config_repo
+                capture_names = []
+                for name in self.selected_observation_state_names:
+                    preset = repo.load_observation_preset(name)
+                    if preset is not None and getattr(preset, "is_stimulus_only", False):
+                        continue
+                    capture_names.append(name)
+                n_ch = len(capture_names)
+            else:
+                n_ch = len(self.selected_configurations)
             non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
             # When capturing merged images, we capture 1 per fov (where all the configurations are merged)
             merged_images = self.Nt * self.NZ * all_regions_coord_count if control._def.MERGE_CHANNELS else 0
@@ -1361,14 +1370,17 @@ class MultiPointController:
             )
             return False
 
-        # When any selected observation state has timed illuminators, the worker
-        # arms a per-frame NIDAQ pulse waveform; without an NIDAQ on this rig
-        # those captures cannot run.
+        # When any selected observation state has timed illuminators (capture-
+        # window or stimulus-only), the worker arms an NIDAQ pulse waveform.
+        # Without an NIDAQ on this rig those steps cannot run.
         repo = self.liveController.microscope.config_repo
         ic = self.liveController.microscope.illumination_controller
         for name in self.selected_observation_state_names or []:
             preset = repo.load_observation_preset(name)
-            if preset is None or not preset.is_waveform_driven:
+            if preset is None:
+                continue
+            is_stimulus = bool(getattr(preset, "is_stimulus_only", False))
+            if not preset.is_waveform_driven and not is_stimulus:
                 continue
             if getattr(self.microscope.addons, "nidaq", None) is None:
                 self._log.error(
@@ -1376,12 +1388,40 @@ class MultiPointController:
                     name,
                 )
                 return False
-            if not control._def.NIDAQ_FRAME_SIGNAL_TERMINAL:
+            # Capture-window pulses require the camera frame-signal terminal.
+            # Stimulus-only steps fire on SOFTWARE trigger, so the terminal is
+            # irrelevant for them.
+            if not is_stimulus and not control._def.NIDAQ_FRAME_SIGNAL_TERMINAL:
                 self._log.error(
                     "Observation state '%s' uses NIDAQ pulse timing but NIDAQ_FRAME_SIGNAL_TERMINAL is not set.",
                     name,
                 )
                 return False
+            if is_stimulus:
+                if not preset.stimulus_duration_ms or preset.stimulus_duration_ms <= 0:
+                    self._log.error(
+                        "Observation state '%s' is_stimulus_only but stimulus_duration_ms is unset or non-positive.",
+                        name,
+                    )
+                    return False
+                window_ms = float(preset.stimulus_duration_ms)
+                has_timed = False
+                for ist in preset.illuminator_states:
+                    if not ist.on or ist.timing is None:
+                        continue
+                    has_timed = True
+                    if ist.timing.end_ms > window_ms + 1e-6:
+                        self._log.error(
+                            "Observation state '%s': illuminator '%s' comb end (%.2f ms) exceeds stimulus_duration_ms (%.2f ms).",
+                            name, ist.illumination_channel, ist.timing.end_ms, window_ms,
+                        )
+                        return False
+                if not has_timed:
+                    self._log.error(
+                        "Observation state '%s' is_stimulus_only but no active illuminator has a timing comb.",
+                        name,
+                    )
+                    return False
             for ist in preset.illuminator_states:
                 if not ist.on or ist.timing is None:
                     continue

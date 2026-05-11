@@ -401,12 +401,13 @@ class ObservationStateConfiguratorDialog(QDialog):
     # Column indices for the channels table
     COL_ENABLED = 0
     COL_NAME = 1
-    COL_ILLUMINATION = 2
-    COL_CAMERA = 3
-    COL_FILTER_WHEEL = 4
-    COL_FILTER_POSITION = 5
-    COL_DISPLAY_COLOR = 6
-    COL_TIMING = 7
+    COL_TYPE = 2
+    COL_ILLUMINATION = 3
+    COL_CAMERA = 4
+    COL_FILTER_WHEEL = 5
+    COL_FILTER_POSITION = 6
+    COL_DISPLAY_COLOR = 7
+    COL_TIMING = 8
 
     def __init__(self, config_repo, parent=None, illumination_controller=None):
         super().__init__(parent)
@@ -434,9 +435,9 @@ class ObservationStateConfiguratorDialog(QDialog):
 
         # Table for acquisition channels
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels(
-            ["Enabled", "Name", "Illumination", "Camera", "Filter Wheel", "Filter", "Color", "Timing"]
+            ["Enabled", "Name", "Type", "Illumination", "Camera", "Filter Wheel", "Filter", "Color", "Timing"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -566,6 +567,13 @@ class ObservationStateConfiguratorDialog(QDialog):
         name_item = QTableWidgetItem(state.name)
         self.table.setItem(row, self.COL_NAME, name_item)
 
+        # Type (Capture / Stimulus) — Stimulus rows have no camera/filter writes
+        type_combo = QComboBox()
+        type_combo.addItems(["Capture", "Stimulus"])
+        type_combo.setCurrentIndex(1 if getattr(state, "is_stimulus_only", False) else 0)
+        type_combo.currentIndexChanged.connect(lambda idx, r=row: self._on_type_changed(r, idx))
+        self.table.setCellWidget(row, self.COL_TYPE, type_combo)
+
         # Illumination dropdown
         illum_combo = QComboBox()
         if self.illumination_config:
@@ -616,6 +624,30 @@ class ObservationStateConfiguratorDialog(QDialog):
         timing_btn.setDefault(False)
         timing_btn.clicked.connect(lambda _checked, r=row: self._configure_timing(r))
         self.table.setCellWidget(row, self.COL_TIMING, timing_btn)
+
+        # Apply Capture/Stimulus visual policy.
+        self._apply_type_policy(row, getattr(state, "is_stimulus_only", False))
+
+    def _apply_type_policy(self, row: int, is_stimulus: bool) -> None:
+        """Grey out camera/filter widgets for Stimulus rows (they're irrelevant)."""
+        for col in (self.COL_CAMERA, self.COL_FILTER_WHEEL, self.COL_FILTER_POSITION):
+            w = self.table.cellWidget(row, col)
+            if w is not None:
+                w.setEnabled(not is_stimulus)
+
+    def _on_type_changed(self, row: int, idx: int) -> None:
+        if row < 0 or row >= len(self._preset_states):
+            return
+        is_stimulus = idx == 1
+        state = self._preset_states[row]
+        state.is_stimulus_only = is_stimulus
+        if is_stimulus and state.stimulus_duration_ms is None:
+            state.stimulus_duration_ms = 100.0  # sensible default; user tunes via Timing button
+        # Refresh the timing summary — switching type can change what's valid.
+        btn = self.table.cellWidget(row, self.COL_TIMING)
+        if btn is not None:
+            btn.setText(PulseTimingDialog.summary(state))
+        self._apply_type_policy(row, is_stimulus)
 
     def _configure_timing(self, row: int):
         """Open PulseTimingDialog for the row's observation state."""
@@ -816,6 +848,10 @@ class ObservationStateConfiguratorDialog(QDialog):
             if name_item:
                 state.name = name_item.text().strip()
 
+            type_combo = self.table.cellWidget(row, self.COL_TYPE)
+            if type_combo and isinstance(type_combo, QComboBox):
+                state.is_stimulus_only = type_combo.currentIndex() == 1
+
             illum_combo = self.table.cellWidget(row, self.COL_ILLUMINATION)
             if illum_combo and isinstance(illum_combo, QComboBox):
                 illum_name = illum_combo.currentText()
@@ -854,6 +890,17 @@ class AddObservationStateDialog(QDialog):
         # Name
         self.name_edit = QLineEdit()
         layout.addRow("Name:", self.name_edit)
+
+        # Type (Capture / Stimulus) — Stimulus types fire an NIDAQ pulse comb
+        # without taking a frame; tune via Timing dialog after Add.
+        type_layout = QHBoxLayout()
+        self.type_capture = QRadioButton("Capture")
+        self.type_stimulus = QRadioButton("Stimulus")
+        self.type_capture.setChecked(True)
+        type_layout.addWidget(self.type_capture)
+        type_layout.addWidget(self.type_stimulus)
+        type_layout.addStretch(1)
+        layout.addRow("Type:", type_layout)
 
         # Illumination source dropdown
         self.illumination_combo = QComboBox()
@@ -945,6 +992,7 @@ class AddObservationStateDialog(QDialog):
             ObservationState,
             CameraSettings,
             IlluminatorState,
+            IlluminatorTiming,
         )
 
         name = self.name_edit.text().strip()
@@ -955,6 +1003,16 @@ class AddObservationStateDialog(QDialog):
         filter_position = self.position_combo.currentData() if self.position_combo else None
         if filter_position is not None:
             emission_filter_positions["default"] = filter_position
+
+        is_stimulus = self.type_stimulus.isChecked()
+        # Stimulus defaults: single 5 ms pulse at offset 0, 100 ms window —
+        # user tunes via the Timing button after Add.
+        timing = IlluminatorTiming(
+            start_offset_ms=0.0,
+            pulse_width_ms=5.0,
+            period_ms=0.0,
+            num_pulses=1,
+        ) if is_stimulus else None
 
         return ObservationState(
             version=3,
@@ -968,11 +1026,14 @@ class AddObservationStateDialog(QDialog):
                 IlluminatorState(
                     illumination_channel=illum_name,
                     intensity=20.0,
-                    on=False,
+                    on=True if is_stimulus else False,
+                    timing=timing,
                 ),
             ],
             z_offset_um=0.0,
             emission_filter_positions=emission_filter_positions,
+            is_stimulus_only=is_stimulus,
+            stimulus_duration_ms=100.0 if is_stimulus else None,
         )
 
 

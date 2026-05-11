@@ -171,8 +171,10 @@ def observation_state_to_yaml(
             entry["led_matrix_mode"] = ist.led_matrix_mode
         if ist.timing is not None:
             entry["timing"] = {
-                "offset_ms": ist.timing.offset_ms,
-                "duration_ms": ist.timing.duration_ms,
+                "start_offset_ms": ist.timing.start_offset_ms,
+                "pulse_width_ms": ist.timing.pulse_width_ms,
+                "period_ms": ist.timing.period_ms,
+                "num_pulses": ist.timing.num_pulses,
             }
         illuminator_out.append(entry)
 
@@ -209,5 +211,10 @@ def observation_state_to_yaml(
         out["confocal_hardware_settings"] = confocal_hw_dict
     if state.enable_channel_auto_filter_switching is not None:
         out["enable_channel_auto_filter_switching"] = bool(state.enable_channel_auto_filter_switching)
+
+    if state.is_stimulus_only:
+        out["is_stimulus_only"] = True
+        if state.stimulus_duration_ms is not None:
+            out["stimulus_duration_ms"] = float(state.stimulus_duration_ms)
 
     return out

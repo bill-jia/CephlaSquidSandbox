@@ -137,8 +137,9 @@ def test_observation_state_yaml_v3_format():
         assert "filter_position" not in ist_view
 
 
-def test_illuminator_timing_round_trip_yaml():
-    """An ObservationState with IlluminatorTiming round-trips through observation_state_to_yaml + load."""
+def test_illuminator_timing_single_pulse_round_trip_yaml():
+    """An ObservationState with a single-pulse IlluminatorTiming round-trips through
+    observation_state_to_yaml + load."""
     state = ObservationState(
         name="pulsed_561",
         camera_settings=CameraSettings(exposure_time_ms=50.0, gain_mode=1.0),
@@ -147,7 +148,7 @@ def test_illuminator_timing_round_trip_yaml():
                 illumination_channel="Fluorescence 561 nm Ex",
                 intensity=50.0,
                 on=True,
-                timing=IlluminatorTiming(offset_ms=24.5, duration_ms=1.0),
+                timing=IlluminatorTiming(start_offset_ms=24.5, pulse_width_ms=1.0),
             ),
             IlluminatorState(
                 illumination_channel="Fluorescence 488 nm Ex",
@@ -160,7 +161,12 @@ def test_illuminator_timing_round_trip_yaml():
 
     view = observation_state_to_yaml(state, camera_label="camera")
     pulsed = view["illuminator_states"][0]
-    assert pulsed["timing"] == {"offset_ms": 24.5, "duration_ms": 1.0}
+    assert pulsed["timing"] == {
+        "start_offset_ms": 24.5,
+        "pulse_width_ms": 1.0,
+        "period_ms": 0.0,
+        "num_pulses": 1,
+    }
     untimed = view["illuminator_states"][1]
     assert "timing" not in untimed
 
@@ -168,14 +174,58 @@ def test_illuminator_timing_round_trip_yaml():
     serialized = yaml.safe_dump(state.model_dump(mode="json"))
     back = ObservationState.model_validate(yaml.safe_load(serialized))
     assert back.illuminator_states[0].timing is not None
-    assert back.illuminator_states[0].timing.offset_ms == 24.5
-    assert back.illuminator_states[0].timing.duration_ms == 1.0
+    assert back.illuminator_states[0].timing.start_offset_ms == 24.5
+    assert back.illuminator_states[0].timing.pulse_width_ms == 1.0
+    assert back.illuminator_states[0].timing.num_pulses == 1
     assert back.illuminator_states[1].timing is None
     assert back.is_waveform_driven is True
 
 
+def test_stimulus_only_state_round_trip_yaml():
+    """A stimulus-only ObservationState with a 10-pulse comb round-trips through YAML."""
+    state = ObservationState(
+        name="opto_561_comb",
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(
+                illumination_channel="Fluorescence 561 nm Ex",
+                intensity=30.0,
+                on=True,
+                timing=IlluminatorTiming(
+                    start_offset_ms=0.0,
+                    pulse_width_ms=5.0,
+                    period_ms=50.0,
+                    num_pulses=10,
+                ),
+            ),
+        ],
+        is_stimulus_only=True,
+        stimulus_duration_ms=500.0,
+    )
+
+    view = observation_state_to_yaml(state, camera_label="camera")
+    assert view["is_stimulus_only"] is True
+    assert view["stimulus_duration_ms"] == 500.0
+    assert view["illuminator_states"][0]["timing"]["num_pulses"] == 10
+    assert view["illuminator_states"][0]["timing"]["period_ms"] == 50.0
+
+    serialized = yaml.safe_dump(state.model_dump(mode="json"))
+    back = ObservationState.model_validate(yaml.safe_load(serialized))
+    assert back.is_stimulus_only is True
+    assert back.stimulus_duration_ms == 500.0
+    assert back.is_waveform_driven is True
+    timing = back.illuminator_states[0].timing
+    assert timing is not None
+    assert timing.num_pulses == 10
+    assert timing.period_ms == 50.0
+    assert timing.pulse_width_ms == 5.0
+    # Last edge = start + (N-1) × period + width = 0 + 9×50 + 5 = 455
+    assert abs(timing.end_ms - 455.0) < 1e-9
+
+
 def test_is_waveform_driven_only_for_active_timed_illuminators():
-    """A timing block on an inactive illuminator must NOT make the state waveform-driven."""
+    """A timing block on an inactive illuminator must NOT make the state waveform-driven
+    (unless is_stimulus_only is True, which always counts)."""
     state = ObservationState(
         name="inactive_pulsed",
         camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
@@ -184,13 +234,20 @@ def test_is_waveform_driven_only_for_active_timed_illuminators():
                 illumination_channel="LaserA",
                 intensity=50.0,
                 on=False,
-                timing=IlluminatorTiming(offset_ms=1.0, duration_ms=1.0),
+                timing=IlluminatorTiming(start_offset_ms=1.0, pulse_width_ms=1.0),
             ),
         ],
     )
     assert state.is_waveform_driven is False
     state.illuminator_states[0] = state.illuminator_states[0].model_copy(update={"on": True})
     assert state.is_waveform_driven is True
+
+
+def test_comb_validator_rejects_period_at_or_below_width():
+    with pytest.raises(ValueError, match="period_ms must exceed pulse_width_ms"):
+        IlluminatorTiming(pulse_width_ms=5.0, period_ms=5.0, num_pulses=2)
+    with pytest.raises(ValueError, match="period_ms must exceed pulse_width_ms"):
+        IlluminatorTiming(pulse_width_ms=5.0, period_ms=4.0, num_pulses=3)
 
 
 def test_observation_state_binning_mode_from_camera_live():

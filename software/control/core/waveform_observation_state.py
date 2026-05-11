@@ -1,16 +1,15 @@
 """
-Per-frame NI-DAQ waveform builder for waveform-driven observation states.
+Per-step NI-DAQ waveform builder for waveform-driven observation states.
 
-Used by ``MultiPointWorker.acquire_camera_image`` when a selected
-``ObservationState`` carries one or more illuminators with a
-:class:`~control.models.observation_state.IlluminatorTiming` block. The
-builder produces a one-shot :class:`~control.nidaq.WaveformData` whose
-digital-output lines pulse the LED gating lines at the requested offset and
-duration relative to the start of the camera exposure.
+Used by ``MultiPointWorker`` when a selected ``ObservationState`` carries one
+or more illuminators with an :class:`IlluminatorTiming` comb, or when the
+state is a stimulus-only step (``is_stimulus_only=True``).
 
-The waveform is intended to be armed with ``TriggerSource.EXTERNAL`` against
-the camera's exposure-active output, so its sample 0 lines up with the rising
-edge of the camera frame.
+For capture-window timed pulses the waveform is armed with
+``TriggerSource.EXTERNAL`` so its sample 0 lines up with the rising edge of
+the camera's exposure-active output. For stimulus-only steps the same
+waveform shape is armed with ``TriggerSource.SOFTWARE`` and fires the moment
+``start_trigger()`` is called.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from control.nidaq import WaveformData
+from control.nidaq import WaveformData, generate_pulse_train
 
 if TYPE_CHECKING:
     from control.lighting import IlluminationController
@@ -33,15 +32,14 @@ def build_pulse_waveform_for_state(
 ) -> WaveformData:
     """Build a one-shot ``WaveformData`` for a waveform-driven observation state.
 
-    Each active illuminator with a ``timing`` block contributes a HIGH window
-    on its NIDAQ digital-output line from ``offset_ms`` to
-    ``offset_ms + duration_ms`` after camera exposure begins. Active
-    illuminators *without* timing are not represented here — those are held
-    continuously high via the standard DC path before the trigger fires.
+    Each active illuminator with a ``timing`` comb contributes a pulse train
+    on its NIDAQ digital-output line; combs sharing the same NIDAQ DO line
+    are bitwise-OR'd into a single pattern on that line. The total task
+    window comes from ``state.step_window_ms`` — i.e. the camera exposure
+    for capture states or ``stimulus_duration_ms`` for stimulus-only states.
 
     Args:
-        state: The observation state being captured. Must have an
-            ``exposure_time`` (drawn from camera_settings/camera_live).
+        state: The observation state being executed.
         illumination_controller: Used to resolve per-channel NIDAQ DO lines.
         sample_rate_hz: NIDAQ sample rate; controls pulse-edge resolution.
 
@@ -50,17 +48,17 @@ def build_pulse_waveform_for_state(
         indices and values are ``num_samples``-long boolean arrays.
 
     Raises:
-        ValueError: When the state has no timed illuminators, when an
-            illuminator's pulse window falls outside the exposure, when a
-            timed illuminator has no resolvable NIDAQ DO line (e.g. LED
-            matrix or serial-only channel), or when two timed illuminators
-            collide on the same NIDAQ DO line.
+        ValueError: when the state has no timed illuminators, when a comb's
+            last edge falls outside the step window, or when a timed
+            illuminator has no resolvable NIDAQ DO line.
     """
-    exposure_ms = float(state.exposure_time)
-    if exposure_ms <= 0:
-        raise ValueError(f"ObservationState '{state.name}' has non-positive exposure_time")
+    window_ms = float(state.step_window_ms)
+    if window_ms <= 0:
+        raise ValueError(
+            f"ObservationState '{state.name}' has non-positive step window ({window_ms} ms)"
+        )
 
-    num_samples = max(1, int(round(exposure_ms * sample_rate_hz / 1000.0)))
+    num_samples = max(1, int(round(window_ms * sample_rate_hz / 1000.0)))
     digital_output: dict[int, np.ndarray] = {}
 
     timed = [ist for ist in state.illuminator_states if ist.on and ist.timing is not None]
@@ -72,15 +70,10 @@ def build_pulse_waveform_for_state(
 
     for ist in timed:
         timing = ist.timing
-        if timing.offset_ms < 0:
+        if timing.end_ms > window_ms + 1e-6:
             raise ValueError(
-                f"Illuminator '{ist.illumination_channel}': pulse offset_ms ({timing.offset_ms}) is negative"
-            )
-        if timing.offset_ms + timing.duration_ms > exposure_ms + 1e-6:
-            raise ValueError(
-                f"Illuminator '{ist.illumination_channel}': pulse window "
-                f"[{timing.offset_ms}, {timing.offset_ms + timing.duration_ms}] ms "
-                f"falls outside camera exposure of {exposure_ms} ms"
+                f"Illuminator '{ist.illumination_channel}': comb ends at "
+                f"{timing.end_ms} ms, outside the {window_ms} ms step window"
             )
 
         line = illumination_controller.get_nidaq_do_line_for_channel(ist.illumination_channel)
@@ -91,17 +84,35 @@ def build_pulse_waveform_for_state(
                 "are not supported)"
             )
 
-        start = max(0, int(round(timing.offset_ms * sample_rate_hz / 1000.0)))
-        end = min(num_samples, start + max(1, int(round(timing.duration_ms * sample_rate_hz / 1000.0))))
+        pulse_width_samples = max(1, int(round(timing.pulse_width_ms * sample_rate_hz / 1000.0)))
+        n_samples_offset = max(0, int(round(timing.start_offset_ms * sample_rate_hz / 1000.0)))
+        if timing.num_pulses > 1:
+            period_samples = int(round(timing.period_ms * sample_rate_hz / 1000.0))
+            # Pydantic validator already enforces period_ms > pulse_width_ms; clamp here
+            # to defend against rounding aliasing at low sample rates.
+            period_samples = max(period_samples, pulse_width_samples + 1)
+        else:
+            # A single pulse: period_samples is unused by generate_pulse_train when
+            # max_num_pulses=1, but must be a sane positive value.
+            period_samples = pulse_width_samples + 1
+
+        pattern = generate_pulse_train(
+            pulse_width_samples=pulse_width_samples,
+            period_samples=period_samples,
+            num_samples=num_samples,
+            n_samples_offset=n_samples_offset,
+            inverted=False,
+            max_num_pulses=timing.num_pulses,
+        )
+        # Coerce to bool: WaveformData.digital_output is keyed on bool arrays.
+        pattern = pattern.astype(bool, copy=False)
 
         if line in digital_output:
-            raise ValueError(
-                f"Multiple timed illuminators share NIDAQ DO line {line}; "
-                "combine their pulse intervals into a single illuminator instead"
-            )
-        pattern = np.zeros(num_samples, dtype=bool)
-        pattern[start:end] = True
-        digital_output[line] = pattern
+            # OR'd shared line: two illuminators mapped to the same NIDAQ DO line
+            # contribute their pulse patterns together (allowed by design).
+            digital_output[line] = np.logical_or(digital_output[line], pattern)
+        else:
+            digital_output[line] = pattern
 
     return WaveformData(digital_output=digital_output)
 
@@ -113,7 +124,7 @@ def nidaq_lines_for_state(
     """Return the NIDAQ DO line indices needed to drive timed illuminators.
 
     Used by the worker to call ``configure_task_io(do_lines=...)`` before
-    arming the per-frame waveform task.
+    arming the per-FOV waveform task.
     """
     lines: list[int] = []
     for ist in state.illuminator_states:

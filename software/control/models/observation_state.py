@@ -22,7 +22,7 @@ import logging
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -120,21 +120,40 @@ class ChannelGroup(BaseModel):
 
 
 class IlluminatorTiming(BaseModel):
-    """Pulse-timing relationship between an illuminator and the camera frame.
+    """Regular pulse-comb timing for an NIDAQ-gated illuminator.
 
-    When set on an :class:`IlluminatorState`, the illuminator's digital gating
-    line is driven by an NIDAQ one-shot waveform that fires on the camera's
-    exposure-active edge. The DC analog intensity (set via the regular
-    ``intensity`` field) is held high throughout the exposure; only the
-    digital gate is pulsed during the configured offset/duration window.
-    Channels that lack a NIDAQ digital gating line (LED matrix, serial-only)
-    cannot use this and will fail validation when an acquisition runs.
+    A single pulse is a comb with ``num_pulses=1`` (``period_ms`` is then
+    ignored). For a capture-window timed pulse the comb must fit within the
+    camera exposure; for a stimulus-only step it must fit within
+    :attr:`ObservationState.stimulus_duration_ms`.
+
+    Drives the illuminator's digital gating line via the per-frame NIDAQ
+    waveform built by :func:`build_pulse_waveform_for_state`. The DC analog
+    intensity (set via the regular ``intensity`` field) is held at level
+    throughout the window; only the digital gate is pulsed. Channels that
+    lack an NIDAQ digital gating line (LED matrix, serial-only) cannot use
+    this and will fail validation when an acquisition runs.
     """
 
-    offset_ms: float = Field(..., ge=0, description="Pulse start, ms after camera exposure begins")
-    duration_ms: float = Field(..., gt=0, description="Pulse width in ms")
+    start_offset_ms: float = Field(0.0, ge=0, description="First pulse start, ms after the step begins")
+    pulse_width_ms: float = Field(..., gt=0, description="HIGH width of each pulse in ms")
+    period_ms: float = Field(0.0, ge=0, description="Pulse-to-pulse period in ms (ignored when num_pulses=1)")
+    num_pulses: int = Field(1, ge=1, description="Number of pulses in the comb")
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check_comb(self) -> "IlluminatorTiming":
+        if self.num_pulses > 1 and self.period_ms <= self.pulse_width_ms:
+            raise ValueError(
+                "IlluminatorTiming: period_ms must exceed pulse_width_ms for a multi-pulse comb"
+            )
+        return self
+
+    @property
+    def end_ms(self) -> float:
+        """Falling edge of the last pulse, ms relative to step start."""
+        return self.start_offset_ms + max(0, self.num_pulses - 1) * self.period_ms + self.pulse_width_ms
 
 
 class IlluminatorState(BaseModel):
@@ -250,6 +269,22 @@ class ObservationState(BaseModel):
         description="If set, emission filter follows observation state selection",
     )
 
+    # Stimulus-only steps (no camera capture; NIDAQ pulse comb only)
+    is_stimulus_only: bool = Field(
+        False,
+        description=(
+            "When True, this step runs an NIDAQ pulse comb at a multipoint FOV and "
+            "produces no camera frame. The active illuminators with `timing` set "
+            "describe the comb; their digital gates are driven by the per-FOV NIDAQ "
+            "waveform."
+        ),
+    )
+    stimulus_duration_ms: Optional[float] = Field(
+        None,
+        gt=0,
+        description="Total NIDAQ task window when is_stimulus_only=True (ms)",
+    )
+
     model_config = {"extra": "forbid"}
 
     # Convenience properties
@@ -279,5 +314,24 @@ class ObservationState(BaseModel):
 
     @property
     def is_waveform_driven(self) -> bool:
-        """True if any active illuminator has NIDAQ pulse timing configured."""
+        """True if any active illuminator has NIDAQ pulse timing configured,
+        or if this is a stimulus-only step (always NIDAQ-driven)."""
+        if self.is_stimulus_only:
+            return True
         return any(ist.on and ist.timing is not None for ist in self.illuminator_states)
+
+    @property
+    def step_window_ms(self) -> float:
+        """Total duration of this step's NIDAQ window (ms).
+
+        For stimulus-only steps that's ``stimulus_duration_ms``; for capture
+        steps it's the camera exposure. Used by the waveform builder to size
+        the NIDAQ task and validate pulse-comb fit.
+        """
+        if self.is_stimulus_only:
+            if self.stimulus_duration_ms is None:
+                raise ValueError(
+                    f"ObservationState '{self.name}' is_stimulus_only=True but stimulus_duration_ms is unset"
+                )
+            return float(self.stimulus_duration_ms)
+        return float(self.exposure_time)
