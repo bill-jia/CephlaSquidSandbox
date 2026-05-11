@@ -322,6 +322,64 @@ class ZarrWriter:
     def _zarr_json_path(self) -> str:
         return os.path.join(self._group_dir(), "zarr.json")
 
+    def _level_zarr_json_path(self, level: int) -> str:
+        return os.path.join(self._level_path(level), "zarr.json")
+
+    def _level_shard_path(self, level: int, t: int) -> str:
+        """On-disk path of the single shard file for timepoint ``t`` at ``level``.
+
+        With outer chunk grid ``(1, C, Z, Y, X)`` and zarr-v3 ``default``
+        chunk-key encoding, each timepoint occupies one shard file at
+        ``<level_dir>/c/<t>/0/0/0/0`` (the trailing zeros are the c/z/y/x
+        grid coordinates — all single-cell axes).
+        """
+        return os.path.join(self._level_path(level), "c", str(t), "0", "0", "0", "0")
+
+    def _frame_times_shard_path(self) -> str:
+        """Single chunk file backing the ``frame_times`` (T, C, Z) array."""
+        return os.path.join(self._frame_times_path(), "c", "0", "0", "0")
+
+    def shard_paths_for_timepoint(self, t: int) -> List[str]:
+        """Per-timepoint shard files for ``t`` — **deletable after verify**.
+
+        Returns one shard file per pyramid level: ``<level_dir>/c/<t>/0/0/0/0``.
+        Each shard is exclusive to a single ``(t, fov)`` bundle; once that
+        bundle's writes are flushed the writer never touches the file again,
+        so deleting it locally after a verified remote copy is safe.
+
+        Files that do not yet exist are filtered out so callers can use this
+        helper before ``write_frame()`` has flushed the first chunk (in
+        practice the barrier job waits on ``wait_for_pending()`` first).
+        """
+        candidates: List[str] = []
+        for level in range(len(self._level_shapes)):
+            candidates.append(self._level_shard_path(level, t))
+        return [p for p in candidates if os.path.exists(p)]
+
+    def metadata_paths(self) -> List[str]:
+        """Shared metadata files — **uploaded every barrier, never deleted**.
+
+        These files are either:
+          - Written once at ``initialize()`` and again at ``finalize()`` (the
+            group-level and per-level ``zarr.json`` files), OR
+          - Rewritten in place on every frame (``frame_times/c/0/0/0`` holds
+            timestamps for *all* ``(t, c, z)`` slots; ``record_frame_time``
+            updates a single cell per call).
+
+        Deleting any of these while the writer is still active would corrupt
+        the running acquisition. They are re-uploaded on every barrier so
+        the remote tree stays continuously readable, but the local copies
+        must remain in place until the writer has finalized.
+
+        Files that do not yet exist are filtered out.
+        """
+        candidates: List[str] = [self._zarr_json_path()]
+        for level in range(len(self._level_shapes)):
+            candidates.append(self._level_zarr_json_path(level))
+        candidates.append(os.path.join(self._frame_times_path(), "zarr.json"))
+        candidates.append(self._frame_times_shard_path())
+        return [p for p in candidates if os.path.exists(p)]
+
     # Spec construction -------------------------------------------------------
 
     def _build_array_spec(

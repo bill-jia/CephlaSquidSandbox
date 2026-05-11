@@ -29,6 +29,21 @@ def check_space_available_with_error_dialog(
     if space_required > available_disk_space:
         megabytes_required = int(space_required / 1024 / 1024)
         megabytes_available = int(available_disk_space / 1024 / 1024)
+        # ZARR_V3 acquisitions can stream to a network share so the local disk
+        # only ever holds about one timepoint at a time. Offer that route
+        # before failing the acquisition.
+        zarr_v3 = getattr(multi_point_controller, "file_saving_option", None)
+        zarr_v3_selected = (
+            zarr_v3 is not None
+            and getattr(zarr_v3, "name", "") == "ZARR_V3"
+        )
+        if zarr_v3_selected and prompt_enable_network_streaming(
+            multi_point_controller,
+            megabytes_required=megabytes_required,
+            megabytes_available=megabytes_available,
+            logger=logger,
+        ):
+            return True
         error_message = (
             f"This acquisition will capture {image_count:,} images, which will"
             f" require {megabytes_required:,} [MB], but '{save_directory}' only has {megabytes_available:,} [MB] available."
@@ -37,6 +52,137 @@ def check_space_available_with_error_dialog(
         error_dialog(error_message, title="Not Enough Disk Space")
         return False
     return True
+
+
+def prompt_enable_network_streaming(
+    multi_point_controller: MultiPointController,
+    megabytes_required: int,
+    megabytes_available: int,
+    logger: logging.Logger,
+) -> bool:
+    """Offer to stream the ZARR_V3 acquisition to a network share.
+
+    Shown when the local disk-space check fails and ``file_saving_option`` is
+    ``ZARR_V3``. The user picks a writable path on a mounted SMB share
+    (Windows ``\\\\server\\share\\dir`` UNC, mac/Linux ``/Volumes/.../`` or
+    ``//server/share/dir`` after mount); on accept we configure the
+    controller's upload target and return True so the caller bypasses the
+    local-disk failure.
+
+    Returns True iff the user enabled streaming with a valid path.
+    """
+    dlg = QDialog()
+    dlg.setWindowTitle("Stream to Network Drive")
+    layout = QVBoxLayout(dlg)
+
+    layout.addWidget(QLabel(
+        f"This acquisition needs ~{megabytes_required:,} MB but only "
+        f"{megabytes_available:,} MB is available locally."
+    ))
+    layout.addWidget(QLabel(
+        "Stream OME-Zarr output to a mounted network drive. Each timepoint "
+        "is verified on the remote and then deleted locally, so peak local "
+        "usage stays small."
+    ))
+
+    path_row = QHBoxLayout()
+    path_row.addWidget(QLabel("Network path:"))
+    path_edit = QLineEdit()
+    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions  (or /Volumes/share/...)")
+    last_path = _load_last_remote_streaming_path()
+    if last_path:
+        path_edit.setText(last_path)
+    path_row.addWidget(path_edit, 1)
+    browse_btn = QPushButton("Browse...")
+    def _browse():
+        chosen = QFileDialog.getExistingDirectory(dlg, "Select network folder")
+        if chosen:
+            path_edit.setText(chosen)
+    browse_btn.clicked.connect(_browse)
+    path_row.addWidget(browse_btn)
+    layout.addLayout(path_row)
+
+    delete_local_cb = QCheckBox("Delete each timepoint locally after verified upload")
+    delete_local_cb.setChecked(True)
+    layout.addWidget(delete_local_cb)
+
+    btns = QHBoxLayout()
+    btns.addStretch(1)
+    cancel_btn = QPushButton("Cancel")
+    cancel_btn.clicked.connect(dlg.reject)
+    btns.addWidget(cancel_btn)
+    accept_btn = QPushButton("Enable streaming and start")
+    accept_btn.setDefault(True)
+    btns.addWidget(accept_btn)
+    layout.addLayout(btns)
+
+    def _on_accept():
+        remote = path_edit.text().strip()
+        if not remote:
+            QMessageBox.warning(dlg, "Network path required", "Please enter a network path.")
+            return
+        if not os.path.isdir(remote):
+            QMessageBox.warning(
+                dlg,
+                "Path not reachable",
+                f"'{remote}' is not a directory the OS can see. "
+                f"Mount the share first, then try again.",
+            )
+            return
+        # Quick write probe so we fail fast on read-only mounts.
+        probe = os.path.join(remote, ".squid_upload_probe")
+        try:
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            QMessageBox.warning(
+                dlg,
+                "Path not writable",
+                f"Cannot write to '{remote}': {e}",
+            )
+            return
+        dlg.accept()
+
+    accept_btn.clicked.connect(_on_accept)
+
+    if dlg.exec_() != QDialog.Accepted:
+        logger.info("User declined network streaming; aborting acquisition.")
+        return False
+
+    remote_root = path_edit.text().strip()
+    delete_after_verify = delete_local_cb.isChecked()
+    multi_point_controller.set_zarr_upload_target(
+        enabled=True,
+        remote_root=remote_root,
+        delete_after_verify=delete_after_verify,
+    )
+    _save_last_remote_streaming_path(remote_root)
+    logger.info(
+        f"Network streaming enabled: remote_root={remote_root!r}, "
+        f"delete_after_verify={delete_after_verify}"
+    )
+    return True
+
+
+def _load_last_remote_streaming_path() -> str:
+    cache_file = "cache/last_streaming_path.txt"
+    try:
+        with open(cache_file, "r") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _save_last_remote_streaming_path(path: str) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs("cache", exist_ok=True)
+        with open("cache/last_streaming_path.txt", "w") as f:
+            f.write(path)
+    except OSError:
+        pass
 
 
 def check_ram_available_with_error_dialog(

@@ -5,7 +5,7 @@ import os
 import queue
 import threading
 import time
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Type
+from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Type
 from datetime import datetime
 
 import imageio as iio
@@ -55,7 +55,17 @@ from control.core.job_processing import (
     JobResult,
     DownsampledViewJob,
     DownsampledViewResult,
+    FlushAndStageUploadJob,
+    BarrierResult,
     append_frame_acquisition_time_csv,
+)
+from control.core.zarr_upload import (
+    UploadTarget,
+    UploadTask,
+    UploadWorker,
+    UploadResult,
+    drain_output_queue_nonblocking,
+    local_to_remote_path,
 )
 from control.core.downsampled_views import (
     DownsampledViewManager,
@@ -418,12 +428,63 @@ class MultiPointWorker:
             mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
 
+        # Live ZARR_V3 upload (per-acquisition setting). When enabled, spawn a
+        # dedicated UploadWorker process and wire its input queue into the
+        # SaveZarrJob runner. Acquisition continues even if the network is
+        # down — uploads queue, deletions defer.
+        self._upload_target: Optional[UploadTarget] = None
+        self._upload_worker: Optional[UploadWorker] = None
+        self._save_zarr_runner: Optional[JobRunner] = None
+        self._upload_tasks_by_tp: Dict[int, set] = {}
+        self._upload_results_by_tp: Dict[int, List[UploadResult]] = {}
+        self._upload_expected_count_by_tp: Dict[int, int] = {}
+        self._upload_deletion_done: Set[int] = set()
+        self._upload_failed_tasks: List[UploadResult] = []
+        if (
+            use_zarr_v3
+            and getattr(acquisition_parameters, "zarr_upload_enabled", False)
+            and getattr(acquisition_parameters, "zarr_upload_remote_root", "")
+        ):
+            self._upload_target = UploadTarget(
+                enabled=True,
+                remote_root=acquisition_parameters.zarr_upload_remote_root,
+                local_base=self.experiment_path,
+                delete_after_verify=acquisition_parameters.zarr_upload_delete_after_verify,
+            )
+            manifest_path = os.path.join(self.experiment_path, "upload_manifest.jsonl")
+            self._upload_worker = UploadWorker(
+                target=self._upload_target, manifest_path=manifest_path
+            )
+            self._upload_worker.start()
+            self._log.info(
+                f"Started UploadWorker (pid={self._upload_worker.pid}) "
+                f"-> {self._upload_target.remote_root}, "
+                f"delete_after_verify={self._upload_target.delete_after_verify}"
+            )
+            fovs_per_tp = sum(
+                len(coords) for coords in self.scan_region_fov_coords_mm.values()
+            )
+            for tp in range(self.Nt):
+                self._upload_expected_count_by_tp[tp] = fovs_per_tp
+                self._upload_tasks_by_tp[tp] = set()
+                self._upload_results_by_tp[tp] = []
+
         # Use pre-warmed job runner if available, otherwise create new ones.
         # IMPORTANT: Only use pre-warmed runner if BOTH runner AND backpressure values
         # are available. Using a runner without matching backpressure values would cause
         # the BackpressureController to track different counters than the JobRunner.
-        can_use_prewarmed = prewarmed_job_runner is not None and prewarmed_bp_values is not None
+        # Also: the upload pipeline must be installed at subprocess startup (the input
+        # queue is class-installed in JobRunner.run()), so a pre-warmed runner started
+        # before the upload config was known cannot satisfy an upload-enabled run.
+        can_use_prewarmed = (
+            prewarmed_job_runner is not None
+            and prewarmed_bp_values is not None
+            and self._upload_target is None
+        )
         used_prewarmed = False
+        upload_queue_for_zarr_runner = (
+            self._upload_worker.input_queue if self._upload_worker is not None else None
+        )
         for job_class in job_classes:
             job_runner = None
             if Acquisition.USE_MULTIPROCESSING:
@@ -452,6 +513,15 @@ class MultiPointWorker:
 
                 if job_runner is None:
                     self._log.info(f"Creating job runner for {job_class.__name__} jobs")
+                    # Only the SaveZarrJob runner needs the upload pipeline — barriers
+                    # are dispatched onto its queue so they FIFO-order behind preceding
+                    # SaveZarrJobs for the same (t, fov).
+                    runner_upload_target = (
+                        self._upload_target if job_class is SaveZarrJob else None
+                    )
+                    runner_upload_queue = (
+                        upload_queue_for_zarr_runner if job_class is SaveZarrJob else None
+                    )
                     job_runner = control.core.job_processing.JobRunner(
                         self.acquisition_info,
                         cleanup_stale_ome_files=use_ome_tiff,
@@ -462,11 +532,19 @@ class MultiPointWorker:
                         bp_capacity_event=self._backpressure.capacity_event,
                         # Pass zarr writer info for ZARR_V3 format
                         zarr_writer_info=zarr_writer_info,
+                        upload_target=runner_upload_target,
+                        upload_input_queue=runner_upload_queue,
                     )
                     job_runner.start()
                     # Subprocess starts warming up in background - don't block here
 
             self._job_runners.append((job_class, job_runner))
+            if job_class is SaveZarrJob:
+                self._save_zarr_runner = job_runner
+
+        # Cache zarr_writer_info so barrier dispatch can resolve writer keys
+        # (HCS vs per-FOV layout) without re-deriving the path.
+        self._zarr_writer_info: Optional[ZarrWriterInfo] = zarr_writer_info
         self._abort_on_failed_job = abort_on_failed_jobs
         self._first_job_dispatched = False  # Track if we've waited for subprocess warmup
 
@@ -1110,11 +1188,159 @@ class MultiPointWorker:
         # Final drain of all output queues (should be empty, but check anyway)
         self._summarize_runner_outputs(drain_all=True)
 
+        # Drain the upload worker. Acquisition is done so backpressure is
+        # released — the network can take as long as it needs. Use a long
+        # default; if the user aborted, we still respect the timeout.
+        self._drain_upload_worker_on_shutdown(timeout_s=30 * 60)
+
         # Release backpressure resources now that all jobs are complete
         try:
             self._backpressure.close()
         except Exception as e:
             self._log.error(f"Error closing backpressure controller: {e}")
+
+    def _enqueue_post_finalize_metadata_resync(self) -> None:
+        """Submit one fresh metadata-only upload per FOV after writer finalize.
+
+        Called from ``_drain_upload_worker_on_shutdown`` immediately after
+        the JobRunner subprocess has exited (which is when
+        ``finalize_all_writers()`` ran and rewrote each FOV's group
+        ``zarr.json`` with ``_squid.acquisition_complete = True``). At this
+        point the local writer is gone, so every metadata file is stable
+        and can be uploaded without racing the writer. This guarantees the
+        remote ends up reflecting the finalized state even if the last live
+        barrier raced finalize.
+        """
+        if self._upload_worker is None or self._zarr_writer_info is None:
+            return
+        if self._upload_target is None or not self._upload_target.enabled:
+            return
+        # Build metadata path enumeration locally — we don't have a writer
+        # instance any more (the subprocess is gone). Recompute the same
+        # candidate set ``ZarrWriter.metadata_paths`` would have returned.
+        info = self._zarr_writer_info
+        submitted = 0
+        for region_id, fov_count in info.region_fov_counts.items():
+            for fov in range(fov_count):
+                group_dir = info.get_group_path(region_id, fov)
+                if not os.path.isdir(group_dir):
+                    continue
+                candidates: List[str] = []
+                gj = os.path.join(group_dir, "zarr.json")
+                if os.path.isfile(gj):
+                    candidates.append(gj)
+                # Level zarr.jsons — discover by directory presence rather
+                # than guessing pyramid depth.
+                for entry in sorted(os.listdir(group_dir)):
+                    if entry.isdigit():
+                        lj = os.path.join(group_dir, entry, "zarr.json")
+                        if os.path.isfile(lj):
+                            candidates.append(lj)
+                ft_dir = os.path.join(group_dir, "frame_times")
+                if os.path.isdir(ft_dir):
+                    ftj = os.path.join(ft_dir, "zarr.json")
+                    if os.path.isfile(ftj):
+                        candidates.append(ftj)
+                    ft_chunk = os.path.join(ft_dir, "c", "0", "0", "0")
+                    if os.path.isfile(ft_chunk):
+                        candidates.append(ft_chunk)
+                if not candidates:
+                    continue
+                files = [
+                    (
+                        local,
+                        local_to_remote_path(
+                            local,
+                            self._upload_target.local_base,
+                            self._upload_target.remote_root,
+                        ),
+                    )
+                    for local in candidates
+                ]
+                from uuid import uuid4
+                task = UploadTask(
+                    task_id=str(uuid4()),
+                    time_point=-1,  # sentinel: post-finalize metadata resync
+                    region_id=str(region_id),
+                    fov=fov,
+                    files=files,
+                    deletable_local_paths=set(),  # never delete metadata locally
+                    # ``stable_read`` is irrelevant now (no writer is active),
+                    # but harmless and matches the live barriers' metadata
+                    # behavior so manifest records are consistent.
+                    stable_read_paths=set(candidates),
+                )
+                self._upload_worker.submit(task)
+                # Account for it in the per-timepoint tally under the
+                # sentinel key -1 so the drain loop can wait for it too.
+                self._upload_tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+                self._upload_expected_count_by_tp[-1] = (
+                    self._upload_expected_count_by_tp.get(-1, 0) + 1
+                )
+                submitted += 1
+        if submitted:
+            self._log.info(
+                f"Submitted {submitted} post-finalize metadata resync task(s)"
+            )
+
+    def _drain_upload_worker_on_shutdown(self, timeout_s: float) -> None:
+        """Wait for the UploadWorker to finish its backlog, then shut it down.
+
+        Polls the result queue until either every expected task has reported,
+        every alive timepoint has been resolved, or the timeout elapses. Any
+        timepoints that fully verified during the drain get their batched
+        deletion applied. A final logged summary captures what was left
+        behind so the operator can run the standalone backfill script over
+        the same experiment directory.
+        """
+        if self._upload_worker is None:
+            return
+        # Re-upload every FOV's metadata now that the JobRunner subprocess
+        # has shut down and finalize has run. This is the canonical
+        # uncontested read of zarr.json / frame_times — any racy intermediate
+        # uploads during the live run are corrected here.
+        self._enqueue_post_finalize_metadata_resync()
+        deadline = time.time() + timeout_s
+        last_log = 0.0
+        while time.time() < deadline:
+            # Count outstanding tasks (BarrierResults received but no UploadResult yet).
+            outstanding = sum(len(s) for s in self._upload_tasks_by_tp.values())
+            if outstanding == 0:
+                break
+            now = time.time()
+            if now - last_log > 5.0:
+                self._log.info(
+                    f"Waiting for UploadWorker: {outstanding} upload(s) still in flight "
+                    f"({int(deadline - now)}s remaining)"
+                )
+                last_log = now
+            self._drain_upload_results()
+            time.sleep(0.5)
+        # Final drain
+        self._drain_upload_results()
+        remaining = sum(len(s) for s in self._upload_tasks_by_tp.values())
+        if remaining:
+            self._log.error(
+                f"UploadWorker drain timed out with {remaining} upload(s) outstanding. "
+                f"Run the standalone backfill script over {self.experiment_path} to "
+                f"complete the upload, then prune local data."
+            )
+        if self._upload_failed_tasks:
+            self._log.warning(
+                f"{len(self._upload_failed_tasks)} upload task(s) failed during this run; "
+                f"local files for the affected timepoints have NOT been deleted."
+            )
+        # Send shutdown sentinel and join (best-effort; non-daemon process
+        # exits cleanly once it drains its own queue).
+        try:
+            self._upload_worker.shutdown()
+            self._upload_worker.join(timeout=10.0)
+            if self._upload_worker.is_alive():
+                self._log.warning("UploadWorker did not exit within 10s; terminating")
+                self._upload_worker.terminate()
+                self._upload_worker.join(timeout=5.0)
+        except Exception as e:
+            self._log.error(f"Error shutting down UploadWorker: {e}")
 
     def wait_till_operation_is_completed(self):
         self.microcontroller.wait_till_operation_is_completed()
@@ -1399,7 +1625,107 @@ class MultiPointWorker:
                     # Queue was closed during shutdown - nothing more to drain
                     break
 
+        # Drain the upload worker's output queue and reconcile against the
+        # per-timepoint completion bookkeeping. Non-blocking — uploads that
+        # are still in flight will be picked up on the next pass.
+        self._drain_upload_results()
+
         return SummarizeResult(none_failed=none_failed, had_results=had_results)
+
+    def _drain_upload_results(self) -> None:
+        """Pull every available ``UploadResult`` from the UploadWorker.
+
+        Each result corresponds to one ``(t, fov)`` bundle. When every bundle
+        for a timepoint has reported (and ``delete_after_verify`` is on) we
+        delete the local shard files for that timepoint in one batch.
+        """
+        if self._upload_worker is None:
+            return
+        try:
+            results = drain_output_queue_nonblocking(self._upload_worker.output_queue)
+        except (OSError, ValueError) as e:
+            self._log.debug(f"Upload result queue read failed: {e}")
+            return
+        for result in results:
+            tp = result.time_point
+            self._upload_tasks_by_tp.get(tp, set()).discard(result.task_id)
+            self._upload_results_by_tp.setdefault(tp, []).append(result)
+            if not result.success:
+                self._upload_failed_tasks.append(result)
+                self._log.warning(
+                    f"Upload task {result.task_id} for t={tp} fov={result.fov} "
+                    f"failed: {result.error}"
+                )
+            self._maybe_batched_delete(tp)
+
+    def _maybe_batched_delete(self, time_point: int) -> None:
+        """If every FOV in ``time_point`` has uploaded successfully, delete
+        the local shard files for that timepoint in one batch.
+
+        We require *all* expected FOVs to be present (so a partial timepoint
+        with one failure does not silently drop the remainder), *and* every
+        result to be ``success=True``. A single failure defers deletion for
+        that timepoint until either a retry succeeds or the user intervenes.
+        """
+        if time_point in self._upload_deletion_done:
+            return
+        if self._upload_target is None or not self._upload_target.delete_after_verify:
+            return
+        expected = self._upload_expected_count_by_tp.get(time_point)
+        if expected is None:
+            return
+        results = self._upload_results_by_tp.get(time_point, [])
+        if len(results) < expected:
+            return
+        if any(not r.success for r in results):
+            return
+        # All bundles for this timepoint are verified on the remote. Delete
+        # only the per-timepoint shard files that the upload worker tagged
+        # as deletable — never the shared metadata (zarr.json / frame_times),
+        # which the live writer is still using.
+        deleted = 0
+        for result in results:
+            for local_path in result.deletable_uploaded_paths:
+                try:
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                        deleted += 1
+                except OSError as e:
+                    self._log.warning(
+                        f"Failed to delete {local_path} after verified upload: {e}"
+                    )
+        # Best-effort prune of the now-empty `c/<t>/...` shard subtrees so
+        # the local directory listing stays tidy.
+        self._prune_empty_shard_dirs(time_point)
+        self._upload_deletion_done.add(time_point)
+        self._log.info(
+            f"Reclaimed local disk: deleted {deleted} files for verified timepoint t={time_point}"
+        )
+
+    def _prune_empty_shard_dirs(self, time_point: int) -> None:
+        """Remove ``<level_dir>/c/<t>`` if empty after batched delete.
+
+        Only descends into ``c/<t>`` and prunes upward to the level dir; never
+        touches sibling timepoints' shard files or array metadata.
+        """
+        if self._zarr_writer_info is None:
+            return
+        for region_id, fov_count in self._zarr_writer_info.region_fov_counts.items():
+            for fov in range(fov_count):
+                group_dir = self._zarr_writer_info.get_group_path(region_id, fov)
+                # Sweep across all level dirs (0/, 1/, ...) plus frame_times.
+                if not os.path.isdir(group_dir):
+                    continue
+                for entry in os.listdir(group_dir):
+                    candidate = os.path.join(group_dir, entry, "c", str(time_point))
+                    if os.path.isdir(candidate):
+                        # rmtree any empty subtree under it.
+                        for root, dirs, files in os.walk(candidate, topdown=False):
+                            if not files and not dirs:
+                                try:
+                                    os.rmdir(root)
+                                except OSError:
+                                    break
 
     def _summarize_job_result(self, job_result: JobResult) -> bool:
         """
@@ -1429,6 +1755,30 @@ class MultiPointWorker:
             elif isinstance(job_result.result, ZarrWriteResult):
                 r = job_result.result
                 self.callbacks.signal_zarr_frame_written(r.fov, r.time_point, r.z_index, r.channel_name, r.region_idx)
+            # Handle BarrierResult - the upload barrier has flushed this (t, fov)
+            # and enqueued the upload task; track its task_id so we can match
+            # the matching UploadResult later.
+            elif isinstance(job_result.result, BarrierResult):
+                br = job_result.result
+                if br.submitted:
+                    self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
+                elif self._upload_target is not None:
+                    # Barrier ran but didn't submit (no writer / no shards).
+                    # Account it as completed-non-uploading so the timepoint
+                    # tally can still close.
+                    self._upload_results_by_tp.setdefault(br.time_point, []).append(
+                        UploadResult(
+                            task_id=br.task_id,
+                            time_point=br.time_point,
+                            region_id=br.region_id,
+                            fov=br.fov,
+                            success=True,
+                            uploaded_paths=[],
+                            failed_paths=[],
+                            error=None,
+                        )
+                    )
+                    self._maybe_batched_delete(br.time_point)
             return True
 
     def _handle_downsampled_view_result(self, result: DownsampledViewResult) -> None:
@@ -1899,6 +2249,34 @@ class MultiPointWorker:
                         self.move_to_coordinate(coordinate_mm, region_id, fov)
                 with self._timing.get_timer("acquire_at_position"):
                     self.acquire_at_position(region_id, current_path, fov)
+
+                # Barrier: after every SaveZarrJob for this (t, region, fov)
+                # has been dispatched, queue a FlushAndStageUploadJob behind
+                # them. The job runs FIFO in the SaveZarrJob runner so by the
+                # time its run() begins, every preceding zarr write has been
+                # processed; it then waits on TensorStore pending futures and
+                # hands the resulting shard paths to the UploadWorker.
+                if (
+                    self._upload_target is not None
+                    and self._save_zarr_runner is not None
+                    and self._zarr_writer_info is not None
+                ):
+                    try:
+                        output_path = self._zarr_writer_info.get_output_path(
+                            str(region_id), fov
+                        )
+                        barrier = FlushAndStageUploadJob(
+                            time_point=self.time_point,
+                            region_id=str(region_id),
+                            fov=fov,
+                            output_path=output_path,
+                        )
+                        self._save_zarr_runner.dispatch(barrier)
+                    except Exception as e:
+                        self._log.exception(
+                            f"Failed to dispatch upload barrier for "
+                            f"t={self.time_point} region={region_id} fov={fov}: {e}"
+                        )
 
                 if self.abort_requested_fn():
                     self.handle_acquisition_abort(current_path)

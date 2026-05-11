@@ -29,6 +29,11 @@ from control.core.memory_profiler import (
     set_worker_operation,
     log_memory,
 )
+from control.core.zarr_upload import (
+    UploadTarget,
+    UploadTask,
+    local_to_remote_path,
+)
 
 
 @dataclass
@@ -786,6 +791,181 @@ class SaveZarrJob(Job):
         self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path}")
 
 
+@dataclass
+class BarrierResult:
+    """Return value of ``FlushAndStageUploadJob`` consumed by ``multi_point_worker``.
+
+    Tells the main process: "I have flushed FOV ``fov`` for timepoint ``t`` to
+    disk and enqueued ``file_count`` files onto the upload worker. Track
+    ``task_id`` until the matching ``UploadResult`` arrives, then it is safe
+    to batched-delete this FOV's local shard."
+    """
+
+    task_id: str
+    time_point: int
+    region_id: str
+    fov: int
+    file_count: int
+    submitted: bool  # False means upload disabled or writer missing — no UploadResult will ever arrive
+
+
+@dataclass
+class FlushAndStageUploadJob:
+    """Barrier job: flush one ``(t, fov)``'s zarr writes, then stage upload.
+
+    Runs in the ``JobRunner`` subprocess. Because the JobRunner pulls jobs
+    FIFO from a single queue, by the time this job runs every preceding
+    ``SaveZarrJob`` for ``(t, fov)`` has already been processed. We then call
+    ``writer.wait_for_pending()`` on the per-FOV ``ZarrWriter`` so all
+    outstanding TensorStore futures resolve, collect the resulting shard
+    paths via :meth:`ZarrWriter.shard_paths_for_timepoint`, build local→remote
+    pairs, and push one :class:`UploadTask` onto the ``UploadWorker``'s input
+    queue. Network I/O happens in the upload worker, not here.
+
+    NOTE: this class does NOT inherit from :class:`Job` because the parent
+    requires a real ``CaptureInfo``/``JobImage`` per-frame. The
+    ``JobRunner`` machinery only needs ``job_id``, ``run()``, and a
+    ``capture_image`` with ``image_array`` (for the backpressure accountant)
+    — all of which are provided here directly.
+    """
+
+    _log: ClassVar = squid.logging.get_logger("FlushAndStageUploadJob")
+
+    time_point: int = 0
+    region_id: str = ""
+    fov: int = 0
+    output_path: str = ""
+    # Injected by ``JobRunner.dispatch`` from its ``self._upload_target``.
+    upload_target: Optional[UploadTarget] = field(default=None)
+
+    job_id: str = field(default_factory=lambda: str(uuid4()))
+    # Empty JobImage keeps the backpressure byte accountant happy without
+    # actually moving image data through the queue.
+    capture_image: JobImage = field(default_factory=lambda: JobImage(image_array=None))
+
+    # Set in each ``JobRunner`` subprocess by ``JobRunner.run()`` so the job
+    # can reach the upload worker without pickling the queue per-job.
+    _upload_input_queue: ClassVar[Optional[multiprocessing.Queue]] = None
+
+    def run(self) -> BarrierResult:
+        from uuid import uuid4
+
+        task_id = str(uuid4())
+
+        writer = SaveZarrJob._zarr_writers.get(self.output_path)
+        if writer is None:
+            # Either no writes happened for this FOV (test scaffold), or the
+            # writer was cleared by an abort. Either way there is nothing to
+            # upload — return submitted=False so the main worker doesn't
+            # wait on a phantom UploadResult.
+            self._log.warning(
+                f"No writer for output_path={self.output_path}; "
+                f"skipping upload for t={self.time_point} fov={self.fov}"
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=0,
+                submitted=False,
+            )
+
+        # Drain every outstanding TensorStore future tied to this writer. After
+        # this returns, every shard file for this FOV is fully on disk and
+        # safe to read for upload.
+        writer.wait_for_pending()
+
+        if not (self.upload_target and self.upload_target.enabled):
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=0,
+                submitted=False,
+            )
+
+        shard_paths = writer.shard_paths_for_timepoint(self.time_point)
+        metadata_paths = writer.metadata_paths()
+        if not shard_paths and not metadata_paths:
+            self._log.warning(
+                f"No shard or metadata paths found for t={self.time_point} "
+                f"fov={self.fov} at {self.output_path}"
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=0,
+                submitted=False,
+            )
+
+        # Compose ``files`` with metadata first (so the remote tree becomes
+        # readable as soon as the shards land) and mark only shards as
+        # deletable: metadata files are shared across timepoints and the
+        # writer continues to update ``frame_times`` and (at finalize)
+        # ``zarr.json``. Deleting them locally would break the live writer.
+        #
+        # Metadata files are also marked ``stable_read`` so the UploadWorker
+        # re-hashes the source after the copy and retries if it detects a
+        # concurrent writer rewrite (``record_frame_time`` hits
+        # ``frame_times/c/0/0/0`` every frame; finalize rewrites the
+        # per-FOV ``zarr.json``).
+        all_locals = list(metadata_paths) + list(shard_paths)
+        files = [
+            (
+                local,
+                local_to_remote_path(
+                    local,
+                    self.upload_target.local_base,
+                    self.upload_target.remote_root,
+                ),
+            )
+            for local in all_locals
+        ]
+        deletable = set(shard_paths)
+        stable_read = set(metadata_paths)
+
+        if FlushAndStageUploadJob._upload_input_queue is None:
+            self._log.error(
+                "Upload enabled but UploadWorker queue not initialized in this "
+                "JobRunner subprocess — dropping task. Check JobRunner.run()."
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+            )
+
+        task = UploadTask(
+            task_id=task_id,
+            time_point=self.time_point,
+            region_id=self.region_id,
+            fov=self.fov,
+            files=files,
+            deletable_local_paths=deletable,
+            stable_read_paths=stable_read,
+        )
+        FlushAndStageUploadJob._upload_input_queue.put(task)
+        self._log.debug(
+            f"Staged upload task {task_id} for t={self.time_point} fov={self.fov} "
+            f"({len(files)} files)"
+        )
+        return BarrierResult(
+            task_id=task_id,
+            time_point=self.time_point,
+            region_id=self.region_id,
+            fov=self.fov,
+            file_count=len(files),
+            submitted=True,
+        )
+
+
 # These are debugging jobs - they should not be used in normal usage!
 class HangForeverJob(Job):
     def run(self) -> bool:
@@ -1086,6 +1266,11 @@ class JobRunner(multiprocessing.Process):
         bp_capacity_event: Optional[multiprocessing.Event] = None,
         # Zarr writer info (for ZARR_V3 saving)
         zarr_writer_info: Optional[ZarrWriterInfo] = None,
+        # Remote upload target for ZARR_V3 streaming (None disables upload).
+        # ``upload_input_queue`` is the input queue of an ``UploadWorker``
+        # owned by the main process; this subprocess only writes to it.
+        upload_target: Optional[UploadTarget] = None,
+        upload_input_queue: Optional[multiprocessing.Queue] = None,
     ):
         super().__init__()
         # Daemon processes are terminated when the main process exits, ensuring
@@ -1096,6 +1281,8 @@ class JobRunner(multiprocessing.Process):
         self._log = squid.logging.get_logger(__class__.__name__)
         self._acquisition_info = acquisition_info
         self._zarr_writer_info = zarr_writer_info
+        self._upload_target = upload_target
+        self._upload_input_queue = upload_input_queue
         self._log_file_path = log_file_path  # Will be used in subprocess to set up file logging
 
         self._input_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -1137,6 +1324,11 @@ class JobRunner(multiprocessing.Process):
                     "When using ZARR_V3 saving, initialize JobRunner with a ZarrWriterInfo instance."
                 )
             job.zarr_writer_info = self._zarr_writer_info
+
+        # Inject upload_target into FlushAndStageUploadJob instances before serialization.
+        # ``upload_input_queue`` is installed on the class in the subprocess at startup.
+        if isinstance(job, FlushAndStageUploadJob):
+            job.upload_target = self._upload_target
 
         # Calculate image bytes for backpressure tracking
         image_bytes = 0
@@ -1202,6 +1394,20 @@ class JobRunner(multiprocessing.Process):
         before the acquisition loop starts, so no synchronization is needed.
         """
         self._acquisition_info = acquisition_info
+
+    def has_upload_pipeline(self) -> bool:
+        """True iff this runner was constructed with an upload target + queue.
+
+        Used by ``multi_point_worker`` to decide whether the pre-warmed runner
+        can be reused: the upload queue must be installed at subprocess
+        startup, so a pre-warmed runner created before the upload config was
+        known cannot satisfy an upload-enabled acquisition.
+        """
+        return (
+            self._upload_target is not None
+            and self._upload_target.enabled
+            and self._upload_input_queue is not None
+        )
 
     def set_zarr_writer_info(self, zarr_writer_info: "ZarrWriterInfo"):
         """Set zarr writer info for ZARR_V3 saving.
@@ -1276,6 +1482,14 @@ class JobRunner(multiprocessing.Process):
         # Start memory monitoring for the worker process
         start_worker_monitoring(sample_interval_ms=200)
         log_memory("WORKER_START", include_children=False)
+
+        # Install the upload worker's input queue on the class so that
+        # ``FlushAndStageUploadJob.run()`` instances in this subprocess can
+        # reach the upload pipeline. The main process owns/started the
+        # ``UploadWorker``; we are only a producer here.
+        if self._upload_input_queue is not None:
+            FlushAndStageUploadJob._upload_input_queue = self._upload_input_queue
+            self._log.info("Upload input queue installed on FlushAndStageUploadJob")
 
         # Signal to main process that we're ready to receive jobs
         self._ready_event.set()

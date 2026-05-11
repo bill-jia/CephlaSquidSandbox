@@ -94,6 +94,18 @@ class AcquisitionParameters:
     laser_af_consistency_threshold_um: float = 5.0
     laser_af_check_last_fov_per_region: bool = True
 
+    # Live ZARR_V3 streaming upload to a network drive. When ``zarr_upload_enabled``
+    # is True and ``file_saving_option == ZARR_V3``, each timepoint's shard
+    # files are pushed to ``zarr_upload_remote_root`` (UNC ``\\server\share\dir``
+    # on Windows or ``//server/share/dir`` POSIX) by a dedicated UploadWorker.
+    # When ``zarr_upload_delete_after_verify`` is True, local shard files are
+    # deleted in batches at the end of each timepoint once every shard in that
+    # timepoint has been sha256-verified on the remote. See
+    # ``control.core.zarr_upload`` for details.
+    zarr_upload_enabled: bool = False
+    zarr_upload_remote_root: str = ""
+    zarr_upload_delete_after_verify: bool = True
+
 
 @dataclass
 class OverallProgressUpdate:

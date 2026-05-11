@@ -353,6 +353,10 @@ class MultiPointController:
         self.skip_saving = False
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
+        # Live ZARR_V3 upload settings (off by default; configured per-acquisition).
+        self.zarr_upload_enabled = False
+        self.zarr_upload_remote_root = ""
+        self.zarr_upload_delete_after_verify = True
         self.xy_mode = "Current Position"
         self.widget_type = "wellplate"  # "wellplate" or "flexible"
         self.scan_size_mm = 0.0  # For wellplate mode: size of scan area per region
@@ -638,6 +642,22 @@ class MultiPointController:
 
     def set_keep_illuminators_on_between_captures(self, keep_on: bool):
         self.keep_illuminators_on_between_captures = bool(keep_on)
+
+    def set_zarr_upload_target(
+        self,
+        enabled: bool,
+        remote_root: str = "",
+        delete_after_verify: bool = True,
+    ) -> None:
+        """Configure live ZARR_V3 upload to a network share for the next acquisition.
+
+        ``remote_root`` must be a writable directory on a mounted SMB share
+        (e.g. ``\\\\server\\share\\bills_acquisitions``). Snapshotted into
+        ``AcquisitionParameters`` in ``build_params()``.
+        """
+        self.zarr_upload_enabled = bool(enabled)
+        self.zarr_upload_remote_root = remote_root or ""
+        self.zarr_upload_delete_after_verify = bool(delete_after_verify)
 
     def set_xy_mode(self, xy_mode):
         self.xy_mode = xy_mode
@@ -1226,6 +1246,9 @@ class MultiPointController:
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
             laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
+            zarr_upload_enabled=self.zarr_upload_enabled,
+            zarr_upload_remote_root=self.zarr_upload_remote_root,
+            zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,
         )
 
     def _on_acquisition_completed(self):
