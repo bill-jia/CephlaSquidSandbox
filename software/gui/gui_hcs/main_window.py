@@ -1933,7 +1933,11 @@ class HighContentScreeningGui(QMainWindow):
 
     def openObservationStateConfigEditor(self):
         """Open the acquisition channel configurator dialog for editing user profiles."""
-        dialog = widgets.ObservationStateConfiguratorDialog(self.microscope.config_repo, self)
+        dialog = widgets.ObservationStateConfiguratorDialog(
+            self.microscope.config_repo,
+            self,
+            illumination_controller=self.microscope.illumination_controller,
+        )
         dialog.signal_channels_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
 

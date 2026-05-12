@@ -1,4 +1,5 @@
 from ._bootstrap import *
+from .pulse_timing_dialog import PulseTimingDialog
 
 class RAMMonitorWidget(QWidget):
     """Compact RAM monitor widget for status bar.
@@ -405,16 +406,18 @@ class ObservationStateConfiguratorDialog(QDialog):
     COL_FILTER_WHEEL = 4
     COL_FILTER_POSITION = 5
     COL_DISPLAY_COLOR = 6
+    COL_TIMING = 7
 
-    def __init__(self, config_repo, parent=None):
+    def __init__(self, config_repo, parent=None, illumination_controller=None):
         super().__init__(parent)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.config_repo = config_repo
+        self._illumination_controller = illumination_controller
         self._preset_states: list = []      # List[ObservationState] currently in dialog
         self._original_names: list = []     # names as loaded, to track deletions
         self.illumination_config = None
         self.setWindowTitle("Acquisition Channel Configuration")
-        self.setMinimumSize(700, 400)
+        self.setMinimumSize(800, 400)
         self._setup_ui()
         self._load_channels()
 
@@ -431,9 +434,9 @@ class ObservationStateConfiguratorDialog(QDialog):
 
         # Table for acquisition channels
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(
-            ["Enabled", "Name", "Illumination", "Camera", "Filter Wheel", "Filter", "Color"]
+            ["Enabled", "Name", "Illumination", "Camera", "Filter Wheel", "Filter", "Color", "Timing"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -606,6 +609,25 @@ class ObservationStateConfiguratorDialog(QDialog):
         color_btn.setProperty("color", color)
         color_btn.clicked.connect(lambda _checked, r=row: self._pick_color(r))
         self.table.setCellWidget(row, self.COL_DISPLAY_COLOR, color_btn)
+
+        # Pulse timing (opens PulseTimingDialog for the row's state)
+        timing_btn = QPushButton(PulseTimingDialog.summary(state))
+        timing_btn.setAutoDefault(False)
+        timing_btn.setDefault(False)
+        timing_btn.clicked.connect(lambda _checked, r=row: self._configure_timing(r))
+        self.table.setCellWidget(row, self.COL_TIMING, timing_btn)
+
+    def _configure_timing(self, row: int):
+        """Open PulseTimingDialog for the row's observation state."""
+        if row < 0 or row >= len(self._preset_states):
+            return
+        state = self._preset_states[row]
+        dialog = PulseTimingDialog(state, illumination_controller=self._illumination_controller, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            # Refresh the timing-button label so the summary reflects the new state.
+            btn = self.table.cellWidget(row, self.COL_TIMING)
+            if btn is not None:
+                btn.setText(PulseTimingDialog.summary(state))
 
     def _on_wheel_changed(self, row: int, wheel_name: str):
         """Update filter position options when wheel selection changes."""

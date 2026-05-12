@@ -16,11 +16,40 @@ def _multipoint_observation_preset_display_names(microscope) -> list:
     return sorted(microscope.config_repo.list_observation_presets())
 
 
-def _create_checkbox_list_item(name: str, checked: bool = False) -> QListWidgetItem:
-    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight."""
+def _is_preset_waveform_driven(microscope, name: str) -> bool:
+    """Return True when the named preset has any timed illuminator (NIDAQ pulse).
+
+    Best-effort: returns False if the preset cannot be loaded for any reason
+    so the visual decoration never blocks list rendering.
+    """
+    if microscope is None:
+        return False
+    try:
+        preset = microscope.config_repo.load_observation_preset(name)
+    except Exception:
+        return False
+    return bool(preset and getattr(preset, "is_waveform_driven", False))
+
+
+def _create_checkbox_list_item(name: str, checked: bool = False, *, microscope=None) -> QListWidgetItem:
+    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight.
+
+    When ``microscope`` is supplied and the named preset uses NIDAQ pulse
+    timing, the row is rendered in italic with a tooltip flagging the
+    requirement. ``item.text()`` remains the canonical preset name so
+    callers comparing against ``item.text()`` are not affected.
+    """
     item = QListWidgetItem(name)
     item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
     item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+    if _is_preset_waveform_driven(microscope, name):
+        font = item.font()
+        font.setItalic(True)
+        item.setFont(font)
+        item.setToolTip(
+            "Uses NIDAQ pulse timing — illumination is delivered as a precisely "
+            "timed pulse during the camera exposure. Requires an NIDAQ on this rig."
+        )
     return item
 
 
@@ -994,7 +1023,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
@@ -1644,7 +1673,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
 
     def toggle_acquisition(self, pressed):
@@ -2460,6 +2491,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Track loading from cache
         self._loading_from_cache = False
 
+        # One-shot scan size restored from cache. Consumed by set_default_scan_size
+        # so the first plate-format-change cascade after startup preserves the
+        # user's last value instead of resetting to the effective well size.
+        self._pending_cached_scan_size = None
+
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
         self.set_default_scan_size()
@@ -2572,7 +2608,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         # Per-point (per-well) channel override. None means "use global selection at every well".
@@ -3010,6 +3046,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_mode.currentTextChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_time.toggled.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_overlap.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.entry_scan_size.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_dt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_Nt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_deltaZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
@@ -3042,6 +3079,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "z_mode": self.combobox_z_mode.currentText(),
                 "time_enabled": self.checkbox_time.isChecked(),
                 "fov_overlap": self.entry_overlap.value(),
+                "scan_size_mm": self.entry_scan_size.value(),
                 "dt": self.entry_dt.value(),
                 "nt": self.entry_Nt.value(),
                 "dz": self.entry_deltaZ.value(),
@@ -3081,6 +3119,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.combobox_z_mode.blockSignals(True)
             self.checkbox_time.blockSignals(True)
             self.entry_overlap.blockSignals(True)
+            self.entry_scan_size.blockSignals(True)
             self.entry_dt.blockSignals(True)
             self.entry_Nt.blockSignals(True)
             self.entry_deltaZ.blockSignals(True)
@@ -3118,6 +3157,15 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             self.checkbox_time.setChecked(settings.get("time_enabled", False))
             self.entry_overlap.setValue(settings.get("fov_overlap", 10))
+            cached_scan_size = settings.get("scan_size_mm")
+            if cached_scan_size is not None:
+                self.entry_scan_size.setValue(cached_scan_size)
+                # Keep per-mode stored params in sync so switching XY mode and
+                # back doesn't clobber the restored value with the default.
+                self.stored_xy_params[self.combobox_xy_mode.currentText()]["scan_size"] = cached_scan_size
+                # Survive the wellplate-format-change cascade fired by
+                # main_window during startup (clobbers via set_default_scan_size).
+                self._pending_cached_scan_size = cached_scan_size
             self.entry_dt.setValue(settings.get("dt", 0))
             self.entry_Nt.setValue(settings.get("nt", 1))
             self.entry_deltaZ.setValue(settings.get("dz", 1.0))
@@ -3148,6 +3196,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.combobox_z_mode.blockSignals(False)
             self.checkbox_time.blockSignals(False)
             self.entry_overlap.blockSignals(False)
+            self.entry_scan_size.blockSignals(False)
             self.entry_dt.blockSignals(False)
             self.entry_Nt.blockSignals(False)
             self.entry_deltaZ.blockSignals(False)
@@ -3819,7 +3868,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             self.set_default_shape()
 
-            if "glass slide" in self.navigationViewer.sample:
+            if self._pending_cached_scan_size is not None:
+                # Restore user's last scan_size (consumed once on startup).
+                self.entry_scan_size.setValue(self._pending_cached_scan_size)
+                self.entry_scan_size.setEnabled(True)
+                self._pending_cached_scan_size = None
+            elif "glass slide" in self.navigationViewer.sample:
                 self.entry_scan_size.setValue(
                     0.1
                 )  # init to 0.1mm when switching to 'glass slide' (for imaging a single FOV by default)
@@ -3853,6 +3907,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # change scan size to single FOV if XY is checked and mode is "Current Position"
         if self.checkbox_xy.isChecked() and self.combobox_xy_mode.currentText() == "Current Position":
             self.entry_scan_size.setValue(0.1)
+            self._pending_cached_scan_size = None
 
     def set_default_shape(self):
         if self.scanCoordinates.format in ["384 well plate", "1536 well plate"]:
@@ -4336,7 +4391,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
         self._reset_per_point_channels_map()
 
@@ -4807,7 +4864,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = QListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name))
+            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
         self.list_configurations.setToolTip("Observation State presets saved for the active profile")
 
         # Laser AF checkbox
@@ -5059,7 +5116,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
         for name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(name, checked=name in checked_names))
+            self.list_configurations.addItem(
+                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
+            )
         self.list_configurations.blockSignals(False)
 
     def acquisition_is_finished(self):

@@ -1337,6 +1337,38 @@ class MultiPointController:
                 "Laser Autofocus Not Ready - Please set the laser autofocus reference position before starting acquisition with laser AF enabled."
             )
             return False
+
+        # When any selected observation state has timed illuminators, the worker
+        # arms a per-frame NIDAQ pulse waveform; without an NIDAQ on this rig
+        # those captures cannot run.
+        repo = self.liveController.microscope.config_repo
+        ic = self.liveController.microscope.illumination_controller
+        for name in self.selected_observation_state_names or []:
+            preset = repo.load_observation_preset(name)
+            if preset is None or not preset.is_waveform_driven:
+                continue
+            if getattr(self.microscope.addons, "nidaq", None) is None:
+                self._log.error(
+                    "Observation state '%s' uses NIDAQ pulse timing but no NIDAQ is configured on this microscope.",
+                    name,
+                )
+                return False
+            if not control._def.NIDAQ_FRAME_SIGNAL_TERMINAL:
+                self._log.error(
+                    "Observation state '%s' uses NIDAQ pulse timing but NIDAQ_FRAME_SIGNAL_TERMINAL is not set.",
+                    name,
+                )
+                return False
+            for ist in preset.illuminator_states:
+                if not ist.on or ist.timing is None:
+                    continue
+                if ic.get_nidaq_do_line_for_channel(ist.illumination_channel) is None:
+                    self._log.error(
+                        "Observation state '%s': illuminator '%s' has pulse timing but no NIDAQ digital-output line is wired for it.",
+                        name,
+                        ist.illumination_channel,
+                    )
+                    return False
         return True
 
     def get_plate_view(self) -> np.ndarray:

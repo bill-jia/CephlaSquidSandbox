@@ -858,6 +858,25 @@ NL5_WAVENLENGTH_MAP = {405: 1, 470: 2, 488: 2, 545: 3, 555: 3, 561: 3, 637: 4, 6
 # This is automatically set based on CAMERA_TYPE during config loading
 NI_DAQ_LOGIC_FAMILY = "FIVE_V"
 
+# Terminal that the camera's exposure-active / frame signal output is wired to
+# on the NI-DAQ. Used when a waveform-driven observation state arms a
+# per-frame pulse task with TriggerSource.EXTERNAL during multipoint
+# acquisition. The actual terminal is resolved at runtime from the machine
+# config's ``main_camera.frame_readout`` endpoint when present (and a
+# ``port0/lineN`` channel id is translated to the equivalent ``PFIN`` alias
+# automatically — NI-DAQ start triggers must reference PFI lines on X-series
+# devices). This constant is only used as a fallback when no endpoint is
+# declared.
+NIDAQ_FRAME_SIGNAL_TERMINAL = "/Dev1/PFI0"
+
+# NI-DAQ sample rate used for per-frame pulse waveforms during multipoint
+# waveform-driven captures. 10 kHz (100 µs resolution) is enough for the
+# millisecond-scale pulses these experiments target and keeps the per-frame
+# waveform tiny (e.g. 500 samples for a 50 ms exposure), which minimises
+# task setup overhead and DMA pressure when interleaved with other NIDAQ
+# users (fast acquisition widget, DAQ-only acquisition).
+NIDAQ_PULSE_SAMPLE_RATE_HZ = 10_000.0
+
 # Laser AF characterization mode
 LASER_AF_CHARACTERIZATION_MODE = False
 

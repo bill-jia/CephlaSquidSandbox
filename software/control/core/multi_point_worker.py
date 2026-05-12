@@ -33,6 +33,11 @@ from control.microcontroller import Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
 from control.models.observation_state import ObservationState
+from control.core.waveform_observation_state import (
+    build_pulse_waveform_for_state,
+    nidaq_lines_for_state,
+)
+from control.nidaq import TriggerSource
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 import squid.logging
 import control.core.job_processing
@@ -622,6 +627,216 @@ class MultiPointWorker:
         except Exception as e:
             self._log.warning("Could not turn off capture illumination after snap: %s", e)
 
+    def _apply_illumination_for_waveform_capture(self, config: ObservationState) -> None:
+        """Apply illumination for a waveform-driven capture.
+
+        DC intensities for every active illuminator are set as usual, but the
+        digital gating line for any illuminator with a ``timing`` block is
+        left LOW — the NIDAQ one-shot waveform is the only thing that pulls
+        it HIGH during the exposure. Standard (un-timed) illuminators in the
+        same observation state are turned on for the full exposure, exactly
+        like the regular path.
+        """
+        ic = self.microscope.illumination_controller
+        active = config.active_illuminator_states
+        if not active:
+            return
+        try:
+            ic.apply_observation_illumination(
+                active,
+                turn_on=True,
+                force_hardware=True,
+                gate_timed_illuminators=False,
+            )
+        except Exception as e:
+            self._log.warning("Could not apply waveform-capture illumination: %s", e)
+
+    def _resolve_camera_frame_signal_terminal(self, nidaq) -> str:
+        """Resolve the NIDAQ terminal carrying the camera's frame readout edge.
+
+        Reads the ``main_camera.frame_readout`` endpoint from the machine
+        config's ``io:`` declarations (e.g. ``port0/line7``), then translates
+        the channel id into a form ``cfg_dig_edge_start_trig`` accepts. NI-DAQ
+        won't take ``port0/lineN`` as a start-trigger source on X-series
+        devices — for triggering you need the corresponding ``PFIN`` alias
+        (same physical pin for N=0..7). Read/write paths still address the
+        line as ``port0/lineN``; only the trigger source needs translation.
+        Falls back to ``control._def.NIDAQ_FRAME_SIGNAL_TERMINAL`` when the
+        endpoint is missing.
+        """
+        try:
+            mc = self.microscope.config_repo.get_machine_config()
+            io_config = mc.collect_io_endpoints()
+            ep = io_config.get("main_camera.frame_readout")
+            if ep is not None and ep.channel_id:
+                device = getattr(nidaq, "device_name", None) or "Dev1"
+                cid = ep.channel_id.strip()
+                # Translate "port0/lineN" -> "PFIN" for the trigger-source path.
+                if cid.startswith("port0/line"):
+                    try:
+                        n = int(cid.rsplit("line", 1)[-1])
+                        return f"/{device}/PFI{n}"
+                    except ValueError:
+                        pass
+                # Already a PFI/PXI/internal terminal — use as-is.
+                return f"/{device}/{cid}"
+            self._log.debug(
+                "main_camera.frame_readout not declared in machine config; "
+                "using NIDAQ_FRAME_SIGNAL_TERMINAL fallback %s",
+                control._def.NIDAQ_FRAME_SIGNAL_TERMINAL,
+            )
+        except Exception:
+            self._log.exception(
+                "Failed to resolve camera frame signal terminal; using fallback"
+            )
+        return control._def.NIDAQ_FRAME_SIGNAL_TERMINAL
+
+    def _arm_nidaq_pulse_for_capture(self, config: ObservationState) -> Optional[Callable[[], None]]:
+        """Arm an NIDAQ one-shot pulse waveform for a waveform-driven capture.
+
+        Builds the per-frame ``WaveformData`` from the observation state's
+        timed illuminators, configures the NIDAQ for an EXTERNAL start
+        trigger latched on the camera's exposure-active line, and arms the
+        task. Returns a cleanup closure that callers must invoke after the
+        camera frame has been read; the closure waits for the waveform to
+        finish, releases the tasks, restores any prior live-output state,
+        and rewrites the NIDAQ timing/trigger config back to whatever the
+        previous user (fast acquisition, DAQ-only widget, etc.) had set.
+        Returns ``None`` (and logs a warning) when the NIDAQ is not
+        configured on this rig — the surrounding controller validation
+        should prevent this from happening in practice.
+        """
+        nidaq = getattr(self.microscope.addons, "nidaq", None)
+        if nidaq is None:
+            self._log.warning(
+                "Waveform-driven observation state '%s' selected but no NIDAQ is configured; "
+                "falling back to standard capture (illumination will stay on for the full exposure)",
+                config.name,
+            )
+            return None
+
+        ic = self.microscope.illumination_controller
+        sample_rate_hz = float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ)
+        try:
+            waveform = build_pulse_waveform_for_state(
+                config, ic, sample_rate_hz=sample_rate_hz,
+            )
+            do_lines = nidaq_lines_for_state(config, ic)
+        except ValueError:
+            self._log.exception("Failed to build NIDAQ pulse waveform for state '%s'", config.name)
+            raise
+
+        terminal = self._resolve_camera_frame_signal_terminal(nidaq)
+        # The NIDAQ instance is shared with the fast-acquisition widget and the
+        # DAQ-only acquisition controller — both write sample_rate_hz /
+        # samples_per_channel / trigger_source / external_trigger_terminal
+        # directly. Snapshot those values now so we can put them back when our
+        # one-shot waveform is done.
+        prev_sample_rate_hz = float(getattr(nidaq, "sample_rate_hz", sample_rate_hz))
+        prev_samples_per_channel = int(getattr(nidaq, "samples_per_channel", 0))
+        prev_trigger_source = getattr(nidaq, "trigger_source", TriggerSource.SOFTWARE)
+        prev_external_terminal = getattr(nidaq, "external_trigger_terminal", terminal)
+
+        # Pick our own task length to match the per-frame waveform — never
+        # inherit whatever the previous run left behind.
+        per_frame_samples = next(iter(waveform.digital_output.values())).size
+
+        with self._timing.get_timer("nidaq_waveform_arm"):
+            try:
+                nidaq.sample_rate_hz = sample_rate_hz
+                nidaq.samples_per_channel = per_frame_samples
+                nidaq.trigger_source = TriggerSource.EXTERNAL
+                nidaq.external_trigger_terminal = terminal
+                nidaq.configure_task_io(
+                    ao_channels=[],
+                    do_lines=do_lines,
+                    di_lines=[],
+                    ai_channels=[],
+                )
+                nidaq.prepare_for_acquisition()
+                nidaq.set_waveforms(waveform)
+                nidaq.arm()
+                nidaq.start_trigger()
+            except Exception:
+                # Best-effort cleanup if any step in the arm sequence failed.
+                try:
+                    nidaq.release_tasks()
+                except Exception:
+                    pass
+                try:
+                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
+                    if callable(restore_fn):
+                        restore_fn()
+                except Exception:
+                    pass
+                # Put the NIDAQ timing/trigger config back to whatever it was.
+                try:
+                    nidaq.sample_rate_hz = prev_sample_rate_hz
+                    if prev_samples_per_channel:
+                        nidaq.samples_per_channel = prev_samples_per_channel
+                    nidaq.trigger_source = prev_trigger_source
+                    nidaq.external_trigger_terminal = prev_external_terminal
+                except Exception:
+                    pass
+                raise
+
+        exposure_s = float(config.exposure_time) / 1000.0
+        # Just enough to cover exposure + camera readout + DMA dispatch. A long
+        # wait here only delays surfacing a wiring problem (e.g. the configured
+        # NIDAQ_FRAME_SIGNAL_TERMINAL doesn't match where the camera signal is
+        # actually wired) and stretches every FOV needlessly.
+        timeout_s = max(exposure_s + 0.2, 0.3)
+
+        def _cleanup() -> None:
+            with self._timing.get_timer("nidaq_waveform_done"):
+                wait_failed = False
+                try:
+                    nidaq.wait_until_done(timeout_s=timeout_s)
+                except Exception as e:
+                    wait_failed = True
+                    if not getattr(self, "_nidaq_pulse_failure_logged", False):
+                        self._log.error(
+                            "NIDAQ pulse waveform did not fire for state '%s' within %.2fs. "
+                            "Check that NIDAQ_FRAME_SIGNAL_TERMINAL (%s) is wired to the "
+                            "camera's exposure-active / frame-signal output on this rig. "
+                            "Aborting acquisition to avoid producing dark frames on every FOV.",
+                            config.name,
+                            timeout_s,
+                            terminal,
+                        )
+                        self._log.debug("NIDAQ wait_until_done error detail: %s", e)
+                        self._nidaq_pulse_failure_logged = True
+                try:
+                    nidaq.release_tasks()
+                except Exception as e:
+                    self._log.warning("NIDAQ release_tasks failed for '%s': %s", config.name, e)
+                try:
+                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
+                    if callable(restore_fn):
+                        restore_fn()
+                except Exception as e:
+                    self._log.warning("NIDAQ restore_after_acquisition failed for '%s': %s", config.name, e)
+                # Restore the timing/trigger config snapshot so the next user
+                # (fast acquisition widget, DAQ-only acquisition) sees the
+                # NIDAQ in the same shape it was before the multipoint run.
+                try:
+                    nidaq.sample_rate_hz = prev_sample_rate_hz
+                    if prev_samples_per_channel:
+                        nidaq.samples_per_channel = prev_samples_per_channel
+                    nidaq.trigger_source = prev_trigger_source
+                    nidaq.external_trigger_terminal = prev_external_terminal
+                except Exception as e:
+                    self._log.warning("NIDAQ config restore failed for '%s': %s", config.name, e)
+                if wait_failed:
+                    # One failure is enough — abort so the user can fix the
+                    # wiring rather than watching every subsequent FOV time out.
+                    try:
+                        self.request_abort_fn()
+                    except Exception:
+                        pass
+
+        return _cleanup
+
     def run(self):
         this_image_callback_id = None
         self._last_illumination_config_name = None
@@ -1206,7 +1421,7 @@ class MultiPointWorker:
                     self._log.warning(f"Failed to send Slack error notification: {e}")
             return False
         else:
-            self._log.debug(f"Got result for job {job_result.job_id}, it completed!")
+            # self._log.debug(f"Got result for job {job_result.job_id}, it completed!")
             # Handle DownsampledViewResult - update plate view
             if isinstance(job_result.result, DownsampledViewResult) and job_result.result.well_images:
                 self._handle_downsampled_view_result(job_result.result)
@@ -1729,11 +1944,16 @@ class MultiPointWorker:
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 
-                    if z_level == 0 and config_idx == 0:
+                    # Run AF on the first ACTIVE channel for this region. Using
+                    # the global ``config_idx`` here misses the AF window
+                    # entirely whenever the per-point channel selection skips
+                    # the global preset 0 — ``active_step`` is the
+                    # per-active-channel counter that survives that subset.
+                    if z_level == 0 and active_step == 0:
                         with self._timing.get_timer("perform_autofocus"):
                             if not self.perform_autofocus(region_id, fov):
                                 self._log.error(
-                                    f"Autofocus failed in acquire_at_position.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+                                    f"Autofocus failed at region={region_id} fov={fov}.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
                                 )
 
                         # laser af characterization mode
@@ -2160,7 +2380,7 @@ class MultiPointWorker:
             saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
             iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
             self._log.error(
-                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed at region={region_id} fov={fov} !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
                 exc_info=e,
             )
 
@@ -2383,8 +2603,12 @@ class MultiPointWorker:
         # trigger acquisition (including turning on the illumination) and read frame
         camera_illumination_time = self.camera.get_exposure_time()
         using_preset_obs_state = self._use_observation_presets
+        is_waveform_driven = bool(getattr(config, "is_waveform_driven", False))
         with self._timing.get_timer("illuminate_for_capture"):
-            if using_preset_obs_state:
+            if is_waveform_driven:
+                # DC intensities ON, digital gating left to the NIDAQ pulse.
+                self._apply_illumination_for_waveform_capture(config)
+            elif using_preset_obs_state:
                 self._apply_current_illumination_state_to_hardware()
             else:
                 self.liveController.obs_controller.turn_on_illumination()
@@ -2489,33 +2713,54 @@ class MultiPointWorker:
             # a no-op since the wait already cleared the flag.
             self._wait_for_move_settled()
 
-            with self._timing.get_timer("send_trigger"):
-                self.camera.send_trigger(illumination_time=camera_illumination_time)
-            self._capture_ts["post_trigger"] = time.perf_counter()
+            # Arm the per-frame NIDAQ pulse waveform before firing the camera so
+            # the task is already waiting for the camera's exposure-active edge
+            # by the time send_trigger returns.
+            nidaq_pulse_cleanup = (
+                self._arm_nidaq_pulse_for_capture(config) if is_waveform_driven else None
+            )
 
-        with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
-            if self.liveController.trigger_mode == TriggerMode.HARDWARE:
-                # Per-capture, so keep at debug to avoid log-format overhead on the hot path.
-                self._log.debug("Waiting %.3f [s] for exposure to complete", self.camera.get_total_frame_time() / 1e3)
-                exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
-                # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
-                # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
-                self._sleep(max(0.0, exposure_done_time - time.time()))
-            else:
-                # In SW trigger mode (or anything not HARDWARE mode), there's indeterminism in the trigger timing.
-                # To overcome this, just wait until the frame for this capture actually comes into the image
-                # callback.  That way we know we have it.  This also helps by making sure the illumination for this
-                # frame is on from before the trigger until after we get the frame (which guarantees it will be on
-                # for the full exposure).
-                #
-                # If we wait for longer than 5x the exposure + 2 seconds, abort the acquisition because something is
-                # wrong.
-                non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
-                if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                    self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
-                    self.request_abort_fn()
-                    # Let this fall through so we still turn off illumination.  Let the caller actually break out
-                    # of the acquisition.
+            try:
+                with self._timing.get_timer("send_trigger"):
+                    self.camera.send_trigger(illumination_time=camera_illumination_time)
+                self._capture_ts["post_trigger"] = time.perf_counter()
+            except Exception:
+                if nidaq_pulse_cleanup is not None:
+                    try:
+                        nidaq_pulse_cleanup()
+                    except Exception:
+                        self._log.exception("NIDAQ cleanup failed after send_trigger error")
+                raise
+        else:
+            nidaq_pulse_cleanup = None
+
+        try:
+            with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
+                if self.liveController.trigger_mode == TriggerMode.HARDWARE:
+                    # Per-capture, so keep at debug to avoid log-format overhead on the hot path.
+                    self._log.debug("Waiting %.3f [s] for exposure to complete", self.camera.get_total_frame_time() / 1e3)
+                    exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
+                    # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
+                    # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
+                    self._sleep(max(0.0, exposure_done_time - time.time()))
+                else:
+                    # In SW trigger mode (or anything not HARDWARE mode), there's indeterminism in the trigger timing.
+                    # To overcome this, just wait until the frame for this capture actually comes into the image
+                    # callback.  That way we know we have it.  This also helps by making sure the illumination for this
+                    # frame is on from before the trigger until after we get the frame (which guarantees it will be on
+                    # for the full exposure).
+                    #
+                    # If we wait for longer than 5x the exposure + 2 seconds, abort the acquisition because something is
+                    # wrong.
+                    non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
+                    if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
+                        self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                        self.request_abort_fn()
+                        # Let this fall through so we still turn off illumination.  Let the caller actually break out
+                        # of the acquisition.
+        finally:
+            if nidaq_pulse_cleanup is not None:
+                nidaq_pulse_cleanup()
         # Break the wait window into sub-intervals so we can see where the
         # ~140 ms/capture goes. Camera-side stamps come from
         # camera._last_capture_ts (populated by _on_sdk_trigger_frame or

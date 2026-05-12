@@ -16,3 +16,4 @@ from .observation_state_dialogs import (
     run_load_observation_state,
     run_save_observation_state_dialog,
 )
+from .pulse_timing_dialog import PulseTimingDialog
