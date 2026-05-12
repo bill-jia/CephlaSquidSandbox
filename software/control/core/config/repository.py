@@ -59,6 +59,7 @@ from control.models.hardware_bindings import (
 )
 from control.models.acquisition_metadata import AcquisitionMetadata
 from control.models.observation_state import ObservationState
+from control.models.gui_state import GuiState
 from control.models.observation_state import CameraLiveSnapshot
 from control.models import ConfocalSettings
 
@@ -839,7 +840,14 @@ class ConfigRepository:
         return True
 
     def get_last_active_channel_name(self) -> Optional[str]:
-        """Read the channel name that was active when the app last shut down."""
+        """Read the channel name that was active when the app last shut down.
+
+        Sourced from ``gui_state.yaml`` (preferred) with a fallback to the
+        legacy ``last_active_channel.txt`` sidecar.
+        """
+        gui_state = self.get_gui_state()
+        if gui_state and gui_state.last_active_observation_state_name:
+            return gui_state.last_active_observation_state_name
         try:
             path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
             if path.exists():
@@ -848,6 +856,35 @@ class ConfigRepository:
         except Exception:
             pass
         return None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GUI STATE (per-profile)
+    # Transient UI selections (geometry, tabs, last objective/channel) that
+    # round-trip across application restarts.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_gui_state(self, profile: Optional[str] = None) -> Optional[GuiState]:
+        """Load the GUI state from gui_state.yaml (cached when using current profile)."""
+        if profile is None or profile == self._current_profile:
+            cache_key = "gui_state"
+            if cache_key not in self._profile_cache:
+                if self._current_profile is None:
+                    return None
+                path = self._get_profile_path() / "gui_state.yaml"
+                self._profile_cache[cache_key] = self._load_yaml(path, GuiState)
+            return self._profile_cache[cache_key]
+        path = self.user_profiles_path / profile / "gui_state.yaml"
+        return self._load_yaml(path, GuiState)
+
+    def save_gui_state(self, state: GuiState, profile: Optional[str] = None) -> None:
+        """Save GUI state to ``user_profiles/{profile}/gui_state.yaml``."""
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set; cannot save GUI state.")
+        path = self.user_profiles_path / profile / "gui_state.yaml"
+        self._save_yaml(path, state)
+        if profile == self._current_profile:
+            self._profile_cache["gui_state"] = state
 
     # ═══════════════════════════════════════════════════════════════════════════
     # LASER AF CONFIGS (per-profile)

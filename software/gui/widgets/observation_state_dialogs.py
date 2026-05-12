@@ -33,7 +33,7 @@ def run_save_observation_state_dialog(
         QMessageBox.warning(
             parent,
             "Observation State",
-            "Load a configuration profile before saving an Observation State preset.",
+            "Load a user profile before saving an Observation State preset.",
         )
         return False
     name, ok = QInputDialog.getText(parent, "Save Observation State", "Preset name:")
@@ -76,7 +76,7 @@ def run_load_observation_state(
         QMessageBox.warning(
             parent,
             "Observation State",
-            "Load a configuration profile before loading an Observation State preset.",
+            "Load a user profile before loading an Observation State preset.",
         )
         return False
     names = repo.list_observation_presets()

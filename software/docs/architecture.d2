@@ -96,7 +96,8 @@ gui: "GUI Layer (PyQt5)" {
     class: gui
     navigation: "NavigationWidget\nstage XYZ jogging"
     objectives: "ObjectivesWidget\nobjective selector"
-    profile: "ProfileWidget\nuser profile + objective"
+    profile: "ProfileWidget\nruntime user-profile switcher\n(opens from Settings menu)"
+    profile_startup: "ProfileSelectionDialog\npre-startup profile picker"
     piezo: "PiezoWidget\nfine Z control"
     emission_fw: "EmissionFilterWheelPanel"
     confocal: "SpinningDiskConfocalWidget\ndisk speed, dichroic, filters"
@@ -541,6 +542,19 @@ config: "Configuration (YAML)" {
     tooltip: "Saved ObservationState snapshots.\nUser can save/load presets\nfrom the GUI."
   }
 
+  gui_state_yaml: "{profile}/gui_state.yaml" {
+    class: storage
+    tooltip: |md
+      Per-profile transient UI state, persisted on shutdown:
+      - Window geometry / dock state
+      - Selected record tab index
+      - Last active objective + observation state name
+      - Snap saving directory + tag
+      - Live display FPS, autolevel, resolution scaling
+      Restored on the next launch.
+    |
+  }
+
   illum_yaml: "illumination_channel_config.yaml" {
     class: storage
     tooltip: "Hardware illumination definitions:\nchannel names, ports, wavelengths,\nfilter wheel associations."
@@ -576,6 +590,7 @@ config: "Configuration (YAML)" {
   config_repo -> general_yaml: reads/writes
   config_repo -> objective_yaml: reads/writes
   config_repo -> preset_yaml: reads/writes
+  config_repo -> gui_state_yaml: reads/writes
   config_repo -> illum_yaml: reads
   config_repo -> io_yaml: reads
   plate_image_gen -> sample_formats_yaml: reads
@@ -692,6 +707,7 @@ gui.viewers.plate_view -> config.plate_image_gen: "ensure_plate_image()" {
 # CONNECTIONS — Controllers ↔ Hardware
 # ============================================================================
 controllers.microscope -> config.config_repo: "loads config"
+gui.hardware_widgets.profile_startup -> config.config_repo: "lists/creates\nprofiles at startup"
 controllers.microscope -> io_layer.io_registry: "owns"
 controllers.live_ctrl -> controllers.stream_handler: "registers\ncallback"
 

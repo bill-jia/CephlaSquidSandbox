@@ -58,6 +58,7 @@ from control.models.acquisition_config import (
     validate_channel_group,
 )
 from control.models.laser_af_config import LaserAFConfig
+from control.models.gui_state import GuiState
 from control.models.io_endpoint_config import (
     IOControllerType,
     IOSignalType,
@@ -126,6 +127,8 @@ __all__ = [
     "validate_channel_group",
     # Laser AF
     "LaserAFConfig",
+    # GUI State
+    "GuiState",
     # IO Endpoints
     "IOControllerType",
     "IOSignalType",
