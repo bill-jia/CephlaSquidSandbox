@@ -110,12 +110,22 @@ if __name__ == "__main__":
     # This allows shutdown via ctrl+C even after the gui has popped up.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+    # Resolve which user profile to load before any hardware is initialized.
+    # --profile on the CLI wins; otherwise prompt the user with a dialog.
+    profile_name = args.profile
+    if profile_name is None:
+        from gui.widgets.profile_selection import prompt_for_profile
+        profile_name = prompt_for_profile()
+        if profile_name is None:
+            log.info("Profile selection cancelled — exiting")
+            sys.exit(0)
+
     # Build the microscope object from the global configuration. This will initialize all hardware components
     microscope = control.microscope.Microscope.build_from_global_config(
         args.simulation,
         skip_init=args.skip_init,
         skip_homing=args.skip_homing,
-        profile_name=args.profile,
+        profile_name=profile_name,
     )
 
     win = gui.HighContentScreeningGui(

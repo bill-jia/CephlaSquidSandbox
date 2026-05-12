@@ -96,7 +96,8 @@ gui: "GUI Layer (PyQt5)" {
     class: gui
     navigation: "NavigationWidget\nstage XYZ jogging"
     objectives: "ObjectivesWidget\nobjective selector"
-    profile: "ProfileWidget\nuser profile + objective"
+    profile: "ProfileWidget\nruntime profile switcher"
+    profile_startup: "ProfileSelectionDialog\npre-startup profile picker"
     piezo: "PiezoWidget\nfine Z control"
     emission_fw: "EmissionFilterWheelPanel"
     confocal: "SpinningDiskConfocalWidget\ndisk speed, dichroic, filters"
@@ -706,6 +707,7 @@ gui.viewers.plate_view -> config.plate_image_gen: "ensure_plate_image()" {
 # CONNECTIONS — Controllers ↔ Hardware
 # ============================================================================
 controllers.microscope -> config.config_repo: "loads config"
+gui.hardware_widgets.profile_startup -> config.config_repo: "lists/creates\nprofiles at startup"
 controllers.microscope -> io_layer.io_registry: "owns"
 controllers.live_ctrl -> controllers.stream_handler: "registers\ncallback"
 
