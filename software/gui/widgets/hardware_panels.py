@@ -1684,7 +1684,7 @@ class ProfileWidget(QFrame):
 
         # Layout
         layout = QHBoxLayout()
-        layout.addWidget(QLabel("Configuration Profile"))
+        layout.addWidget(QLabel("User Profile"))
         layout.addWidget(self.dropdown_profiles, 2)
         layout.addWidget(self.btn_newProfile)
 

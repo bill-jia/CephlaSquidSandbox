@@ -64,10 +64,13 @@ never empty on first run.
 
 ### Runtime switching
 
-At runtime, the **Configuration Profile** dropdown (`ProfileWidget`) lets the
-user switch profiles without restarting. *Save As* duplicates the current
-profile under a new name. Switching emits `signal_profile_changed`, which
-refreshes channel lists and the observation-state preset combo.
+At runtime, the **User Profile** switcher (`ProfileWidget`) lets the user
+change profiles without restarting. It lives behind the
+**Settings → Switch User Profile…** menu action — selecting it opens a small
+modal dialog with the profile dropdown and a *Save As* button to duplicate
+the current profile under a new name. Switching emits
+`signal_profile_changed`, which refreshes channel lists and the
+observation-state preset combo.
 
 ## What persists, where
 

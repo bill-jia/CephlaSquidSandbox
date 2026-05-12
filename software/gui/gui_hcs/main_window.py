@@ -307,6 +307,12 @@ class HighContentScreeningGui(QMainWindow):
             led_matrix_action.triggered.connect(self.openLedMatrixSettings)
             settings_menu.addAction(led_matrix_action)
 
+        # User Profile selector (modal switcher; same widget as the legacy inline panel)
+        user_profile_action = QAction("Switch User Profile...", self)
+        user_profile_action.setMenuRole(QAction.NoRole)
+        user_profile_action.triggered.connect(self.openUserProfileSwitcher)
+        settings_menu.addAction(user_profile_action)
+
         # Channel Configuration (user-facing acquisition channels)
         acq_channel_config_action = QAction("Channel Configuration...", self)
         acq_channel_config_action.setMenuRole(QAction.NoRole)
@@ -1049,7 +1055,8 @@ class HighContentScreeningGui(QMainWindow):
             simulated_io_banner.setAlignment(Qt.AlignCenter)
             layout.addWidget(simulated_io_banner)
 
-        layout.addWidget(self.profileWidget)
+        # The user-profile switcher is available from the Settings menu
+        # ("Switch User Profile..."); we don't display it inline anymore.
 
         # Top row: snaps/start live/autolevel on the left, camera+autofocus tabs on the right.
         top_row = QWidget()
@@ -1930,6 +1937,20 @@ class HighContentScreeningGui(QMainWindow):
         dialog = widgets.IlluminationChannelConfiguratorDialog(config_repo, self)
         dialog.signal_channels_updated.connect(self._refresh_channel_lists)
         dialog.exec_()
+
+    def openUserProfileSwitcher(self):
+        """Open a modal dialog wrapping the runtime ProfileWidget."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("User Profile")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(self.profileWidget)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec_()
+        # Re-parent the widget back so it survives for subsequent invocations.
+        self.profileWidget.setParent(self)
 
     def openObservationStateConfigEditor(self):
         """Open the acquisition channel configurator dialog for editing user profiles."""

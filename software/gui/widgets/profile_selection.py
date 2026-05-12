@@ -41,11 +41,22 @@ class ProfileSelectionDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(420)
         self.setMinimumHeight(360)
+        # Stay on top so the dialog isn't hidden behind the launching terminal
+        # at startup, when no main window exists yet.
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         self._setup_ui()
         self._populate_profiles()
         self._connect_signals()
         self._update_load_enabled()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Pull the dialog to the foreground and give it keyboard focus.
+        self.raise_()
+        self.activateWindow()
+        if self.list_profiles.currentItem() is not None:
+            self.list_profiles.setFocus(Qt.ActiveWindowFocusReason)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
