@@ -87,6 +87,401 @@ class SummarizeResult(NamedTuple):
     had_results: bool  # True if any results were pulled from queue
 
 
+# ----------------------------------------------------------------------------
+# Background upload drainer registry
+# ----------------------------------------------------------------------------
+#
+# An acquisition's UploadWorker is handed off to a background daemon thread
+# at shutdown so the controller can free up and the next acquisition can
+# start. Multiple drainers can be active concurrently (one per in-flight
+# acquisition). Holding strong references in a module-level list keeps the
+# daemon threads from getting GC'd before they finish their backlog.
+
+_active_upload_drainers: List["_BackgroundUploadDrainer"] = []
+_active_upload_drainers_lock = threading.Lock()
+
+
+def register_active_upload_drainer(drainer: "_BackgroundUploadDrainer") -> None:
+    """Add a drainer to the live registry, pruning completed ones first."""
+    with _active_upload_drainers_lock:
+        _active_upload_drainers[:] = [
+            d for d in _active_upload_drainers if not d.is_done()
+        ]
+        _active_upload_drainers.append(drainer)
+
+
+def active_upload_drainer_count() -> int:
+    """How many background upload drainers are still running."""
+    with _active_upload_drainers_lock:
+        _active_upload_drainers[:] = [
+            d for d in _active_upload_drainers if not d.is_done()
+        ]
+        return len(_active_upload_drainers)
+
+
+def active_upload_drainer_summary() -> List[dict]:
+    """Snapshot of each running drainer's experiment path + outstanding count.
+
+    Useful for the GUI to surface to the user before starting a new run
+    ("3 previous acquisitions are still uploading, X tasks total").
+    """
+    with _active_upload_drainers_lock:
+        _active_upload_drainers[:] = [
+            d for d in _active_upload_drainers if not d.is_done()
+        ]
+        return [d.snapshot() for d in _active_upload_drainers]
+
+
+class _BackgroundUploadDrainer:
+    """Owns one acquisition's UploadWorker after the MultiPointWorker has gone.
+
+    Created by ``MultiPointWorker._spawn_background_upload_drainer`` with a
+    snapshot of all state the drain needs. Runs a daemon thread that:
+      1. Submits the post-finalize metadata resync (uncontested clean read
+         of every FOV's zarr.json + frame_times, since the JobRunner
+         subprocess has exited and the writer has finalized).
+      2. Polls the UploadWorker's output queue; for each ``UploadResult``,
+         applies local deletion if ``delete_after_verify`` is on and the
+         containing timepoint has fully verified.
+      3. Stops when pending hits 0 or the wallclock timeout fires.
+      4. Sends ``shutdown()``, joins the worker subprocess, releases its
+         queue feeder threads so the host process can later exit cleanly.
+
+    The drainer is independent of MultiPointWorker — multiple drainers
+    (one per past acquisition) can be alive concurrently.
+    """
+
+    def __init__(
+        self,
+        *,
+        upload_worker,
+        upload_target,
+        tasks_by_tp: Dict[int, set],
+        results_by_tp: Dict[int, List],
+        expected_by_tp: Dict[int, int],
+        deletion_done: Set[int],
+        failed_tasks: List,
+        zarr_writer_info,
+        experiment_path: Optional[str],
+        metadata_paths_builder,
+        timeout_s: float,
+    ):
+        self._worker = upload_worker
+        self._target = upload_target
+        self._tasks_by_tp = tasks_by_tp
+        self._results_by_tp = results_by_tp
+        self._expected_by_tp = expected_by_tp
+        self._deletion_done = deletion_done
+        self._failed_tasks = failed_tasks
+        self._zarr_writer_info = zarr_writer_info
+        self._experiment_path = experiment_path
+        self._metadata_paths_for_fov = metadata_paths_builder
+        self._timeout_s = timeout_s
+        self._log = squid.logging.get_logger(self.__class__.__name__)
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"UploadDrain[{os.path.basename(experiment_path or 'unknown')}]",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def is_done(self) -> bool:
+        return self._done.is_set()
+
+    def snapshot(self) -> dict:
+        outstanding = sum(len(s) for s in self._tasks_by_tp.values())
+        return {
+            "experiment_path": self._experiment_path,
+            "outstanding": outstanding,
+            "alive": self._thread.is_alive(),
+        }
+
+    def _outstanding(self) -> int:
+        return sum(len(s) for s in self._tasks_by_tp.values())
+
+    def _drain_available_results(self) -> int:
+        """Pull every available UploadResult; apply per-timepoint deletion."""
+        if self._worker is None:
+            return 0
+        try:
+            from control.core.zarr_upload import drain_output_queue_nonblocking
+            results = drain_output_queue_nonblocking(self._worker.output_queue)
+        except (OSError, ValueError) as e:
+            self._log.debug(f"Upload result queue read failed: {e}")
+            return 0
+        for result in results:
+            tp = result.time_point
+            self._tasks_by_tp.get(tp, set()).discard(result.task_id)
+            self._results_by_tp.setdefault(tp, []).append(result)
+            if not result.success:
+                self._failed_tasks.append(result)
+                self._log.warning(
+                    f"Upload task {result.task_id} for t={tp} fov={result.fov} "
+                    f"failed: {result.error}"
+                )
+            self._maybe_batched_delete(tp)
+        return len(results)
+
+    def _maybe_batched_delete(self, time_point: int) -> None:
+        if time_point in self._deletion_done:
+            return
+        if self._target is None or not self._target.delete_after_verify:
+            return
+        expected = self._expected_by_tp.get(time_point)
+        if expected is None:
+            return
+        results = self._results_by_tp.get(time_point, [])
+        if len(results) < expected:
+            return
+        if any(not r.success for r in results):
+            return
+        deleted = 0
+        for result in results:
+            for local_path in result.deletable_uploaded_paths:
+                try:
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                        deleted += 1
+                except OSError as e:
+                    self._log.warning(
+                        f"Failed to delete {local_path} after verified upload: {e}"
+                    )
+        self._prune_empty_shard_dirs(time_point)
+        self._deletion_done.add(time_point)
+        self._log.info(
+            f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+            f"Reclaimed local disk: deleted {deleted} files "
+            f"for verified timepoint t={time_point}"
+        )
+
+    def _prune_empty_shard_dirs(self, time_point: int) -> None:
+        if self._zarr_writer_info is None:
+            return
+        for region_id, fov_count in self._zarr_writer_info.region_fov_counts.items():
+            for fov in range(fov_count):
+                group_dir = self._zarr_writer_info.get_group_path(region_id, fov)
+                if not os.path.isdir(group_dir):
+                    continue
+                for entry in os.listdir(group_dir):
+                    candidate = os.path.join(group_dir, entry, "c", str(time_point))
+                    if os.path.isdir(candidate):
+                        for root, dirs, files in os.walk(candidate, topdown=False):
+                            if not files and not dirs:
+                                try:
+                                    os.rmdir(root)
+                                except OSError:
+                                    break
+
+    # Files at the experiment-root that the upload pipeline produces or
+    # otherwise has no business shipping to the remote.
+    _EXPERIMENT_ROOT_SKIP_NAMES = frozenset({
+        "upload_manifest.jsonl",
+        "upload_manifest_backfill.jsonl",
+        "RAW_DATA_UPLOADED.txt",
+    })
+
+    def _enqueue_post_finalize_metadata_resync(self) -> None:
+        if self._zarr_writer_info is None or self._target is None or not self._target.enabled:
+            return
+        from uuid import uuid4
+        from control.core.zarr_upload import UploadTask, local_to_remote_path
+        info = self._zarr_writer_info
+        submitted = 0
+        for region_id, fov_count in info.region_fov_counts.items():
+            for fov in range(fov_count):
+                candidates = self._metadata_paths_for_fov(str(region_id), fov)
+                if not candidates:
+                    continue
+                files = [
+                    (
+                        local,
+                        local_to_remote_path(
+                            local, self._target.local_base, self._target.remote_root,
+                        ),
+                    )
+                    for local in candidates
+                ]
+                task = UploadTask(
+                    task_id=str(uuid4()),
+                    time_point=-1,  # sentinel
+                    region_id=str(region_id),
+                    fov=fov,
+                    files=files,
+                    deletable_local_paths=set(),
+                    stable_read_paths=set(candidates),
+                )
+                self._worker.submit(task)
+                self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+                self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+                submitted += 1
+        if submitted:
+            self._log.info(
+                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                f"Submitted {submitted} post-finalize metadata resync task(s)"
+            )
+
+        # Also push every experiment-root file (acquisition.yaml, run logs,
+        # config dumps, …) so the remote ends up with the full acquisition
+        # record, not just the zarr-internal metadata.
+        self._enqueue_experiment_root_resync()
+
+    def _enqueue_experiment_root_resync(self) -> None:
+        if (
+            self._target is None
+            or not self._target.enabled
+            or not self._experiment_path
+        ):
+            return
+        from uuid import uuid4
+        from control.core.zarr_upload import UploadTask, local_to_remote_path
+        try:
+            entries = sorted(os.listdir(self._experiment_path))
+        except OSError as e:
+            self._log.warning(
+                f"Could not list experiment root {self._experiment_path}: {e}"
+            )
+            return
+        root_files: List[str] = []
+        for name in entries:
+            if name in self._EXPERIMENT_ROOT_SKIP_NAMES:
+                continue
+            full = os.path.join(self._experiment_path, name)
+            if os.path.isfile(full):
+                root_files.append(full)
+        if not root_files:
+            return
+        files = [
+            (
+                local,
+                local_to_remote_path(
+                    local, self._target.local_base, self._target.remote_root,
+                ),
+            )
+            for local in root_files
+        ]
+        task = UploadTask(
+            task_id=str(uuid4()),
+            time_point=-1,
+            region_id="",
+            fov=-1,
+            files=files,
+            deletable_local_paths=set(),
+            stable_read_paths=set(root_files),
+        )
+        self._worker.submit(task)
+        self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+        self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+        self._log.info(
+            f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+            f"Submitted experiment-root resync ({len(root_files)} file(s))"
+        )
+
+    def _write_upload_complete_marker(self) -> None:
+        """Drop a ``RAW_DATA_UPLOADED.txt`` note in the experiment dir.
+
+        Only called when the drain finishes cleanly (nothing remaining, no
+        failed tasks) — the marker means "everything has been verified on
+        the remote and only shard data was reclaimed locally; the rest of
+        the directory is a valid OME-NGFF pointer."
+        """
+        if not self._experiment_path or self._target is None:
+            return
+        from datetime import datetime, timezone
+        marker = os.path.join(self._experiment_path, "RAW_DATA_UPLOADED.txt")
+        manifest = os.path.join(self._experiment_path, "upload_manifest.jsonl")
+        content = (
+            f"Raw zarr shard data for this acquisition has been uploaded to:\n"
+            f"    {self._target.remote_root}\n"
+            f"\n"
+            f"Local zarr metadata (zarr.json, frame_times) is preserved so this\n"
+            f"directory is still a valid OME-NGFF reader pointer. Only the\n"
+            f"per-timepoint shard data has been removed from local disk.\n"
+            f"\n"
+            f"Uploaded at: {datetime.now(timezone.utc).isoformat()}\n"
+            f"Upload manifest: {manifest}\n"
+        )
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(content)
+            self._log.info(
+                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                f"Wrote upload-complete marker: {marker}"
+            )
+        except OSError as e:
+            self._log.warning(
+                f"Could not write upload-complete marker {marker}: {e}"
+            )
+
+    def _run(self) -> None:
+        try:
+            self._enqueue_post_finalize_metadata_resync()
+            deadline = time.time() + self._timeout_s
+            last_log = 0.0
+            while time.time() < deadline:
+                outstanding = self._outstanding()
+                if outstanding == 0:
+                    break
+                now = time.time()
+                if now - last_log > 30.0:
+                    self._log.info(
+                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                        f"upload drainer: {outstanding} in flight "
+                        f"({int(deadline - now)}s remaining)"
+                    )
+                    last_log = now
+                self._drain_available_results()
+                time.sleep(0.5)
+            self._drain_available_results()
+            remaining = self._outstanding()
+            if remaining:
+                self._log.error(
+                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                    f"UploadWorker drain timed out with {remaining} upload(s) "
+                    f"outstanding. Run the standalone backfill script over "
+                    f"{self._experiment_path} to complete the upload."
+                )
+            if self._failed_tasks:
+                self._log.warning(
+                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                    f"{len(self._failed_tasks)} upload task(s) failed during this run; "
+                    f"local files for the affected timepoints have NOT been deleted."
+                )
+            # Marker only on a fully-clean drain: every task accounted for
+            # AND no task reported failure. If a subsequent backfill run
+            # closes the gap, that run will drop the marker instead.
+            if remaining == 0 and not self._failed_tasks:
+                self._write_upload_complete_marker()
+            try:
+                self._worker.shutdown()
+                self._worker.join(timeout=10.0)
+                if self._worker.is_alive():
+                    self._log.warning(
+                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                        f"UploadWorker did not exit within 10s; terminating"
+                    )
+                    self._worker.terminate()
+                    self._worker.join(timeout=5.0)
+                try:
+                    self._worker.release_queue_resources()
+                except Exception as e:
+                    self._log.debug(f"release_queue_resources: {e}")
+                try:
+                    self._worker.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                self._log.error(f"Error shutting down UploadWorker: {e}")
+        finally:
+            self._done.set()
+            self._log.info(
+                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+                f"background upload drainer finished."
+            )
+
+
 class MultiPointWorker:
     def __init__(
         self,
@@ -888,6 +1283,17 @@ class MultiPointWorker:
                     nidaq.release_tasks()
                 except Exception as e:
                     self._log.warning("NIDAQ release_tasks failed for '%s': %s", config.name, e)
+                # Drive each timed DO line LOW before the live-output restore —
+                # see _run_nidaq_stimulus for the rationale. Same hazard here:
+                # a pulse that ends at the exposure boundary leaves the gate
+                # HIGH and the snapshot can't fix it for never-live lines.
+                try:
+                    nidaq.start_live_output(do_values={line: False for line in do_lines})
+                except Exception as e:
+                    self._log.warning(
+                        "Post-capture DO clear failed for '%s' on lines %s: %s",
+                        config.name, do_lines, e,
+                    )
                 try:
                     restore_fn = getattr(nidaq, "restore_after_acquisition", None)
                     if callable(restore_fn):
@@ -1015,6 +1421,21 @@ class MultiPointWorker:
                     nidaq.release_tasks()
                 except Exception as e:
                     self._log.warning("NIDAQ release_tasks failed for stimulus '%s': %s", config.name, e)
+                # Drive each timed DO line LOW before the live-output restore.
+                # A FINITE DAQmx output task holds its last written sample after
+                # release, so combs whose final pulse runs to the window boundary
+                # leave the gate HIGH. Lines that were never live (typical for
+                # stimulus channels) aren't in the prepare/restore snapshot, so
+                # restore_after_acquisition can't undo that — this explicit write
+                # does. start_live_output also seeds the persistent DO task so
+                # later operations see the line in a known state.
+                try:
+                    nidaq.start_live_output(do_values={line: False for line in do_lines})
+                except Exception as e:
+                    self._log.warning(
+                        "Post-stimulus DO clear failed for '%s' on lines %s: %s",
+                        config.name, do_lines, e,
+                    )
                 try:
                     restore_fn = getattr(nidaq, "restore_after_acquisition", None)
                     if callable(restore_fn):
@@ -1312,10 +1733,12 @@ class MultiPointWorker:
         # Final drain of all output queues (should be empty, but check anyway)
         self._summarize_runner_outputs(drain_all=True)
 
-        # Drain the upload worker. Acquisition is done so backpressure is
-        # released — the network can take as long as it needs. Use a long
-        # default; if the user aborted, we still respect the timeout.
-        self._drain_upload_worker_on_shutdown(timeout_s=30 * 60)
+        # Hand the UploadWorker drain off to a background daemon thread.
+        # The controller is free to start the next acquisition immediately;
+        # the previous run's uploads finish independently. Multiple drainers
+        # can run concurrently — see ``active_upload_drainer_count()`` for
+        # operator visibility.
+        self._spawn_background_upload_drainer(timeout_s=30 * 60)
 
         # Release backpressure resources now that all jobs are complete
         try:
@@ -1407,75 +1830,92 @@ class MultiPointWorker:
                 f"Submitted {submitted} post-finalize metadata resync task(s)"
             )
 
-    def _drain_upload_worker_on_shutdown(self, timeout_s: float) -> None:
-        """Wait for the UploadWorker to finish its backlog, then shut it down.
+    def _spawn_background_upload_drainer(self, timeout_s: float) -> None:
+        """Detach the UploadWorker drain to a background thread.
 
-        Polls the result queue until either every expected task has reported,
-        every alive timepoint has been resolved, or the timeout elapses. Any
-        timepoints that fully verified during the drain get their batched
-        deletion applied. A final logged summary captures what was left
-        behind so the operator can run the standalone backfill script over
-        the same experiment directory.
+        The thread takes over ownership of:
+          - the UploadWorker subprocess,
+          - the per-timepoint pending/result/expected tracking dicts,
+          - the local-deletion application and shard-dir pruning,
+          - the post-finalize metadata resync,
+          - the eventual ``shutdown()``+``join()``+``release_queue_resources()``
+            of the worker.
+
+        After this returns, ``MultiPointWorker`` may exit and a new
+        acquisition may start — each acquisition gets its own UploadWorker
+        and previously-spawned drainer threads continue independently.
         """
         if self._upload_worker is None:
             return
-        # Re-upload every FOV's metadata now that the JobRunner subprocess
-        # has shut down and finalize has run. This is the canonical
-        # uncontested read of zarr.json / frame_times — any racy intermediate
-        # uploads during the live run are corrected here.
-        self._enqueue_post_finalize_metadata_resync()
-        deadline = time.time() + timeout_s
-        last_log = 0.0
-        while time.time() < deadline:
-            # Count outstanding tasks (BarrierResults received but no UploadResult yet).
-            outstanding = sum(len(s) for s in self._upload_tasks_by_tp.values())
-            if outstanding == 0:
-                break
-            now = time.time()
-            if now - last_log > 5.0:
-                self._log.info(
-                    f"Waiting for UploadWorker: {outstanding} upload(s) still in flight "
-                    f"({int(deadline - now)}s remaining)"
-                )
-                last_log = now
-            self._drain_upload_results()
-            time.sleep(0.5)
-        # Final drain
-        self._drain_upload_results()
-        remaining = sum(len(s) for s in self._upload_tasks_by_tp.values())
-        if remaining:
-            self._log.error(
-                f"UploadWorker drain timed out with {remaining} upload(s) outstanding. "
-                f"Run the standalone backfill script over {self.experiment_path} to "
-                f"complete the upload, then prune local data."
-            )
-        if self._upload_failed_tasks:
-            self._log.warning(
-                f"{len(self._upload_failed_tasks)} upload task(s) failed during this run; "
-                f"local files for the affected timepoints have NOT been deleted."
-            )
-        # Send shutdown sentinel and join (best-effort; non-daemon process
-        # exits cleanly once it drains its own queue). After the worker is
-        # gone, release its queues' parent-side feeder threads so the host
-        # Python process doesn't hang at exit waiting on items that have
-        # nowhere to go.
-        try:
-            self._upload_worker.shutdown()
-            self._upload_worker.join(timeout=10.0)
-            if self._upload_worker.is_alive():
-                self._log.warning("UploadWorker did not exit within 10s; terminating")
-                self._upload_worker.terminate()
-                self._upload_worker.join(timeout=5.0)
-            try:
-                self._upload_worker.release_queue_resources()
-            except Exception as e:
-                self._log.debug(f"release_queue_resources: {e}")
-            try:
-                self._upload_worker.close()
-            except Exception:
-                pass
-        except Exception as e:
-            self._log.error(f"Error shutting down UploadWorker: {e}")
+
+        # Capture every piece of state the drainer needs into a fresh
+        # _BackgroundUploadDrainer so the daemon thread does not depend on
+        # MultiPointWorker still being alive.
+        drainer = _BackgroundUploadDrainer(
+            upload_worker=self._upload_worker,
+            upload_target=self._upload_target,
+            tasks_by_tp=self._upload_tasks_by_tp,
+            results_by_tp=self._upload_results_by_tp,
+            expected_by_tp=self._upload_expected_count_by_tp,
+            deletion_done=self._upload_deletion_done,
+            failed_tasks=self._upload_failed_tasks,
+            zarr_writer_info=self._zarr_writer_info,
+            experiment_path=self.experiment_path,
+            metadata_paths_builder=self._collect_metadata_paths_for_fov,
+            timeout_s=timeout_s,
+        )
+        register_active_upload_drainer(drainer)
+        drainer.start()
+        active = active_upload_drainer_count()
+        self._log.info(
+            f"UploadWorker drain handed off to background thread "
+            f"(experiment={self.experiment_path}). "
+            f"{active} background drainer(s) now active; "
+            f"acquisition controller is free to start the next run."
+        )
+
+        # Detach the upload state from the MultiPointWorker so nothing
+        # else can accidentally mutate or shutdown the now-owned worker.
+        self._upload_worker = None
+        self._upload_target = None
+        self._upload_tasks_by_tp = {}
+        self._upload_results_by_tp = {}
+        self._upload_expected_count_by_tp = {}
+        self._upload_deletion_done = set()
+        self._upload_failed_tasks = []
+
+    def _collect_metadata_paths_for_fov(
+        self, region_id: str, fov: int
+    ) -> List[str]:
+        """Enumerate the same shared-metadata files
+        ``ZarrWriter.metadata_paths`` would return for one (region, fov).
+
+        Kept as a method so the background drainer can call it after the
+        JobRunner subprocess (and its in-memory writer instances) is gone.
+        """
+        if self._zarr_writer_info is None:
+            return []
+        group_dir = self._zarr_writer_info.get_group_path(region_id, fov)
+        if not os.path.isdir(group_dir):
+            return []
+        out: List[str] = []
+        gj = os.path.join(group_dir, "zarr.json")
+        if os.path.isfile(gj):
+            out.append(gj)
+        for entry in sorted(os.listdir(group_dir)):
+            if entry.isdigit():
+                lj = os.path.join(group_dir, entry, "zarr.json")
+                if os.path.isfile(lj):
+                    out.append(lj)
+        ft_dir = os.path.join(group_dir, "frame_times")
+        if os.path.isdir(ft_dir):
+            ftj = os.path.join(ft_dir, "zarr.json")
+            if os.path.isfile(ftj):
+                out.append(ftj)
+            ft_chunk = os.path.join(ft_dir, "c", "0", "0", "0")
+            if os.path.isfile(ft_chunk):
+                out.append(ft_chunk)
+        return out
 
     def wait_till_operation_is_completed(self):
         self.microcontroller.wait_till_operation_is_completed()
@@ -1598,6 +2038,18 @@ class MultiPointWorker:
                 utils.create_done_file(current_path)
             self._log.debug(f"Single time point took: {time.time() - start} [s]")
         finally:
+            # Backstop: drive every illuminator OFF before the inter-timepoint wait.
+            # Patterned-pulse stimulus channels don't go through the regular
+            # set_channel_state path, so _hardware_asserted never tracks them and
+            # turn_off_all_hardware_preserving_state skips them. That leaves the
+            # NIDAQ DO line in its post-pulse state, which can be HIGH when the
+            # last sample of the waveform happens to be HIGH (e.g. comb extending
+            # to the end of the window). Calling the device-level turn_off_all
+            # forces every channel OFF regardless of the cache.
+            try:
+                self.microscope.illumination_controller.turn_off_all()
+            except Exception:
+                self._log.exception("end-of-timepoint illumination backstop failed")
             self.microcontroller.enable_joystick(True)
 
     def _needs_per_timepoint_folder(self) -> bool:

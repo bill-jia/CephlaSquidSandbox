@@ -60,6 +60,7 @@ import queue
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
@@ -258,6 +259,75 @@ def detect_acquisition_complete(fov_groups: List[Path]) -> bool:
     if not fov_groups:
         return False
     return all(fov_acquisition_complete(fg) for fg in fov_groups)
+
+
+# Filenames at the experiment root that the upload pipeline itself produces
+# or that don't belong on the remote. Kept module-level so the live
+# pipeline and the script agree on the same skip list.
+_EXPERIMENT_ROOT_SKIP_NAMES = frozenset({
+    "upload_manifest.jsonl",
+    "upload_manifest_backfill.jsonl",
+    "RAW_DATA_UPLOADED.txt",
+})
+
+# Marker file written into the experiment dir after every shard + every
+# metadata file has been verified on the remote. Its presence advertises
+# that the local zarr metadata is now just a pointer to remotely-stored
+# raw data.
+_UPLOAD_COMPLETE_MARKER_NAME = "RAW_DATA_UPLOADED.txt"
+
+
+def gather_experiment_root_files(experiment_dir: Path) -> List[Path]:
+    """Top-level files in the experiment dir, e.g. ``acquisition.yaml``.
+
+    Includes things like the acquisition manifest, config dumps, run logs,
+    and anything else the GUI may have dropped at the experiment root.
+    Excludes:
+      - Subdirectories (the zarr/ and plate.ome.zarr/ subtrees have their
+        own per-FOV metadata handled by ``gather_metadata_files``).
+      - This pipeline's own bookkeeping files (manifests, marker).
+    """
+    out: List[Path] = []
+    if not experiment_dir.is_dir():
+        return out
+    for entry in sorted(experiment_dir.iterdir()):
+        if entry.is_file() and entry.name not in _EXPERIMENT_ROOT_SKIP_NAMES:
+            out.append(entry)
+    return out
+
+
+def write_upload_complete_marker(
+    experiment_dir: Path,
+    remote_root: str,
+    manifest_path: str,
+) -> None:
+    """Drop a ``RAW_DATA_UPLOADED.txt`` note into the experiment dir.
+
+    Called after a successful run where every shard + every metadata file
+    has been sha256-verified on the remote. The local zarr metadata stays
+    in place so the directory is still a navigable OME-NGFF tree, but the
+    bulk shard data lives on the remote — the marker tells future readers
+    where to look. The write is best-effort; failure is logged but does
+    not affect the upload's success.
+    """
+    marker = experiment_dir / _UPLOAD_COMPLETE_MARKER_NAME
+    content = (
+        f"Raw zarr shard data for this acquisition has been uploaded to:\n"
+        f"    {remote_root}\n"
+        f"\n"
+        f"Local zarr metadata (zarr.json, frame_times) is preserved so this\n"
+        f"directory is still a valid OME-NGFF reader pointer. Only the\n"
+        f"per-timepoint shard data has been removed from local disk.\n"
+        f"\n"
+        f"Uploaded at: {datetime.now(timezone.utc).isoformat()}\n"
+        f"Upload manifest: {manifest_path}\n"
+    )
+    try:
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"Wrote upload-complete marker: {marker}")
+    except OSError as e:
+        log.warning(f"Could not write upload-complete marker {marker}: {e}")
 
 
 def gather_metadata_files(fov_group: Path) -> List[Path]:
@@ -489,17 +559,28 @@ def run_backfill(
                      f"files={len(t.files)}")
         return 0
 
-    # Upload acquisition.yaml first (small, safe to upload immediately).
-    acq_yaml = experiment_dir / "acquisition.yaml"
-    if acq_yaml.is_file():
-        local = str(acq_yaml)
-        files = [(local, local_to_remote_path(local, target.local_base, target.remote_root))]
+    # Upload all experiment-root metadata first (acquisition.yaml + any
+    # other files dropped at the experiment root: logs, config dumps, …).
+    # Small, safe to upload immediately and lets the remote tree be a
+    # complete copy of the local acquisition record once shards land.
+    root_files = gather_experiment_root_files(experiment_dir)
+    if root_files:
+        root_pairs = []
+        root_stable = set()
+        for p in root_files:
+            local = str(p)
+            root_pairs.append(
+                (local, local_to_remote_path(local, target.local_base, target.remote_root))
+            )
+            root_stable.add(local)
         metadata_tasks.insert(0, UploadTask(
             task_id=str(uuid4()),
             time_point=-1,
             region_id="",
             fov=-1,
-            files=files,
+            files=root_pairs,
+            deletable_local_paths=set(),  # never delete experiment-root metadata
+            stable_read_paths=root_stable,
         ))
 
     manifest_path = str(experiment_dir / "upload_manifest_backfill.jsonl")
@@ -575,12 +656,22 @@ def run_backfill(
                         deleted_local += delete_verified_locals(result, log)
             except (KeyboardInterrupt, SystemExit):
                 log.warning("Second interrupt during drain; bringing worker down immediately.")
-        worker.shutdown()
-        worker.join(timeout=30.0)
-        if worker.is_alive():
-            log.warning("UploadWorker did not exit cleanly; terminating")
-            worker.terminate()
-            worker.join(timeout=5.0)
+        # Mirror the follow-mode logic: don't sit on a 30 s graceful join
+        # if the user already hit Ctrl-C with thousands of tasks queued.
+        if interrupted:
+            log.info("Force-terminating UploadWorker (interrupted exit).")
+            try:
+                worker.terminate()
+                worker.join(timeout=5.0)
+            except Exception as e:
+                log.warning(f"terminate/join during interrupted exit failed: {e}")
+        else:
+            worker.shutdown()
+            worker.join(timeout=30.0)
+            if worker.is_alive():
+                log.warning("UploadWorker did not exit cleanly; terminating")
+                worker.terminate()
+                worker.join(timeout=5.0)
         # Release feeder-thread resources so Python can exit (see comment in
         # ``UploadWorker.release_queue_resources``).
         worker.release_queue_resources()
@@ -590,12 +681,22 @@ def run_backfill(
             pass
 
         # Final size report so the operator sees the net effect of the run.
+        # Logs a running total every 5 s during the walk so the user can
+        # see forward progress; a further Ctrl-C aborts the walk cleanly.
+        log.info("Measuring final local archive size (Ctrl-C again to skip)...")
         try:
-            final_size = measure_local_size_bytes(experiment_dir)
+            final_size = measure_local_size_bytes(
+                experiment_dir,
+                progress_interval_s=5.0,
+                progress_logger=log,
+                progress_label="final size",
+            )
             log.info(
                 f"local archive at exit: {_format_bytes(final_size)} "
                 f"(net {_format_signed_bytes(final_size - initial_size)})"
             )
+        except KeyboardInterrupt:
+            log.info("Final size measurement aborted by Ctrl-C; exiting.")
         except Exception as e:
             log.debug(f"final size measurement failed: {e}")
 
@@ -604,22 +705,66 @@ def run_backfill(
         f"{failed_files} file(s) failed, {deleted_local} local file(s) deleted."
         + (" (INTERRUPTED)" if interrupted else "")
     )
+
+    # Drop the upload-complete marker only when the run finished cleanly:
+    # every task accounted for, no failures, no interrupt. A re-run that
+    # picks up where this one stopped will write the marker once *its*
+    # run is clean.
+    if (
+        not interrupted
+        and failed_files == 0
+        and received == expected_results
+    ):
+        write_upload_complete_marker(experiment_dir, remote_root, manifest_path)
+
     return failed_files
 
 
-def measure_local_size_bytes(path: Path) -> int:
+def measure_local_size_bytes(
+    path: Path,
+    *,
+    progress_interval_s: float = 0.0,
+    progress_logger=None,
+    progress_label: str = "measuring local archive",
+) -> int:
     """Best-effort recursive size of all files under ``path``.
 
     Missing files (e.g. just-deleted shards) are silently ignored — we
     only need a coarse number for the periodic "growing/shrinking" log.
+
+    When ``progress_interval_s > 0`` and ``progress_logger`` is provided,
+    a running total is logged every ``progress_interval_s`` seconds so the
+    operator can see the walk is making progress (this matters on multi-TB
+    trees where the os.walk legitimately takes many minutes). The check
+    runs once per visited directory rather than per file, so the timing
+    overhead is negligible even for millions of files.
     """
     total = 0
+    file_count = 0
+    last_log = time.time()
+    use_progress = progress_interval_s > 0 and progress_logger is not None
     for root, _dirs, files in os.walk(path):
         for fname in files:
             try:
                 total += os.path.getsize(os.path.join(root, fname))
+                file_count += 1
             except OSError:
                 pass
+        if use_progress:
+            now = time.time()
+            if now - last_log >= progress_interval_s:
+                # Trim the displayed dir to keep the log line short.
+                try:
+                    display_root = os.path.relpath(root, path)
+                    if len(display_root) > 60:
+                        display_root = "…" + display_root[-58:]
+                except ValueError:
+                    display_root = root
+                progress_logger.info(
+                    f"  {progress_label}: {_format_bytes(total)} so far "
+                    f"({file_count:,} files; in {display_root})"
+                )
+                last_log = now
     return total
 
 
@@ -914,7 +1059,9 @@ def run_backfill_follow(
                 if not final_pass_done:
                     # One final non-in-progress sweep: pick up the
                     # previously-skipped highest timepoint + final metadata
-                    # snapshot post-finalize.
+                    # snapshot post-finalize + every experiment-root file
+                    # (acquisition.yaml, logs, etc.) so the remote ends up
+                    # with a complete record of the acquisition.
                     log.info(
                         "Writer reports acquisition_complete; running final pass."
                     )
@@ -941,6 +1088,31 @@ def run_backfill_follow(
                             worker.submit(task)
                             pending_task_ids.add(task.task_id)
                             final_count += 1
+                    # Experiment-root metadata (one task with all files).
+                    root_files = gather_experiment_root_files(experiment_dir)
+                    if root_files:
+                        root_pairs = []
+                        root_stable = set()
+                        for p in root_files:
+                            local = str(p)
+                            root_pairs.append(
+                                (local, local_to_remote_path(
+                                    local, target.local_base, target.remote_root,
+                                ))
+                            )
+                            root_stable.add(local)
+                        root_task = UploadTask(
+                            task_id=str(uuid4()),
+                            time_point=-1,
+                            region_id="",
+                            fov=-1,
+                            files=root_pairs,
+                            deletable_local_paths=set(),
+                            stable_read_paths=root_stable,
+                        )
+                        worker.submit(root_task)
+                        pending_task_ids.add(root_task.task_id)
+                        final_count += 1
                     log.info(f"Final pass: submitted {final_count} task(s)")
                     final_pass_done = True
                     last_submission_time = time.time()
@@ -1025,16 +1197,35 @@ def run_backfill_follow(
                     )
         except (KeyboardInterrupt, SystemExit):
             log.warning("Second interrupt during drain; bringing worker down immediately.")
-        worker.shutdown()
-        worker.join(timeout=60.0)
-        if worker.is_alive():
-            log.warning("UploadWorker did not exit within 60s; terminating")
-            worker.terminate()
-            worker.join(timeout=5.0)
+            interrupted = True
+        # Worker shutdown strategy depends on why we're exiting:
+        #   * Clean exit: try graceful shutdown (worker drains its own
+        #     internal queue before exiting). Wait up to 60 s; if it's
+        #     still alive, terminate.
+        #   * Interrupted exit: skip the graceful path entirely. With
+        #     potentially tens of thousands of tasks already buffered in
+        #     the input queue, the worker physically cannot reach the
+        #     shutdown sentinel within any reasonable wait window. Send
+        #     terminate() right away and move on so the user actually
+        #     gets their prompt back.
+        if interrupted:
+            log.info("Force-terminating UploadWorker (interrupted exit).")
+            try:
+                worker.terminate()
+                worker.join(timeout=5.0)
+            except Exception as e:
+                log.warning(f"terminate/join during interrupted exit failed: {e}")
+        else:
+            worker.shutdown()
+            worker.join(timeout=60.0)
+            if worker.is_alive():
+                log.warning("UploadWorker did not exit within 60s; terminating")
+                worker.terminate()
+                worker.join(timeout=5.0)
         # Release feeder-thread resources so the Python interpreter can
-        # exit. Without this, abandoned items in the input queue (e.g.
-        # 22k tasks after a drain-budget abandonment) prevent the parent's
-        # feeder thread from joining and Python hangs at shutdown.
+        # exit. Without this, abandoned items in the input queue prevent
+        # the parent's feeder thread from joining and Python hangs at
+        # shutdown.
         worker.release_queue_resources()
         try:
             # Available on Python 3.7+. Releases process handle resources;
@@ -1044,13 +1235,26 @@ def run_backfill_follow(
             pass
 
         # Final size report so the operator sees the net effect of the run.
+        # On a multi-TB tree the os.walk can take many minutes; we log a
+        # running total every 5 s so the user sees forward progress. A
+        # KeyboardInterrupt (yet another Ctrl-C) cleanly aborts the walk
+        # and lets the script exit even if the user can't wait for the
+        # full tree.
+        log.info("Measuring final local archive size (Ctrl-C again to skip)...")
         try:
-            final_size = measure_local_size_bytes(experiment_dir)
+            final_size = measure_local_size_bytes(
+                experiment_dir,
+                progress_interval_s=5.0,
+                progress_logger=log,
+                progress_label="final size",
+            )
             net_delta = final_size - last_size_bytes
             log.info(
                 f"local archive at exit: {_format_bytes(final_size)} "
                 f"(net {_format_signed_bytes(net_delta)} since last sample)"
             )
+        except KeyboardInterrupt:
+            log.info("Final size measurement aborted by Ctrl-C; exiting.")
         except Exception as e:
             log.debug(f"final size measurement failed: {e}")
 
@@ -1058,7 +1262,19 @@ def run_backfill_follow(
         f"Follow mode done. {failed_files} file(s) failed, "
         f"{deleted_local} local file(s) deleted, "
         f"{len(pending_task_ids)} task(s) abandoned in flight."
+        + (" (INTERRUPTED)" if interrupted else "")
     )
+
+    # Drop the upload-complete marker only when follow mode reached the
+    # post-finalize final pass AND drained it without abandoning anything.
+    if (
+        not interrupted
+        and final_pass_done
+        and failed_files == 0
+        and not pending_task_ids
+    ):
+        write_upload_complete_marker(experiment_dir, remote_root, manifest_path)
+
     return failed_files
 
 

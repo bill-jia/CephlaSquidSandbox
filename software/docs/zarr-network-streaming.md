@@ -21,15 +21,32 @@ write data in shapes that are not safe to copy incrementally.
      deleted in batches at the end of every timepoint, once every shard for
      that timepoint has been sha256-verified on the remote.
 
-2. **UI entry point.** When `check_space_available_with_error_dialog` finds
-   that the planned acquisition exceeds local free space and ZARR_V3 is the
-   selected format, the disk-space dialog now offers an
-   *"Enable streaming and start"* button. Pick a remote path, confirm the
-   delete policy, and the acquisition continues with streaming on. The
-   selected path is cached at `cache/last_streaming_path.txt` so the next
-   run starts pre-filled.
+2. **UI entry point — inline.** In each multipoint widget (flexible + 
+   wellplate), an inline row appears immediately below the "Save format"
+   dropdown when `ZARR_V3` is the selected format:
 
-3. **Headless / scripted use.** Call
+   ```
+   [Save format: ZARR_V3 ▾]
+   [☐ Stream to network] [\\server\share\path________] [Browse...] [☑ Delete after verify]
+   ```
+
+   The row is auto-hidden for non-ZARR_V3 formats (and the enable flag is
+   forcibly cleared if you toggle away from ZARR_V3 with streaming on, so
+   the worker doesn't try to spawn an upload pipeline against a non-zarr
+   writer). All four child widgets stay disabled until the "Stream to
+   network" master checkbox is on. Edits propagate immediately to
+   `MultiPointController.set_zarr_upload_target(...)`, and the chosen path
+   is cached at `cache/last_streaming_path.txt` so the next session
+   pre-fills it.
+
+3. **UI entry point — disk-space fallback.** As a safety net, if you start
+   an acquisition that would exceed local free space without having
+   enabled streaming in the inline row,
+   `check_space_available_with_error_dialog` opens a modal that lets you
+   enable streaming on the spot (write-probe + path validation) instead of
+   failing. Same `cache/last_streaming_path.txt` pre-fill.
+
+4. **Headless / scripted use.** Call
    `MultiPointController.set_zarr_upload_target(enabled=True,
    remote_root="...", delete_after_verify=True)` before `run_acquisition()`.
    The values are snapshotted into `AcquisitionParameters` by
@@ -237,6 +254,66 @@ FOV with a mismatched layout (e.g. someone pointed it at the wrong
 directory) still triggers the same abort. The live upload pipeline is
 not affected by this — it is tightly coupled to the current writer and
 cannot run against older outputs by construction.
+
+## End-of-acquisition cleanup
+
+Both the live pipeline (via `_BackgroundUploadDrainer`) and the standalone
+backfill script perform these steps once every shard + every metadata
+file has been verified on the remote:
+
+1. **Empty per-timepoint shard directories are pruned.** `c/<t>/0/0/0/`,
+   `c/<t>/0/0/`, … `c/<t>/` are removed bottom-up after each timepoint's
+   `delete_after_verify` pass. The parent `c/`, the level `<n>/`
+   (containing `zarr.json`), the FOV group dir, and the `frame_times/`
+   subtree all stay so the directory remains a valid OME-NGFF reader.
+2. **Experiment-root metadata is mirrored too.** All files at the root of
+   the experiment dir — `acquisition.yaml`, run logs, config dumps, the
+   downsampled plate views, etc. — are pushed to the remote as one
+   additional `UploadTask` during the final / post-finalize pass. The
+   set excludes `upload_manifest.jsonl`, `upload_manifest_backfill.jsonl`,
+   and `RAW_DATA_UPLOADED.txt` since those are upload-pipeline outputs.
+3. **A `RAW_DATA_UPLOADED.txt` marker** is dropped into the local
+   experiment dir when *and only when* the run finished with zero failed
+   tasks and zero abandoned tasks. The marker carries the remote root URL,
+   an ISO-8601 UTC timestamp, and a pointer to the manifest, and explains
+   that local zarr metadata has been preserved so the directory is still
+   a valid OME-NGFF reader pointer.
+
+A re-run that picks up where an earlier (incomplete) run stopped will
+write the marker once *its* run is clean. The marker is overwritten
+atomically each time, so accidental partial-success markers are
+self-correcting.
+
+## Concurrency across acquisitions
+
+Each acquisition gets its **own** UploadWorker subprocess. When the
+acquisition finishes (or the user aborts it), the worker's drain is
+handed off to a daemon thread (`_BackgroundUploadDrainer` in
+`multi_point_worker.py`) and the acquisition controller is freed
+immediately — the user can start a new run without waiting for the
+previous one's uploads to finish. Several drainers can be active
+concurrently, one per past-but-not-yet-finished acquisition. The module
+exposes `active_upload_drainer_count()` and
+`active_upload_drainer_summary()` for the UI to surface "N previous
+acquisitions still uploading" if desired.
+
+Each acquisition writes to a unique `experiment_path`, so concurrent
+drainers' local files, remote paths, and manifests don't collide.
+Bandwidth contention on a shared SMB share is the only real overlap;
+that's an accepted cost of the concurrent design.
+
+### Lost-task bug fix
+
+Until the fix in `JobRunner.run()` that calls `close()` + `join_thread()`
+on the upload queue before the subprocess exits, items that
+`FlushAndStageUploadJob.run()` had `put()` onto the upload queue could
+be silently lost when the JobRunner subprocess died: the per-process
+feeder thread holding buffered items is killed without flushing.
+Symptom was `pending_task_ids` stuck at a non-zero count after abort,
+because the matching BarrierResults had already been processed in the
+main process but the UploadWorker never received the actual tasks. The
+explicit feeder flush before subprocess exit is required for
+correctness.
 
 ## Caveats and current limitations
 

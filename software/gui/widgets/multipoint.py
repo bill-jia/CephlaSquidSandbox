@@ -5,6 +5,8 @@ from .common import (
     error_dialog,
     get_last_used_saving_path,
     save_last_used_saving_path,
+    _load_last_remote_streaming_path,
+    _save_last_remote_streaming_path,
 )
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
@@ -88,6 +90,107 @@ def _has_checked_items(list_widget: QListWidget) -> bool:
     return False
 
 
+def _list_widget_item_names_in_order(list_widget: QListWidget) -> list:
+    """Return the text of every item in display order (checked and unchecked)."""
+    return [list_widget.item(i).text() for i in range(list_widget.count())]
+
+
+def _reorder_list_widget(list_widget: QListWidget, ordered_names: list) -> None:
+    """Reorder list_widget items so they appear in ``ordered_names`` order.
+
+    Items whose text isn't in ``ordered_names`` keep their relative order and
+    follow the named items. No-op if the requested order matches the current
+    order. Signals are blocked during the rebuild so the wholesale take/insert
+    doesn't masquerade as user-driven check changes.
+    """
+    n = list_widget.count()
+    if n == 0:
+        return
+    current = [list_widget.item(i) for i in range(n)]
+    by_text = {item.text(): item for item in current}
+    new_seq = [by_text[name] for name in ordered_names if name in by_text]
+    seen = set(id(item) for item in new_seq)
+    new_seq.extend(item for item in current if id(item) not in seen)
+    if new_seq == current:
+        return
+    list_widget.blockSignals(True)
+    try:
+        # Take from the back so indices stay valid as we pop.
+        for _ in range(n):
+            list_widget.takeItem(0)
+        for item in new_seq:
+            list_widget.addItem(item)
+    finally:
+        list_widget.blockSignals(False)
+
+
+class _ObservationStateListWidget(QListWidget):
+    """Checkbox list with internal drag/drop and "float checked to top".
+
+    - Items are checkbox rows (created by :func:`_create_checkbox_list_item`).
+    - Users can drag any row to reorder. The post-drag order is preserved.
+    - On a check-state change, the changed item moves to the boundary between
+      the checked block (top) and the unchecked block (bottom): checking
+      floats the row to the *end* of the checked block; unchecking sinks the
+      row to the *start* of the unchecked block. Relative order within each
+      block is otherwise preserved, so the list reads as "selected on top,
+      not-selected below, both in the user's last-chosen order."
+    """
+
+    order_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._reordering = False
+        self.itemChanged.connect(self._on_item_changed)
+
+    def _on_item_changed(self, item):
+        if self._reordering:
+            return
+        self._reordering = True
+        try:
+            self._float_changed_item_to_partition_boundary(item)
+        finally:
+            self._reordering = False
+        self.order_changed.emit()
+
+    def _float_changed_item_to_partition_boundary(self, item):
+        """Move ``item`` to the boundary between checked and unchecked blocks.
+
+        Assumes the rest of the list is already partitioned (the invariant
+        this method preserves). When the user drags an item across the
+        boundary, the partition can temporarily break — that's tolerated, and
+        the next check change snaps it back.
+        """
+        current_row = self.row(item)
+        # Boundary = number of checked items in the whole list excluding our
+        # item, which we treat as already "removed" from its current slot for
+        # placement purposes.
+        checked_elsewhere = sum(
+            1
+            for i in range(self.count())
+            if i != current_row and self.item(i).checkState() == Qt.Checked
+        )
+        if item.checkState() == Qt.Checked:
+            target_row = checked_elsewhere  # end of the checked block (after taking item out)
+        else:
+            target_row = checked_elsewhere  # start of the unchecked block
+        if target_row == current_row:
+            return
+        taken = self.takeItem(current_row)
+        self.insertItem(target_row, taken)
+        # takeItem clears the selection; restoring it keeps the keyboard focus
+        # row consistent so the user can keep checking nearby items.
+        self.setCurrentItem(taken)
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.order_changed.emit()
+
+
 _FILE_SAVING_FORMAT_TOOLTIPS = {
     "INDIVIDUAL_IMAGES": "One TIFF (or PNG/BMP) per (region, FOV, Z, channel).",
     "MULTI_PAGE_TIFF": "One multi-page TIFF per FOV, pages = (Z × channel × time).",
@@ -133,6 +236,125 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     row.addWidget(combo)
     row.addStretch(1)
     return row, combo
+
+
+def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict]":
+    """Build an inline ``Stream to network`` row for ZARR_V3 acquisitions.
+
+    The row contains:
+      - Enable checkbox (master switch)
+      - Path text field (UNC ``\\\\server\\share\\dir`` on Windows or
+        ``/Volumes/share/dir`` POSIX after mount) + Browse button
+      - "Delete after verify" checkbox (default on)
+
+    All four child widgets stay disabled until the enable checkbox is on.
+    Edits push immediately to ``MultiPointController.set_zarr_upload_target``
+    so the values flow through ``AcquisitionParameters`` to the worker. The
+    last-used path is cached at ``cache/last_streaming_path.txt`` (shared
+    with the fallback disk-space dialog).
+
+    Caller should:
+      1. Place the returned layout next to ``fileSavingFormatRow``.
+      2. Toggle the row's visibility based on the file-format combobox
+         (only meaningful for ``ZARR_V3``).
+    """
+    enable_cb = QCheckBox("Stream to network")
+    enable_cb.setToolTip(
+        "Stream ZARR_V3 output to a mounted network share as the acquisition "
+        "runs. Each timepoint is sha256-verified on the remote before local "
+        "files are deleted. See Settings > Preferences for related tuning."
+    )
+
+    path_edit = QLineEdit()
+    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions")
+    last_path = _load_last_remote_streaming_path()
+    if last_path:
+        path_edit.setText(last_path)
+    path_edit.setEnabled(False)
+
+    browse_btn = QPushButton("Browse...")
+    browse_btn.setEnabled(False)
+
+    delete_cb = QCheckBox("Delete after verify")
+    delete_cb.setChecked(True)
+    delete_cb.setEnabled(False)
+    delete_cb.setToolTip(
+        "After every shard of a timepoint is sha256-verified on the remote, "
+        "delete the local copies. Required to reclaim disk space during a "
+        "long acquisition; uncheck to keep local copies."
+    )
+
+    def _push_to_controller():
+        if multi_point_controller is None:
+            return
+        enabled = enable_cb.isChecked()
+        path = path_edit.text().strip()
+        # Only flag as enabled if the user gave us a path; otherwise the
+        # worker would try to spawn an UploadWorker with an empty target.
+        multi_point_controller.set_zarr_upload_target(
+            enabled=enabled and bool(path),
+            remote_root=path,
+            delete_after_verify=delete_cb.isChecked(),
+        )
+        if enabled and path:
+            _save_last_remote_streaming_path(path)
+
+    def _on_enable_toggled(checked):
+        path_edit.setEnabled(checked)
+        browse_btn.setEnabled(checked)
+        delete_cb.setEnabled(checked)
+        _push_to_controller()
+
+    def _on_browse():
+        chosen = QFileDialog.getExistingDirectory(None, "Select network folder")
+        if chosen:
+            path_edit.setText(chosen)
+            _push_to_controller()
+
+    enable_cb.toggled.connect(_on_enable_toggled)
+    browse_btn.clicked.connect(_on_browse)
+    path_edit.editingFinished.connect(_push_to_controller)
+    delete_cb.toggled.connect(_push_to_controller)
+
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addWidget(enable_cb)
+    row.addWidget(path_edit, 1)
+    row.addWidget(browse_btn)
+    row.addWidget(delete_cb)
+
+    widgets = {
+        "enable_cb": enable_cb,
+        "path_edit": path_edit,
+        "browse_btn": browse_btn,
+        "delete_cb": delete_cb,
+        "_push": _push_to_controller,
+    }
+    return row, widgets
+
+
+def _bind_streaming_row_visibility(combo_format: "QComboBox", widgets: dict) -> None:
+    """Show the streaming widgets only when ``ZARR_V3`` is selected."""
+    members = (
+        widgets["enable_cb"],
+        widgets["path_edit"],
+        widgets["browse_btn"],
+        widgets["delete_cb"],
+    )
+
+    def _on_change(name: str) -> None:
+        is_zarr = (name == "ZARR_V3")
+        for w in members:
+            w.setVisible(is_zarr)
+        if not is_zarr and widgets["enable_cb"].isChecked():
+            # User switched away from ZARR_V3 with streaming on. Clear the
+            # controller-side flag so the next start doesn't try to stream
+            # against a non-zarr writer.
+            widgets["enable_cb"].setChecked(False)
+            widgets["_push"]()
+
+    combo_format.currentTextChanged.connect(_on_change)
+    _on_change(combo_format.currentText())
 
 
 class _DragToggleTableWidget(QTableWidget):
@@ -207,17 +429,32 @@ class RegionObservationStateDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Per-Point Observation States")
         self._region_ids = list(region_ids)
-        self._obs_names = list(observation_state_names)
+        # Seed the column order from the first region's stored channel list (if it
+        # has a partial subset stored), keeping any channels the first region
+        # excluded at the end so the user can still toggle them on.
+        existing_map = existing_map or {}
+        default_order = list(observation_state_names)
+        first_order = existing_map.get(self._region_ids[0]) if self._region_ids else None
+        if first_order:
+            first_in_global = [n for n in first_order if n in default_order]
+            remaining = [n for n in default_order if n not in first_in_global]
+            self._obs_names = first_in_global + remaining
+        else:
+            self._obs_names = default_order
         self._result_map = None
 
         layout = QVBoxLayout(self)
 
         # Instructions
-        layout.addWidget(QLabel("Click and drag to toggle observation states per region:"))
+        layout.addWidget(QLabel(
+            "Click and drag to toggle observation states per region.\n"
+            "Drag column headers to reorder channels (applies to acquisition)."
+        ))
 
         # Matrix table
         self._table = _DragToggleTableWidget(len(self._region_ids), len(self._obs_names))
         self._table.setHorizontalHeaderLabels(self._obs_names)
+        self._table.horizontalHeader().setSectionsMovable(True)
 
         # Build row labels with coordinate info
         row_labels = []
@@ -230,7 +467,6 @@ class RegionObservationStateDialog(QDialog):
         self._table.setVerticalHeaderLabels(row_labels)
 
         # Populate cells with checkboxes
-        existing_map = existing_map or {}
         for row, rid in enumerate(self._region_ids):
             active_set = set(existing_map.get(rid, self._obs_names))
             for col, obs_name in enumerate(self._obs_names):
@@ -296,17 +532,33 @@ class RegionObservationStateDialog(QDialog):
 
     def get_result(self):
         """Return the mapping, or None if everything is checked (no subsetting)."""
+        ordered_cols = self._ordered_logical_columns()
+        ordered_names = [self._obs_names[c] for c in ordered_cols]
         mapping = {}
         all_checked = True
         for row, rid in enumerate(self._region_ids):
             active = []
-            for col, obs_name in enumerate(self._obs_names):
+            for col in ordered_cols:
+                obs_name = self._obs_names[col]
                 if self._table.item(row, col).checkState() == Qt.Checked:
                     active.append(obs_name)
                 else:
                     all_checked = False
             mapping[rid] = active
-        return None if all_checked else mapping
+        if all_checked:
+            return None
+        # Reinsert keys in region order so the caller iterates in the same order
+        # they were registered. Values follow the (possibly reordered) channel order.
+        return mapping
+
+    def _ordered_logical_columns(self):
+        """Logical column indices in the user's drag-reordered visual order."""
+        header = self._table.horizontalHeader()
+        return [header.logicalIndex(v) for v in range(header.count())]
+
+    def get_channel_order(self):
+        """Channel names in the user's (post-drag) visual order."""
+        return [self._obs_names[c] for c in self._ordered_logical_columns()]
 
 
 # Palette of visually distinct hues used to color-code channels (observation states)
@@ -523,11 +775,19 @@ class _ChannelChipButton(QPushButton):
     text shows the (truncated) channel name and the current state badge, and
     the background tint reflects the on/off/mixed state across the current
     well selection.
+
+    Supports drag-and-drop reordering: press-and-drag the chip onto another
+    chip to swap them; the parent dialog connects ``chip_dropped`` to rebuild
+    the toolbar in the new order.
     """
 
     STATE_OFF = 0
     STATE_ON = 1
     STATE_MIXED = 2
+
+    CHIP_MIME = "application/x-channel-chip-name"
+
+    chip_dropped = Signal(str, str)  # source channel name, target channel name
 
     def __init__(self, full_name, color_hex, parent=None):
         super().__init__(parent)
@@ -535,18 +795,62 @@ class _ChannelChipButton(QPushButton):
         self._truncated = _truncate_label(full_name, 30)
         self._color = color_hex
         self._state = self.STATE_OFF
+        self._drag_start_pos = None
         self.setCursor(Qt.PointingHandCursor)
         self.setIcon(_make_swatch_icon(color_hex, 14))
         self.setIconSize(QSize(14, 14))
         self.setMinimumHeight(30)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setToolTip(full_name)
+        self.setToolTip(full_name + "\nDrag to reorder.")
+        self.setAcceptDrops(True)
         self._refresh()
 
     def set_state(self, state):
         if state != self._state:
             self._state = state
             self._refresh()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.LeftButton) or self._drag_start_pos is None:
+            return super().mouseMoveEvent(event)
+        if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            return super().mouseMoveEvent(event)
+        # Begin a drag. Suppress the imminent click by clearing the press so the
+        # parent QPushButton machinery doesn't fire its clicked signal on release.
+        self.setDown(False)
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(self.CHIP_MIME, QByteArray(self._full_name.encode("utf-8")))
+        drag.setMimeData(mime)
+        drag.setPixmap(self.grab())
+        drag.setHotSpot(event.pos())
+        self._drag_start_pos = None
+        drag.exec_(Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(self.CHIP_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(self.CHIP_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat(self.CHIP_MIME):
+            return super().dropEvent(event)
+        source = bytes(event.mimeData().data(self.CHIP_MIME)).decode("utf-8")
+        if source != self._full_name:
+            self.chip_dropped.emit(source, self._full_name)
+        event.acceptProposedAction()
 
     def _refresh(self):
         if self._state == self.STATE_ON:
@@ -621,12 +925,24 @@ class WellplateObservationStateDialog(QDialog):
         self._rows = rows
         self._cols = cols
         self.well_shape = well_shape
+        # Wellplate IDs ("A1", "A2", "B3"...) sort alphabetically here, so the
+        # first selected well = the top-leftmost-ish currently-selected well.
+        # The dialog uses its stored channel order (if any) as the initial chip
+        # order, so what the user sees mirrors that well's channel layout.
         self._selected = set(selected_well_ids)
-        self._channels = list(channel_names)
+        existing_map = existing_map or {}
+        global_channels = list(channel_names)
+        first_selected = next(iter(sorted(self._selected)), None)
+        first_order = existing_map.get(first_selected) if first_selected else None
+        if first_order:
+            head = [ch for ch in first_order if ch in global_channels]
+            tail = [ch for ch in global_channels if ch not in head]
+            self._channels = head + tail
+        else:
+            self._channels = global_channels
         self._color_index = _assign_channel_colors(self._channels, color_index or {})
 
         # Internal state: Dict[channel_name, Set[well_id]]
-        existing_map = existing_map or {}
         self._state = {ch: set() for ch in self._channels}
         for well_id in self._selected:
             active_for_well = existing_map.get(well_id, self._channels)
@@ -669,49 +985,30 @@ class WellplateObservationStateDialog(QDialog):
     def get_color_index(self):
         return dict(self._color_index)
 
+    def get_channel_order(self):
+        """Channel names in the order they currently appear in the toolbar."""
+        return list(self._channels)
+
     # ---- UI ---------------------------------------------------------------------
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Select wells, then toggle channels in the toolbar to apply to the selection."))
+        layout.addWidget(QLabel(
+            "Select wells, then toggle channels in the toolbar to apply to the selection.\n"
+            "Drag chips to reorder them (applies to acquisition)."
+        ))
 
         # Bulk-edit toolbar: 3 chip buttons per row. Each chip toggles the
         # channel for the currently-selected wells; the button's tinted state
         # reflects the union (on / off / mixed) across that selection.
         self._toolbar_frame = QFrame()
         self._toolbar_frame.setFrameShape(QFrame.StyledPanel)
-        toolbar_grid = QGridLayout(self._toolbar_frame)
-        toolbar_grid.setContentsMargins(6, 4, 6, 4)
-        toolbar_grid.setHorizontalSpacing(6)
-        toolbar_grid.setVerticalSpacing(4)
-
-        hint = QLabel("Click a channel chip to toggle it for the selected wells:")
-        toolbar_grid.addWidget(hint, 0, 0, 1, 3)
+        self._toolbar_grid = QGridLayout(self._toolbar_frame)
+        self._toolbar_grid.setContentsMargins(6, 4, 6, 4)
+        self._toolbar_grid.setHorizontalSpacing(6)
+        self._toolbar_grid.setVerticalSpacing(4)
 
         self._channel_checkboxes = {}
-        per_row = 3
-        for idx, name in enumerate(self._channels):
-            color = _CHANNEL_COLOR_PALETTE[self._color_index[name] % len(_CHANNEL_COLOR_PALETTE)]
-            chip = _ChannelChipButton(name, color)
-            chip.clicked.connect(lambda _checked=False, ch=name: self._on_channel_clicked(ch))
-            toolbar_grid.addWidget(chip, 1 + idx // per_row, idx % per_row)
-            self._channel_checkboxes[name] = chip
-
-        # Distribute the 3 columns evenly so chips share space.
-        for col in range(per_row):
-            toolbar_grid.setColumnStretch(col, 1)
-
-        # All-on / All-off on a final row, right-aligned.
-        chips_rows = (len(self._channels) + per_row - 1) // per_row
-        extras_row = 1 + chips_rows
-        btn_all = QPushButton("All on")
-        btn_none = QPushButton("All off")
-        btn_all.clicked.connect(lambda: self._apply_all_channels(True))
-        btn_none.clicked.connect(lambda: self._apply_all_channels(False))
-        extras = QHBoxLayout()
-        extras.addStretch()
-        extras.addWidget(btn_all)
-        extras.addWidget(btn_none)
-        toolbar_grid.addLayout(extras, extras_row, 0, 1, per_row)
+        self._populate_chip_toolbar()
 
         layout.addWidget(self._toolbar_frame)
 
@@ -768,6 +1065,83 @@ class WellplateObservationStateDialog(QDialog):
         target_w = min(1200, max(500, cell_size * self._cols + 120))
         target_h = min(900, max(400, cell_size * self._rows + 200))
         self.resize(target_w, target_h)
+
+    def _populate_chip_toolbar(self):
+        """(Re)build the chip toolbar contents from ``self._channels``.
+
+        Called once during ``_build_ui`` and again whenever the user drags a
+        chip to reorder. Removes any existing chip widgets/sub-layouts from
+        the grid (keeping the grid itself) before re-adding everything in the
+        current ``self._channels`` order.
+        """
+        grid = self._toolbar_grid
+        # Clear out previous children. We rebuild because QGridLayout doesn't
+        # expose a re-position API; reparenting + delete is cleaner than
+        # in-place reseat.
+        while grid.count():
+            item = grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+            elif item.layout() is not None:
+                sub = item.layout()
+                while sub.count():
+                    child = sub.takeAt(0)
+                    if child.widget() is not None:
+                        child.widget().setParent(None)
+                        child.widget().deleteLater()
+                sub.deleteLater()
+        self._channel_checkboxes = {}
+
+        per_row = 3
+        hint = QLabel("Click a channel chip to toggle it for the selected wells. Drag to reorder.")
+        grid.addWidget(hint, 0, 0, 1, per_row)
+        for idx, name in enumerate(self._channels):
+            color = _CHANNEL_COLOR_PALETTE[self._color_index[name] % len(_CHANNEL_COLOR_PALETTE)]
+            chip = _ChannelChipButton(name, color)
+            chip.clicked.connect(lambda _checked=False, ch=name: self._on_channel_clicked(ch))
+            chip.chip_dropped.connect(self._on_chip_dropped)
+            grid.addWidget(chip, 1 + idx // per_row, idx % per_row)
+            self._channel_checkboxes[name] = chip
+
+        for col in range(per_row):
+            grid.setColumnStretch(col, 1)
+
+        chips_rows = (len(self._channels) + per_row - 1) // per_row
+        extras_row = 1 + chips_rows
+        btn_all = QPushButton("All on")
+        btn_none = QPushButton("All off")
+        btn_all.clicked.connect(lambda: self._apply_all_channels(True))
+        btn_none.clicked.connect(lambda: self._apply_all_channels(False))
+        extras = QHBoxLayout()
+        extras.addStretch()
+        extras.addWidget(btn_all)
+        extras.addWidget(btn_none)
+        grid.addLayout(extras, extras_row, 0, 1, per_row)
+
+    def _on_chip_dropped(self, source_name, target_name):
+        """Move ``source_name`` so it appears just before ``target_name``.
+
+        The user reads the gesture as "this chip belongs here now"; inserting
+        before the target matches the visual where the drop indicator falls
+        on/near the target chip. The toolbar rebuild is deferred to the next
+        event-loop tick so we don't tear down the chips that are still inside
+        the drop event's call stack.
+        """
+        if source_name == target_name:
+            return
+        if source_name not in self._channels or target_name not in self._channels:
+            return
+        self._channels.remove(source_name)
+        target_idx = self._channels.index(target_name)
+        self._channels.insert(target_idx, source_name)
+        QTimer.singleShot(0, self._rebuild_after_reorder)
+
+    def _rebuild_after_reorder(self):
+        self._populate_chip_toolbar()
+        self._refresh_toolbar_state()
+        self._refresh_footer()
+        self._table.viewport().update()
 
     def _selected_well_ids(self):
         ids = []
@@ -1039,10 +1413,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_NZ.setFixedWidth(max_num_width)
         self.entry_Nt.setFixedWidth(max_num_width)
 
-        self.list_configurations = QListWidget()
+        self.list_configurations = _ObservationStateListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
             self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
-        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
+        self.list_configurations.setToolTip(
+            "Observation State presets saved for the active profile.\n"
+            "Drag rows to reorder; checked rows float to the top."
+        )
 
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
         self.btn_per_point_channels.setToolTip("Configure which observation states to acquire at each registered point")
@@ -1078,6 +1455,12 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
+        )
+        self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
+            self.multipointController
+        )
+        _bind_streaming_row_visibility(
+            self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
         self.checkbox_snakeScan = QCheckBox("Snake scan")
@@ -1266,6 +1649,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_af.addWidget(self.checkbox_set_z_range)
         grid_af.addWidget(self.checkbox_skipSaving)
         grid_af.addLayout(self.fileSavingFormatRow)
+        grid_af.addLayout(self.zarrStreamingRow)
         grid_af.addWidget(self.checkbox_snakeScan)
         grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
@@ -1680,17 +2064,25 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         )
         if dialog.exec_() == QDialog.Accepted:
             self._region_obs_state_map = dialog.get_result()
+            new_order = dialog.get_channel_order()
+            if new_order:
+                _reorder_list_widget(self.list_configurations, new_order)
             self._update_per_point_button_text()
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        # Remember currently checked channels
-        checked_names = _get_checked_names(self.list_configurations)
+        # Preserve currently checked names and the user-chosen display order.
+        checked_names = set(_get_checked_names(self.list_configurations))
+        prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        # Clear and repopulate
+        # Repopulate in prior order; preset names not in prior_order go to the end.
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
-        for name in _multipoint_observation_preset_display_names(self.microscope):
+        available = list(_multipoint_observation_preset_display_names(self.microscope))
+        available_set = set(available)
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+        for name in ordered:
             self.list_configurations.addItem(
                 _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
             )
@@ -2624,10 +3016,13 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.list_configurations = QListWidget()
+        self.list_configurations = _ObservationStateListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
             self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
-        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
+        self.list_configurations.setToolTip(
+            "Observation State presets saved for the active profile.\n"
+            "Drag rows to reorder; checked rows float to the top."
+        )
 
         # Per-point (per-well) channel override. None means "use global selection at every well".
         self._region_obs_state_map = None
@@ -2683,6 +3078,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
+        )
+        self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
+            self.multipointController
+        )
+        _bind_streaming_row_visibility(
+            self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
         self.checkbox_snakeScan = QCheckBox("Snake scan")
@@ -2938,6 +3339,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setVisible(False)
         options_layout.addWidget(self.checkbox_skipSaving)
         options_layout.addLayout(self.fileSavingFormatRow)
+        options_layout.addLayout(self.zarrStreamingRow)
         options_layout.addWidget(self.checkbox_snakeScan)
         options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         options_layout.addWidget(self.checkbox_showLiveDuringAcquisition)
@@ -3070,6 +3472,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_deltaZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_NZ.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.list_configurations.itemChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.list_configurations.order_changed.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_withAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
@@ -3103,6 +3506,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 "dz": self.entry_deltaZ.value(),
                 "nz": self.entry_NZ.value(),
                 "selected_observation_states": _get_checked_names(self.list_configurations),
+                "observation_state_order": _list_widget_item_names_in_order(self.list_configurations),
                 "contrast_af": self.checkbox_withAutofocus.isChecked(),
                 "laser_af": (
                     self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
@@ -3191,6 +3595,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Restore selected observation states (legacy key: selected_channels)
             selected_channels = settings.get("selected_observation_states") or settings.get("selected_channels", [])
+            saved_order = settings.get("observation_state_order") or []
+            if saved_order:
+                _reorder_list_widget(self.list_configurations, saved_order)
             if selected_channels:
                 self.list_configurations.blockSignals(True)
                 for i in range(self.list_configurations.count()):
@@ -4404,11 +4811,16 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        checked_names = _get_checked_names(self.list_configurations)
+        checked_names = set(_get_checked_names(self.list_configurations))
+        prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
-        for name in _multipoint_observation_preset_display_names(self.microscope):
+        available = list(_multipoint_observation_preset_display_names(self.microscope))
+        available_set = set(available)
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+        for name in ordered:
             self.list_configurations.addItem(
                 _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
             )
@@ -4473,6 +4885,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         if dialog.exec_() == QDialog.Accepted:
             self._region_obs_state_map = dialog.get_result()
             self._channel_color_index = dialog.get_color_index()
+            new_order = dialog.get_channel_order()
+            if new_order:
+                _reorder_list_widget(self.list_configurations, new_order)
+                self.save_multipoint_widget_config_to_cache()
             self._update_per_point_button_text()
 
     def toggle_coordinate_controls(self, has_coordinates: bool):
@@ -4880,10 +5296,13 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.entry_NZ.setValue(1)
 
         # Observation State presets (same list as Illumination / Observation State)
-        self.list_configurations = QListWidget()
+        self.list_configurations = _ObservationStateListWidget()
         for preset_name in _multipoint_observation_preset_display_names(self.microscope):
             self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
-        self.list_configurations.setToolTip("Observation State presets saved for the active profile")
+        self.list_configurations.setToolTip(
+            "Observation State presets saved for the active profile.\n"
+            "Drag rows to reorder; checked rows float to the top."
+        )
 
         # Laser AF checkbox
         self.checkbox_withReflectionAutofocus = LaserAutofocusButton(self.multipointController)
@@ -5130,10 +5549,15 @@ class MultiPointWithFluidicsWidget(QFrame):
 
     def refresh_channel_list(self):
         """Refresh the observation state list after profile or preset changes."""
-        checked_names = _get_checked_names(self.list_configurations)
+        checked_names = set(_get_checked_names(self.list_configurations))
+        prior_order = _list_widget_item_names_in_order(self.list_configurations)
         self.list_configurations.blockSignals(True)
         self.list_configurations.clear()
-        for name in _multipoint_observation_preset_display_names(self.microscope):
+        available = list(_multipoint_observation_preset_display_names(self.microscope))
+        available_set = set(available)
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+        for name in ordered:
             self.list_configurations.addItem(
                 _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
             )

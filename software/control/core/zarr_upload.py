@@ -142,9 +142,13 @@ def local_to_remote_path(local_path: str, local_base: str, remote_base: str) -> 
     """Map a local file path to its remote counterpart under ``remote_base``.
 
     Uses **native separators** throughout the result so OS APIs accept the
-    path: backslashes on Windows (including ``\\\\server\\share`` UNCs),
-    forward slashes on POSIX. Accepts mixed input — a remote root typed as
-    ``//srv/share/dir`` on Windows is normalized to ``\\\\srv\\share\\dir``.
+    path: backslashes on Windows (including ``\\\\server\\share`` UNCs and
+    mapped drives like ``Z:\\``), forward slashes on POSIX. Accepts mixed
+    input — a remote root typed as ``//srv/share/dir`` is normalized to
+    ``\\\\srv\\share\\dir`` on Windows, and oddities like ``Z://path`` or
+    ``Z://a//b`` are collapsed to ``Z:\\path`` / ``Z:\\a\\b`` (Windows
+    treats ``\\\\`` after a drive letter as an invalid UNC, so we have to
+    collapse rather than just substitute separators).
 
     ``local_path`` must live under ``local_base``. Comparison is
     case-insensitive on Windows (where ``C:\\Foo`` and ``c:/foo`` refer to
@@ -162,12 +166,15 @@ def local_to_remote_path(local_path: str, local_base: str, remote_base: str) -> 
             f"local_path {local_path!r} is not under local_base {local_base!r}"
         )
     rel = os.path.relpath(abs_local, abs_base)
-    # Normalize remote_base to native separators (preserving the UNC ``\\``
-    # prefix on Windows) and strip any trailing slash/backslash before
-    # composing with the relative portion.
-    remote_base_clean = remote_base.rstrip("/\\")
+    # Normalize remote_base end-to-end. On Windows, ``os.path.normpath``
+    # collapses redundant separators (``Z://path`` → ``Z:\\path``), turns
+    # forward slashes into backslashes, and crucially preserves the
+    # leading ``\\\\`` of UNC paths. On POSIX it collapses ``//`` to ``/``.
+    # We strip a trailing separator after normalization so the join below
+    # doesn't double-up (``os.path.normpath('Z:/')`` returns ``'Z:\\'``,
+    # which would compose to ``'Z:\\\\rel'`` if not stripped).
+    remote_base_clean = os.path.normpath(remote_base).rstrip("/\\")
     if os.name == "nt":
-        remote_base_clean = remote_base_clean.replace("/", "\\")
         rel = rel.replace("/", "\\")
     else:
         remote_base_clean = remote_base_clean.replace("\\", "/")

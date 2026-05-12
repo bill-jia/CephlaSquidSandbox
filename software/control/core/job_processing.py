@@ -1570,6 +1570,29 @@ class JobRunner(multiprocessing.Process):
         except Exception as e:
             self._log.error(f"Error finalizing zarr writers during shutdown: {e}")
 
+        # Flush the upload queue feeder thread so any UploadTask items that
+        # FlushAndStageUploadJob.run() put() onto the queue actually reach
+        # the UploadWorker before this subprocess exits.
+        #
+        # multiprocessing.Queue.put() returns as soon as the item is
+        # buffered into the per-process Python-side feeder thread, NOT when
+        # it has been written to the underlying pipe. If we exit the
+        # subprocess without flushing, the feeder is killed and any buffered
+        # items are silently lost — even though the BarrierResult we
+        # already sent back through the JobRunner's OUTPUT queue has the
+        # main process tracking those tasks as "in flight". Symptom:
+        # ``pending_task_ids`` stays positive forever because the
+        # UploadWorker never receives the lost tasks and never emits
+        # matching UploadResults.
+        if self._upload_input_queue is not None:
+            try:
+                self._upload_input_queue.close()
+                self._upload_input_queue.join_thread()
+            except Exception as e:
+                self._log.error(
+                    f"Error flushing upload queue feeder on shutdown: {e}"
+                )
+
         # Stop memory monitoring and log final report
         log_memory("WORKER_SHUTDOWN", include_children=False)
         stop_worker_monitoring()
