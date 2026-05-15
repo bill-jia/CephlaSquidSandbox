@@ -167,6 +167,18 @@ class ObservationStateController:
         except Exception as e:
             self._log.warning("Could not set illumination on/off for %r: %s", channel, e)
 
+    def set_led_matrix_array_na(self, na: float) -> bool:
+        """GUI-safe entrypoint to update the SciMicroscopy LED array NA.
+
+        Returns the underlying IC result (False if no array is available).
+        """
+        try:
+            if hasattr(self.ic, "set_led_matrix_array_na"):
+                return bool(self.ic.set_led_matrix_array_na(float(na)))
+        except Exception as e:
+            self._log.warning("Could not set LED matrix array NA: %s", e)
+        return False
+
     def set_led_matrix_mode(self, mode: str) -> None:
         """Update LED matrix mode on relevant illuminator states and apply to IC."""
         if self._current_state is not None:

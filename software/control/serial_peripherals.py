@@ -1054,6 +1054,10 @@ class LDI_Simulation(LightSource):
             self.set_shutter_state(ch, False)
 
 
+# [LED-DBG] Temporary: flip to False to silence per-call serial logging.
+_LED_DBG = True
+
+
 class SciMicroscopyLEDArray:
     """Wrapper for communicating with SciMicroscopy over serial"""
 
@@ -1086,6 +1090,13 @@ class SciMicroscopyLEDArray:
         self.NA = 0.5
         self.turn_on_delay = turn_on_delay
         self._default_color: tuple[float, float, float] = default_color
+        # Cached "objective NA" used by bf/df/dpc.<half>. Updated lazily by
+        # _set_na_cached so we don't burn a serial round-trip on every
+        # re-apply when the requested NA hasn't changed.
+        self._active_na: Optional[float] = None
+        # Tracks whether half-annulus firmware command has been observed to
+        # fail; once True we stop re-attempting and just log.
+        self._half_annulus_disabled: bool = False
 
     def write(self, command):
         self.serial_connection.write_and_check(command + "\r", "", read_delay=0.01, print_response=True)
@@ -1105,23 +1116,78 @@ class SciMicroscopyLEDArray:
 
     def set_NA(self, NA):
         self.NA = NA
-        NA = str(int(NA * 100))
+        NA_int = int(NA * 100)
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_NA NA={NA} -> serial 'na.{NA_int}'")
         self.serial_connection.write_and_check(
-            "na." + NA + "\r", "Current NA is 0." + NA, read_delay=0.01, print_response=False
+            "na." + str(NA_int) + "\r",
+            "Current NA is 0." + str(NA_int),
+            read_delay=0.01,
+            print_response=False,
         )
+        self._active_na = NA
+
+    def set_array_na(self, na: float) -> None:
+        """Public alias for set_NA, used by IlluminationController / GUI."""
+        self.set_NA(float(na))
+
+    def _set_na_cached(self, na: float) -> None:
+        """Write na.<X> only when changed from cached value."""
+        try:
+            if self._active_na is not None and abs(float(na) - float(self._active_na)) < 1e-3:
+                if _LED_DBG:
+                    log.info(f"[LED-DBG] SciMicroscopy._set_na_cached NA={na} (cached, no write)")
+                return
+            self.set_NA(float(na))
+        except Exception as exc:
+            log.warning(f"[LED-DBG] _set_na_cached(NA={na}) failed: {exc}")
+
+    def set_annulus(self, min_na: float, max_na: float) -> str:
+        """Build (and return) the 'an.<min>.<max>' pattern command.
+
+        The firmware applies this command as an immediate light-up pattern when
+        sent — we therefore return the string and let the caller store it via
+        set_illumination so the existing turn_on/turn_off lifecycle is reused.
+        """
+        a, b = int(min_na * 100), int(max_na * 100)
+        cmd = f"an.{a}.{b}"
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_annulus min_na={min_na} max_na={max_na} -> cmd '{cmd}'")
+        return cmd
+
+    def set_half_annulus_pattern(self, half: str, min_na: float, max_na: float) -> str:
+        """Build the half-annulus pattern command. Experimental firmware path."""
+        # Firmware command syntax follows the dpc convention (half letter first).
+        # If the firmware does not support 'ha' the call from turn_on_illumination
+        # will raise SerialDeviceError; that gets caught and the device is
+        # marked disabled so further attempts short-circuit.
+        h = (half or "t")[0]
+        a, b = int(min_na * 100), int(max_na * 100)
+        cmd = f"ha.{h}.{a}.{b}"
+        if _LED_DBG:
+            log.info(
+                f"[LED-DBG] SciMicroscopy.set_half_annulus_pattern half='{h}' "
+                f"min_na={min_na} max_na={max_na} -> cmd '{cmd}' (EXPERIMENTAL firmware)"
+            )
+        return cmd
 
     def set_color(self, color):
         # (r,g,b), 0-1
         r = int(255 * color[0])
         g = int(255 * color[1])
         b = int(255 * color[2])
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_color color={color} -> serial 'sc.{r}.{g}.{b}'")
         self.serial_connection.write_and_check(
             f"sc.{r}.{g}.{b}\r", f"Current color balance values are {r}.{g}.{b}", read_delay=0.01, print_response=False
         )
 
     def set_brightness(self, brightness):
         # 0 to 100
+        raw_brightness = brightness
         brightness = str(int(255 * (brightness / 100.0)))
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_brightness pct={raw_brightness} -> serial 'sb.{brightness}' (0-255)")
         self.serial_connection.write_and_check(
             f"sb.{brightness}\r", f"Current brightness value is {brightness}.", read_delay=0.01, print_response=False
         )
@@ -1136,19 +1202,46 @@ class SciMicroscopyLEDArray:
         self.serial_connection.write_and_check(f"df\r", "-==-", read_delay=0.01, print_response=False)
 
     def set_illumination(self, illumination):
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_illumination mode='{illumination}' (stored, not yet sent)")
         self.illumination = illumination
 
     def clear(self):
         self.serial_connection.write_and_check("x\r", "-==-", read_delay=0.01, print_response=False)
 
     def turn_on_illumination(self):
-        if self.illumination is not None:
+        if self.illumination is None:
+            return
+        cmd = self.illumination
+        is_experimental_ha = cmd.startswith("ha.")
+        if is_experimental_ha and self._half_annulus_disabled:
+            log.warning(
+                f"[LED-DBG] turn_on_illumination skipping disabled half-annulus '{cmd}'; "
+                f"firmware previously rejected this command"
+            )
+            return
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.turn_on_illumination -> serial '{cmd}'")
+        try:
             self.serial_connection.write_and_check(
-                f"{self.illumination}\r", "-==-", read_delay=0.01, print_response=False
+                f"{cmd}\r", "-==-", read_delay=0.01, print_response=False
             )
             time.sleep(self.turn_on_delay)
+        except SerialDeviceError as exc:
+            if is_experimental_ha:
+                # Latch off the experimental mode so we don't keep stalling 5s
+                # per call against a firmware that doesn't understand 'ha.'.
+                self._half_annulus_disabled = True
+                log.warning(
+                    f"[LED-DBG] half-annulus command '{cmd}' rejected by firmware ({exc}); "
+                    f"disabling for the rest of this session"
+                )
+            else:
+                raise
 
     def turn_off_illumination(self):
+        if _LED_DBG:
+            log.info("[LED-DBG] SciMicroscopy.turn_off_illumination -> serial 'x' (clear)")
         self.clear()
 
     # High-level helper used by LiveController to map channel names to
@@ -1158,8 +1251,22 @@ class SciMicroscopyLEDArray:
         self,
         channel_name: str,
         intensity: float,
+        mode_spec: Optional[dict] = None,
     ) -> None:
-        """Configure color, brightness and illumination mode from a channel name."""
+        """Configure color, brightness and illumination mode for a channel.
+
+        ``mode_spec`` (optional) carries per-mode parameters from the LED
+        matrix mode dict, allowing patterns that need NA, annulus radii, or a
+        half-annulus direction to be expressed declaratively:
+
+            { "na": 0.2 }                  → low-NA brightfield
+            { "annulus": [0.5, 0.95] }     → annulus
+            { "annulus": [0.5, 0.95],
+              "half": "t" }                → half-annulus (experimental)
+
+        When ``mode_spec`` is omitted, falls back to channel-name matching to
+        preserve the original legacy code path.
+        """
         # Map channel name to color
         if "BF LED matrix full_R" in channel_name:
             color = (1.0, 0.0, 0.0)
@@ -1170,22 +1277,48 @@ class SciMicroscopyLEDArray:
         else:
             color = self._default_color
 
-        # Map channel name to illumination mode
-        if "BF LED matrix left half" in channel_name:
-            mode = "dpc.l"
-        elif "BF LED matrix right half" in channel_name:
-            mode = "dpc.r"
-        elif "BF LED matrix top half" in channel_name:
-            mode = "dpc.t"
-        elif "BF LED matrix bottom half" in channel_name:
-            mode = "dpc.b"
-        elif "BF LED matrix full" in channel_name:
-            mode = "bf"
-        elif "DF LED matrix" in channel_name:
-            mode = "df"
-        else:
-            mode = "bf"
+        spec = mode_spec or {}
+        annulus = spec.get("annulus")
+        half = spec.get("half")
+        spec_na = spec.get("na")
 
+        # Pattern command resolution
+        if annulus is not None and half:
+            min_na, max_na = float(annulus[0]), float(annulus[1])
+            mode = self.set_half_annulus_pattern(half, min_na, max_na)
+        elif annulus is not None:
+            min_na, max_na = float(annulus[0]), float(annulus[1])
+            mode = self.set_annulus(min_na, max_na)
+        else:
+            # Legacy / NA-based modes — name-matched for backward compatibility
+            if "BF LED matrix left half" in channel_name:
+                mode = "dpc.l"
+            elif "BF LED matrix right half" in channel_name:
+                mode = "dpc.r"
+            elif "BF LED matrix top half" in channel_name:
+                mode = "dpc.t"
+            elif "BF LED matrix bottom half" in channel_name:
+                mode = "dpc.b"
+            elif "BF LED matrix low NA" in channel_name or "BF LED matrix center" in channel_name:
+                mode = "bf"
+            elif "BF LED matrix full" in channel_name:
+                mode = "bf"
+            elif "DF LED matrix" in channel_name:
+                mode = "df"
+            else:
+                mode = "bf"
+
+            # Apply NA: spec wins; otherwise leave firmware NA alone so the
+            # global "Array NA" (set via set_array_na) keeps applying.
+            if spec_na is not None:
+                self._set_na_cached(float(spec_na))
+
+        if _LED_DBG:
+            log.info(
+                f"[LED-DBG] SciMicroscopy.apply_channel_configuration "
+                f"channel='{channel_name}' intensity_pct={intensity} color={color} "
+                f"mode='{mode}' spec_na={spec_na} annulus={annulus} half={half}"
+            )
         self.set_color(color)
         self.set_brightness(intensity)
         self.set_illumination(mode)
@@ -1259,10 +1392,21 @@ class SciMicroscopyLEDArray_Simulation:
     def turn_off_illumination(self):
         pass
 
+    def set_array_na(self, na: float) -> None:
+        self.NA = float(na)
+
+    def set_annulus(self, min_na: float, max_na: float) -> str:
+        return f"an.{int(min_na*100)}.{int(max_na*100)}"
+
+    def set_half_annulus_pattern(self, half: str, min_na: float, max_na: float) -> str:
+        h = (half or "t")[0]
+        return f"ha.{h}.{int(min_na*100)}.{int(max_na*100)}"
+
     def apply_channel_configuration(
         self,
         channel_name: str,
         intensity: float,
+        mode_spec: Optional[dict] = None,
     ) -> None:
         """Simulation stub; mirrors real API but is a no-op."""
         return

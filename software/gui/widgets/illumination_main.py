@@ -125,6 +125,7 @@ class IlluminationWidget(QWidget):
                 label_text += f"  ({wl} nm)"
 
             mode_combo: Optional[QComboBox] = None
+            na_spinbox: Optional[QDoubleSpinBox] = None
             if unified_lm_name and ch_name == unified_lm_name:
                 name_cell = QWidget()
                 name_row = QHBoxLayout(name_cell)
@@ -141,6 +142,30 @@ class IlluminationWidget(QWidget):
                         mode_combo.setCurrentIndex(mi)
                 mode_combo.setMinimumWidth(160)
                 name_row.addWidget(mode_combo, stretch=1)
+
+                # Optional Array-NA spinbox (controls bf/df/dpc radius live).
+                # Only present when the underlying device exposes the API; for
+                # plain MCU matrices the value is meaningless.
+                cur_na = None
+                if hasattr(self._controller, "get_led_matrix_array_na"):
+                    try:
+                        cur_na = self._controller.get_led_matrix_array_na()
+                    except Exception:
+                        cur_na = None
+                if cur_na is not None:
+                    name_row.addWidget(QLabel("NA:"))
+                    na_spinbox = QDoubleSpinBox()
+                    na_spinbox.setMinimum(0.05)
+                    na_spinbox.setMaximum(0.99)
+                    na_spinbox.setSingleStep(0.05)
+                    na_spinbox.setDecimals(2)
+                    na_spinbox.setValue(float(cur_na))
+                    na_spinbox.setFixedWidth(70)
+                    na_spinbox.setToolTip(
+                        "SciMicroscopy LED array NA. Re-fires the current pattern "
+                        "when changed while the channel is on."
+                    )
+                    name_row.addWidget(na_spinbox)
                 label = name_cell
             else:
                 label = QLabel(label_text)
@@ -185,6 +210,8 @@ class IlluminationWidget(QWidget):
             }
             if mode_combo is not None:
                 row_data["mode_combo"] = mode_combo
+            if na_spinbox is not None:
+                row_data["na_spinbox"] = na_spinbox
             self._channel_rows[ch_name] = row_data
 
             # Wire signals (capture ch.name by closure)
@@ -201,6 +228,10 @@ class IlluminationWidget(QWidget):
             if mode_combo is not None:
                 mode_combo.currentIndexChanged.connect(
                     lambda idx, n=name: self._on_led_matrix_mode_changed(n, idx)
+                )
+            if na_spinbox is not None:
+                na_spinbox.valueChanged.connect(
+                    lambda v, n=name: self._on_led_matrix_na_changed(n, v)
                 )
 
         root.addWidget(channels_group)
@@ -261,6 +292,21 @@ class IlluminationWidget(QWidget):
                 self._obs_controller.set_led_matrix_mode(mode_key)
             elif getattr(self._controller, "set_led_matrix_mode", None):
                 self._controller.set_led_matrix_mode(mode_key)
+
+    def _on_led_matrix_na_changed(self, channel_name: str, value: float):
+        """Push LED matrix array-NA change to controller (re-fires pattern if on)."""
+        row = self._channel_rows.get(channel_name)
+        if row is None:
+            return
+        try:
+            if self._obs_controller is not None and hasattr(
+                self._obs_controller, "set_led_matrix_array_na"
+            ):
+                self._obs_controller.set_led_matrix_array_na(float(value))
+            elif hasattr(self._controller, "set_led_matrix_array_na"):
+                self._controller.set_led_matrix_array_na(float(value))
+        except Exception:
+            pass
 
     def update_ui_for_mode(self, config=None) -> None:
         """Refresh illumination controls to match current hardware state.

@@ -701,8 +701,13 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
     },
     "low_na": {
         "source_code": 4,
-        "label": "BF low NA",
+        "label": "BF center (low NA)",
         "matrix_channel_name": "BF LED matrix low NA",
+        # Center-only BF: firmware NA set low so `bf` lights only the central
+        # disk of LEDs. Without this the mode was identical to bf_full because
+        # the driver never re-issued na.<X> and the matrix_channel_name didn't
+        # match any non-`bf` branch.
+        "na": 0.2,
     },
     "left_half": {
         "source_code": 1,
@@ -723,6 +728,41 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
         "source_code": 8,
         "label": "BF bottom half",
         "matrix_channel_name": "BF LED matrix bottom half",
+    },
+    # --- Experimental DPC-style patterns ---
+    "outer_ring": {
+        "source_code": 0,
+        "label": "BF outer ring (annulus)",
+        "matrix_channel_name": "BF LED matrix annulus",
+        "annulus": [0.5, 0.95],
+    },
+    "half_ann_t": {
+        "source_code": 0,
+        "label": "Half annulus top (exp.)",
+        "matrix_channel_name": "BF LED matrix half annulus top",
+        "annulus": [0.5, 0.95],
+        "half": "t",
+    },
+    "half_ann_b": {
+        "source_code": 0,
+        "label": "Half annulus bottom (exp.)",
+        "matrix_channel_name": "BF LED matrix half annulus bottom",
+        "annulus": [0.5, 0.95],
+        "half": "b",
+    },
+    "half_ann_l": {
+        "source_code": 0,
+        "label": "Half annulus left (exp.)",
+        "matrix_channel_name": "BF LED matrix half annulus left",
+        "annulus": [0.5, 0.95],
+        "half": "l",
+    },
+    "half_ann_r": {
+        "source_code": 0,
+        "label": "Half annulus right (exp.)",
+        "matrix_channel_name": "BF LED matrix half annulus right",
+        "annulus": [0.5, 0.95],
+        "half": "r",
     },
     "bf_r": {
         "source_code": 0,
@@ -745,10 +785,16 @@ _DEFAULT_LEGACY_TO_MODE: Dict[str, str] = {
     "BF LED matrix full": "bf_full",
     "DF LED matrix": "df",
     "BF LED matrix low NA": "low_na",
+    "BF LED matrix center": "low_na",
     "BF LED matrix left half": "left_half",
     "BF LED matrix right half": "right_half",
     "BF LED matrix top half": "top_half",
     "BF LED matrix bottom half": "bottom_half",
+    "BF LED matrix annulus": "outer_ring",
+    "BF LED matrix half annulus top": "half_ann_t",
+    "BF LED matrix half annulus bottom": "half_ann_b",
+    "BF LED matrix half annulus left": "half_ann_l",
+    "BF LED matrix half annulus right": "half_ann_r",
     "BF LED matrix full_R": "bf_r",
     "BF LED matrix full_G": "bf_g",
     "BF LED matrix full_B": "bf_b",
@@ -875,12 +921,30 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         spec = self._modes[self._active_mode_key]
         source_code = int(spec["source_code"])
         mcu_name = str(spec.get("matrix_channel_name", "BF LED matrix full"))
+        # [LED-DBG] temporary trace; flip serial_peripherals._LED_DBG = False to silence
+        logger.info(
+            f"[LED-DBG] LEDMatrix._apply_unified_intensity mode_key='{self._active_mode_key}' "
+            f"source_code={source_code} mcu_name='{mcu_name}' intensity_pct={intensity} "
+            f"spec_na={spec.get('na')} annulus={spec.get('annulus')} half={spec.get('half')} "
+            f"backend={'sci_array' if self._sci_array is not None else 'mcu'}"
+        )
         if self._sci_array is not None:
-            self._sci_array.apply_channel_configuration(mcu_name, intensity)
+            self._sci_array.apply_channel_configuration(mcu_name, intensity, mode_spec=spec)
         elif self._microcontroller is not None:
+            # Plain MCU path only understands source_code; NA/annulus modes are
+            # SciMicroscopy-only and silently degrade to brightfield here.
             self._microcontroller.apply_led_matrix_channel_configuration(
                 mcu_name, source_code, intensity
             )
+
+    def set_array_na(self, na: float) -> None:
+        """Update the SciMicroscopy array's objective-NA setting (no-op for MCU)."""
+        if self._sci_array is None:
+            return
+        try:
+            self._sci_array.set_array_na(float(na))
+        except Exception as exc:
+            logger.warning(f"set_array_na({na}) failed: {exc}")
 
     @property
     def channel_names(self) -> List[str]:
@@ -1142,6 +1206,45 @@ class IlluminationController:
             return None
         return self._led_matrix_unified.get_matrix_mode()
 
+    def get_led_matrix_array_na(self) -> Optional[float]:
+        """Current SciMicroscopy LED array NA, or None if unavailable."""
+        dev = self._led_matrix_unified
+        if dev is None:
+            return None
+        sci = getattr(dev, "_sci_array", None)
+        if sci is None:
+            return None
+        return float(getattr(sci, "NA", 0.0))
+
+    def set_led_matrix_array_na(self, na: float) -> bool:
+        """Update the SciMicroscopy LED array NA (controls bf / df / dpc radius).
+
+        If a unified LED-matrix channel is currently asserted on hardware, the
+        current pattern is re-fired so the new NA takes immediate visual effect
+        (firmware applies stored NA only on the next pattern command).
+        Returns False when no SciMicroscopy LED array is available.
+        """
+        dev = self._led_matrix_unified
+        if dev is None:
+            return False
+        sci = getattr(dev, "_sci_array", None)
+        if sci is None:
+            return False
+        logger.info(f"[LED-DBG] IC.set_led_matrix_array_na requested NA={na}")
+        dev.set_array_na(float(na))
+        unified_name = dev.unified_channel_name
+        if (
+            self._channel_state.get(unified_name)
+            and self._channel_state[unified_name].is_on
+            and self._hardware_asserted.get(unified_name)
+        ):
+            # Re-issue pattern so firmware refreshes with the new NA. set_intensity
+            # rewrites color/brightness and stores the mode; turn_on fires it.
+            intensity = self._channel_state[unified_name].intensity
+            dev.set_intensity(unified_name, intensity)
+            dev.turn_on(unified_name)
+        return True
+
     def illumination_maps_to_unified_led_matrix(self, illumination_channel_name: Optional[str]) -> bool:
         """True if *illumination_channel_name* (from acquisition config) maps to the unified LED matrix.
 
@@ -1208,7 +1311,15 @@ class IlluminationController:
         lm = self._resolve_led_matrix_channel(channel_name)
         if lm is not None:
             unified_name, mode_key = lm
-            if abs(intensity - self._channel_state[unified_name].intensity) < 0.1:
+            cur = self._channel_state[unified_name].intensity
+            # [LED-DBG] log every LED-matrix intensity request (incl. dedup skips)
+            logger.info(
+                f"[LED-DBG] IC.set_channel_intensity LED matrix "
+                f"in='{channel_name}' -> unified='{unified_name}' mode_key={mode_key!r} "
+                f"requested={intensity} current={cur} "
+                f"{'(SKIPPED dedup)' if abs(intensity - cur) < 0.1 else ''}"
+            )
+            if abs(intensity - cur) < 0.1:
                 return
             dev = self._channel_map.get(unified_name)
             if isinstance(dev, LEDMatrixIlluminationDevice):
