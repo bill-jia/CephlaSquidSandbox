@@ -101,7 +101,8 @@ gui: "GUI Layer (PyQt5)" {
     piezo: "PiezoWidget\nfine Z control"
     emission_fw: "EmissionFilterWheelPanel"
     confocal: "SpinningDiskConfocalWidget\ndisk speed, dichroic, filters"
-    laser_af: "LaserAutofocusSettingWidget\nexposure, gain, calibration"
+    laser_af: "LaserAutofocusSettingWidget\nexposure, gain, calibration + live view\n(Tools menu popup: 'Focus Camera / Laser AF Setup')"
+    laser_af_ctrl_widget: "LaserAutofocusControlWidget\nInitialize + status indicator (green only after a\nsuccessful Initialize this session; amber when ROI\nloaded from cache), Set Reference, Measure Displacement\n('Laser AF' tab)"
     autofocus: "AutoFocusWidget\nN planes, delta Z"
   }
 

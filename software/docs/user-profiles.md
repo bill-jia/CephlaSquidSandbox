@@ -99,7 +99,9 @@ The following transient UI state is persisted to
 | `last_active_observation_state_name` | `ObservationStateController.current_observation_state.name` |
 | `window_geometry_b64`, `window_state_b64` | `QMainWindow.saveGeometry / saveState` |
 | `record_tab_index` | `recordTabWidget.currentIndex()` |
-| `snap_saving_dir`, `snap_tag` | `LiveControlWidget` |
+| `snap_saving_dir` | `LiveControlWidget.snap_saving_path` |
+| `acquisition_saving_dir` | `MultiPointController.base_path` (shared by all multipoint widgets) |
+| `snap_tag` | `LiveControlWidget` |
 | `live_display_fps`, `autolevel_enabled`, `display_resolution_scaling` | `LiveControlWidget` |
 
 Persistence is wired in `HighContentScreeningGui._cleanup_common`
@@ -107,6 +109,18 @@ Persistence is wired in `HighContentScreeningGui._cleanup_common`
 restoration runs after widget construction (`_restore_gui_state`) and again
 after `show()` for window geometry (`apply_persisted_window_state`, called
 from `main_hcs.py`).
+
+### Save folders default per profile
+
+The snap and acquisition save folders default to `C:/Microscope_Data/<profile>`
+(the global `DEFAULT_SAVING_PATH` joined with the active profile name) the first
+time a profile is used. Whatever folder the GUI shows at shutdown is written
+back to `snap_saving_dir` / `acquisition_saving_dir` and restored next time.
+`_apply_profile_saving_paths` resolves saved-value-or-default and applies it at
+startup and again on every live profile switch (wired to
+`ProfileWidget.signal_profile_changed`), creating the default folder on demand.
+There is no cross-profile "last used path" cache — each profile remembers its
+own folders.
 
 ## Programmatic access
 

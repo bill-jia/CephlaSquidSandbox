@@ -3,8 +3,6 @@ from .common import (
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
     error_dialog,
-    get_last_used_saving_path,
-    save_last_used_saving_path,
     _load_last_remote_streaming_path,
     _save_last_remote_streaming_path,
 )
@@ -1279,9 +1277,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.lineEdit_savingDir = QLineEdit()
         self.lineEdit_savingDir.setReadOnly(True)
 
-        last_path = get_last_used_saving_path()
-        self.lineEdit_savingDir.setText(last_path)
-        self.multipointController.set_base_path(last_path)
+        # Placeholder; the real folder is applied per-profile after construction
+        # via MainWindow._apply_profile_saving_paths().
+        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
+        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -2029,7 +2028,6 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_base_path(save_dir_base)
             self.lineEdit_savingDir.setText(save_dir_base)
             self.base_path_is_set = True
-            save_last_used_saving_path(save_dir_base)
 
     def _on_channel_list_changed(self):
         self.emit_selected_channels()
@@ -2925,9 +2923,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_setSavingDir.setFixedWidth(btn_width)
 
         self.lineEdit_savingDir = QLineEdit()
-        last_path = get_last_used_saving_path()
-        self.lineEdit_savingDir.setText(last_path)
-        self.multipointController.set_base_path(last_path)
+        # Placeholder; the real folder is applied per-profile after construction
+        # via MainWindow._apply_profile_saving_paths().
+        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
+        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -4772,7 +4771,6 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_base_path(save_dir_base)
             self.lineEdit_savingDir.setText(save_dir_base)
             self.base_path_is_set = True
-            save_last_used_saving_path(save_dir_base)
 
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current

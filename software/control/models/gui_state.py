@@ -32,8 +32,11 @@ class GuiState(BaseModel):
     window_state_b64: Optional[str] = None
     record_tab_index: Optional[int] = None
 
-    # Live / snap
+    # Save folders (default to C:/Microscope_Data/<profile> when unset)
     snap_saving_dir: Optional[str] = None
+    acquisition_saving_dir: Optional[str] = None
+
+    # Live / snap
     snap_tag: Optional[str] = None
     live_display_fps: Optional[float] = None
     autolevel_enabled: Optional[bool] = None

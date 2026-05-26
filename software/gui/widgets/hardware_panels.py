@@ -4,8 +4,11 @@ class LaserAutofocusSettingWidget(QWidget):
 
     signal_newExposureTime = Signal(float)
     signal_newAnalogGain = Signal(float)
-    signal_apply_settings = Signal()
     signal_laser_spot_location = Signal(np.ndarray, float, float)
+    # Emitted after apply_and_initialize() runs, carrying whether init succeeded.
+    # The "Initialize" button now lives in LaserAutofocusControlWidget, which
+    # uses this to enable its buttons and drive its success indicator.
+    signal_initialization_finished = Signal(bool)
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -132,14 +135,6 @@ class LaserAutofocusSettingWidget(QWidget):
         spot_detection_layout.addWidget(self.run_spot_detection_button)
         spot_detection_group.setLayout(spot_detection_layout)
 
-        # Initialize button
-        initialize_group = QFrame()
-        initialize_layout = QVBoxLayout()
-        self.initialize_button = QPushButton("Initialize")
-        self.initialize_button.setStyleSheet("background-color: #C2C2FF")
-        initialize_layout.addWidget(self.initialize_button)
-        initialize_group.setLayout(initialize_layout)
-
         # Add Laser AF Characterization Mode checkbox
         characterization_group = QFrame()
         characterization_layout = QHBoxLayout()
@@ -153,7 +148,6 @@ class LaserAutofocusSettingWidget(QWidget):
         layout.addWidget(non_threshold_group)
         layout.addWidget(settings_group)
         layout.addWidget(spot_detection_group)
-        layout.addWidget(initialize_group)
         layout.addWidget(characterization_group)
         self.setLayout(layout)
 
@@ -166,7 +160,6 @@ class LaserAutofocusSettingWidget(QWidget):
         self.analog_gain_spinbox.valueChanged.connect(self.update_analog_gain)
         self.update_threshold_button.clicked.connect(self.update_threshold_settings)
         self.run_spot_detection_button.clicked.connect(self.run_spot_detection)
-        self.initialize_button.clicked.connect(self.apply_and_initialize)
         self.characterization_checkbox.toggled.connect(self.toggle_characterization_mode)
 
     def _add_spinbox(
@@ -279,10 +272,10 @@ class LaserAutofocusSettingWidget(QWidget):
             "has_reference": False,
         }
         self.laserAutofocusController.set_laser_af_properties(updates)
-        self.laserAutofocusController.initialize_auto()
-        self.signal_apply_settings.emit()
-        self.update_threshold_button.setEnabled(True)
+        success = self.laserAutofocusController.initialize_auto()
+        self.update_threshold_button.setEnabled(success)
         self.update_calibration_label()
+        self.signal_initialization_finished.emit(bool(success))
 
     def update_threshold_settings(self):
         updates = {
@@ -2000,6 +1993,7 @@ class LiveControlWidget(QFrame):
 
             filepath = os.path.join(self.snap_saving_path, filename)
 
+            os.makedirs(self.snap_saving_path, exist_ok=True)
             imageio.imwrite(filepath, image)
             self._log.info(f"Snap frame saved to: {filepath}")
             self._save_snap_acquisition_metadata(filepath)

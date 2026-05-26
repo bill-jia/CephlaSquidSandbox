@@ -197,6 +197,7 @@ class LaserAutofocusController(QObject):
         if result is None:
             self._log.error("Failed to find laser spot during initialization")
             self.turn_off_AF_laser()
+            self.is_initialized = False
             return False
         x, y = result
 
@@ -219,6 +220,9 @@ class LaserAutofocusController(QObject):
         # Calibrate pixel-to-um conversion
         if not self._calibrate_pixel_to_um():
             self._log.error("Failed to calibrate pixel-to-um conversion")
+            # initialize_manual set is_initialized=True above; calibration failed,
+            # so the system is not usable until re-initialized.
+            self.is_initialized = False
             return False
 
         # Save configuration
