@@ -49,7 +49,8 @@ class LaserAFConfig(BaseModel):
     # Spot detection
     spot_crop_size: int = Field(100, description="Size of spot crop region")
     correlation_threshold: float = Field(0.9, description="Correlation threshold")
-    y_window: int = Field(96, description="Y window half-height for detection")
+    # y_window: int = Field(96, description="Y window half-height for detection")
+    y_window: int = Field(20, description="Y window half-height for detection") # Used to be 96, but reduced to 20 to avoid edge issues with smaller crop height
     x_window: int = Field(20, description="X window half-width for detection")
     min_peak_width: float = Field(10.0, description="Minimum peak width")
     min_peak_distance: float = Field(10.0, description="Minimum distance between peaks")
