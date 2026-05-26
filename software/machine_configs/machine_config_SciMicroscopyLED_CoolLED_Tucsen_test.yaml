@@ -162,12 +162,12 @@ devices:
       flip_direction: false
 
   led_matrix:
-    driver: teensy
+    driver: scimicroscopy_led_array
     enabled: true
     connection:
-      serial_number: null
+      serial_number: "12732490"
     config:
-      distance: 50
+      distance: 65
       default_na: 0.8
       turn_on_delay: 0.03
       default_color: [1, 1, 1]
