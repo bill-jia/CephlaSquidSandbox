@@ -186,6 +186,7 @@ class LaserAutofocusController(QObject):
         # Find initial spot position
         self.turn_on_AF_laser()
 
+        self._log.info(f"Finding laser spot for autofocus initialization using crop {self.laser_af_properties.initialize_crop_width}x{self.laser_af_properties.initialize_crop_height}")
         result = self._get_laser_spot_centroid(
             remove_background=True,
             use_center_crop=(
@@ -196,6 +197,7 @@ class LaserAutofocusController(QObject):
         if result is None:
             self._log.error("Failed to find laser spot during initialization")
             self.turn_off_AF_laser()
+            self.is_initialized = False
             return False
         x, y = result
 
@@ -218,6 +220,9 @@ class LaserAutofocusController(QObject):
         # Calibrate pixel-to-um conversion
         if not self._calibrate_pixel_to_um():
             self._log.error("Failed to calibrate pixel-to-um conversion")
+            # initialize_manual set is_initialized=True above; calibration failed,
+            # so the system is not usable until re-initialized.
+            self.is_initialized = False
             return False
 
         # Save configuration
@@ -595,6 +600,7 @@ class LaserAutofocusController(QObject):
                 try:
                     with self._time("af:spot_centroid_loop:get_frame"):
                         image = self.get_new_frame()
+                        self._log.info(f"Captured frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n} with shape {image.shape} for spot centroid calculation")
                         if image is None:
                             self._log.warning(f"Failed to read frame {i + 1}/{self.laser_af_properties.laser_af_averaging_n}")
                             continue
@@ -604,6 +610,7 @@ class LaserAutofocusController(QObject):
                         full_height, full_width = image.shape[:2]
 
                         if use_center_crop is not None:
+                            self._log.info(f"Using center crop of size {use_center_crop} for spot detection")
                             image = utils.crop_image(image, use_center_crop[0], use_center_crop[1])
 
                         if remove_background:

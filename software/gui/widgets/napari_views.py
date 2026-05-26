@@ -951,6 +951,17 @@ class NapariLiveWidget(QWidget):
         self.pg_image_item = pg.ImageItem()
         self.histogram_widget = pg.HistogramLUTWidget(image=self.pg_image_item)
         self.histogram_widget.setFixedWidth(100)
+        # The contrast-limit region is added to the histogram view box with its bounds
+        # counted toward auto-ranging. Because the region usually spans the full dtype
+        # range (e.g. 0-65535 for uint16), any auto-range - including an accidental click
+        # on the view box's auto-range button - rescales the value axis to the contrast
+        # limits instead of the image data, squashing the histogram into a thin sliver.
+        # Re-add the regions ignoring their bounds so the histogram always scales to the
+        # measured pixel values.
+        hist_vb = self.histogram_widget.item.vb
+        for region in self.histogram_widget.item.regions:
+            hist_vb.removeItem(region)
+            hist_vb.addItem(region, ignoreBounds=True)
         self.histogram_dock = self.viewer.window.add_dock_widget(self.histogram_widget, area="right", name="hist")
         self.histogram_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.histogram_dock.setTitleBarWidget(QWidget())

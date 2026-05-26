@@ -306,6 +306,7 @@ def find_spot_location(
 
         peak_y = np.argmax(y_intensity_profile)
 
+        print(f"Detected peak Y position: {peak_y} in image of height {image.shape[0]} with y_window={p['y_window']}")
         # Validate peak_y location
         if peak_y < p["y_window"] or peak_y > image.shape[0] - p["y_window"]:
             raise ValueError("Spot too close to image edge")

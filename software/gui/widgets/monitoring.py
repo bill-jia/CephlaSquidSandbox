@@ -317,6 +317,149 @@ class BackpressureMonitorWidget(QWidget):
         super().closeEvent(event)
 
 
+class StopwatchWidget(QWidget):
+    """Compact free-running stopwatch for the status bar.
+
+    A manual timing aid, independent of acquisition: it runs until the user
+    stops it and survives across acquisition start/stop. Intended for timing
+    manual interventions during long multipoint runs (e.g. drug treatments).
+
+    Buttons:
+        Start/Pause/Resume: toggle the clock (time turns green while running).
+        Mark: record a lap. Logs total elapsed, split since the previous mark,
+            and wall-clock time at INFO so interventions are timestamped in the
+            application log.
+        Reset: zero the clock and clear marks.
+
+    Timing uses ``time.monotonic()`` and banks elapsed time across pause/resume,
+    so the display stays accurate even if GUI timer ticks are delayed under load.
+    """
+
+    UPDATE_INTERVAL_MS = 250  # display refresh only; timing is monotonic-clock based
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._log = logging.getLogger("squid." + self.__class__.__name__)
+        self._accumulated_s = 0.0   # elapsed banked before the current running segment
+        self._run_start = None      # monotonic timestamp of current segment, or None if paused
+        self._mark_count = 0
+        self._last_mark_s = 0.0     # total elapsed at the previous mark, for split times
+        self._setup_ui()
+        self._setup_timer()
+        self._refresh()
+
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        self.label_prefix = QLabel("Stopwatch:")
+        self.label_prefix.setStyleSheet("font-weight: bold;")
+
+        fm = QFontMetrics(self.font())
+        self.label_time = QLabel("00:00:00")
+        self.label_time.setFixedWidth(fm.horizontalAdvance("88:88:88") + 8)
+        self.label_time.setAlignment(Qt.AlignCenter)
+        self._time_style_stopped = "font-family: monospace;"
+        self._time_style_running = "font-family: monospace; color: #2ecc71; font-weight: bold;"
+        self.label_time.setStyleSheet(self._time_style_stopped)
+
+        self.btn_start = self._make_button("Start", self.toggle)
+        self.btn_mark = self._make_button("Mark", self.mark)
+        self.btn_reset = self._make_button("Reset", self.reset)
+
+        self.label_marks = QLabel("")
+        self.label_marks.setStyleSheet("color: #666;")
+
+        layout.addWidget(self.label_prefix)
+        layout.addWidget(self.label_time)
+        layout.addWidget(self.btn_start)
+        layout.addWidget(self.btn_mark)
+        layout.addWidget(self.btn_reset)
+        layout.addWidget(self.label_marks)
+
+    @staticmethod
+    def _make_button(text, slot) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setAutoDefault(False)
+        btn.setDefault(False)
+        btn.clicked.connect(slot)
+        return btn
+
+    def _setup_timer(self):
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(self.UPDATE_INTERVAL_MS)
+        self._update_timer.timeout.connect(self._refresh)
+
+    @property
+    def running(self) -> bool:
+        return self._run_start is not None
+
+    def elapsed_s(self) -> float:
+        if self._run_start is not None:
+            return self._accumulated_s + (time.monotonic() - self._run_start)
+        return self._accumulated_s
+
+    @staticmethod
+    def _format(seconds: float) -> str:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def toggle(self):
+        if self.running:
+            # Pause: bank elapsed time so the next Resume continues from here.
+            self._accumulated_s = self.elapsed_s()
+            self._run_start = None
+            self._update_timer.stop()
+        else:
+            self._run_start = time.monotonic()
+            self._update_timer.start()
+        self._refresh()
+
+    def mark(self):
+        """Record a lap without affecting the clock."""
+        if not self.running and self.elapsed_s() == 0.0:
+            return
+        elapsed = self.elapsed_s()
+        self._mark_count += 1
+        split = elapsed - self._last_mark_s
+        self._last_mark_s = elapsed
+        wall = datetime.now().strftime("%H:%M:%S")
+        self._log.info(
+            f"Stopwatch mark #{self._mark_count}: {self._format(elapsed)} elapsed "
+            f"(+{self._format(split)} since last mark) at {wall}"
+        )
+        self._refresh()
+
+    def reset(self):
+        self._accumulated_s = 0.0
+        self._run_start = None
+        self._mark_count = 0
+        self._last_mark_s = 0.0
+        self._update_timer.stop()
+        self._refresh()
+
+    def _refresh(self):
+        elapsed = self.elapsed_s()
+        self.label_time.setText(self._format(elapsed))
+        if self.running:
+            self.btn_start.setText("Pause")
+            self.label_time.setStyleSheet(self._time_style_running)
+        else:
+            self.btn_start.setText("Start" if elapsed == 0.0 else "Resume")
+            self.label_time.setStyleSheet(self._time_style_stopped)
+        self.btn_mark.setEnabled(self.running or elapsed > 0.0)
+        if self._mark_count > 0:
+            self.label_marks.setText(f"marks: {self._mark_count} | last @ {self._format(self._last_mark_s)}")
+        else:
+            self.label_marks.setText("")
+
+    def closeEvent(self, event):
+        self._update_timer.stop()
+        super().closeEvent(event)
+
+
 def _is_filter_wheel_enabled(config_repo=None) -> bool:
     """True if ``emission_filter_wheel`` is enabled in MachineConfig."""
     from control.core.config.repository import ConfigRepository

@@ -218,31 +218,6 @@ def check_ram_available_with_error_dialog(
     return True
 
 
-def get_last_used_saving_path() -> str:
-    """Get the last used saving path from cache file, or return the default."""
-    cache_file = "cache/last_saving_path.txt"
-    try:
-        with open(cache_file, "r") as f:
-            path = f.read().strip()
-            if path and os.path.isdir(path):
-                return path
-    except OSError:
-        pass
-    return DEFAULT_SAVING_PATH
-
-
-def save_last_used_saving_path(path: str) -> None:
-    """Save the last used saving path to cache file."""
-    if path:  # Only save non-empty paths
-        cache_file = "cache/last_saving_path.txt"
-        try:
-            os.makedirs("cache", exist_ok=True)
-            with open(cache_file, "w") as f:
-                f.write(path)
-        except OSError:
-            pass  # Silently fail - caching is a convenience feature
-
-
 class WrapperWindow(QMainWindow):
     def __init__(self, content_widget, *args, **kwargs):
         super().__init__(*args, **kwargs)

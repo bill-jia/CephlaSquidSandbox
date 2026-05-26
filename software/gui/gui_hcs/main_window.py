@@ -102,9 +102,30 @@ from gui.widgets.multipoint import TemplateMultiPointWidget
 
 from .qt_controllers import MovementUpdater, QtAutoFocusController, QtMultiPointController
 
+class FocusCameraDialog(QDialog):
+    """Non-modal popup hosting the focus-camera live view + laser AF settings.
+
+    Lives behind a Tools-menu action. Stops focus-camera live whenever it is
+    hidden (closed/Escape) so the focus camera is never left streaming in the
+    background.
+    """
+
+    def __init__(self, settings_widget, on_hidden, parent=None):
+        super().__init__(parent)
+        self._settings_widget = settings_widget
+        self._on_hidden = on_hidden
+        self.setWindowTitle("Focus Camera / Laser AF Setup")
+        # Non-modal so the user can drive the stage / acquisition while watching
+        # the focus-camera spot.
+        self.setModal(False)
+
+    def hideEvent(self, event):
+        self._on_hidden()
+        super().hideEvent(event)
+
+
 class HighContentScreeningGui(QMainWindow):
     fps_software_trigger = 100
-    LASER_BASED_FOCUS_TAB_NAME = "Laser-Based Focus"
     signal_performance_mode_changed = Signal(bool)
 
     def __init__(
@@ -244,6 +265,7 @@ class HighContentScreeningGui(QMainWindow):
         self.fastAcquisitionWidget: Optional[widgets.FastAcquisitionWidget] = None
         self.ramMonitorWidget: Optional[widgets.RAMMonitorWidget] = None
         self.backpressureMonitorWidget: Optional[widgets.BackpressureMonitorWidget] = None
+        self.stopwatchWidget: Optional[widgets.StopwatchWidget] = None
 
         self.recordTabWidget: QTabWidget = QTabWidget()
         # Always-visible controls panel (replaces the old tabbed UI).
@@ -349,6 +371,14 @@ class HighContentScreeningGui(QMainWindow):
             filter_wheel_config_action = QAction("Filter Wheel Configuration", self)
             filter_wheel_config_action.triggered.connect(self.openFilterWheelConfigEditor)
             advanced_menu.addAction(filter_wheel_config_action)
+
+        # Tools menu (only populated when the focus camera is present for now)
+        if self.microscope.addons.camera_focus and getattr(self, "focusCameraDialog", None) is not None:
+            tools_menu = menubar.addMenu("Tools")
+            focus_camera_action = QAction("Focus Camera / Laser AF Setup...", self)
+            focus_camera_action.setMenuRole(QAction.NoRole)
+            focus_camera_action.triggered.connect(self.openFocusCameraDialog)
+            tools_menu.addAction(focus_camera_action)
 
         if USE_JUPYTER_CONSOLE:
             # Create namespace to expose to Jupyter
@@ -587,6 +617,7 @@ class HighContentScreeningGui(QMainWindow):
                 self.laserAutofocusController, self.liveController
             )
             self.imageDisplayWindow_focus = core.ImageDisplayWindow(liveController=self.liveController_focus_camera)
+            self._build_focus_camera_dialog()
 
         if RUN_FLUIDICS:
             self.fluidicsWidget = widgets.FluidicsWidget(self.fluidics)
@@ -875,18 +906,36 @@ class HighContentScreeningGui(QMainWindow):
             # Connect the point clicked signal to move the stage
             self.zPlotWidget.signal_point_clicked.connect(self.move_to_mm)
 
-        if self.microscope.addons.camera_focus:
-            dock_laserfocus_image_display = dock.Dock("Focus Camera Image Display", autoOrientation=False)
-            dock_laserfocus_image_display.showTitleBar()
-            dock_laserfocus_image_display.addWidget(self.imageDisplayWindow_focus.widget)
-            dock_laserfocus_image_display.setStretch(x=100, y=100)
+        # The focus-camera live view + laser AF settings live in a Tools-menu
+        # popup (built in _build_focus_camera_dialog), not an image-display tab.
 
-            dock_laserfocus_liveController = dock.Dock("Laser Autofocus Settings", autoOrientation=False)
-            dock_laserfocus_liveController.showTitleBar()
-            dock_laserfocus_liveController.addWidget(self.laserAutofocusSettingWidget)
-            dock_laserfocus_liveController.setStretch(x=100, y=100)
-            dock_laserfocus_liveController.setFixedWidth(self.laserAutofocusSettingWidget.minimumSizeHint().width())
+        if RUN_FLUIDICS:
+            self.imageDisplayTabs.addTab(self.fluidicsWidget, "Fluidics")
 
+        # Only add NI DAQ tab if the widget was created (nidaq enabled in MachineConfig)
+        if hasattr(self, "niDAQWidget") and self.niDAQWidget is not None:
+            self.imageDisplayTabs.addTab(self.niDAQWidget, "NI DAQ")
+
+    def _build_focus_camera_dialog(self):
+        """Build the Tools-menu popup that holds the focus-camera live view and
+        the laser AF settings widget. Uses a pyqtgraph DockArea so the image and
+        settings panels stay independently resizable, matching the old tab."""
+        dock_image_display = dock.Dock("Focus Camera Image Display", autoOrientation=False)
+        dock_image_display.showTitleBar()
+        dock_image_display.addWidget(self.imageDisplayWindow_focus.widget)
+        dock_image_display.setStretch(x=100, y=100)
+
+        dock_settings = dock.Dock("Laser Autofocus Settings", autoOrientation=False)
+        dock_settings.showTitleBar()
+        dock_settings.addWidget(self.laserAutofocusSettingWidget)
+        dock_settings.setStretch(x=100, y=100)
+        dock_settings.setFixedWidth(self.laserAutofocusSettingWidget.minimumSizeHint().width())
+
+        focus_dockArea = dock.DockArea()
+        focus_dockArea.addDock(dock_image_display)
+        focus_dockArea.addDock(dock_settings, "right", relativeTo=dock_image_display)
+
+        if SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS:
             dock_waveform = dock.Dock("Displacement Measurement", autoOrientation=False)
             dock_waveform.showTitleBar()
             dock_waveform.addWidget(self.waveformDisplay)
@@ -898,23 +947,32 @@ class HighContentScreeningGui(QMainWindow):
             dock_displayMeasurement.setStretch(x=100, y=40)
             dock_displayMeasurement.setFixedWidth(self.displacementMeasurementWidget.minimumSizeHint().width())
 
-            laserfocus_dockArea = dock.DockArea()
-            laserfocus_dockArea.addDock(dock_laserfocus_image_display)
-            laserfocus_dockArea.addDock(
-                dock_laserfocus_liveController, "right", relativeTo=dock_laserfocus_image_display
-            )
-            if SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS:
-                laserfocus_dockArea.addDock(dock_waveform, "bottom", relativeTo=dock_laserfocus_liveController)
-                laserfocus_dockArea.addDock(dock_displayMeasurement, "bottom", relativeTo=dock_waveform)
+            focus_dockArea.addDock(dock_waveform, "bottom", relativeTo=dock_settings)
+            focus_dockArea.addDock(dock_displayMeasurement, "bottom", relativeTo=dock_waveform)
 
-            self.imageDisplayTabs.addTab(laserfocus_dockArea, self.LASER_BASED_FOCUS_TAB_NAME)
+        self.focusCameraDialog = FocusCameraDialog(
+            settings_widget=self.laserAutofocusSettingWidget,
+            on_hidden=self._on_focus_camera_dialog_hidden,
+            parent=self,
+        )
+        dialog_layout = QVBoxLayout(self.focusCameraDialog)
+        dialog_layout.setContentsMargins(0, 0, 0, 0)
+        dialog_layout.addWidget(focus_dockArea)
+        self.focusCameraDialog.resize(1000, 700)
 
-        if RUN_FLUIDICS:
-            self.imageDisplayTabs.addTab(self.fluidicsWidget, "Fluidics")
+    def openFocusCameraDialog(self):
+        """Show (or re-show) the focus-camera live view popup."""
+        if getattr(self, "focusCameraDialog", None) is None:
+            return
+        self.focusCameraDialog.show()
+        self.focusCameraDialog.raise_()
+        self.focusCameraDialog.activateWindow()
 
-        # Only add NI DAQ tab if the widget was created (nidaq enabled in MachineConfig)
-        if hasattr(self, "niDAQWidget") and self.niDAQWidget is not None:
-            self.imageDisplayTabs.addTab(self.niDAQWidget, "NI DAQ")
+    def _on_focus_camera_dialog_hidden(self):
+        """Stop focus-camera live when the popup closes so the focus camera
+        isn't left streaming in the background."""
+        if getattr(self, "laserAutofocusSettingWidget", None) is not None:
+            self.laserAutofocusSettingWidget.stop_live()
 
     def setupRecordTabWidget(self):
         if ENABLE_WELLPLATE_MULTIPOINT:
@@ -1041,6 +1099,10 @@ class HighContentScreeningGui(QMainWindow):
         self.warningErrorWidget.setVisible(False)
         self._warning_handler = None
 
+        # Free-running stopwatch: a manual timing aid (e.g. drug-treatment timing).
+        # Independent of acquisition and always visible at the right of the status bar.
+        self.stopwatchWidget = widgets.StopwatchWidget()
+
     def setup_layout(self):
         layout = QVBoxLayout()
 
@@ -1129,6 +1191,10 @@ class HighContentScreeningGui(QMainWindow):
         if self.warningErrorWidget is not None:
             self.statusBar().addWidget(self.warningErrorWidget)  # Left-aligned
 
+        # Stopwatch sits at the right end of the status bar and is always visible.
+        if self.stopwatchWidget is not None:
+            self.statusBar().addPermanentWidget(self.stopwatchWidget)  # Right-aligned
+
     def _getMainWindowMinimumSize(self):
         """
         We want our main window to fit on the primary screen, so grab the users primary screen and return
@@ -1191,6 +1257,7 @@ class HighContentScreeningGui(QMainWindow):
         self.recordingControlWidget.signal_acquisition_started.connect(self.toggleAcquisitionStart)
 
         self.profileWidget.signal_profile_changed.connect(self._refresh_channel_lists)
+        self.profileWidget.signal_profile_changed.connect(self._apply_saving_paths_for_active_profile)
         self.profileWidget.signal_profile_changed.connect(self.observationStateWidget.refresh_presets)
 
         if not self.live_only_mode:
@@ -1306,8 +1373,15 @@ class HighContentScreeningGui(QMainWindow):
             self.laserAutofocusSettingWidget.signal_newAnalogGain.connect(
                 self.cameraSettingWidget_focus_camera.set_analog_gain
             )
-            self.laserAutofocusSettingWidget.signal_apply_settings.connect(
-                self.laserAutofocusControlWidget.update_init_state
+            # "Initialize" lives in the control widget; route the click to the
+            # settings widget (which owns the spinboxes apply_and_initialize needs)
+            # and feed the result back to the control widget's button-enable state
+            # and status indicator.
+            self.laserAutofocusControlWidget.signal_initialize_requested.connect(
+                self.laserAutofocusSettingWidget.apply_and_initialize
+            )
+            self.laserAutofocusSettingWidget.signal_initialization_finished.connect(
+                self.laserAutofocusControlWidget.on_initialization_finished
             )
             self.laserAutofocusSettingWidget.signal_laser_spot_location.connect(self.imageDisplayWindow_focus.mark_spot)
             self.laserAutofocusSettingWidget.update_exposure_time(
@@ -1618,8 +1692,7 @@ class HighContentScreeningGui(QMainWindow):
     def toggleNapariTabs(self):
         # Enable/disable Napari tabs based on performance mode
         for i in range(1, self.imageDisplayTabs.count()):
-            if self.imageDisplayTabs.tabText(i) != self.LASER_BASED_FOCUS_TAB_NAME:
-                self.imageDisplayTabs.setTabEnabled(i, not self.performance_mode)
+            self.imageDisplayTabs.setTabEnabled(i, not self.performance_mode)
 
         if self.performance_mode:
             # Switch to the NapariLiveWidget tab if it exists
@@ -2074,15 +2147,8 @@ class HighContentScreeningGui(QMainWindow):
         if hasattr(current_widget, "viewer"):
             current_widget.activate()
 
-        # Stop focus camera live if not on laser focus tab
-        if self.microscope.addons.camera_focus:
-            is_laser_focus_tab = self.imageDisplayTabs.tabText(index) == self.LASER_BASED_FOCUS_TAB_NAME
-
-            if hasattr(self, "dock_wellSelection"):
-                self.dock_wellSelection.setVisible(not is_laser_focus_tab)
-
-            if not is_laser_focus_tab:
-                self.laserAutofocusSettingWidget.stop_live()
+        # (Focus-camera live is started/stopped from the Tools-menu popup, which
+        # stops live on close — no per-tab handling needed here.)
 
         # Only show well selector in Live View tab if it was previously shown
         if self.imageDisplayTabs.tabText(index) == "Live View":
@@ -2256,10 +2322,13 @@ class HighContentScreeningGui(QMainWindow):
         self._update_status_bar_visibility()
 
     def _update_status_bar_visibility(self):
-        """Show or hide status bar based on whether any monitor widgets should be visible."""
+        """Show or hide status bar based on monitor widgets and the always-on stopwatch."""
         warning_has_messages = self.warningErrorWidget is not None and self.warningErrorWidget.has_messages()
+        # The stopwatch is always present, so the status bar stays visible once created.
+        stopwatch_present = self.stopwatchWidget is not None
         self.statusBar().setVisible(
-            self._ram_monitor_should_show or self._bp_monitor_should_show or warning_has_messages
+            self._ram_monitor_should_show or self._bp_monitor_should_show
+            or warning_has_messages or stopwatch_present
         )
 
     def _connect_ram_monitor_widget(self):
@@ -2464,6 +2533,67 @@ class HighContentScreeningGui(QMainWindow):
     # GUI state persistence (per-profile gui_state.yaml)
     # ─────────────────────────────────────────────────────────────────────
 
+    def _default_saving_path(self) -> str:
+        """Per-profile default save folder: ``C:/Microscope_Data/<profile>``.
+
+        Created on demand so it's ready for Browse dialogs and snaps. Falls back
+        to the global default if somehow no profile is active.
+        """
+        profile = self.microscope.config_repo.current_profile
+        path = os.path.join(DEFAULT_SAVING_PATH, profile) if profile else DEFAULT_SAVING_PATH
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            self.log.exception("Could not create default save folder %s", path)
+        return path
+
+    def _apply_profile_saving_paths(self, gui_state: Optional[GuiState]) -> None:
+        """Point snap + acquisition save folders at the active profile.
+
+        Uses the folder saved in the profile's gui_state, or the per-profile
+        default (``C:/Microscope_Data/<profile>``) when none is saved. All
+        multipoint widgets share one controller, so they get the same folder.
+        Called at startup and whenever the user switches profile.
+        """
+        default_path = self._default_saving_path()
+
+        snap_path = (gui_state.snap_saving_dir if gui_state else None) or default_path
+        lcw = self.liveControlWidget
+        if lcw is not None:
+            try:
+                lcw.snap_saving_path = snap_path
+                lcw.lineEdit_snapSavingDir.setText(snap_path)
+            except Exception:
+                self.log.exception("Failed to set snap save folder")
+
+        acq_path = (gui_state.acquisition_saving_dir if gui_state else None) or default_path
+        try:
+            self.multipointController.set_base_path(acq_path)
+        except Exception:
+            self.log.exception("Failed to set acquisition base path")
+        for w in (
+            self.flexibleMultiPointWidget,
+            self.wellplateMultiPointWidget,
+            self.templateMultiPointWidget,
+            self.multiPointWithFluidicsWidget,
+        ):
+            if w is None:
+                continue
+            try:
+                w.lineEdit_savingDir.setText(acq_path)
+                w.base_path_is_set = True
+            except Exception:
+                self.log.exception("Failed to set acquisition save folder on %s", type(w).__name__)
+
+    def _apply_saving_paths_for_active_profile(self) -> None:
+        """Reload + re-apply save folders for the active profile (live switch)."""
+        try:
+            gui_state = self.microscope.config_repo.get_gui_state()
+        except Exception:
+            self.log.exception("Failed to load gui_state for save folders")
+            gui_state = None
+        self._apply_profile_saving_paths(gui_state)
+
     def _collect_gui_state(self) -> GuiState:
         """Snapshot transient UI selections for save_gui_state()."""
         state = GuiState()
@@ -2488,6 +2618,11 @@ class HighContentScreeningGui(QMainWindow):
 
         try:
             state.record_tab_index = int(self.recordTabWidget.currentIndex())
+        except Exception:
+            pass
+
+        try:
+            state.acquisition_saving_dir = self.multipointController.base_path
         except Exception:
             pass
 
@@ -2556,9 +2691,13 @@ class HighContentScreeningGui(QMainWindow):
             gui_state = self.microscope.config_repo.get_gui_state()
         except Exception:
             self.log.exception("Failed to load gui_state")
-            return
+            gui_state = None
         if gui_state is None:
-            return
+            # Fresh profile (no saved state yet) — still apply per-profile defaults.
+            gui_state = GuiState()
+
+        # Snap + acquisition save folders (per-profile default when unset)
+        self._apply_profile_saving_paths(gui_state)
 
         # Objective
         if gui_state.last_active_objective:
@@ -2577,15 +2716,9 @@ class HighContentScreeningGui(QMainWindow):
             except Exception:
                 self.log.exception("Failed to restore record tab index")
 
-        # Snap / live settings
+        # Snap / live settings (save folder is handled by _apply_profile_saving_paths)
         lcw = self.liveControlWidget
         if lcw is not None:
-            if gui_state.snap_saving_dir:
-                try:
-                    lcw.snap_saving_path = gui_state.snap_saving_dir
-                    lcw.lineEdit_snapSavingDir.setText(gui_state.snap_saving_dir)
-                except Exception:
-                    pass
             if gui_state.snap_tag:
                 try:
                     lcw.lineEdit_snapTag.setText(gui_state.snap_tag)
@@ -2718,6 +2851,8 @@ class HighContentScreeningGui(QMainWindow):
         # Stop laser autofocus
         if self.microscope.addons.camera_focus:
             try:
+                if getattr(self, "focusCameraDialog", None) is not None:
+                    self.focusCameraDialog.close()
                 self.liveController_focus_camera.stop_live()
                 self.imageDisplayWindow_focus.close()
             except Exception:

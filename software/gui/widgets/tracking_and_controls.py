@@ -572,21 +572,37 @@ class DisplacementMeasurementWidget(QFrame):
 
 
 class LaserAutofocusControlWidget(QFrame):
+    # Emitted when the user clicks "Initialize". The main window routes this to
+    # the focus-camera settings widget's apply_and_initialize() (the settings
+    # spinboxes it needs live in the Tools-menu popup, not here).
+    signal_initialize_requested = Signal()
+
     def __init__(self, laserAutofocusController, liveController: LiveController, main=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.laserAutofocusController = laserAutofocusController
         self.liveController: LiveController = liveController
+        # True only after a successful Initialize (initialize_auto) in this session.
+        # A cache load configures the ROI but does NOT re-locate the spot, so it does
+        # not count as initialized for the purpose of enabling Set Reference / Measure.
+        self._session_initialized = False
         self.add_components()
         self.update_init_state()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
     def add_components(self):
+        self.btn_initialize = QPushButton("Initialize")
+        self.btn_initialize.setStyleSheet("background-color: #C2C2FF")
+        self.btn_initialize.setCheckable(False)
+        self.btn_initialize.setDefault(False)
+
+        # Simple at-a-glance indicator of whether initialization succeeded.
+        self.label_init_status = QLabel()
+        self.label_init_status.setAlignment(Qt.AlignCenter)
+
         self.btn_set_reference = QPushButton(" Set Reference ")
         self.btn_set_reference.setCheckable(False)
         self.btn_set_reference.setChecked(False)
         self.btn_set_reference.setDefault(False)
-        if not self.laserAutofocusController.is_initialized:
-            self.btn_set_reference.setEnabled(False)
 
         self.label_displacement = QLabel()
         self.label_displacement.setFrameStyle(QFrame.Panel | QFrame.Sunken)
@@ -595,8 +611,6 @@ class LaserAutofocusControlWidget(QFrame):
         self.btn_measure_displacement.setCheckable(False)
         self.btn_measure_displacement.setChecked(False)
         self.btn_measure_displacement.setDefault(False)
-        if not self.laserAutofocusController.is_initialized:
-            self.btn_measure_displacement.setEnabled(False)
 
         self.entry_target = QDoubleSpinBox()
         self.entry_target.setMinimum(-100)
@@ -610,32 +624,71 @@ class LaserAutofocusControlWidget(QFrame):
         self.btn_move_to_target.setCheckable(False)
         self.btn_move_to_target.setChecked(False)
         self.btn_move_to_target.setDefault(False)
-        if not self.laserAutofocusController.is_initialized:
-            self.btn_move_to_target.setEnabled(False)
 
         self.grid = QGridLayout()
 
-        self.grid.addWidget(self.btn_set_reference, 0, 0, 1, 4)
+        self.grid.addWidget(self.btn_initialize, 0, 0, 1, 4)
+        self.grid.addWidget(self.label_init_status, 1, 0, 1, 4)
 
-        self.grid.addWidget(QLabel("Displacement (um)"), 1, 0)
-        self.grid.addWidget(self.label_displacement, 1, 1)
-        self.grid.addWidget(self.btn_measure_displacement, 1, 2, 1, 2)
+        self.grid.addWidget(self.btn_set_reference, 2, 0, 1, 4)
 
-        self.grid.addWidget(QLabel("Target (um)"), 2, 0)
-        self.grid.addWidget(self.entry_target, 2, 1)
-        self.grid.addWidget(self.btn_move_to_target, 2, 2, 1, 2)
+        self.grid.addWidget(QLabel("Displacement (um)"), 3, 0)
+        self.grid.addWidget(self.label_displacement, 3, 1)
+        self.grid.addWidget(self.btn_measure_displacement, 3, 2, 1, 2)
+
+        self.grid.addWidget(QLabel("Target (um)"), 4, 0)
+        self.grid.addWidget(self.entry_target, 4, 1)
+        self.grid.addWidget(self.btn_move_to_target, 4, 2, 1, 2)
         self.setLayout(self.grid)
 
         # make connections
+        self.btn_initialize.clicked.connect(self.signal_initialize_requested)
         self.btn_set_reference.clicked.connect(self.on_set_reference_clicked)
         self.btn_measure_displacement.clicked.connect(self.on_measure_displacement_clicked)
         self.btn_move_to_target.clicked.connect(self.move_to_target)
         self.laserAutofocusController.signal_displacement_um.connect(self.label_displacement.setNum)
 
+    def _set_status_indicator(self, state: str):
+        """state: 'ok' (verified this session), 'failed' (last init attempt failed),
+        'cached' (ROI loaded from cache but spot not re-located this session), or 'off'."""
+        if state == "ok":
+            self.label_init_status.setText("● Initialized")
+            self.label_init_status.setStyleSheet("color: #1E8449; font-weight: bold;")
+        elif state == "failed":
+            self.label_init_status.setText("● Initialization failed")
+            self.label_init_status.setStyleSheet("color: #C0392B; font-weight: bold;")
+        elif state == "cached":
+            self.label_init_status.setText("◐ Loaded from cache — click Initialize")
+            self.label_init_status.setStyleSheet("color: #B9770E; font-weight: bold;")
+        else:
+            self.label_init_status.setText("○ Not initialized")
+            self.label_init_status.setStyleSheet("color: #7F8C8D;")
+
+    def _apply_button_state(self):
+        """Enable the action buttons only once the spot has been located this session.
+        Measure/Move additionally require a stored reference."""
+        has_reference = self.laserAutofocusController.laser_af_properties.has_reference
+        self.btn_set_reference.setEnabled(self._session_initialized)
+        self.btn_measure_displacement.setEnabled(self._session_initialized and has_reference)
+        self.btn_move_to_target.setEnabled(self._session_initialized and has_reference)
+
     def update_init_state(self):
-        self.btn_set_reference.setEnabled(self.laserAutofocusController.is_initialized)
-        self.btn_measure_displacement.setEnabled(self.laserAutofocusController.laser_af_properties.has_reference)
-        self.btn_move_to_target.setEnabled(self.laserAutofocusController.laser_af_properties.has_reference)
+        """Refresh after construction or a profile/objective change.
+
+        A cache load re-applies the saved ROI but does NOT re-locate the laser spot,
+        so the system is treated as unverified until the user runs Initialize this
+        session: the action buttons stay disabled and the indicator shows the amber
+        'cached' state (or gray 'not initialized' when there is no cached config)."""
+        self._session_initialized = False
+        self._apply_button_state()
+        self._set_status_indicator("cached" if self.laserAutofocusController.is_initialized else "off")
+
+    def on_initialization_finished(self, success: bool):
+        """Slot for the settings widget's signal_initialization_finished. Only a
+        successful initialize_auto here marks the session as verified (green)."""
+        self._session_initialized = bool(success)
+        self._apply_button_state()
+        self._set_status_indicator("ok" if success else "failed")
 
     def move_to_target(self):
         was_live = self.liveController.is_live
@@ -651,11 +704,18 @@ class LaserAutofocusControlWidget(QFrame):
         if was_live:
             self.liveController.stop_live()
         success = self.laserAutofocusController.set_reference()
+        if was_live:
+            self.liveController.start_live()
         if success:
             self.btn_measure_displacement.setEnabled(True)
             self.btn_move_to_target.setEnabled(True)
-        if was_live:
-            self.liveController.start_live()
+        else:
+            QMessageBox.warning(
+                self,
+                "Set Reference Failed",
+                "Could not detect the laser spot. Re-run Initialize to re-locate the "
+                "spot, then set the reference again.",
+            )
 
     def on_measure_displacement_clicked(self):
         was_live = self.liveController.is_live
