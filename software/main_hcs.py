@@ -32,27 +32,17 @@ import squid.logging
 # Set up exception logging to catch and log unhandled exceptions
 squid.logging.setup_uncaught_exception_logging()
 
-# Application-specific libraries
-import gui.gui_hcs as gui
+# Application-specific libraries.
+#
+# Only lightweight config flags are imported at module load. The heavy stack —
+# gui.gui_hcs (napari/pyqtgraph) and control.microscope (camera/NIDAQ drivers) —
+# costs ~13s to import, so it is deferred into __main__ and imported *after* the
+# profile picker is shown. This lets the picker appear in <1s instead of ~13s.
 from control._def import USE_TERMINAL_CONSOLE, ENABLE_MCP_SERVER_SUPPORT, CONTROL_SERVER_HOST, CONTROL_SERVER_PORT
 import control._def
-import control.utils
-import control.microscope
 
 # Import auto-migration function
 # from tools.migrate_acquisition_configs import run_auto_migration
-
-
-if USE_TERMINAL_CONSOLE:
-    from control.console import ConsoleThread
-
-if ENABLE_MCP_SERVER_SUPPORT:
-    from control.microscope_control_server import MicroscopeControlServer
-    from gui.widgets.claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
-    import shlex
-    import subprocess
-    import shutil
-    import tempfile
 
 
 if __name__ == "__main__":
@@ -95,8 +85,6 @@ if __name__ == "__main__":
         log.error("Couldn't setup logging to file!")
         sys.exit(1)
 
-    log.info(f"Squid Repository State: {control.utils.get_squid_repo_state_description()}")
-
     # When running with --simulation, default all per-component SIMULATE_* to True
     # (config can override with simulate_camera=false etc. to use real hardware for that component)
     control._def.apply_simulation_mode_defaults(args.simulation)
@@ -110,15 +98,36 @@ if __name__ == "__main__":
     # This allows shutdown via ctrl+C even after the gui has popped up.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    # Resolve which user profile to load before any hardware is initialized.
-    # --profile on the CLI wins; otherwise prompt the user with a dialog.
+    # Resolve which user profile to load BEFORE importing the heavy GUI/hardware
+    # stack, so the picker appears in <1s instead of after the full ~13s import.
+    # --profile on the CLI wins; otherwise prompt the user with a dialog. The
+    # dialog module is deliberately a lightweight import (Qt + ConfigRepository).
     profile_name = args.profile
     if profile_name is None:
-        from gui.widgets.profile_selection import prompt_for_profile
+        from gui.profile_selection import prompt_for_profile
         profile_name = prompt_for_profile()
         if profile_name is None:
             log.info("Profile selection cancelled — exiting")
             sys.exit(0)
+
+    # Heavy imports happen now, with the picker already dismissed: napari/pyqtgraph
+    # (gui.gui_hcs) and the full camera/NIDAQ driver stack (control.microscope).
+    import control.utils
+    import control.microscope
+    import gui.gui_hcs as gui
+
+    if USE_TERMINAL_CONSOLE:
+        from control.console import ConsoleThread
+
+    if ENABLE_MCP_SERVER_SUPPORT:
+        from control.microscope_control_server import MicroscopeControlServer
+        from gui.widgets.claude import ClaudeApiKeyDialog, load_claude_api_key_from_cache
+        import shlex
+        import subprocess
+        import shutil
+        import tempfile
+
+    log.info(f"Squid Repository State: {control.utils.get_squid_repo_state_description()}")
 
     # Build the microscope object from the global configuration. This will initialize all hardware components
     microscope = control.microscope.Microscope.build_from_global_config(

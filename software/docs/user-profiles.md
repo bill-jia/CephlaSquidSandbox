@@ -37,8 +37,9 @@ software/
 ### Startup selector (`ProfileSelectionDialog`)
 
 When `main_hcs.py` starts without an explicit `--profile` flag, it shows a
-modal **Select User Profile** dialog (`software/gui/widgets/profile_selection.py`)
-*before* any hardware initialization. The dialog:
+modal **Select User Profile** dialog (`software/gui/profile_selection.py`)
+*before* any hardware initialization — and, deliberately, before the heavy
+GUI/driver imports, so it appears in well under a second. The dialog:
 
 - Lists every directory under `user_profiles/`.
 - Pre-selects the last-active profile recorded in
