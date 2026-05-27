@@ -518,13 +518,17 @@ config: "Configuration (YAML)" {
     |
   }
 
-  machine_config: "machine_config.yaml" {
+  machine_config: "machine_configs/library/\n(selected machine config)" {
     class: storage
     tooltip: |md
       Top-level hardware definition:
       devices (teensy, camera, stage, piezo, laser_af, nidaq),
       illumination_devices, objectives,
       IO endpoints, hardware bindings.
+
+      Active config is picked from machine_configs/library/
+      via the startup dialog and remembered globally in
+      cache/last_machine_config.txt.
     |
   }
 

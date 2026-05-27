@@ -8,8 +8,11 @@ and recorded as the last-active profile through ``ConfigRepository``.
 
 from typing import Optional
 
+from pathlib import Path
+
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -47,6 +50,7 @@ class ProfileSelectionDialog(QDialog):
 
         self._setup_ui()
         self._populate_profiles()
+        self._populate_machine_configs()
         self._connect_signals()
         self._update_load_enabled()
 
@@ -81,6 +85,20 @@ class ProfileSelectionDialog(QDialog):
         new_row.addStretch()
         layout.addLayout(new_row)
 
+        # Bottom-left machine-config selector. The choice is global (shared by
+        # every profile) and persisted so it becomes the default next startup.
+        mc_row = QHBoxLayout()
+        mc_row.addWidget(QLabel("Machine config:"))
+        self.combo_machine_config = QComboBox()
+        self.combo_machine_config.setMinimumWidth(240)
+        self.combo_machine_config.setToolTip(
+            "Hardware configuration loaded for this session, from "
+            "machine_configs/library/. Shared across all user profiles."
+        )
+        mc_row.addWidget(self.combo_machine_config)
+        mc_row.addStretch()
+        layout.addLayout(mc_row)
+
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Load profile")
         layout.addWidget(self.buttons)
@@ -110,6 +128,44 @@ class ProfileSelectionDialog(QDialog):
                 self.list_profiles.setCurrentItem(matches[0])
         # Disable "duplicate" when there's nothing to copy from.
         self.btn_new_copy.setEnabled(bool(profiles))
+
+    @staticmethod
+    def _machine_config_label(path: Path) -> str:
+        """Human-friendly combo label: strip the shared ``machine_config_`` prefix."""
+        stem = path.stem
+        prefix = "machine_config_"
+        return stem[len(prefix):] if stem.startswith(prefix) else stem
+
+    def _populate_machine_configs(self):
+        self.combo_machine_config.clear()
+        library = self.config_repo.get_machine_config_library()
+        active = self.config_repo.get_active_machine_config_source()
+
+        library_names = {path.name for path in library}
+        for path in library:
+            self.combo_machine_config.addItem(self._machine_config_label(path), str(path))
+
+        # The resolved config may be a root file not in the library (legacy
+        # side-by-side setup). Surface it so the dropdown can default to what is
+        # actually loaded, and the user can switch to a library entry.
+        if active is not None and active.name not in library_names:
+            self.combo_machine_config.insertItem(
+                0, f"{self._machine_config_label(active)} (current)", str(active)
+            )
+
+        if self.combo_machine_config.count() == 0:
+            self.combo_machine_config.addItem("(built-in default)", "")
+            self.combo_machine_config.setEnabled(False)
+            return
+
+        # Default to the config that would load this session (cached selection,
+        # else the current root file), matched by file name.
+        if active is not None:
+            for i in range(self.combo_machine_config.count()):
+                data = self.combo_machine_config.itemData(i)
+                if data and Path(data).name == active.name:
+                    self.combo_machine_config.setCurrentIndex(i)
+                    break
 
     def _update_load_enabled(self):
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(
@@ -175,7 +231,17 @@ class ProfileSelectionDialog(QDialog):
         if item is None:
             return
         self._selected_profile = item.text()
+        self._persist_machine_config_choice()
         self.accept()
+
+    def _persist_machine_config_choice(self):
+        """Record the selected machine config so it loads (and re-defaults) next time."""
+        if not self.combo_machine_config.isEnabled():
+            return
+        data = self.combo_machine_config.currentData()
+        if not data:
+            return
+        self.config_repo.set_machine_config_selection(Path(data))
 
     def selected_profile(self) -> Optional[str]:
         return self._selected_profile

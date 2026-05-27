@@ -9,7 +9,8 @@ The configuration system uses a hierarchical structure that separates concerns:
 ```
 software/
 ├── machine_configs/                    # Hardware-specific (per machine)
-│   ├── machine_config.yaml             # Root device inventory (see README); may embed filter_wheel_registry / hardware_bindings
+│   ├── library/                          # Selectable machine configs (machine_config*.yaml); chosen via the startup dialog
+│   ├── machine_config.yaml             # Optional pinned root device inventory (fallback; see README); may embed filter_wheel_registry / hardware_bindings
 │   ├── illumination_channel_config.yaml   # Illumination channels (required)
 │   ├── cameras.yaml                      # Optional: camera registry
 │   ├── filter_wheels.yaml                # Optional: standalone filter wheels (ignored if embedded registry is non-empty)
@@ -52,6 +53,16 @@ software/
 ## Machine Configs
 
 Machine configs define the physical hardware setup. These files live in `machine_configs/` and are typically configured once per microscope.
+
+### machine_config.yaml (active hardware config)
+
+The root device inventory for the microscope. Rather than editing a single file in place, configs are kept in a **library** and selected at startup:
+
+- **`machine_configs/library/`** holds the selectable configs (`machine_config*.yaml`), one per hardware setup.
+- The startup user-profile dialog shows a **Machine config** dropdown (bottom-left) listing the library. The choice is **global** — shared by every user profile, not stored per-profile.
+- The selection is persisted to `cache/last_machine_config.txt` and becomes the pre-selected default next launch.
+
+`ConfigRepository.get_machine_config()` resolves the active config in order: (1) the library config named in `cache/last_machine_config.txt`, (2) an explicit `machine_configs/machine_config.yaml`, (3) a single `machine_configs/machine_config_*.yaml` in the root, (4) a built-in default. Steps 2–3 are fallbacks for pinning a config by file; normal use goes through the library selector. See the [Machine Configs README](../machine_configs/README.md) for field-level details.
 
 ### illumination_channel_config.yaml
 
