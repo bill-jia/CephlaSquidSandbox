@@ -1,5 +1,12 @@
 from ._bootstrap import *
 
+# Live-view cap for the laser AF camera. The focus exposure is sub-millisecond,
+# so without an explicit cap the camera can free-run at hundreds of fps and
+# starve the GUI/CPU. 10 Hz matches the main camera live view and keeps the
+# perceived cadence responsive when locating the spot.
+LASER_AF_LIVE_VIEW_FPS = 10
+
+
 class LaserAutofocusSettingWidget(QWidget):
 
     signal_newExposureTime = Signal(float)
@@ -16,8 +23,8 @@ class LaserAutofocusSettingWidget(QWidget):
         self.liveController: LiveController = liveController
         self.laserAutofocusController = laserAutofocusController
         self.stretch = stretch
-        self.liveController.set_trigger_fps(10)
-        self.streamHandler.set_display_fps(10)
+        self.liveController.set_trigger_fps(LASER_AF_LIVE_VIEW_FPS)
+        self.streamHandler.set_display_fps(LASER_AF_LIVE_VIEW_FPS)
 
         # Enable background filling
         self.setAutoFillBackground(True)
@@ -28,6 +35,14 @@ class LaserAutofocusSettingWidget(QWidget):
         self.setPalette(palette)
 
         self.spinboxes = {}
+        # Cache of the most recent focus-camera frame for "Save Snapshot".
+        # Updated whenever the stream handler emits a new display frame.
+        self._last_focus_frame: Optional[np.ndarray] = None
+        self.streamHandler.image_to_display.connect(self._cache_focus_frame)
+        # Folder for AF snapshots. Set by main_window from the active profile's
+        # gui_state.snap_saving_dir so AF snaps land alongside regular snaps.
+        # When None, the save dialog opens at the current working directory.
+        self.snap_saving_path: Optional[str] = None
         self.init_ui()
         self.update_calibration_label()
 
@@ -40,10 +55,17 @@ class LaserAutofocusSettingWidget(QWidget):
         live_group.setFrameStyle(QFrame.Panel | QFrame.Raised)
         live_layout = QVBoxLayout()
 
-        # Live button
+        # Live button + Save Snapshot side by side
+        live_buttons_layout = QHBoxLayout()
         self.btn_live = QPushButton("Start Live")
         self.btn_live.setCheckable(True)
         self.btn_live.setStyleSheet("background-color: #C2C2FF")
+        live_buttons_layout.addWidget(self.btn_live)
+        self.btn_save_snapshot = QPushButton("Save Snapshot")
+        # Disabled until we've seen at least one frame, so users don't get an
+        # empty-file surprise.
+        self.btn_save_snapshot.setEnabled(False)
+        live_buttons_layout.addWidget(self.btn_save_snapshot)
 
         # Exposure time control
         exposure_layout = QHBoxLayout()
@@ -69,7 +91,7 @@ class LaserAutofocusSettingWidget(QWidget):
         analog_gain_layout.addWidget(self.analog_gain_spinbox)
 
         # Add to live group
-        live_layout.addWidget(self.btn_live)
+        live_layout.addLayout(live_buttons_layout)
         live_layout.addLayout(exposure_layout)
         live_layout.addLayout(analog_gain_layout)
         live_group.setLayout(live_layout)
@@ -156,6 +178,7 @@ class LaserAutofocusSettingWidget(QWidget):
 
         # Connect all signals to slots
         self.btn_live.clicked.connect(self.toggle_live)
+        self.btn_save_snapshot.clicked.connect(self.save_snapshot)
         self.exposure_spinbox.valueChanged.connect(self.update_exposure_time)
         self.analog_gain_spinbox.valueChanged.connect(self.update_analog_gain)
         self.update_threshold_button.clicked.connect(self.update_threshold_settings)
@@ -199,13 +222,66 @@ class LaserAutofocusSettingWidget(QWidget):
         # Store spinbox reference
         self.spinboxes[property_name] = spinbox
 
+    def _cache_focus_frame(self, image: np.ndarray) -> None:
+        """Hold onto the most recent focus-camera display frame so the user
+        can save it from the GUI without re-triggering the camera."""
+        self._last_focus_frame = image
+        if not self.btn_save_snapshot.isEnabled():
+            self.btn_save_snapshot.setEnabled(True)
+
+    def save_snapshot(self) -> None:
+        """Save the most recent focus-camera frame to disk so the user can
+        inspect it offline (e.g. brighten it to confirm whether the laser
+        spot is dim or fully outside the FOV)."""
+        if self._last_focus_frame is None:
+            QMessageBox.information(
+                self, "No frame yet", "Start live view first to capture a frame."
+            )
+            return
+
+        default_name = f"laser_af_snapshot_{time.strftime('%Y%m%d_%H%M%S')}.tiff"
+        if self.snap_saving_path:
+            os.makedirs(self.snap_saving_path, exist_ok=True)
+            default_path = os.path.join(self.snap_saving_path, default_name)
+        else:
+            default_path = default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save laser AF snapshot", default_path, "TIFF (*.tiff *.tif);;PNG (*.png)"
+        )
+        if not path:
+            return
+
+        frame = self._last_focus_frame
+        # cv2.imwrite expects BGR for color; the focus camera is configured
+        # MONO8 so frames are 2D and write directly.
+        if not cv2.imwrite(path, frame):
+            QMessageBox.warning(self, "Save failed", f"Could not write {path}")
+
     def toggle_live(self, pressed):
         if pressed:
+            # Show the full sensor so the user can locate the spot even when the
+            # cached/configured ROI no longer contains it (e.g. after an
+            # objective change).
+            self.laserAutofocusController.camera.set_region_of_interest(0, 0, 3088, 2064)
+            # Re-pin the live-view rate cap. The widget sets it in __init__,
+            # but other code paths can change trigger_fps in between; re-applying
+            # here guarantees the cap is in effect every time live starts,
+            # regardless of the configured focus exposure.
+            self.liveController.set_trigger_fps(LASER_AF_LIVE_VIEW_FPS)
+            self.streamHandler.set_display_fps(LASER_AF_LIVE_VIEW_FPS)
             self.liveController.start_live()
             self.btn_live.setText("Stop Live")
             self.run_spot_detection_button.setEnabled(False)
         else:
             self.liveController.stop_live()
+            # Restore the configured AF ROI so subsequent measurements use the
+            # narrow crop. Skip if the controller hasn't been initialized yet —
+            # in that case there's no meaningful ROI to restore to.
+            if self.laserAutofocusController.is_initialized:
+                props = self.laserAutofocusController.laser_af_properties
+                self.laserAutofocusController.camera.set_region_of_interest(
+                    props.x_offset, props.y_offset, props.width, props.height
+                )
             self.btn_live.setText("Start Live")
             self.run_spot_detection_button.setEnabled(True)
 

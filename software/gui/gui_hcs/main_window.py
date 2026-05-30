@@ -2565,6 +2565,12 @@ class HighContentScreeningGui(QMainWindow):
                 lcw.lineEdit_snapSavingDir.setText(snap_path)
             except Exception:
                 self.log.exception("Failed to set snap save folder")
+        # Laser AF snapshots share the same folder as regular snaps.
+        if self.laserAutofocusSettingWidget is not None:
+            try:
+                self.laserAutofocusSettingWidget.snap_saving_path = snap_path
+            except Exception:
+                self.log.exception("Failed to set laser AF snap save folder")
 
         acq_path = (gui_state.acquisition_saving_dir if gui_state else None) or default_path
         try:

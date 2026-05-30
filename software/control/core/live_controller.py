@@ -93,18 +93,21 @@ class LiveController:
         self._log.info("stopping live")
         if self.is_live:
             self.is_live = False
-            # Close streaming gate first
-            ic = self.microscope.illumination_controller
-            ic.set_streaming_active(False)
 
-            if self.trigger_mode == TriggerMode.SOFTWARE:
-                self._stop_triggered_acquisition()
-            if self.trigger_mode == TriggerMode.CONTINUOUS:
-                self.camera.stop_streaming()
-            if (self.trigger_mode == TriggerMode.SOFTWARE) or (
+            # Mirror start_live: only touch the illumination controller's
+            # streaming gate when this LiveController actually owns illumination.
+            # The focus-camera LiveController runs with control_illumination=False
+            # and must not poke the main illumination controller's state.
+            if self.control_illumination and self.obs_controller:
+                ic = self.microscope.illumination_controller
+                ic.set_streaming_active(False)
+
+            if self.trigger_mode == TriggerMode.SOFTWARE or (
                 self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
             ):
                 self._stop_triggered_acquisition()
+            if self.trigger_mode == TriggerMode.CONTINUOUS:
+                self.camera.stop_streaming()
 
             if self.for_displacement_measurement:
                 self.microscope.low_level_drivers.microcontroller.set_pin_level(MCU_PINS.AF_LASER, 0)
