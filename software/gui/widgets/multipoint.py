@@ -2171,7 +2171,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.run_acquisition()
         else:
             # This must eventually propagate through and call out acquisition_finished.
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
 
     def load_last_used_locations(self):
         if self.last_used_locations is None or len(self.last_used_locations) == 0:
@@ -2208,13 +2208,29 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 print("Duplicate values not added based on x and y.")
                 # to-do: update z coordinate
 
+    def _next_region_id(self):
+        """Return the smallest unused 'R{n}' region id.
+
+        Region ids key the shared scanCoordinates dicts, so they must be unique.
+        The old scheme f"R{len(self.location_ids)}" reused an id after a removal
+        (delete R0 -> ['R1'] -> next add is 'R1' again), and the colliding
+        add_flexible_region silently overwrote the existing region — two list
+        rows collapsed into a single scanned region. Scanning for the smallest
+        free index keeps ids unique across removals and imports.
+        """
+        existing = set(self.location_ids.tolist())
+        n = 0
+        while f"R{n}" in existing:
+            n += 1
+        return f"R{n}"
+
     def add_location(self):
         # Get raw positions without rounding
         pos = self.stage.get_pos()
         x = pos.x_mm
         y = pos.y_mm
         z = pos.z_mm
-        region_id = f"R{len(self.location_ids)}"
+        region_id = self._next_region_id()
 
         # Check for duplicates using rounded values for comparison
         if not np.any(np.all(self.location_list[:, :2] == [round(x, 3), round(y, 3)], axis=1)):
@@ -2510,6 +2526,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 y = row["y (mm)"]
                 z = row["z (mm)"]
                 region_id = row["ID"]
+                # CSVs without an ID column give every row "None"; duplicate or
+                # missing ids would collapse into one scanCoordinates entry. Fall
+                # back to a fresh unique id in those cases.
+                if region_id in ("None", "nan", "") or region_id in self.location_ids:
+                    region_id = self._next_region_id()
                 if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
                     location_str = (
                         "x:"
@@ -2637,10 +2658,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def set_performance_mode(self, enabled):
@@ -2753,7 +2774,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.clear_only_location_list()
 
         for pos in positions:
-            name = pos.get("name", f"R{len(self.location_ids)}")
+            name = pos.get("name") or self._next_region_id()
             center = pos.get("center_mm", [0, 0, 0])
 
             if len(center) >= 3:
@@ -4659,9 +4680,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.run_acquisition()
 
         else:
-            # This must eventually propagate through and call our aquisition_is_finished, or else we'll be left
+            # This must eventually propagate through and call our acquisition_is_finished, or else we'll be left
             # in an odd state.
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
 
     def _set_ui_acquisition_running(self, nz: int, delta_z_um: float, set_button_checked: bool = False):
         """Update UI to reflect that acquisition is running.
@@ -4755,10 +4776,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 # In Current Position mode, coverage should be disabled (N/A)
                 self.entry_well_coverage.setEnabled(False)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def set_performance_mode(self, enabled):
@@ -5503,7 +5524,7 @@ class MultiPointWithFluidicsWidget(QFrame):
             # Start acquisition
             self.multipointController.run_acquisition()
         else:
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
             # Also stop fluidics operations
             if self.multipointController.fluidics:
                 self.multipointController.fluidics.emergency_stop()
@@ -5586,10 +5607,10 @@ class MultiPointWithFluidicsWidget(QFrame):
             ):
                 widget.setEnabled(enabled)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def update_region_progress(self, current_fov, num_fovs):
@@ -6376,7 +6397,7 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             y = ref_y + row["y_offset_mm"]
 
             self.location_list = np.vstack((self.location_list, [[x, y, ref_z]]))
-            self.location_ids = np.append(self.location_ids, f"R{len(self.location_ids)}")
+            self.location_ids = np.append(self.location_ids, self._next_region_id())
 
             location_str = f"x:{round(x,3)} mm  y:{round(y,3)} mm  z:{round(ref_z*1000,1)} μm"
             self.dropdown_location_list.addItem(location_str)

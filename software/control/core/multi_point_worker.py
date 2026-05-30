@@ -1567,7 +1567,7 @@ class MultiPointWorker:
                     pass
                 else:  # timed acquisition
 
-                    # check if the aquisition has taken longer than dt or integer multiples of dt, if so immediately start the next time point without waiting to catch up (but still check for abort request to allow user to stop if acquisition is running too long)
+                    # check if the acquisition has taken longer than dt or integer multiples of dt, if so immediately start the next time point without waiting to catch up (but still check for abort request to allow user to stop if acquisition is running too long)
                     if time.time() > self.timestamp_prev_timepoint_started + self.dt:
                         self._log.info(f"Acquisition is running behind schedule (time since last time point start: {time.time() - self.timestamp_prev_timepoint_started} [s])")
                         if self.abort_requested_fn():

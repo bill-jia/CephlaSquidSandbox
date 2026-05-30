@@ -944,7 +944,7 @@ class MultiPointController:
             coordinates_df.to_csv(os.path.join(self.base_path, self.experiment_ID, "coordinates.csv"), index=False)
 
             self._log.info(
-                f"num fovs: {sum(len(coords) for coords in scan_position_information.scan_region_fov_coords_mm)}"
+                f"num fovs: {sum(len(coords) for coords in scan_position_information.scan_region_fov_coords_mm.values())}"
             )
             self._log.info(f"num regions: {len(scan_position_information.scan_region_coords_mm)}")
             # self._log.info(f"region ids: {scan_position_information.scan_region_names}")
@@ -1162,7 +1162,7 @@ class MultiPointController:
                     acquisition_parameters=acquisition_params,
                     callbacks=updated_callbacks,
                     abort_requested_fn=lambda: self.abort_acqusition_requested,
-                    request_abort_fn=self.request_abort_aquisition,
+                    request_abort_fn=self.request_abort_acquisition,
                     extra_job_classes=[],
                     alignment_widget=self._alignment_widget,
                     slack_notifier=self._slack_notifier,
@@ -1359,7 +1359,7 @@ class MultiPointController:
         ending_pos = self.stage.get_pos()
         self.callbacks.signal_current_fov(ending_pos.x_mm, ending_pos.y_mm)
 
-    def request_abort_aquisition(self):
+    def request_abort_acquisition(self):
         self.abort_acqusition_requested = True
 
     def validate_acquisition_settings(self) -> bool:
@@ -1484,7 +1484,7 @@ class MultiPointController:
         # Abort any running acquisition
         try:
             if self.acquisition_in_progress():
-                self.request_abort_aquisition()
+                self.request_abort_acquisition()
                 if self.thread is not None:
                     self.thread.join(timeout=timeout_s)
                     if self.thread.is_alive():

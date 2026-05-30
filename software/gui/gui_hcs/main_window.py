@@ -2199,28 +2199,28 @@ class HighContentScreeningGui(QMainWindow):
     def connectSlidePositionController(self):
         if ENABLE_FLEXIBLE_MULTIPOINT:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.flexibleMultiPointWidget.disable_the_start_aquisition_button
+                self.flexibleMultiPointWidget.disable_the_start_acquisition_button
             )
         if ENABLE_WELLPLATE_MULTIPOINT:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.wellplateMultiPointWidget.disable_the_start_aquisition_button
+                self.wellplateMultiPointWidget.disable_the_start_acquisition_button
             )
         if RUN_FLUIDICS:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.multiPointWithFluidicsWidget.disable_the_start_aquisition_button
+                self.multiPointWithFluidicsWidget.disable_the_start_acquisition_button
             )
 
         if ENABLE_FLEXIBLE_MULTIPOINT:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.flexibleMultiPointWidget.enable_the_start_aquisition_button
+                self.flexibleMultiPointWidget.enable_the_start_acquisition_button
             )
         if ENABLE_WELLPLATE_MULTIPOINT:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.wellplateMultiPointWidget.enable_the_start_aquisition_button
+                self.wellplateMultiPointWidget.enable_the_start_acquisition_button
             )
         if RUN_FLUIDICS:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.multiPointWithFluidicsWidget.enable_the_start_aquisition_button
+                self.multiPointWithFluidicsWidget.enable_the_start_acquisition_button
             )
 
         self.stageUtils.signal_scanning_position_reached.connect(self.navigationViewer.clear_slide)

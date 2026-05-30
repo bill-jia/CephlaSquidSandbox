@@ -63,8 +63,8 @@ class LaserAFConfig(BaseModel):
     focus_camera_analog_gain: float = Field(0.0, description="Focus camera analog gain")
 
     # Initialization
-    initialize_crop_width: int = Field(1200, description="Initial crop width")
-    initialize_crop_height: int = Field(800, description="Initial crop height")
+    initialize_crop_width: int = Field(1600, description="Initial crop width")
+    initialize_crop_height: int = Field(1600, description="Initial crop height")
 
     # Reference image (base64 encoded)
     reference_image: Optional[str] = Field(None, description="Base64-encoded reference image data")

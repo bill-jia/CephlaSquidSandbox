@@ -13,15 +13,52 @@ The software controls a complete microscope system including:
 - Optional addons (piezo stages, fluidics, etc.)
 """
 
-# Set QT_API environment variable before importing Qt libraries
-# This ensures we use PyQt5 as the Qt backend
 import argparse
 import logging
 import os
+import sys
 
+
+def _windows_startup_bootstrap():
+    """Make the app launchable by a bare env Python without ``conda activate``.
+
+    When started via a console-less ``pythonw.exe`` shortcut (the clean,
+    pinnable taskbar launch), conda activation hasn't run, so:
+      - add the env's native DLL dirs so Qt/numpy/OpenCV resolve their DLLs
+      - point SSL at the env's cert bundle (conda's openssl activate.d script)
+      - set an explicit AppUserModelID so Windows shows one "Squid" taskbar
+        button (using the app's window icon) instead of grouping under
+        python/pythonw — which also lets it be pinned cleanly.
+
+    Every step is a harmless no-op off Windows or when the env is already
+    activated (DLL dirs just get added twice, env vars are left as-is).
+    """
+    if sys.platform != "win32":
+        return
+    for sub in ("Library\\bin", "Library\\mingw-w64\\bin", "Library\\usr\\bin", "Scripts"):
+        dll_dir = os.path.join(sys.prefix, sub)
+        if os.path.isdir(dll_dir):
+            try:
+                os.add_dll_directory(dll_dir)
+            except OSError:
+                pass
+    cert = os.path.join(sys.prefix, "Library", "ssl", "cacert.pem")
+    if os.path.isfile(cert):
+        os.environ.setdefault("SSL_CERT_FILE", cert)
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Cephla.Squid")
+    except Exception:
+        pass
+
+
+_windows_startup_bootstrap()
+
+# Set QT_API environment variable before importing Qt libraries
+# This ensures we use PyQt5 as the Qt backend
 os.environ["QT_API"] = "pyqt5"
 import signal
-import sys
 
 # Qt libraries for GUI
 from qtpy.QtWidgets import *
@@ -43,6 +80,72 @@ import control._def
 
 # Import auto-migration function
 # from tools.migrate_acquisition_configs import run_auto_migration
+
+
+def _make_splash():
+    """Build a branded splash (Cephla logo) shown during the slow startup load.
+
+    With the console-less ``pythonw`` launch there is otherwise no on-screen
+    feedback while the heavy GUI/hardware stack imports and initializes
+    (~10-15s), which can look like a hang or an error. Rendering is
+    best-effort: any failure still yields a plain splash rather than blocking
+    startup.
+    """
+    from qtpy.QtCore import Qt, QRectF
+    from qtpy.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+    from qtpy.QtWidgets import QSplashScreen
+
+    side = 440
+    canvas = QPixmap(side, side)
+    canvas.fill(QColor("#ffffff"))
+    icon_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon")
+
+    painter = QPainter(canvas)
+    try:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        logo_box = QRectF(90, 40, side - 180, side - 180)
+        drawn = False
+        try:
+            from qtpy.QtSvg import QSvgRenderer
+
+            renderer = QSvgRenderer(os.path.join(icon_dir, "cephla_logo.svg"))
+            if renderer.isValid():
+                renderer.render(painter, logo_box)
+                drawn = True
+        except Exception:
+            drawn = False
+        if not drawn:
+            pm = QPixmap(os.path.join(icon_dir, "cephla_logo.ico"))
+            if not pm.isNull():
+                pm = pm.scaled(
+                    int(logo_box.width()), int(logo_box.height()),
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                )
+                painter.drawPixmap(int(logo_box.x()), int(logo_box.y()), pm)
+        title_font = QFont()
+        title_font.setPointSize(26)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#31c4f3"))
+        painter.drawText(QRectF(0, 300, side, 56), Qt.AlignHCenter | Qt.AlignVCenter, "Squid")
+        painter.setPen(QPen(QColor("#dcdcdc")))
+        painter.drawRect(0, 0, side - 1, side - 1)
+    finally:
+        painter.end()
+
+    return QSplashScreen(canvas)
+
+
+def _splash_message(splash, text):
+    """Update the splash status line and repaint immediately (no-op if None)."""
+    from qtpy.QtCore import Qt
+    from qtpy.QtGui import QColor
+    from qtpy.QtWidgets import QApplication
+
+    if splash is None:
+        return
+    splash.showMessage("   " + text + "   ", Qt.AlignBottom | Qt.AlignHCenter, QColor("#146b86"))
+    QApplication.processEvents()
 
 
 if __name__ == "__main__":
@@ -110,6 +213,13 @@ if __name__ == "__main__":
             log.info("Profile selection cancelled — exiting")
             sys.exit(0)
 
+    # Branded splash so the launch never looks like a hang: with the console-less
+    # pythonw shortcut there is otherwise no feedback while the heavy GUI/hardware
+    # stack imports and initializes (~10-15s).
+    splash = _make_splash()
+    splash.show()
+    _splash_message(splash, "Loading modules…")
+
     # Heavy imports happen now, with the picker already dismissed: napari/pyqtgraph
     # (gui.gui_hcs) and the full camera/NIDAQ driver stack (control.microscope).
     import control.utils
@@ -130,6 +240,7 @@ if __name__ == "__main__":
     log.info(f"Squid Repository State: {control.utils.get_squid_repo_state_description()}")
 
     # Build the microscope object from the global configuration. This will initialize all hardware components
+    _splash_message(splash, "Initializing microscope…")
     microscope = control.microscope.Microscope.build_from_global_config(
         args.simulation,
         skip_init=args.skip_init,
@@ -137,6 +248,7 @@ if __name__ == "__main__":
         profile_name=profile_name,
     )
 
+    _splash_message(splash, "Starting interface…")
     win = gui.HighContentScreeningGui(
         microscope=microscope,
         is_simulation=args.simulation,
@@ -162,6 +274,7 @@ if __name__ == "__main__":
 
     # Show startup warning if simulated disk I/O mode is enabled
     if control._def.SIMULATED_DISK_IO_ENABLED:
+        splash.hide()  # don't let the splash cover the modal warning
         QMessageBox.warning(
             None,
             "Development Mode Active",
@@ -174,6 +287,8 @@ if __name__ == "__main__":
         )
 
     # Restore last-session window geometry if available; otherwise maximize.
+    # Close the splash as soon as the main window appears.
+    splash.finish(win)
     gui_state = microscope.config_repo.get_gui_state()
     if gui_state is not None and gui_state.window_geometry_b64:
         win.show()

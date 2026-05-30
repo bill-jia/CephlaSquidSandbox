@@ -1,35 +1,64 @@
 # Running the software
 
-## Quick start (recommended): the Squid launcher
+There are two ways to launch, both of which skip the slow
+`conda activate` step:
 
-Double-click **`Squid.bat`** (repo root) or the **Squid** desktop shortcut. It
-launches the HCS GUI from source, so editing `.py` files and relaunching picks
-up changes immediately — no build step.
+| Launch | Console | Taskbar | Use it for |
+|--------|---------|---------|------------|
+| **Squid** desktop shortcut (`pythonw.exe`) | none | single clean "Squid" button, pinnable | everyday "just open it" |
+| **`Squid.bat`** (repo root) | yes (logs visible) | cmd + python buttons | development / watching logs |
 
-Pass arguments through to `main_hcs.py`:
+## Quick start: the desktop shortcut
 
-```
-Squid.bat --simulation
-Squid.bat --profile my_profile
-```
+Double-click the **Squid** icon on the Desktop. It runs the env's
+`pythonw.exe` (no console window) directly on `main_hcs.py`. Logs still go to
+the log file (`C:\Microscope_Data\logs\main_hcs.log`).
 
-The window stays open only if startup fails, so a crash traceback remains
-readable; a clean GUI close exits silently.
+Because the app sets an explicit taskbar identity (see below), it shows as one
+**Squid** button with the Cephla icon while running.
 
-### Why it's fast
+While the heavy GUI/hardware stack loads (~10-15s), a **splash screen** with the
+Cephla logo and a status line ("Loading modules…" → "Initializing microscope…"
+→ "Starting interface…") is shown so the launch never looks like a hang. It's
+built in `main_hcs.py` (`_make_splash` / `_splash_message`) and closes the
+moment the main window appears.
+
+### Pinning to the taskbar (Windows 11)
+
+Either:
+- Right-click the running **Squid** taskbar button → *Pin to taskbar*, or
+- Right-click the desktop **Squid** shortcut → *Show more options* → *Pin to
+  taskbar*.
+
+This works because the shortcut targets `pythonw.exe` (an executable). A
+shortcut to `Squid.bat` cannot be pinned and shows up as separate **cmd** +
+**python** buttons — which is why the desktop shortcut uses `pythonw` instead.
+
+## Developer launcher: `Squid.bat`
+
+Double-click `Squid.bat` (repo root), or run `Squid.bat --simulation`,
+`Squid.bat --profile NAME`, etc. It keeps a console window so logs are visible,
+and stays open only if startup fails (so a crash traceback is readable). Runs
+from source — edit `.py` files and relaunch, no build step.
+
+### Why both are fast
 
 Launching the old way — a PowerShell window running
 `conda activate squid; python main_hcs.py` — spent **~5.4s** in PowerShell
-startup plus the conda activation hook *before Python even began*. `Squid.bat`
-avoids all of that:
+startup plus the conda activation hook *before Python even began*. Both launch
+paths avoid that:
 
-- It does **not** run `conda activate`. Instead it sets `PATH` to the env's
-  bin/DLL directories and `SSL_CERT_FILE` — the only things activation actually
-  contributes here (verified: the Windows Qt platform plugin, numpy/MKL, and
-  OpenCV all load without it) — then runs the env's `python.exe` directly.
+- Neither runs `conda activate`. `Squid.bat` sets `PATH` to the env's bin/DLL
+  dirs + `SSL_CERT_FILE`; the `pythonw` shortcut relies on `main_hcs.py`'s
+  Windows bootstrap (`_windows_startup_bootstrap`), which adds the env's DLL
+  dirs via `os.add_dll_directory` and sets the SSL cert. Verified that the
+  Windows Qt plugin, numpy/MKL, and OpenCV all load without activation.
+- `main_hcs.py` also calls `SetCurrentProcessExplicitAppUserModelID("Cephla.Squid")`
+  so Windows gives the GUI its own taskbar identity (single button, window
+  icon) instead of grouping it under python/pythonw.
 - cmd startup is ~0.2s versus PowerShell + activate at ~5.4s.
 
-The launcher finds the environment at `%USERPROFILE%\.conda\envs\squid` by
+`Squid.bat` finds the environment at `%USERPROFILE%\.conda\envs\squid` by
 default; set `SQUID_ENV` before running to override.
 
 ## Fast startup internals (`main_hcs.py`)
@@ -61,5 +90,9 @@ python main_hcs.py [--simulation] [--profile NAME] [--skip-init] ...
 
 ## Recreating the desktop shortcut
 
-Point a new shortcut's **Target** at `<repo>\Squid.bat`, **Start in** at
-`<repo>`, and **Icon** at `software\icon\cephla_logo.ico`.
+The console-less **Squid** desktop shortcut points at:
+
+- **Target:** `%USERPROFILE%\.conda\envs\squid\pythonw.exe`
+- **Arguments:** `main_hcs.py`
+- **Start in:** `<repo>\software`
+- **Icon:** `<repo>\software\icon\cephla_logo.ico`
