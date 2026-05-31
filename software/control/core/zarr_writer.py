@@ -361,14 +361,21 @@ class ZarrWriter:
         """
         if not self._unstaged_t_indices:
             return []
-        ts = sorted(self._unstaged_t_indices)
-        self._unstaged_t_indices.clear()
         paths: List[str] = []
-        for t in ts:
-            for level in range(len(self._level_shapes)):
-                p = self._level_shard_path(level, t)
-                if os.path.exists(p):
-                    paths.append(p)
+        staged: set[int] = set()
+        for t in sorted(self._unstaged_t_indices):
+            t_paths = [self._level_shard_path(level, t) for level in range(len(self._level_shapes))]
+            present = [p for p in t_paths if os.path.exists(p)]
+            # Only consider a timepoint staged once *all* its level shards are
+            # on disk; otherwise leave it pending so a later barrier re-checks
+            # (guards against a shard TensorStore hasn't flushed yet — never
+            # drop a written timepoint). An all-fill-value (e.g. all-zero)
+            # frame writes no chunk, so a t whose shards never appear simply
+            # stays pending and is harmless.
+            if present and len(present) == len(t_paths):
+                paths.extend(present)
+                staged.add(t)
+        self._unstaged_t_indices -= staged
         return paths
 
     def metadata_paths(self) -> List[str]:
