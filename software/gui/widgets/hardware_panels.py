@@ -1893,11 +1893,11 @@ class LiveControlWidget(QFrame):
         self.btn_autolevel.setChecked(autolevel)
 
         # snap frame grabber
-        from control._def import DEFAULT_SAVING_PATH
+        _default_dir = self.liveController.microscope.config_repo.default_saving_path()
         self.lineEdit_snapSavingDir = QLineEdit()
         self.lineEdit_snapSavingDir.setReadOnly(True)
-        self.lineEdit_snapSavingDir.setText(DEFAULT_SAVING_PATH)
-        self.snap_saving_path = DEFAULT_SAVING_PATH
+        self.lineEdit_snapSavingDir.setText(_default_dir)
+        self.snap_saving_path = _default_dir
 
         self.btn_setSnapSavingDir = QPushButton("Browse")
         self.btn_setSnapSavingDir.setDefault(False)

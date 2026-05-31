@@ -1695,10 +1695,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.lineEdit_savingDir = QLineEdit()
         self.lineEdit_savingDir.setReadOnly(True)
 
-        # Placeholder; the real folder is applied per-profile after construction
-        # via MainWindow._apply_profile_saving_paths().
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        # Per-profile default (<root>/<profile>); MainWindow._apply_profile_saving_paths()
+        # may still override it with a gui_state-saved folder after construction.
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -3436,10 +3437,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_setSavingDir.setFixedWidth(btn_width)
 
         self.lineEdit_savingDir = QLineEdit()
-        # Placeholder; the real folder is applied per-profile after construction
-        # via MainWindow._apply_profile_saving_paths().
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        # Per-profile default (<root>/<profile>); MainWindow._apply_profile_saving_paths()
+        # may still override it with a gui_state-saved folder after construction.
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -5859,8 +5861,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.btn_setSavingDir.setIcon(QIcon("icon/folder.png"))
 
         self.lineEdit_savingDir = QLineEdit()
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()

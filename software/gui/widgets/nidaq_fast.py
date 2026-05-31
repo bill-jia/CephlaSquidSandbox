@@ -2205,10 +2205,9 @@ class FastAcquisitionWidget(QWidget):
 
         self.lineEdit_savingDir = QLineEdit()
         self.lineEdit_savingDir.setReadOnly(True)
-        from control._def import DEFAULT_SAVING_PATH
-
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.output_path = DEFAULT_SAVING_PATH
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.output_path = _default_dir
         self.base_path_is_set = True
 
         self.btn_setSavingDir = QPushButton("Browse")

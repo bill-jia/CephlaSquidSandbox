@@ -213,6 +213,26 @@ class ConfigRepository:
         """Get the current profile name."""
         return self._current_profile
 
+    def default_saving_path(self) -> str:
+        """Canonical per-profile default save folder: ``<root>/<profile>``.
+
+        The root is the live ``control._def.DEFAULT_SAVING_PATH`` setting (seeded from
+        ``machine_config.software.default_saving_path`` and editable in Preferences); the
+        per-profile subfolder keeps each profile's data separate. Falls back to the bare
+        root when no profile is active. Created on demand so it's ready for Browse dialogs
+        and saves. This is the single source of truth — UI widgets and the main window
+        should call it rather than referencing the root directly.
+        """
+        import control._def
+
+        root = control._def.DEFAULT_SAVING_PATH
+        path = Path(root) / self._current_profile if self._current_profile else Path(root)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("Could not create default save folder %s", path)
+        return str(path)
+
     def _last_active_profile_path(self) -> Path:
         """Cache file so the same profile is restored on the next application start."""
         return self.base_path / "cache" / "last_active_profile.txt"
