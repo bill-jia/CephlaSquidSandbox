@@ -1205,6 +1205,89 @@ class ConfigRepository:
             return None
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # ACQUISITION CYCLES
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def list_acquisition_cycles(self, profile: Optional[str] = None) -> List[str]:
+        """List saved acquisition-cycle names (without ``.yaml``) for a profile."""
+        profile = profile or self._current_profile
+        if profile is None:
+            return []
+        cycles_dir = self.user_profiles_path / profile / "cycles"
+        if not cycles_dir.is_dir():
+            return []
+        return [p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
+
+    def save_acquisition_cycle(self, name: str, cycle: "AcquisitionCycle", profile: Optional[str] = None) -> Path:
+        """Save an acquisition cycle under ``user_profiles/{profile}/cycles/``.
+
+        The cycle's ``name`` is normalized to the sanitized file stem so the
+        on-disk name and the in-file name always match.
+        """
+        from control.core.observation_state_service import acquisition_cycle_path, sanitize_preset_filename
+
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
+        safe_name = sanitize_preset_filename(name)
+        cycle_to_save = cycle.model_copy(update={"name": safe_name})
+        path = acquisition_cycle_path(self, name, profile=profile)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    cycle_to_save.model_dump(mode="json"),
+                    f,
+                    Dumper=_YamlDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+        except (OSError, yaml.YAMLError) as e:
+            logger.error("Failed to save acquisition cycle YAML '%s': %s", path, e)
+            raise
+        return path
+
+    def load_acquisition_cycle(self, name: str, profile: Optional[str] = None) -> Optional["AcquisitionCycle"]:
+        """Load a named acquisition cycle from the profile. Returns None if missing/invalid."""
+        from control.core.observation_state_service import acquisition_cycle_path
+        from control.models.acquisition_cycle import AcquisitionCycle
+
+        profile = profile or self._current_profile
+        if profile is None:
+            return None
+        path = acquisition_cycle_path(self, name, profile=profile)
+        if not path.exists():
+            logger.debug("acquisition cycle not found: %s", path)
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.load(f, Loader=_YamlSafeLoader)
+            if not isinstance(data, dict):
+                raise ValueError("acquisition cycle YAML did not parse into a dict")
+            return AcquisitionCycle.model_validate(data)
+        except (yaml.YAMLError, ValidationError, OSError, ValueError, TypeError) as e:
+            logger.warning("Failed to load acquisition cycle %s: %s", path, e)
+            return None
+
+    def delete_acquisition_cycle(self, name: str, profile: Optional[str] = None) -> bool:
+        """Delete a named acquisition cycle. Returns True if a file was removed."""
+        from control.core.observation_state_service import acquisition_cycle_path
+
+        profile = profile or self._current_profile
+        if profile is None:
+            return False
+        path = acquisition_cycle_path(self, name, profile=profile)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.error("Failed to delete acquisition cycle '%s': %s", path, e)
+            raise
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # CACHE MANAGEMENT
     # ═══════════════════════════════════════════════════════════════════════════
 

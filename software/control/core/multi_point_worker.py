@@ -550,6 +550,23 @@ class MultiPointWorker:
         self.region_observation_state_map = acquisition_parameters.region_observation_state_map
         self._emission_filter_wheel = getattr(scope.addons, "emission_filter_wheel", None)
 
+        # Resolved per-position acquisition plan (cycles). A flat/legacy
+        # selection arrives as a global plan of 1-frame-per-state events, so the
+        # worker has a single iteration path. `_global_plan` applies to any
+        # region without an explicit override in `_region_plans`.
+        from control.models.acquisition_cycle import RegionPlan, _index_events
+
+        self._global_plan = acquisition_parameters.global_region_plan
+        if self._global_plan is None:
+            # Defensive fallback (e.g. direct worker construction in tests): treat
+            # the channel axis as a 1-frame-per-state chain.
+            self._global_plan = RegionPlan.from_events(_index_events(list(self.observation_state_names)))
+        self._region_plans = dict(acquisition_parameters.resolved_region_plans or {})
+        # Imaged channel axis (C order) and per-channel display metadata, used for
+        # zarr/omero naming. Resolved lazily so a None pixel/illumination config
+        # in tests doesn't break construction.
+        self._channel_meta_cache: Dict[str, Tuple[str, Optional[int]]] = {}
+
         # Pre-compute acquisition metadata that remains constant throughout the run.
         try:
             pixel_factor = self.objectiveStore.get_pixel_size_factor()
@@ -779,35 +796,24 @@ class MultiPointWorker:
                     for fov_idx, coord in enumerate(coords)
                 }
 
-            # Extract channel metadata for zarr output
-            illumination_config = self.microscope.config_repo.get_illumination_config()
-            if self._use_observation_presets:
-                channel_names = list(self.observation_state_names)
-                channel_colors: List[str] = []
-                channel_wavelengths: List[Optional[int]] = []
-                repo = self.microscope.config_repo
-                for pname in self.observation_state_names:
-                    st = repo.load_observation_preset(pname)
-                    if st is not None and st.illuminator_states:
-                        channel_colors.append(st.display_color)
-                        active = st.active_illuminator_states
-                        ist = active[0] if active else st.illuminator_states[0]
-                        wl = None
-                        if illumination_config and ist.illumination_channel:
-                            ch_def = illumination_config.get_channel_by_name(ist.illumination_channel)
-                            wl = ch_def.wavelength_nm if ch_def else None
-                        channel_wavelengths.append(wl)
-                    else:
-                        channel_colors.append("#FFFFFF")
-                        channel_wavelengths.append(None)
-            else:
-                channel_names = []
-                channel_colors = []
-                channel_wavelengths = []
+            # Channel axis for the dense layout = the global plan's imaged states
+            # (stimulus-only states produce no frame, so they're excluded). For
+            # ragged runs each frame self-describes its single-channel array via
+            # CaptureInfo.save_*, so these global dims are the dense fallback.
+            channel_names = list(self._global_plan.channel_order)
+            channel_colors = []
+            channel_wavelengths = []
+            for pname in channel_names:
+                color, wl = self._channel_display_meta(pname)
+                channel_colors.append(color)
+                channel_wavelengths.append(wl)
+            # Dense T expands by frames-per-state; ragged overrides per-array.
+            dense_t_size = self.Nt * (self._global_plan.frames_per_position // max(1, len(channel_names))) \
+                if (self._global_plan.dense and channel_names) else self.Nt
 
             zarr_writer_info = ZarrWriterInfo(
                 base_path=self.experiment_path,
-                t_size=self.Nt,
+                t_size=dense_t_size,
                 c_size=len(channel_names),
                 z_size=self.NZ,
                 is_hcs=is_hcs,
@@ -1017,11 +1023,68 @@ class MultiPointWorker:
     def _channel_step_count(self) -> int:
         return len(self.observation_state_names)
 
+    def _get_region_plan(self, region_id):
+        """Return the resolved RegionPlan for a region (its override or global)."""
+        return self._region_plans.get(str(region_id), self._global_plan)
+
     def _get_observation_states_for_region(self, region_id: str) -> list:
-        """Return the list of observation state names active for this region."""
-        if self.region_observation_state_map is None:
-            return self.observation_state_names
-        return self.region_observation_state_map.get(region_id, self.observation_state_names)
+        """Imaged channel axis (C order) active for this region."""
+        return list(self._get_region_plan(region_id).channel_order)
+
+    def _channel_display_meta(self, name: str) -> Tuple[str, Optional[int]]:
+        """(display_color, wavelength_nm) for an imaged observation state, cached."""
+        if name in self._channel_meta_cache:
+            return self._channel_meta_cache[name]
+        color, wavelength = "#FFFFFF", None
+        try:
+            repo = self.microscope.config_repo
+            st = self._observation_preset_cache.get(name) or repo.load_observation_preset(name)
+            if st is not None and st.illuminator_states:
+                color = st.display_color
+                active = st.active_illuminator_states
+                ist = active[0] if active else st.illuminator_states[0]
+                illum = repo.get_illumination_config()
+                if illum and ist.illumination_channel:
+                    ch_def = illum.get_channel_by_name(ist.illumination_channel)
+                    wavelength = ch_def.wavelength_nm if ch_def else None
+        except Exception:
+            pass
+        self._channel_meta_cache[name] = (color, wavelength)
+        return self._channel_meta_cache[name]
+
+    def _build_save_layout(self, region_plan, event):
+        """Build the self-describing SaveLayout for one imaged event at the
+        current timepoint, using the dense/ragged layout from the region plan."""
+        from control.models.acquisition_cycle import frame_coord, SaveLayout
+
+        coord = frame_coord(region_plan, self.Nt, self.time_point, event)
+        if coord.array_key is None:
+            # Dense: one array, all imaged channels.
+            names = list(region_plan.channel_order)
+        else:
+            # Ragged: a single-channel per-state array.
+            names = [event.observation_state]
+        colors, wavelengths = [], []
+        for n in names:
+            c, w = self._channel_display_meta(n)
+            colors.append(c)
+            wavelengths.append(w)
+        # Only disambiguate filenames when this state repeats within a position.
+        repeats = region_plan.frame_counts.get(event.observation_state, 1) > 1
+        frame_suffix = f"f{event.state_frame_index:0{FILE_ID_PADDING}}" if repeats else None
+        return SaveLayout(
+            array_key=coord.array_key,
+            t_index=coord.t_index,
+            c_index=coord.c_index,
+            t_size=coord.t_size,
+            c_size=coord.c_size,
+            cycle_event_index=event.cycle_event_index,
+            state_frame_index=event.state_frame_index,
+            channel_names=names,
+            channel_colors=colors,
+            channel_wavelengths=wavelengths,
+            frame_suffix=frame_suffix,
+        )
 
     def _seed_camera_for_first_observation_state(self) -> None:
         """Apply the first observation state's camera_live snapshot once before streaming.
@@ -2814,8 +2877,10 @@ class MultiPointWorker:
                 )
             )
             self.num_fovs = len(coordinates)
-            active_channel_count = len(self._get_observation_states_for_region(region_id))
-            self.total_scans = self.num_fovs * self.NZ * active_channel_count
+            # Count imaged frames per position (cycles capture several frames per
+            # state), not just distinct channels.
+            frames_per_pos = self._get_region_plan(region_id).frames_per_position
+            self.total_scans = self.num_fovs * self.NZ * frames_per_pos
 
             for fov, coordinate_mm in enumerate(coordinates):
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
@@ -2849,16 +2914,21 @@ class MultiPointWorker:
                     and self._zarr_writer_info is not None
                 ):
                     try:
-                        output_path = self._zarr_writer_info.get_output_path(
-                            str(region_id), fov
-                        )
-                        barrier = FlushAndStageUploadJob(
-                            time_point=self.time_point,
-                            region_id=str(region_id),
-                            fov=fov,
-                            output_path=output_path,
-                        )
-                        self._save_zarr_runner.dispatch(barrier)
+                        # Dense -> one array per FOV (array_key=None); ragged ->
+                        # one single-channel plate per imaged state, so flush each.
+                        region_plan = self._get_region_plan(region_id)
+                        array_keys = [None] if region_plan.dense else list(region_plan.channel_order)
+                        for array_key in array_keys:
+                            output_path = self._zarr_writer_info.get_output_path(
+                                str(region_id), fov, array_key
+                            )
+                            barrier = FlushAndStageUploadJob(
+                                time_point=self.time_point,
+                                region_id=str(region_id),
+                                fov=fov,
+                                output_path=output_path,
+                            )
+                            self._save_zarr_runner.dispatch(barrier)
                     except Exception as e:
                         self._log.exception(
                             f"Failed to dispatch upload barrier for "
@@ -2889,16 +2959,22 @@ class MultiPointWorker:
 
 
 
-            current_round_images = {}
-            # Get the active observation states for this region (may be a subset)
-            active_states = set(self._get_observation_states_for_region(region_id))
-            n_active = len(active_states)
-            # iterate through observation states
-            if self.observation_state_names:
-                active_step = 0
-                for config_idx, preset_name in enumerate(self.observation_state_names):
-                    if preset_name not in active_states:
+            # Iterate the resolved per-position plan (cycles). A flat selection is
+            # just a 1-frame-per-state plan, so this single path serves both. The
+            # plan's ordered events preserve interleave / chain order; imaged
+            # events capture a frame, stimulus events fire an NIDAQ pulse comb.
+            region_plan = self._get_region_plan(region_id)
+            frames_per_pos = region_plan.frames_per_position  # imaged frames per (FOV, z)
+            if region_plan.events:
+                imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
+                for event in region_plan.events:
+                    if event.is_wait:
+                        # Timed delay between events — no frame, no AF, no progress
+                        # tick. Sleep in short slices so an abort interrupts it.
+                        with self._timing.get_timer("cycle_wait"):
+                            self._interruptible_sleep(event.wait_ms / 1000.0)
                         continue
+                    preset_name = event.observation_state
                     try:
                         with self._timing.get_timer("apply_observation_state"):
                             config = self._apply_observation_state(preset_name)
@@ -2909,12 +2985,12 @@ class MultiPointWorker:
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 
-                    # Run AF on the first ACTIVE channel for this region. Using
-                    # the global ``config_idx`` here misses the AF window
-                    # entirely whenever the per-point channel selection skips
-                    # the global preset 0 — ``active_step`` is the
-                    # per-active-channel counter that survives that subset.
-                    if z_level == 0 and active_step == 0:
+                    # Run AF once per position, on the first IMAGED frame of the
+                    # first z-plane. Keying on the first imaged event (not the
+                    # first plan event) keeps AF firing even when a cycle leads
+                    # with a stimulus-only step — the same per-active guard the
+                    # old config_idx-vs-active_step fix preserved.
+                    if z_level == 0 and imaged_step == 0 and not event.is_stimulus:
                         with self._timing.get_timer("perform_autofocus"):
                             if not self.perform_autofocus(region_id, fov):
                                 self._log.error(
@@ -2927,37 +3003,41 @@ class MultiPointWorker:
                             saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
                             iio.imwrite(saving_path, image)
 
-
-                    if config.is_stimulus_only:
+                    if event.is_stimulus or config.is_stimulus_only:
                         with self._timing.get_timer("run_nidaq_stimulus"):
                             self._run_nidaq_stimulus(config)
-                    else:
-                        with self._timing.get_timer("acquire_camera_image"):
-                            if "RGB" in config.name:
-                                self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
-                            else:
-                                with self._timing.get_timer("acquire_camera_image_inner"):
-                                    self.acquire_camera_image(
-                                        config,
-                                        file_ID,
-                                        current_path,
-                                        z_level,
-                                        region_id=region_id,
-                                        fov=fov,
-                                        config_idx=config_idx,
-                                        filename_channel_label=preset_name,
-                                    )
+                        if self.NZ == 1:
+                            self.handle_z_offset(config, False)
+                        continue  # no frame, no progress tick
+
+                    save_layout = self._build_save_layout(region_plan, event)
+                    with self._timing.get_timer("acquire_camera_image"):
+                        if "RGB" in config.name:
+                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
+                        else:
+                            with self._timing.get_timer("acquire_camera_image_inner"):
+                                self.acquire_camera_image(
+                                    config,
+                                    file_ID,
+                                    current_path,
+                                    z_level,
+                                    region_id=region_id,
+                                    fov=fov,
+                                    config_idx=save_layout.c_index,
+                                    filename_channel_label=preset_name,
+                                    save_layout=save_layout,
+                                )
 
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
 
-                    current_image = fov * self.NZ * n_active + z_level * n_active + active_step + 1
-                    active_step += 1
+                    current_image = fov * self.NZ * frames_per_pos + z_level * frames_per_pos + imaged_step + 1
+                    imaged_step += 1
                     self.callbacks.signal_region_progress(
                         RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
                     )
             else:
-                raise ValueError("Legacy channel configurations are deprecated.  Use observation states instead.")
+                raise ValueError("No observation states selected for acquisition.")
 
             # updates coordinates df
             self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
@@ -3557,6 +3637,7 @@ class MultiPointWorker:
         config_idx: int,
         *,
         filename_channel_label: Optional[str] = None,
+        save_layout=None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -3640,6 +3721,17 @@ class MultiPointWorker:
                 filename_channel_label=filename_channel_label,
                 file_saving_option=self.file_saving_option,
                 acquisition_root=self.experiment_path,
+                array_key=(save_layout.array_key if save_layout else None),
+                save_t_index=(save_layout.t_index if save_layout else None),
+                save_c_index=(save_layout.c_index if save_layout else None),
+                save_t_size=(save_layout.t_size if save_layout else None),
+                save_c_size=(save_layout.c_size if save_layout else None),
+                cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
+                state_frame_index=(save_layout.state_frame_index if save_layout else None),
+                frame_suffix=(save_layout.frame_suffix if save_layout else None),
+                array_channel_names=(list(save_layout.channel_names) if save_layout else None),
+                array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
+                array_channel_wavelengths=(list(save_layout.channel_wavelengths) if save_layout else None),
             )
             self._current_capture_info = current_capture_info
         # Hot path — demoted to debug so formatting CaptureInfo (dataclass with Pos and
@@ -3789,6 +3881,23 @@ class MultiPointWorker:
         time_to_sleep = max(sec, 1e-6)
         # self._log.debug(f"Sleeping for {time_to_sleep} [s]")
         time.sleep(time_to_sleep)
+
+    def _interruptible_sleep(self, sec, slice_s: float = 0.05):
+        """Sleep up to ``sec`` seconds, returning early if an abort is requested.
+
+        Used for cycle wait periods, which may be long — a plain time.sleep would
+        block abort until it elapsed.
+        """
+        if sec <= 0:
+            return
+        deadline = time.time() + sec
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if self.abort_requested_fn():
+                return
+            time.sleep(min(slice_s, remaining))
 
     def acquire_rgb_image(self, config, file_ID, current_path, k, region_id, fov):
         # go through the channels

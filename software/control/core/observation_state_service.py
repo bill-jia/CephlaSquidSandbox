@@ -141,6 +141,16 @@ def observation_preset_path(
     return config_repo.get_profile_path(profile) / "observation_presets" / f"{stem}.yaml"
 
 
+def acquisition_cycle_path(
+    config_repo: "ConfigRepository",
+    cycle_name: str,
+    profile: Optional[str] = None,
+) -> Path:
+    """Absolute path for a named acquisition-cycle YAML under the given profile."""
+    stem = sanitize_preset_filename(cycle_name)
+    return config_repo.get_profile_path(profile) / "cycles" / f"{stem}.yaml"
+
+
 # ── YAML serialization ───────────────────────────────────────────────────────
 
 

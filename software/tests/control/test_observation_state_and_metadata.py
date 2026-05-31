@@ -310,6 +310,72 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     assert loaded.name == "test_preset"
 
 
+def test_config_repository_acquisition_cycle_io(tmp_path: Path):
+    from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, CycleStep, CycleWait
+
+    base = tmp_path / "sw"
+    (base / "machine_configs").mkdir(parents=True)
+    (base / "user_profiles" / "p1" / "channel_configs").mkdir(parents=True)
+    (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
+        "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
+    )
+    state_for_general = ObservationState(
+        version=3,
+        name="TestLaser",
+        display_color="#FF0000",
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False)],
+    )
+    (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
+        yaml.safe_dump(state_for_general.model_dump(mode="json", exclude_none=True)), encoding="utf-8"
+    )
+
+    repo = ConfigRepository(base_path=base)
+    repo.set_profile("p1")
+
+    assert repo.list_acquisition_cycles() == []
+    cycle = AcquisitionCycle(
+        name="ignored - normalized on save",
+        repeat=4,
+        items=[
+            CycleGroup(
+                repeat=3,
+                steps=[
+                    CycleStep(observation_state="GFP", n_frames=10),
+                    CycleWait(duration_ms=250.0),
+                    CycleStep(observation_state="stim"),
+                ],
+            ),
+            CycleWait(duration_ms=1000.0),
+            CycleStep(observation_state="RFP", n_frames=5),
+        ],
+    )
+    path = repo.save_acquisition_cycle("opto v1", cycle)
+    assert path.exists()
+    # Sanitized name becomes the file stem and the in-file name.
+    assert repo.list_acquisition_cycles() == ["opto_v1"]
+
+    loaded = repo.load_acquisition_cycle("opto_v1")
+    assert loaded is not None
+    assert loaded.name == "opto_v1"
+    assert loaded.repeat == 4
+    assert isinstance(loaded.items[0], CycleGroup)
+    assert loaded.items[0].repeat == 3
+    assert loaded.items[0].steps[0].observation_state == "GFP"
+    assert loaded.items[0].steps[0].n_frames == 10
+    # Wait round-trips at both nesting levels (pydantic union discrimination).
+    assert isinstance(loaded.items[0].steps[1], CycleWait)
+    assert loaded.items[0].steps[1].duration_ms == 250.0
+    assert isinstance(loaded.items[1], CycleWait)
+    assert loaded.items[1].duration_ms == 1000.0
+    assert isinstance(loaded.items[2], CycleStep)
+    assert loaded.items[2].n_frames == 5
+
+    assert repo.delete_acquisition_cycle("opto_v1") is True
+    assert repo.list_acquisition_cycles() == []
+    assert repo.load_acquisition_cycle("opto_v1") is None
+
+
 def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):
     base = tmp_path / "sw"
     (base / "machine_configs").mkdir(parents=True)

@@ -9,6 +9,7 @@ from squid.abc import CameraFrame
 if TYPE_CHECKING:
     from control.slack_notifier import TimepointStats, AcquisitionStats
     from control.models.observation_state import ObservationState
+    from control.models.acquisition_cycle import RegionPlan
 
 
 @dataclass
@@ -73,12 +74,25 @@ class AcquisitionParameters:
 
     # XY mode for determining scan type
     xy_mode: str = "Current Position"  # "Current Position", "Select Wells", "Manual", "Load Coordinates"
-    # Observation State preset names (profile observation_presets/).
+    # Observation State preset names (profile observation_presets/). This is the
+    # imaged channel axis (distinct imaged states); for cycle-driven runs it is
+    # derived from the selected cycles so existing zarr/metadata/naming code
+    # keeps working unchanged.
     selected_observation_state_names: List[str] = field(default_factory=list)
     # Per-region observation state override. Keys are region IDs (e.g. "R0"),
     # values are lists of preset names to acquire at that region.
     # None means all regions use selected_observation_state_names.
     region_observation_state_map: Optional[Dict[str, List[str]]] = None
+
+    # Cycle-driven per-position acquisition plan. When `selected_cycle_names` is
+    # empty the worker uses the legacy flat path (one frame per state, in
+    # `selected_observation_state_names` order). `global_region_plan` is the
+    # resolved plan applied to every region that has no explicit override;
+    # `resolved_region_plans` holds per-region overrides (keyed by region_id).
+    selected_cycle_names: List[str] = field(default_factory=list)
+    region_cycle_map: Optional[Dict[str, List[str]]] = None
+    global_region_plan: Optional["RegionPlan"] = None
+    resolved_region_plans: Dict[str, "RegionPlan"] = field(default_factory=dict)
 
     # Run-only ObservationStates not backed by an on-disk preset. Used when no
     # preset is checked in the GUI: the controller snapshots the current live

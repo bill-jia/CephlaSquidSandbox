@@ -11,66 +11,6 @@ from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
 
 
-def _multipoint_observation_preset_display_names(microscope) -> list:
-    """Sorted preset names for multipoint acquisition (same source as Observation State combo)."""
-    return sorted(microscope.config_repo.list_observation_presets())
-
-
-def _preset_nidaq_kind(microscope, name: str) -> Optional[str]:
-    """Classify a preset's relationship to the NIDAQ pulse pathway.
-
-    Returns ``None`` for ordinary captures, ``"stimulus"`` for stimulus-only
-    steps (no camera frame, comb runs at the FOV), and ``"capture_pulse"``
-    when timed illumination overlays a normal camera exposure. Used to
-    decorate multipoint list rows so the user can see which presets require
-    a working NIDAQ. Best-effort: returns None if the preset can't be loaded.
-    """
-    if microscope is None:
-        return None
-    try:
-        preset = microscope.config_repo.load_observation_preset(name)
-    except Exception:
-        return None
-    if preset is None:
-        return None
-    if getattr(preset, "is_stimulus_only", False):
-        return "stimulus"
-    if getattr(preset, "is_waveform_driven", False):
-        return "capture_pulse"
-    return None
-
-
-def _create_checkbox_list_item(name: str, checked: bool = False, *, microscope=None) -> QListWidgetItem:
-    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight.
-
-    When ``microscope`` is supplied and the named preset uses NIDAQ pulse
-    timing, the row is rendered in italic with a tooltip describing the
-    type (capture-window pulse vs stimulus-only). ``item.text()`` remains
-    the canonical preset name so callers comparing against ``item.text()``
-    are not affected.
-    """
-    item = QListWidgetItem(name)
-    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-    kind = _preset_nidaq_kind(microscope, name)
-    if kind is not None:
-        font = item.font()
-        font.setItalic(True)
-        item.setFont(font)
-        if kind == "stimulus":
-            item.setToolTip(
-                "Stimulus-only step — NIDAQ pulse comb, no camera frame. "
-                "Requires a working NIDAQ on this rig."
-            )
-        else:
-            item.setToolTip(
-                "Uses NIDAQ pulse timing during the camera exposure — "
-                "illumination is delivered as a precisely timed pulse. "
-                "Requires a working NIDAQ on this rig."
-            )
-    return item
-
-
 def _get_checked_names(list_widget: QListWidget) -> list:
     """Return the text of all checked items in a checkbox-style QListWidget."""
     return [
@@ -125,7 +65,7 @@ def _reorder_list_widget(list_widget: QListWidget, ordered_names: list) -> None:
 class _ObservationStateListWidget(QListWidget):
     """Checkbox list with internal drag/drop and "float checked to top".
 
-    - Items are checkbox rows (created by :func:`_create_checkbox_list_item`).
+    - Items are checkbox rows (populated by :func:`_populate_cycle_list`).
     - Users can drag any row to reorder. The post-drag order is preserved.
     - On a check-state change, the changed item moves to the boundary between
       the checked block (top) and the unchecked block (bottom): checking
@@ -187,6 +127,386 @@ class _ObservationStateListWidget(QListWidget):
     def dropEvent(self, event):
         super().dropEvent(event)
         self.order_changed.emit()
+
+
+def _multipoint_cycle_display_names(microscope) -> list:
+    """Sorted acquisition-cycle names for the multipoint checklist."""
+    try:
+        return sorted(microscope.config_repo.list_acquisition_cycles())
+    except Exception:
+        return []
+
+
+def _populate_cycle_list(list_widget, microscope, checked_names=None, prior_order=None) -> None:
+    """Fill a checkbox list with available acquisition cycles.
+
+    Preserves the prior display order and checked state when refreshing.
+    """
+    checked_names = set(checked_names or [])
+    available = list(_multipoint_cycle_display_names(microscope))
+    available_set = set(available)
+    if prior_order:
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+    else:
+        ordered = available
+    list_widget.blockSignals(True)
+    list_widget.clear()
+    for name in ordered:
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if name in checked_names else Qt.Unchecked)
+        list_widget.addItem(item)
+    list_widget.blockSignals(False)
+
+
+class CycleEditorDialog(QDialog):
+    """Modal editor for named acquisition cycles (two-level: outer repeat ->
+    ordered steps, where a step can sit inside a one-level repeatable group).
+
+    Steps reference observation-state presets by name. Cycles are saved/loaded
+    via the config repo (``cycles/*.yaml`` under the active profile).
+    """
+
+    _TYPE_ROLE = Qt.UserRole
+
+    def __init__(self, microscope, parent=None):
+        super().__init__(parent)
+        self.microscope = microscope
+        self.repo = microscope.config_repo
+        self.setWindowTitle("Edit Acquisition Cycles")
+
+        layout = QHBoxLayout(self)
+
+        # ── Left: existing cycle library ──
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Saved cycles"))
+        self.list_existing = QListWidget()
+        self.list_existing.itemClicked.connect(lambda it: self._load_cycle(it.text()))
+        left.addWidget(self.list_existing)
+        row = QHBoxLayout()
+        btn_new = QPushButton("New")
+        btn_new.clicked.connect(self._new_cycle)
+        btn_del = QPushButton("Delete")
+        btn_del.clicked.connect(self._delete_selected_cycle)
+        row.addWidget(btn_new)
+        row.addWidget(btn_del)
+        left.addLayout(row)
+        layout.addLayout(left, 1)
+
+        # ── Right: editor ──
+        right = QVBoxLayout()
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.edit_name = QLineEdit()
+        name_row.addWidget(self.edit_name)
+        name_row.addWidget(QLabel("Repeat:"))
+        self.spin_repeat = QSpinBox()
+        self.spin_repeat.setRange(1, 100000)
+        name_row.addWidget(self.spin_repeat)
+        right.addLayout(name_row)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat"])
+        self.tree.setColumnWidth(0, 220)
+        right.addWidget(self.tree)
+
+        tools = QHBoxLayout()
+        for label, slot in (
+            ("Add Step", self._add_step),
+            ("Add Wait", self._add_wait),
+            ("Add Group", self._add_group),
+            ("Add → Group", self._add_step_to_group),
+            ("Wait → Group", self._add_wait_to_group),
+            ("Remove", self._remove_selected),
+            ("Up", lambda: self._move_selected(-1)),
+            ("Down", lambda: self._move_selected(1)),
+        ):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            tools.addWidget(b)
+        right.addLayout(tools)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self._save_cycle)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        save_row.addWidget(btn_save)
+        save_row.addWidget(btn_close)
+        right.addLayout(save_row)
+        layout.addLayout(right, 2)
+
+        self.resize(720, 420)
+        self._refresh_existing()
+
+    # ── preset combo helper ──
+    def _preset_names(self):
+        try:
+            return sorted(self.repo.list_observation_presets())
+        except Exception:
+            return []
+
+    def _make_step_widgets(self, item, observation_state="", n_frames=1):
+        combo = QComboBox()
+        names = self._preset_names()
+        combo.addItems(names)
+        if observation_state and observation_state in names:
+            combo.setCurrentText(observation_state)
+        elif observation_state:
+            combo.addItem(observation_state)
+            combo.setCurrentText(observation_state)
+        spin = QSpinBox()
+        spin.setRange(1, 100000)
+        spin.setValue(int(n_frames))
+        self.tree.setItemWidget(item, 0, combo)
+        self.tree.setItemWidget(item, 1, spin)
+
+    def _make_group_widgets(self, item, repeat=1):
+        item.setText(0, "Group")
+        spin = QSpinBox()
+        spin.setRange(1, 100000)
+        spin.setValue(int(repeat))
+        self.tree.setItemWidget(item, 1, spin)
+
+    def _make_wait_widgets(self, item, duration_ms=1000.0):
+        item.setText(0, "Wait (ms)")
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1e9)
+        spin.setDecimals(1)
+        spin.setValue(float(duration_ms))
+        self.tree.setItemWidget(item, 1, spin)
+
+    # ── tree editing ──
+    def _add_step(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "step")
+        self.tree.addTopLevelItem(item)
+        self._make_step_widgets(item)
+
+    def _add_group(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "group")
+        self.tree.addTopLevelItem(item)
+        self._make_group_widgets(item)
+        item.setExpanded(True)
+
+    def _add_wait(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "wait")
+        self.tree.addTopLevelItem(item)
+        self._make_wait_widgets(item)
+
+    def _selected_group(self, action):
+        sel = self.tree.currentItem()
+        if sel is None:
+            QMessageBox.information(self, action, "Select a group (or an item inside one) first.")
+            return None
+        group = sel if sel.data(0, self._TYPE_ROLE) == "group" else sel.parent()
+        if group is None or group.data(0, self._TYPE_ROLE) != "group":
+            QMessageBox.information(self, action, "Select a group first.")
+            return None
+        return group
+
+    def _add_step_to_group(self):
+        group = self._selected_group("Add Step")
+        if group is None:
+            return
+        child = QTreeWidgetItem(group)
+        child.setData(0, self._TYPE_ROLE, "step")
+        self._make_step_widgets(child)
+        group.setExpanded(True)
+
+    def _add_wait_to_group(self):
+        group = self._selected_group("Add Wait")
+        if group is None:
+            return
+        child = QTreeWidgetItem(group)
+        child.setData(0, self._TYPE_ROLE, "wait")
+        self._make_wait_widgets(child)
+        group.setExpanded(True)
+
+    def _remove_selected(self):
+        sel = self.tree.currentItem()
+        if sel is None:
+            return
+        parent = sel.parent()
+        if parent is None:
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(sel))
+        else:
+            parent.removeChild(sel)
+
+    def _move_selected(self, delta):
+        sel = self.tree.currentItem()
+        if sel is None or sel.parent() is not None:
+            return  # only reorder top-level items
+        idx = self.tree.indexOfTopLevelItem(sel)
+        new_idx = idx + delta
+        if not (0 <= new_idx < self.tree.topLevelItemCount()):
+            return
+        # Re-take and re-insert preserves child widgets only if rebuilt; simplest
+        # is to rebuild from the model. Take/insert loses itemWidgets, so rebuild.
+        model = self._read_tree()
+        model.insert(new_idx, model.pop(idx))
+        self._load_model(self.edit_name.text(), self.spin_repeat.value(), model)
+        self.tree.setCurrentItem(self.tree.topLevelItem(new_idx))
+
+    # ── model <-> tree ──
+    def _read_leaf(self, item):
+        """Read a step or wait item into a model dict (None if malformed)."""
+        kind = item.data(0, self._TYPE_ROLE)
+        if kind == "wait":
+            spin = self.tree.itemWidget(item, 1)
+            return {"type": "wait", "duration_ms": spin.value() if spin else 0.0}
+        combo = self.tree.itemWidget(item, 0)
+        spin = self.tree.itemWidget(item, 1)
+        if combo is None:
+            return None
+        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value()}
+
+    def _read_tree(self):
+        """Return a list of dicts describing top-level items (steps/waits/groups)."""
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, self._TYPE_ROLE) == "group":
+                spin = self.tree.itemWidget(item, 1)
+                steps = []
+                for j in range(item.childCount()):
+                    leaf = self._read_leaf(item.child(j))
+                    if leaf is not None:
+                        steps.append(leaf)
+                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps})
+            else:
+                leaf = self._read_leaf(item)
+                if leaf is not None:
+                    out.append(leaf)
+        return out
+
+    def _make_leaf_item(self, parent, entry):
+        item = QTreeWidgetItem(parent)
+        if entry["type"] == "wait":
+            item.setData(0, self._TYPE_ROLE, "wait")
+            self._make_wait_widgets(item, entry.get("duration_ms", 0.0))
+        else:
+            item.setData(0, self._TYPE_ROLE, "step")
+            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1))
+
+    def _load_model(self, name, repeat, model):
+        self.tree.clear()
+        self.edit_name.setText(name)
+        self.spin_repeat.setValue(int(repeat))
+        for entry in model:
+            if entry["type"] == "group":
+                gitem = QTreeWidgetItem(self.tree)
+                gitem.setData(0, self._TYPE_ROLE, "group")
+                self._make_group_widgets(gitem, entry.get("repeat", 1))
+                for st in entry.get("steps", []):
+                    self._make_leaf_item(gitem, st)
+                gitem.setExpanded(True)
+            else:
+                self._make_leaf_item(self.tree, entry)
+
+    # ── persistence ──
+    def _refresh_existing(self):
+        self.list_existing.clear()
+        for name in _multipoint_cycle_display_names(self.microscope):
+            self.list_existing.addItem(name)
+
+    def _new_cycle(self):
+        self._load_model("", 1, [])
+
+    @staticmethod
+    def _leaf_to_dict(item):
+        from control.models.acquisition_cycle import CycleWait
+
+        if isinstance(item, CycleWait):
+            return {"type": "wait", "duration_ms": item.duration_ms}
+        return {"type": "step", "observation_state": item.observation_state, "n_frames": item.n_frames}
+
+    def _load_cycle(self, name):
+        from control.models.acquisition_cycle import CycleGroup
+
+        cyc = self.repo.load_acquisition_cycle(name)
+        if cyc is None:
+            return
+        model = []
+        for item in cyc.items:
+            if isinstance(item, CycleGroup):
+                model.append(
+                    {
+                        "type": "group",
+                        "repeat": item.repeat,
+                        "steps": [self._leaf_to_dict(s) for s in item.steps],
+                    }
+                )
+            else:
+                model.append(self._leaf_to_dict(item))
+        self._load_model(cyc.name, cyc.repeat, model)
+
+    def _delete_selected_cycle(self):
+        item = self.list_existing.currentItem()
+        if item is None:
+            return
+        name = item.text()
+        if QMessageBox.question(self, "Delete cycle", f"Delete cycle '{name}'?") != QMessageBox.Yes:
+            return
+        try:
+            self.repo.delete_acquisition_cycle(name)
+        except Exception as e:
+            QMessageBox.warning(self, "Delete failed", str(e))
+        self._refresh_existing()
+
+    @staticmethod
+    def _dict_to_leaf(entry):
+        """Build a CycleStep/CycleWait from a model dict (None to skip)."""
+        from control.models.acquisition_cycle import CycleStep, CycleWait
+
+        if entry["type"] == "wait":
+            return CycleWait(duration_ms=entry["duration_ms"])
+        if entry.get("observation_state"):
+            return CycleStep(observation_state=entry["observation_state"], n_frames=entry["n_frames"])
+        return None
+
+    def _save_cycle(self):
+        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup
+
+        name = self.edit_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Save cycle", "Enter a cycle name.")
+            return
+        model = self._read_tree()
+        items = []
+        for entry in model:
+            if entry["type"] == "group":
+                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in entry["steps"]) if leaf is not None]
+                if steps:
+                    items.append(CycleGroup(repeat=entry["repeat"], steps=steps))
+            else:
+                leaf = self._dict_to_leaf(entry)
+                if leaf is not None:
+                    items.append(leaf)
+        if not items:
+            QMessageBox.warning(self, "Save cycle", "Add at least one step.")
+            return
+        cycle = AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+        try:
+            self.repo.save_acquisition_cycle(name, cycle)
+        except Exception as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+            return
+        self._refresh_existing()
+        QMessageBox.information(self, "Saved", f"Cycle '{name}' saved.")
+
+
+def _open_cycle_editor(widget) -> None:
+    """Open the cycle editor for a multipoint widget and refresh its checklist."""
+    dialog = CycleEditorDialog(widget.microscope, parent=widget)
+    dialog.exec_()
+    if hasattr(widget, "refresh_channel_list"):
+        widget.refresh_channel_list()
 
 
 _FILE_SAVING_FORMAT_TOOLTIPS = {
@@ -1413,14 +1733,16 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_Nt.setFixedWidth(max_num_width)
 
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_cycle_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
         )
 
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
+        self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_per_point_channels.setToolTip("Configure which observation states to acquire at each registered point")
         self._region_obs_state_map = None
 
@@ -1656,6 +1978,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_config = QHBoxLayout()
         grid_config.addWidget(self.list_configurations)
         grid_config.addWidget(self.btn_per_point_channels)
+        grid_config.addWidget(self.btn_edit_cycles)
         grid_config.addSpacerItem(edge_spacer)
 
         # Button column (bottom-right). Laser AF button sits above Snap Images
@@ -2074,17 +2397,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
         # Repopulate in prior order; preset names not in prior_order go to the end.
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        _populate_cycle_list(
+            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
+        )
 
     def toggle_acquisition(self, pressed):
         self._log.debug(f"FlexibleMultiPointWidget.toggle_acquisition, {pressed=}")
@@ -2137,10 +2452,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("flexible")
-            self.multipointController.set_selected_configurations(
+            self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)
             )
-            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -2589,7 +2904,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_configurations(
+        self.multipointController.set_selected_cycles(
             _get_checked_names(self.list_configurations)
         )
         # Set the acquisition parameters
@@ -3037,8 +3352,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_cycle_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
@@ -3049,6 +3363,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Stable channel_name -> palette index, persists across dialog opens for color continuity.
         self._channel_color_index = {}
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
+        self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_per_point_channels.setToolTip(
             "Override which observation states acquire at each selected well. "
             "Asterisk indicates a custom map is active."
@@ -3343,6 +3660,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         config_cell.setContentsMargins(0, 0, 0, 0)
         config_cell.addWidget(self.list_configurations)
         config_cell.addWidget(self.btn_per_point_channels)
+        config_cell.addWidget(self.btn_edit_cycles)
         grid.addLayout(config_cell, 2, 0)
 
         # Options and Start button
@@ -4653,10 +4971,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
-            self.multipointController.set_selected_configurations(
+            self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)
             )
-            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -4796,7 +5114,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_configurations(
+        self.multipointController.set_selected_cycles(
             _get_checked_names(self.list_configurations)
         )
         # Set the acquisition parameters
@@ -4833,17 +5151,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        _populate_cycle_list(
+            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
+        )
         self._reset_per_point_channels_map()
 
     def _reset_per_point_channels_map(self):
@@ -5316,8 +5626,7 @@ class MultiPointWithFluidicsWidget(QFrame):
 
         # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_cycle_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
@@ -5509,10 +5818,10 @@ class MultiPointWithFluidicsWidget(QFrame):
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
-            self.multipointController.set_selected_configurations(
+            self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)
             )
-            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(None)
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
@@ -5570,17 +5879,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         """Refresh the observation state list after profile or preset changes."""
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        _populate_cycle_list(
+            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
+        )
 
     def acquisition_is_finished(self):
         """Handle acquisition completion"""

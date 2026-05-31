@@ -124,6 +124,66 @@ def _save_region_observation_state_csv(experiment_path, region_observation_state
             logger.error("Failed to write region_observation_states.csv: %s", e, exc_info=True)
 
 
+def _save_cycle_manifest(experiment_path, params, repo, logger=None):
+    """Write the resolved cycle/acquisition-order manifest (the ground truth).
+
+    Records, per region: the dense/ragged layout, per-state frame counts, the
+    imaged channel order, and the flat ordered list of events (so the exact
+    interleave of imaged frames and stimulus pulses is reconstructable
+    regardless of the on-disk array layout). Also embeds the selected cycle
+    definitions. Skipped when no cycles were selected (flat acquisition).
+    """
+    if not getattr(params, "selected_cycle_names", None):
+        return
+
+    def _plan_dict(plan):
+        if plan is None:
+            return None
+        return {
+            "dense": plan.dense,
+            "frame_counts": dict(plan.frame_counts),
+            "channel_order": list(plan.channel_order),
+            "events": [
+                {
+                    "observation_state": ev.observation_state,
+                    "is_stimulus": ev.is_stimulus,
+                    "is_wait": ev.is_wait,
+                    "wait_ms": ev.wait_ms,
+                    "state_frame_index": ev.state_frame_index,
+                    "cycle_event_index": ev.cycle_event_index,
+                }
+                for ev in plan.events
+            ],
+        }
+
+    cycle_defs = {}
+    names = list(params.selected_cycle_names)
+    for region_names in (params.region_cycle_map or {}).values():
+        names.extend(region_names)
+    for name in dict.fromkeys(names):
+        try:
+            cyc = repo.load_acquisition_cycle(name)
+            if cyc is not None:
+                cycle_defs[name] = cyc.model_dump(mode="json")
+        except Exception:
+            pass
+
+    manifest = {
+        "selected_cycle_names": list(params.selected_cycle_names),
+        "region_cycle_map": params.region_cycle_map,
+        "cycle_definitions": cycle_defs,
+        "global_plan": _plan_dict(params.global_region_plan),
+        "region_plans": {rid: _plan_dict(p) for rid, p in (params.resolved_region_plans or {}).items()},
+    }
+    path = os.path.join(experiment_path, "cycles_manifest.yaml")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(manifest, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception as e:
+        if logger:
+            logger.error("Failed to write cycles_manifest.yaml: %s", e, exc_info=True)
+
+
 def _save_unified_multipoint_acquisition_yaml(
     params: "AcquisitionParameters",
     experiment_path: str,
@@ -369,6 +429,13 @@ class MultiPointController:
         self.selected_configurations = []
         self.selected_observation_state_names = []
         self.region_observation_state_map = None
+        # Cycle-driven selection. When `selected_cycle_names` is non-empty the
+        # per-position plan comes from resolving those cycles; otherwise the
+        # legacy flat path over `selected_observation_state_names` (one frame per
+        # state) is used unchanged — so the old path stays an instant rollback.
+        self.selected_cycle_names = []
+        self.region_cycle_map = None
+        self._frames_per_position = 1
         self.scanCoordinates = scan_coordinates
         self._log.debug(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}, format: {self.scanCoordinates.format}")
         
@@ -680,19 +747,113 @@ class MultiPointController:
         utils.ensure_directory_exists(experiment_dir)
 
     def set_selected_configurations(self, selected_configurations_name):
+        """Legacy flat selection: acquire these observation states, one frame each.
+
+        Clears any cycle selection so the worker takes the flat path.
+        """
         repo = self.liveController.microscope.config_repo
         preset_set = set(repo.list_observation_presets())
         self.selected_configurations = []
         self.selected_observation_state_names = []
+        self.selected_cycle_names = []
         for name in selected_configurations_name:
             if name in preset_set:
                 self.selected_observation_state_names.append(name)
             else:
                 self._log.warning("Channel '%s' not found in observation presets, skipping", name)
+        self._frames_per_position = len(self.selected_observation_state_names)
+
+    def set_selected_cycles(self, selected_cycle_names):
+        """Cycle-driven selection: run these cycles (in order) at each position.
+
+        Derives the imaged channel axis (distinct imaged states) and
+        frames-per-position so existing disk/image-count/zarr-naming helpers,
+        which read ``selected_observation_state_names``, keep working.
+        """
+        repo = self.liveController.microscope.config_repo
+        cycle_set = set(repo.list_acquisition_cycles())
+        self.selected_configurations = []
+        self.selected_cycle_names = []
+        for name in selected_cycle_names:
+            if name in cycle_set:
+                self.selected_cycle_names.append(name)
+            else:
+                self._log.warning("Cycle '%s' not found, skipping", name)
+        from control.models.acquisition_cycle import all_states_in_order
+
+        plan = self._resolve_plan(self.selected_cycle_names, None)
+        # Metadata/disk/image-count helpers read this; keep stimulus states in the
+        # record. The zarr C axis (imaged-only) is taken from the plan separately.
+        self.selected_observation_state_names = all_states_in_order(plan.events)
+        self._frames_per_position = plan.frames_per_position
 
     def set_region_observation_state_map(self, mapping):
         """Set per-region observation state overrides. None means all regions use the global list."""
         self.region_observation_state_map = mapping
+
+    def set_region_cycle_map(self, mapping):
+        """Set per-region cycle overrides (region_id -> list of cycle names).
+
+        None means all regions run the global selected cycles.
+        """
+        self.region_cycle_map = mapping
+
+    def _is_stimulus_predicate(self):
+        """Return a cached predicate: is this observation state stimulus-only?
+
+        Consults inline (live-snapshot) states first, then saved presets.
+        """
+        repo = self.liveController.microscope.config_repo
+        inline = getattr(self, "_inline_observation_states_for_run", None) or {}
+        cache = {}
+
+        def is_stim(name):
+            if name in cache:
+                return cache[name]
+            st = inline.get(name)
+            if st is None:
+                st = repo.load_observation_preset(name)
+            result = bool(getattr(st, "is_stimulus_only", False)) if st is not None else False
+            cache[name] = result
+            return result
+
+        return is_stim
+
+    def _resolve_plan(self, cycle_names, region_state_names):
+        """Resolve a RegionPlan from cycle names (preferred) or bare state names.
+
+        ``cycle_names`` non-empty -> resolve those cycles into a chain.
+        Otherwise ``region_state_names`` (falling back to the global
+        ``selected_observation_state_names``) is treated as a chain of 1-frame
+        events — today's flat behaviour.
+        """
+        from control.models.acquisition_cycle import RegionPlan, resolve_chain, _index_events
+
+        repo = self.liveController.microscope.config_repo
+        is_stim = self._is_stimulus_predicate()
+        if cycle_names:
+            events = resolve_chain(list(cycle_names), repo.load_acquisition_cycle, is_stim)
+        else:
+            names = region_state_names if region_state_names is not None else self.selected_observation_state_names
+            events = _index_events(list(names), is_stim)
+        return RegionPlan.from_events(events)
+
+    def _build_region_plans(self, scan_region_names):
+        """Build (global_plan, {region_id: RegionPlan}) for an acquisition.
+
+        Per-region plans are produced only for regions that have an explicit
+        override (cycle map or legacy state map); other regions fall back to the
+        global plan at run time.
+        """
+        global_plan = self._resolve_plan(self.selected_cycle_names, None)
+        region_plans = {}
+        if self.region_cycle_map is not None:
+            for region_id, names in self.region_cycle_map.items():
+                region_plans[region_id] = self._resolve_plan(names, None)
+        elif self.region_observation_state_map is not None:
+            for region_id, names in self.region_observation_state_map.items():
+                region_plans[region_id] = self._resolve_plan([], names)
+        return global_plan, region_plans
 
     def get_acquisition_image_count(self):
         """
@@ -715,18 +876,11 @@ class MultiPointController:
             ]
             all_regions_coord_count = sum(coords_per_region)
 
-            # Stimulus-only states fire an NIDAQ pulse comb but produce no
-            # camera frame — exclude them from the image count so disk-space
-            # estimates stay correct.
-            if self.selected_observation_state_names:
-                repo = self.liveController.microscope.config_repo
-                capture_names = []
-                for name in self.selected_observation_state_names:
-                    preset = repo.load_observation_preset(name)
-                    if preset is not None and getattr(preset, "is_stimulus_only", False):
-                        continue
-                    capture_names.append(name)
-                n_ch = len(capture_names)
+            # Resolve the per-position plan so cycles (multiple frames per state)
+            # and stimulus-only states (no camera frame) are both accounted for:
+            # frames_per_position already excludes stimulus events.
+            if self.selected_observation_state_names or self.selected_cycle_names:
+                n_ch = self._resolve_plan(self.selected_cycle_names, None).frames_per_position
             else:
                 n_ch = len(self.selected_configurations)
             non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
@@ -1147,6 +1301,14 @@ class MultiPointController:
                 logger=self._log,
             )
 
+            # Save the resolved cycle/acquisition-order manifest (cycle runs only)
+            _save_cycle_manifest(
+                experiment_path,
+                acquisition_params,
+                self.liveController.microscope.config_repo,
+                logger=self._log,
+            )
+
             # Get pre-warmed job runner and its shared backpressure values
             # (starts a new one warming for next acquisition)
             prewarmed_runner, prewarmed_bp_values = self.get_prewarmed_job_runner()
@@ -1215,6 +1377,8 @@ class MultiPointController:
                     f"Unknown wellplate format '{self.scanCoordinates.format}', using default 96-well dimensions"
                 )
 
+        global_plan, region_plans = self._build_region_plans(scan_position_information.scan_region_names)
+
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
             base_path=self.base_path,
@@ -1250,6 +1414,10 @@ class MultiPointController:
             xy_mode=self.xy_mode,
             selected_observation_state_names=self.selected_observation_state_names,
             region_observation_state_map=self.region_observation_state_map,
+            selected_cycle_names=list(self.selected_cycle_names),
+            region_cycle_map=self.region_cycle_map,
+            global_region_plan=global_plan,
+            resolved_region_plans=region_plans,
             inline_observation_states=dict(getattr(self, "_inline_observation_states_for_run", {})),
             laser_af_seed_mode=self.laser_af_seed_mode,
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,

@@ -95,6 +95,26 @@ class CaptureInfo:
     time_point: Optional[int] = None
     filename_channel_label: Optional[str] = None
     """If set, used for TIFF basename instead of observation_state.name."""
+    # ── Self-describing save layout (cycles) ──
+    # When ``array_key`` is None and the ``save_*`` fields are None, the legacy
+    # global ``zarr_writer_info`` dims and ``(time_point, configuration_idx)``
+    # coordinates are used (today's behaviour). When set, the frame fully
+    # describes its own array so the save layer needs no global uniform
+    # ``(T, C, Z)`` assumption — which per-region cycles and ragged counts break.
+    # ``array_key`` None = dense single array per FOV; a state name = a ragged
+    # single-channel per-state plate/store.
+    array_key: Optional[str] = None
+    save_t_index: Optional[int] = None
+    save_c_index: Optional[int] = None
+    save_t_size: Optional[int] = None
+    save_c_size: Optional[int] = None
+    cycle_event_index: Optional[int] = None
+    state_frame_index: Optional[int] = None
+    frame_suffix: Optional[str] = None
+    """Disambiguating basename suffix for per-frame formats; None = no suffix."""
+    array_channel_names: Optional[List[str]] = None
+    array_channel_colors: Optional[List[str]] = None
+    array_channel_wavelengths: Optional[List[Optional[int]]] = None
     # On-disk save format the worker selected for this acquisition. Travels with
     # the job through the multiprocessing pickle so subprocess code branches on
     # this value rather than reading the (stale) global ``_def.FILE_SAVING_OPTION``.
@@ -180,6 +200,8 @@ def append_frame_acquisition_time_csv(
         "z_level",
         "channel",
         "channel_index",
+        "cycle_event_index",
+        "state_frame_index",
         "filename",
         "unix_time_s",
         "utc_iso",
@@ -193,6 +215,10 @@ def append_frame_acquisition_time_csv(
         "z_level": info.z_index,
         "channel": ch,
         "channel_index": cidx,
+        # Cycle acquisition-order backbone: where this frame sat in the flat
+        # per-position chain and which repeat of its state it was.
+        "cycle_event_index": "" if info.cycle_event_index is None else info.cycle_event_index,
+        "state_frame_index": "" if info.state_frame_index is None else info.state_frame_index,
         "filename": filename,
         "unix_time_s": f"{float(info.capture_time):.6f}",
         "utc_iso": datetime.fromtimestamp(float(info.capture_time), tz=timezone.utc).isoformat(),
@@ -294,17 +320,22 @@ class SaveImageJob(Job):
                 )
             append_frame_acquisition_time_csv(info, os.path.basename(output_path))
         else:
+            # Disambiguate repeated frames of the same state at one position
+            # (cycles) by folding the frame suffix into the basename's channel
+            # label. Kept out of info.filename_channel_label so the channel
+            # identity used by zarr/CSV stays clean.
+            _base_label = info.filename_channel_label or info.observation_state.name
+            _disambiguated = f"{_base_label}_{info.frame_suffix}" if info.frame_suffix else _base_label
             saved_image = utils_acquisition.save_image(
                 image=image,
                 file_id=info.file_id,
                 save_directory=info.save_directory,
                 config=info.observation_state,
                 is_color=is_color,
-                filename_channel_label=info.filename_channel_label,
+                filename_channel_label=_disambiguated,
             )
-            _label = info.filename_channel_label or info.observation_state.name
             _written = utils_acquisition.get_image_filepath(
-                info.save_directory, info.file_id, _label, image.dtype
+                info.save_directory, info.file_id, _disambiguated, image.dtype
             )
             append_frame_acquisition_time_csv(info, os.path.basename(_written))
 
@@ -344,11 +375,12 @@ class SaveOMETiffJob(Job):
             base_name = ome_tiff_writer.ome_base_name(self.capture_info)
             stack_key = os.path.join(ome_folder, base_name)
 
-            # Determine 5D shape (T, Z, C, Y, X)
+            # Determine 5D shape (T, Z, C, Y, X), preferring cycle self-describing dims
+            _t_sim, _c_sim = ome_tiff_writer.ome_plane_indices(self.capture_info)
             shape = (
-                self.acquisition_info.total_time_points,
+                ome_tiff_writer._ome_t_size(self.acquisition_info, self.capture_info),
                 self.acquisition_info.total_z_levels,
-                self.acquisition_info.total_channels,
+                ome_tiff_writer._ome_c_size(self.acquisition_info, self.capture_info),
                 image.shape[0],
                 image.shape[1],
             )
@@ -357,9 +389,9 @@ class SaveOMETiffJob(Job):
                 image=image,
                 stack_key=stack_key,
                 shape=shape,
-                time_point=self.capture_info.time_point or 0,
+                time_point=_t_sim,
                 z_index=self.capture_info.z_index,
-                channel_index=self.capture_info.configuration_idx,
+                channel_index=_c_sim,
             )
             self._log.debug(
                 f"SaveOMETiffJob {self.job_id}: simulated write of {bytes_written} bytes "
@@ -407,9 +439,8 @@ class SaveOMETiffJob(Job):
             target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
             image_to_store = image if image.dtype == target_dtype else image.astype(target_dtype)
 
-            time_point = int(info.time_point)
+            time_point, channel_index = ome_tiff_writer.ome_plane_indices(info)
             z_index = int(info.z_index)
-            channel_index = int(info.configuration_idx)
             shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
             if not (0 <= time_point < shape[0]):
                 raise ValueError("Time point index out of range for OME stack")
@@ -510,32 +541,34 @@ class ZarrWriterInfo:
     channel_colors: List[str] = field(default_factory=list)
     channel_wavelengths: List[Optional[int]] = field(default_factory=list)
 
-    def get_output_path(self, region_id: str, fov: int) -> str:
-        """Resolution-0 array path for a given ``(region_id, fov)``."""
-        if self.is_hcs:
-            group_path = utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov)
-        else:
-            group_path = utils.build_per_fov_zarr_path(self.base_path, region_id, fov)
-        return os.path.join(group_path, "0")
+    def get_output_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
+        """Resolution-0 array path for a given ``(region_id, fov)``.
 
-    def get_group_path(self, region_id: str, fov: int) -> str:
+        ``array_key`` (a channel name) selects a ragged per-state plate/store; None
+        is the dense single-array layout.
+        """
+        return os.path.join(self.get_group_path(region_id, fov, array_key), "0")
+
+    def get_group_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
         """FOV group directory (parent of the resolution levels)."""
         if self.is_hcs:
-            return utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov)
-        return utils.build_per_fov_zarr_path(self.base_path, region_id, fov)
+            return utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov, array_key)
+        return utils.build_per_fov_zarr_path(self.base_path, region_id, fov, array_key)
 
     def get_fov_count(self, region_id: str) -> int:
         """Number of FOVs in a region (for HCS well fields metadata)."""
         return self.region_fov_counts.get(str(region_id), 1)
 
-    def get_plate_path(self) -> str:
-        """Path to ``plate.ome.zarr`` (HCS mode only)."""
-        return os.path.join(self.base_path, "plate.ome.zarr")
+    def get_plate_path(self, array_key: Optional[str] = None) -> str:
+        """Path to the plate store (HCS mode). ``array_key`` selects a ragged
+        per-channel plate (``{array_key}.ome.zarr``)."""
+        plate = "plate.ome.zarr" if array_key is None else f"{array_key}.ome.zarr"
+        return os.path.join(self.base_path, plate)
 
-    def get_well_path(self, well_id: str) -> str:
+    def get_well_path(self, well_id: str, array_key: Optional[str] = None) -> str:
         """Path to a well directory (HCS mode only)."""
         row_letter, col_num = utils.parse_well_id(well_id)
-        return os.path.join(self.base_path, "plate.ome.zarr", row_letter, col_num)
+        return os.path.join(self.get_plate_path(array_key), row_letter, col_num)
 
     def get_hcs_structure(self) -> Tuple[List[str], List[int], List[Tuple[str, int]]]:
         """Return ``(rows, cols, wells)`` for HCS plate metadata."""
@@ -645,30 +678,34 @@ class SaveZarrJob(Job):
             return False
         return True
 
-    def _write_hcs_metadata_if_needed(self, region_id: str, fov: int) -> None:
+    def _write_hcs_metadata_if_needed(self, region_id: str, fov: int, array_key: Optional[str] = None) -> None:
         """Write HCS plate and well metadata if not already written.
 
         Called when a new writer is initialized for an HCS acquisition.
         Uses class-level sets to track which plate/well metadata has been written.
+        In the ragged cycle layout each imaged channel is its own single-channel
+        plate (``array_key``), so plate/well metadata is written once per plate.
 
         Args:
             region_id: Well ID (e.g., "A1", "B12")
             fov: Field of view index
+            array_key: Per-channel plate namespace (ragged), or None (dense).
         """
         from control.core.zarr_writer import write_plate_metadata, write_well_metadata
 
         info = self.zarr_writer_info
 
-        # Write plate metadata (once per acquisition)
-        plate_path = info.get_plate_path()
+        # Write plate metadata (once per plate)
+        plate_path = info.get_plate_path(array_key)
         if plate_path not in self._hcs_plate_written:
             rows, cols, wells = info.get_hcs_structure()
-            write_plate_metadata(plate_path, rows, cols, wells, plate_name="plate")
+            plate_name = "plate" if array_key is None else str(array_key)
+            write_plate_metadata(plate_path, rows, cols, wells, plate_name=plate_name)
             self._hcs_plate_written.add(plate_path)
-            self._log.info(f"Wrote HCS plate metadata: {len(wells)} wells")
+            self._log.info(f"Wrote HCS plate metadata ({plate_name}): {len(wells)} wells")
 
-        # Write well metadata (once per well)
-        well_path = info.get_well_path(region_id)
+        # Write well metadata (once per well per plate)
+        well_path = info.get_well_path(region_id, array_key)
         if well_path not in self._hcs_wells_written:
             # Get FOV count for this well
             fov_count = info.get_fov_count(region_id)
@@ -692,21 +729,22 @@ class SaveZarrJob(Job):
 
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
-        output_path = self.zarr_writer_info.get_output_path(region_id, fov)
+        ak, t, c, t_size, c_size = self._effective_save_coords(info)
+        output_path = self.zarr_writer_info.get_output_path(region_id, fov, ak)
 
         region_names = list(self.zarr_writer_info.region_fov_counts.keys())
         result = ZarrWriteResult(
             fov=fov,
-            time_point=info.time_point or 0,
+            time_point=t,
             z_index=info.z_index,
             channel_name=info.observation_state.name,
             region_idx=region_names.index(region_id) if region_id in region_names else 0,
         )
 
-        # Always 5D: (T, C, Z, Y, X) per FOV.
+        # Always 5D: (T, C, Z, Y, X) per FOV (dense) or per (FOV, channel) (ragged).
         shape = (
-            self.zarr_writer_info.t_size,
-            self.zarr_writer_info.c_size,
+            t_size,
+            c_size,
             self.zarr_writer_info.z_size,
             image.shape[0],
             image.shape[1],
@@ -717,9 +755,9 @@ class SaveZarrJob(Job):
                 image=image,
                 stack_key=output_path,
                 shape=shape,
-                time_point=info.time_point or 0,
+                time_point=t,
                 z_index=info.z_index,
-                channel_index=info.configuration_idx,
+                channel_index=c,
             )
             self._log.debug(
                 f"SaveZarrJob {self.job_id}: simulated write of {bytes_written} bytes "
@@ -735,6 +773,21 @@ class SaveZarrJob(Job):
         append_frame_acquisition_time_csv(info, _rel_z.replace("\\", "/"))
         return result
 
+    def _effective_save_coords(self, info: CaptureInfo):
+        """Resolve (array_key, t, c, t_size, c_size) for a frame.
+
+        Uses the self-describing ``save_*`` fields when present (cycle layout),
+        else falls back to today's global ``(time_point, configuration_idx)`` and
+        the uniform ``zarr_writer_info`` dims.
+        """
+        zwi = self.zarr_writer_info
+        ak = info.array_key
+        t = info.save_t_index if info.save_t_index is not None else (info.time_point or 0)
+        c = info.save_c_index if info.save_c_index is not None else info.configuration_idx
+        t_size = info.save_t_size if info.save_t_size is not None else zwi.t_size
+        c_size = info.save_c_size if info.save_c_size is not None else zwi.c_size
+        return ak, t, c, t_size, c_size
+
     def _save_zarr(self, image: np.ndarray, info: CaptureInfo, output_path: str) -> None:
         """Write one plane to the per-FOV zarr (level 0 + pyramid via ZarrWriter)."""
         from control.core.zarr_writer import ZarrWriter, ZarrAcquisitionConfig
@@ -742,29 +795,37 @@ class SaveZarrJob(Job):
 
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
-        writer_key = output_path  # One writer per FOV
+        ak, t, c, t_size, c_size = self._effective_save_coords(info)
+        writer_key = output_path  # One writer per (FOV[, channel] for ragged)
 
+        zwi = self.zarr_writer_info
         if writer_key not in self._zarr_writers:
             shape = (
-                self.zarr_writer_info.t_size,
-                self.zarr_writer_info.c_size,
-                self.zarr_writer_info.z_size,
+                t_size,
+                c_size,
+                zwi.z_size,
                 image.shape[0],
                 image.shape[1],
             )
-            translation_um = self.zarr_writer_info.get_fov_translation_um(region_id, fov)
-            manifest_path = self.zarr_writer_info.get_manifest_path(region_id, fov)
+            translation_um = zwi.get_fov_translation_um(region_id, fov)
+            manifest_path = zwi.get_manifest_path(region_id, fov)
+            # Per-array channel metadata (ragged = single channel) falls back to global.
+            channel_names = info.array_channel_names if info.array_channel_names is not None else zwi.channel_names
+            channel_colors = info.array_channel_colors if info.array_channel_colors is not None else zwi.channel_colors
+            channel_wavelengths = (
+                info.array_channel_wavelengths if info.array_channel_wavelengths is not None else zwi.channel_wavelengths
+            )
 
             config = ZarrAcquisitionConfig(
                 output_path=output_path,
                 shape=shape,
                 dtype=image.dtype,
-                pixel_size_um=self.zarr_writer_info.pixel_size_um or 1.0,
-                z_step_um=self.zarr_writer_info.z_step_um,
-                time_increment_s=self.zarr_writer_info.time_increment_s,
-                channel_names=self.zarr_writer_info.channel_names,
-                channel_colors=self.zarr_writer_info.channel_colors,
-                channel_wavelengths=self.zarr_writer_info.channel_wavelengths,
+                pixel_size_um=zwi.pixel_size_um or 1.0,
+                z_step_um=zwi.z_step_um,
+                time_increment_s=zwi.time_increment_s,
+                channel_names=channel_names,
+                channel_colors=channel_colors,
+                channel_wavelengths=channel_wavelengths,
                 compression=_def.ZARR_COMPRESSION,
                 translation_um=translation_um,
                 manifest_path=manifest_path,
@@ -776,19 +837,17 @@ class SaveZarrJob(Job):
                 self._log.error(f"Failed to initialize zarr writer for {output_path}: {e}")
                 raise
             self._zarr_writers[writer_key] = writer
-            if self.zarr_writer_info.is_hcs:
-                self._write_hcs_metadata_if_needed(region_id, fov)
-            mode_str = "HCS" if self.zarr_writer_info.is_hcs else "per-FOV"
+            if zwi.is_hcs:
+                self._write_hcs_metadata_if_needed(region_id, fov, ak)
+            mode_str = "HCS" if zwi.is_hcs else "per-FOV"
             self._log.info(f"Initialized zarr writer ({mode_str}): {output_path}")
 
         writer = self._zarr_writers[writer_key]
-        t = info.time_point or 0
-        c = info.configuration_idx
         z = info.z_index
         channel_name = info.filename_channel_label or info.observation_state.name
         writer.write_frame(image, t=t, c=c, z=z)
         writer.record_frame_time(t=t, c=c, z=z, unix_time_s=info.capture_time, channel_name=channel_name)
-        self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path}")
+        self._log.debug(f"Wrote frame t={t}, c={c}, z={z} to {output_path} (array_key={ak})")
 
 
 @dataclass
