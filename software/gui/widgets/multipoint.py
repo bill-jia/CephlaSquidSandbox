@@ -517,14 +517,69 @@ _FILE_SAVING_FORMAT_TOOLTIPS = {
 }
 
 
-def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox]":
-    """Build a compact ``Save format: [combo]`` row.
+def _human_bytes(n: float) -> str:
+    """Format a byte count as a short human-readable string (e.g. ``3.4 GB``)."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def _format_acquisition_size_estimate(controller, checked_cycle_names, region_cycle_map, skip_saving) -> str:
+    """One-line ``N images · ~X`` estimate for the configured acquisition.
+
+    Pushes the current cycle selection into ``controller`` (re-pushed at Start anyway) so
+    the controller's format-/cycle-aware estimators can read live state, then reads
+    ``get_acquisition_image_count`` and ``estimate_acquisition_disk_bytes``. Returns a short
+    hint string when the acquisition isn't estimable yet. Never raises.
+    """
+    if skip_saving:
+        return "Saving disabled — no files written"
+    if not checked_cycle_names:
+        return "Select a cycle to estimate size"
+    try:
+        if controller.acquisition_in_progress():
+            return ""
+        controller.set_selected_cycles(checked_cycle_names)
+        controller.set_region_cycle_map(region_cycle_map)
+        image_count = controller.get_acquisition_image_count()
+        if image_count <= 0:
+            return "Add a region to estimate size"
+        disk_bytes = controller.estimate_acquisition_disk_bytes()
+    except Exception:
+        return "—"
+    fmt = getattr(controller, "file_saving_option", None)
+    # ZARR_V3 size is data-dependent (compression); flag it as approximate.
+    approx = "≈" if fmt is not None and getattr(fmt, "name", "") == "ZARR_V3" else "~"
+    return f"{image_count:,} images · {approx}{_human_bytes(disk_bytes)}"
+
+
+def _refresh_size_estimate(widget) -> None:
+    """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
+
+    A no-op if the widget has no estimate label (e.g. the fluidics variant). Wired to every
+    setting that changes the image count or on-disk size (Nt/NZ/region geometry, channel/cycle
+    selection, save format, skip-saving).
+    """
+    label = getattr(widget, "label_size_estimate", None)
+    if label is None:
+        return
+    checked = _get_checked_names(widget.list_configurations)
+    region_map = getattr(widget, "_region_obs_state_map", None)
+    skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
+    label.setText(_format_acquisition_size_estimate(widget.multipointController, checked, region_map, skip_saving))
+
+
+def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox, QLabel]":
+    """Build a compact ``Save format: [combo] ........ [size estimate]`` row.
 
     The combo only mirrors local UI state; the caller wires its
     ``currentTextChanged`` signal to ``MultiPointController.set_file_saving_option``
     so the choice flows through ``AcquisitionParameters`` to the worker
     (mirroring how ``Skip Saving`` is plumbed). Compression / chunking knobs
-    live in Settings > Preferences.
+    live in Settings > Preferences. The trailing label shows a live image-count /
+    disk-size estimate (the caller keeps it updated via ``_refresh_size_estimate``).
     """
     label = QLabel("Save format:")
     combo = QComboBox()
@@ -548,12 +603,20 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
     combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
+    estimate_label = QLabel("")
+    estimate_label.setToolTip(
+        "Estimated image count and on-disk size for the current settings.\n"
+        "ZARR_V3 sizes are approximate (compression is data-dependent)."
+    )
+    estimate_label.setStyleSheet("color: gray;")
+
     row = QHBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
     row.addWidget(label)
     row.addWidget(combo)
     row.addStretch(1)
-    return row, combo
+    row.addWidget(estimate_label)
+    return row, combo, estimate_label
 
 
 def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict]":
@@ -1774,7 +1837,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
-        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
         self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
@@ -2077,6 +2140,17 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_started.connect(self.display_progress_bar)
         self.eta_timer.timeout.connect(self.update_eta_display)
 
+        # Live acquisition-size estimate: recompute on any setting that changes image
+        # count or on-disk size. (NX/NY/locations flow through update_fov_positions.)
+        for _sig in (
+            self.entry_NZ.valueChanged,
+            self.entry_Nt.valueChanged,
+            self.combobox_fileSavingFormat.currentTextChanged,
+            self.checkbox_skipSaving.toggled,
+            self.list_configurations.itemChanged,
+        ):
+            _sig.connect(lambda *_: _refresh_size_estimate(self))
+
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
         self.btn_previous.clicked.connect(self.previous)
@@ -2097,6 +2171,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.toggle_z_range_controls(False)
         self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
+
+        _refresh_size_estimate(self)
 
     def setup_layout(self):
         self.grid = QVBoxLayout()
@@ -2335,6 +2411,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                     self.entry_deltaY.value(),
                 )
 
+        _refresh_size_estimate(self)
+
     def set_deltaZ(self, value):
         if self.checkbox_usePiezo.isChecked():
             deltaZ = value
@@ -2400,6 +2478,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         _populate_cycle_list(
             self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
         )
+        _refresh_size_estimate(self)
 
     def toggle_acquisition(self, pressed):
         self._log.debug(f"FlexibleMultiPointWidget.toggle_acquisition, {pressed=}")
@@ -2600,6 +2679,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
             self._region_obs_state_map = None
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
         else:
             print("Invalid Region: Duplicate Location")
 
@@ -2661,6 +2741,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.dropdown_location_list.blockSignals(False)
             self._region_obs_state_map = None
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
 
     def next(self):
         index = self.dropdown_location_list.currentIndex()
@@ -2700,6 +2781,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.navigationViewer.clear_overlay()
         self._region_obs_state_map = None
         self._update_per_point_button_text()
+        _refresh_size_estimate(self)
 
         self._log.info("Cleared all locations and overlays.")
 
@@ -3413,7 +3495,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
-        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
         self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
@@ -3777,6 +3859,16 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
+
+        # Live acquisition-size estimate (region geometry flows through update_coordinates).
+        for _sig in (
+            self.entry_NZ.valueChanged,
+            self.entry_Nt.valueChanged,
+            self.combobox_fileSavingFormat.currentTextChanged,
+            self.checkbox_skipSaving.toggled,
+            self.list_configurations.itemChanged,
+        ):
+            _sig.connect(lambda *_: _refresh_size_estimate(self))
         # Connect signal for setting acquisition state from external sources (e.g., TCP server)
         self.signal_set_acquisition_running.connect(self.set_acquisition_running_state)
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -3796,6 +3888,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         # Load cached acquisition settings
         self.load_multipoint_widget_config_from_cache()
+
+        _refresh_size_estimate(self)
 
         # Connect settings saving to relevant value changes
         self.checkbox_xy.toggled.connect(self.save_multipoint_widget_config_to_cache)
@@ -4848,6 +4942,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.scanCoordinates.clear_regions()
             self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
 
+        _refresh_size_estimate(self)
+
     def handle_objective_change(self):
         """Handle objective change - update coverage and coordinates.
 
@@ -4882,6 +4978,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
         elif self.scanCoordinates.has_regions():
             self.scanCoordinates.clear_regions()
+
+        _refresh_size_estimate(self)
 
     def update_live_coordinates(self, pos: squid.abc.Pos):
         if self.tab_widget and self.tab_widget.currentWidget() != self:
@@ -5155,6 +5253,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
         )
         self._reset_per_point_channels_map()
+        _refresh_size_estimate(self)
 
     def _reset_per_point_channels_map(self):
         """Drop any per-well channel override and refresh the button label.
@@ -5219,6 +5318,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 _reorder_list_widget(self.list_configurations, new_order)
                 self.save_multipoint_widget_config_to_cache()
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
 
     def toggle_coordinate_controls(self, has_coordinates: bool):
         """Toggle button text and control states based on whether coordinates are loaded"""

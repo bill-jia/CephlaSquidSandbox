@@ -279,6 +279,11 @@ class ZarrWriter:
         self._level_shapes: List[Tuple[int, int]] = []  # (y, x) per level
         self._frame_times_dataset: Optional[Any] = None
         self._pending_futures: List[Any] = []
+        # Array-t indices written since the last upload barrier drained them.
+        # A dense/ragged cycle FOV visit folds many frames into a contiguous
+        # block of array-t indices, so the barrier must stage every one of
+        # them — not just the shard at the scan time_point.
+        self._unstaged_t_indices: set[int] = set()
         self._initialized = False
         self._finalized = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -339,22 +344,32 @@ class ZarrWriter:
         """Single chunk file backing the ``frame_times`` (T, C, Z) array."""
         return os.path.join(self._frame_times_path(), "c", "0", "0", "0")
 
-    def shard_paths_for_timepoint(self, t: int) -> List[str]:
-        """Per-timepoint shard files for ``t`` — **deletable after verify**.
+    def drain_unstaged_shard_paths(self) -> List[str]:
+        """Shard files for every timepoint written since the last drain.
 
-        Returns one shard file per pyramid level: ``<level_dir>/c/<t>/0/0/0/0``.
+        Returns one shard file per ``(written-t, pyramid-level)`` —
+        ``<level_dir>/c/<t>/0/0/0/0`` — then clears the pending set so each
+        shard is staged for upload exactly once. A single FOV visit in a
+        dense/ragged cycle writes many frames that fold into a contiguous
+        block of array-t indices; the upload barrier must stage all of them,
+        not just the shard at the scan time_point.
+
         Each shard is exclusive to a single ``(t, fov)`` bundle; once that
         bundle's writes are flushed the writer never touches the file again,
-        so deleting it locally after a verified remote copy is safe.
-
-        Files that do not yet exist are filtered out so callers can use this
-        helper before ``write_frame()`` has flushed the first chunk (in
-        practice the barrier job waits on ``wait_for_pending()`` first).
+        so deleting it locally after a verified remote copy is safe. Callers
+        run ``wait_for_pending()`` first, so every recorded shard is on disk.
         """
-        candidates: List[str] = []
-        for level in range(len(self._level_shapes)):
-            candidates.append(self._level_shard_path(level, t))
-        return [p for p in candidates if os.path.exists(p)]
+        if not self._unstaged_t_indices:
+            return []
+        ts = sorted(self._unstaged_t_indices)
+        self._unstaged_t_indices.clear()
+        paths: List[str] = []
+        for t in ts:
+            for level in range(len(self._level_shapes)):
+                p = self._level_shard_path(level, t)
+                if os.path.exists(p):
+                    paths.append(p)
+        return paths
 
     def metadata_paths(self) -> List[str]:
         """Shared metadata files — **uploaded every barrier, never deleted**.
@@ -630,6 +645,10 @@ class ZarrWriter:
 
         if image.dtype != config.dtype:
             image = image.astype(config.dtype)
+
+        # Record this array-t index so the upload barrier stages every shard
+        # written for the FOV visit (frames fold into a block of t indices).
+        self._unstaged_t_indices.add(t)
 
         # Level 0
         future = self._level_datasets[0][t, c, z, :, :].write(image)

@@ -255,6 +255,13 @@ Three independent focus aids are available (combine as needed):
   | **OME_TIFF** | OME‑TIFF stacks (TZCYX) with embedded XML metadata; opens in ImageJ/FIJI. |
   | **ZARR_V3** | OME‑NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines. |
 
+- **Size estimate** — to the right of **Save format**, a live `N images · ~size` readout
+  updates as you change settings (regions, Nz, Nt, channels/cycles, save format). It
+  accounts for the per‑position cycle plan (frames per position, including ragged plans —
+  see [acquisition-cycles.md](../acquisition-cycles.md)) and the chosen format: TIFF
+  formats are estimated uncompressed, while **ZARR_V3** is shown with a `≈` and reflects
+  the selected compression preset plus pyramid overhead (the real size is data‑dependent
+  and usually smaller). It reads *Saving disabled* when **Skip Saving** is checked.
 - **Stream to network** (ZARR_V3 only) — appears when the format is ZARR_V3. Streams the
   zarr output to a mounted network share as the run proceeds, sha256‑verifies each
   timepoint on the remote, and optionally deletes local copies (**Delete after verify**)

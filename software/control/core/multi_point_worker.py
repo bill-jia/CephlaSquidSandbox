@@ -1,4 +1,5 @@
 import csv
+import glob
 import json
 import logging
 import os
@@ -164,7 +165,7 @@ class _BackgroundUploadDrainer:
         zarr_writer_info,
         experiment_path: Optional[str],
         metadata_paths_builder,
-        timeout_s: float,
+        stall_window_s: float,
     ):
         self._worker = upload_worker
         self._target = upload_target
@@ -176,7 +177,7 @@ class _BackgroundUploadDrainer:
         self._zarr_writer_info = zarr_writer_info
         self._experiment_path = experiment_path
         self._metadata_paths_for_fov = metadata_paths_builder
-        self._timeout_s = timeout_s
+        self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
         self._thread = threading.Thread(
@@ -323,10 +324,80 @@ class _BackgroundUploadDrainer:
                 f"Submitted {submitted} post-finalize metadata resync task(s)"
             )
 
+        # Plate/well group metadata sits above the per-FOV groups and is
+        # required for the remote to open as a valid HCS plate.
+        self._enqueue_plate_metadata_resync()
+
         # Also push every experiment-root file (acquisition.yaml, run logs,
         # config dumps, …) so the remote ends up with the full acquisition
         # record, not just the zarr-internal metadata.
         self._enqueue_experiment_root_resync()
+
+    def _enqueue_plate_metadata_resync(self) -> None:
+        """Upload plate-root and per-well ``zarr.json`` for every HCS plate.
+
+        ``_metadata_paths_for_fov`` only covers per-FOV groups; without the
+        plate-root (``<plate>.ome.zarr/zarr.json``) and per-well
+        (``<plate>.ome.zarr/<row>/<col>/zarr.json``) group metadata the
+        remote tree is a headless collection of images, not a readable plate.
+        """
+        if (
+            self._target is None
+            or not self._target.enabled
+            or not self._experiment_path
+        ):
+            return
+        import json as _json
+        from uuid import uuid4
+        from control.core.zarr_upload import UploadTask, local_to_remote_path
+        meta_files: List[str] = []
+        try:
+            plate_roots = sorted(glob.glob(os.path.join(self._experiment_path, "*.ome.zarr")))
+        except OSError:
+            return
+        for plate_root in plate_roots:
+            root_json = os.path.join(plate_root, "zarr.json")
+            try:
+                with open(root_json, "r", encoding="utf-8") as f:
+                    ome = (_json.load(f).get("attributes", {}) or {}).get("ome", {}) or {}
+            except (OSError, ValueError):
+                continue
+            if "plate" not in ome:
+                continue
+            meta_files.append(root_json)
+            for row in sorted(os.listdir(plate_root)):
+                row_dir = os.path.join(plate_root, row)
+                if not os.path.isdir(row_dir):
+                    continue
+                rj = os.path.join(row_dir, "zarr.json")
+                if os.path.isfile(rj):
+                    meta_files.append(rj)
+                for col in sorted(os.listdir(row_dir)):
+                    wj = os.path.join(row_dir, col, "zarr.json")
+                    if os.path.isfile(wj):
+                        meta_files.append(wj)
+        if not meta_files:
+            return
+        files = [
+            (local, local_to_remote_path(local, self._target.local_base, self._target.remote_root))
+            for local in meta_files
+        ]
+        task = UploadTask(
+            task_id=str(uuid4()),
+            time_point=-1,
+            region_id="(plate)",
+            fov=-1,
+            files=files,
+            deletable_local_paths=set(),
+            stable_read_paths=set(meta_files),
+        )
+        self._worker.submit(task)
+        self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+        self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+        self._log.info(
+            f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+            f"Submitted plate/well metadata resync ({len(meta_files)} file(s))"
+        )
 
     def _enqueue_experiment_root_resync(self) -> None:
         if (
@@ -418,30 +489,43 @@ class _BackgroundUploadDrainer:
     def _run(self) -> None:
         try:
             self._enqueue_post_finalize_metadata_resync()
-            deadline = time.time() + self._timeout_s
+            # Stall-based, NOT a wallclock cap: a healthy worker that is still
+            # making progress (results keep arriving) is never abandoned, no
+            # matter how large the backlog or how slow the network. We only
+            # give up if no new result lands for ``stall_window_s`` — i.e. the
+            # worker is genuinely stuck, not merely slow. (A fixed deadline
+            # used to time out mid-upload on large/slow transfers.)
+            stall_window_s = self._stall_window_s
+            last_progress = time.time()
             last_log = 0.0
-            while time.time() < deadline:
+            while True:
                 outstanding = self._outstanding()
                 if outstanding == 0:
                     break
+                got = self._drain_available_results()
                 now = time.time()
+                if got:
+                    last_progress = now
+                elif now - last_progress > stall_window_s:
+                    break
                 if now - last_log > 30.0:
                     self._log.info(
                         f"[{os.path.basename(self._experiment_path or 'unknown')}] "
                         f"upload drainer: {outstanding} in flight "
-                        f"({int(deadline - now)}s remaining)"
+                        f"(idle {int(now - last_progress)}s / "
+                        f"stall window {int(stall_window_s)}s)"
                     )
                     last_log = now
-                self._drain_available_results()
                 time.sleep(0.5)
             self._drain_available_results()
             remaining = self._outstanding()
             if remaining:
                 self._log.error(
                     f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                    f"UploadWorker drain timed out with {remaining} upload(s) "
-                    f"outstanding. Run the standalone backfill script over "
-                    f"{self._experiment_path} to complete the upload."
+                    f"UploadWorker drain stalled with {remaining} upload(s) "
+                    f"outstanding (no progress for {int(stall_window_s)}s). Run "
+                    f"the standalone backfill script over {self._experiment_path} "
+                    f"to complete the upload."
                 )
             if self._failed_tasks:
                 self._log.warning(
@@ -1801,7 +1885,10 @@ class MultiPointWorker:
         # the previous run's uploads finish independently. Multiple drainers
         # can run concurrently — see ``active_upload_drainer_count()`` for
         # operator visibility.
-        self._spawn_background_upload_drainer(timeout_s=30 * 60)
+        # Stall window, not a deadline: the drainer keeps running as long as
+        # uploads make progress; it only gives up after this many seconds of
+        # *no* new results (worker genuinely stuck).
+        self._spawn_background_upload_drainer(stall_window_s=10 * 60)
 
         # Release backpressure resources now that all jobs are complete
         try:
@@ -1893,7 +1980,7 @@ class MultiPointWorker:
                 f"Submitted {submitted} post-finalize metadata resync task(s)"
             )
 
-    def _spawn_background_upload_drainer(self, timeout_s: float) -> None:
+    def _spawn_background_upload_drainer(self, stall_window_s: float) -> None:
         """Detach the UploadWorker drain to a background thread.
 
         The thread takes over ownership of:
@@ -1925,7 +2012,7 @@ class MultiPointWorker:
             zarr_writer_info=self._zarr_writer_info,
             experiment_path=self.experiment_path,
             metadata_paths_builder=self._collect_metadata_paths_for_fov,
-            timeout_s=timeout_s,
+            stall_window_s=stall_window_s,
         )
         register_active_upload_drainer(drainer)
         drainer.start()

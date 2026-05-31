@@ -30,8 +30,6 @@ All acquisition is performed in a background thread to keep the GUI responsive.
 import dataclasses
 import math
 import os
-import pathlib
-import tempfile
 import time
 import yaml
 from datetime import datetime
@@ -44,7 +42,7 @@ from control.models.observation_state import ObservationState
 import numpy as np
 import pandas as pd
 
-from control import utils, utils_acquisition
+from control import utils
 import control._def
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
@@ -60,6 +58,18 @@ from control.piezo import PiezoStage
 from control.core.config.repository import ConfigRepository
 from squid.abc import CameraFrame, AbstractCamera, AbstractStage
 import squid.logging
+
+
+# Approximate on-disk compression ratios for the zarr blosc presets (see ZarrCompression in
+# _def for the documented encode ratios). Used only for the disk-space estimate.
+_ZARR_COMPRESSION_RATIOS = {
+    control._def.ZarrCompression.NONE: 1.0,
+    control._def.ZarrCompression.FAST: 2.0,
+    control._def.ZarrCompression.BALANCED: 3.5,
+    control._def.ZarrCompression.BEST: 4.0,
+}
+# Pyramid levels add geometric overhead on top of level 0: 1 + 1/4 + 1/16 + ... -> ~4/3.
+_ZARR_PYRAMID_OVERHEAD = 4.0 / 3.0
 
 
 # No-op callbacks for cases where callbacks are not needed
@@ -893,77 +903,65 @@ class MultiPointController:
             # this "not configured" and want it to be a ValueError.
             raise ValueError("Not properly configured for an acquisition, cannot calculate image count.")
 
-    def _temporary_get_an_image_hack(self) -> Tuple[np.array, bool]:
-        was_streaming = self.camera.get_is_streaming()
-        callbacks_were_enabled = self.camera.get_callbacks_enabled()
-        self.camera.enable_callbacks(False)
-        test_frame = None
-        if not was_streaming:
-            self.camera.start_streaming()
-        try:
-            if (
-                self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE
-                or self.liveController.trigger_mode == control._def.TriggerMode.HARDWARE
-            ):
-                self.camera.send_trigger()
-            test_frame = self.camera.read_camera_frame()
-        finally:
-            self.camera.enable_callbacks(callbacks_were_enabled)
-            if not was_streaming:
-                self.camera.stop_streaming()
-        return (test_frame.frame, test_frame.is_color()) if test_frame else (None, False)
+    def _raw_bytes_per_image(self) -> int:
+        """Uncompressed bytes for a single captured frame at the current crop / pixel format.
+
+        Worst-case assumptions matching the save pipeline: 24-bit color (3 bytes/px) or
+        16-bit grayscale (2 bytes/px). Grayscale saved as pseudo-color expands to 3 samples.
+        """
+        width, height = self.camera.get_crop_size()
+        is_color = squid.abc.CameraPixelFormat.is_color_format(self.camera.get_pixel_format())
+        if is_color:
+            bytes_per_pixel = 3
+        elif control._def.SAVE_IN_PSEUDO_COLOR:
+            bytes_per_pixel = 6  # uint16 grayscale promoted to 3-sample RGB
+        else:
+            bytes_per_pixel = 2
+        return width * height * bytes_per_pixel
+
+    def _format_size_factor(self) -> float:
+        """Multiplier on raw (uncompressed) image bytes for the selected save format.
+
+        INDIVIDUAL_IMAGES and OME_TIFF store planes uncompressed (~1.0). ZARR_V3 applies a
+        blosc codec (per ``ZARR_COMPRESSION``) and writes a downsampled pyramid on top of
+        level 0, so the on-disk size is ``pyramid_overhead / compression_ratio`` of raw.
+        """
+        if self.file_saving_option == control._def.FileSavingOption.ZARR_V3:
+            ratio = _ZARR_COMPRESSION_RATIOS.get(control._def.ZARR_COMPRESSION, 1.0)
+            return _ZARR_PYRAMID_OVERHEAD / ratio
+        return 1.0
+
+    def estimate_acquisition_disk_bytes(self) -> int:
+        """Fast, format-aware estimate of the image bytes this acquisition will write.
+
+        Pure arithmetic (no camera capture, no temp save), so it is cheap enough to call
+        live as the user edits settings. Accounts for:
+
+          * cycles / ragged plans (frames per position) via ``get_acquisition_image_count``,
+          * the selected ``file_saving_option`` (zarr compression + pyramid overhead).
+
+        Returns 0 if nothing would be captured. Raises ValueError if the controller is not
+        configured for a valid acquisition.
+        """
+        image_count = self.get_acquisition_image_count()
+        if image_count == 0:
+            return 0
+        return int(self._raw_bytes_per_image() * self._format_size_factor() * image_count)
 
     def get_estimated_acquisition_disk_storage(self):
         """
-        This does its best to return the number of bytes needed to store the settings for the currently
-        configured acquisition on disk.  If you don't have at least this amount of disk space available
-        when starting this acquisition, it is likely it will fail with an "out of disk space" error.
+        This does its best to return the number of bytes needed to store the currently
+        configured acquisition on disk.  If you don't have at least this amount of disk space
+        available when starting this acquisition, it is likely it will fail with an
+        "out of disk space" error.
+
+        Note: for ZARR_V3 the byte estimate assumes a typical compression ratio for the
+        selected preset; the real size is data-dependent and usually smaller.
         """
-        if self.selected_observation_state_names:
-            repo = self.liveController.microscope.config_repo
-            first_config = repo.load_observation_preset(self.selected_observation_state_names[0])
-        elif self.selected_configurations:
-            first_config = self.selected_configurations[0]
-        else:
-            raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-        if first_config is None:
-            raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-
-        # Our best bet is to grab an image, and use that for our size estimate.
-        test_image = None
-        is_color = True
-        try:
-            test_image, is_color = self._temporary_get_an_image_hack()
-        except Exception as e:
-            self._log.exception("Couldn't capture image from camera for size estimate, using worst cast image.")
-            # Not ideal that we need to catch Exception, but the camera implementations vary wildly...
-            pass
-
-        if test_image is None:
-            is_color = squid.abc.CameraPixelFormat.is_color_format(self.camera.get_pixel_format())
-            # Do our best to create a fake image with the correct properties.
-            # TODO(imo): It'd be better to pull this from our camera but need to wait for AbstractCamera for a consistent way to do that.
-            width, height = self.camera.get_crop_size()
-            bytes_per_pixel = 3 if is_color else 2  # Worst case assumptions: 24 bit color, 16 bit grayscale
-
-            test_image = np.random.randint(2**16 - 1, size=(height, width, (3 if is_color else 1)), dtype=np.uint16)
-
-        # Depending on settings, we modify the image before saving.  This means we need to actually save an image
-        # to see how much disk space it takes up.  This can be very wrong (eg: if we compress during saving, then
-        # it is dependent on the data), but is better than just guessing based on raw image size.
-        with tempfile.TemporaryDirectory() as temp_save_dir:
-            file_id = "test_id"
-            test_config = first_config
-            size_before = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
-            saved_image = utils_acquisition.save_image(test_image, file_id, temp_save_dir, test_config, is_color)
-            size_after = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
-
-            size_per_image = size_after - size_before
-
         # Add in 100kB for non-image files.  This is normally more like 10k total, so this gives us extra.
         non_image_file_size = 100 * 1024
 
-        return size_per_image * self.get_acquisition_image_count() + non_image_file_size
+        return self.estimate_acquisition_disk_bytes() + non_image_file_size
 
     def get_estimated_mosaic_ram_bytes(self) -> int:
         """

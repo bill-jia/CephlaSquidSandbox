@@ -877,7 +877,7 @@ class FlushAndStageUploadJob:
     ``SaveZarrJob`` for ``(t, fov)`` has already been processed. We then call
     ``writer.wait_for_pending()`` on the per-FOV ``ZarrWriter`` so all
     outstanding TensorStore futures resolve, collect the resulting shard
-    paths via :meth:`ZarrWriter.shard_paths_for_timepoint`, build local→remote
+    paths via :meth:`ZarrWriter.drain_unstaged_shard_paths`, build local→remote
     pairs, and push one :class:`UploadTask` onto the ``UploadWorker``'s input
     queue. Network I/O happens in the upload worker, not here.
 
@@ -945,7 +945,7 @@ class FlushAndStageUploadJob:
                 submitted=False,
             )
 
-        shard_paths = writer.shard_paths_for_timepoint(self.time_point)
+        shard_paths = writer.drain_unstaged_shard_paths()
         metadata_paths = writer.metadata_paths()
         if not shard_paths and not metadata_paths:
             self._log.warning(
