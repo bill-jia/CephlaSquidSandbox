@@ -160,6 +160,37 @@ def _populate_cycle_list(list_widget, microscope, checked_names=None, prior_orde
     list_widget.blockSignals(False)
 
 
+def _multipoint_observation_preset_display_names(microscope) -> list:
+    """Sorted observation-state preset names for the simple-mode checklist."""
+    try:
+        return sorted(microscope.config_repo.list_observation_presets())
+    except Exception:
+        return []
+
+
+def _populate_observation_state_list(list_widget, microscope, checked_names=None, prior_order=None) -> None:
+    """Fill a checkbox list with available observation-state presets (simple mode).
+
+    Symmetric to :func:`_populate_cycle_list`; preserves prior order and checked state.
+    """
+    checked_names = set(checked_names or [])
+    available = list(_multipoint_observation_preset_display_names(microscope))
+    available_set = set(available)
+    if prior_order:
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+    else:
+        ordered = available
+    list_widget.blockSignals(True)
+    list_widget.clear()
+    for name in ordered:
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if name in checked_names else Qt.Unchecked)
+        list_widget.addItem(item)
+    list_widget.blockSignals(False)
+
+
 class CycleEditorDialog(QDialog):
     """Modal editor for named acquisition cycles (two-level: outer repeat ->
     ordered steps, where a step can sit inside a one-level repeatable group).
@@ -526,23 +557,21 @@ def _human_bytes(n: float) -> str:
         n /= 1024.0
 
 
-def _format_acquisition_size_estimate(controller, checked_cycle_names, region_cycle_map, skip_saving) -> str:
+def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hint) -> str:
     """One-line ``N images · ~X`` estimate for the configured acquisition.
 
-    Pushes the current cycle selection into ``controller`` (re-pushed at Start anyway) so
-    the controller's format-/cycle-aware estimators can read live state, then reads
-    ``get_acquisition_image_count`` and ``estimate_acquisition_disk_bytes``. Returns a short
-    hint string when the acquisition isn't estimable yet. Never raises.
+    Mode-agnostic: the caller is expected to have already pushed its channel selection into
+    ``controller`` (via the widget's ``_push_channel_selection_to_controller``), so this only
+    *reads* ``get_acquisition_image_count`` / ``estimate_acquisition_disk_bytes``. ``hint`` is
+    the mode-specific text shown when nothing is selected. Never raises.
     """
     if skip_saving:
         return "Saving disabled — no files written"
-    if not checked_cycle_names:
-        return "Select a cycle to estimate size"
+    if not has_selection:
+        return hint
     try:
         if controller.acquisition_in_progress():
             return ""
-        controller.set_selected_cycles(checked_cycle_names)
-        controller.set_region_cycle_map(region_cycle_map)
         image_count = controller.get_acquisition_image_count()
         if image_count <= 0:
             return "Add a region to estimate size"
@@ -558,17 +587,23 @@ def _format_acquisition_size_estimate(controller, checked_cycle_names, region_cy
 def _refresh_size_estimate(widget) -> None:
     """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
 
-    A no-op if the widget has no estimate label (e.g. the fluidics variant). Wired to every
-    setting that changes the image count or on-disk size (Nt/NZ/region geometry, channel/cycle
-    selection, save format, skip-saving).
+    A no-op if the widget has no estimate label (e.g. the fluidics variant). The widget first
+    pushes its current (mode-aware) selection into the controller, then the controller's
+    format-/cycle-aware estimators are read. Wired to every setting that changes the image
+    count or on-disk size (Nt/NZ/region geometry, channel selection, save format, skip-saving).
     """
     label = getattr(widget, "label_size_estimate", None)
     if label is None:
         return
-    checked = _get_checked_names(widget.list_configurations)
-    region_map = getattr(widget, "_region_obs_state_map", None)
+    widget._push_channel_selection_to_controller()
+    has_selection = bool(_get_checked_names(widget.list_configurations))
     skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
-    label.setText(_format_acquisition_size_estimate(widget.multipointController, checked, region_map, skip_saving))
+    hint = (
+        "Select a cycle to estimate size"
+        if getattr(widget, "_channel_mode", "simple") == "advanced"
+        else "Select a channel to estimate size"
+    )
+    label.setText(_format_acquisition_size_estimate(widget.multipointController, has_selection, skip_saving, hint))
 
 
 def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox, QLabel]":
@@ -1795,17 +1830,29 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_NZ.setFixedWidth(max_num_width)
         self.entry_Nt.setFixedWidth(max_num_width)
 
+        # Simple (default): list single observation-state presets as channels.
+        # Advanced: list acquisition cycles. Toggled via combobox_channel_mode below.
+        self._channel_mode = "simple"
         self.list_configurations = _ObservationStateListWidget()
-        _populate_cycle_list(self.list_configurations, self.microscope)
+        _populate_observation_state_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
+        )
+
+        self.combobox_channel_mode = QComboBox()
+        self.combobox_channel_mode.addItems(["Simple", "Advanced"])
+        self.combobox_channel_mode.setCurrentIndex(0)
+        self.combobox_channel_mode.setToolTip(
+            "Simple: pick observation-state presets (channels), one frame each.\n"
+            "Advanced: pick acquisition cycles (per-position sequences of states)."
         )
 
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
         self.btn_edit_cycles = QPushButton("Edit\nCycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
+        self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
         self.btn_per_point_channels.setToolTip("Configure which observation states to acquire at each registered point")
         self._region_obs_state_map = None
 
@@ -2039,6 +2086,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
 
         grid_config = QHBoxLayout()
+        grid_config.addWidget(self.combobox_channel_mode, 0, Qt.AlignTop)
         grid_config.addWidget(self.list_configurations)
         grid_config.addWidget(self.btn_per_point_channels)
         grid_config.addWidget(self.btn_edit_cycles)
@@ -2150,6 +2198,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
+        # Simple/Advanced channel-mode toggle (handler refreshes the estimate itself, so it
+        # is wired separately from the loop above to avoid a double refresh).
+        self.combobox_channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
 
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
@@ -2449,7 +2500,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
         if not obs_names:
-            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            unit = "cycle" if self._channel_mode == "advanced" else "observation state"
+            QMessageBox.warning(self, "Warning", f"Please check at least one {unit} first")
             return
         if len(self.location_ids) == 0:
             QMessageBox.warning(self, "Warning", "Please add at least one location first")
@@ -2468,16 +2520,64 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 _reorder_list_widget(self.list_configurations, new_order)
             self._update_per_point_button_text()
 
+    def _populate_channel_list_for_mode(self, checked_names=None, prior_order=None):
+        """Fill the checklist with cycles (advanced) or observation-state presets (simple)."""
+        if self._channel_mode == "advanced":
+            _populate_cycle_list(self.list_configurations, self.microscope, checked_names, prior_order)
+        else:
+            _populate_observation_state_list(self.list_configurations, self.microscope, checked_names, prior_order)
+
+    def _push_channel_selection_to_controller(self):
+        """Push the current (mode-aware) channel selection + per-region map to the controller.
+
+        Simple mode routes through the flat path; advanced through cycles. Always clears the
+        opposite per-region map so a stale one can't win in ``_build_region_plans``. No-op while
+        an acquisition is in progress.
+        """
+        if self.multipointController.acquisition_in_progress():
+            return
+        names = _get_checked_names(self.list_configurations)
+        if self._channel_mode == "advanced":
+            self.multipointController.set_selected_cycles(names)
+            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+        else:
+            self.multipointController.set_selected_configurations(names)
+            self.multipointController.set_region_cycle_map(None)
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+
+    def _on_channel_mode_changed(self):
+        """Switch between simple (observation states) and advanced (cycles) channel modes."""
+        self._channel_mode = "advanced" if self.combobox_channel_mode.currentIndex() == 1 else "simple"
+        # Cycle names and state names are not interchangeable: drop selection + per-point map.
+        self._region_obs_state_map = None
+        self.btn_edit_cycles.setVisible(self._channel_mode == "advanced")
+        if self._channel_mode == "advanced":
+            self.list_configurations.setToolTip(
+                "Acquisition cycles for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip("Configure which cycles to acquire at each registered point")
+        else:
+            self.list_configurations.setToolTip(
+                "Observation State presets saved for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Configure which observation states to acquire at each registered point"
+            )
+        self._populate_channel_list_for_mode()  # checked_names=None -> reset selection
+        self._update_per_point_button_text()
+        _refresh_size_estimate(self)
+
     def refresh_channel_list(self):
-        """Refresh the observation state list after profile or preset changes."""
+        """Refresh the channel list (cycles or observation states) after profile/preset changes."""
         # Preserve currently checked names and the user-chosen display order.
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        # Repopulate in prior order; preset names not in prior_order go to the end.
-        _populate_cycle_list(
-            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
-        )
+        # Repopulate in prior order; names not in prior_order go to the end.
+        self._populate_channel_list_for_mode(checked_names=checked_names, prior_order=prior_order)
         _refresh_size_estimate(self)
 
     def toggle_acquisition(self, pressed):
@@ -2531,10 +2631,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("flexible")
-            self.multipointController.set_selected_cycles(
-                _get_checked_names(self.list_configurations)
-            )
-            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+            self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -2986,9 +3083,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_cycles(
-            _get_checked_names(self.list_configurations)
-        )
+        self._push_channel_selection_to_controller()
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
         self.multipointController.set_NZ(1)
@@ -3433,11 +3528,22 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        # Simple (default): list single observation-state presets as channels.
+        # Advanced: list acquisition cycles. Toggled via combobox_channel_mode below.
+        self._channel_mode = "simple"
         self.list_configurations = _ObservationStateListWidget()
-        _populate_cycle_list(self.list_configurations, self.microscope)
+        _populate_observation_state_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
+        )
+
+        self.combobox_channel_mode = QComboBox()
+        self.combobox_channel_mode.addItems(["Simple", "Advanced"])
+        self.combobox_channel_mode.setCurrentIndex(0)
+        self.combobox_channel_mode.setToolTip(
+            "Simple: pick observation-state presets (channels), one frame each.\n"
+            "Advanced: pick acquisition cycles (per-position sequences of states)."
         )
 
         # Per-point (per-well) channel override. None means "use global selection at every well".
@@ -3448,6 +3554,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_edit_cycles = QPushButton("Edit\nCycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
+        self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
         self.btn_per_point_channels.setToolTip(
             "Override which observation states acquire at each selected well. "
             "Asterisk indicates a custom map is active."
@@ -3740,6 +3847,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # the Z-stack frames above).
         config_cell = QVBoxLayout()
         config_cell.setContentsMargins(0, 0, 0, 0)
+        config_cell.addWidget(self.combobox_channel_mode)
         config_cell.addWidget(self.list_configurations)
         config_cell.addWidget(self.btn_per_point_channels)
         config_cell.addWidget(self.btn_edit_cycles)
@@ -3869,6 +3977,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
+        # Simple/Advanced channel-mode toggle (handler refreshes the estimate itself, so it
+        # is wired separately from the loop above to avoid a double refresh).
+        self.combobox_channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
         # Connect signal for setting acquisition state from external sources (e.g., TCP server)
         self.signal_set_acquisition_running.connect(self.set_acquisition_running_state)
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -5069,10 +5180,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
-            self.multipointController.set_selected_cycles(
-                _get_checked_names(self.list_configurations)
-            )
-            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+            self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -5212,9 +5320,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_cycles(
-            _get_checked_names(self.list_configurations)
-        )
+        self._push_channel_selection_to_controller()
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
         self.multipointController.set_NZ(1)
@@ -5244,14 +5350,65 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         selected_channels = _get_checked_names(self.list_configurations)
         self.signal_acquisition_channels.emit(selected_channels)
 
+    def _populate_channel_list_for_mode(self, checked_names=None, prior_order=None):
+        """Fill the checklist with cycles (advanced) or observation-state presets (simple)."""
+        if self._channel_mode == "advanced":
+            _populate_cycle_list(self.list_configurations, self.microscope, checked_names, prior_order)
+        else:
+            _populate_observation_state_list(self.list_configurations, self.microscope, checked_names, prior_order)
+
+    def _push_channel_selection_to_controller(self):
+        """Push the current (mode-aware) channel selection + per-well map to the controller.
+
+        Simple mode routes through the flat path; advanced through cycles. Always clears the
+        opposite per-region map so a stale one can't win in ``_build_region_plans``. No-op while
+        an acquisition is in progress.
+        """
+        if self.multipointController.acquisition_in_progress():
+            return
+        names = _get_checked_names(self.list_configurations)
+        if self._channel_mode == "advanced":
+            self.multipointController.set_selected_cycles(names)
+            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+        else:
+            self.multipointController.set_selected_configurations(names)
+            self.multipointController.set_region_cycle_map(None)
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+
+    def _on_channel_mode_changed(self):
+        """Switch between simple (observation states) and advanced (cycles) channel modes."""
+        self._channel_mode = "advanced" if self.combobox_channel_mode.currentIndex() == 1 else "simple"
+        self.btn_edit_cycles.setVisible(self._channel_mode == "advanced")
+        if self._channel_mode == "advanced":
+            self.list_configurations.setToolTip(
+                "Acquisition cycles for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Override which cycles acquire at each selected well. "
+                "Asterisk indicates a custom map is active."
+            )
+        else:
+            self.list_configurations.setToolTip(
+                "Observation State presets saved for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Override which observation states acquire at each selected well. "
+                "Asterisk indicates a custom map is active."
+            )
+        # Cycle names and state names are not interchangeable: reset selection + per-well map.
+        self._populate_channel_list_for_mode()  # checked_names=None -> reset selection
+        self._reset_per_point_channels_map()
+        _refresh_size_estimate(self)
+
     def refresh_channel_list(self):
-        """Refresh the observation state list after profile or preset changes."""
+        """Refresh the channel list (cycles or observation states) after profile/preset changes."""
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        _populate_cycle_list(
-            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
-        )
+        self._populate_channel_list_for_mode(checked_names=checked_names, prior_order=prior_order)
         self._reset_per_point_channels_map()
         _refresh_size_estimate(self)
 
@@ -5274,7 +5431,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
         if not obs_names:
-            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            unit = "cycle" if self._channel_mode == "advanced" else "observation state"
+            QMessageBox.warning(self, "Warning", f"Please check at least one {unit} first")
             return
 
         # Region IDs come from the populated scan coordinates (well IDs like "A1").

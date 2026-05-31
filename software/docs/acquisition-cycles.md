@@ -84,13 +84,21 @@ filenames are unchanged.
 
 `gui/widgets/multipoint.py`
 
-- The multipoint checklist (`_ObservationStateListWidget`) now lists **cycles**;
-  checked + ordered cycles run in sequence at each position.
+- A **Simple / Advanced** dropdown (`combobox_channel_mode`) gates the cycle UI.
+  Cycles are an **Advanced-mode** feature; the widgets default to **Simple**, where
+  the checklist lists single observation-state presets (one frame each) and the
+  flat path (`set_selected_configurations` / `set_region_observation_state_map`) is
+  used. See [multipoint.md](user_guides/multipoint.md) Step 5.
+- In **Advanced** mode the checklist (`_ObservationStateListWidget`) lists **cycles**
+  (`_populate_cycle_list`); checked + ordered cycles run in sequence at each position,
+  and the **Edit Cycles** button appears.
 - **Edit Cycles** button → `CycleEditorDialog`: a two-level tree builder
   (outer repeat, add Step / add Group / add Step→Group, reorder, save/load via
   the repo). Steps pick from `list_observation_presets()`.
-- **Per-Point Channels** assigns different selected cycles per region (extends
-  the existing per-region map; wired to `set_region_cycle_map`).
+- **Per-Point Channels** assigns different selected cycles (advanced) or observation
+  states (simple) per region. The widget pushes the selection via a single mode-aware
+  `_push_channel_selection_to_controller`, wired to `set_region_cycle_map` (advanced) or
+  `set_region_observation_state_map` (simple), always clearing the opposite map.
 
 ## Code map
 

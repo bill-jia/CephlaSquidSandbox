@@ -195,8 +195,22 @@ Coords** button and a read‑only field showing the loaded file path. The CSV mu
 
 ### Step 5 — Choose channels (observation states)
 
-The **observation‑state list** is a checkbox list of the presets saved for your active
-profile. Check the ones you want to acquire.
+A **Simple / Advanced** dropdown next to the channel list controls what the checklist
+holds. It defaults to **Simple** every time you open the widget.
+
+- **Simple** (default) — the checklist lists single **observation‑state presets**
+  (channels); each checked one is imaged **once** per position, like standard microscope
+  software. This is all most acquisitions need.
+- **Advanced** — the checklist lists **acquisition cycles** (per‑position sequences of
+  states with frame counts, waits, and repeats) and an **Edit Cycles** button appears.
+  Use this for voltage‑imaging / optogenetics‑style protocols. See
+  [acquisition-cycles.md](../acquisition-cycles.md).
+
+Switching modes clears the current selection (cycle names and channel names are not
+interchangeable). The underlying acquisition is identical either way — Simple is just a
+cycle of one‑frame steps — and the **size estimate** (Step 9) works in both modes.
+
+For the checklist itself:
 
 - **Drag** rows to reorder them — this sets the channel acquisition order.
 - Checking a row floats it to the top of the checked block, so selected channels stay
