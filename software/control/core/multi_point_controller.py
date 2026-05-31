@@ -845,7 +845,9 @@ class MultiPointController:
             events = resolve_chain(list(cycle_names), repo.load_acquisition_cycle, is_stim)
         else:
             names = region_state_names if region_state_names is not None else self.selected_observation_state_names
-            events = _index_events(list(names), is_stim)
+            # _index_events takes tagged raw events; a flat selection is one ("state", name)
+            # event per checked state (1 frame each) — today's flat behaviour.
+            events = _index_events([("state", n) for n in names], is_stim)
         return RegionPlan.from_events(events)
 
     def _build_region_plans(self, scan_region_names):

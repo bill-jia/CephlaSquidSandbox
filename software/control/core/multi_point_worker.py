@@ -643,8 +643,11 @@ class MultiPointWorker:
         self._global_plan = acquisition_parameters.global_region_plan
         if self._global_plan is None:
             # Defensive fallback (e.g. direct worker construction in tests): treat
-            # the channel axis as a 1-frame-per-state chain.
-            self._global_plan = RegionPlan.from_events(_index_events(list(self.observation_state_names)))
+            # the channel axis as a 1-frame-per-state chain. _index_events takes
+            # tagged raw events, so wrap each name as a ("state", name) event.
+            self._global_plan = RegionPlan.from_events(
+                _index_events([("state", n) for n in self.observation_state_names])
+            )
         self._region_plans = dict(acquisition_parameters.resolved_region_plans or {})
         # Imaged channel axis (C order) and per-channel display metadata, used for
         # zarr/omero naming. Resolved lazily so a None pixel/illumination config

@@ -5311,7 +5311,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     def set_saving_dir(self):
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
         if save_dir_base:  # Only update if user didn't cancel
             self.multipointController.set_base_path(save_dir_base)
             self.lineEdit_savingDir.setText(save_dir_base)
@@ -6099,7 +6099,7 @@ class MultiPointWithFluidicsWidget(QFrame):
     def set_saving_dir(self):
         """Open dialog to set saving directory"""
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
         self.multipointController.set_base_path(save_dir_base)
         self.lineEdit_savingDir.setText(save_dir_base)
         self.base_path_is_set = True
