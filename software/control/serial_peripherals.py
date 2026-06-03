@@ -1105,14 +1105,20 @@ class SciMicroscopyLEDArray:
         self.serial_connection.write_and_check("about" + "\r", "=", read_delay=0.01, print_response=True)
 
     def set_distance(self, array_distance):
-        # array distance in mm
+        # array distance in mm.
+        # Load-bearing: the SCI DOME firmware default WD is 50 mm (wrong for this
+        # 65 mm array); this value is sent as sad.<mm> on every launch to override
+        # it. Do NOT remove or change without re-verifying NA calibration.
         array_distance = str(int(array_distance))
-        self.serial_connection.write_and_check(
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_distance -> serial 'sad.{array_distance}'")
+        response = self.serial_connection.write_and_check(
             "sad." + array_distance + "\r",
             "Current array distance from sample is " + array_distance + "mm",
             read_delay=0.01,
-            print_response=False,
         )
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_distance ACK: '{response}'")
 
     def set_NA(self, NA):
         self.NA = NA
@@ -1356,6 +1362,8 @@ class SciMicroscopyLEDArray_Simulation:
     def set_distance(self, array_distance):
         # array distance in mm
         array_distance = str(int(array_distance))
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy_Simulation.set_distance -> 'sad.{array_distance}' (no-op)")
 
     def set_NA(self, NA):
         self.NA = NA

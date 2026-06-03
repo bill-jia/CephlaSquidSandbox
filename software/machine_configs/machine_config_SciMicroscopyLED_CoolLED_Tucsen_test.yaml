@@ -167,6 +167,9 @@ devices:
     connection:
       serial_number: "12732490"
     config:
+      # Load-bearing — the SCI DOME firmware default WD is 50 mm (wrong for this
+      # 65 mm array); this value is sent as sad.<mm> on every launch to override
+      # it. Do NOT remove or change without re-verifying NA calibration.
       distance: 65
       default_na: 0.8
       turn_on_delay: 0.03
