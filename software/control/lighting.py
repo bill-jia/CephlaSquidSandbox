@@ -906,6 +906,8 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         return self._active_mode_key
 
     def set_matrix_mode(self, mode_key: str) -> None:
+        """Select the active pattern. Pure state update: callers re-fire hardware
+        (set_intensity + turn_on) when they need the new pattern asserted live."""
         if not self._unified:
             logger.warning("set_matrix_mode: device is not in unified mode")
             return
@@ -913,9 +915,6 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             logger.warning(f"set_matrix_mode: unknown mode '{mode_key}'")
             return
         self._active_mode_key = mode_key
-        u = self._unified_channel_name
-        if self._is_on_state.get(u, False):
-            self.set_intensity(u, self._intensity.get(u, 0.0))
 
     def _apply_unified_intensity(self, intensity: float) -> None:
         spec = self._modes[self._active_mode_key]
@@ -1194,10 +1193,27 @@ class IlluminationController:
         return self._led_matrix_unified.unified_channel_name
 
     def set_led_matrix_mode(self, mode_key: str) -> bool:
-        """Select LED matrix pattern (unified device only). Returns False if N/A."""
-        if self._led_matrix_unified is None:
+        """Select LED matrix pattern (unified device only). Returns False if N/A.
+
+        If the unified LED-matrix channel is currently asserted on hardware, the
+        new pattern is re-fired so the change takes immediate visual effect
+        (firmware applies a stored pattern only on the next pattern command).
+        """
+        dev = self._led_matrix_unified
+        if dev is None:
             return False
-        self._led_matrix_unified.set_matrix_mode(mode_key)
+        dev.set_matrix_mode(mode_key)
+        unified_name = dev.unified_channel_name
+        if (
+            self._channel_state.get(unified_name)
+            and self._channel_state[unified_name].is_on
+            and self._hardware_asserted.get(unified_name)
+        ):
+            # Re-issue pattern so firmware refreshes with the new mode. set_intensity
+            # rewrites color/brightness and stores the mode; turn_on fires it.
+            intensity = self._channel_state[unified_name].intensity
+            dev.set_intensity(unified_name, intensity)
+            dev.turn_on(unified_name)
         return True
 
     def get_led_matrix_mode(self) -> Optional[str]:
