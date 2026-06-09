@@ -1,0 +1,376 @@
+"""
+Acquisition Cycle — an ordered, repeatable sequence of ObservationState steps
+run *at a single position* before the stage moves on.
+
+Where an :class:`~control.models.observation_state.ObservationState` is the
+microscopy equivalent of a "channel" (one light-path configuration, one frame),
+a Cycle composes several of them into a per-position temporal protocol:
+
+  * **Step** — capture ``n_frames`` of one observation state (or, for a
+    stimulus-only state, fire ``n_frames`` NIDAQ pulses with no camera frame).
+  * **Group** — an ordered list of steps repeated ``repeat`` times. Exactly one
+    level of grouping is allowed; the type structure itself caps nesting depth.
+  * **Cycle** — an ordered list of items (steps and/or groups) repeated
+    ``repeat`` times.
+
+Multiple selected cycles run back-to-back at each position (chaining). A cycle
+references observation states **by name** so it tracks preset edits.
+
+Cycles are saved under the active profile (``cycles/*.yaml``), objective-free,
+just like observation presets.
+
+The resolution helpers in this module are pure (no hardware, no I/O) so they can
+be unit-tested directly: they expand a cycle (or a chain of cycles) into a flat,
+ordered list of :class:`ResolvedEvent` — the exact per-position acquisition plan
+the worker iterates and the save layer keys on.
+"""
+
+import logging
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Serializable cycle definition
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class CycleStep(BaseModel):
+    """Capture ``n_frames`` of one observation state at the current position.
+
+    For an imaged state this yields ``n_frames`` camera frames. For a
+    stimulus-only state (``ObservationState.is_stimulus_only``) it yields
+    ``n_frames`` NIDAQ stimulus pulses and no camera frame.
+    """
+
+    observation_state: str = Field(..., description="Observation-state preset name (by reference)")
+    n_frames: int = Field(1, ge=1, description="Number of frames / pulses for this step")
+
+    model_config = {"extra": "forbid"}
+
+
+class CycleWait(BaseModel):
+    """Pause for ``duration_ms`` milliseconds at the current position.
+
+    Produces no camera frame and no stimulus — purely a timed delay between
+    events. Allowed at any nesting level (top-level item or inside a group), so
+    its repeat count comes from the enclosing group / cycle repeat.
+    """
+
+    duration_ms: float = Field(..., ge=0, description="Wait duration in milliseconds")
+
+    model_config = {"extra": "forbid"}
+
+
+class CycleGroup(BaseModel):
+    """An ordered list of steps/waits repeated ``repeat`` times (one nesting level)."""
+
+    repeat: int = Field(1, ge=1, description="How many times to repeat this group")
+    steps: List[Union[CycleStep, CycleWait]] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
+class AcquisitionCycle(BaseModel):
+    """A named, repeatable per-position acquisition sequence."""
+
+    name: str
+    version: int = 1
+    repeat: int = Field(1, ge=1, description="How many times to repeat the whole cycle")
+    items: List[Union[CycleGroup, CycleStep, CycleWait]] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resolved (flattened) acquisition plan
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ResolvedEvent:
+    """One concrete acquisition event in a flattened per-position plan.
+
+    Attributes:
+        observation_state: Preset name to apply for this event ("" for a wait).
+        is_stimulus: True for a stimulus-only event (NIDAQ pulse, no frame).
+        state_frame_index: Running per-state occurrence index across the whole
+            chain (k-th frame of this state). For an imaged state this is the
+            ``T`` coordinate within the position; for a stimulus state it is the
+            k-th pulse. Starts at 0.
+        cycle_event_index: Position of this event in the flat chain (0-based);
+            preserves interleave / acquisition order across all selected cycles.
+        is_wait: True for a timed-delay event (no frame, no stimulus).
+        wait_ms: Delay duration in milliseconds (only meaningful when is_wait).
+    """
+
+    observation_state: str
+    is_stimulus: bool
+    state_frame_index: int
+    cycle_event_index: int
+    is_wait: bool = False
+    wait_ms: float = 0.0
+
+
+# A predicate telling whether a named observation state is stimulus-only.
+StimulusPredicate = Callable[[str], bool]
+
+
+# A raw event is a tagged tuple: ("state", preset_name) or ("wait", duration_ms).
+_RawEvent = Tuple[str, object]
+
+
+def _expand_item(item, out: List[_RawEvent]) -> None:
+    """Expand one cycle item (group / step / wait) into raw tagged events."""
+    if isinstance(item, CycleGroup):
+        for _ in range(item.repeat):
+            for sub in item.steps:
+                _expand_item(sub, out)
+    elif isinstance(item, CycleWait):
+        out.append(("wait", float(item.duration_ms)))
+    else:  # CycleStep
+        out.extend([("state", item.observation_state)] * item.n_frames)
+
+
+def _raw_events(cycle: AcquisitionCycle) -> List[_RawEvent]:
+    """Expand a single cycle's outer repeat / groups / steps / waits into an
+    ordered list of tagged raw events (one entry per event)."""
+    out: List[_RawEvent] = []
+    for _ in range(cycle.repeat):
+        for item in cycle.items:
+            _expand_item(item, out)
+    return out
+
+
+def _index_events(
+    raw: List[_RawEvent],
+    is_stimulus: Optional[StimulusPredicate] = None,
+) -> List[ResolvedEvent]:
+    """Assign per-state frame indices and chain positions to a raw event list.
+
+    When ``is_stimulus`` is None every imaged event is treated as imaged (kind
+    unknown). A given observation state is uniformly imaged or stimulus-only, so
+    the per-state counter is consistent regardless. Wait events carry their
+    duration and do not participate in per-state counting.
+    """
+    per_state: Dict[str, int] = {}
+    events: List[ResolvedEvent] = []
+    for position, (kind, payload) in enumerate(raw):
+        if kind == "wait":
+            events.append(
+                ResolvedEvent(
+                    observation_state="",
+                    is_stimulus=False,
+                    state_frame_index=0,
+                    cycle_event_index=position,
+                    is_wait=True,
+                    wait_ms=float(payload),
+                )
+            )
+            continue
+        name = payload
+        k = per_state.get(name, 0)
+        per_state[name] = k + 1
+        stim = bool(is_stimulus(name)) if is_stimulus is not None else False
+        events.append(
+            ResolvedEvent(
+                observation_state=name,
+                is_stimulus=stim,
+                state_frame_index=k,
+                cycle_event_index=position,
+            )
+        )
+    return events
+
+
+def resolve_cycle(
+    cycle: AcquisitionCycle,
+    is_stimulus: Optional[StimulusPredicate] = None,
+) -> List[ResolvedEvent]:
+    """Flatten a single cycle into its ordered event list."""
+    return _index_events(_raw_events(cycle), is_stimulus)
+
+
+def resolve_chain(
+    cycle_names: List[str],
+    load_cycle: Callable[[str], Optional[AcquisitionCycle]],
+    is_stimulus: Optional[StimulusPredicate] = None,
+) -> List[ResolvedEvent]:
+    """Flatten a chain of selected cycles (run back-to-back) into one event list.
+
+    ``load_cycle`` resolves a cycle name to its definition (e.g.
+    ``repo.load_acquisition_cycle``). Unknown / empty cycles are skipped with a
+    warning. Per-state frame indices and chain positions are numbered across the
+    *whole* concatenated chain, not per cycle.
+    """
+    raw: List[_RawEvent] = []
+    for name in cycle_names:
+        cycle = load_cycle(name)
+        if cycle is None:
+            logger.warning("Acquisition cycle %r not found, skipping", name)
+            continue
+        raw.extend(_raw_events(cycle))
+    return _index_events(raw, is_stimulus)
+
+
+def chain_frame_counts(events: List[ResolvedEvent]) -> Dict[str, int]:
+    """Per-state count of *imaged* frames across a resolved chain.
+
+    Stimulus-only and wait events are excluded — they produce no saved frame and
+    so do not participate in the dense/ragged layout decision.
+    """
+    counts: Dict[str, int] = {}
+    for ev in events:
+        if ev.is_stimulus or ev.is_wait:
+            continue
+        counts[ev.observation_state] = counts.get(ev.observation_state, 0) + 1
+    return counts
+
+
+def is_dense(events: List[ResolvedEvent]) -> bool:
+    """True if every imaged state has the same total frame count in the chain.
+
+    A dense chain folds into a regular ``T × C`` grid (standard 5-D TZCYX); a
+    ragged one is saved as per-state arrays. An empty chain is trivially dense.
+    """
+    counts = chain_frame_counts(events)
+    return len(set(counts.values())) <= 1
+
+
+def imaged_states_in_order(events: List[ResolvedEvent]) -> List[str]:
+    """Distinct imaged observation-state names, in first-appearance order.
+
+    This is the channel (``C``) axis ordering for the dense layout.
+    """
+    seen: Dict[str, None] = {}
+    for ev in events:
+        if ev.is_stimulus or ev.is_wait:
+            continue
+        if ev.observation_state not in seen:
+            seen[ev.observation_state] = None
+    return list(seen.keys())
+
+
+def all_states_in_order(events: List[ResolvedEvent]) -> List[str]:
+    """Distinct observation-state names (imaged *and* stimulus), first-appearance
+    order. Used for the metadata record of which states a run touched."""
+    seen: Dict[str, None] = {}
+    for ev in events:
+        if ev.is_wait:
+            continue
+        if ev.observation_state not in seen:
+            seen[ev.observation_state] = None
+    return list(seen.keys())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-region acquisition plan + save layout (pure, unit-testable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RegionPlan:
+    """Everything the worker and save layer need for one region.
+
+    Built once by the controller from the region's selected cycles (or a bare
+    observation-state selection, which is just a chain of 1-frame events).
+    """
+
+    events: List[ResolvedEvent]          # flat per-position acquisition order (incl. stimulus)
+    dense: bool                          # all imaged states share the same frame count
+    frame_counts: Dict[str, int]         # imaged state -> frames per position
+    channel_order: List[str]             # distinct imaged states, in C-axis order
+
+    @staticmethod
+    def from_events(events: List[ResolvedEvent]) -> "RegionPlan":
+        return RegionPlan(
+            events=list(events),
+            dense=is_dense(events),
+            frame_counts=chain_frame_counts(events),
+            channel_order=imaged_states_in_order(events),
+        )
+
+    @property
+    def frames_per_position(self) -> int:
+        """Total imaged frames captured at one position per scan timepoint."""
+        return sum(self.frame_counts.values())
+
+
+@dataclass(frozen=True)
+class FrameCoord:
+    """Where one imaged event's frame lands in the saved arrays.
+
+    ``array_key`` is ``None`` for the dense layout (one ``TZCYX`` array per FOV)
+    and the observation-state name for the ragged layout (one array per
+    ``(FOV, state)``). ``t_index`` / ``c_index`` are the coordinates within that
+    array; ``t_size`` / ``c_size`` are its full extents (so a frame fully
+    describes the array it belongs to, without a global uniform assumption).
+    """
+
+    array_key: Optional[str]
+    t_index: int
+    c_index: int
+    t_size: int
+    c_size: int
+
+
+@dataclass(frozen=True)
+class SaveLayout:
+    """Fully self-describing save target for one imaged frame.
+
+    Carries the array identity, coordinates, extents, and per-array channel
+    metadata so the save layer never has to consult a global uniform
+    ``(T, C, Z)`` assumption — which per-region cycles and ragged counts break.
+    """
+
+    array_key: Optional[str]                 # None=dense single array; state name=ragged per-state plate
+    t_index: int
+    c_index: int
+    t_size: int
+    c_size: int
+    cycle_event_index: int                   # position in the flat chain (acquisition order)
+    state_frame_index: int                   # k-th frame of this state at this position
+    channel_names: List[str]                 # omero channel labels for this array
+    channel_colors: List[str]
+    channel_wavelengths: List[Optional[int]]
+    # Disambiguating basename suffix for per-frame file formats (INDIVIDUAL_IMAGES),
+    # set only when this state captures >1 frame per position so simple-case
+    # filenames are unchanged. None = no suffix.
+    frame_suffix: Optional[str] = None
+
+
+def frame_coord(plan: RegionPlan, Nt: int, t_scan: int, event: ResolvedEvent) -> FrameCoord:
+    """Compute the save coordinate for one imaged ``event`` at scan timepoint ``t_scan``.
+
+    Dense: imaged frames fold into ``T`` (``T = Nt × frames_per_state``), ``C`` =
+    channel index. Ragged: each state is its own array (``C`` size 1) with
+    ``T = Nt × that_state's_count``. ``t_scan`` blocks stack along ``T`` so a
+    scan-level timelapse runs on top of the per-position cycle.
+
+    Raises ``ValueError`` for a stimulus or wait event (no frame to place).
+    """
+    if event.is_stimulus or event.is_wait:
+        raise ValueError("stimulus/wait events have no frame coordinate")
+    name = event.observation_state
+    count = plan.frame_counts[name]
+    k = event.state_frame_index
+    if plan.dense:
+        # All imaged states share `count`; T axis interleaves scan blocks of size `count`.
+        return FrameCoord(
+            array_key=None,
+            t_index=t_scan * count + k,
+            c_index=plan.channel_order.index(name),
+            t_size=Nt * count,
+            c_size=len(plan.channel_order),
+        )
+    return FrameCoord(
+        array_key=name,
+        t_index=t_scan * count + k,
+        c_index=0,
+        t_size=Nt * count,
+        c_size=1,
+    )

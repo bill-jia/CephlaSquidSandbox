@@ -1306,3 +1306,92 @@ class TestUpdateChannelSettingV3:
         gen = repo_v3.get_general_config()
         assert gen.confocal_hardware_settings is not None
         assert gen.confocal_hardware_settings.illumination_iris == 42.0
+
+
+class TestConfigRepositoryMachineConfigLibrary:
+    """Tests for the machine-config library and last-selection cache."""
+
+    @staticmethod
+    def _write_machine_config(path: Path, version: float):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"version: {version}\ndevices: {{}}\n")
+
+    def test_library_lists_only_machine_configs_sorted(self, temp_dir):
+        lib = temp_dir / "machine_configs" / "library"
+        self._write_machine_config(lib / "machine_config_b.yaml", 3.0)
+        self._write_machine_config(lib / "machine_config_a.yaml", 3.0)
+        (lib / "notes.yaml").write_text("hello: world\n")  # not a machine config
+
+        repo = ConfigRepository(base_path=temp_dir)
+        names = [p.name for p in repo.get_machine_config_library()]
+        assert names == ["machine_config_a.yaml", "machine_config_b.yaml"]
+
+    def test_library_empty_when_missing(self, temp_dir):
+        (temp_dir / "machine_configs").mkdir()
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_machine_config_library() == []
+
+    def test_selection_roundtrip_resolves_under_library(self, temp_dir):
+        lib = temp_dir / "machine_configs" / "library"
+        self._write_machine_config(lib / "machine_config_x.yaml", 3.0)
+
+        repo = ConfigRepository(base_path=temp_dir)
+        repo.set_machine_config_selection(lib / "machine_config_x.yaml")
+
+        resolved = repo.get_last_machine_config()
+        assert resolved == lib / "machine_config_x.yaml"
+
+    def test_last_config_none_when_file_removed(self, temp_dir):
+        (temp_dir / "machine_configs" / "library").mkdir(parents=True)
+        repo = ConfigRepository(base_path=temp_dir)
+        repo.set_machine_config_selection("machine_config_gone.yaml")
+        assert repo.get_last_machine_config() is None
+
+    def test_last_config_none_when_no_cache(self, temp_dir):
+        (temp_dir / "machine_configs").mkdir()
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_last_machine_config() is None
+
+    def test_active_source_prefers_cache_over_root(self, temp_dir):
+        mc = temp_dir / "machine_configs"
+        lib = mc / "library"
+        self._write_machine_config(lib / "machine_config_libsel.yaml", 3.0)
+        self._write_machine_config(mc / "machine_config.yaml", 3.0)  # explicit root
+
+        repo = ConfigRepository(base_path=temp_dir)
+        repo.set_machine_config_selection("machine_config_libsel.yaml")
+        assert repo.get_active_machine_config_source() == lib / "machine_config_libsel.yaml"
+
+    def test_active_source_falls_back_to_primary(self, temp_dir):
+        mc = temp_dir / "machine_configs"
+        self._write_machine_config(mc / "machine_config.yaml", 3.0)
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_active_machine_config_source() == mc / "machine_config.yaml"
+
+    def test_active_source_falls_back_to_single_named(self, temp_dir):
+        mc = temp_dir / "machine_configs"
+        self._write_machine_config(mc / "machine_config_only.yaml", 3.0)
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_active_machine_config_source() == mc / "machine_config_only.yaml"
+
+    def test_active_source_none_when_multiple_named(self, temp_dir):
+        mc = temp_dir / "machine_configs"
+        self._write_machine_config(mc / "machine_config_a.yaml", 3.0)
+        self._write_machine_config(mc / "machine_config_b.yaml", 3.0)
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_active_machine_config_source() is None
+
+    def test_get_machine_config_loads_cached_selection(self, temp_dir):
+        mc = temp_dir / "machine_configs"
+        lib = mc / "library"
+        self._write_machine_config(lib / "machine_config_sel.yaml", 7.5)
+        self._write_machine_config(mc / "machine_config.yaml", 3.0)  # would lose to cache
+
+        repo = ConfigRepository(base_path=temp_dir)
+        repo.set_machine_config_selection("machine_config_sel.yaml")
+        assert repo.get_machine_config().version == 7.5
+
+    def test_get_machine_config_falls_back_to_default(self, temp_dir):
+        (temp_dir / "machine_configs").mkdir()
+        repo = ConfigRepository(base_path=temp_dir)
+        assert repo.get_machine_config() is not None  # built-in default, no crash

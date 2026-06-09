@@ -39,28 +39,45 @@ class DisplacementMeasurementController(QObject):
 
         t = time.time()
 
-        if len(image.shape) == 3:
+        if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
-        h, w = image.shape
-        x, y = np.meshgrid(range(w), range(h))
-        I = image.astype(float)
-        I = I - np.amin(I)
-        I[I / np.amax(I) < 0.2] = 0
-        x = np.sum(x * I) / np.sum(I)
-        y = np.sum(y * I) / np.sum(I)
+        # Intensity-weighted centroid via 1D projections. This is mathematically
+        # equivalent to the meshgrid+multiply form (sum(x*I)/sum(I)) but does
+        # O(h*w) work and one h*w allocation instead of three. At full sensor
+        # FOV (3088x2064) the previous form took 100s of ms per frame and
+        # blocked the Qt event loop; this stays in single-digit ms.
+        I = image.astype(np.float32)
+        Imax = float(I.max())
+        if Imax <= 0:
+            return  # blank frame, nothing to measure
+        Imin = float(I.min())
+        I -= Imin
+        # Threshold at 20% of peak (post-background-subtraction the original
+        # divided by amax; here we threshold against the equivalent constant).
+        I[I < 0.2 * (Imax - Imin)] = 0
+        total = float(I.sum())
+        if total <= 0:
+            return
 
-        x = x - self.x_offset
-        y = y - self.y_offset
-        x = x * self.x_scaling
-        y = y * self.y_scaling
+        h, w = I.shape
+        col_sum = I.sum(axis=0)  # length w
+        row_sum = I.sum(axis=1)  # length h
+        x = float((col_sum * np.arange(w, dtype=np.float32)).sum() / total)
+        y = float((row_sum * np.arange(h, dtype=np.float32)).sum() / total)
 
-        self.t_array = np.append(self.t_array, t)
-        self.x_array = np.append(self.x_array, x)
-        self.y_array = np.append(self.y_array, y)
+        x = (x - self.x_offset) * self.x_scaling
+        y = (y - self.y_offset) * self.y_scaling
 
-        self.signal_plots.emit(self.t_array[-self.N :], np.vstack((self.x_array[-self.N :], self.y_array[-self.N :])))
-        self.signal_readings.emit([np.mean(self.x_array[-self.N_average :]), np.mean(self.y_array[-self.N_average :])])
+        # Trim on append so the underlying arrays don't grow without bound —
+        # the original kept appending forever and only sliced [-N:] at emit
+        # time, so memory and append cost climbed every frame.
+        self.t_array = np.append(self.t_array, t)[-self.N :]
+        self.x_array = np.append(self.x_array, x)[-self.N :]
+        self.y_array = np.append(self.y_array, y)[-self.N :]
+
+        self.signal_plots.emit(self.t_array, np.vstack((self.x_array, self.y_array)))
+        self.signal_readings.emit([float(self.x_array[-self.N_average :].mean()), float(self.y_array[-self.N_average :].mean())])
 
     def update_settings(self, x_offset, y_offset, x_scaling, y_scaling, N_average, N):
         self.N = N

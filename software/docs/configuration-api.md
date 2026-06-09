@@ -69,7 +69,9 @@ config_repo = ConfigRepository(base_path=Path("/custom/path"))
 **Directory structure assumed:**
 ```
 base_path/
+├── cache/                       # global state (last profile, last machine config, …)
 ├── machine_configs/
+│   └── library/                 # selectable machine configs (machine_config*.yaml)
 └── user_profiles/
     └── {profile}/
         ├── channel_configs/
@@ -746,6 +748,8 @@ if obj_config is None:
 **Observation State** is the objective-free imaging preset users save from **Settings → Save Observation State Preset…** in the HCS GUI. It is stored as YAML under `user_profiles/{profile}/observation_presets/*.yaml` using the `ObservationState` Pydantic model (`control/models/observation_state.py`). It does not include `objective`; when loading, **Load Observation State Preset…** writes `general.yaml` and applies the current objective’s overrides via `merge_channel_configs`.
 
 The **active profile** is persisted in `cache/last_active_profile.txt` (under the repo `base_path`, typically `software/`) whenever `set_profile` runs, so the next startup reloads the same profile instead of always using the first profile alphabetically—otherwise presets saved under another profile would appear to “disappear” after restart.
+
+The **active machine config** is persisted the same way in `cache/last_machine_config.txt` (the file name of a config in `machine_configs/library/`). It is **global**, not per-profile: the startup dialog's *Machine config* dropdown writes it via `set_machine_config_selection`, and `get_machine_config` reads it back via `get_active_machine_config_source` on the next launch. Related API: `get_machine_config_library` (list selectable configs), `get_last_machine_config` (resolve the cached selection, or `None`).
 
 **Acquisition Metadata** is the per-run manifest written as `acquisition_metadata.yaml` in each experiment folder (`AcquisitionMetadata` in `control/models/acquisition_metadata.py`). It includes **objective** and scan/trigger summary for reproducibility. Legacy `acquisition parameters.json` (multipoint) and `acquisition_channels.yaml` remain side‑by‑side; analysis tools can read `acquisition_metadata.yaml` (see `tools/analyze_acquisition_logs.py`).
 

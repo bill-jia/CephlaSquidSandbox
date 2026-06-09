@@ -734,7 +734,7 @@ def parse_well_id(well_id: str) -> Tuple[str, str]:
 # -----------------------------------------------------------------------------
 
 
-def build_hcs_zarr_fov_path(base_path: str, well_id: str, fov: int) -> str:
+def build_hcs_zarr_fov_path(base_path: str, well_id: str, fov: int, array_key: str = None) -> str:
     """Build path for HCS (wellplate) zarr FOV group (OME-NGFF compliant).
 
     Returns the field GROUP path per OME-NGFF spec. The image array is at
@@ -747,20 +747,27 @@ def build_hcs_zarr_fov_path(base_path: str, well_id: str, fov: int) -> str:
 
     Returns:
         Path to zarr group: {base_path}/plate.ome.zarr/{row}/{col}/{fov}
+
+    When ``array_key`` is set (ragged cycle layout), each imaged channel gets its
+    own single-channel plate: ``{base_path}/{array_key}.ome.zarr/{row}/{col}/{fov}``.
     """
     row_letter, col_num = parse_well_id(well_id)
-    return os.path.join(base_path, "plate.ome.zarr", row_letter, col_num, str(fov))
+    plate = "plate.ome.zarr" if array_key is None else f"{array_key}.ome.zarr"
+    return os.path.join(base_path, plate, row_letter, col_num, str(fov))
 
 
-def build_per_fov_zarr_path(base_path: str, region_id: str, fov: int) -> str:
+def build_per_fov_zarr_path(base_path: str, region_id: str, fov: int, array_key: str = None) -> str:
     """Build path for non-HCS per-FOV zarr store.
 
     Args:
         base_path: Base experiment path (e.g., /data/experiment_001)
         region_id: Region identifier (e.g., "region_0", "scan_area_1")
         fov: FOV index within the region
+        array_key: Optional per-channel namespace for the ragged cycle layout.
 
     Returns:
-        Path to zarr store: {base_path}/zarr/{region_id}/fov_{fov}.ome.zarr
+        Path to zarr store: {base_path}/zarr/{region_id}/fov_{fov}.ome.zarr, or
+        {base_path}/zarr/{array_key}/{region_id}/fov_{fov}.ome.zarr when set.
     """
-    return os.path.join(base_path, "zarr", str(region_id), f"fov_{fov}.ome.zarr")
+    sub = ("zarr",) if array_key is None else ("zarr", str(array_key))
+    return os.path.join(base_path, *sub, str(region_id), f"fov_{fov}.ome.zarr")

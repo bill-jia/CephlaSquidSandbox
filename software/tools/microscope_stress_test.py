@@ -239,7 +239,7 @@ def main(args):
                 raise TimeoutError(f"Didn't see an acquisition update after {update_timeout_s}, failing.")
             time.sleep(0.1)
     except TimeoutError:
-        mpc.request_abort_aquisition()
+        mpc.request_abort_acquisition()
 
     counts = mpc_tracker.counts
     log.info(f"After acquisition, counts on tracker are:\n{counts}")

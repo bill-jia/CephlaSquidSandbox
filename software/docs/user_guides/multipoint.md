@@ -195,8 +195,22 @@ Coords** button and a read‑only field showing the loaded file path. The CSV mu
 
 ### Step 5 — Choose channels (observation states)
 
-The **observation‑state list** is a checkbox list of the presets saved for your active
-profile. Check the ones you want to acquire.
+A **Simple / Advanced** dropdown next to the channel list controls what the checklist
+holds. It defaults to **Simple** every time you open the widget.
+
+- **Simple** (default) — the checklist lists single **observation‑state presets**
+  (channels); each checked one is imaged **once** per position, like standard microscope
+  software. This is all most acquisitions need.
+- **Advanced** — the checklist lists **acquisition cycles** (per‑position sequences of
+  states with frame counts, waits, and repeats) and an **Edit Cycles** button appears.
+  Use this for voltage‑imaging / optogenetics‑style protocols. See
+  [acquisition-cycles.md](../acquisition-cycles.md).
+
+Switching modes clears the current selection (cycle names and channel names are not
+interchangeable). The underlying acquisition is identical either way — Simple is just a
+cycle of one‑frame steps — and the **size estimate** (Step 9) works in both modes.
+
+For the checklist itself:
 
 - **Drag** rows to reorder them — this sets the channel acquisition order.
 - Checking a row floats it to the top of the checked block, so selected channels stay
@@ -255,6 +269,13 @@ Three independent focus aids are available (combine as needed):
   | **OME_TIFF** | OME‑TIFF stacks (TZCYX) with embedded XML metadata; opens in ImageJ/FIJI. |
   | **ZARR_V3** | OME‑NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines. |
 
+- **Size estimate** — to the right of **Save format**, a live `N images · ~size` readout
+  updates as you change settings (regions, Nz, Nt, channels/cycles, save format). It
+  accounts for the per‑position cycle plan (frames per position, including ragged plans —
+  see [acquisition-cycles.md](../acquisition-cycles.md)) and the chosen format: TIFF
+  formats are estimated uncompressed, while **ZARR_V3** is shown with a `≈` and reflects
+  the selected compression preset plus pyramid overhead (the real size is data‑dependent
+  and usually smaller). It reads *Saving disabled* when **Skip Saving** is checked.
 - **Stream to network** (ZARR_V3 only) — appears when the format is ZARR_V3. Streams the
   zarr output to a mounted network share as the run proceeds, sha256‑verifies each
   timepoint on the remote, and optionally deletes local copies (**Delete after verify**)

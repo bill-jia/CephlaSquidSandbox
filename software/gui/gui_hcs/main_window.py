@@ -2199,28 +2199,28 @@ class HighContentScreeningGui(QMainWindow):
     def connectSlidePositionController(self):
         if ENABLE_FLEXIBLE_MULTIPOINT:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.flexibleMultiPointWidget.disable_the_start_aquisition_button
+                self.flexibleMultiPointWidget.disable_the_start_acquisition_button
             )
         if ENABLE_WELLPLATE_MULTIPOINT:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.wellplateMultiPointWidget.disable_the_start_aquisition_button
+                self.wellplateMultiPointWidget.disable_the_start_acquisition_button
             )
         if RUN_FLUIDICS:
             self.stageUtils.signal_loading_position_reached.connect(
-                self.multiPointWithFluidicsWidget.disable_the_start_aquisition_button
+                self.multiPointWithFluidicsWidget.disable_the_start_acquisition_button
             )
 
         if ENABLE_FLEXIBLE_MULTIPOINT:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.flexibleMultiPointWidget.enable_the_start_aquisition_button
+                self.flexibleMultiPointWidget.enable_the_start_acquisition_button
             )
         if ENABLE_WELLPLATE_MULTIPOINT:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.wellplateMultiPointWidget.enable_the_start_aquisition_button
+                self.wellplateMultiPointWidget.enable_the_start_acquisition_button
             )
         if RUN_FLUIDICS:
             self.stageUtils.signal_scanning_position_reached.connect(
-                self.multiPointWithFluidicsWidget.enable_the_start_aquisition_button
+                self.multiPointWithFluidicsWidget.enable_the_start_acquisition_button
             )
 
         self.stageUtils.signal_scanning_position_reached.connect(self.navigationViewer.clear_slide)
@@ -2534,26 +2534,21 @@ class HighContentScreeningGui(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────
 
     def _default_saving_path(self) -> str:
-        """Per-profile default save folder: ``C:/Microscope_Data/<profile>``.
+        """Per-profile default save folder: ``<root>/<profile>``.
 
-        Created on demand so it's ready for Browse dialogs and snaps. Falls back
-        to the global default if somehow no profile is active.
+        Thin wrapper over the canonical ``config_repo.default_saving_path()`` (the single
+        source of truth), kept for the existing call sites.
         """
-        profile = self.microscope.config_repo.current_profile
-        path = os.path.join(DEFAULT_SAVING_PATH, profile) if profile else DEFAULT_SAVING_PATH
-        try:
-            os.makedirs(path, exist_ok=True)
-        except OSError:
-            self.log.exception("Could not create default save folder %s", path)
-        return path
+        return self.microscope.config_repo.default_saving_path()
 
     def _apply_profile_saving_paths(self, gui_state: Optional[GuiState]) -> None:
-        """Point snap + acquisition save folders at the active profile.
+        """Point every save folder at the active profile.
 
         Uses the folder saved in the profile's gui_state, or the per-profile
-        default (``C:/Microscope_Data/<profile>``) when none is saved. All
-        multipoint widgets share one controller, so they get the same folder.
-        Called at startup and whenever the user switches profile.
+        default (``<root>/<profile>``) when none is saved. All multipoint widgets
+        share one controller, so they get the same folder. Called at startup and
+        whenever the user switches profile — so no widget is left at the bare,
+        profile-less root.
         """
         default_path = self._default_saving_path()
 
@@ -2565,6 +2560,12 @@ class HighContentScreeningGui(QMainWindow):
                 lcw.lineEdit_snapSavingDir.setText(snap_path)
             except Exception:
                 self.log.exception("Failed to set snap save folder")
+        # Laser AF snapshots share the same folder as regular snaps.
+        if self.laserAutofocusSettingWidget is not None:
+            try:
+                self.laserAutofocusSettingWidget.snap_saving_path = snap_path
+            except Exception:
+                self.log.exception("Failed to set laser AF snap save folder")
 
         acq_path = (gui_state.acquisition_saving_dir if gui_state else None) or default_path
         try:
@@ -2584,6 +2585,41 @@ class HighContentScreeningGui(QMainWindow):
                 w.base_path_is_set = True
             except Exception:
                 self.log.exception("Failed to set acquisition save folder on %s", type(w).__name__)
+
+        # Other save-dir widgets that aren't wired to the multipoint controller and would
+        # otherwise keep their construction-time bare-root default. Each exposes a different
+        # line-edit / path attribute, so set them individually (guarded — created on demand).
+        rcw = getattr(self, "recordingControlWidget", None)
+        if rcw is not None:
+            try:
+                rcw.lineEdit_savingDir.setText(default_path)
+                self.imageSaver.set_base_path(default_path)
+            except Exception:
+                self.log.exception("Failed to set recording save folder")
+
+        tcw = self.trackingControlWidget
+        if tcw is not None:
+            try:
+                tcw.lineEdit_savingDir.setText(default_path)
+                self.trackingController.set_base_path(default_path)
+            except Exception:
+                self.log.exception("Failed to set tracking save folder")
+
+        ndw = self.niDAQWidget
+        if ndw is not None:
+            try:
+                ndw.daq_only_saving_dir_edit.setText(default_path)
+                ndw._daq_only_output_path = default_path
+            except Exception:
+                self.log.exception("Failed to set NI DAQ save folder")
+
+        faw = self.fastAcquisitionWidget
+        if faw is not None:
+            try:
+                faw.lineEdit_savingDir.setText(default_path)
+                faw.output_path = default_path
+            except Exception:
+                self.log.exception("Failed to set fast-acquisition save folder")
 
     def _apply_saving_paths_for_active_profile(self) -> None:
         """Reload + re-apply save folders for the active profile (live switch)."""

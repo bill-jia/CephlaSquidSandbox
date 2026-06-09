@@ -107,6 +107,7 @@ class ConfigRepository:
             base_path = Path(__file__).parent.parent.parent.parent
         self.base_path = Path(base_path)
         self.machine_configs_path = self.base_path / "machine_configs"
+        self.machine_config_library_path = self.machine_configs_path / "library"
         self.user_profiles_path = self.base_path / "user_profiles"
 
         self._current_profile: Optional[str] = None
@@ -211,6 +212,26 @@ class ConfigRepository:
     def current_profile(self) -> Optional[str]:
         """Get the current profile name."""
         return self._current_profile
+
+    def default_saving_path(self) -> str:
+        """Canonical per-profile default save folder: ``<root>/<profile>``.
+
+        The root is the live ``control._def.DEFAULT_SAVING_PATH`` setting (seeded from
+        ``machine_config.software.default_saving_path`` and editable in Preferences); the
+        per-profile subfolder keeps each profile's data separate. Falls back to the bare
+        root when no profile is active. Created on demand so it's ready for Browse dialogs
+        and saves. This is the single source of truth — UI widgets and the main window
+        should call it rather than referencing the root directly.
+        """
+        import control._def
+
+        root = control._def.DEFAULT_SAVING_PATH
+        path = Path(root) / self._current_profile if self._current_profile else Path(root)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("Could not create default save folder %s", path)
+        return str(path)
 
     def _last_active_profile_path(self) -> Path:
         """Cache file so the same profile is restored on the next application start."""
@@ -438,35 +459,103 @@ class ConfigRepository:
             self._machine_cache[cache_key] = loaded
         return self._machine_cache[cache_key]
 
+    # ───────────────────────────────────────────────────────────────────────────
+    # Machine Config Library + last-selection cache (global, not per-profile)
+    # ───────────────────────────────────────────────────────────────────────────
+
+    def _last_machine_config_path(self) -> Path:
+        """Cache file recording the machine config selected on the last startup.
+
+        Global (not per-profile) — mirrors :meth:`_last_active_profile_path`.
+        """
+        return self.base_path / "cache" / "last_machine_config.txt"
+
+    def get_machine_config_library(self) -> List[Path]:
+        """List selectable machine config files from the library directory.
+
+        Returns ``machine_config*.yaml`` files under ``machine_configs/library/``,
+        sorted by name. Empty list when the library directory doesn't exist.
+        """
+        if not self.machine_config_library_path.is_dir():
+            return []
+        return sorted(self.machine_config_library_path.glob("machine_config*.yaml"))
+
+    def get_last_machine_config(self) -> Optional[Path]:
+        """Resolve the machine config chosen on the last startup, if still present.
+
+        Returns the path under ``machine_configs/library/`` named by
+        ``cache/last_machine_config.txt``, or ``None`` when the cache is missing,
+        unreadable, empty, or points at a file that no longer exists.
+        """
+        path = self._last_machine_config_path()
+        if not path.is_file():
+            return None
+        try:
+            name = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not name:
+            return None
+        candidate = self.machine_config_library_path / name
+        return candidate if candidate.is_file() else None
+
+    def set_machine_config_selection(self, config: Union[Path, str]) -> None:
+        """Persist the selected machine config (by file name) for the next startup.
+
+        Only the file name is stored; it is resolved under ``machine_configs/library/``
+        on the next launch via :meth:`get_last_machine_config`.
+        """
+        name = Path(config).name
+        try:
+            path = self._last_machine_config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name + "\n", encoding="utf-8")
+        except OSError as e:
+            logger.warning("Could not persist machine config selection: %s", e)
+
+    def get_active_machine_config_source(self) -> Optional[Path]:
+        """Resolve which machine config file would be loaded, without loading it.
+
+        Resolution order mirrors :meth:`get_machine_config`:
+        1. Cached library selection (``cache/last_machine_config.txt``)
+        2. Explicit ``machine_configs/machine_config.yaml``
+        3. A single ``machine_configs/machine_config_*.yaml`` in the root
+
+        Returns ``None`` when none apply (the built-in default would be used).
+        """
+        cached = self.get_last_machine_config()
+        if cached is not None:
+            return cached
+        primary = self.machine_configs_path / "machine_config.yaml"
+        if primary.exists():
+            return primary
+        candidates = sorted(self.machine_configs_path.glob("machine_config_*.yaml"))
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
     def get_machine_config(self) -> MachineConfig:
         """Load the unified machine configuration (cached).
 
         Resolution order:
-        1. Explicit ``machine_config.yaml`` (active config for this install)
-        2. If missing, a single matching ``machine_config_*.yaml`` file
-           (for setups that keep multiple named configs side-by-side)
-        3. Built-in default via ``build_default_machine_config()``
+        1. The library config selected on the last startup
+           (``cache/last_machine_config.txt`` → ``machine_configs/library/``)
+        2. Explicit ``machine_config.yaml`` in the machine_configs root
+        3. A single ``machine_config_*.yaml`` in the root (side-by-side setups)
+        4. Built-in default via ``build_default_machine_config()``
         """
         cache_key = "machine_config"
         if cache_key not in self._machine_cache:
-            primary = self.machine_configs_path / "machine_config.yaml"
+            source = self.get_active_machine_config_source()
             loaded: Optional[MachineConfig] = None
 
-            # 1) Primary explicit config file
-            if primary.exists():
-                loaded = self._load_yaml(primary, MachineConfig)
-            else:
-                # 2) Fallback: single named machine_config_*.yaml
-                candidates = sorted(self.machine_configs_path.glob("machine_config_*.yaml"))
-                if len(candidates) == 1:
-                    logger.info(
-                        f"machine_config.yaml not found — using named config {candidates[0].name}"
-                    )
-                    loaded = self._load_yaml(candidates[0], MachineConfig)
+            if source is not None:
+                logger.info(f"Loading machine config from {source}")
+                loaded = self._load_yaml(source, MachineConfig)
 
             if loaded is None:
                 logger.info(
-                    "No machine_config.yaml (or unique machine_config_*.yaml) found — "
+                    "No usable machine config found (cache/library/root) — "
                     "using built-in default machine config"
                 )
                 loaded = build_default_machine_config()
@@ -1134,6 +1223,89 @@ class ConfigRepository:
         except (yaml.YAMLError, ValidationError, OSError, ValueError, TypeError) as e:
             logger.warning("Failed to load Observation State preset %s: %s", path, e)
             return None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ACQUISITION CYCLES
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def list_acquisition_cycles(self, profile: Optional[str] = None) -> List[str]:
+        """List saved acquisition-cycle names (without ``.yaml``) for a profile."""
+        profile = profile or self._current_profile
+        if profile is None:
+            return []
+        cycles_dir = self.user_profiles_path / profile / "cycles"
+        if not cycles_dir.is_dir():
+            return []
+        return [p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
+
+    def save_acquisition_cycle(self, name: str, cycle: "AcquisitionCycle", profile: Optional[str] = None) -> Path:
+        """Save an acquisition cycle under ``user_profiles/{profile}/cycles/``.
+
+        The cycle's ``name`` is normalized to the sanitized file stem so the
+        on-disk name and the in-file name always match.
+        """
+        from control.core.observation_state_service import acquisition_cycle_path, sanitize_preset_filename
+
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
+        safe_name = sanitize_preset_filename(name)
+        cycle_to_save = cycle.model_copy(update={"name": safe_name})
+        path = acquisition_cycle_path(self, name, profile=profile)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    cycle_to_save.model_dump(mode="json"),
+                    f,
+                    Dumper=_YamlDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+        except (OSError, yaml.YAMLError) as e:
+            logger.error("Failed to save acquisition cycle YAML '%s': %s", path, e)
+            raise
+        return path
+
+    def load_acquisition_cycle(self, name: str, profile: Optional[str] = None) -> Optional["AcquisitionCycle"]:
+        """Load a named acquisition cycle from the profile. Returns None if missing/invalid."""
+        from control.core.observation_state_service import acquisition_cycle_path
+        from control.models.acquisition_cycle import AcquisitionCycle
+
+        profile = profile or self._current_profile
+        if profile is None:
+            return None
+        path = acquisition_cycle_path(self, name, profile=profile)
+        if not path.exists():
+            logger.debug("acquisition cycle not found: %s", path)
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.load(f, Loader=_YamlSafeLoader)
+            if not isinstance(data, dict):
+                raise ValueError("acquisition cycle YAML did not parse into a dict")
+            return AcquisitionCycle.model_validate(data)
+        except (yaml.YAMLError, ValidationError, OSError, ValueError, TypeError) as e:
+            logger.warning("Failed to load acquisition cycle %s: %s", path, e)
+            return None
+
+    def delete_acquisition_cycle(self, name: str, profile: Optional[str] = None) -> bool:
+        """Delete a named acquisition cycle. Returns True if a file was removed."""
+        from control.core.observation_state_service import acquisition_cycle_path
+
+        profile = profile or self._current_profile
+        if profile is None:
+            return False
+        path = acquisition_cycle_path(self, name, profile=profile)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.error("Failed to delete acquisition cycle '%s': %s", path, e)
+            raise
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CACHE MANAGEMENT

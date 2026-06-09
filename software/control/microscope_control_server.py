@@ -916,7 +916,7 @@ class MicroscopeControlServer:
             self.multipoint_controller.request_abort_acquisition()
         else:
             # Legacy misspelled method name
-            self.multipoint_controller.request_abort_aquisition()
+            self.multipoint_controller.request_abort_acquisition()
         return {"aborted": True}
 
     def _get_widget_for_type(self, widget_type: str):

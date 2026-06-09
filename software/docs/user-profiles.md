@@ -14,7 +14,7 @@ Hardware-level configuration (cameras, illumination devices, IO endpoints) is
 ```
 software/
 ├── machine_configs/                       # global, shared across all users
-│   ├── machine_config.yaml
+│   ├── library/                           # selectable machine configs
 │   ├── illumination_channel_config.yaml
 │   └── ...
 ├── user_profiles/
@@ -28,7 +28,8 @@ software/
 │       │   └── {objective}.yaml
 │       └── gui_state.yaml                 # per-profile UI state (see below)
 └── cache/
-    └── last_active_profile.txt            # remembers the last loaded profile
+    ├── last_active_profile.txt            # remembers the last loaded profile
+    └── last_machine_config.txt            # remembers the last machine config (global)
 ```
 
 ## Selecting a profile
@@ -36,8 +37,9 @@ software/
 ### Startup selector (`ProfileSelectionDialog`)
 
 When `main_hcs.py` starts without an explicit `--profile` flag, it shows a
-modal **Select User Profile** dialog (`software/gui/widgets/profile_selection.py`)
-*before* any hardware initialization. The dialog:
+modal **Select User Profile** dialog (`software/gui/profile_selection.py`)
+*before* any hardware initialization — and, deliberately, before the heavy
+GUI/driver imports, so it appears in well under a second. The dialog:
 
 - Lists every directory under `user_profiles/`.
 - Pre-selects the last-active profile recorded in
@@ -49,6 +51,12 @@ modal **Select User Profile** dialog (`software/gui/widgets/profile_selection.py
   observation-state presets, and laser AF calibrations) under a new name.
 - Double-clicking a profile, or pressing **Load profile**, accepts the choice.
 - Cancelling exits the application without initializing hardware.
+
+The dialog also has a **Machine config** dropdown in the bottom-left listing the
+configs in `machine_configs/library/`. This choice is **global**, not part of the
+selected profile — it determines which hardware configuration loads this session
+and is persisted to `cache/last_machine_config.txt` so it pre-selects next launch.
+See [Configuration System → machine_config.yaml](configuration-system.md#machine_configyaml-active-hardware-config).
 
 If no profiles exist yet, the dialog auto-creates `default` so the list is
 never empty on first run.

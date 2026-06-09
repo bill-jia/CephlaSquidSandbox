@@ -62,7 +62,8 @@ multi_point_worker (main proc)
 JobRunner subprocess (one FIFO queue per job class)
     │  the barrier runs after every preceding SaveZarrJob for the same (t, fov):
     │    writer.wait_for_pending()        ← drains TensorStore futures
-    │    paths = writer.shard_paths_for_timepoint(t)
+    │    paths = writer.drain_unstaged_shard_paths()  ← ALL shards written
+    │                                                    since the last barrier
     │    upload_queue.put(UploadTask(...))
     │  returns BarrierResult(task_id, t, fov, ...) on the output queue
     │
@@ -115,11 +116,32 @@ authoritative:
 2. **Post-finalize metadata resync.** After the JobRunner subprocess exits
    (which is when ``finalize_all_writers()`` runs in the subprocess and
    rewrites every FOV's ``zarr.json`` with ``acquisition_complete = True``),
-   ``_drain_upload_worker_on_shutdown`` enqueues one final metadata-only
-   upload per FOV. This pass reads files that no writer can be touching, so
-   the upload is guaranteed clean. The remote ends up reflecting the
-   finalized local state even if every intermediate barrier upload of
-   ``frame_times`` had been torn.
+   the background drainer enqueues a final metadata resync. This pass reads
+   files that no writer can be touching, so the upload is guaranteed clean.
+   The remote ends up reflecting the finalized local state even if every
+   intermediate barrier upload of ``frame_times`` had been torn. It covers
+   three tiers, all marked non-deletable:
+   - **per-FOV** group + level ``zarr.json`` and ``frame_times``
+     (``_enqueue_post_finalize_metadata_resync``);
+   - **plate/well group metadata** — every ``*.ome.zarr`` plate's root
+     ``zarr.json`` and per-well ``<row>/<col>/zarr.json``
+     (``_enqueue_plate_metadata_resync``). Without these the remote tree is a
+     headless collection of images, not a readable OME-NGFF plate;
+   - **experiment-root files** — ``acquisition.yaml`` and any other
+     top-level record (``_enqueue_experiment_root_resync``).
+
+### Staging every shard a FOV visit writes
+
+The barrier does **not** key on the scan ``time_point``. A dense or ragged
+[acquisition cycle](acquisition-cycles.md) visit folds many frames into a
+*contiguous block* of array-``t`` indices (``T = Nt × frames/visit``), so one
+visit seals several shards. ``ZarrWriter`` records every array-``t`` it writes
+in ``_unstaged_t_indices`` (in ``write_frame``); ``drain_unstaged_shard_paths``
+returns the shard files for **all** of them across every pyramid level, then
+clears only the timepoints whose shards are fully on disk (an unflushed ``t``
+stays pending for the next barrier — a written timepoint is never dropped).
+Keying on the scan ``time_point`` instead would stage one shard per visit and
+silently skip the rest.
 
 In the manifest, each record carries:
 - ``"deletable": true|false`` — whether the file was eligible for local
@@ -246,6 +268,17 @@ conditional layouts that vary by compression mode:
 | Older `BALANCED` (per-z-level) | `(1, C, 1, Y, X)` | `c/<t>/0/<z>/0/0` ✗ |
 | Older 6D wellplate | `(1, 1, 1, 1, Y, X)` | `c/<fov>/<t>/<c>/<z>/0/0` ✗ |
 
+The script discovers FOV groups in three layouts: non-HCS
+`zarr/<region>/fov_*.ome.zarr`; HCS `<plate>.ome.zarr/<row>/<col>/<fov>` for
+**any** top-level `*.ome.zarr` whose root `zarr.json` carries an `ome.plate`
+attribute (a ragged [acquisition cycle](acquisition-cycles.md) writes one
+plate per imaged state — `{state}.ome.zarr` — so there can be several; the
+legacy single `plate.ome.zarr` is just the one-plate case); and a top-level
+`*.ome.zarr` that is itself a multiscales group. Region IDs are namespaced by
+plate stem so wells from different per-state plates don't collide. Plate-root
+and per-well group `zarr.json` are uploaded alongside the per-FOV metadata so
+the remote opens as a valid HCS plate.
+
 To prevent silent data loss against older datasets, the script reads the
 level-0 `zarr.json` of every FOV before submitting any uploads and aborts
 with a clear error if the outer chunk grid is not `(1, C, Z, Y, X)`. The
@@ -326,9 +359,13 @@ correctness.
 - **Delete is per-timepoint, not per-FOV.** A single FOV upload failure
   defers deletion of the whole timepoint's local data until the failure
   resolves.
-- **Aborts.** On user abort, in-flight uploads continue draining for up to
-  30 minutes. Re-running the backfill against the same experiment dir is
-  the canonical recovery path if the drain timed out.
+- **Aborts / end-of-run drain.** When an acquisition ends, the background
+  drainer keeps uploading and only gives up after a **stall window** — 10
+  minutes with *no* new verified result — rather than a fixed wallclock
+  deadline. A healthy worker that is merely slow (large backlog, slow share)
+  is never abandoned; only a genuinely stuck one is. If the drain does report
+  outstanding uploads, re-running the backfill against the same experiment
+  dir is the canonical recovery path.
 
 ## Key files
 
@@ -336,7 +373,8 @@ correctness.
   `UploadResult`, `UploadWorker`, `upload_one_file`, manifest helpers.
 - `software/control/core/job_processing.py` — `FlushAndStageUploadJob`,
   `BarrierResult`, `JobRunner(upload_target=..., upload_input_queue=...)`.
-- `software/control/core/zarr_writer.py` — `shard_paths_for_timepoint`.
+- `software/control/core/zarr_writer.py` — `drain_unstaged_shard_paths`
+  (stages every shard written since the last barrier).
 - `software/control/core/multi_point_worker.py` — UploadWorker lifecycle,
   barrier dispatch, batched-delete, drain on shutdown.
 - `software/control/core/multi_point_utils.py` — new fields on

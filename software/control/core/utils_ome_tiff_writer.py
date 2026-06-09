@@ -68,7 +68,26 @@ def ome_base_name(info: "CaptureInfo") -> str:
     # Import here to avoid circular dependency: _def -> utils_ome_tiff_writer -> _def
     from control import _def
 
-    return f"{info.region_id}_{info.fov:0{_def.FILE_ID_PADDING}}"
+    base = f"{info.region_id}_{info.fov:0{_def.FILE_ID_PADDING}}"
+    # Ragged cycle layout: one single-channel OME-TIFF stack per state.
+    if info.array_key is not None:
+        base = f"{base}_{info.array_key}"
+    return base
+
+
+def _ome_t_size(acq_info: "AcquisitionInfo", info: "CaptureInfo") -> int:
+    return int(info.save_t_size) if info.save_t_size is not None else int(acq_info.total_time_points)
+
+
+def _ome_c_size(acq_info: "AcquisitionInfo", info: "CaptureInfo") -> int:
+    return int(info.save_c_size) if info.save_c_size is not None else int(acq_info.total_channels)
+
+
+def ome_plane_indices(info: "CaptureInfo") -> "tuple[int, int]":
+    """(t, c) plane coordinates, preferring the self-describing cycle fields."""
+    t = int(info.save_t_index) if info.save_t_index is not None else int(info.time_point)
+    c = int(info.save_c_index) if info.save_c_index is not None else int(info.configuration_idx)
+    return t, c
 
 
 def validate_capture_info(info: "CaptureInfo", acq_info: "AcquisitionInfo", image: np.ndarray) -> None:
@@ -85,7 +104,10 @@ def validate_capture_info(info: "CaptureInfo", acq_info: "AcquisitionInfo", imag
 
 
 def initialize_metadata(acq_info: "AcquisitionInfo", info: "CaptureInfo", image: np.ndarray) -> Dict[str, Any]:
-    channel_names = acq_info.channel_names or []
+    # Cycle layout self-describes its array dims; fall back to the global totals.
+    t_size = _ome_t_size(acq_info, info)
+    c_size = _ome_c_size(acq_info, info)
+    channel_names = (info.array_channel_names if info.array_channel_names is not None else acq_info.channel_names) or []
     time_increment = float(acq_info.time_increment_s) if acq_info.time_increment_s is not None else None
     time_increment_unit = "s" if time_increment is not None else None
     physical_size_z = float(acq_info.physical_size_z_um) if acq_info.physical_size_z_um is not None else None
@@ -98,18 +120,16 @@ def initialize_metadata(acq_info: "AcquisitionInfo", info: "CaptureInfo", image:
         DTYPE_KEY: np.dtype(image.dtype).str,
         AXES_KEY: "TZCYX",
         SHAPE_KEY: [
-            int(acq_info.total_time_points),
+            t_size,
             int(acq_info.total_z_levels),
-            int(acq_info.total_channels),
+            c_size,
             int(image.shape[-2]),
             int(image.shape[-1]),
         ],
         CHANNEL_NAMES_KEY: channel_names,
         WRITTEN_INDICES_KEY: [],
         SAVED_COUNT_KEY: 0,
-        EXPECTED_COUNT_KEY: int(acq_info.total_time_points)
-        * int(acq_info.total_z_levels)
-        * int(acq_info.total_channels),
+        EXPECTED_COUNT_KEY: t_size * int(acq_info.total_z_levels) * c_size,
         PLANES_KEY: {},
         START_TIME_KEY: info.capture_time,
         COMPLETED_KEY: False,
@@ -125,11 +145,12 @@ def initialize_metadata(acq_info: "AcquisitionInfo", info: "CaptureInfo", image:
 
 
 def update_plane_metadata(metadata: Dict[str, Any], info: "CaptureInfo") -> Dict[str, Any]:
-    plane_key = f"{info.time_point}-{info.configuration_idx}-{info.z_index}"
+    t, c = ome_plane_indices(info)
+    plane_key = f"{t}-{c}-{info.z_index}"
     plane_data: Dict[str, Any] = {
-        "TheT": int(info.time_point),
+        "TheT": t,
         "TheZ": int(info.z_index),
-        "TheC": int(info.configuration_idx),
+        "TheC": c,
     }
     if info.position is not None:
         if getattr(info.position, "x_mm", None) is not None:

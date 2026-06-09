@@ -11,66 +11,6 @@ from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
 
 
-def _multipoint_observation_preset_display_names(microscope) -> list:
-    """Sorted preset names for multipoint acquisition (same source as Observation State combo)."""
-    return sorted(microscope.config_repo.list_observation_presets())
-
-
-def _preset_nidaq_kind(microscope, name: str) -> Optional[str]:
-    """Classify a preset's relationship to the NIDAQ pulse pathway.
-
-    Returns ``None`` for ordinary captures, ``"stimulus"`` for stimulus-only
-    steps (no camera frame, comb runs at the FOV), and ``"capture_pulse"``
-    when timed illumination overlays a normal camera exposure. Used to
-    decorate multipoint list rows so the user can see which presets require
-    a working NIDAQ. Best-effort: returns None if the preset can't be loaded.
-    """
-    if microscope is None:
-        return None
-    try:
-        preset = microscope.config_repo.load_observation_preset(name)
-    except Exception:
-        return None
-    if preset is None:
-        return None
-    if getattr(preset, "is_stimulus_only", False):
-        return "stimulus"
-    if getattr(preset, "is_waveform_driven", False):
-        return "capture_pulse"
-    return None
-
-
-def _create_checkbox_list_item(name: str, checked: bool = False, *, microscope=None) -> QListWidgetItem:
-    """Create a QListWidgetItem with a checkbox instead of relying on selection highlight.
-
-    When ``microscope`` is supplied and the named preset uses NIDAQ pulse
-    timing, the row is rendered in italic with a tooltip describing the
-    type (capture-window pulse vs stimulus-only). ``item.text()`` remains
-    the canonical preset name so callers comparing against ``item.text()``
-    are not affected.
-    """
-    item = QListWidgetItem(name)
-    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-    kind = _preset_nidaq_kind(microscope, name)
-    if kind is not None:
-        font = item.font()
-        font.setItalic(True)
-        item.setFont(font)
-        if kind == "stimulus":
-            item.setToolTip(
-                "Stimulus-only step — NIDAQ pulse comb, no camera frame. "
-                "Requires a working NIDAQ on this rig."
-            )
-        else:
-            item.setToolTip(
-                "Uses NIDAQ pulse timing during the camera exposure — "
-                "illumination is delivered as a precisely timed pulse. "
-                "Requires a working NIDAQ on this rig."
-            )
-    return item
-
-
 def _get_checked_names(list_widget: QListWidget) -> list:
     """Return the text of all checked items in a checkbox-style QListWidget."""
     return [
@@ -125,7 +65,7 @@ def _reorder_list_widget(list_widget: QListWidget, ordered_names: list) -> None:
 class _ObservationStateListWidget(QListWidget):
     """Checkbox list with internal drag/drop and "float checked to top".
 
-    - Items are checkbox rows (created by :func:`_create_checkbox_list_item`).
+    - Items are checkbox rows (populated by :func:`_populate_cycle_list`).
     - Users can drag any row to reorder. The post-drag order is preserved.
     - On a check-state change, the changed item moves to the boundary between
       the checked block (top) and the unchecked block (bottom): checking
@@ -189,6 +129,417 @@ class _ObservationStateListWidget(QListWidget):
         self.order_changed.emit()
 
 
+def _multipoint_cycle_display_names(microscope) -> list:
+    """Sorted acquisition-cycle names for the multipoint checklist."""
+    try:
+        return sorted(microscope.config_repo.list_acquisition_cycles())
+    except Exception:
+        return []
+
+
+def _populate_cycle_list(list_widget, microscope, checked_names=None, prior_order=None) -> None:
+    """Fill a checkbox list with available acquisition cycles.
+
+    Preserves the prior display order and checked state when refreshing.
+    """
+    checked_names = set(checked_names or [])
+    available = list(_multipoint_cycle_display_names(microscope))
+    available_set = set(available)
+    if prior_order:
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+    else:
+        ordered = available
+    list_widget.blockSignals(True)
+    list_widget.clear()
+    for name in ordered:
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if name in checked_names else Qt.Unchecked)
+        list_widget.addItem(item)
+    list_widget.blockSignals(False)
+
+
+def _multipoint_observation_preset_display_names(microscope) -> list:
+    """Sorted observation-state preset names for the simple-mode checklist."""
+    try:
+        return sorted(microscope.config_repo.list_observation_presets())
+    except Exception:
+        return []
+
+
+def _populate_observation_state_list(list_widget, microscope, checked_names=None, prior_order=None) -> None:
+    """Fill a checkbox list with available observation-state presets (simple mode).
+
+    Symmetric to :func:`_populate_cycle_list`; preserves prior order and checked state.
+    """
+    checked_names = set(checked_names or [])
+    available = list(_multipoint_observation_preset_display_names(microscope))
+    available_set = set(available)
+    if prior_order:
+        ordered = [n for n in prior_order if n in available_set]
+        ordered.extend(n for n in available if n not in ordered)
+    else:
+        ordered = available
+    list_widget.blockSignals(True)
+    list_widget.clear()
+    for name in ordered:
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if name in checked_names else Qt.Unchecked)
+        list_widget.addItem(item)
+    list_widget.blockSignals(False)
+
+
+class CycleEditorDialog(QDialog):
+    """Modal editor for named acquisition cycles (two-level: outer repeat ->
+    ordered steps, where a step can sit inside a one-level repeatable group).
+
+    Steps reference observation-state presets by name. Cycles are saved/loaded
+    via the config repo (``cycles/*.yaml`` under the active profile).
+    """
+
+    _TYPE_ROLE = Qt.UserRole
+
+    def __init__(self, microscope, parent=None):
+        super().__init__(parent)
+        self.microscope = microscope
+        self.repo = microscope.config_repo
+        self.setWindowTitle("Edit Acquisition Cycles")
+
+        layout = QHBoxLayout(self)
+
+        # ── Left: existing cycle library ──
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Saved cycles"))
+        self.list_existing = QListWidget()
+        self.list_existing.itemClicked.connect(lambda it: self._load_cycle(it.text()))
+        left.addWidget(self.list_existing)
+        row = QHBoxLayout()
+        btn_new = QPushButton("New")
+        btn_new.clicked.connect(self._new_cycle)
+        btn_del = QPushButton("Delete")
+        btn_del.clicked.connect(self._delete_selected_cycle)
+        row.addWidget(btn_new)
+        row.addWidget(btn_del)
+        left.addLayout(row)
+        layout.addLayout(left, 1)
+
+        # ── Right: editor ──
+        right = QVBoxLayout()
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.edit_name = QLineEdit()
+        name_row.addWidget(self.edit_name)
+        name_row.addWidget(QLabel("Repeat:"))
+        self.spin_repeat = QSpinBox()
+        self.spin_repeat.setRange(1, 100000)
+        name_row.addWidget(self.spin_repeat)
+        right.addLayout(name_row)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat"])
+        self.tree.setColumnWidth(0, 220)
+        right.addWidget(self.tree)
+
+        tools = QHBoxLayout()
+        for label, slot in (
+            ("Add Step", self._add_step),
+            ("Add Wait", self._add_wait),
+            ("Add Group", self._add_group),
+            ("Add → Group", self._add_step_to_group),
+            ("Wait → Group", self._add_wait_to_group),
+            ("Remove", self._remove_selected),
+            ("Up", lambda: self._move_selected(-1)),
+            ("Down", lambda: self._move_selected(1)),
+        ):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            tools.addWidget(b)
+        right.addLayout(tools)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self._save_cycle)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        save_row.addWidget(btn_save)
+        save_row.addWidget(btn_close)
+        right.addLayout(save_row)
+        layout.addLayout(right, 2)
+
+        self.resize(720, 420)
+        self._refresh_existing()
+
+    # ── preset combo helper ──
+    def _preset_names(self):
+        try:
+            return sorted(self.repo.list_observation_presets())
+        except Exception:
+            return []
+
+    def _make_step_widgets(self, item, observation_state="", n_frames=1):
+        combo = QComboBox()
+        names = self._preset_names()
+        combo.addItems(names)
+        if observation_state and observation_state in names:
+            combo.setCurrentText(observation_state)
+        elif observation_state:
+            combo.addItem(observation_state)
+            combo.setCurrentText(observation_state)
+        spin = QSpinBox()
+        spin.setRange(1, 100000)
+        spin.setValue(int(n_frames))
+        self.tree.setItemWidget(item, 0, combo)
+        self.tree.setItemWidget(item, 1, spin)
+
+    def _make_group_widgets(self, item, repeat=1):
+        item.setText(0, "Group")
+        spin = QSpinBox()
+        spin.setRange(1, 100000)
+        spin.setValue(int(repeat))
+        self.tree.setItemWidget(item, 1, spin)
+
+    def _make_wait_widgets(self, item, duration_ms=1000.0):
+        item.setText(0, "Wait (ms)")
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1e9)
+        spin.setDecimals(1)
+        spin.setValue(float(duration_ms))
+        self.tree.setItemWidget(item, 1, spin)
+
+    # ── tree editing ──
+    def _add_step(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "step")
+        self.tree.addTopLevelItem(item)
+        self._make_step_widgets(item)
+
+    def _add_group(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "group")
+        self.tree.addTopLevelItem(item)
+        self._make_group_widgets(item)
+        item.setExpanded(True)
+
+    def _add_wait(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "wait")
+        self.tree.addTopLevelItem(item)
+        self._make_wait_widgets(item)
+
+    def _selected_group(self, action):
+        sel = self.tree.currentItem()
+        if sel is None:
+            QMessageBox.information(self, action, "Select a group (or an item inside one) first.")
+            return None
+        group = sel if sel.data(0, self._TYPE_ROLE) == "group" else sel.parent()
+        if group is None or group.data(0, self._TYPE_ROLE) != "group":
+            QMessageBox.information(self, action, "Select a group first.")
+            return None
+        return group
+
+    def _add_step_to_group(self):
+        group = self._selected_group("Add Step")
+        if group is None:
+            return
+        child = QTreeWidgetItem(group)
+        child.setData(0, self._TYPE_ROLE, "step")
+        self._make_step_widgets(child)
+        group.setExpanded(True)
+
+    def _add_wait_to_group(self):
+        group = self._selected_group("Add Wait")
+        if group is None:
+            return
+        child = QTreeWidgetItem(group)
+        child.setData(0, self._TYPE_ROLE, "wait")
+        self._make_wait_widgets(child)
+        group.setExpanded(True)
+
+    def _remove_selected(self):
+        sel = self.tree.currentItem()
+        if sel is None:
+            return
+        parent = sel.parent()
+        if parent is None:
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(sel))
+        else:
+            parent.removeChild(sel)
+
+    def _move_selected(self, delta):
+        sel = self.tree.currentItem()
+        if sel is None or sel.parent() is not None:
+            return  # only reorder top-level items
+        idx = self.tree.indexOfTopLevelItem(sel)
+        new_idx = idx + delta
+        if not (0 <= new_idx < self.tree.topLevelItemCount()):
+            return
+        # Re-take and re-insert preserves child widgets only if rebuilt; simplest
+        # is to rebuild from the model. Take/insert loses itemWidgets, so rebuild.
+        model = self._read_tree()
+        model.insert(new_idx, model.pop(idx))
+        self._load_model(self.edit_name.text(), self.spin_repeat.value(), model)
+        self.tree.setCurrentItem(self.tree.topLevelItem(new_idx))
+
+    # ── model <-> tree ──
+    def _read_leaf(self, item):
+        """Read a step or wait item into a model dict (None if malformed)."""
+        kind = item.data(0, self._TYPE_ROLE)
+        if kind == "wait":
+            spin = self.tree.itemWidget(item, 1)
+            return {"type": "wait", "duration_ms": spin.value() if spin else 0.0}
+        combo = self.tree.itemWidget(item, 0)
+        spin = self.tree.itemWidget(item, 1)
+        if combo is None:
+            return None
+        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value()}
+
+    def _read_tree(self):
+        """Return a list of dicts describing top-level items (steps/waits/groups)."""
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, self._TYPE_ROLE) == "group":
+                spin = self.tree.itemWidget(item, 1)
+                steps = []
+                for j in range(item.childCount()):
+                    leaf = self._read_leaf(item.child(j))
+                    if leaf is not None:
+                        steps.append(leaf)
+                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps})
+            else:
+                leaf = self._read_leaf(item)
+                if leaf is not None:
+                    out.append(leaf)
+        return out
+
+    def _make_leaf_item(self, parent, entry):
+        item = QTreeWidgetItem(parent)
+        if entry["type"] == "wait":
+            item.setData(0, self._TYPE_ROLE, "wait")
+            self._make_wait_widgets(item, entry.get("duration_ms", 0.0))
+        else:
+            item.setData(0, self._TYPE_ROLE, "step")
+            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1))
+
+    def _load_model(self, name, repeat, model):
+        self.tree.clear()
+        self.edit_name.setText(name)
+        self.spin_repeat.setValue(int(repeat))
+        for entry in model:
+            if entry["type"] == "group":
+                gitem = QTreeWidgetItem(self.tree)
+                gitem.setData(0, self._TYPE_ROLE, "group")
+                self._make_group_widgets(gitem, entry.get("repeat", 1))
+                for st in entry.get("steps", []):
+                    self._make_leaf_item(gitem, st)
+                gitem.setExpanded(True)
+            else:
+                self._make_leaf_item(self.tree, entry)
+
+    # ── persistence ──
+    def _refresh_existing(self):
+        self.list_existing.clear()
+        for name in _multipoint_cycle_display_names(self.microscope):
+            self.list_existing.addItem(name)
+
+    def _new_cycle(self):
+        self._load_model("", 1, [])
+
+    @staticmethod
+    def _leaf_to_dict(item):
+        from control.models.acquisition_cycle import CycleWait
+
+        if isinstance(item, CycleWait):
+            return {"type": "wait", "duration_ms": item.duration_ms}
+        return {"type": "step", "observation_state": item.observation_state, "n_frames": item.n_frames}
+
+    def _load_cycle(self, name):
+        from control.models.acquisition_cycle import CycleGroup
+
+        cyc = self.repo.load_acquisition_cycle(name)
+        if cyc is None:
+            return
+        model = []
+        for item in cyc.items:
+            if isinstance(item, CycleGroup):
+                model.append(
+                    {
+                        "type": "group",
+                        "repeat": item.repeat,
+                        "steps": [self._leaf_to_dict(s) for s in item.steps],
+                    }
+                )
+            else:
+                model.append(self._leaf_to_dict(item))
+        self._load_model(cyc.name, cyc.repeat, model)
+
+    def _delete_selected_cycle(self):
+        item = self.list_existing.currentItem()
+        if item is None:
+            return
+        name = item.text()
+        if QMessageBox.question(self, "Delete cycle", f"Delete cycle '{name}'?") != QMessageBox.Yes:
+            return
+        try:
+            self.repo.delete_acquisition_cycle(name)
+        except Exception as e:
+            QMessageBox.warning(self, "Delete failed", str(e))
+        self._refresh_existing()
+
+    @staticmethod
+    def _dict_to_leaf(entry):
+        """Build a CycleStep/CycleWait from a model dict (None to skip)."""
+        from control.models.acquisition_cycle import CycleStep, CycleWait
+
+        if entry["type"] == "wait":
+            return CycleWait(duration_ms=entry["duration_ms"])
+        if entry.get("observation_state"):
+            return CycleStep(observation_state=entry["observation_state"], n_frames=entry["n_frames"])
+        return None
+
+    def _save_cycle(self):
+        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup
+
+        name = self.edit_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Save cycle", "Enter a cycle name.")
+            return
+        model = self._read_tree()
+        items = []
+        for entry in model:
+            if entry["type"] == "group":
+                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in entry["steps"]) if leaf is not None]
+                if steps:
+                    items.append(CycleGroup(repeat=entry["repeat"], steps=steps))
+            else:
+                leaf = self._dict_to_leaf(entry)
+                if leaf is not None:
+                    items.append(leaf)
+        if not items:
+            QMessageBox.warning(self, "Save cycle", "Add at least one step.")
+            return
+        cycle = AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+        try:
+            self.repo.save_acquisition_cycle(name, cycle)
+        except Exception as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+            return
+        self._refresh_existing()
+        QMessageBox.information(self, "Saved", f"Cycle '{name}' saved.")
+
+
+def _open_cycle_editor(widget) -> None:
+    """Open the cycle editor for a multipoint widget and refresh its checklist."""
+    dialog = CycleEditorDialog(widget.microscope, parent=widget)
+    dialog.exec_()
+    if hasattr(widget, "refresh_channel_list"):
+        widget.refresh_channel_list()
+
+
 _FILE_SAVING_FORMAT_TOOLTIPS = {
     "INDIVIDUAL_IMAGES": "One TIFF (or PNG/BMP) per (region, FOV, Z, channel).",
     "MULTI_PAGE_TIFF": "One multi-page TIFF per FOV, pages = (Z × channel × time).",
@@ -197,14 +548,73 @@ _FILE_SAVING_FORMAT_TOOLTIPS = {
 }
 
 
-def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox]":
-    """Build a compact ``Save format: [combo]`` row.
+def _human_bytes(n: float) -> str:
+    """Format a byte count as a short human-readable string (e.g. ``3.4 GB``)."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hint) -> str:
+    """One-line ``N images · ~X`` estimate for the configured acquisition.
+
+    Mode-agnostic: the caller is expected to have already pushed its channel selection into
+    ``controller`` (via the widget's ``_push_channel_selection_to_controller``), so this only
+    *reads* ``get_acquisition_image_count`` / ``estimate_acquisition_disk_bytes``. ``hint`` is
+    the mode-specific text shown when nothing is selected. Never raises.
+    """
+    if skip_saving:
+        return "Saving disabled — no files written"
+    if not has_selection:
+        return hint
+    try:
+        if controller.acquisition_in_progress():
+            return ""
+        image_count = controller.get_acquisition_image_count()
+        if image_count <= 0:
+            return "Add a region to estimate size"
+        disk_bytes = controller.estimate_acquisition_disk_bytes()
+    except Exception:
+        return "—"
+    fmt = getattr(controller, "file_saving_option", None)
+    # ZARR_V3 size is data-dependent (compression); flag it as approximate.
+    approx = "≈" if fmt is not None and getattr(fmt, "name", "") == "ZARR_V3" else "~"
+    return f"{image_count:,} images · {approx}{_human_bytes(disk_bytes)}"
+
+
+def _refresh_size_estimate(widget) -> None:
+    """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
+
+    A no-op if the widget has no estimate label (e.g. the fluidics variant). The widget first
+    pushes its current (mode-aware) selection into the controller, then the controller's
+    format-/cycle-aware estimators are read. Wired to every setting that changes the image
+    count or on-disk size (Nt/NZ/region geometry, channel selection, save format, skip-saving).
+    """
+    label = getattr(widget, "label_size_estimate", None)
+    if label is None:
+        return
+    widget._push_channel_selection_to_controller()
+    has_selection = bool(_get_checked_names(widget.list_configurations))
+    skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
+    hint = (
+        "Select a cycle to estimate size"
+        if getattr(widget, "_channel_mode", "simple") == "advanced"
+        else "Select a channel to estimate size"
+    )
+    label.setText(_format_acquisition_size_estimate(widget.multipointController, has_selection, skip_saving, hint))
+
+
+def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox, QLabel]":
+    """Build a compact ``Save format: [combo] ........ [size estimate]`` row.
 
     The combo only mirrors local UI state; the caller wires its
     ``currentTextChanged`` signal to ``MultiPointController.set_file_saving_option``
     so the choice flows through ``AcquisitionParameters`` to the worker
     (mirroring how ``Skip Saving`` is plumbed). Compression / chunking knobs
-    live in Settings > Preferences.
+    live in Settings > Preferences. The trailing label shows a live image-count /
+    disk-size estimate (the caller keeps it updated via ``_refresh_size_estimate``).
     """
     label = QLabel("Save format:")
     combo = QComboBox()
@@ -228,12 +638,20 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
     combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
+    estimate_label = QLabel("")
+    estimate_label.setToolTip(
+        "Estimated image count and on-disk size for the current settings.\n"
+        "ZARR_V3 sizes are approximate (compression is data-dependent)."
+    )
+    estimate_label.setStyleSheet("color: gray;")
+
     row = QHBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
     row.addWidget(label)
     row.addWidget(combo)
     row.addStretch(1)
-    return row, combo
+    row.addWidget(estimate_label)
+    return row, combo, estimate_label
 
 
 def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict]":
@@ -1277,10 +1695,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.lineEdit_savingDir = QLineEdit()
         self.lineEdit_savingDir.setReadOnly(True)
 
-        # Placeholder; the real folder is applied per-profile after construction
-        # via MainWindow._apply_profile_saving_paths().
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        # Per-profile default (<root>/<profile>); MainWindow._apply_profile_saving_paths()
+        # may still override it with a gui_state-saved folder after construction.
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -1412,15 +1831,29 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_NZ.setFixedWidth(max_num_width)
         self.entry_Nt.setFixedWidth(max_num_width)
 
+        # Simple (default): list single observation-state presets as channels.
+        # Advanced: list acquisition cycles. Toggled via combobox_channel_mode below.
+        self._channel_mode = "simple"
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_observation_state_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
         )
 
+        self.combobox_channel_mode = QComboBox()
+        self.combobox_channel_mode.addItems(["Simple", "Advanced"])
+        self.combobox_channel_mode.setCurrentIndex(0)
+        self.combobox_channel_mode.setToolTip(
+            "Simple: pick observation-state presets (channels), one frame each.\n"
+            "Advanced: pick acquisition cycles (per-position sequences of states)."
+        )
+
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
+        self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
+        self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
         self.btn_per_point_channels.setToolTip("Configure which observation states to acquire at each registered point")
         self._region_obs_state_map = None
 
@@ -1452,7 +1885,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
-        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
         self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
@@ -1654,8 +2087,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
 
         grid_config = QHBoxLayout()
+        grid_config.addWidget(self.combobox_channel_mode, 0, Qt.AlignTop)
         grid_config.addWidget(self.list_configurations)
         grid_config.addWidget(self.btn_per_point_channels)
+        grid_config.addWidget(self.btn_edit_cycles)
         grid_config.addSpacerItem(edge_spacer)
 
         # Button column (bottom-right). Laser AF button sits above Snap Images
@@ -1754,6 +2189,20 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.signal_acquisition_started.connect(self.display_progress_bar)
         self.eta_timer.timeout.connect(self.update_eta_display)
 
+        # Live acquisition-size estimate: recompute on any setting that changes image
+        # count or on-disk size. (NX/NY/locations flow through update_fov_positions.)
+        for _sig in (
+            self.entry_NZ.valueChanged,
+            self.entry_Nt.valueChanged,
+            self.combobox_fileSavingFormat.currentTextChanged,
+            self.checkbox_skipSaving.toggled,
+            self.list_configurations.itemChanged,
+        ):
+            _sig.connect(lambda *_: _refresh_size_estimate(self))
+        # Simple/Advanced channel-mode toggle (handler refreshes the estimate itself, so it
+        # is wired separately from the loop above to avoid a double refresh).
+        self.combobox_channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
+
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
         self.btn_previous.clicked.connect(self.previous)
@@ -1774,6 +2223,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         self.toggle_z_range_controls(False)
         self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
+
+        _refresh_size_estimate(self)
 
     def setup_layout(self):
         self.grid = QVBoxLayout()
@@ -2012,6 +2463,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                     self.entry_deltaY.value(),
                 )
 
+        _refresh_size_estimate(self)
+
     def set_deltaZ(self, value):
         if self.checkbox_usePiezo.isChecked():
             deltaZ = value
@@ -2048,7 +2501,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
         if not obs_names:
-            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            unit = "cycle" if self._channel_mode == "advanced" else "observation state"
+            QMessageBox.warning(self, "Warning", f"Please check at least one {unit} first")
             return
         if len(self.location_ids) == 0:
             QMessageBox.warning(self, "Warning", "Please add at least one location first")
@@ -2067,24 +2521,65 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 _reorder_list_widget(self.list_configurations, new_order)
             self._update_per_point_button_text()
 
+    def _populate_channel_list_for_mode(self, checked_names=None, prior_order=None):
+        """Fill the checklist with cycles (advanced) or observation-state presets (simple)."""
+        if self._channel_mode == "advanced":
+            _populate_cycle_list(self.list_configurations, self.microscope, checked_names, prior_order)
+        else:
+            _populate_observation_state_list(self.list_configurations, self.microscope, checked_names, prior_order)
+
+    def _push_channel_selection_to_controller(self):
+        """Push the current (mode-aware) channel selection + per-region map to the controller.
+
+        Simple mode routes through the flat path; advanced through cycles. Always clears the
+        opposite per-region map so a stale one can't win in ``_build_region_plans``. No-op while
+        an acquisition is in progress.
+        """
+        if self.multipointController.acquisition_in_progress():
+            return
+        names = _get_checked_names(self.list_configurations)
+        if self._channel_mode == "advanced":
+            self.multipointController.set_selected_cycles(names)
+            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+        else:
+            self.multipointController.set_selected_configurations(names)
+            self.multipointController.set_region_cycle_map(None)
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+
+    def _on_channel_mode_changed(self):
+        """Switch between simple (observation states) and advanced (cycles) channel modes."""
+        self._channel_mode = "advanced" if self.combobox_channel_mode.currentIndex() == 1 else "simple"
+        # Cycle names and state names are not interchangeable: drop selection + per-point map.
+        self._region_obs_state_map = None
+        self.btn_edit_cycles.setVisible(self._channel_mode == "advanced")
+        if self._channel_mode == "advanced":
+            self.list_configurations.setToolTip(
+                "Acquisition cycles for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip("Configure which cycles to acquire at each registered point")
+        else:
+            self.list_configurations.setToolTip(
+                "Observation State presets saved for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Configure which observation states to acquire at each registered point"
+            )
+        self._populate_channel_list_for_mode()  # checked_names=None -> reset selection
+        self._update_per_point_button_text()
+        _refresh_size_estimate(self)
+
     def refresh_channel_list(self):
-        """Refresh the observation state list after profile or preset changes."""
+        """Refresh the channel list (cycles or observation states) after profile/preset changes."""
         # Preserve currently checked names and the user-chosen display order.
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        # Repopulate in prior order; preset names not in prior_order go to the end.
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        # Repopulate in prior order; names not in prior_order go to the end.
+        self._populate_channel_list_for_mode(checked_names=checked_names, prior_order=prior_order)
+        _refresh_size_estimate(self)
 
     def toggle_acquisition(self, pressed):
         self._log.debug(f"FlexibleMultiPointWidget.toggle_acquisition, {pressed=}")
@@ -2137,10 +2632,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("flexible")
-            self.multipointController.set_selected_configurations(
-                _get_checked_names(self.list_configurations)
-            )
-            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+            self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -2171,7 +2663,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.run_acquisition()
         else:
             # This must eventually propagate through and call out acquisition_finished.
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
 
     def load_last_used_locations(self):
         if self.last_used_locations is None or len(self.last_used_locations) == 0:
@@ -2208,13 +2700,29 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 print("Duplicate values not added based on x and y.")
                 # to-do: update z coordinate
 
+    def _next_region_id(self):
+        """Return the smallest unused 'R{n}' region id.
+
+        Region ids key the shared scanCoordinates dicts, so they must be unique.
+        The old scheme f"R{len(self.location_ids)}" reused an id after a removal
+        (delete R0 -> ['R1'] -> next add is 'R1' again), and the colliding
+        add_flexible_region silently overwrote the existing region — two list
+        rows collapsed into a single scanned region. Scanning for the smallest
+        free index keeps ids unique across removals and imports.
+        """
+        existing = set(self.location_ids.tolist())
+        n = 0
+        while f"R{n}" in existing:
+            n += 1
+        return f"R{n}"
+
     def add_location(self):
         # Get raw positions without rounding
         pos = self.stage.get_pos()
         x = pos.x_mm
         y = pos.y_mm
         z = pos.z_mm
-        region_id = f"R{len(self.location_ids)}"
+        region_id = self._next_region_id()
 
         # Check for duplicates using rounded values for comparison
         if not np.any(np.all(self.location_list[:, :2] == [round(x, 3), round(y, 3)], axis=1)):
@@ -2269,6 +2777,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
             self._region_obs_state_map = None
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
         else:
             print("Invalid Region: Duplicate Location")
 
@@ -2330,6 +2839,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.dropdown_location_list.blockSignals(False)
             self._region_obs_state_map = None
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
 
     def next(self):
         index = self.dropdown_location_list.currentIndex()
@@ -2369,6 +2879,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.navigationViewer.clear_overlay()
         self._region_obs_state_map = None
         self._update_per_point_button_text()
+        _refresh_size_estimate(self)
 
         self._log.info("Cleared all locations and overlays.")
 
@@ -2510,6 +3021,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 y = row["y (mm)"]
                 z = row["z (mm)"]
                 region_id = row["ID"]
+                # CSVs without an ID column give every row "None"; duplicate or
+                # missing ids would collapse into one scanCoordinates entry. Fall
+                # back to a fresh unique id in those cases.
+                if region_id in ("None", "nan", "") or region_id in self.location_ids:
+                    region_id = self._next_region_id()
                 if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
                     location_str = (
                         "x:"
@@ -2568,9 +3084,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_configurations(
-            _get_checked_names(self.list_configurations)
-        )
+        self._push_channel_selection_to_controller()
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
         self.multipointController.set_NZ(1)
@@ -2637,10 +3151,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def set_performance_mode(self, enabled):
@@ -2753,7 +3267,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.clear_only_location_list()
 
         for pos in positions:
-            name = pos.get("name", f"R{len(self.location_ids)}")
+            name = pos.get("name") or self._next_region_id()
             center = pos.get("center_mm", [0, 0, 0])
 
             if len(center) >= 3:
@@ -2923,10 +3437,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_setSavingDir.setFixedWidth(btn_width)
 
         self.lineEdit_savingDir = QLineEdit()
-        # Placeholder; the real folder is applied per-profile after construction
-        # via MainWindow._apply_profile_saving_paths().
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        # Per-profile default (<root>/<profile>); MainWindow._apply_profile_saving_paths()
+        # may still override it with a gui_state-saved folder after construction.
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -3015,12 +3530,22 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
         self.combobox_z_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+        # Simple (default): list single observation-state presets as channels.
+        # Advanced: list acquisition cycles. Toggled via combobox_channel_mode below.
+        self._channel_mode = "simple"
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_observation_state_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
+        )
+
+        self.combobox_channel_mode = QComboBox()
+        self.combobox_channel_mode.addItems(["Simple", "Advanced"])
+        self.combobox_channel_mode.setCurrentIndex(0)
+        self.combobox_channel_mode.setToolTip(
+            "Simple: pick observation-state presets (channels), one frame each.\n"
+            "Advanced: pick acquisition cycles (per-position sequences of states)."
         )
 
         # Per-point (per-well) channel override. None means "use global selection at every well".
@@ -3028,6 +3553,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # Stable channel_name -> palette index, persists across dialog opens for color continuity.
         self._channel_color_index = {}
         self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
+        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
+        self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
+        self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
         self.btn_per_point_channels.setToolTip(
             "Override which observation states acquire at each selected well. "
             "Asterisk indicates a custom map is active."
@@ -3075,7 +3604,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.checkbox_skipSaving = QCheckBox("Skip Saving")
         self.checkbox_skipSaving.setChecked(False)
 
-        self.fileSavingFormatRow, self.combobox_fileSavingFormat = _make_file_saving_format_row(
+        self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
         self.zarrStreamingRow, self._zarr_streaming_widgets = _make_zarr_streaming_row(
@@ -3320,8 +3849,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         # the Z-stack frames above).
         config_cell = QVBoxLayout()
         config_cell.setContentsMargins(0, 0, 0, 0)
+        config_cell.addWidget(self.combobox_channel_mode)
         config_cell.addWidget(self.list_configurations)
         config_cell.addWidget(self.btn_per_point_channels)
+        config_cell.addWidget(self.btn_edit_cycles)
         grid.addLayout(config_cell, 2, 0)
 
         # Options and Start button
@@ -3438,6 +3969,19 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
+
+        # Live acquisition-size estimate (region geometry flows through update_coordinates).
+        for _sig in (
+            self.entry_NZ.valueChanged,
+            self.entry_Nt.valueChanged,
+            self.combobox_fileSavingFormat.currentTextChanged,
+            self.checkbox_skipSaving.toggled,
+            self.list_configurations.itemChanged,
+        ):
+            _sig.connect(lambda *_: _refresh_size_estimate(self))
+        # Simple/Advanced channel-mode toggle (handler refreshes the estimate itself, so it
+        # is wired separately from the loop above to avoid a double refresh).
+        self.combobox_channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
         # Connect signal for setting acquisition state from external sources (e.g., TCP server)
         self.signal_set_acquisition_running.connect(self.set_acquisition_running_state)
         self.eta_timer.timeout.connect(self.update_eta_display)
@@ -3457,6 +4001,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
         # Load cached acquisition settings
         self.load_multipoint_widget_config_from_cache()
+
+        _refresh_size_estimate(self)
 
         # Connect settings saving to relevant value changes
         self.checkbox_xy.toggled.connect(self.save_multipoint_widget_config_to_cache)
@@ -4509,6 +5055,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.scanCoordinates.clear_regions()
             self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
 
+        _refresh_size_estimate(self)
+
     def handle_objective_change(self):
         """Handle objective change - update coverage and coordinates.
 
@@ -4543,6 +5091,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
         elif self.scanCoordinates.has_regions():
             self.scanCoordinates.clear_regions()
+
+        _refresh_size_estimate(self)
 
     def update_live_coordinates(self, pos: squid.abc.Pos):
         if self.tab_widget and self.tab_widget.currentWidget() != self:
@@ -4632,10 +5182,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
-            self.multipointController.set_selected_configurations(
-                _get_checked_names(self.list_configurations)
-            )
-            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+            self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if self.checkbox_skipSaving.isChecked():
@@ -4659,9 +5206,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.run_acquisition()
 
         else:
-            # This must eventually propagate through and call our aquisition_is_finished, or else we'll be left
+            # This must eventually propagate through and call our acquisition_is_finished, or else we'll be left
             # in an odd state.
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
 
     def _set_ui_acquisition_running(self, nz: int, delta_z_um: float, set_button_checked: bool = False):
         """Update UI to reflect that acquisition is running.
@@ -4755,10 +5302,10 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 # In Current Position mode, coverage should be disabled (N/A)
                 self.entry_well_coverage.setEnabled(False)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def set_performance_mode(self, enabled):
@@ -4766,7 +5313,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
     def set_saving_dir(self):
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
         if save_dir_base:  # Only update if user didn't cancel
             self.multipointController.set_base_path(save_dir_base)
             self.lineEdit_savingDir.setText(save_dir_base)
@@ -4775,9 +5322,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def on_snap_images(self):
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
-        self.multipointController.set_selected_configurations(
-            _get_checked_names(self.list_configurations)
-        )
+        self._push_channel_selection_to_controller()
         # Set the acquisition parameters
         self.multipointController.set_deltaZ(0)
         self.multipointController.set_NZ(1)
@@ -4807,23 +5352,67 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         selected_channels = _get_checked_names(self.list_configurations)
         self.signal_acquisition_channels.emit(selected_channels)
 
+    def _populate_channel_list_for_mode(self, checked_names=None, prior_order=None):
+        """Fill the checklist with cycles (advanced) or observation-state presets (simple)."""
+        if self._channel_mode == "advanced":
+            _populate_cycle_list(self.list_configurations, self.microscope, checked_names, prior_order)
+        else:
+            _populate_observation_state_list(self.list_configurations, self.microscope, checked_names, prior_order)
+
+    def _push_channel_selection_to_controller(self):
+        """Push the current (mode-aware) channel selection + per-well map to the controller.
+
+        Simple mode routes through the flat path; advanced through cycles. Always clears the
+        opposite per-region map so a stale one can't win in ``_build_region_plans``. No-op while
+        an acquisition is in progress.
+        """
+        if self.multipointController.acquisition_in_progress():
+            return
+        names = _get_checked_names(self.list_configurations)
+        if self._channel_mode == "advanced":
+            self.multipointController.set_selected_cycles(names)
+            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(self._region_obs_state_map)
+        else:
+            self.multipointController.set_selected_configurations(names)
+            self.multipointController.set_region_cycle_map(None)
+            self.multipointController.set_region_observation_state_map(self._region_obs_state_map)
+
+    def _on_channel_mode_changed(self):
+        """Switch between simple (observation states) and advanced (cycles) channel modes."""
+        self._channel_mode = "advanced" if self.combobox_channel_mode.currentIndex() == 1 else "simple"
+        self.btn_edit_cycles.setVisible(self._channel_mode == "advanced")
+        if self._channel_mode == "advanced":
+            self.list_configurations.setToolTip(
+                "Acquisition cycles for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Override which cycles acquire at each selected well. "
+                "Asterisk indicates a custom map is active."
+            )
+        else:
+            self.list_configurations.setToolTip(
+                "Observation State presets saved for the active profile.\n"
+                "Drag rows to reorder; checked rows float to the top."
+            )
+            self.btn_per_point_channels.setToolTip(
+                "Override which observation states acquire at each selected well. "
+                "Asterisk indicates a custom map is active."
+            )
+        # Cycle names and state names are not interchangeable: reset selection + per-well map.
+        self._populate_channel_list_for_mode()  # checked_names=None -> reset selection
+        self._reset_per_point_channels_map()
+        _refresh_size_estimate(self)
+
     def refresh_channel_list(self):
-        """Refresh the observation state list after profile or preset changes."""
+        """Refresh the channel list (cycles or observation states) after profile/preset changes."""
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
 
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        self._populate_channel_list_for_mode(checked_names=checked_names, prior_order=prior_order)
         self._reset_per_point_channels_map()
+        _refresh_size_estimate(self)
 
     def _reset_per_point_channels_map(self):
         """Drop any per-well channel override and refresh the button label.
@@ -4844,7 +5433,8 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
         if not obs_names:
-            QMessageBox.warning(self, "Warning", "Please check at least one observation state first")
+            unit = "cycle" if self._channel_mode == "advanced" else "observation state"
+            QMessageBox.warning(self, "Warning", f"Please check at least one {unit} first")
             return
 
         # Region IDs come from the populated scan coordinates (well IDs like "A1").
@@ -4888,6 +5478,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 _reorder_list_widget(self.list_configurations, new_order)
                 self.save_multipoint_widget_config_to_cache()
             self._update_per_point_button_text()
+            _refresh_size_estimate(self)
 
     def toggle_coordinate_controls(self, has_coordinates: bool):
         """Toggle button text and control states based on whether coordinates are loaded"""
@@ -5270,8 +5861,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.btn_setSavingDir.setIcon(QIcon("icon/folder.png"))
 
         self.lineEdit_savingDir = QLineEdit()
-        self.lineEdit_savingDir.setText(DEFAULT_SAVING_PATH)
-        self.multipointController.set_base_path(DEFAULT_SAVING_PATH)
+        _default_dir = self.microscope.config_repo.default_saving_path()
+        self.lineEdit_savingDir.setText(_default_dir)
+        self.multipointController.set_base_path(_default_dir)
         self.base_path_is_set = True
 
         self.lineEdit_experimentID = QLineEdit()
@@ -5295,8 +5887,7 @@ class MultiPointWithFluidicsWidget(QFrame):
 
         # Observation State presets (same list as Illumination / Observation State)
         self.list_configurations = _ObservationStateListWidget()
-        for preset_name in _multipoint_observation_preset_display_names(self.microscope):
-            self.list_configurations.addItem(_create_checkbox_list_item(preset_name, microscope=self.microscope))
+        _populate_cycle_list(self.list_configurations, self.microscope)
         self.list_configurations.setToolTip(
             "Observation State presets saved for the active profile.\n"
             "Drag rows to reorder; checked rows float to the top."
@@ -5488,10 +6079,10 @@ class MultiPointWithFluidicsWidget(QFrame):
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
-            self.multipointController.set_selected_configurations(
+            self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)
             )
-            self.multipointController.set_region_observation_state_map(None)
+            self.multipointController.set_region_cycle_map(None)
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
@@ -5503,7 +6094,7 @@ class MultiPointWithFluidicsWidget(QFrame):
             # Start acquisition
             self.multipointController.run_acquisition()
         else:
-            self.multipointController.request_abort_aquisition()
+            self.multipointController.request_abort_acquisition()
             # Also stop fluidics operations
             if self.multipointController.fluidics:
                 self.multipointController.fluidics.emergency_stop()
@@ -5511,7 +6102,7 @@ class MultiPointWithFluidicsWidget(QFrame):
     def set_saving_dir(self):
         """Open dialog to set saving directory"""
         dialog = QFileDialog()
-        save_dir_base = dialog.getExistingDirectory(None, "Select Folder")
+        save_dir_base = dialog.getExistingDirectory(None, "Select Folder", self.lineEdit_savingDir.text())
         self.multipointController.set_base_path(save_dir_base)
         self.lineEdit_savingDir.setText(save_dir_base)
         self.base_path_is_set = True
@@ -5549,17 +6140,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         """Refresh the observation state list after profile or preset changes."""
         checked_names = set(_get_checked_names(self.list_configurations))
         prior_order = _list_widget_item_names_in_order(self.list_configurations)
-        self.list_configurations.blockSignals(True)
-        self.list_configurations.clear()
-        available = list(_multipoint_observation_preset_display_names(self.microscope))
-        available_set = set(available)
-        ordered = [n for n in prior_order if n in available_set]
-        ordered.extend(n for n in available if n not in ordered)
-        for name in ordered:
-            self.list_configurations.addItem(
-                _create_checkbox_list_item(name, checked=name in checked_names, microscope=self.microscope)
-            )
-        self.list_configurations.blockSignals(False)
+        _populate_cycle_list(
+            self.list_configurations, self.microscope, checked_names=checked_names, prior_order=prior_order
+        )
 
     def acquisition_is_finished(self):
         """Handle acquisition completion"""
@@ -5586,10 +6169,10 @@ class MultiPointWithFluidicsWidget(QFrame):
             ):
                 widget.setEnabled(enabled)
 
-    def disable_the_start_aquisition_button(self):
+    def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
-    def enable_the_start_aquisition_button(self):
+    def enable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(True)
 
     def update_region_progress(self, current_fov, num_fovs):
@@ -6376,7 +6959,7 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             y = ref_y + row["y_offset_mm"]
 
             self.location_list = np.vstack((self.location_list, [[x, y, ref_z]]))
-            self.location_ids = np.append(self.location_ids, f"R{len(self.location_ids)}")
+            self.location_ids = np.append(self.location_ids, self._next_region_id())
 
             location_str = f"x:{round(x,3)} mm  y:{round(y,3)} mm  z:{round(ref_z*1000,1)} μm"
             self.dropdown_location_list.addItem(location_str)

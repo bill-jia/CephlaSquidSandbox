@@ -331,6 +331,60 @@ class TestFrameTimes:
 
 
 # ---------------------------------------------------------------------------
+# ZarrWriter: upload-barrier shard staging
+# ---------------------------------------------------------------------------
+
+
+class TestDrainUnstagedShardPaths:
+    """``drain_unstaged_shard_paths`` must return every shard written since
+    the last drain — not just one per call. A dense/ragged acquisition-cycle
+    FOV visit folds many frames into a contiguous block of array-t indices;
+    a barrier that staged only the shard at the scan time_point silently
+    skipped ~98% of the data (the bug this method replaced)."""
+
+    def test_returns_all_written_timepoints_then_clears(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # One visit writes a block of 5 timepoints (e.g. 5 frames folded
+            # into T at one FOV position), single channel/z, 3 pyramid levels.
+            writer, out_path = _make_writer(tmpdir, t=10, c=1, z=1, y=512, x=512)
+            writer.initialize()
+            try:
+                # Non-zero data: TensorStore omits all-fill-value (all-zero)
+                # chunks, so a zero frame would write no shard file at all.
+                rng = np.random.default_rng(0)
+                for t in range(5):
+                    img = (rng.random((512, 512)) * 1000 + 1).astype(np.uint16)
+                    writer.write_frame(img, t=t, c=0, z=0)
+                writer.wait_for_pending()
+
+                n_levels = len(writer._level_shapes)
+                assert n_levels >= 2  # multi-level pyramid at 512x512
+
+                staged = writer.drain_unstaged_shard_paths()
+                # Every (timepoint, level) shard, not just one.
+                assert len(staged) == 5 * n_levels
+                assert all(os.path.isfile(p) for p in staged)
+                # Distinct array-t indices 0..4 are represented.
+                ts_in_paths = {p.replace("\\", "/").split("/c/")[1].split("/")[0] for p in staged}
+                assert ts_in_paths == {"0", "1", "2", "3", "4"}
+
+                # Draining again returns nothing — each shard staged once.
+                assert writer.drain_unstaged_shard_paths() == []
+
+                # A second visit's frames are picked up by the next drain.
+                for t in range(5, 8):
+                    img = (rng.random((512, 512)) * 1000 + 1).astype(np.uint16)
+                    writer.write_frame(img, t=t, c=0, z=0)
+                writer.wait_for_pending()
+                staged2 = writer.drain_unstaged_shard_paths()
+                assert len(staged2) == 3 * n_levels
+                ts2 = {p.replace("\\", "/").split("/c/")[1].split("/")[0] for p in staged2}
+                assert ts2 == {"5", "6", "7"}
+            finally:
+                writer.finalize()
+
+
+# ---------------------------------------------------------------------------
 # ZarrWriter: finalize / abort flags
 # ---------------------------------------------------------------------------
 

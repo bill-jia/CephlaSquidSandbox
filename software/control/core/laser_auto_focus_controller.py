@@ -186,14 +186,8 @@ class LaserAutofocusController(QObject):
         # Find initial spot position
         self.turn_on_AF_laser()
 
-        self._log.info(f"Finding laser spot for autofocus initialization using crop {self.laser_af_properties.initialize_crop_width}x{self.laser_af_properties.initialize_crop_height}")
-        result = self._get_laser_spot_centroid(
-            remove_background=True,
-            use_center_crop=(
-                self.laser_af_properties.initialize_crop_width,
-                self.laser_af_properties.initialize_crop_height,
-            ),
-        )
+        self._log.info("Finding laser spot for autofocus initialization using full sensor FOV")
+        result = self._get_laser_spot_centroid(remove_background=True)
         if result is None:
             self._log.error("Failed to find laser spot during initialization")
             self.turn_off_AF_laser()
@@ -203,17 +197,27 @@ class LaserAutofocusController(QObject):
 
         self.turn_off_AF_laser()
 
-        # Set up ROI around spot and clear reference
+        # Set up ROI around spot and clear reference. Clamp offsets so the ROI
+        # stays inside the full sensor (camera will reject offsets that push
+        # offset + width past the sensor size).
+        sensor_w, sensor_h = 3088, 2064
+        roi_w = self.laser_af_properties.width
+        roi_h = self.laser_af_properties.height
+        x_offset = max(0.0, min(x - roi_w / 2, sensor_w - roi_w))
+        y_offset = max(0.0, min(y - roi_h / 2, sensor_h - roi_h))
         config = self.laser_af_properties.model_copy(
             update={
-                "x_offset": x - self.laser_af_properties.width / 2,
-                "y_offset": y - self.laser_af_properties.height / 2,
+                "x_offset": x_offset,
+                "y_offset": y_offset,
                 "has_reference": False,
             }
         )
         self.reference_crop = None
         config.set_reference_image(None)
-        self._log.info(f"Laser spot location on the full sensor is ({int(x)}, {int(y)})")
+        self._log.info(
+            f"Laser spot location on the full sensor is ({int(x)}, {int(y)}); "
+            f"ROI offset clamped to ({int(x_offset)}, {int(y_offset)})"
+        )
 
         self.initialize_manual(config)
 

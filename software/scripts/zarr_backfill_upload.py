@@ -89,13 +89,28 @@ log = squid.logging.get_logger("zarr_backfill_upload")
 # ---------------------------------------------------------------------------
 
 
+def _ome_attrs(zarr_json: Path) -> dict:
+    """Return the ``attributes.ome`` block of a zarr.json, or ``{}``."""
+    try:
+        with open(zarr_json, "r", encoding="utf-8") as f:
+            return (json.load(f).get("attributes", {}) or {}).get("ome", {}) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def find_fov_groups(experiment_dir: Path) -> List[Path]:
     """Return absolute paths of every FOV group directory in ``experiment_dir``.
 
-    Detects both layouts:
+    Detects three layouts:
       - non-HCS: ``zarr/<region>/fov_*.ome.zarr``
-      - HCS:     ``plate.ome.zarr/<row>/<col>/<fov>``  (numeric ``fov`` dirs
-                 under a 2-deep row/col tree containing ``zarr.json``)
+      - HCS:     ``<plate>.ome.zarr/<row>/<col>/<fov>`` — **any** top-level
+                 ``*.ome.zarr`` whose root zarr.json carries an ``ome.plate``
+                 attribute. A ragged acquisition-cycle run writes one plate
+                 per imaged state (``{state}.ome.zarr``), so there can be
+                 several; the legacy single ``plate.ome.zarr`` is just the
+                 one-plate case of this.
+      - single:  a top-level ``*.ome.zarr`` that is itself a multiscales FOV
+                 group (``ome.multiscales``, no plate nesting).
     """
     fov_groups: List[Path] = []
 
@@ -108,17 +123,23 @@ def find_fov_groups(experiment_dir: Path) -> List[Path]:
                 if (fov_dir / "zarr.json").is_file():
                     fov_groups.append(fov_dir)
 
-    hcs_root = experiment_dir / "plate.ome.zarr"
-    if hcs_root.is_dir():
-        for row_dir in sorted(hcs_root.iterdir()):
-            if not row_dir.is_dir():
-                continue
-            for col_dir in sorted(row_dir.iterdir()):
-                if not col_dir.is_dir():
+    for plate_root in sorted(experiment_dir.glob("*.ome.zarr")):
+        if not plate_root.is_dir():
+            continue
+        attrs = _ome_attrs(plate_root / "zarr.json")
+        if "plate" in attrs:
+            # <plate>.ome.zarr/<row>/<col>/<fov>
+            for row_dir in sorted(plate_root.iterdir()):
+                if not row_dir.is_dir():
                     continue
-                for fov_dir in sorted(col_dir.iterdir()):
-                    if fov_dir.is_dir() and (fov_dir / "zarr.json").is_file():
-                        fov_groups.append(fov_dir)
+                for col_dir in sorted(row_dir.iterdir()):
+                    if not col_dir.is_dir():
+                        continue
+                    for fov_dir in sorted(col_dir.iterdir()):
+                        if fov_dir.is_dir() and (fov_dir / "zarr.json").is_file():
+                            fov_groups.append(fov_dir)
+        elif "multiscales" in attrs:
+            fov_groups.append(plate_root)
 
     return fov_groups
 
@@ -136,14 +157,19 @@ def parse_fov_identity(fov_group: Path, experiment_dir: Path) -> Tuple[str, int]
         except (IndexError, ValueError):
             fov_idx = 0
         return region_id, fov_idx
-    if parts[0] == "plate.ome.zarr":
-        # plate.ome.zarr/<row>/<col>/<fov>
-        well_id = parts[1] + parts[2]
+    if parts[0].endswith(".ome.zarr") and len(parts) >= 4:
+        # <plate>.ome.zarr/<row>/<col>/<fov> — namespace the well by the plate
+        # stem so wells from different per-state plates don't collide.
+        plate_stem = parts[0][: -len(".ome.zarr")]
+        well_id = f"{plate_stem}/{parts[1]}{parts[2]}"
         try:
             fov_idx = int(parts[3])
         except ValueError:
             fov_idx = 0
         return well_id, fov_idx
+    if parts[0].endswith(".ome.zarr"):
+        # top-level single-FOV multiscales group
+        return parts[0][: -len(".ome.zarr")], 0
     return "unknown", 0
 
 
@@ -353,6 +379,38 @@ def gather_metadata_files(fov_group: Path) -> List[Path]:
     return out
 
 
+def gather_hcs_plate_metadata(experiment_dir: Path) -> List[Path]:
+    """Plate-root and well-level ``zarr.json`` for every HCS plate.
+
+    These group-metadata files sit *above* the per-FOV groups
+    (``<plate>.ome.zarr/zarr.json`` and the per-well
+    ``<plate>.ome.zarr/<row>/<col>/zarr.json``) and are required for the
+    remote tree to open as a valid OME-NGFF plate. ``gather_metadata_files``
+    only covers the per-FOV level — without these the remote plate is
+    headless. Never deletable.
+    """
+    out: List[Path] = []
+    for plate_root in sorted(experiment_dir.glob("*.ome.zarr")):
+        if not plate_root.is_dir():
+            continue
+        if "plate" not in _ome_attrs(plate_root / "zarr.json"):
+            continue
+        out.append(plate_root / "zarr.json")
+        for row_dir in sorted(plate_root.iterdir()):
+            if not row_dir.is_dir():
+                continue
+            rj = row_dir / "zarr.json"  # row group (present in some layouts)
+            if rj.is_file():
+                out.append(rj)
+            for col_dir in sorted(row_dir.iterdir()):
+                if not col_dir.is_dir():
+                    continue
+                wj = col_dir / "zarr.json"  # well (row/col) group
+                if wj.is_file():
+                    out.append(wj)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Task building
 # ---------------------------------------------------------------------------
@@ -539,6 +597,26 @@ def run_backfill(
         md = build_metadata_task(fov_group, experiment_dir, target, in_progress)
         if md is not None:
             metadata_tasks.append(md)
+
+    # Plate/well group metadata (above the per-FOV groups). Required for the
+    # remote to open as a valid HCS plate; skipped in --in-progress mode to
+    # avoid racing a finalize-time rewrite.
+    if not in_progress:
+        plate_meta = gather_hcs_plate_metadata(experiment_dir)
+        if plate_meta:
+            pm_pairs = [
+                (str(p), local_to_remote_path(str(p), target.local_base, target.remote_root))
+                for p in plate_meta
+            ]
+            metadata_tasks.append(UploadTask(
+                task_id=str(uuid4()),
+                time_point=-1,
+                region_id="(plate)",
+                fov=-1,
+                files=pm_pairs,
+                deletable_local_paths=set(),
+                stable_read_paths={str(p) for p in plate_meta},
+            ))
 
     total_files = sum(len(t.files) for t in tasks) + sum(len(t.files) for t in metadata_tasks)
     total_bytes = 0

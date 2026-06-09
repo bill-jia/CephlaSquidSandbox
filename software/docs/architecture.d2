@@ -169,8 +169,13 @@ controllers: "Core Controllers" {
     tooltip: |md
       Orchestrates multi-position acquisition:
       1. Generate grid coordinates
-      2. Per FOV: move stage → autofocus → per channel: illuminate → acquire → save
-      3. Repeat for Z-stack, time-lapse
+      2. Resolve selected cycles → per-region RegionPlan
+         (flat ordered events + dense/ragged flag)
+      3. Per FOV: move stage → autofocus → run the
+         cycle (interleaved frames + stimulus) → save
+      4. Repeat for Z-stack, time-lapse (Nt)
+      A flat (no-cycle) selection resolves to a
+      1-frame-per-state plan — the legacy path.
     |
   }
 
@@ -518,13 +523,17 @@ config: "Configuration (YAML)" {
     |
   }
 
-  machine_config: "machine_config.yaml" {
+  machine_config: "machine_configs/library/\n(selected machine config)" {
     class: storage
     tooltip: |md
       Top-level hardware definition:
       devices (teensy, camera, stage, piezo, laser_af, nidaq),
       illumination_devices, objectives,
       IO endpoints, hardware bindings.
+
+      Active config is picked from machine_configs/library/
+      via the startup dialog and remembered globally in
+      cache/last_machine_config.txt.
     |
   }
 
@@ -541,6 +550,11 @@ config: "Configuration (YAML)" {
   preset_yaml: "observation_presets/\n{name}.yaml" {
     class: storage
     tooltip: "Saved ObservationState snapshots.\nUser can save/load presets\nfrom the GUI."
+  }
+
+  cycle_yaml: "cycles/\n{name}.yaml" {
+    class: storage
+    tooltip: "Saved AcquisitionCycle definitions.\nTwo-level: outer repeat → ordered steps\n(state + frame count), waits (delays), and\none-level groups. Waits allowed at any level.\nReference observation states by name.\nEdited via the multipoint 'Edit Cycles' dialog."
   }
 
   gui_state_yaml: "{profile}/gui_state.yaml" {
@@ -608,6 +622,11 @@ writers: "Data Output" {
     class: controller
     tooltip: |md
       Queue-based async job processing.
+      Iterates each region's resolved cycle plan:
+      per imaged event computes a self-describing
+      SaveLayout (array key + T/C coords + sizes)
+      so the save layer needs no global uniform
+      (T,C,Z) assumption.
       Job types: SaveImage, SaveOMETiff,
       SaveZarr, DownsampledView.
     |
@@ -628,7 +647,12 @@ writers: "Data Output" {
     tooltip: |md
       OME-NGFF v0.5 per-FOV output.
       5D shape (T, C, Z, Y, X).
-      Shard = (1, C, Z, Y, X) per FOV-timepoint.
+      Cycle layouts (decided per region):
+      - Dense (equal frames/channel): one plate,
+        frames fold into T (T = Nt × frames/state).
+      - Ragged (unequal frames/channel): one
+        single-channel plate per state, each with
+        its own T size; manifest joins them.
       Streaming multiscale pyramid.
       frame_times zarr array for timestamps.
     |

@@ -30,8 +30,6 @@ All acquisition is performed in a background thread to keep the GUI responsive.
 import dataclasses
 import math
 import os
-import pathlib
-import tempfile
 import time
 import yaml
 from datetime import datetime
@@ -44,7 +42,7 @@ from control.models.observation_state import ObservationState
 import numpy as np
 import pandas as pd
 
-from control import utils, utils_acquisition
+from control import utils
 import control._def
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
@@ -60,6 +58,18 @@ from control.piezo import PiezoStage
 from control.core.config.repository import ConfigRepository
 from squid.abc import CameraFrame, AbstractCamera, AbstractStage
 import squid.logging
+
+
+# Approximate on-disk compression ratios for the zarr blosc presets (see ZarrCompression in
+# _def for the documented encode ratios). Used only for the disk-space estimate.
+_ZARR_COMPRESSION_RATIOS = {
+    control._def.ZarrCompression.NONE: 1.0,
+    control._def.ZarrCompression.FAST: 2.0,
+    control._def.ZarrCompression.BALANCED: 3.5,
+    control._def.ZarrCompression.BEST: 4.0,
+}
+# Pyramid levels add geometric overhead on top of level 0: 1 + 1/4 + 1/16 + ... -> ~4/3.
+_ZARR_PYRAMID_OVERHEAD = 4.0 / 3.0
 
 
 # No-op callbacks for cases where callbacks are not needed
@@ -122,6 +132,66 @@ def _save_region_observation_state_csv(experiment_path, region_observation_state
     except Exception as e:
         if logger:
             logger.error("Failed to write region_observation_states.csv: %s", e, exc_info=True)
+
+
+def _save_cycle_manifest(experiment_path, params, repo, logger=None):
+    """Write the resolved cycle/acquisition-order manifest (the ground truth).
+
+    Records, per region: the dense/ragged layout, per-state frame counts, the
+    imaged channel order, and the flat ordered list of events (so the exact
+    interleave of imaged frames and stimulus pulses is reconstructable
+    regardless of the on-disk array layout). Also embeds the selected cycle
+    definitions. Skipped when no cycles were selected (flat acquisition).
+    """
+    if not getattr(params, "selected_cycle_names", None):
+        return
+
+    def _plan_dict(plan):
+        if plan is None:
+            return None
+        return {
+            "dense": plan.dense,
+            "frame_counts": dict(plan.frame_counts),
+            "channel_order": list(plan.channel_order),
+            "events": [
+                {
+                    "observation_state": ev.observation_state,
+                    "is_stimulus": ev.is_stimulus,
+                    "is_wait": ev.is_wait,
+                    "wait_ms": ev.wait_ms,
+                    "state_frame_index": ev.state_frame_index,
+                    "cycle_event_index": ev.cycle_event_index,
+                }
+                for ev in plan.events
+            ],
+        }
+
+    cycle_defs = {}
+    names = list(params.selected_cycle_names)
+    for region_names in (params.region_cycle_map or {}).values():
+        names.extend(region_names)
+    for name in dict.fromkeys(names):
+        try:
+            cyc = repo.load_acquisition_cycle(name)
+            if cyc is not None:
+                cycle_defs[name] = cyc.model_dump(mode="json")
+        except Exception:
+            pass
+
+    manifest = {
+        "selected_cycle_names": list(params.selected_cycle_names),
+        "region_cycle_map": params.region_cycle_map,
+        "cycle_definitions": cycle_defs,
+        "global_plan": _plan_dict(params.global_region_plan),
+        "region_plans": {rid: _plan_dict(p) for rid, p in (params.resolved_region_plans or {}).items()},
+    }
+    path = os.path.join(experiment_path, "cycles_manifest.yaml")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(manifest, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception as e:
+        if logger:
+            logger.error("Failed to write cycles_manifest.yaml: %s", e, exc_info=True)
 
 
 def _save_unified_multipoint_acquisition_yaml(
@@ -369,6 +439,13 @@ class MultiPointController:
         self.selected_configurations = []
         self.selected_observation_state_names = []
         self.region_observation_state_map = None
+        # Cycle-driven selection. When `selected_cycle_names` is non-empty the
+        # per-position plan comes from resolving those cycles; otherwise the
+        # legacy flat path over `selected_observation_state_names` (one frame per
+        # state) is used unchanged — so the old path stays an instant rollback.
+        self.selected_cycle_names = []
+        self.region_cycle_map = None
+        self._frames_per_position = 1
         self.scanCoordinates = scan_coordinates
         self._log.debug(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}, format: {self.scanCoordinates.format}")
         
@@ -680,19 +757,115 @@ class MultiPointController:
         utils.ensure_directory_exists(experiment_dir)
 
     def set_selected_configurations(self, selected_configurations_name):
+        """Legacy flat selection: acquire these observation states, one frame each.
+
+        Clears any cycle selection so the worker takes the flat path.
+        """
         repo = self.liveController.microscope.config_repo
         preset_set = set(repo.list_observation_presets())
         self.selected_configurations = []
         self.selected_observation_state_names = []
+        self.selected_cycle_names = []
         for name in selected_configurations_name:
             if name in preset_set:
                 self.selected_observation_state_names.append(name)
             else:
                 self._log.warning("Channel '%s' not found in observation presets, skipping", name)
+        self._frames_per_position = len(self.selected_observation_state_names)
+
+    def set_selected_cycles(self, selected_cycle_names):
+        """Cycle-driven selection: run these cycles (in order) at each position.
+
+        Derives the imaged channel axis (distinct imaged states) and
+        frames-per-position so existing disk/image-count/zarr-naming helpers,
+        which read ``selected_observation_state_names``, keep working.
+        """
+        repo = self.liveController.microscope.config_repo
+        cycle_set = set(repo.list_acquisition_cycles())
+        self.selected_configurations = []
+        self.selected_cycle_names = []
+        for name in selected_cycle_names:
+            if name in cycle_set:
+                self.selected_cycle_names.append(name)
+            else:
+                self._log.warning("Cycle '%s' not found, skipping", name)
+        from control.models.acquisition_cycle import all_states_in_order
+
+        plan = self._resolve_plan(self.selected_cycle_names, None)
+        # Metadata/disk/image-count helpers read this; keep stimulus states in the
+        # record. The zarr C axis (imaged-only) is taken from the plan separately.
+        self.selected_observation_state_names = all_states_in_order(plan.events)
+        self._frames_per_position = plan.frames_per_position
 
     def set_region_observation_state_map(self, mapping):
         """Set per-region observation state overrides. None means all regions use the global list."""
         self.region_observation_state_map = mapping
+
+    def set_region_cycle_map(self, mapping):
+        """Set per-region cycle overrides (region_id -> list of cycle names).
+
+        None means all regions run the global selected cycles.
+        """
+        self.region_cycle_map = mapping
+
+    def _is_stimulus_predicate(self):
+        """Return a cached predicate: is this observation state stimulus-only?
+
+        Consults inline (live-snapshot) states first, then saved presets.
+        """
+        repo = self.liveController.microscope.config_repo
+        inline = getattr(self, "_inline_observation_states_for_run", None) or {}
+        cache = {}
+
+        def is_stim(name):
+            if name in cache:
+                return cache[name]
+            st = inline.get(name)
+            if st is None:
+                st = repo.load_observation_preset(name)
+            result = bool(getattr(st, "is_stimulus_only", False)) if st is not None else False
+            cache[name] = result
+            return result
+
+        return is_stim
+
+    def _resolve_plan(self, cycle_names, region_state_names):
+        """Resolve a RegionPlan from cycle names (preferred) or bare state names.
+
+        ``cycle_names`` non-empty -> resolve those cycles into a chain.
+        Otherwise ``region_state_names`` (falling back to the global
+        ``selected_observation_state_names``) is treated as a chain of 1-frame
+        events — today's flat behaviour.
+        """
+        from control.models.acquisition_cycle import RegionPlan, resolve_chain, _index_events
+
+        repo = self.liveController.microscope.config_repo
+        is_stim = self._is_stimulus_predicate()
+        if cycle_names:
+            events = resolve_chain(list(cycle_names), repo.load_acquisition_cycle, is_stim)
+        else:
+            names = region_state_names if region_state_names is not None else self.selected_observation_state_names
+            # _index_events takes tagged raw events; a flat selection is one ("state", name)
+            # event per checked state (1 frame each) — today's flat behaviour.
+            events = _index_events([("state", n) for n in names], is_stim)
+        return RegionPlan.from_events(events)
+
+    def _build_region_plans(self, scan_region_names):
+        """Build (global_plan, {region_id: RegionPlan}) for an acquisition.
+
+        Per-region plans are produced only for regions that have an explicit
+        override (cycle map or legacy state map); other regions fall back to the
+        global plan at run time.
+        """
+        global_plan = self._resolve_plan(self.selected_cycle_names, None)
+        region_plans = {}
+        if self.region_cycle_map is not None:
+            for region_id, names in self.region_cycle_map.items():
+                region_plans[region_id] = self._resolve_plan(names, None)
+        elif self.region_observation_state_map is not None:
+            for region_id, names in self.region_observation_state_map.items():
+                region_plans[region_id] = self._resolve_plan([], names)
+        return global_plan, region_plans
 
     def get_acquisition_image_count(self):
         """
@@ -715,18 +888,11 @@ class MultiPointController:
             ]
             all_regions_coord_count = sum(coords_per_region)
 
-            # Stimulus-only states fire an NIDAQ pulse comb but produce no
-            # camera frame — exclude them from the image count so disk-space
-            # estimates stay correct.
-            if self.selected_observation_state_names:
-                repo = self.liveController.microscope.config_repo
-                capture_names = []
-                for name in self.selected_observation_state_names:
-                    preset = repo.load_observation_preset(name)
-                    if preset is not None and getattr(preset, "is_stimulus_only", False):
-                        continue
-                    capture_names.append(name)
-                n_ch = len(capture_names)
+            # Resolve the per-position plan so cycles (multiple frames per state)
+            # and stimulus-only states (no camera frame) are both accounted for:
+            # frames_per_position already excludes stimulus events.
+            if self.selected_observation_state_names or self.selected_cycle_names:
+                n_ch = self._resolve_plan(self.selected_cycle_names, None).frames_per_position
             else:
                 n_ch = len(self.selected_configurations)
             non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
@@ -739,77 +905,65 @@ class MultiPointController:
             # this "not configured" and want it to be a ValueError.
             raise ValueError("Not properly configured for an acquisition, cannot calculate image count.")
 
-    def _temporary_get_an_image_hack(self) -> Tuple[np.array, bool]:
-        was_streaming = self.camera.get_is_streaming()
-        callbacks_were_enabled = self.camera.get_callbacks_enabled()
-        self.camera.enable_callbacks(False)
-        test_frame = None
-        if not was_streaming:
-            self.camera.start_streaming()
-        try:
-            if (
-                self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE
-                or self.liveController.trigger_mode == control._def.TriggerMode.HARDWARE
-            ):
-                self.camera.send_trigger()
-            test_frame = self.camera.read_camera_frame()
-        finally:
-            self.camera.enable_callbacks(callbacks_were_enabled)
-            if not was_streaming:
-                self.camera.stop_streaming()
-        return (test_frame.frame, test_frame.is_color()) if test_frame else (None, False)
+    def _raw_bytes_per_image(self) -> int:
+        """Uncompressed bytes for a single captured frame at the current crop / pixel format.
+
+        Worst-case assumptions matching the save pipeline: 24-bit color (3 bytes/px) or
+        16-bit grayscale (2 bytes/px). Grayscale saved as pseudo-color expands to 3 samples.
+        """
+        width, height = self.camera.get_crop_size()
+        is_color = squid.abc.CameraPixelFormat.is_color_format(self.camera.get_pixel_format())
+        if is_color:
+            bytes_per_pixel = 3
+        elif control._def.SAVE_IN_PSEUDO_COLOR:
+            bytes_per_pixel = 6  # uint16 grayscale promoted to 3-sample RGB
+        else:
+            bytes_per_pixel = 2
+        return width * height * bytes_per_pixel
+
+    def _format_size_factor(self) -> float:
+        """Multiplier on raw (uncompressed) image bytes for the selected save format.
+
+        INDIVIDUAL_IMAGES and OME_TIFF store planes uncompressed (~1.0). ZARR_V3 applies a
+        blosc codec (per ``ZARR_COMPRESSION``) and writes a downsampled pyramid on top of
+        level 0, so the on-disk size is ``pyramid_overhead / compression_ratio`` of raw.
+        """
+        if self.file_saving_option == control._def.FileSavingOption.ZARR_V3:
+            ratio = _ZARR_COMPRESSION_RATIOS.get(control._def.ZARR_COMPRESSION, 1.0)
+            return _ZARR_PYRAMID_OVERHEAD / ratio
+        return 1.0
+
+    def estimate_acquisition_disk_bytes(self) -> int:
+        """Fast, format-aware estimate of the image bytes this acquisition will write.
+
+        Pure arithmetic (no camera capture, no temp save), so it is cheap enough to call
+        live as the user edits settings. Accounts for:
+
+          * cycles / ragged plans (frames per position) via ``get_acquisition_image_count``,
+          * the selected ``file_saving_option`` (zarr compression + pyramid overhead).
+
+        Returns 0 if nothing would be captured. Raises ValueError if the controller is not
+        configured for a valid acquisition.
+        """
+        image_count = self.get_acquisition_image_count()
+        if image_count == 0:
+            return 0
+        return int(self._raw_bytes_per_image() * self._format_size_factor() * image_count)
 
     def get_estimated_acquisition_disk_storage(self):
         """
-        This does its best to return the number of bytes needed to store the settings for the currently
-        configured acquisition on disk.  If you don't have at least this amount of disk space available
-        when starting this acquisition, it is likely it will fail with an "out of disk space" error.
+        This does its best to return the number of bytes needed to store the currently
+        configured acquisition on disk.  If you don't have at least this amount of disk space
+        available when starting this acquisition, it is likely it will fail with an
+        "out of disk space" error.
+
+        Note: for ZARR_V3 the byte estimate assumes a typical compression ratio for the
+        selected preset; the real size is data-dependent and usually smaller.
         """
-        if self.selected_observation_state_names:
-            repo = self.liveController.microscope.config_repo
-            first_config = repo.load_observation_preset(self.selected_observation_state_names[0])
-        elif self.selected_configurations:
-            first_config = self.selected_configurations[0]
-        else:
-            raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-        if first_config is None:
-            raise ValueError("Cannot calculate disk space requirements without any valid configurations.")
-
-        # Our best bet is to grab an image, and use that for our size estimate.
-        test_image = None
-        is_color = True
-        try:
-            test_image, is_color = self._temporary_get_an_image_hack()
-        except Exception as e:
-            self._log.exception("Couldn't capture image from camera for size estimate, using worst cast image.")
-            # Not ideal that we need to catch Exception, but the camera implementations vary wildly...
-            pass
-
-        if test_image is None:
-            is_color = squid.abc.CameraPixelFormat.is_color_format(self.camera.get_pixel_format())
-            # Do our best to create a fake image with the correct properties.
-            # TODO(imo): It'd be better to pull this from our camera but need to wait for AbstractCamera for a consistent way to do that.
-            width, height = self.camera.get_crop_size()
-            bytes_per_pixel = 3 if is_color else 2  # Worst case assumptions: 24 bit color, 16 bit grayscale
-
-            test_image = np.random.randint(2**16 - 1, size=(height, width, (3 if is_color else 1)), dtype=np.uint16)
-
-        # Depending on settings, we modify the image before saving.  This means we need to actually save an image
-        # to see how much disk space it takes up.  This can be very wrong (eg: if we compress during saving, then
-        # it is dependent on the data), but is better than just guessing based on raw image size.
-        with tempfile.TemporaryDirectory() as temp_save_dir:
-            file_id = "test_id"
-            test_config = first_config
-            size_before = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
-            saved_image = utils_acquisition.save_image(test_image, file_id, temp_save_dir, test_config, is_color)
-            size_after = utils.get_directory_disk_usage(pathlib.Path(temp_save_dir))
-
-            size_per_image = size_after - size_before
-
         # Add in 100kB for non-image files.  This is normally more like 10k total, so this gives us extra.
         non_image_file_size = 100 * 1024
 
-        return size_per_image * self.get_acquisition_image_count() + non_image_file_size
+        return self.estimate_acquisition_disk_bytes() + non_image_file_size
 
     def get_estimated_mosaic_ram_bytes(self) -> int:
         """
@@ -944,7 +1098,7 @@ class MultiPointController:
             coordinates_df.to_csv(os.path.join(self.base_path, self.experiment_ID, "coordinates.csv"), index=False)
 
             self._log.info(
-                f"num fovs: {sum(len(coords) for coords in scan_position_information.scan_region_fov_coords_mm)}"
+                f"num fovs: {sum(len(coords) for coords in scan_position_information.scan_region_fov_coords_mm.values())}"
             )
             self._log.info(f"num regions: {len(scan_position_information.scan_region_coords_mm)}")
             # self._log.info(f"region ids: {scan_position_information.scan_region_names}")
@@ -1147,6 +1301,14 @@ class MultiPointController:
                 logger=self._log,
             )
 
+            # Save the resolved cycle/acquisition-order manifest (cycle runs only)
+            _save_cycle_manifest(
+                experiment_path,
+                acquisition_params,
+                self.liveController.microscope.config_repo,
+                logger=self._log,
+            )
+
             # Get pre-warmed job runner and its shared backpressure values
             # (starts a new one warming for next acquisition)
             prewarmed_runner, prewarmed_bp_values = self.get_prewarmed_job_runner()
@@ -1162,7 +1324,7 @@ class MultiPointController:
                     acquisition_parameters=acquisition_params,
                     callbacks=updated_callbacks,
                     abort_requested_fn=lambda: self.abort_acqusition_requested,
-                    request_abort_fn=self.request_abort_aquisition,
+                    request_abort_fn=self.request_abort_acquisition,
                     extra_job_classes=[],
                     alignment_widget=self._alignment_widget,
                     slack_notifier=self._slack_notifier,
@@ -1215,6 +1377,8 @@ class MultiPointController:
                     f"Unknown wellplate format '{self.scanCoordinates.format}', using default 96-well dimensions"
                 )
 
+        global_plan, region_plans = self._build_region_plans(scan_position_information.scan_region_names)
+
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
             base_path=self.base_path,
@@ -1250,6 +1414,10 @@ class MultiPointController:
             xy_mode=self.xy_mode,
             selected_observation_state_names=self.selected_observation_state_names,
             region_observation_state_map=self.region_observation_state_map,
+            selected_cycle_names=list(self.selected_cycle_names),
+            region_cycle_map=self.region_cycle_map,
+            global_region_plan=global_plan,
+            resolved_region_plans=region_plans,
             inline_observation_states=dict(getattr(self, "_inline_observation_states_for_run", {})),
             laser_af_seed_mode=self.laser_af_seed_mode,
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
@@ -1359,7 +1527,7 @@ class MultiPointController:
         ending_pos = self.stage.get_pos()
         self.callbacks.signal_current_fov(ending_pos.x_mm, ending_pos.y_mm)
 
-    def request_abort_aquisition(self):
+    def request_abort_acquisition(self):
         self.abort_acqusition_requested = True
 
     def validate_acquisition_settings(self) -> bool:
@@ -1484,7 +1652,7 @@ class MultiPointController:
         # Abort any running acquisition
         try:
             if self.acquisition_in_progress():
-                self.request_abort_aquisition()
+                self.request_abort_acquisition()
                 if self.thread is not None:
                     self.thread.join(timeout=timeout_s)
                     if self.thread.is_alive():
