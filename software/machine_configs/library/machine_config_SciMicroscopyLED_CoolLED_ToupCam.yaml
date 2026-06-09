@@ -1,0 +1,300 @@
+version: 3.0
+
+# ============================================================
+# DEVICES -- declarative hardware inventory
+# ============================================================
+
+devices:
+
+  teensy:
+    driver: teensy
+    config:
+      illumination_intensity_factor: 0.6
+      output_gains:
+        refdiv: false
+        channels: [false, false, false, false, false, false, false, true]
+
+  nidaq:
+    driver: nidaq
+    enabled: true
+    config:
+      device_name: "Dev1"
+      sample_rate: 100000
+      samples_per_channel: 1000
+      ao_min_voltage: -10.0
+      ao_max_voltage: 10.0
+      ai_min_voltage: -10.0
+      ai_max_voltage: 10.0
+      ai_terminal_config: "RSE"
+      trigger_source: "SOFTWARE"
+      external_trigger_terminal: "/Dev1/PFI0"
+      trigger_edge: "RISING"
+      continuous: false
+      logic_family: "THREE_POINT_THREE_V"
+
+main_camera:
+    driver: toupcam
+    role: main
+    io:
+      trigger:
+        controller: nidaq
+        signal_type: digital
+        direction: output
+        channel_id: "port0/line12"
+        display_name: "camera_trigger"
+    config:
+      model: "ITR3CMOS26000KMA"
+      pixel_format: MONO16
+      binning: 2
+      roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
+      crop: { width: 4168, height: 4168 }
+      rotate_angle: 0
+      flip: null
+      temperature: 20
+      fan_speed: 1
+      black_level: 3
+      awb_ratios:
+        r: 1.375
+        g: 1
+        b: 1.4141
+      hardware_triggering_enabled: true
+      readout_mode: "GLOBAL"
+
+  focus_camera:
+    driver: daheng
+    role: focus
+    config:
+      model: "MER2-630-60U3M"
+      exposure_time_ms: 0.8
+
+  stage:
+    driver: cephla
+    controller: teensy
+    config:
+      x:
+        fullsteps_per_rev: 200
+        screw_pitch_mm: 2.54
+        microstepping: 16
+        motor_rms_current_ma: 1000
+        i_hold: 0.25
+        max_velocity_mm: 30
+        max_acceleration_mm: 500
+        movement_sign: 1
+        homing_enabled: true
+        home_switch_polarity: 1
+        scan_stabilization_time_ms: 25
+      y:
+        fullsteps_per_rev: 200
+        screw_pitch_mm: 2.54
+        microstepping: 16
+        motor_rms_current_ma: 1000
+        i_hold: 0.25
+        max_velocity_mm: 30
+        max_acceleration_mm: 500
+        movement_sign: 1
+        homing_enabled: true
+        home_switch_polarity: 1
+        scan_stabilization_time_ms: 25
+      z:
+        fullsteps_per_rev: 200
+        screw_pitch_mm: 0.3
+        microstepping: 16
+        motor_rms_current_ma: 500
+        i_hold: 0.5
+        max_velocity_mm: 3.8
+        max_acceleration_mm: 100
+        movement_sign: -1
+        homing_enabled: true
+        home_switch_polarity: 0
+        scan_stabilization_time_ms: 20
+        motor_config: stepper
+      canonical:
+        x: { sign: -1, origin_raw_mm: 121.332}
+        y: { sign: -1, origin_raw_mm: 80.4608}
+      encoders:
+        x: { enabled: false, has_encoder: false }
+        y: { enabled: false, has_encoder: false }
+        z: { enabled: false, has_encoder: false }
+      pid:
+        x: { enabled: false }
+        y: { enabled: false }
+        z: { enabled: false }
+      software_limits:
+        x: { positive: 115, negative: 5 }
+        y: { positive: 76, negative: 4 }
+        z: { positive: 6, negative: 0.05 }
+      positions:
+        loading: { x_mm: 0.5, y_mm: 0.5 }
+        scanning: { x_mm: 20, y_mm: 20 }
+        default_z_mm: 2.287
+
+  # illumination: block removed — channels are declared in illumination_devices below
+
+  laser_af:
+    driver: laser_af
+    enabled: true
+    io:
+      laser_gate:
+        controller: teensy
+        signal_type: digital
+        direction: output
+        channel_id: "pin:15"
+        display_name: "laser_af_gate_mcu"
+    config:
+      spot_detection_mode: dual_left
+
+  piezo:
+    driver: objective_piezo
+    enabled: false
+    io:
+      output:
+        controller: teensy
+        signal_type: analog
+        direction: output
+        channel_id: "dac:7"
+    config:
+      range_um: 300
+      home_um: 150
+      control_voltage_range: 10
+      flip_direction: false
+
+  led_matrix:
+    driver: scimicroscopy_led_array
+    enabled: true
+    connection:
+      serial_number: "12732490"
+    config:
+      distance: 65
+      default_na: 0.8
+      turn_on_delay: 0.03
+      default_color: [1, 1, 1]
+      r_factor: 1.0
+      g_factor: 1.0
+      b_factor: 1.0
+
+  # emission_filter_wheel:
+  #   driver: squid_emission_filter_wheel
+  #   enabled: true
+  #   config:
+  #     controller_type: SQUID
+
+illumination_channels_file: illumination_channel_config.yaml
+
+# ============================================================
+# ILLUMINATION DEVICES
+# Composable illumination sources.  Each entry becomes an
+# IlluminationDevice inside IlluminationController.  Channel
+# keys must match the names in illumination_channel_config.yaml
+# and in user profile general.yaml files.
+# ============================================================
+
+illumination_devices:
+
+  - id: coolled_pe400
+    driver: coolled_pe400
+    # Update COM port / connection details to match your setup.
+    connection:
+      serial_number: "388335613133"
+    channels:
+      "Fluorescence 405 nm Ex":
+        wavelength_nm: 405
+        type: epi_illumination
+        serial_key: "B"
+        io:
+          shutter:
+            controller: nidaq
+            signal_type: digital
+            direction: output
+            channel_id: "port0/line0"
+            display_name: "coolled_shutter_405_nidaq0"
+      "Fluorescence 488 nm Ex":
+        wavelength_nm: 488
+        type: epi_illumination
+        serial_key: "C"
+        io:
+          shutter:
+            controller: nidaq
+            signal_type: digital
+            direction: output
+            channel_id: "port0/line1"
+            display_name: "coolled_shutter_488_nidaq1"
+      "Fluorescence 561 nm Ex":
+        wavelength_nm: 561
+        type: epi_illumination
+        serial_key: "D"
+        io:
+          shutter:
+            controller: nidaq
+            signal_type: digital
+            direction: output
+            channel_id: "port0/line2"
+            display_name: "coolled_shutter_561_nidaq2"
+      "Fluorescence 635 nm Ex":
+        wavelength_nm: 635
+        type: epi_illumination
+        serial_key: "A"
+        io:
+          shutter:
+            controller: nidaq
+            signal_type: digital
+            direction: output
+            channel_id: "port0/line3"
+            display_name: "coolled_shutter_635_nidaq3"
+          
+  - id: led_matrix
+    driver: led_matrix
+    # Single logical channel + mode (BF / DF / halves / RGB) — see lighting.LEDMatrixIlluminationDevice
+    config:
+      unified: true
+      unified_channel_name: "LED matrix"
+    channels: {}
+
+software:
+  is_hcs: true
+  wellplate_format: 96
+  default_saving_path: "C:/Microscope_Data"
+  display:
+    default_crop: 85
+    use_napari_for_live_view: false
+    use_napari_for_mosaic: true
+  acquisition:
+    image_format: tif
+    scaling_factor: 0.85
+    dx: 0.9
+    dy: 0.9
+    dz: 1.5
+    fovs_per_af: 3
+    flexible_multipoint: true
+    wellplate_multipoint: false
+    recording: true
+    fast_acquisition: true
+    default_nx: 1
+    default_ny: 1
+    illumination_settle_ms: 1
+  autofocus:
+    channel: "BF LED matrix full"
+    enable_by_default: false
+    bf_saving_option: "Green Channel Only"
+    stop_threshold: 0.85
+    crop_width: 800
+    crop_height: 800
+  tracking:
+    enabled: false
+    default_tracker: csrt
+  optics:
+    tube_lens_mm: 180
+    inverted_objective: true
+  plate_reader:
+    rows: 8
+    columns: 12
+    row_spacing_mm: 9
+    column_spacing_mm: 9
+    offset_column_1_mm: 20
+    offset_row_a_mm: 20
+  wellplate_calibrations:
+    "384":
+      upper_left_x_mm: 12.41
+      upper_left_y_mm: 11.18
+      offset_x_mm: 0
+      offset_y_mm: 0
+
