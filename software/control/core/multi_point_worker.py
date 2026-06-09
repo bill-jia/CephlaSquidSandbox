@@ -1639,7 +1639,7 @@ class MultiPointWorker:
             # mode live mode left the camera in.
             self._seed_camera_for_first_observation_state()
             self.camera.start_streaming()
-            self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
+            # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
             this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
             # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
             # soon as raw bytes arrive, before decode. Snapshots capture_info

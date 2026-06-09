@@ -53,6 +53,8 @@ devices:
       temperature: 20
       fan_speed: 1
       black_level: 3
+      high_fullwell: true
+      analog_gain: 0   # reset sensor off its ~5x power-on default at init (prevents recurring blowout)
       awb_ratios:
         r: 1.375
         g: 1
@@ -108,6 +110,9 @@ devices:
         home_switch_polarity: 0
         scan_stabilization_time_ms: 20
         motor_config: stepper
+      canonical:
+        x: { sign: -1, origin_raw_mm: 121.332}
+        y: { sign: -1, origin_raw_mm: 80.4608}
       encoders:
         x: { enabled: false, has_encoder: false }
         y: { enabled: false, has_encoder: false }
@@ -191,7 +196,7 @@ illumination_devices:
     driver: coolled_pe400
     # Update COM port / connection details to match your setup.
     connection:
-      serial_number: "3065377C3433"
+      serial_number: "388335613133"
     channels:
       "Fluorescence 405 nm Ex":
         wavelength_nm: 405
@@ -237,7 +242,7 @@ illumination_devices:
             direction: output
             channel_id: "port0/line3"
             display_name: "coolled_shutter_635_nidaq3"
-
+          
   - id: led_matrix
     driver: led_matrix
     # Single logical channel + mode (BF / DF / halves / RGB) — see lighting.LEDMatrixIlluminationDevice
@@ -249,13 +254,13 @@ illumination_devices:
 software:
   is_hcs: true
   wellplate_format: 96
-  default_saving_path: "/Downloads"
+  default_saving_path: "C:/Microscope_Data"
   display:
     default_crop: 85
     use_napari_for_live_view: false
     use_napari_for_mosaic: true
   acquisition:
-    image_format: bmp
+    image_format: tif
     scaling_factor: 0.85
     dx: 0.9
     dy: 0.9
@@ -267,6 +272,7 @@ software:
     fast_acquisition: true
     default_nx: 1
     default_ny: 1
+    illumination_settle_ms: 1
   autofocus:
     channel: "BF LED matrix full"
     enable_by_default: false

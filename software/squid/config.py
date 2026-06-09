@@ -696,6 +696,16 @@ class CameraConfig(pydantic.BaseModel):
     # Set the black level of the camera to this value once on initialization.
     default_black_level: Optional[int] = None
 
+    # Enable high fullwell capacity mode once on initialization. Only applied on cameras that
+    # support it (e.g. Toupcam models with the high-fullwell flag). None means "leave at default".
+    default_high_fullwell: Optional[bool] = None
+
+    # Set the analog gain once on initialization (same units as set_analog_gain, e.g. 0 = unity/1x).
+    # Load-bearing for Toupcam: the sensor powers on at a non-unity raw gain (~5x), which otherwise
+    # leaks into the cached live state via bootstrap-from-hardware and causes recurring blowout.
+    # None means "leave at the camera's power-on default".
+    default_analog_gain: Optional[float] = None
+
     # After initialization, set the white balance gains to this once. Only valid for color cameras.
     default_white_balance_gains: Optional[RGBValue] = None
 
@@ -905,6 +915,8 @@ def _build_camera_config_from_device(
         default_temperature=cfg.get("temperature"),
         default_fan_speed=cfg.get("fan_speed"),
         default_black_level=cfg.get("black_level"),
+        default_high_fullwell=cfg.get("high_fullwell"),
+        default_analog_gain=cfg.get("analog_gain"),
         default_white_balance_gains=wb_gains,
         hardware_triggering_enabled=cfg.get("hardware_triggering_enabled", True),
         default_readout_mode=cfg.get("readout_mode"),

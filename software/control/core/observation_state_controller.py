@@ -64,6 +64,25 @@ class ObservationStateController:
         # Callers (e.g. MultiPointWorker) may assign a TimingManager here to
         # collect sub-step timings; None means timers are no-ops.
         self._timing: Optional[Any] = None
+        # Lazily-probed, cached: does this camera expose a usable analog gain?
+        self._analog_gain_supported: Optional[bool] = None
+
+    def _camera_supports_analog_gain(self) -> bool:
+        """Whether the camera exposes a usable analog gain control.
+
+        Probed once and cached: ``get_gain_range`` is a hardware round-trip on
+        some cameras, so it must not run per-capture. Cameras without analog
+        gain report a degenerate range (max == min) or raise. Used to gate the
+        per-state gain apply so it is a clean no-op on gainless cameras and is
+        always applied where the option exists.
+        """
+        if self._analog_gain_supported is None:
+            try:
+                gr = self.camera.get_gain_range()
+                self._analog_gain_supported = bool(gr is not None and gr.max_gain > gr.min_gain)
+            except Exception:
+                self._analog_gain_supported = False
+        return self._analog_gain_supported
 
     def _time(self, name: str):
         """Return a context manager that records elapsed time under ``name`` if
@@ -428,11 +447,14 @@ class ObservationStateController:
         # Camera settings
         with self._time("obs:fos:set_exposure_time"):
             self.camera.set_exposure_time(state.exposure_time)
-        try:
-            with self._time("obs:fos:set_analog_gain"):
-                self.camera.set_analog_gain(state.analog_gain)
-        except NotImplementedError:
-            pass
+        # Analog gain: apply only where the camera actually exposes the control,
+        # so live hardware gain == logical state before any capture/snapshot.
+        if self._camera_supports_analog_gain():
+            try:
+                with self._time("obs:fos:set_analog_gain"):
+                    self.camera.set_analog_gain(state.analog_gain)
+            except Exception as e:
+                self._log.warning("Could not set analog gain: %s", e)
 
         # Illumination + optical path
         with self._time("obs:fos:apply_illumination_parameters"):
@@ -485,18 +507,10 @@ class ObservationStateController:
             except Exception as e:
                 self._log.warning("Could not apply emission filter positions: %s", e)
 
-        # Camera settings from camera_settings block
+        # Camera settings from camera_settings block.
+        # Exposure + analog gain are (re-)applied by apply_full_observation_state
+        # below — only pixel_format is unique to this block, so set just that here.
         if state.camera_settings is not None:
-            try:
-                with self._time("obs:preset:cs_set_exposure_time"):
-                    self.camera.set_exposure_time(state.camera_settings.exposure_time_ms)
-            except Exception as e:
-                self._log.warning("Could not set exposure: %s", e)
-            try:
-                with self._time("obs:preset:cs_set_analog_gain"):
-                    self.camera.set_analog_gain(state.camera_settings.gain_mode)
-            except Exception:
-                pass
             if state.camera_settings.pixel_format:
                 try:
                     from squid.config import CameraPixelFormat

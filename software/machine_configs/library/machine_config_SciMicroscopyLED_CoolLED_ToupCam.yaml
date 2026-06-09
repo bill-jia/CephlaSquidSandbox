@@ -32,33 +32,35 @@ devices:
       continuous: false
       logic_family: "THREE_POINT_THREE_V"
 
-main_camera:
-    driver: toupcam
-    role: main
-    io:
-      trigger:
-        controller: nidaq
-        signal_type: digital
-        direction: output
-        channel_id: "port0/line12"
-        display_name: "camera_trigger"
-    config:
-      model: "ITR3CMOS26000KMA"
-      pixel_format: MONO16
-      binning: 2
-      roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
-      crop: { width: 4168, height: 4168 }
-      rotate_angle: 0
-      flip: null
-      temperature: 20
-      fan_speed: 1
-      black_level: 3
-      awb_ratios:
-        r: 1.375
-        g: 1
-        b: 1.4141
-      hardware_triggering_enabled: true
-      readout_mode: "GLOBAL"
+  main_camera:
+      driver: toupcam
+      role: main
+      io:
+        trigger:
+          controller: nidaq
+          signal_type: digital
+          direction: output
+          channel_id: "port0/line12"
+          display_name: "camera_trigger"
+      config:
+        model: "ITR3CMOS26000KMA"
+        pixel_format: MONO16
+        binning: 2
+        roi: { offset_x: 0, offset_y: 0, width: 6224, height: 4168 }
+        crop: { width: 4168, height: 4168 }
+        rotate_angle: 0
+        flip: null
+        temperature: 20
+        fan_speed: 1
+        black_level: 3
+        high_fullwell: true
+        analog_gain: 0   # reset sensor off its ~5x power-on default at init (prevents recurring blowout)
+        awb_ratios:
+          r: 1.375
+          g: 1
+          b: 1.4141
+        hardware_triggering_enabled: true
+        readout_mode: "GLOBAL"
 
   focus_camera:
     driver: daheng
@@ -167,7 +169,7 @@ main_camera:
       distance: 65
       default_na: 0.8
       turn_on_delay: 0.03
-      default_color: [1, 1, 1]
+      default_color: [0, 1, 0]
       r_factor: 1.0
       g_factor: 1.0
       b_factor: 1.0

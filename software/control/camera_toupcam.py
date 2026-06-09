@@ -31,6 +31,10 @@ class ToupCamCapabilities(pydantic.BaseModel):
     has_TEC: bool
     has_low_noise_mode: bool
     has_black_level: bool
+    # Conversion Gain support: HCG/LCG (TOUPCAM_FLAG_CG) and the HDR superset (TOUPCAM_FLAG_CGHDR).
+    has_conversion_gain: bool
+    has_cghdr: bool
+    has_high_fullwell: bool
 
 
 class StrobeInfo(pydantic.BaseModel):
@@ -216,6 +220,9 @@ class ToupcamCamera(AbstractCamera):
             has_TEC=(devices[index].model.flag & toupcam.TOUPCAM_FLAG_TEC_ONOFF) > 0,
             has_low_noise_mode=(devices[index].model.flag & toupcam.TOUPCAM_FLAG_LOW_NOISE) > 0,
             has_black_level=(devices[index].model.flag & toupcam.TOUPCAM_FLAG_BLACKLEVEL) > 0,
+            has_conversion_gain=(devices[index].model.flag & (toupcam.TOUPCAM_FLAG_CG | toupcam.TOUPCAM_FLAG_CGHDR)) > 0,
+            has_cghdr=(devices[index].model.flag & toupcam.TOUPCAM_FLAG_CGHDR) > 0,
+            has_high_fullwell=(devices[index].model.flag & toupcam.TOUPCAM_FLAG_HIGH_FULLWELL) > 0,
         )
 
         return camera, capabilities
@@ -256,6 +263,12 @@ class ToupcamCamera(AbstractCamera):
         # camera at startup (but then set_exposure_time will modify it when a user sets exposure time)
         self._exposure_time = self._get_raw_exposure_time()
         self._trigger_duration_us = 40
+        # Default strobe info so get_strobe_time() is safe before the first
+        # (streaming-gated) strobe recalc in _update_internal_settings.
+        self._strobe_info = StrobeInfo(strobe_time_us=0.0, trigger_delay_us=0.0)
+        # True when a settings change skipped the strobe recalc (stream stopped);
+        # start_streaming refreshes it.
+        self._strobe_dirty = False
 
         # toupcam temperature
         self.temperature_reading_callback = None
@@ -397,19 +410,41 @@ class ToupcamCamera(AbstractCamera):
 
         image_exposure_time_ms = self.get_exposure_time()
         camera_exposure_time_ms = self._calculate_camera_exposure_time(image_exposure_time_ms)
-        self._strobe_info = ToupcamCamera._calculate_strobe_info(
-            camera=self._camera,
-            pixel_size=self._get_pixel_size_in_bytes(),
-            exposure_time_ms=camera_exposure_time_ms,
-            capabilities=self._capabilities,
-        )
-        if self._hw_set_strobe_delay_ms_fn and self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER:
-            self._hw_set_strobe_delay_ms_fn(self.get_strobe_time())
+        self._log.info(
+            f"Updating internal settings with {width=} x {height=}, {buffer_size=}, image_exposure_time={image_exposure_time_ms} [ms], camera_exposure_time={camera_exposure_time_ms} [ms], send_exposure={send_exposure}")
+        # Strobe timing reads camera options (e.g. MAX_PRECISE_FRAMERATE) that the
+        # toupcam SDK only services while the pull stream is running. When the
+        # stream is stopped (e.g. after stopping CONTINUOUS live) that read raises
+        # E_UNEXPECTED ("Catastrophic failure"). Skip the recalc when not streaming
+        # and mark strobe dirty so it is refreshed on the next start_streaming;
+        # this keeps the last-known strobe info usable in the meantime. Without
+        # this, changing any camera setting after live broke with a fatal error.
+        if self.get_is_streaming():
+            try:
+                self._strobe_info = ToupcamCamera._calculate_strobe_info(
+                    camera=self._camera,
+                    pixel_size=self._get_pixel_size_in_bytes(),
+                    exposure_time_ms=camera_exposure_time_ms,
+                    capabilities=self._capabilities,
+                )
+                self._strobe_dirty = False
+            except toupcam.HRESULTException as ex:
+                # Transient failure (e.g. just after restart): keep last strobe
+                # info and retry on the next update/start.
+                self._strobe_dirty = True
+                self._log.warning(
+                    f"Strobe recalc failed (camera not ready, hr=0x{ex.hr:x}); will retry on stream start."
+                )
+            if self._hw_set_strobe_delay_ms_fn and self.get_acquisition_mode() == CameraAcquisitionMode.HARDWARE_TRIGGER:
+                self._hw_set_strobe_delay_ms_fn(self.get_strobe_time())
+        else:
+            # Defer the strobe recalc until the stream is running again.
+            self._strobe_dirty = True
 
         if send_exposure:
             self._calculate_and_set_camera_exposure_time(image_exposure_time_ms)
 
-        self._log.debug(
+        self._log.info(
             f"image size: {width=} x {height=}, {buffer_size=}, strobe_time={self.get_strobe_time()} [ms], exposure_time={self.get_exposure_time()} [ms], full frame time={self.get_total_frame_time()} [ms], {send_exposure=}"
         )
 
@@ -428,8 +463,40 @@ class ToupcamCamera(AbstractCamera):
         """
         Run our initial configuration to get the camera into a know and safe starting state.
         """
+        # Disable SDK auto-exposure/auto-gain. Touptek defaults it ON, and in
+        # CONTINUOUS (live) mode it ramps ExpoTime up to 350 ms and ExpoAGain up
+        # to 5x chasing a brightness target — blowing out the image and silently
+        # overriding the user's exposure/gain (it also auto-drives gain to 500,
+        # which the live-state cache then persists). The software owns exposure
+        # and analog gain explicitly, so the camera must stay in full manual mode.
+        try:
+            self.set_auto_exposure(False)
+        except Exception as e:
+            self._log.warning(f"Could not disable auto-exposure at init: {e}")
+
         if self._capabilities.has_low_noise_mode:
             self._camera.put_Option(toupcam.TOUPCAM_OPTION_LOW_NOISE, 0)
+
+        # High fullwell capacity is an init-only setting (not runtime configurable here).
+        if self._config.default_high_fullwell is not None:
+            if self._capabilities.has_high_fullwell:
+                self._camera.put_Option(
+                    toupcam.TOUPCAM_OPTION_HIGH_FULLWELL, 1 if self._config.default_high_fullwell else 0
+                )
+                self._log.info(f"High fullwell capacity set to {self._config.default_high_fullwell}")
+            else:
+                self._log.warning(
+                    "high_fullwell requested but this toupcam model does not support it, ignoring"
+                )
+
+        # Reset analog gain to a deterministic baseline. The sensor powers on at a
+        # non-unity raw gain (~5x = 13.979 user units); without this it leaks into the
+        # cached live state (bootstrap-from-hardware) and causes recurring live blowout.
+        if self._config.default_analog_gain is not None:
+            try:
+                self.set_analog_gain(self._config.default_analog_gain)
+            except Exception as e:
+                self._log.warning(f"Could not set default analog gain at init: {e}")
 
         self._set_fan_speed(self._config.default_fan_speed)
 
@@ -472,6 +539,12 @@ class ToupcamCamera(AbstractCamera):
         self._log.info("start streaming requested")
         if not self._raw_camera_stream_started:
             self._start_raw_camera_stream()
+            # Settings changed while the stream was stopped deferred the strobe
+            # recalc (the SDK can't read MAX_PRECISE_FRAMERATE when stopped). Now
+            # that the stream is running again, refresh strobe/buffer/exposure so
+            # the next acquisition uses correct timing.
+            if self._strobe_dirty:
+                self._update_internal_settings()
 
     def stop_streaming(self):
         self._camera.Stop()
@@ -526,6 +599,7 @@ class ToupcamCamera(AbstractCamera):
 
     def set_analog_gain(self, analog_gain):
         gain_range = self.get_gain_range()
+        self._log.info(f"Requested {analog_gain=} with gain range {gain_range} in gain mode {self._get_gain_mode()}")
 
         clamped_gain = max(gain_range.min_gain, min(analog_gain, gain_range.max_gain))
 
@@ -598,24 +672,44 @@ class ToupcamCamera(AbstractCamera):
         raise NotImplementedError("get_available_pixel_formats is not implemented for Toupcam")
 
     # ------------------------------------------------------------------
-    # Camera/readout mode implementations required by AbstractCamera
-    # ToupcamCamera historically did not expose logical "camera modes"
-    # or configurable readout modes through this interface, so we treat
-    # both as single fixed values and keep setters as no-ops. This
-    # satisfies the abstract API without changing existing behavior.
+    # Camera mode == Conversion Gain mode for ToupcamCamera.
+    # Models with TOUPCAM_FLAG_CG expose LCG/HCG; models with
+    # TOUPCAM_FLAG_CGHDR additionally expose HDR. Models with neither
+    # have no selectable camera mode.
     # ------------------------------------------------------------------
 
-    def get_camera_mode(self) -> str:
-        """Return the current camera mode. ToupcamCamera exposes a single logical mode."""
-        return "default"
-
     def get_available_camera_modes(self) -> List[str]:
-        """Return the list of available camera modes."""
-        return ["default"]
+        """Return the selectable gain (conversion gain) modes for this camera."""
+        if self._capabilities.has_cghdr:
+            return ["LCG", "HCG", "HDR"]
+        elif self._capabilities.has_conversion_gain:
+            return ["LCG", "HCG"]
+        return []
+
+    def get_camera_mode(self) -> Optional[str]:
+        """Return the current gain mode, or None if the camera has no selectable mode."""
+        if not self._capabilities.has_conversion_gain:
+            return None
+        return self._get_gain_mode()
 
     def set_camera_mode(self, camera_mode: str):
-        """Set the camera mode. ToupcamCamera has a single fixed mode; this is a no-op."""
-        pass
+        """Set the gain (conversion gain) mode. No-op on cameras without conversion gain."""
+        if not self._capabilities.has_conversion_gain:
+            self._log.debug("set_camera_mode: camera has no conversion gain support, ignoring")
+            return
+
+        available = self.get_available_camera_modes()
+        if camera_mode not in available:
+            raise ValueError(f"Unknown camera mode '{camera_mode}'. Available: {available}")
+
+        if camera_mode == self.get_camera_mode():
+            self._log.debug(f"set_camera_mode: already {camera_mode}, skipping")
+            return
+
+        with self._pause_streaming():
+            self._set_gain_mode(camera_mode)
+        self._update_internal_settings()
+        self._log.info(f"Set camera mode (conversion gain) to {camera_mode}")
 
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
         """Set the readout mode. ToupcamCamera does not expose readout modes; this is a no-op."""
@@ -735,6 +829,17 @@ class ToupcamCamera(AbstractCamera):
             self._camera.put_Option(toupcam.TOUPCAM_OPTION_CG, 1)
         elif mode == "HDR":
             self._camera.put_Option(toupcam.TOUPCAM_OPTION_CG, 2)
+    
+    def _get_gain_mode(self):
+        cg_mode = self._camera.get_Option(toupcam.TOUPCAM_OPTION_CG)
+        if cg_mode == 0:
+            return "LCG"
+        elif cg_mode == 1:
+            return "HCG"
+        elif cg_mode == 2:
+            return "HDR"
+        else:
+            raise ValueError(f"Camera returned unknown gain mode: value={cg_mode}")
     
     def set_trigger_duration_us(self, trigger_duration_us: int):
         self._trigger_duration_us = trigger_duration_us
