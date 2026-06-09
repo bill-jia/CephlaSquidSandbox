@@ -1161,6 +1161,18 @@ class SciMicroscopyLEDArray:
             log.info(f"[LED-DBG] SciMicroscopy.set_annulus min_na={min_na} max_na={max_na} -> cmd '{cmd}'")
         return cmd
 
+    def set_single_led(self, index: int) -> str:
+        """Build (and return) the 'l.<index>' single-LED pattern command.
+
+        Mirrors :meth:`set_annulus`: the firmware lights the LED immediately on
+        receipt, so we return the string and let the caller store it via
+        set_illumination, reusing the existing turn_on/turn_off lifecycle.
+        """
+        cmd = f"l.{int(index)}"
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_single_led index={index} -> cmd '{cmd}'")
+        return cmd
+
     def set_half_annulus_pattern(self, half: str, min_na: float, max_na: float) -> str:
         """Build the half-annulus pattern command. Experimental firmware path."""
         # Firmware command syntax follows the dpc convention (half letter first).
@@ -1273,8 +1285,14 @@ class SciMicroscopyLEDArray:
         When ``mode_spec`` is omitted, falls back to channel-name matching to
         preserve the original legacy code path.
         """
-        # Map channel name to color
-        if "BF LED matrix full_R" in channel_name:
+        spec = mode_spec or {}
+
+        # Per-mode "color" override wins; then legacy _R/_G/_B name suffixes;
+        # otherwise the array-wide default_color.
+        spec_color = spec.get("color")
+        if spec_color is not None:
+            color = tuple(float(c) for c in spec_color)
+        elif "BF LED matrix full_R" in channel_name:
             color = (1.0, 0.0, 0.0)
         elif "BF LED matrix full_G" in channel_name:
             color = (0.0, 1.0, 0.0)
@@ -1282,14 +1300,15 @@ class SciMicroscopyLEDArray:
             color = (0.0, 0.0, 1.0)
         else:
             color = self._default_color
-
-        spec = mode_spec or {}
         annulus = spec.get("annulus")
         half = spec.get("half")
         spec_na = spec.get("na")
+        single_led = spec.get("single_led")
 
         # Pattern command resolution
-        if annulus is not None and half:
+        if single_led is not None:
+            mode = self.set_single_led(int(single_led))
+        elif annulus is not None and half:
             min_na, max_na = float(annulus[0]), float(annulus[1])
             mode = self.set_half_annulus_pattern(half, min_na, max_na)
         elif annulus is not None:

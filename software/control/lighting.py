@@ -693,6 +693,7 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
         "source_code": 0,
         "label": "BF full",
         "matrix_channel_name": "BF LED matrix full",
+        "color": [1.0, 1.0, 1.0],
     },
     "df": {
         "source_code": 3,
@@ -713,21 +714,32 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
         "source_code": 1,
         "label": "BF left half",
         "matrix_channel_name": "BF LED matrix left half",
+        "color": [0.0, 1.0, 0.0],
     },
     "right_half": {
         "source_code": 2,
         "label": "BF right half",
         "matrix_channel_name": "BF LED matrix right half",
+        "color": [0.0, 1.0, 0.0],
     },
     "top_half": {
         "source_code": 7,
         "label": "BF top half",
         "matrix_channel_name": "BF LED matrix top half",
+        "color": [0.0, 1.0, 0.0],
     },
     "bottom_half": {
         "source_code": 8,
         "label": "BF bottom half",
         "matrix_channel_name": "BF LED matrix bottom half",
+        "color": [0.0, 1.0, 0.0],
+    },
+    "sg": {
+        "source_code": 0,
+        "label": "Single LED (green, on-axis)",
+        "matrix_channel_name": "Single LED green",
+        "color": [0.0, 1.0, 0.0],
+        "single_led": 0,
     },
     # --- Experimental DPC-style patterns ---
     "outer_ring": {
