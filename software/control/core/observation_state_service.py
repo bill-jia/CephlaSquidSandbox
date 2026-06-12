@@ -179,6 +179,8 @@ def observation_state_to_yaml(
         }
         if ist.led_matrix_mode is not None:
             entry["led_matrix_mode"] = ist.led_matrix_mode
+        if ist.led_matrix_na is not None:
+            entry["led_matrix_na"] = ist.led_matrix_na
         if ist.timing is not None:
             entry["timing"] = {
                 "start_offset_ms": ist.timing.start_offset_ms,

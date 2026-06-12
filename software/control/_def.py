@@ -1160,7 +1160,7 @@ Z_HOME_SAFETY_MARGIN_UM = 100
 # safety point
 X_HOME_SAFETY_POINT = 0
 Y_HOME_SAFETY_POINT = 0
-Z_HOME_SAFETY_POINT = 400
+Z_HOME_SAFETY_POINT = 100
 
 # When the last stage position cache is missing or unreadable, move here after homing (mm).
 STARTUP_DEFAULT_STAGE_X_MM = 30.0

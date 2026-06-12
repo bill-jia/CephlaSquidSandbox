@@ -917,6 +917,23 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
     def get_matrix_mode(self) -> str:
         return self._active_mode_key
 
+    def mode_uses_array_na(self, mode_key: str) -> bool:
+        """True if *mode_key*'s pattern is computed against the array NA.
+
+        bf / df / dpc-half patterns use the array NA; single-LED, annulus /
+        half-annulus, and modes carrying their own fixed ``na`` ignore it. The
+        array-NA command must be skipped for those — otherwise applying a stored
+        NA would re-fire and clobber e.g. a single-LED pattern.
+        """
+        spec = self._modes.get(mode_key)
+        if not spec:
+            return False
+        return (
+            spec.get("single_led") is None
+            and spec.get("annulus") is None
+            and spec.get("na") is None
+        )
+
     def set_matrix_mode(self, mode_key: str) -> None:
         """Select the active pattern. Pure state update: callers re-fire hardware
         (set_intensity + turn_on) when they need the new pattern asserted live."""
@@ -1243,6 +1260,15 @@ class IlluminationController:
         if sci is None:
             return None
         return float(getattr(sci, "NA", 0.0))
+
+    def led_matrix_mode_uses_array_na(self, mode_key: Optional[str]) -> bool:
+        """True if *mode_key* on the unified LED matrix is computed against the
+        array NA (bf/df/dpc). False for single-LED / annulus / fixed-NA modes,
+        which must skip the array-NA command."""
+        dev = self._led_matrix_unified
+        if dev is None or not mode_key:
+            return False
+        return dev.mode_uses_array_na(mode_key)
 
     def set_led_matrix_array_na(self, na: float) -> bool:
         """Update the SciMicroscopy LED array NA (controls bf / df / dpc radius).
@@ -1757,9 +1783,14 @@ class IlluminationController:
         for ist in illuminator_states:
             timed = ist.timing is not None
             if turn_on:
-                mode = ist.led_matrix_mode
-                if mode and self.has_unified_led_matrix():
-                    self.set_led_matrix_mode(mode)
+                if self.has_unified_led_matrix():
+                    mode = ist.led_matrix_mode
+                    # NA before mode so bf/df/dpc fire at the right NA; skip NA for
+                    # modes that ignore it (single-LED, annulus) so it can't clobber.
+                    if ist.led_matrix_na is not None and self.led_matrix_mode_uses_array_na(mode):
+                        self.set_led_matrix_array_na(float(ist.led_matrix_na))
+                    if mode:
+                        self.set_led_matrix_mode(mode)
                 self.set_channel_intensity(ist.illumination_channel, ist.intensity)
                 if timed and not gate_timed_illuminators:
                     # Skip the digital ON; NIDAQ waveform will drive it.

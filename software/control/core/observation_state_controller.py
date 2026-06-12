@@ -189,8 +189,17 @@ class ObservationStateController:
     def set_led_matrix_array_na(self, na: float) -> bool:
         """GUI-safe entrypoint to update the SciMicroscopy LED array NA.
 
-        Returns the underlying IC result (False if no array is available).
+        Persists the NA onto the relevant illuminator states so it is saved with
+        the ObservationState, then applies it to hardware. Returns the underlying
+        IC result (False if no array is available).
         """
+        if self._current_state is not None:
+            for ist in self._current_state.illuminator_states:
+                if ist.led_matrix_mode is not None or (
+                    hasattr(self.ic, "illumination_maps_to_unified_led_matrix")
+                    and self.ic.illumination_maps_to_unified_led_matrix(ist.illumination_channel)
+                ):
+                    ist.led_matrix_na = float(na)
         try:
             if hasattr(self.ic, "set_led_matrix_array_na"):
                 return bool(self.ic.set_led_matrix_array_na(float(na)))
@@ -327,8 +336,20 @@ class ObservationStateController:
             timed = ist.timing is not None
 
             with self._time("obs:ip:set_led_matrix_mode"):
+                has_matrix = getattr(ic, "has_unified_led_matrix", lambda: False)()
                 mode = ist.led_matrix_mode
-                if mode and getattr(ic, "has_unified_led_matrix", lambda: False)():
+                na = ist.led_matrix_na
+                # NA before mode so the bf/df/dpc pattern fires at the right NA.
+                # Skip NA for modes that ignore it (single-LED, annulus, fixed-NA)
+                # so a stored NA can't re-fire over e.g. a single-LED pattern.
+                if (
+                    na is not None
+                    and has_matrix
+                    and hasattr(ic, "set_led_matrix_array_na")
+                    and getattr(ic, "led_matrix_mode_uses_array_na", lambda m: True)(mode)
+                ):
+                    ic.set_led_matrix_array_na(float(na))
+                if mode and has_matrix:
                     ic.set_led_matrix_mode(mode)
 
             # Always send the intensity command (serial for CoolLED-like
@@ -612,7 +633,7 @@ class ObservationStateController:
         # Merge with hardware state
         ic = self.ic
         illuminator_states = self._merge_illumination_hardware(illuminator_states, ic)
-        illuminator_states = self._merge_led_matrix_mode(illuminator_states, ic)
+        illuminator_states = self._merge_led_matrix_state(illuminator_states, ic)
         illuminator_states = self._reconcile_with_hardware(illuminator_states, ic)
 
         camera_settings = self._collect_camera_settings()
@@ -822,13 +843,15 @@ class ObservationStateController:
         return out
 
     @staticmethod
-    def _merge_led_matrix_mode(
+    def _merge_led_matrix_state(
         states: List[IlluminatorState], ic: Any
     ) -> List[IlluminatorState]:
+        """Capture the live LED matrix mode and array NA onto matrix-mapped states."""
         if ic is None or not getattr(ic, "has_unified_led_matrix", lambda: False)():
             return states
         mode = ic.get_led_matrix_mode()
-        if mode is None:
+        na = ic.get_led_matrix_array_na() if hasattr(ic, "get_led_matrix_array_na") else None
+        if mode is None and na is None:
             return states
         uses_matrix = getattr(ic, "illumination_maps_to_unified_led_matrix", None)
         unified = getattr(ic, "unified_led_matrix_channel_name", lambda: None)()
@@ -843,7 +866,15 @@ class ObservationStateController:
                     applies = False
             if not applies and unified is not None and hw == unified:
                 applies = True
-            out.append(ist.model_copy(update={"led_matrix_mode": mode}) if applies else ist)
+            if not applies:
+                out.append(ist)
+                continue
+            update: Dict[str, Any] = {}
+            if mode is not None:
+                update["led_matrix_mode"] = mode
+            if na is not None:
+                update["led_matrix_na"] = float(na)
+            out.append(ist.model_copy(update=update) if update else ist)
         return out
 
     @staticmethod

@@ -27,6 +27,7 @@ class CachedIlluminationSettings:
 
     snapshot: IlluminationSnapshot
     led_matrix_mode: Optional[str] = None
+    led_matrix_na: Optional[float] = None
 
 
 def save_illumination_settings(controller: Any, cache_path: Path = _DEFAULT_CACHE_PATH) -> None:
@@ -47,6 +48,10 @@ def save_illumination_settings(controller: Any, cache_path: Path = _DEFAULT_CACH
             mk = controller.get_led_matrix_mode()
             if mk is not None:
                 data["led_matrix_mode"] = mk
+        if hasattr(controller, "get_led_matrix_array_na") and callable(controller.get_led_matrix_array_na):
+            na = controller.get_led_matrix_array_na()
+            if na is not None:
+                data["led_matrix_na"] = float(na)
     except Exception:
         pass
 
@@ -99,4 +104,14 @@ def load_illumination_settings(cache_path: Path = _DEFAULT_CACHE_PATH) -> Option
     lm = raw.get("led_matrix_mode")
     led_matrix_mode = str(lm) if lm is not None else None
 
-    return CachedIlluminationSettings(snapshot=IlluminationSnapshot(states), led_matrix_mode=led_matrix_mode)
+    na_raw = raw.get("led_matrix_na")
+    try:
+        led_matrix_na = float(na_raw) if na_raw is not None else None
+    except (TypeError, ValueError):
+        led_matrix_na = None
+
+    return CachedIlluminationSettings(
+        snapshot=IlluminationSnapshot(states),
+        led_matrix_mode=led_matrix_mode,
+        led_matrix_na=led_matrix_na,
+    )

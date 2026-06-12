@@ -46,6 +46,7 @@ IlluminatorState
   intensity: float              # 0-100%
   on: bool                      # logical on/off
   led_matrix_mode: str          # LED pattern key (optional)
+  led_matrix_na: float          # SciMicroscopy array NA for bf/df/dpc (optional)
 ```
 
 ## Key Naming Distinctions

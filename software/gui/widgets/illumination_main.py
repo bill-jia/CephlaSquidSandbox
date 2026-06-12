@@ -363,6 +363,14 @@ class IlluminationWidget(QWidget):
                         combo.setCurrentIndex(mi)
                         combo.blockSignals(False)
 
+            na_sb = row.get("na_spinbox")
+            if na_sb is not None and getattr(self._controller, "get_led_matrix_array_na", None):
+                na_val = self._controller.get_led_matrix_array_na()
+                if na_val is not None:
+                    na_sb.blockSignals(True)
+                    na_sb.setValue(float(na_val))
+                    na_sb.blockSignals(False)
+
             slider.blockSignals(False)
             spinbox.blockSignals(False)
             btn.blockSignals(False)

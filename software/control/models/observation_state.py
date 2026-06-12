@@ -174,6 +174,12 @@ class IlluminatorState(BaseModel):
         None,
         description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",
     )
+    led_matrix_na: Optional[float] = Field(
+        None,
+        ge=0,
+        le=1,
+        description="LED matrix array NA (bf/df/dpc illumination radius) for the unified SciMicroscopy LED matrix",
+    )
     timing: Optional[IlluminatorTiming] = Field(
         None,
         description="Optional NIDAQ-driven pulse timing within camera exposure (None = on for full exposure)",
