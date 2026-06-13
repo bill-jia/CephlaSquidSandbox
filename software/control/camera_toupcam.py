@@ -284,16 +284,41 @@ class ToupcamCamera(AbstractCamera):
 
 
     def toupcam_raw_bytes_to_np(self, raw: bytes, meta: dict) -> np.ndarray:
-        """Decode one frame; packing comes from the camera (see byte_decoding_fn closure), not metadata."""
+        """Decode one fast-acquisition frame; packing comes from the camera, not metadata.
+
+        Applies the same flip as the normal frame path (AbstractCamera._process_raw_frame,
+        driven by self._config.flip) so fast-acquisition output has the same real-space
+        orientation as live/multipoint frames. The normal path can't be reused here because
+        fast acquisition deliberately operates on raw bytes (no rotate/crop) for performance.
+        """
         height = int(meta["height"])
         width = int(meta["width"])
         px_size_bytes = self._get_pixel_size_in_bytes()
         if px_size_bytes == 1:
-            return np.frombuffer(raw, dtype="uint8").reshape(height, width)
+            image = np.frombuffer(raw, dtype="uint8").reshape(height, width)
         elif px_size_bytes == 2:
-            return np.frombuffer(raw, dtype="uint16").reshape(height, width)
+            image = np.frombuffer(raw, dtype="uint16").reshape(height, width)
         else:
             raise ValueError(f"Unknown pixel size for fast-acquisition decode: {px_size_bytes!r}")
+        return self._apply_config_flip(image)
+
+    def _apply_config_flip(self, image: np.ndarray) -> np.ndarray:
+        """Apply the configured camera flip (self._config.flip) to a 2D frame.
+
+        Mirrors the flip half of utils.rotate_and_flip_image so the raw
+        fast-acquisition decode matches the normal _process_raw_frame orientation.
+        Returns a contiguous array (np.frombuffer gives a read-only view). Flips
+        preserve frame dimensions, so the fast-acquisition writer's height/width
+        metadata stays valid.
+        """
+        flip = self._config.flip
+        if flip == control.utils.FlipVariant.VERTICAL:
+            return np.ascontiguousarray(image[::-1, :])
+        elif flip == control.utils.FlipVariant.HORIZONTAL:
+            return np.ascontiguousarray(image[:, ::-1])
+        elif flip == control.utils.FlipVariant.BOTH:
+            return np.ascontiguousarray(image[::-1, ::-1])
+        return image
 
     def _start_raw_camera_stream(self):
         """
