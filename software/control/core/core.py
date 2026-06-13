@@ -730,6 +730,10 @@ class ImageDisplayWindow(QMainWindow):
         self.preview_line = None
         self.start_point_marker = None
 
+        # Crosshair state
+        self.crosshair_v_line = None
+        self.crosshair_h_line = None
+
         # Create main layout
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -758,6 +762,20 @@ class ImageDisplayWindow(QMainWindow):
         self.btn_line_profiler.setEnabled(False)
         self.btn_line_profiler.clicked.connect(self.toggle_line_profiler)
 
+        # Add draggable crosshair toggle button
+        self.btn_crosshair = QPushButton("Crosshair")
+        self.btn_crosshair.setCheckable(True)
+        self.btn_crosshair.setChecked(False)
+        self.btn_crosshair.setEnabled(False)
+        self.btn_crosshair.clicked.connect(self.toggle_crosshair)
+
+        # Label showing the crosshair center in image pixel coordinates
+        self.crosshair_position_label = QLabel()
+        self.crosshair_position_label.setMinimumWidth(150)
+        self.crosshair_position_label.setVisible(False)
+        self.crosshair_separator = QLabel(" | ")
+        self.crosshair_separator.setVisible(False)
+
         # Add well selector toggle button
         self.btn_well_selector = QPushButton("Show Well Selector")
         self.btn_well_selector.setCheckable(False)
@@ -770,10 +788,14 @@ class ImageDisplayWindow(QMainWindow):
         status_layout.addWidget(self.stage_position_label)
         status_layout.addWidget(QLabel(" | "))  # Add separator
         status_layout.addWidget(self.piezo_position_label)
+        status_layout.addWidget(self.crosshair_separator)  # Separator (hidden until crosshair on)
+        status_layout.addWidget(self.crosshair_position_label)  # Crosshair coordinate readout
         status_layout.addStretch()  # Push labels to the left
         status_layout.addWidget(self.btn_well_selector)  # Add well selector button
         status_layout.addWidget(QLabel(" | "))  # Add separator
         status_layout.addWidget(self.btn_line_profiler)  # Add line profiler button
+        status_layout.addWidget(QLabel(" | "))  # Add separator
+        status_layout.addWidget(self.btn_crosshair)  # Add crosshair button
 
         status_widget.setLayout(status_layout)
 
@@ -959,6 +981,83 @@ class ImageDisplayWindow(QMainWindow):
     def _on_range_changed(self, view_range):
         """Handle manual range changes in the line profiler plot."""
         self.line_profiler_manual_range = True
+
+    def _get_image_view(self):
+        """Return the ViewBox that holds the image item, regardless of LUT mode."""
+        if self.show_LUT:
+            return self.graphics_widget.view.getView()
+        return self.graphics_widget.view
+
+    def toggle_crosshair(self):
+        """Toggle a draggable crosshair overlay on the live image.
+
+        The crosshair is two full-span infinite lines (one vertical, one
+        horizontal). Each line is independently draggable along its
+        perpendicular axis, so the user can position the crosshair center
+        anywhere over the image. The center is reported in image pixel
+        coordinates in the status bar.
+        """
+        view = self._get_image_view()
+        if self.btn_crosshair.isChecked():
+            if self.crosshair_v_line is None:
+                # Position the crosshair at the center of the current image
+                img = self.graphics_widget.img
+                if img.image is not None:
+                    x_center = img.width() / 2
+                    y_center = img.height() / 2
+                else:
+                    x_center, y_center = 0, 0
+
+                pen = pg.mkPen("c", width=1)
+                hover_pen = pg.mkPen("c", width=2)
+                self.crosshair_v_line = pg.InfiniteLine(
+                    pos=x_center, angle=90, movable=True, pen=pen, hoverPen=hover_pen
+                )
+                self.crosshair_h_line = pg.InfiniteLine(
+                    pos=y_center, angle=0, movable=True, pen=pen, hoverPen=hover_pen
+                )
+                self.crosshair_v_line.setZValue(20)
+                self.crosshair_h_line.setZValue(20)
+                self._update_crosshair_bounds()
+                view.addItem(self.crosshair_v_line)
+                view.addItem(self.crosshair_h_line)
+                self.crosshair_v_line.sigPositionChanged.connect(self.update_crosshair_position)
+                self.crosshair_h_line.sigPositionChanged.connect(self.update_crosshair_position)
+            else:
+                self.crosshair_v_line.show()
+                self.crosshair_h_line.show()
+
+            self.crosshair_separator.setVisible(True)
+            self.crosshair_position_label.setVisible(True)
+            self.update_crosshair_position()
+        else:
+            if self.crosshair_v_line is not None:
+                self.crosshair_v_line.hide()
+                self.crosshair_h_line.hide()
+            self.crosshair_separator.setVisible(False)
+            self.crosshair_position_label.setVisible(False)
+
+    def _update_crosshair_bounds(self):
+        """Constrain the crosshair lines to the current image extent."""
+        if self.crosshair_v_line is None or self.crosshair_h_line is None:
+            return
+        img = self.graphics_widget.img
+        if img.image is None:
+            return
+        self.crosshair_v_line.setBounds([0, img.width()])
+        self.crosshair_h_line.setBounds([0, img.height()])
+
+    def update_crosshair_position(self):
+        """Update the crosshair coordinate readout from the line positions."""
+        if self.crosshair_v_line is None or self.crosshair_h_line is None:
+            return
+        if not self.btn_crosshair.isChecked():
+            return
+        view_point = pg.Point(self.crosshair_v_line.value(), self.crosshair_h_line.value())
+        image_coord = self.graphics_widget.img.mapFromView(view_point)
+        x = int(round(image_coord.x()))
+        y = int(round(image_coord.y()))
+        self.crosshair_position_label.setText(f"Crosshair: ({x}, {y})")
 
     def create_line_roi(self):
         """Create a line ROI for intensity profiling."""
@@ -1243,10 +1342,11 @@ class ImageDisplayWindow(QMainWindow):
             return False
 
     def display_image(self, image):
-        # enable the line profiler button after the first image is displayed
+        # enable the line profiler and crosshair buttons after the first image is displayed
         if self.first_image:
             self.first_image = False
             self.btn_line_profiler.setEnabled(True)
+            self.btn_crosshair.setEnabled(True)
 
         if ENABLE_TRACKING:
             image = np.copy(image)
@@ -1292,6 +1392,9 @@ class ImageDisplayWindow(QMainWindow):
 
         if self.line_roi is not None and self.btn_line_profiler.isChecked():
             self.update_line_profile()
+
+        if self.crosshair_v_line is not None and self.btn_crosshair.isChecked():
+            self._update_crosshair_bounds()
 
     def mark_spot(self, image: np.ndarray, x: float, y: float):
         """Mark the detected laserspot location on the image.

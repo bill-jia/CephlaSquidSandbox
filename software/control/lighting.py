@@ -688,12 +688,20 @@ class SerialIlluminationDevice(IlluminationDevice):
 # LED matrix defaults (Teensy / SciMicroscopy channel-name conventions)
 # ---------------------------------------------------------------------------
 
+
+def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:
+    """Convert ``#RRGGBB`` to an (r, g, b) tuple of 0-1 floats."""
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0)
+
+# Mode color is no longer hardcoded here: the LED matrix color is a single global
+# RGB value (set live, recorded per ObservationState). The annulus [inner, outer]
+# values are defaults only — per-state led_matrix_inner_na/outer_na override them.
 _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
     "bf_full": {
         "source_code": 0,
         "label": "BF full",
         "matrix_channel_name": "BF LED matrix full",
-        "color": [1.0, 1.0, 1.0],
     },
     "df": {
         "source_code": 3,
@@ -704,44 +712,34 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
         "source_code": 4,
         "label": "BF center (low NA)",
         "matrix_channel_name": "BF LED matrix low NA",
-        # Center-only BF: firmware NA set low so `bf` lights only the central
-        # disk of LEDs. Without this the mode was identical to bf_full because
-        # the driver never re-issued na.<X> and the matrix_channel_name didn't
-        # match any non-`bf` branch.
-        "na": 0.2,
     },
     "left_half": {
         "source_code": 1,
         "label": "BF left half",
         "matrix_channel_name": "BF LED matrix left half",
-        "color": [0.0, 1.0, 0.0],
     },
     "right_half": {
         "source_code": 2,
         "label": "BF right half",
         "matrix_channel_name": "BF LED matrix right half",
-        "color": [0.0, 1.0, 0.0],
     },
     "top_half": {
         "source_code": 7,
         "label": "BF top half",
         "matrix_channel_name": "BF LED matrix top half",
-        "color": [0.0, 1.0, 0.0],
     },
     "bottom_half": {
         "source_code": 8,
         "label": "BF bottom half",
         "matrix_channel_name": "BF LED matrix bottom half",
-        "color": [0.0, 1.0, 0.0],
     },
     "sg": {
         "source_code": 0,
-        "label": "Single LED (green, on-axis)",
-        "matrix_channel_name": "Single LED green",
-        "color": [0.0, 1.0, 0.0],
+        "label": "Single LED (on-axis)",
+        "matrix_channel_name": "Single LED",
         "single_led": 0,
     },
-    # --- Experimental DPC-style patterns ---
+    # --- Annulus / DPC-style patterns (inner/outer NA adjustable per state) ---
     "outer_ring": {
         "source_code": 0,
         "label": "BF outer ring (annulus)",
@@ -750,46 +748,31 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
     },
     "half_ann_t": {
         "source_code": 0,
-        "label": "Half annulus top (exp.)",
+        "label": "Half annulus top",
         "matrix_channel_name": "BF LED matrix half annulus top",
         "annulus": [0.5, 0.95],
         "half": "t",
     },
     "half_ann_b": {
         "source_code": 0,
-        "label": "Half annulus bottom (exp.)",
+        "label": "Half annulus bottom",
         "matrix_channel_name": "BF LED matrix half annulus bottom",
         "annulus": [0.5, 0.95],
         "half": "b",
     },
     "half_ann_l": {
         "source_code": 0,
-        "label": "Half annulus left (exp.)",
+        "label": "Half annulus left",
         "matrix_channel_name": "BF LED matrix half annulus left",
         "annulus": [0.5, 0.95],
         "half": "l",
     },
     "half_ann_r": {
         "source_code": 0,
-        "label": "Half annulus right (exp.)",
+        "label": "Half annulus right",
         "matrix_channel_name": "BF LED matrix half annulus right",
         "annulus": [0.5, 0.95],
         "half": "r",
-    },
-    "bf_r": {
-        "source_code": 0,
-        "label": "BF (red)",
-        "matrix_channel_name": "BF LED matrix full_R",
-    },
-    "bf_g": {
-        "source_code": 0,
-        "label": "BF (green)",
-        "matrix_channel_name": "BF LED matrix full_G",
-    },
-    "bf_b": {
-        "source_code": 0,
-        "label": "BF (blue)",
-        "matrix_channel_name": "BF LED matrix full_B",
     },
 }
 
@@ -807,11 +790,21 @@ _DEFAULT_LEGACY_TO_MODE: Dict[str, str] = {
     "BF LED matrix half annulus bottom": "half_ann_b",
     "BF LED matrix half annulus left": "half_ann_l",
     "BF LED matrix half annulus right": "half_ann_r",
-    "BF LED matrix full_R": "bf_r",
-    "BF LED matrix full_G": "bf_g",
-    "BF LED matrix full_B": "bf_b",
-    "BF LED matrix full_RGB": "bf_full",
 }
+
+# Maps each scalar-NA mode to its NA "group". bf/df/low_na are independent; the
+# four DPC half-circles share the "dpc" group (partners locked). Annulus modes
+# use inner/outer NA (not a scalar group); single-LED uses its LED index.
+_NA_GROUP_OF_MODE: Dict[str, str] = {
+    "bf_full": "bf",
+    "df": "df",
+    "low_na": "low_na",
+    "left_half": "dpc",
+    "right_half": "dpc",
+    "top_half": "dpc",
+    "bottom_half": "dpc",
+}
+_NA_GROUPS: Tuple[str, ...] = ("bf", "df", "low_na", "dpc")
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +886,13 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             self._is_on_state = {n: False for n in channel_source_codes}
 
         self._active_channel: Optional[str] = None
+        # Per-state inner/outer NA override for annulus modes (None => mode default).
+        self._annulus_na_override: Optional[List[float]] = None
+        # Per-group scalar NA (keys: bf/df/low_na/dpc) applied when the matching
+        # mode fires. Empty => the firmware's current NA is used.
+        self._group_na: Dict[str, float] = {}
+        # LED index for the single-LED pattern (None => the mode's default index).
+        self._single_led_index: Optional[int] = None
 
     @property
     def is_unified_mode(self) -> bool:
@@ -946,7 +946,23 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         self._active_mode_key = mode_key
 
     def _apply_unified_intensity(self, intensity: float) -> None:
-        spec = self._modes[self._active_mode_key]
+        spec = dict(self._modes[self._active_mode_key])
+        if spec.get("annulus") is not None:
+            # Per-state inner/outer NA overrides the mode's default annulus radii.
+            if self._annulus_na_override is not None:
+                spec["annulus"] = [float(self._annulus_na_override[0]), float(self._annulus_na_override[1])]
+        elif spec.get("single_led") is not None:
+            if self._single_led_index is not None:
+                spec["single_led"] = int(self._single_led_index)
+        else:
+            # Scalar-NA mode (bf/df/low_na/dpc): push this mode's group NA to the
+            # array before the pattern fires, so each variety uses its own NA.
+            group = _NA_GROUP_OF_MODE.get(self._active_mode_key)
+            if group is not None and group in self._group_na and self._sci_array is not None:
+                try:
+                    self._sci_array.set_array_na(float(self._group_na[group]))
+                except Exception as exc:
+                    logger.warning(f"_apply_unified_intensity set_array_na failed: {exc}")
         source_code = int(spec["source_code"])
         mcu_name = str(spec.get("matrix_channel_name", "BF LED matrix full"))
         # [LED-DBG] temporary trace; flip serial_peripherals._LED_DBG = False to silence
@@ -966,13 +982,85 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             )
 
     def set_array_na(self, na: float) -> None:
-        """Update the SciMicroscopy array's objective-NA setting (no-op for MCU)."""
+        """Set the NA for the active scalar mode's group (no-op for non-scalar modes / MCU)."""
+        group = _NA_GROUP_OF_MODE.get(self._active_mode_key)
+        if group is not None:
+            self.set_group_na(group, na)
+
+    def set_group_na(self, group: str, na: float) -> None:
+        """Set a scalar-NA group's NA (bf/df/low_na/dpc). Pushed to the array now
+        if that group's mode is currently active; otherwise applied when it fires."""
+        self._group_na[group] = float(na)
+        if self._sci_array is not None and _NA_GROUP_OF_MODE.get(self._active_mode_key) == group:
+            try:
+                self._sci_array.set_array_na(float(na))
+            except Exception as exc:
+                logger.warning(f"set_group_na({group},{na}) failed: {exc}")
+
+    def get_group_na(self, group: str) -> Optional[float]:
+        """Current NA for a scalar-NA group, or None if unset."""
+        v = self._group_na.get(group)
+        return float(v) if v is not None else None
+
+    def set_single_led_index(self, index: int) -> None:
+        """Set the LED index used by the single-LED pattern (no-op for MCU)."""
+        self._single_led_index = int(index)
+
+    def get_single_led_index(self) -> Optional[int]:
+        """Current single-LED index: override if set, else the 'sg' mode default."""
+        if self._single_led_index is not None:
+            return int(self._single_led_index)
+        sl = self._modes.get("sg", {}).get("single_led") if self._unified else None
+        return int(sl) if sl is not None else None
+
+    def get_single_led_index_override(self) -> Optional[int]:
+        """Raw single-LED index override (None if unset; no mode-default fallback)."""
+        return int(self._single_led_index) if self._single_led_index is not None else None
+
+    def set_annulus_na(self, inner_na: float, outer_na: float) -> None:
+        """Set inner/outer NA radii for annulus / half-annulus patterns (no-op for MCU)."""
+        self._annulus_na_override = [float(inner_na), float(outer_na)]
+
+    def clear_annulus_na(self) -> None:
+        """Drop any inner/outer NA override so annulus modes use their mode default."""
+        self._annulus_na_override = None
+
+    def get_annulus_na(self) -> Optional[Tuple[float, float]]:
+        """Current inner/outer NA: per-state override, else the active mode's annulus default."""
+        if self._annulus_na_override is not None:
+            return (float(self._annulus_na_override[0]), float(self._annulus_na_override[1]))
+        spec = self._modes.get(self._active_mode_key, {}) if self._unified else {}
+        ann = spec.get("annulus")
+        if ann is not None:
+            return (float(ann[0]), float(ann[1]))
+        return None
+
+    def get_annulus_override(self) -> Optional[Tuple[float, float]]:
+        """Raw inner/outer NA override (None if unset; no mode-default fallback)."""
+        if self._annulus_na_override is not None:
+            return (float(self._annulus_na_override[0]), float(self._annulus_na_override[1]))
+        return None
+
+    def mode_is_annulus(self, mode_key: str) -> bool:
+        """True if *mode_key* is an annulus / half-annulus pattern (uses inner/outer NA)."""
+        spec = self._modes.get(mode_key)
+        return bool(spec and spec.get("annulus") is not None)
+
+    def set_array_color(self, rgb) -> None:
+        """Set the global LED matrix RGB color (0-1 floats; no-op for MCU)."""
         if self._sci_array is None:
             return
         try:
-            self._sci_array.set_array_na(float(na))
+            self._sci_array.set_default_color(tuple(float(c) for c in rgb))
         except Exception as exc:
-            logger.warning(f"set_array_na({na}) failed: {exc}")
+            logger.warning(f"set_array_color({rgb}) failed: {exc}")
+
+    def get_array_color(self) -> Optional[Tuple[float, float, float]]:
+        """Current global RGB color (0-1 floats), or None for MCU/unavailable."""
+        if self._sci_array is None:
+            return None
+        c = getattr(self._sci_array, "_default_color", None)
+        return tuple(float(x) for x in c) if c is not None else None
 
     @property
     def channel_names(self) -> List[str]:
@@ -1232,17 +1320,7 @@ class IlluminationController:
         if dev is None:
             return False
         dev.set_matrix_mode(mode_key)
-        unified_name = dev.unified_channel_name
-        if (
-            self._channel_state.get(unified_name)
-            and self._channel_state[unified_name].is_on
-            and self._hardware_asserted.get(unified_name)
-        ):
-            # Re-issue pattern so firmware refreshes with the new mode. set_intensity
-            # rewrites color/brightness and stores the mode; turn_on fires it.
-            intensity = self._channel_state[unified_name].intensity
-            dev.set_intensity(unified_name, intensity)
-            dev.turn_on(unified_name)
+        self._refire_led_matrix_if_on(dev)
         return True
 
     def get_led_matrix_mode(self) -> Optional[str]:
@@ -1252,14 +1330,93 @@ class IlluminationController:
         return self._led_matrix_unified.get_matrix_mode()
 
     def get_led_matrix_array_na(self) -> Optional[float]:
-        """Current SciMicroscopy LED array NA, or None if unavailable."""
+        """NA for the active scalar mode's group (falls back to the array's NA)."""
         dev = self._led_matrix_unified
         if dev is None:
             return None
         sci = getattr(dev, "_sci_array", None)
         if sci is None:
             return None
+        group = _NA_GROUP_OF_MODE.get(dev.get_matrix_mode())
+        if group is not None:
+            gv = dev.get_group_na(group)
+            if gv is not None:
+                return gv
         return float(getattr(sci, "NA", 0.0))
+
+    def set_led_matrix_group_na(self, group: str, na: float) -> bool:
+        """Set a scalar-NA group's NA (bf/df/low_na/dpc); re-fire if on."""
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        dev.set_group_na(group, float(na))
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def get_led_matrix_group_na(self, group: str) -> Optional[float]:
+        """Current NA for a scalar-NA group, or None if unset/unavailable."""
+        dev = self._led_matrix_unified
+        return dev.get_group_na(group) if dev is not None else None
+
+    def set_led_matrix_single_led_index(self, index: int) -> bool:
+        """Set the LED index used by the single-LED pattern; re-fire if on."""
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        dev.set_single_led_index(int(index))
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def get_led_matrix_single_led_index(self) -> Optional[int]:
+        """Current single-LED index, or None if unavailable."""
+        dev = self._led_matrix_unified
+        return dev.get_single_led_index() if dev is not None else None
+
+    def apply_led_matrix_state(self, ist: Any, fire: bool = True) -> None:
+        """Push a full LED-matrix pattern config from an IlluminatorState-like object
+        (color + per-group NA + annulus inner/outer + single-LED index) and select
+        its mode. Reads attributes defensively; no-op without a matrix.
+
+        When ``fire`` is True (default) the pattern is re-fired once if the channel
+        is currently lit. Pass ``fire=False`` to stage the config only (used when
+        applying a saved state whose digital gate is driven separately), so a
+        previously-on channel is not relit while staging an inactive state.
+        """
+        dev = self._led_matrix_unified
+        if dev is None:
+            return
+        # Select the mode first so set_group_na's "is this group active?" check and
+        # the annulus/single-led overrides resolve against the TARGET mode.
+        mode = getattr(ist, "led_matrix_mode", None)
+        if mode:
+            dev.set_matrix_mode(mode)
+        color = getattr(ist, "led_matrix_color", None)
+        if color is not None:
+            try:
+                dev.set_array_color(_hex_to_rgb01(color))
+            except Exception as exc:
+                logger.warning(f"apply_led_matrix_state color failed: {exc}")
+        for group, attr in (
+            ("bf", "led_matrix_bf_na"),
+            ("df", "led_matrix_df_na"),
+            ("low_na", "led_matrix_lowna_na"),
+            ("dpc", "led_matrix_dpc_na"),
+        ):
+            v = getattr(ist, attr, None)
+            if v is not None:
+                dev.set_group_na(group, float(v))
+        inner = getattr(ist, "led_matrix_inner_na", None)
+        outer = getattr(ist, "led_matrix_outer_na", None)
+        if inner is not None and outer is not None:
+            dev.set_annulus_na(float(inner), float(outer))
+        elif dev.mode_is_annulus(mode or ""):
+            # Annulus mode with no stored radii: use the mode default, not a leftover.
+            dev.clear_annulus_na()
+        sli = getattr(ist, "led_matrix_single_led_index", None)
+        if sli is not None:
+            dev.set_single_led_index(int(sli))
+        if fire:
+            self._refire_led_matrix_if_on(dev)
 
     def led_matrix_mode_uses_array_na(self, mode_key: Optional[str]) -> bool:
         """True if *mode_key* on the unified LED matrix is computed against the
@@ -1270,12 +1427,26 @@ class IlluminationController:
             return False
         return dev.mode_uses_array_na(mode_key)
 
+    def _refire_led_matrix_if_on(self, dev: "LEDMatrixIlluminationDevice") -> None:
+        """Re-issue the current pattern so a staged color/NA/annulus/mode change
+        takes immediate visual effect (the firmware latches these on the next
+        pattern command). No-op when the matrix channel is not currently lit.
+
+        ``turn_on`` re-runs ``_apply_unified_intensity`` with the device's stored
+        intensity, so it alone re-applies color/brightness + the pattern."""
+        unified_name = dev.unified_channel_name
+        if (
+            self._channel_state.get(unified_name)
+            and self._channel_state[unified_name].is_on
+            and self._hardware_asserted.get(unified_name)
+        ):
+            dev.turn_on(unified_name)
+
     def set_led_matrix_array_na(self, na: float) -> bool:
         """Update the SciMicroscopy LED array NA (controls bf / df / dpc radius).
 
         If a unified LED-matrix channel is currently asserted on hardware, the
-        current pattern is re-fired so the new NA takes immediate visual effect
-        (firmware applies stored NA only on the next pattern command).
+        current pattern is re-fired so the new NA takes immediate visual effect.
         Returns False when no SciMicroscopy LED array is available.
         """
         dev = self._led_matrix_unified
@@ -1286,18 +1457,70 @@ class IlluminationController:
             return False
         logger.info(f"[LED-DBG] IC.set_led_matrix_array_na requested NA={na}")
         dev.set_array_na(float(na))
-        unified_name = dev.unified_channel_name
-        if (
-            self._channel_state.get(unified_name)
-            and self._channel_state[unified_name].is_on
-            and self._hardware_asserted.get(unified_name)
-        ):
-            # Re-issue pattern so firmware refreshes with the new NA. set_intensity
-            # rewrites color/brightness and stores the mode; turn_on fires it.
-            intensity = self._channel_state[unified_name].intensity
-            dev.set_intensity(unified_name, intensity)
-            dev.turn_on(unified_name)
+        self._refire_led_matrix_if_on(dev)
         return True
+
+    def set_led_matrix_annulus_na(self, inner_na: float, outer_na: float) -> bool:
+        """Set inner/outer NA radii for annulus / half-annulus patterns; re-fire if on.
+        Returns False when no SciMicroscopy LED array is available."""
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        logger.info(f"[LED-DBG] IC.set_led_matrix_annulus_na inner={inner_na} outer={outer_na}")
+        dev.set_annulus_na(float(inner_na), float(outer_na))
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def get_led_matrix_annulus_na(self) -> Optional[Tuple[float, float]]:
+        """Current inner/outer NA for annulus modes, or None if unavailable."""
+        dev = self._led_matrix_unified
+        if dev is None:
+            return None
+        return dev.get_annulus_na()
+
+    def get_led_matrix_annulus_override(self) -> Optional[Tuple[float, float]]:
+        """User-set inner/outer NA override (None if unset; for persistence capture)."""
+        dev = self._led_matrix_unified
+        return dev.get_annulus_override() if dev is not None else None
+
+    def get_led_matrix_single_led_index_override(self) -> Optional[int]:
+        """User-set single-LED index override (None if unset; for persistence capture)."""
+        dev = self._led_matrix_unified
+        return dev.get_single_led_index_override() if dev is not None else None
+
+    def clear_led_matrix_annulus_na(self) -> bool:
+        """Drop any inner/outer NA override so annulus modes use their default; re-fire if on."""
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        dev.clear_annulus_na()
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def led_matrix_mode_is_annulus(self, mode_key: Optional[str]) -> bool:
+        """True if *mode_key* is an annulus / half-annulus pattern (inner/outer NA)."""
+        dev = self._led_matrix_unified
+        if dev is None or not mode_key:
+            return False
+        return dev.mode_is_annulus(mode_key)
+
+    def set_led_matrix_color(self, rgb: Tuple[float, float, float]) -> bool:
+        """Set the global LED matrix RGB color (0-1 floats); re-fire if on.
+        Returns False when no SciMicroscopy LED array is available."""
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        logger.info(f"[LED-DBG] IC.set_led_matrix_color rgb={rgb}")
+        dev.set_array_color(rgb)
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def get_led_matrix_color(self) -> Optional[Tuple[float, float, float]]:
+        """Current global LED matrix RGB color (0-1 floats), or None if unavailable."""
+        dev = self._led_matrix_unified
+        if dev is None:
+            return None
+        return dev.get_array_color()
 
     def illumination_maps_to_unified_led_matrix(self, illumination_channel_name: Optional[str]) -> bool:
         """True if *illumination_channel_name* (from acquisition config) maps to the unified LED matrix.
@@ -1381,6 +1604,15 @@ class IlluminationController:
                     dev.set_matrix_mode(mode_key)
                 dev.set_intensity(unified_name, intensity)
                 self._channel_state[unified_name].intensity = intensity
+                # Re-fire so a live intensity change reaches the array immediately.
+                # set_intensity only stages color/brightness; the firmware latches
+                # brightness on the next pattern command, so without this the matrix
+                # had to be toggled off/on for a new % to take visual effect.
+                if self._channel_state[unified_name].is_on and self._hardware_asserted.get(unified_name):
+                    dev.turn_on(unified_name)
+            return
+        if channel_name not in self._channel_state:
+            logger.debug(f"set_channel_intensity: unknown channel '{channel_name}' (skipped)")
             return
         if abs(float(intensity) - float(self._channel_state[channel_name].intensity)) < 0.1:
             # self._log.debug(f"set_channel_intensity: intensity for {channel_name} is the same as the current intensity")
@@ -1486,6 +1718,9 @@ class IlluminationController:
                     self._hardware_asserted[unified_name] = is_on
             return
 
+        if channel_name not in self._channel_state:
+            logger.debug(f"set_channel_state: unknown channel '{channel_name}' (skipped)")
+            return
         self._channel_state[channel_name].is_on = is_on
         if apply_hw and self._hardware_asserted.get(channel_name) != is_on:
             dev = self._channel_map.get(channel_name)
@@ -1530,9 +1765,11 @@ class IlluminationController:
                 unified_name, _mode_key = lm
                 self._channel_state[unified_name].is_on = is_on
                 resolved_targets[unified_name] = is_on
-            else:
+            elif channel_name in self._channel_state:
                 self._channel_state[channel_name].is_on = is_on
                 resolved_targets[channel_name] = is_on
+            else:
+                logger.debug(f"set_channel_states_batch: unknown channel '{channel_name}' (skipped)")
 
         if not apply_hw:
             return
@@ -1784,13 +2021,9 @@ class IlluminationController:
             timed = ist.timing is not None
             if turn_on:
                 if self.has_unified_led_matrix():
-                    mode = ist.led_matrix_mode
-                    # NA before mode so bf/df/dpc fire at the right NA; skip NA for
-                    # modes that ignore it (single-LED, annulus) so it can't clobber.
-                    if ist.led_matrix_na is not None and self.led_matrix_mode_uses_array_na(mode):
-                        self.set_led_matrix_array_na(float(ist.led_matrix_na))
-                    if mode:
-                        self.set_led_matrix_mode(mode)
+                    # Push the full per-pattern config (color + per-group NA +
+                    # annulus + single-LED) and select the mode in one re-fire.
+                    self.apply_led_matrix_state(ist)
                 self.set_channel_intensity(ist.illumination_channel, ist.intensity)
                 if timed and not gate_timed_illuminators:
                     # Skip the digital ON; NIDAQ waveform will drive it.

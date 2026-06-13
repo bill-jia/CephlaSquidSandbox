@@ -209,6 +209,70 @@ For low-level debugging or firmware development:
 | SET_WATCHDOG_TIMEOUT | 40 | Set serial watchdog timeout and enable (v1.1+) |
 | HEARTBEAT | 42 | No-op keepalive for serial watchdog (v1.1+) |
 
+## SciMicroscopy LED Matrix (unified mode)
+
+When a SciMicroscopy LED array (e.g. SCI DOME) is configured as `led_matrix:
+{driver: scimicroscopy_led_array}`, the array is exposed as a single unified
+`"LED matrix"` channel whose **pattern** is selected by a *mode* (`bf_full`,
+`df`, `low_na`, `left/right/top/bottom_half`, `outer_ring`, `half_ann_{t,b,l,r}`,
+`sg` single-LED). Modes are defined in `_DEFAULT_UNIFIED_MODES`
+(`control/lighting.py`).
+
+### Color, NA, and the config popup
+
+Color and NA are **not hardcoded per mode**. They are set at runtime and recorded
+per `ObservationState`:
+
+- **Color** — one *global* RGB value for the whole array, set via
+  `IlluminationController.set_led_matrix_color((r,g,b))` (0–1 floats) → firmware
+  `sc.<r>.<g>.<b>`. Recorded per state as `IlluminatorState.led_matrix_color`
+  (hex). The old per-mode colors and the separate `bf_r/bf_g/bf_b` modes were
+  removed.
+- **Per-pattern NA** — each scalar variety has its own NA, recorded in its own
+  field: `bf_full` → `led_matrix_bf_na`, `df` → `led_matrix_df_na`, `low_na` →
+  `led_matrix_lowna_na`, and the four DPC half-circles share `led_matrix_dpc_na`
+  (partners locked). Set via `set_led_matrix_group_na(group, na)` (groups: `bf`,
+  `df`, `low_na`, `dpc`); the inline NA box routes through `set_led_matrix_array_na`
+  to the *active* mode's group. The firmware NA (`na.<NA*100>`) is applied per
+  mode at fire-time.
+- **Annulus inner/outer NA** (annulus `outer_ring` + `half_ann_*`) —
+  `set_led_matrix_annulus_na(inner, outer)` → firmware `an.<min>.<max>` /
+  `ha.<h>.<min>.<max>`. Recorded as `led_matrix_inner_na` / `led_matrix_outer_na`;
+  the whole annulus family shares one inner/outer pair.
+- **Single-LED index** — `set_led_matrix_single_led_index(idx)` → firmware
+  `l.<idx>`. Recorded as `led_matrix_single_led_index`.
+
+The illumination panel shows a compact mode selector + an inline NA box (the
+active scalar mode's NA), and a **⚙ config popup** (`LEDMatrixConfigDialog`) that
+shows **every variety at once**: RGB color, per-pattern NA (BF / DF / low-NA / DPC),
+annulus inner/outer NA, single-LED index, and read-only **1.25× / 0.75×
+objective-NA** references (from the current objective's `NA` via `ObjectiveStore`).
+Changes apply live (the pattern is re-fired) and are recorded on the observation
+state, so they reload and persist across restart.
+
+> Top/bottom DPC half-circles and half-annuli are flipped vs the firmware's array
+> letters so the lit half matches the camera image (camera Y is inverted vs the
+> LED array); left/right are unchanged.
+
+### NA geometry
+
+The firmware computes each LED's NA as `NA_led = r / sqrt(r² + z²)` where `r` is
+the LED's in-plane radius and `z` is the array-to-sample **working distance**
+(the `led_matrix.config.distance` value, sent once at startup as `sad.<mm>`). `bf`
+lights LEDs with `NA_led ≤ NA`; `an` lights `min ≤ NA_led ≤ max`. NA accuracy
+therefore depends on `distance` matching the true physical WD (config-driven, not
+hardcoded).
+
+### Live intensity
+
+LED-matrix intensity is adjustable while the channel is **on** — a change re-fires
+the current pattern so the new brightness takes effect immediately (no off/on
+toggle required).
+
+> The legacy sequential **RGB-separation acquisition** (capture `full_R/_G/_B` →
+> combine into an RGB TIFF) was removed along with the R/G/B modes; use the global
+> color setting instead.
+
 ## Troubleshooting
 
 ### "Firmware does not support multi-port illumination commands"

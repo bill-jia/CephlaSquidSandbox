@@ -179,8 +179,19 @@ def observation_state_to_yaml(
         }
         if ist.led_matrix_mode is not None:
             entry["led_matrix_mode"] = ist.led_matrix_mode
-        if ist.led_matrix_na is not None:
-            entry["led_matrix_na"] = ist.led_matrix_na
+        for _fld in (
+            "led_matrix_bf_na",
+            "led_matrix_df_na",
+            "led_matrix_lowna_na",
+            "led_matrix_dpc_na",
+            "led_matrix_inner_na",
+            "led_matrix_outer_na",
+            "led_matrix_single_led_index",
+            "led_matrix_color",
+        ):
+            _val = getattr(ist, _fld)
+            if _val is not None:
+                entry[_fld] = _val
         if ist.timing is not None:
             entry["timing"] = {
                 "start_offset_ms": ist.timing.start_offset_ms,

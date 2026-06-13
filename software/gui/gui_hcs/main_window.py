@@ -1060,6 +1060,7 @@ class HighContentScreeningGui(QMainWindow):
             self.microscope.illumination_controller,
             parent=self,
             obs_controller=self.microscope.obs_controller,
+            objective_store=self.objectiveStore,
         )
 
         # Observation State preset widget (save/load imaging presets)

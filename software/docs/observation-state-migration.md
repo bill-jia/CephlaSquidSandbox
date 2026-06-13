@@ -45,9 +45,21 @@ IlluminatorState
   illumination_channel: str     # name referencing IlluminationChannelConfig
   intensity: float              # 0-100%
   on: bool                      # logical on/off
-  led_matrix_mode: str          # LED pattern key (optional)
-  led_matrix_na: float          # SciMicroscopy array NA for bf/df/dpc (optional)
+  led_matrix_mode: str              # LED pattern key (optional)
+  # Per-pattern LED matrix NA (all optional; SciMicroscopy unified matrix):
+  led_matrix_bf_na: float           # NA for BF full
+  led_matrix_df_na: float           # NA for dark field
+  led_matrix_lowna_na: float        # NA for BF center (low NA)
+  led_matrix_dpc_na: float          # shared NA for the DPC half-circles
+  led_matrix_inner_na: float        # annulus family inner NA
+  led_matrix_outer_na: float        # annulus family outer NA
+  led_matrix_single_led_index: int  # single-LED pattern index
+  led_matrix_color: str             # global RGB color (hex)
 ```
+
+> Note: the legacy scalar `led_matrix_na` field was replaced by the per-pattern
+> fields above. Old saved YAML carrying `led_matrix_na` is migrated automatically
+> on load (mapped onto the field for the entry's mode) and self-heals on next save.
 
 ## Key Naming Distinctions
 

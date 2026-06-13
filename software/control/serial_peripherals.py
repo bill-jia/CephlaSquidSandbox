@@ -1200,6 +1200,10 @@ class SciMicroscopyLEDArray:
             f"sc.{r}.{g}.{b}\r", f"Current color balance values are {r}.{g}.{b}", read_delay=0.01, print_response=False
         )
 
+    def set_default_color(self, color):
+        """Set the array-wide RGB color (0-1 floats) used by every pattern."""
+        self._default_color = tuple(float(c) for c in color)
+
     def set_brightness(self, brightness):
         # 0 to 100
         raw_brightness = brightness
@@ -1274,32 +1278,24 @@ class SciMicroscopyLEDArray:
         """Configure color, brightness and illumination mode for a channel.
 
         ``mode_spec`` (optional) carries per-mode parameters from the LED
-        matrix mode dict, allowing patterns that need NA, annulus radii, or a
+        matrix mode dict, allowing patterns that need annulus radii or a
         half-annulus direction to be expressed declaratively:
 
-            { "na": 0.2 }                  → low-NA brightfield
             { "annulus": [0.5, 0.95] }     → annulus
             { "annulus": [0.5, 0.95],
               "half": "t" }                → half-annulus (experimental)
+            { "single_led": 0 }            → single LED
 
+        Color is a single global value (set via :meth:`set_default_color`); the
+        scalar NA used by bf/df/dpc comes from :meth:`set_NA` / ``set_array_na``.
         When ``mode_spec`` is omitted, falls back to channel-name matching to
         preserve the original legacy code path.
         """
         spec = mode_spec or {}
 
-        # Per-mode "color" override wins; then legacy _R/_G/_B name suffixes;
-        # otherwise the array-wide default_color.
-        spec_color = spec.get("color")
-        if spec_color is not None:
-            color = tuple(float(c) for c in spec_color)
-        elif "BF LED matrix full_R" in channel_name:
-            color = (1.0, 0.0, 0.0)
-        elif "BF LED matrix full_G" in channel_name:
-            color = (0.0, 1.0, 0.0)
-        elif "BF LED matrix full_B" in channel_name:
-            color = (0.0, 0.0, 1.0)
-        else:
-            color = self._default_color
+        # LED matrix color is a single global value (set via set_default_color);
+        # it is no longer hardcoded per mode or per channel-name suffix.
+        color = self._default_color
         annulus = spec.get("annulus")
         half = spec.get("half")
         spec_na = spec.get("na")
@@ -1310,7 +1306,10 @@ class SciMicroscopyLEDArray:
             mode = self.set_single_led(int(single_led))
         elif annulus is not None and half:
             min_na, max_na = float(annulus[0]), float(annulus[1])
-            mode = self.set_half_annulus_pattern(half, min_na, max_na)
+            # Flip top<->bottom so the lit half matches the camera image (camera Y
+            # is inverted vs the LED array). Same flip as the dpc branch below.
+            cam_half = {"t": "b", "b": "t"}.get(half, half)
+            mode = self.set_half_annulus_pattern(cam_half, min_na, max_na)
         elif annulus is not None:
             min_na, max_na = float(annulus[0]), float(annulus[1])
             mode = self.set_annulus(min_na, max_na)
@@ -1320,10 +1319,12 @@ class SciMicroscopyLEDArray:
                 mode = "dpc.l"
             elif "BF LED matrix right half" in channel_name:
                 mode = "dpc.r"
+            # Top/bottom are swapped vs the firmware's array letters so the lit
+            # half matches the camera image (camera Y is inverted vs the array).
             elif "BF LED matrix top half" in channel_name:
-                mode = "dpc.t"
-            elif "BF LED matrix bottom half" in channel_name:
                 mode = "dpc.b"
+            elif "BF LED matrix bottom half" in channel_name:
+                mode = "dpc.t"
             elif "BF LED matrix low NA" in channel_name or "BF LED matrix center" in channel_name:
                 mode = "bf"
             elif "BF LED matrix full" in channel_name:
@@ -1393,6 +1394,9 @@ class SciMicroscopyLEDArray_Simulation:
         r = int(255 * color[0])
         g = int(255 * color[1])
         b = int(255 * color[2])
+
+    def set_default_color(self, color):
+        self._default_color = tuple(float(c) for c in color)
 
     def set_brightness(self, brightness):
         # 0 to 100

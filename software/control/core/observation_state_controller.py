@@ -19,7 +19,7 @@ from control._def import NL5_USE_DOUT
 
 import contextlib
 import time
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import squid.logging
 from control._def import *
@@ -186,40 +186,124 @@ class ObservationStateController:
         except Exception as e:
             self._log.warning("Could not set illumination on/off for %r: %s", channel, e)
 
-    def set_led_matrix_array_na(self, na: float) -> bool:
-        """GUI-safe entrypoint to update the SciMicroscopy LED array NA.
+    # Per-state field for each scalar-NA group.
+    _GROUP_NA_FIELD = {
+        "bf": "led_matrix_bf_na",
+        "df": "led_matrix_df_na",
+        "low_na": "led_matrix_lowna_na",
+        "dpc": "led_matrix_dpc_na",
+    }
 
-        Persists the NA onto the relevant illuminator states so it is saved with
-        the ObservationState, then applies it to hardware. Returns the underlying
-        IC result (False if no array is available).
-        """
-        if self._current_state is not None:
-            for ist in self._current_state.illuminator_states:
-                if ist.led_matrix_mode is not None or (
-                    hasattr(self.ic, "illumination_maps_to_unified_led_matrix")
-                    and self.ic.illumination_maps_to_unified_led_matrix(ist.illumination_channel)
-                ):
-                    ist.led_matrix_na = float(na)
+    def _active_na_group(self) -> Optional[str]:
+        from control.lighting import _NA_GROUP_OF_MODE
+
         try:
-            if hasattr(self.ic, "set_led_matrix_array_na"):
-                return bool(self.ic.set_led_matrix_array_na(float(na)))
+            mode = self.ic.get_led_matrix_mode()
+        except Exception:
+            mode = None
+        return _NA_GROUP_OF_MODE.get(mode) if mode else None
+
+    def set_led_matrix_array_na(self, na: float) -> bool:
+        """Set the NA for the active scalar mode's group (used by the inline NA box).
+
+        Persists onto the matrix illuminator states so it saves with the
+        ObservationState, then applies to hardware.
+        """
+        group = self._active_na_group()
+        if group is None:
+            return False
+        return self.set_led_matrix_group_na(group, na)
+
+    def set_led_matrix_group_na(self, group: str, na: float) -> bool:
+        """Persist a scalar-NA group's NA (bf/df/low_na/dpc) onto matrix states and apply."""
+        field = self._GROUP_NA_FIELD.get(group)
+        if field is None:
+            return False
+        for ist in self._matrix_illuminator_states():
+            setattr(ist, field, float(na))
+        try:
+            if hasattr(self.ic, "set_led_matrix_group_na"):
+                return bool(self.ic.set_led_matrix_group_na(group, float(na)))
         except Exception as e:
-            self._log.warning("Could not set LED matrix array NA: %s", e)
+            self._log.warning("Could not set LED matrix group NA: %s", e)
+        return False
+
+    def set_led_matrix_single_led_index(self, index: int) -> bool:
+        """Persist the single-LED index onto matrix states and apply to hardware."""
+        for ist in self._matrix_illuminator_states():
+            ist.led_matrix_single_led_index = int(index)
+        try:
+            if hasattr(self.ic, "set_led_matrix_single_led_index"):
+                return bool(self.ic.set_led_matrix_single_led_index(int(index)))
+        except Exception as e:
+            self._log.warning("Could not set LED matrix single-LED index: %s", e)
         return False
 
     def set_led_matrix_mode(self, mode: str) -> None:
         """Update LED matrix mode on relevant illuminator states and apply to IC."""
-        if self._current_state is not None:
-            for ist in self._current_state.illuminator_states:
-                if ist.led_matrix_mode is not None or (
-                    hasattr(self.ic, "illumination_maps_to_unified_led_matrix")
-                    and self.ic.illumination_maps_to_unified_led_matrix(ist.illumination_channel)
-                ):
-                    ist.led_matrix_mode = mode
+        for ist in self._matrix_illuminator_states():
+            ist.led_matrix_mode = mode
         try:
             self.ic.set_led_matrix_mode(mode)
         except Exception as e:
             self._log.warning("Could not set LED matrix mode: %s", e)
+
+    def _is_matrix_state(self, ist) -> bool:
+        """True if *ist* maps to the unified LED matrix (by mode or channel name)."""
+        if ist.led_matrix_mode is not None:
+            return True
+        return bool(
+            hasattr(self.ic, "illumination_maps_to_unified_led_matrix")
+            and self.ic.illumination_maps_to_unified_led_matrix(ist.illumination_channel)
+        )
+
+    def _matrix_illuminator_states(self):
+        """Yield the current state's illuminator entries that map to the unified LED matrix."""
+        if self._current_state is None:
+            return
+        for ist in self._current_state.illuminator_states:
+            if self._is_matrix_state(ist):
+                yield ist
+
+    @staticmethod
+    def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:
+        h = hex_color.lstrip("#")
+        return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0)
+
+    @staticmethod
+    def _rgb01_to_hex(rgb: Tuple[float, float, float]) -> str:
+        return "#{:02X}{:02X}{:02X}".format(
+            max(0, min(255, round(float(rgb[0]) * 255))),
+            max(0, min(255, round(float(rgb[1]) * 255))),
+            max(0, min(255, round(float(rgb[2]) * 255))),
+        )
+
+    def set_led_matrix_annulus_na(self, inner_na: float, outer_na: float) -> bool:
+        """Persist inner/outer annulus NA onto matrix states and apply to hardware."""
+        for ist in self._matrix_illuminator_states():
+            ist.led_matrix_inner_na = float(inner_na)
+            ist.led_matrix_outer_na = float(outer_na)
+        try:
+            if hasattr(self.ic, "set_led_matrix_annulus_na"):
+                return bool(self.ic.set_led_matrix_annulus_na(float(inner_na), float(outer_na)))
+        except Exception as e:
+            self._log.warning("Could not set LED matrix annulus NA: %s", e)
+        return False
+
+    def set_led_matrix_color(self, color_hex: str) -> bool:
+        """Persist the global LED matrix color (hex) onto matrix states and apply to hardware.
+
+        Color is global on the array (one value for all modes) but recorded per
+        ObservationState so it saves/restores.
+        """
+        for ist in self._matrix_illuminator_states():
+            ist.led_matrix_color = color_hex
+        try:
+            if hasattr(self.ic, "set_led_matrix_color"):
+                return bool(self.ic.set_led_matrix_color(self._hex_to_rgb01(color_hex)))
+        except Exception as e:
+            self._log.warning("Could not set LED matrix color: %s", e)
+        return False
 
     def set_trigger_mode(self, mode) -> None:
         """Delegate trigger mode to LiveController."""
@@ -326,31 +410,27 @@ class ObservationStateController:
             return
         ic = self.ic
         for ist in self._current_state.illuminator_states:
+            # Stage the LED-matrix pattern config (color + per-group NA + annulus +
+            # single-LED + mode) for matrix-mapped states regardless of on/off, WITHOUT
+            # firing — the digital gate below controls on/off. This ensures a state
+            # saved with the matrix off still seeds the device so a later toggle-on
+            # fires with the saved values.
+            if (
+                self._is_matrix_state(ist)
+                and getattr(ic, "has_unified_led_matrix", lambda: False)()
+                and hasattr(ic, "apply_led_matrix_state")
+            ):
+                with self._time("obs:ip:set_led_matrix_mode"):
+                    ic.apply_led_matrix_state(ist, fire=False)
+
             if not ist.on:
                 # Inactive: ensure hardware matches the off intent without
-                # re-asserting intensity / matrix mode / laser power.
+                # re-asserting intensity / laser power.
                 with self._time("obs:ip:set_channel_state"):
                     ic.set_channel_state(ist.illumination_channel, False)
                 continue
 
             timed = ist.timing is not None
-
-            with self._time("obs:ip:set_led_matrix_mode"):
-                has_matrix = getattr(ic, "has_unified_led_matrix", lambda: False)()
-                mode = ist.led_matrix_mode
-                na = ist.led_matrix_na
-                # NA before mode so the bf/df/dpc pattern fires at the right NA.
-                # Skip NA for modes that ignore it (single-LED, annulus, fixed-NA)
-                # so a stored NA can't re-fire over e.g. a single-LED pattern.
-                if (
-                    na is not None
-                    and has_matrix
-                    and hasattr(ic, "set_led_matrix_array_na")
-                    and getattr(ic, "led_matrix_mode_uses_array_na", lambda m: True)(mode)
-                ):
-                    ic.set_led_matrix_array_na(float(na))
-                if mode and has_matrix:
-                    ic.set_led_matrix_mode(mode)
 
             # Always send the intensity command (serial for CoolLED-like
             # devices, DAC for IORouted) so the LED is at the right level
@@ -846,12 +926,24 @@ class ObservationStateController:
     def _merge_led_matrix_state(
         states: List[IlluminatorState], ic: Any
     ) -> List[IlluminatorState]:
-        """Capture the live LED matrix mode and array NA onto matrix-mapped states."""
+        """Capture the live LED matrix pattern config (mode, per-group NA, annulus
+        NA, single-LED index, color) onto matrix-mapped states for cross-session save."""
         if ic is None or not getattr(ic, "has_unified_led_matrix", lambda: False)():
             return states
         mode = ic.get_led_matrix_mode()
-        na = ic.get_led_matrix_array_na() if hasattr(ic, "get_led_matrix_array_na") else None
-        if mode is None and na is None:
+        group_na = {}
+        if hasattr(ic, "get_led_matrix_group_na"):
+            for group, field in ObservationStateController._GROUP_NA_FIELD.items():
+                v = ic.get_led_matrix_group_na(group)
+                if v is not None:
+                    group_na[field] = float(v)
+        # Use override-only getters so we record what the user actually set, not a
+        # mode default (which would mask "unset" and pollute every saved state).
+        annulus = ic.get_led_matrix_annulus_override() if hasattr(ic, "get_led_matrix_annulus_override") else None
+        sli = ic.get_led_matrix_single_led_index_override() if hasattr(ic, "get_led_matrix_single_led_index_override") else None
+        rgb = ic.get_led_matrix_color() if hasattr(ic, "get_led_matrix_color") else None
+        color_hex = ObservationStateController._rgb01_to_hex(rgb) if rgb is not None else None
+        if mode is None and not group_na and annulus is None and sli is None and color_hex is None:
             return states
         uses_matrix = getattr(ic, "illumination_maps_to_unified_led_matrix", None)
         unified = getattr(ic, "unified_led_matrix_channel_name", lambda: None)()
@@ -872,8 +964,14 @@ class ObservationStateController:
             update: Dict[str, Any] = {}
             if mode is not None:
                 update["led_matrix_mode"] = mode
-            if na is not None:
-                update["led_matrix_na"] = float(na)
+            update.update(group_na)
+            if annulus is not None:
+                update["led_matrix_inner_na"] = float(annulus[0])
+                update["led_matrix_outer_na"] = float(annulus[1])
+            if sli is not None:
+                update["led_matrix_single_led_index"] = int(sli)
+            if color_hex is not None:
+                update["led_matrix_color"] = color_hex
             out.append(ist.model_copy(update=update) if update else ist)
         return out
 

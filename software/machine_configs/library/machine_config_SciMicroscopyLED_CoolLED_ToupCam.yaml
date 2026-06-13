@@ -166,7 +166,7 @@ devices:
     connection:
       serial_number: "12732490"
     config:
-      distance: 65
+      distance: 71
       default_na: 0.8
       turn_on_delay: 0.03
       default_color: [0, 1, 0]

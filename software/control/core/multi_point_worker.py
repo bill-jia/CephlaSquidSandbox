@@ -3102,21 +3102,18 @@ class MultiPointWorker:
 
                     save_layout = self._build_save_layout(region_plan, event)
                     with self._timing.get_timer("acquire_camera_image"):
-                        if "RGB" in config.name:
-                            self.acquire_rgb_image(config, file_ID, current_path, z_level, region_id, fov)
-                        else:
-                            with self._timing.get_timer("acquire_camera_image_inner"):
-                                self.acquire_camera_image(
-                                    config,
-                                    file_ID,
-                                    current_path,
-                                    z_level,
-                                    region_id=region_id,
-                                    fov=fov,
-                                    config_idx=save_layout.c_index,
-                                    filename_channel_label=preset_name,
-                                    save_layout=save_layout,
-                                )
+                        with self._timing.get_timer("acquire_camera_image_inner"):
+                            self.acquire_camera_image(
+                                config,
+                                file_ID,
+                                current_path,
+                                z_level,
+                                region_id=region_id,
+                                fov=fov,
+                                config_idx=save_layout.c_index,
+                                filename_channel_label=preset_name,
+                                save_layout=save_layout,
+                            )
 
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
@@ -3988,178 +3985,6 @@ class MultiPointWorker:
             if self.abort_requested_fn():
                 return
             time.sleep(min(slice_s, remaining))
-
-    def acquire_rgb_image(self, config, file_ID, current_path, k, region_id, fov):
-        # go through the channels
-        rgb_channels = ["BF LED matrix full_R", "BF LED matrix full_G", "BF LED matrix full_B"]
-        images = {}
-
-        for config_ in self.liveController.get_channels(self.objectiveStore.current_objective):
-            if config_.name in rgb_channels:
-                if (
-                    self.liveController.trigger_mode == TriggerMode.SOFTWARE
-                    and self.keep_illuminators_on_between_captures
-                    and self._last_illumination_config_name is not None
-                    and self._last_illumination_config_name != config_.name
-                ):
-                    self.liveController.obs_controller.turn_off_illumination()
-
-                self._select_config(config_)
-
-                # trigger acquisition (including turning on the illumination)
-                if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-                    # TODO(imo): use illum controller
-                    self.liveController.obs_controller.turn_on_illumination()
-                    self.wait_till_operation_is_completed()
-
-                # read camera frame
-                self.camera.send_trigger(illumination_time=self.camera.get_exposure_time())
-                image = self.camera.read_frame()
-                if image is None:
-                    self._log.warning("self.camera.read_frame() returned None")
-                    continue
-
-                # TODO(imo): use illum controller
-                # turn off the illumination if using software trigger
-                if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
-                    if not self.keep_illuminators_on_between_captures:
-                        self.liveController.obs_controller.turn_off_illumination()
-                self._last_illumination_config_name = config_.name
-
-                # add the image to dictionary
-                images[config_.name] = np.copy(image)
-
-        # Check if the image is RGB or monochrome
-        i_size = images["BF LED matrix full_R"].shape
-
-        current_capture_info = CaptureInfo(
-            position=self.stage.get_pos(),
-            z_index=k,
-            capture_time=time.time(),
-            z_piezo_um=(self.z_piezo_um if self.use_piezo else None),
-            observation_state=config,
-            save_directory=current_path,
-            file_id=file_ID,
-            region_id=region_id,
-            fov=fov,
-            configuration_idx=0,
-            time_point=self.time_point,
-            file_saving_option=self.file_saving_option,
-            acquisition_root=self.experiment_path,
-        )
-
-        if len(i_size) == 3:
-            # If already RGB, write and emit individual channels
-            self._log.debug("writing R, G, B channels")
-            self.handle_rgb_channels(images, current_capture_info)
-        else:
-            # If monochrome, reconstruct RGB image
-            self._log.debug("constructing RGB image")
-            self.construct_rgb_image(images, current_capture_info)
-
-    @staticmethod
-    def handle_rgb_generation(current_round_images, capture_info: CaptureInfo):
-        keys_to_check = ["BF LED matrix full_R", "BF LED matrix full_G", "BF LED matrix full_B"]
-        if all(key in current_round_images for key in keys_to_check):
-            _log.debug(f"constructing RGB image: dtype={current_round_images['BF LED matrix full_R'].dtype}")
-            size = current_round_images["BF LED matrix full_R"].shape
-            rgb_image = np.zeros((*size, 3), dtype=current_round_images["BF LED matrix full_R"].dtype)
-            _log.debug(f"RGB image shape: {rgb_image.shape}")
-            rgb_image[:, :, 0] = current_round_images["BF LED matrix full_R"]
-            rgb_image[:, :, 1] = current_round_images["BF LED matrix full_G"]
-            rgb_image[:, :, 2] = current_round_images["BF LED matrix full_B"]
-
-            # TODO(imo): There used to be a "display image" comment here, and then an unused cropped image.  Do we need to emit an image here?
-
-            # write the image
-            if len(rgb_image.shape) == 3:
-                _log.debug("writing RGB image")
-                if rgb_image.dtype == np.uint16:
-                    iio.imwrite(
-                        os.path.join(
-                            capture_info.save_directory, capture_info.file_id + "_BF_LED_matrix_full_RGB.tiff"
-                        ),
-                        rgb_image,
-                    )
-                else:
-                    iio.imwrite(
-                        os.path.join(
-                            capture_info.save_directory,
-                            capture_info.file_id + "_BF_LED_matrix_full_RGB." + Acquisition.IMAGE_FORMAT,
-                        ),
-                        rgb_image,
-                    )
-
-    def handle_rgb_channels(self, images, capture_info: CaptureInfo):
-        for channel in ["BF LED matrix full_R", "BF LED matrix full_G", "BF LED matrix full_B"]:
-            image_to_display = utils.crop_image(
-                images[channel],
-                round(images[channel].shape[1] * self.display_resolution_scaling),
-                round(images[channel].shape[0] * self.display_resolution_scaling),
-            )
-            self.callbacks.signal_new_image(
-                CameraFrame(
-                    self.image_count,
-                    capture_info.capture_time,
-                    image_to_display,
-                    CameraFrameFormat.RAW,
-                    CameraPixelFormat.MONO16,
-                ),
-                capture_info,
-            )
-
-            file_name = (
-                capture_info.file_id
-                + "_"
-                + channel.replace(" ", "_")
-                + (".tiff" if images[channel].dtype == np.uint16 else "." + Acquisition.IMAGE_FORMAT)
-            )
-            iio.imwrite(os.path.join(capture_info.save_directory, file_name), images[channel])
-            append_frame_acquisition_time_csv(
-                capture_info,
-                file_name,
-                channel=channel,
-                channel_index=capture_info.configuration_idx,
-            )
-
-    def construct_rgb_image(self, images, capture_info: CaptureInfo):
-        rgb_image = np.zeros((*images["BF LED matrix full_R"].shape, 3), dtype=images["BF LED matrix full_R"].dtype)
-        rgb_image[:, :, 0] = images["BF LED matrix full_R"]
-        rgb_image[:, :, 1] = images["BF LED matrix full_G"]
-        rgb_image[:, :, 2] = images["BF LED matrix full_B"]
-
-        # send image to display
-        height, width = rgb_image.shape[:2]
-        image_to_display = utils.crop_image(
-            rgb_image,
-            round(width * self.display_resolution_scaling),
-            round(height * self.display_resolution_scaling),
-        )
-        self.callbacks.signal_new_image(
-            CameraFrame(
-                self.image_count,
-                capture_info.capture_time,
-                image_to_display,
-                CameraFrameFormat.RGB,
-                CameraPixelFormat.RGB48,
-            ),
-            capture_info,
-        )
-
-        # write the RGB image
-        self._log.debug("writing RGB image")
-        file_name = (
-            capture_info.file_id
-            + "_BF_LED_matrix_full_RGB"
-            + (".tiff" if rgb_image.dtype == np.uint16 else "." + Acquisition.IMAGE_FORMAT)
-        )
-        iio.imwrite(os.path.join(capture_info.save_directory, file_name), rgb_image)
-        append_frame_acquisition_time_csv(
-            capture_info,
-            file_name,
-            channel="BF_LED_matrix_full_RGB",
-            channel_index=capture_info.configuration_idx,
-        )
 
     def handle_acquisition_abort(self, current_path):
         # Save coordinates.csv (skip for ZARR_V3 — the controller's root copy is canonical

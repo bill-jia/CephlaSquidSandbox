@@ -174,11 +174,29 @@ class IlluminatorState(BaseModel):
         None,
         description="LED matrix pattern key when using unified LED matrix (e.g. bf_full, df, left_half)",
     )
-    led_matrix_na: Optional[float] = Field(
+    # Per-pattern NA (global-live, recorded per state so it saves/restores).
+    # bf/df/low_na each own their NA; the four DPC half-circles share
+    # led_matrix_dpc_na; the annulus family (full + half annuli) shares
+    # inner/outer; single-LED uses its LED index.
+    led_matrix_bf_na: Optional[float] = Field(None, ge=0, le=1, description="NA for BF full")
+    led_matrix_df_na: Optional[float] = Field(None, ge=0, le=1, description="NA for dark field")
+    led_matrix_lowna_na: Optional[float] = Field(None, ge=0, le=1, description="NA for BF center (low NA)")
+    led_matrix_dpc_na: Optional[float] = Field(
+        None, ge=0, le=1, description="Shared NA for the DPC half-circles (left/right/top/bottom)"
+    )
+    led_matrix_inner_na: Optional[float] = Field(
+        None, ge=0, le=1, description="Inner NA for the annulus family (full + half annuli)"
+    )
+    led_matrix_outer_na: Optional[float] = Field(
+        None, ge=0, le=1, description="Outer NA for the annulus family (full + half annuli)"
+    )
+    led_matrix_single_led_index: Optional[int] = Field(
+        None, ge=0, description="LED index for the single-LED pattern"
+    )
+    led_matrix_color: Optional[str] = Field(
         None,
-        ge=0,
-        le=1,
-        description="LED matrix array NA (bf/df/dpc illumination radius) for the unified SciMicroscopy LED matrix",
+        pattern=r"^#[0-9A-Fa-f]{6}$",
+        description="LED matrix RGB color as hex (global color, recorded per state so it saves/restores)",
     )
     timing: Optional[IlluminatorTiming] = Field(
         None,
@@ -186,6 +204,31 @@ class IlluminatorState(BaseModel):
     )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_led_matrix_na(cls, data):
+        """Migrate the removed scalar ``led_matrix_na`` from older saved YAML onto
+        the per-pattern field for the entry's mode, so old presets/general.yaml
+        still load (they self-heal to the new fields on next save)."""
+        if not isinstance(data, dict) or "led_matrix_na" not in data:
+            return data
+        data = dict(data)
+        na = data.pop("led_matrix_na")
+        field = {
+            "bf_full": "led_matrix_bf_na",
+            "df": "led_matrix_df_na",
+            "low_na": "led_matrix_lowna_na",
+            "left_half": "led_matrix_dpc_na",
+            "right_half": "led_matrix_dpc_na",
+            "top_half": "led_matrix_dpc_na",
+            "bottom_half": "led_matrix_dpc_na",
+        }.get(data.get("led_matrix_mode"))
+        # Scalar modes map onto their group field; annulus / single-LED / unknown
+        # modes never used the scalar NA, so the legacy value is simply dropped.
+        if field is not None and na is not None and data.get(field) is None:
+            data[field] = na
+        return data
 
 
 # ─────────────────────────────────────────────────────────────────────────────

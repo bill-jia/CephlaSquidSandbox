@@ -860,22 +860,18 @@ class Microcontroller:
         illumination_source: int,
         intensity: float,
     ) -> None:
-        """Map a logical LED-matrix channel name to RGB and send it to firmware.
+        """Map a logical LED-matrix channel to RGB and send it to firmware.
 
-        The per-channel RGB weighting is provided via *r_factor*/*g_factor*/*b_factor*
-        (typically loaded from MachineConfig for the white LED source).
+        RGB weighting is taken from the instance attributes
+        ``self._led_matrix_{r,g,b}_factor`` (set via :meth:`set_led_matrix_factors`,
+        typically from the MachineConfig white-LED factors), not from parameters.
+        NA / annulus / color patterns are SciMicroscopy-only and degrade to plain
+        brightfield on this MCU backend.
         """
-        if "BF LED matrix full_R" in channel_name:
-            r, g, b = intensity / 100.0, 0.0, 0.0
-        elif "BF LED matrix full_G" in channel_name:
-            r, g, b = 0.0, intensity / 100.0, 0.0
-        elif "BF LED matrix full_B" in channel_name:
-            r, g, b = 0.0, 0.0, intensity / 100.0
-        else:
-            scale = intensity / 100.0
-            r = scale * self._led_matrix_r_factor
-            g = scale * self._led_matrix_g_factor
-            b = scale * self._led_matrix_b_factor
+        scale = intensity / 100.0
+        r = scale * self._led_matrix_r_factor
+        g = scale * self._led_matrix_g_factor
+        b = scale * self._led_matrix_b_factor
 
         self.set_illumination_led_matrix(illumination_source, r, g, b)
 

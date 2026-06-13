@@ -36,7 +36,15 @@ The acquisition controls are split between two areas of the main window:
 
 - **Image display tabs (main viewing area).** **Live View**, **Multichannel
   Acquisition**, **Mosaic View**, and optionally **Plate View** and **NDViewer** —
-  these show images as they are captured.
+  these show images as they are captured. The Live View status bar (bottom of the
+  window) shows the cursor position, pixel value, and stage/piezo position, plus two
+  measurement tools that become available once the first image is displayed:
+  - **Line Profiler.** Toggle on, then click a start and end point to drop a
+    draggable, rotatable line; an intensity profile along the line is plotted below
+    the image and updates live.
+  - **Crosshair.** Toggle on to overlay a draggable crosshair (a full‑span vertical
+    and horizontal line). Drag either line to position the center; its image pixel
+    coordinates are shown in the status bar. Toggle off to hide it.
 
 > Which tabs and panels appear depends on your machine configuration and attached
 > hardware. Laser autofocus, the objective piezo, fluidics, the 1536‑well selector,

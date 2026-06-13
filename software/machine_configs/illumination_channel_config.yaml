@@ -100,27 +100,3 @@ channels:
     controller_port: USB8
     wavelength_nm: null
     intensity_calibration_file: null
-
-  - name: BF LED matrix full_R
-    type: transillumination
-    controller_port: USB1
-    wavelength_nm: null
-    intensity_calibration_file: null
-
-  - name: BF LED matrix full_G
-    type: transillumination
-    controller_port: USB1
-    wavelength_nm: null
-    intensity_calibration_file: null
-
-  - name: BF LED matrix full_B
-    type: transillumination
-    controller_port: USB1
-    wavelength_nm: null
-    intensity_calibration_file: null
-
-  - name: BF LED matrix full_RGB
-    type: transillumination
-    controller_port: USB1
-    wavelength_nm: null
-    intensity_calibration_file: null
