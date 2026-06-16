@@ -739,6 +739,15 @@ _DEFAULT_UNIFIED_MODES: Dict[str, Dict[str, Any]] = {
         "matrix_channel_name": "Single LED",
         "single_led": 0,
     },
+    # Source-coded FPM: an explicit list of darkfield LEDs lit simultaneously.
+    # The index list is supplied per-capture (set_multiplexed_led_indices); the
+    # default empty list lights nothing until one is provided.
+    "mux": {
+        "source_code": 3,
+        "label": "Multiplexed LEDs (FPM)",
+        "matrix_channel_name": "Multiplexed LEDs",
+        "multiplexed_leds": [],
+    },
     # --- Annulus / DPC-style patterns (inner/outer NA adjustable per state) ---
     "outer_ring": {
         "source_code": 0,
@@ -893,6 +902,9 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         self._group_na: Dict[str, float] = {}
         # LED index for the single-LED pattern (None => the mode's default index).
         self._single_led_index: Optional[int] = None
+        # Explicit LED index list for the multiplexed ("mux") FPM pattern
+        # (None => the mode's empty default, i.e. nothing lit).
+        self._multiplexed_led_indices: Optional[List[int]] = None
 
     @property
     def is_unified_mode(self) -> bool:
@@ -932,6 +944,7 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             spec.get("single_led") is None
             and spec.get("annulus") is None
             and spec.get("na") is None
+            and spec.get("multiplexed_leds") is None
         )
 
     def set_matrix_mode(self, mode_key: str) -> None:
@@ -954,6 +967,10 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         elif spec.get("single_led") is not None:
             if self._single_led_index is not None:
                 spec["single_led"] = int(self._single_led_index)
+        elif spec.get("multiplexed_leds") is not None:
+            # Per-capture LED index list overrides the mode's empty default.
+            if self._multiplexed_led_indices is not None:
+                spec["multiplexed_leds"] = list(self._multiplexed_led_indices)
         else:
             # Scalar-NA mode (bf/df/low_na/dpc): push this mode's group NA to the
             # array before the pattern fires, so each variety uses its own NA.
@@ -1016,6 +1033,14 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
     def get_single_led_index_override(self) -> Optional[int]:
         """Raw single-LED index override (None if unset; no mode-default fallback)."""
         return int(self._single_led_index) if self._single_led_index is not None else None
+
+    def set_multiplexed_led_indices(self, indices) -> None:
+        """Set the explicit LED index list for the multiplexed 'mux' pattern."""
+        self._multiplexed_led_indices = [int(i) for i in indices]
+
+    def get_multiplexed_led_indices(self) -> Optional[List[int]]:
+        """Current multiplexed LED index list (None if unset)."""
+        return list(self._multiplexed_led_indices) if self._multiplexed_led_indices is not None else None
 
     def set_annulus_na(self, inner_na: float, outer_na: float) -> None:
         """Set inner/outer NA radii for annulus / half-annulus patterns (no-op for MCU)."""
@@ -1371,6 +1396,26 @@ class IlluminationController:
         """Current single-LED index, or None if unavailable."""
         dev = self._led_matrix_unified
         return dev.get_single_led_index() if dev is not None else None
+
+    def set_led_matrix_multiplexed_indices(self, indices) -> bool:
+        """Select the multiplexed ('mux') pattern and light the given LED indices.
+
+        Used per-capture for source-coded FPM darkfield frames: switches the
+        unified matrix to the 'mux' mode, stores the index list, and re-fires if
+        the channel is currently on. Returns False when no SciMicroscopy array.
+        """
+        dev = self._led_matrix_unified
+        if dev is None or getattr(dev, "_sci_array", None) is None:
+            return False
+        dev.set_matrix_mode("mux")
+        dev.set_multiplexed_led_indices(indices)
+        self._refire_led_matrix_if_on(dev)
+        return True
+
+    def get_led_matrix_multiplexed_indices(self) -> Optional[List[int]]:
+        """Current multiplexed LED index list, or None if unavailable/unset."""
+        dev = self._led_matrix_unified
+        return dev.get_multiplexed_led_indices() if dev is not None else None
 
     def apply_led_matrix_state(self, ist: Any, fire: bool = True) -> None:
         """Push a full LED-matrix pattern config from an IlluminatorState-like object

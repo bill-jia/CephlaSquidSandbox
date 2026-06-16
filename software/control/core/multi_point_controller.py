@@ -161,6 +161,9 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
                     "wait_ms": ev.wait_ms,
                     "state_frame_index": ev.state_frame_index,
                     "cycle_event_index": ev.cycle_event_index,
+                    # Source-coded FPM: the exact LED indices lit for this frame,
+                    # so the reconstruction can recover each multiplexed pattern.
+                    "multiplexed_leds": list(ev.multiplexed_leds) if ev.multiplexed_leds else None,
                 }
                 for ev in plan.events
             ],
@@ -192,6 +195,87 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
     except Exception as e:
         if logger:
             logger.error("Failed to write cycles_manifest.yaml: %s", e, exc_info=True)
+
+
+def _save_fpm_pattern_positions(experiment_path, params, repo, objective_na, logger=None):
+    """Write per-pattern LED indices + NA positions for source-coded FPM runs.
+
+    Reconstruction needs each multiplexed darkfield frame's LED NA coordinates;
+    the cycles manifest records only the indices, so this resolves them against the
+    cached dome geometry and writes a self-contained ``fpm_patterns.yaml`` to the
+    acquisition root. No-op when the run has no FPM darkfield frames.
+    """
+    # Distinct (base state, LED set) frames in first-seen order, across the global
+    # plan and any per-region plans. The base state distinguishes brightfield from
+    # darkfield in the full routine; for the source-coded routine all share one.
+    plans = []
+    if getattr(params, "global_region_plan", None) is not None:
+        plans.append(params.global_region_plan)
+    plans.extend((getattr(params, "resolved_region_plans", None) or {}).values())
+    seen = set()
+    records = []  # (observation_state, leds_tuple)
+    for plan in plans:
+        if plan is None:
+            continue
+        for ev in plan.events:
+            if not ev.multiplexed_leds:
+                continue
+            key = (ev.observation_state, tuple(ev.multiplexed_leds))
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(key)
+    if not records:
+        return
+
+    try:
+        from control import fpm_led_geometry as fpm
+
+        table = fpm.load_na_table()
+    except Exception as e:
+        if logger:
+            logger.warning("FPM: could not load LED NA table to write fpm_patterns.yaml: %s", e)
+        return
+
+    distance_mm = None
+    try:
+        entry = repo.get_machine_config().get_device("led_matrix")
+        if entry is not None:
+            distance_mm = entry.config.get("distance")
+    except Exception:
+        pass
+
+    def _centroid(leds):
+        pts = [table[j] for j in leds if j in table]
+        if not pts:
+            return [0.0, 0.0]
+        return [round(sum(p[0] for p in pts) / len(pts), 6), round(sum(p[1] for p in pts) / len(pts), 6)]
+
+    out = {
+        "objective_na": float(objective_na) if objective_na else None,
+        "array_distance_mm": distance_mm,
+        "na_table": str(fpm.DEFAULT_NA_TABLE_PATH),
+        "n_patterns": len(records),
+        "patterns": [
+            {
+                "index": i,
+                "observation_state": name,
+                "led_indices": [int(j) for j in leds],
+                "led_na": [[round(table[j][0], 6), round(table[j][1], 6)] for j in leds if j in table],
+                "centroid_na": _centroid(leds),
+            }
+            for i, (name, leds) in enumerate(records)
+        ],
+    }
+    path = os.path.join(experiment_path, "fpm_patterns.yaml")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(out, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        if logger:
+            logger.info("FPM: wrote %d pattern positions to %s", len(records), path)
+    except Exception as e:
+        if logger:
+            logger.error("Failed to write fpm_patterns.yaml: %s", e, exc_info=True)
 
 
 def _save_unified_multipoint_acquisition_yaml(
@@ -829,6 +913,107 @@ class MultiPointController:
 
         return is_stim
 
+    def _fpm_pattern_provider(self):
+        """Build the FPM frame generator for the cycle resolver.
+
+        Closes over the current objective NA + the cached LED NA table so the pure
+        resolver can expand an FPM item into concrete frames. Returns a callable
+        ``item -> List[(observation_state_name, led_indices)]`` (one camera frame
+        each). Handles ``CycleFPMDarkfield`` (random multiplexed darkfield),
+        ``CycleFPMBrightfield`` (single-LED BF sweep) and
+        ``CycleFPMClusteredDarkfield`` (angle-clustered DF sweep). On any failure
+        (no NA table, unknown objective NA) it logs and returns ``[]`` so the
+        acquisition degrades rather than crashing.
+        """
+        from control import fpm_led_geometry as fpm
+        from control.models.acquisition_cycle import (
+            CycleFPMBrightfield,
+            CycleFPMClusteredDarkfield,
+            CycleFPMDarkfield,
+        )
+
+        def _context():
+            table = fpm.load_na_table()
+            obj_na = float(self.objectiveStore.get_current_objective_info().get("NA", 0.0))
+            return table, obj_na
+
+        def provider(item):
+            try:
+                table, obj_na = _context()
+            except Exception as e:
+                self._log.warning("FPM: geometry/objective NA unavailable (%s); no FPM frames generated", e)
+                return []
+            if obj_na <= 0:
+                self._log.warning("FPM: objective NA is %.3f (<=0); no FPM frames generated", obj_na)
+                return []
+
+            if isinstance(item, CycleFPMDarkfield):
+                patterns, report = fpm.build_fpm_darkfield_patterns(
+                    table,
+                    objective_na=obj_na,
+                    outer_na=item.outer_na,
+                    inner_na=item.inner_na,
+                    min_overlap=item.min_overlap,
+                    leds_per_pattern=item.leds_per_pattern,
+                    seed=item.seed,
+                )
+                inner = item.inner_na if item.inner_na is not None else obj_na
+                if report.n_candidates == 0 or not patterns:
+                    self._log.warning(
+                        "FPM darkfield: NO LEDs in region[%.3f,%.3f] for obj_NA=%.3f; 0 frames.",
+                        inner, item.outer_na, obj_na,
+                    )
+                    return []
+                m_used = max((len(p) for p in patterns), default=0)
+                self._log.info(
+                    "FPM darkfield: obj_NA=%.3f region[%.3f,%.3f] %d/%d LEDs -> %d patterns of <=%d%s (overlap %.2f)",
+                    obj_na, inner, item.outer_na, report.n_selected, report.n_candidates,
+                    len(patterns), m_used, " [auto]" if item.leds_per_pattern <= 0 else "",
+                    report.min_achieved_overlap,
+                )
+                return [(item.observation_state, tuple(g)) for g in patterns]
+
+            if isinstance(item, CycleFPMBrightfield):
+                bf_all = fpm.brightfield_leds(table, obj_na)
+                bf = bf_all
+                sampled = item.n_leds and item.n_leds > 0 and item.n_leds < len(bf_all)
+                if sampled:
+                    bf = fpm.pseudorandom_sample(bf_all, item.n_leds, seed=item.seed)
+                self._log.info(
+                    "FPM brightfield: obj_NA=%.3f -> %d single-LED frames%s (of %d LEDs with NA <= %.3f)",
+                    obj_na, len(bf), f" [pseudorandom n={item.n_leds} seed={item.seed}]" if sampled else "",
+                    len(bf_all), obj_na,
+                )
+                if not bf:
+                    self._log.warning("FPM brightfield: no LEDs with NA <= %.3f; 0 frames.", obj_na)
+                    return []
+                return [(item.observation_state, (led,)) for led in bf]
+
+            if isinstance(item, CycleFPMClusteredDarkfield):
+                inner = item.inner_na if item.inner_na is not None else obj_na
+                cells, report = fpm.cluster_darkfield_leds(
+                    table,
+                    inner_na=inner,
+                    outer_na=item.outer_na,
+                    pupil_radius_na=obj_na,
+                    min_overlap=item.min_overlap,
+                )
+                self._log.info(
+                    "FPM clustered darkfield: obj_NA=%.3f region[%.3f,%.3f] %d LEDs -> %d cells (overlap %.2f)",
+                    obj_na, inner, item.outer_na, report.n_candidates, len(cells), report.min_achieved_overlap,
+                )
+                if not cells:
+                    self._log.warning(
+                        "FPM clustered darkfield: NO LEDs in region[%.3f,%.3f] for obj_NA=%.3f; 0 frames.",
+                        inner, item.outer_na, obj_na,
+                    )
+                    return []
+                return [(item.observation_state, tuple(c.indices)) for c in cells]
+
+            return []
+
+        return provider
+
     def _resolve_plan(self, cycle_names, region_state_names):
         """Resolve a RegionPlan from cycle names (preferred) or bare state names.
 
@@ -842,7 +1027,9 @@ class MultiPointController:
         repo = self.liveController.microscope.config_repo
         is_stim = self._is_stimulus_predicate()
         if cycle_names:
-            events = resolve_chain(list(cycle_names), repo.load_acquisition_cycle, is_stim)
+            events = resolve_chain(
+                list(cycle_names), repo.load_acquisition_cycle, is_stim, self._fpm_pattern_provider()
+            )
         else:
             names = region_state_names if region_state_names is not None else self.selected_observation_state_names
             # _index_events takes tagged raw events; a flat selection is one ("state", name)
@@ -1108,6 +1295,18 @@ class MultiPointController:
 
             self.configuration_before_running_multipoint = self.liveController.obs_controller.current_observation_state
 
+            # Snapshot the live camera geometry/mode (binning, ROI, pixel_format,
+            # camera_mode) so it can be restored after the run. The acquisition
+            # seeds the camera from the first observation preset's camera_live
+            # snapshot (_seed_camera_for_first_observation_state), which can change
+            # binning/ROI; apply_full_observation_state at the end only restores
+            # exposure/gain/illumination, so without this the camera would be left
+            # in the preset's resolution/ROI (e.g. defaulting back to 2x2 with a
+            # cropped ROI) instead of the live state the user had before the run.
+            self._camera_live_snapshot_before_multipoint = (
+                self.liveController.obs_controller._collect_camera_live_snapshot()
+            )
+
             # Edge case: nothing checked in the GUI → use the current live-controller
             # state as a single synthetic observation state for this run only.
             # Populated via build_params/AcquisitionParameters; NOT written to the
@@ -1309,6 +1508,21 @@ class MultiPointController:
                 logger=self._log,
             )
 
+            # Save per-pattern LED indices + NA positions for source-coded FPM runs
+            # (self-contained geometry for offline reconstruction).
+            _fpm_obj_na = None
+            try:
+                _fpm_obj_na = float(self.objectiveStore.get_current_objective_info().get("NA"))
+            except Exception:
+                pass
+            _save_fpm_pattern_positions(
+                experiment_path,
+                acquisition_params,
+                self.liveController.microscope.config_repo,
+                _fpm_obj_na,
+                logger=self._log,
+            )
+
             # Get pre-warmed job runner and its shared backpressure values
             # (starts a new one warming for next acquisition)
             prewarmed_runner, prewarmed_bp_values = self.get_prewarmed_job_runner()
@@ -1466,6 +1680,21 @@ class MultiPointController:
             self.callbacks.signal_current_configuration(prior_config)
             self.liveController.obs_controller.apply_full_observation_state(prior_config)
 
+        # Restore the live camera geometry/mode captured at acquisition start.
+        # apply_full_observation_state above only restores exposure/gain/illumination,
+        # so binning/ROI/pixel_format/camera_mode must be re-applied here to undo the
+        # first-preset seeding (otherwise live returns at the preset's resolution/ROI).
+        # Trigger settings are restored separately below, so skip them here.
+        camera_snapshot = getattr(self, "_camera_live_snapshot_before_multipoint", None)
+        if camera_snapshot is not None:
+            try:
+                self.liveController.obs_controller._apply_camera_live_snapshot(
+                    camera_snapshot, apply_trigger_settings=False
+                )
+            except Exception as e:
+                self._log.warning(f"Failed to restore camera geometry after acquisition: {e}")
+            self._camera_live_snapshot_before_multipoint = None
+
         # Restore illumination state that was active before the acquisition
         _illum_snapshot = getattr(self, "_illumination_snapshot_before_acquisition", None)
         if _illum_snapshot is not None:
@@ -1598,6 +1827,49 @@ class MultiPointController:
                         "Observation state '%s': illuminator '%s' has pulse timing but no NIDAQ digital-output line is wired for it.",
                         name,
                         ist.illumination_channel,
+                    )
+                    return False
+
+        # FPM items (brightfield sweep, clustered darkfield, or source-coded
+        # darkfield) each need (a) a SciMicroscopy unified LED matrix and (b) a base
+        # observation state whose LED-matrix channel is ON (the mux override only
+        # lights an already-on matrix). Validate up front so a misconfiguration
+        # fails clearly here instead of silently capturing dark/wrong frames mid-run.
+        from control.models.acquisition_cycle import (
+            CycleFPMBrightfield,
+            CycleFPMClusteredDarkfield,
+            CycleFPMDarkfield,
+        )
+
+        fpm_types = (CycleFPMBrightfield, CycleFPMClusteredDarkfield, CycleFPMDarkfield)
+        cycle_names = list(self.selected_cycle_names or [])
+        for names in (self.region_cycle_map or {}).values():
+            cycle_names.extend(names or [])
+        fpm_base_states = []
+        for cname in dict.fromkeys(cycle_names):
+            cyc = repo.load_acquisition_cycle(cname)
+            if cyc is None:
+                continue
+            for it in cyc.items:
+                if isinstance(it, fpm_types):
+                    fpm_base_states.append(it.observation_state)
+        if fpm_base_states:
+            matrix_name = ic.unified_led_matrix_channel_name()
+            if matrix_name is None:
+                self._log.error(
+                    "An FPM cycle is selected but no SciMicroscopy unified LED matrix is configured."
+                )
+                return False
+            for state_name in dict.fromkeys(fpm_base_states):
+                preset = repo.load_observation_preset(state_name)
+                if preset is None:
+                    self._log.error("FPM base observation state '%s' not found.", state_name)
+                    return False
+                if not any(ist.illumination_channel == matrix_name for ist in preset.active_illuminator_states):
+                    self._log.error(
+                        "FPM base observation state '%s' must have the LED matrix channel ('%s') ON.",
+                        state_name,
+                        matrix_name,
                     )
                     return False
         return True

@@ -1058,6 +1058,98 @@ class LDI_Simulation(LightSource):
 _LED_DBG = True
 
 
+def _parse_pledposna(raw):
+    """Parse the firmware ``pledposna`` reply into ``[(index, na_x, na_y), ...]``.
+
+    The illuminate firmware may answer as JSON (``{"led_position_list_na": {...}}``)
+    or as plain per-LED lines. We try JSON first, then fall back to taking the
+    first three numeric fields of every data line as ``index, na_x, na_y`` (a
+    fourth ``na_distance`` field, if present, is ignored).
+    """
+    import json
+    import re
+
+    text = raw if isinstance(raw, str) else (raw.decode("utf-8", "ignore") if raw else "")
+    out = []
+
+    # JSON form: find the embedded object and read its led position dict.
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start : end + 1])
+            for key in ("led_position_list_na", "led_position_list_cartesian", "led_position_list"):
+                if isinstance(obj.get(key), dict):
+                    for k, v in obj[key].items():
+                        vals = list(v)
+                        if len(vals) >= 2:
+                            out.append((int(k), float(vals[0]), float(vals[1])))
+                    if out:
+                        out.sort(key=lambda r: r[0])
+                        return out
+        except (ValueError, TypeError):
+            pass
+
+    # Line form: first three numeric fields per data line.
+    num = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+    for line in text.splitlines():
+        fields = num.findall(line)
+        if len(fields) >= 3:
+            try:
+                out.append((int(float(fields[0])), float(fields[1]), float(fields[2])))
+            except ValueError:
+                continue
+    return out
+
+
+def _parse_pledpos_cartesian(raw):
+    """Parse a ``pledpos`` (cartesian x,y,z) reply into ``[(index, na_x, na_y)]``.
+
+    Each LED line/entry is ``index, x, y, z``; NA is ``(x, y) / sqrt(x^2+y^2+z^2)``.
+    Tries JSON (``led_position_list_cartesian``) first, then per-line parsing of
+    the first four numeric fields.
+    """
+    import json
+    import math
+    import re
+
+    text = raw if isinstance(raw, str) else (raw.decode("utf-8", "ignore") if raw else "")
+
+    def _to_na(x, y, z):
+        r = math.sqrt(x * x + y * y + z * z)
+        if r <= 0:
+            return (0.0, 0.0)
+        return (x / r, y / r)
+
+    out = []
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start : end + 1])
+            for key in ("led_position_list_cartesian", "led_position_list"):
+                if isinstance(obj.get(key), dict):
+                    for k, v in obj[key].items():
+                        vals = list(v)
+                        if len(vals) >= 3:
+                            nx, ny = _to_na(float(vals[0]), float(vals[1]), float(vals[2]))
+                            out.append((int(k), nx, ny))
+                    if out:
+                        out.sort(key=lambda r: r[0])
+                        return out
+        except (ValueError, TypeError):
+            pass
+
+    num = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+    for line in text.splitlines():
+        fields = num.findall(line)
+        if len(fields) >= 4:
+            try:
+                nx, ny = _to_na(float(fields[1]), float(fields[2]), float(fields[3]))
+                out.append((int(float(fields[0])), nx, ny))
+            except ValueError:
+                continue
+    return out
+
+
 class SciMicroscopyLEDArray:
     """Wrapper for communicating with SciMicroscopy over serial"""
 
@@ -1172,6 +1264,81 @@ class SciMicroscopyLEDArray:
         if _LED_DBG:
             log.info(f"[LED-DBG] SciMicroscopy.set_single_led index={index} -> cmd '{cmd}'")
         return cmd
+
+    def set_multiple_leds(self, indices) -> str:
+        """Build (and return) the 'l.<i0>.<i1>...' multi-LED pattern command.
+
+        The illuminate firmware's ``l`` command lights every listed index
+        simultaneously as one pattern. Used for source-coded FPM multiplexed
+        darkfield captures. Mirrors :meth:`set_single_led`: the firmware lights
+        the set immediately on receipt, so we return the string and let the
+        caller store it via set_illumination, reusing turn_on/turn_off.
+        """
+        idx = [int(i) for i in indices]
+        cmd = "l." + ".".join(str(i) for i in idx)
+        if _LED_DBG:
+            log.info(f"[LED-DBG] SciMicroscopy.set_multiple_leds n={len(idx)} -> cmd '{cmd}'")
+        return cmd
+
+    def read_streamed_response(self, command: str, idle_s: float = 0.7, timeout_s: float = 25.0) -> str:
+        """Send ``command`` and accumulate a multi-line streamed reply.
+
+        ``write_and_check`` only returns the *first* line and flushes the rest,
+        which truncates large dumps (``pledposna``/``pledpos`` print one line per
+        LED — ~793 lines over a couple of seconds). This reads the full stream:
+        keep draining ``in_waiting`` until the port is idle for ``idle_s`` (after
+        some data has arrived) or ``timeout_s`` elapses. Returns the raw text.
+        """
+        ser = self.serial_connection.serial
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        ser.write((command + "\r").encode())
+        buf = bytearray()
+        start = time.time()
+        last = start
+        while True:
+            n = getattr(ser, "in_waiting", 0)
+            if n:
+                buf.extend(ser.read(n))
+                last = time.time()
+            else:
+                time.sleep(0.05)
+            now = time.time()
+            if buf and (now - last) >= idle_s:
+                break
+            if (now - start) >= timeout_s:
+                break
+        return buf.decode("utf-8", "ignore")
+
+    def dump_led_na_positions(self):
+        """Query the firmware for every LED's NA-space position via ``pledposna``.
+
+        Returns a list of ``(index, na_x, na_y)`` tuples (empty if the firmware
+        does not support the command). Reads the full streamed reply (one line per
+        LED) and parses it with :func:`_parse_pledposna`.
+        """
+        if _LED_DBG:
+            log.info("[LED-DBG] SciMicroscopy.dump_led_na_positions -> serial 'pledposna'")
+        raw = self.read_streamed_response("pledposna")
+        if _LED_DBG:
+            log.info(f"[LED-DBG] pledposna raw reply: {len(raw)} chars, {raw.count(chr(10))} lines")
+        return _parse_pledposna(raw)
+
+    def dump_led_cartesian_positions(self):
+        """Fallback: query ``pledpos`` (cartesian x,y,z) and convert to NA.
+
+        Returns ``(index, na_x, na_y)`` with ``na = (x, y) / sqrt(x^2+y^2+z^2)``
+        — the illumination NA for an LED at ``(x,y,z)`` over a sample at the
+        origin. Used when ``pledposna`` is unsupported on a given firmware.
+        """
+        if _LED_DBG:
+            log.info("[LED-DBG] SciMicroscopy.dump_led_cartesian_positions -> serial 'pledpos'")
+        raw = self.read_streamed_response("pledpos")
+        if _LED_DBG:
+            log.info(f"[LED-DBG] pledpos raw reply: {len(raw)} chars, {raw.count(chr(10))} lines")
+        return _parse_pledpos_cartesian(raw)
 
     def set_half_annulus_pattern(self, half: str, min_na: float, max_na: float) -> str:
         """Build the half-annulus pattern command. Experimental firmware path."""
@@ -1300,9 +1467,12 @@ class SciMicroscopyLEDArray:
         half = spec.get("half")
         spec_na = spec.get("na")
         single_led = spec.get("single_led")
+        multiplexed = spec.get("multiplexed_leds")
 
         # Pattern command resolution
-        if single_led is not None:
+        if multiplexed:  # non-empty list (avoids a bare "l." with no indices)
+            mode = self.set_multiple_leds(list(multiplexed))
+        elif single_led is not None:
             mode = self.set_single_led(int(single_led))
         elif annulus is not None and half:
             min_na, max_na = float(annulus[0]), float(annulus[1])
@@ -1363,7 +1533,8 @@ class SciMicroscopyLEDArray_Simulation:
         """
         Provide serial number
         """
-        self.serial_connection.open_ser()
+        # No real serial port in simulation; check_about/set_* are no-ops below.
+        self.serial_connection = None
         self.check_about()
         self.set_distance(array_distance)
         self.set_brightness(1)
@@ -1432,6 +1603,19 @@ class SciMicroscopyLEDArray_Simulation:
     def set_half_annulus_pattern(self, half: str, min_na: float, max_na: float) -> str:
         h = (half or "t")[0]
         return f"ha.{h}.{int(min_na*100)}.{int(max_na*100)}"
+
+    def set_single_led(self, index: int) -> str:
+        return f"l.{int(index)}"
+
+    def set_multiple_leds(self, indices) -> str:
+        return "l." + ".".join(str(int(i)) for i in indices)
+
+    def dump_led_na_positions(self):
+        """Synthetic hemispherical dome so the FPM pipeline can be exercised
+        offline. NOT the real geometry — re-run the dump on hardware for that."""
+        from control.fpm_led_geometry import synthetic_dome_na_table
+
+        return [(i, nx, ny) for i, (nx, ny) in synthetic_dome_na_table().items()]
 
     def apply_channel_configuration(
         self,

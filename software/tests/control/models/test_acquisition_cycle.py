@@ -10,6 +10,9 @@ import pytest
 
 from control.models.acquisition_cycle import (
     AcquisitionCycle,
+    CycleFPMBrightfield,
+    CycleFPMClusteredDarkfield,
+    CycleFPMDarkfield,
     CycleGroup,
     CycleStep,
     CycleWait,
@@ -239,3 +242,122 @@ class TestWaits:
 
 def _n(e):
     return e.observation_state
+
+
+class TestFPMDarkfield:
+    """Source-coded FPM darkfield item: provider-driven expansion to multiplexed
+    frames, threading of the LED index set, round-trip, and plan layout."""
+
+    @staticmethod
+    def _provider(item):
+        # Deterministic fake: three (base_state, led_set) frames.
+        name = item.observation_state
+        return [(name, (10, 11, 12)), (name, (13, 14, 15)), (name, (16, 17))]
+
+    def test_expands_via_provider(self):
+        cyc = AcquisitionCycle(
+            name="fpm",
+            items=[
+                CycleStep(observation_state="dpc_l"),
+                CycleFPMDarkfield(observation_state="fpm_df", outer_na=0.8, leds_per_pattern=8, seed=0),
+            ],
+        )
+        ev = resolve_cycle(cyc, fpm_provider=self._provider)
+        # One DPC step + three multiplexed darkfield frames.
+        assert _names(ev) == ["dpc_l", "fpm_df", "fpm_df", "fpm_df"]
+        mux = [e for e in ev if e.multiplexed_leds is not None]
+        assert [e.multiplexed_leds for e in mux] == [(10, 11, 12), (13, 14, 15), (16, 17)]
+        # Multiplexed frames count as frames of the base state (T axis).
+        assert [e.state_frame_index for e in mux] == [0, 1, 2]
+        assert all(e.observation_state == "fpm_df" for e in mux)
+        assert all(not e.is_stimulus for e in mux)
+
+    def test_no_provider_yields_no_frames(self):
+        cyc = AcquisitionCycle(
+            name="fpm",
+            items=[CycleStep(observation_state="dpc_l"), CycleFPMDarkfield(observation_state="fpm_df")],
+        )
+        ev = resolve_cycle(cyc)  # provider omitted
+        assert _names(ev) == ["dpc_l"]
+
+    def test_plan_is_ragged_with_per_pattern_frames(self):
+        cyc = AcquisitionCycle(
+            name="fpm",
+            items=[
+                CycleStep(observation_state="dpc_l"),
+                CycleFPMDarkfield(observation_state="fpm_df"),
+            ],
+        )
+        ev = resolve_cycle(cyc, fpm_provider=self._provider)
+        plan = RegionPlan.from_events(ev)
+        assert plan.frame_counts == {"dpc_l": 1, "fpm_df": 3}
+        assert plan.dense is False  # ragged: counts differ
+        assert plan.channel_order == ["dpc_l", "fpm_df"]
+
+    def test_resolve_chain_threads_provider(self):
+        cycles = {
+            "c": AcquisitionCycle(name="c", items=[CycleFPMDarkfield(observation_state="fpm_df")]),
+        }
+        ev = resolve_chain(["c"], cycles.get, fpm_provider=self._provider)
+        assert len([e for e in ev if e.multiplexed_leds]) == 3
+
+    def test_model_round_trip_disambiguates_from_step(self):
+        cyc = AcquisitionCycle(
+            name="fpm",
+            items=[
+                CycleStep(observation_state="dpc_l", n_frames=2),
+                CycleFPMDarkfield(observation_state="fpm_df", outer_na=0.75, inner_na=0.3, seed=5),
+            ],
+        )
+        restored = AcquisitionCycle.model_validate(cyc.model_dump(mode="json"))
+        assert isinstance(restored.items[0], CycleStep)
+        assert isinstance(restored.items[1], CycleFPMDarkfield)
+        assert restored.items[1].outer_na == 0.75
+        assert restored.items[1].inner_na == 0.3
+        assert restored.items[1].seed == 5
+
+
+class TestFPMBrightfieldAndClustered:
+    """Full routine as two composable single-base-state items: BF sweep + clustered DF."""
+
+    @staticmethod
+    def _provider(item):
+        # BF item -> single-LED frames; clustered-DF item -> co-located cell frames.
+        if isinstance(item, CycleFPMBrightfield):
+            return [(item.observation_state, (0,)), (item.observation_state, (1,))]
+        return [(item.observation_state, (10, 11, 12)), (item.observation_state, (13, 14))]
+
+    def test_compose_bf_then_clustered_df(self):
+        cyc = AcquisitionCycle(
+            name="full",
+            items=[
+                CycleFPMBrightfield(observation_state="BF"),
+                CycleFPMClusteredDarkfield(observation_state="DF"),
+            ],
+        )
+        ev = resolve_cycle(cyc, fpm_provider=self._provider)
+        assert _names(ev) == ["BF", "BF", "DF", "DF"]
+        assert [e.multiplexed_leds for e in ev] == [(0,), (1,), (10, 11, 12), (13, 14)]
+        assert [e.state_frame_index for e in ev] == [0, 1, 0, 1]
+        plan = RegionPlan.from_events(ev)
+        assert plan.frame_counts == {"BF": 2, "DF": 2}
+        assert plan.channel_order == ["BF", "DF"]
+
+    def test_round_trip_disambiguates_all_fpm_types(self):
+        cyc = AcquisitionCycle(
+            name="full",
+            items=[
+                CycleFPMBrightfield(observation_state="BF", n_leds=50, seed=7),
+                CycleFPMClusteredDarkfield(observation_state="DF", outer_na=0.7, inner_na=0.35, min_overlap=0.65),
+                CycleFPMDarkfield(observation_state="rand", outer_na=0.8, seed=2),
+                CycleStep(observation_state="dpc_l"),
+            ],
+        )
+        restored = AcquisitionCycle.model_validate(cyc.model_dump(mode="json"))
+        assert isinstance(restored.items[0], CycleFPMBrightfield)
+        assert isinstance(restored.items[1], CycleFPMClusteredDarkfield)
+        assert isinstance(restored.items[2], CycleFPMDarkfield)
+        assert isinstance(restored.items[3], CycleStep)
+        assert restored.items[0].observation_state == "BF"
+        assert restored.items[0].n_leds == 50 and restored.items[0].seed == 7
+        assert restored.items[1].outer_na == 0.7 and restored.items[1].min_overlap == 0.65

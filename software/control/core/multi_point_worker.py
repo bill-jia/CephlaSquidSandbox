@@ -3072,6 +3072,30 @@ class MultiPointWorker:
                         self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
                         self.request_abort_fn()
                         return
+                    # Source-coded FPM darkfield frame: override the LED matrix to
+                    # this multiplexed pattern (base state supplies exposure/gain/
+                    # color; the matrix channel must be ON in that base state — this
+                    # is enforced pre-flight in validate_acquisition_settings). The
+                    # override switches the device to 'mux' mode, so the capture
+                    # path's re-fire lights exactly this LED set. A False return
+                    # means no SciMicroscopy array is available, which would
+                    # silently capture the wrong pattern — abort instead.
+                    if event.multiplexed_leds is not None:
+                        ok = False
+                        try:
+                            ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
+                                event.multiplexed_leds
+                            )
+                        except Exception as e:
+                            self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
+                        if not ok:
+                            self._log.error(
+                                "FPM: could not light multiplexed darkfield pattern for base state %r "
+                                "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
+                                preset_name,
+                            )
+                            self.request_abort_fn()
+                            return
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 

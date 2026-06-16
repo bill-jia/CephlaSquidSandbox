@@ -191,13 +191,390 @@ def _populate_observation_state_list(list_widget, microscope, checked_names=None
     list_widget.blockSignals(False)
 
 
+def _default_fpm_params() -> dict:
+    """Default source-coded FPM darkfield parameters (matches the model defaults).
+
+    ``leds_per_pattern`` 0 means auto (balanced from the geometry at acquisition).
+    """
+    return {"outer_na": 0.8, "inner_na": None, "min_overlap": 0.6, "leds_per_pattern": 0, "seed": 0}
+
+
+def _fpm_summary(params: dict) -> str:
+    """One-line summary for the FPM node's params button."""
+    inner = params.get("inner_na")
+    inner_s = "obj" if inner is None else f"{float(inner):.2f}"
+    leds = int(params.get("leds_per_pattern", 0))
+    leds_s = "auto" if leds <= 0 else str(leds)
+    return (
+        f"FPM df  NA[{inner_s}..{float(params.get('outer_na', 0.8)):.2f}]  "
+        f"x{leds_s}  ovl{float(params.get('min_overlap', 0.6)):.2f}  "
+        f"seed{int(params.get('seed', 0))}"
+    )
+
+
+def _default_fpm_bf() -> dict:
+    """Default brightfield-sweep parameters (n_leds 0 = every BF LED)."""
+    return {"n_leds": 0, "seed": 0}
+
+
+def _fpm_bf_summary(params: dict) -> str:
+    """One-line summary for the brightfield node's params button."""
+    n = int(params.get("n_leds", 0))
+    if n <= 0:
+        return "BF sweep: all LEDs"
+    return f"BF sample: n={n}  seed{int(params.get('seed', 0))}"
+
+
+def _default_fpm_cdf() -> dict:
+    """Default clustered-darkfield parameters."""
+    return {"outer_na": 0.8, "inner_na": None, "min_overlap": 0.6}
+
+
+def _fpm_cdf_summary(params: dict) -> str:
+    """One-line summary for the clustered-darkfield node's params button."""
+    inner = params.get("inner_na")
+    inner_s = "obj" if inner is None else f"{float(inner):.2f}"
+    return (
+        f"clustered DF  NA[{inner_s}..{float(params.get('outer_na', 0.8)):.2f}]  "
+        f"ovl{float(params.get('min_overlap', 0.6)):.2f}"
+    )
+
+
+class FPMDarkfieldParamsDialog(QDialog):
+    """Edit the generation parameters for a source-coded FPM darkfield item.
+
+    These determine how the darkfield annulus is tiled and grouped into
+    multiplexed captures; the actual LED indices are computed at acquisition
+    time from the live objective NA and the cached dome geometry.
+    """
+
+    def __init__(self, params: dict, objective_na=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("FPM Darkfield Parameters")
+        params = {**_default_fpm_params(), **(params or {})}
+        self._objective_na = objective_na
+        form = QFormLayout(self)
+
+        # Make it explicit which objective NA the selection will use — the pupil
+        # radius and (by default) the inner edge of the darkfield annulus.
+        obj_str = f"{objective_na:.2f}" if objective_na else "unknown"
+        info = QLabel(
+            f"Current objective NA: {obj_str}  (= pupil radius; darkfield count "
+            f"scales as (NA range / objective NA)²)"
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        self.spin_outer = QDoubleSpinBox()
+        self.spin_outer.setRange(0.05, 1.4)
+        self.spin_outer.setSingleStep(0.05)
+        self.spin_outer.setDecimals(2)
+        self.spin_outer.setValue(float(params["outer_na"]))
+        form.addRow("Outer NA", self.spin_outer)
+
+        # Inner NA defaults to the objective NA (the brightfield/darkfield edge).
+        auto_label = "Use objective NA as inner edge"
+        if objective_na:
+            auto_label += f" ({objective_na:.2f})"
+        self.chk_inner_auto = QCheckBox(auto_label)
+        self.chk_inner_auto.setChecked(params["inner_na"] is None)
+        form.addRow(self.chk_inner_auto)
+        self.spin_inner = QDoubleSpinBox()
+        self.spin_inner.setRange(0.0, 1.4)
+        self.spin_inner.setSingleStep(0.05)
+        self.spin_inner.setDecimals(2)
+        # When "use objective NA" is checked, show the live objective NA (not a
+        # misleading hardcoded placeholder) in the disabled box.
+        if params["inner_na"] is not None:
+            self.spin_inner.setValue(float(params["inner_na"]))
+        else:
+            self.spin_inner.setValue(float(objective_na) if objective_na else 0.4)
+        self.spin_inner.setEnabled(params["inner_na"] is not None)
+        self.chk_inner_auto.toggled.connect(lambda on: self.spin_inner.setEnabled(not on))
+        form.addRow("Inner NA", self.spin_inner)
+
+        self.spin_overlap = QDoubleSpinBox()
+        self.spin_overlap.setRange(0.1, 0.95)
+        self.spin_overlap.setSingleStep(0.05)
+        self.spin_overlap.setDecimals(2)
+        self.spin_overlap.setValue(float(params["min_overlap"]))
+        form.addRow("Min pupil overlap", self.spin_overlap)
+
+        # LEDs per pattern: auto (balanced from the selected-LED count) or fixed.
+        leds = int(params["leds_per_pattern"])
+        self.chk_leds_auto = QCheckBox("Auto (balanced from geometry)")
+        self.chk_leds_auto.setChecked(leds <= 0)
+        form.addRow(self.chk_leds_auto)
+        self.spin_leds = QSpinBox()
+        self.spin_leds.setRange(1, 64)
+        self.spin_leds.setValue(leds if leds > 0 else 8)
+        self.spin_leds.setEnabled(leds > 0)
+        self.chk_leds_auto.toggled.connect(lambda on: self.spin_leds.setEnabled(not on))
+        form.addRow("LEDs per pattern", self.spin_leds)
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 1_000_000)
+        self.spin_seed.setValue(int(params["seed"]))
+        form.addRow("Grouping seed", self.spin_seed)
+
+        # Live preview of the resulting selection (needs the cached geometry).
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        form.addRow("Preview", self.preview_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        # Connect AFTER initial values are set so construction doesn't spuriously
+        # fire the preview mid-build; then render the first preview once.
+        for w in (self.spin_outer, self.spin_inner, self.spin_overlap, self.spin_leds, self.spin_seed):
+            w.valueChanged.connect(self._update_preview)
+        self.chk_inner_auto.toggled.connect(self._update_preview)
+        self.chk_leds_auto.toggled.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self):
+        """Recompute and show the selected-LED / pattern counts for the current
+        settings, using the live objective NA and the cached dome geometry."""
+        if not self._objective_na:
+            self.preview_label.setText("objective NA unknown — cannot preview")
+            return
+        try:
+            from control import fpm_led_geometry as fpm
+
+            table = fpm.load_na_table()
+        except Exception:
+            self.preview_label.setText("run the geometry dump (pledposna) to preview counts")
+            return
+        inner = None if self.chk_inner_auto.isChecked() else float(self.spin_inner.value())
+        leds = 0 if self.chk_leds_auto.isChecked() else int(self.spin_leds.value())
+        try:
+            pats, rep = fpm.build_fpm_darkfield_patterns(
+                table,
+                objective_na=float(self._objective_na),
+                outer_na=float(self.spin_outer.value()),
+                inner_na=inner,
+                min_overlap=float(self.spin_overlap.value()),
+                leds_per_pattern=leds,
+                seed=int(self.spin_seed.value()),
+            )
+        except Exception as e:  # noqa: BLE001
+            self.preview_label.setText(f"preview error: {e}")
+            return
+        m_used = max((len(p) for p in pats), default=0)
+        if self.chk_leds_auto.isChecked() and m_used:
+            self.spin_leds.blockSignals(True)
+            self.spin_leds.setValue(m_used)
+            self.spin_leds.blockSignals(False)
+        self.preview_label.setText(
+            f"→ {rep.n_selected} darkfield LEDs, {len(pats)} patterns of ≤{m_used} "
+            f"(overlap {rep.min_achieved_overlap:.2f})"
+        )
+
+    def get_params(self) -> dict:
+        return {
+            "outer_na": float(self.spin_outer.value()),
+            "inner_na": None if self.chk_inner_auto.isChecked() else float(self.spin_inner.value()),
+            "min_overlap": float(self.spin_overlap.value()),
+            "leds_per_pattern": 0 if self.chk_leds_auto.isChecked() else int(self.spin_leds.value()),
+            "seed": int(self.spin_seed.value()),
+        }
+
+
+class FPMBrightfieldParamsDialog(QDialog):
+    """Edit a brightfield-sweep item: full sweep or a pseudorandom subset of N LEDs.
+
+    The live preview shows the resulting single-LED frame count from the cached
+    geometry + live objective NA.
+    """
+
+    def __init__(self, params: dict, objective_na=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Brightfield Sweep Parameters")
+        params = {**_default_fpm_bf(), **(params or {})}
+        self._objective_na = objective_na
+        form = QFormLayout(self)
+
+        obj_str = f"{objective_na:.2f}" if objective_na else "unknown"
+        info = QLabel(
+            f"Current objective NA: {obj_str}  —  brightfield = every LED with NA ≤ "
+            f"objective NA, captured one LED per frame."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        n = int(params["n_leds"])
+        self.chk_all = QCheckBox("Use every brightfield LED")
+        self.chk_all.setChecked(n <= 0)
+        form.addRow(self.chk_all)
+        self.spin_n = QSpinBox()
+        self.spin_n.setRange(1, 100000)
+        self.spin_n.setValue(n if n > 0 else 50)
+        self.spin_n.setEnabled(n > 0)
+        self.chk_all.toggled.connect(lambda on: self.spin_n.setEnabled(not on))
+        form.addRow("Pseudorandom N LEDs", self.spin_n)
+
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 1_000_000)
+        self.spin_seed.setValue(int(params["seed"]))
+        form.addRow("Sample seed", self.spin_seed)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        form.addRow("Preview", self.preview_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        self.spin_n.valueChanged.connect(self._update_preview)
+        self.chk_all.toggled.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self):
+        if not self._objective_na:
+            self.preview_label.setText("objective NA unknown — cannot preview")
+            return
+        try:
+            from control import fpm_led_geometry as fpm
+
+            table = fpm.load_na_table()
+        except Exception:
+            self.preview_label.setText("run the geometry dump (pledposna) to preview counts")
+            return
+        total = len(fpm.brightfield_leds(table, float(self._objective_na)))
+        n = total if self.chk_all.isChecked() else min(int(self.spin_n.value()), total)
+        suffix = "" if self.chk_all.isChecked() else f" (pseudorandom of {total})"
+        self.preview_label.setText(f"→ {n} single-LED brightfield frames{suffix}")
+
+    def get_params(self) -> dict:
+        return {
+            "n_leds": 0 if self.chk_all.isChecked() else int(self.spin_n.value()),
+            "seed": int(self.spin_seed.value()),
+        }
+
+
+class FPMClusteredDarkfieldParamsDialog(QDialog):
+    """Edit an angle-clustered darkfield item's params (outer/inner NA + overlap).
+
+    The live preview shows the resulting darkfield cell count from the cached
+    geometry + live objective NA. The base observation state is the tree node's
+    combo (a single state, like every other FPM item).
+    """
+
+    def __init__(self, params: dict, objective_na=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Clustered Darkfield Parameters")
+        params = {**_default_fpm_cdf(), **(params or {})}
+        self._objective_na = objective_na
+        form = QFormLayout(self)
+
+        obj_str = f"{objective_na:.2f}" if objective_na else "unknown"
+        info = QLabel(
+            f"Current objective NA: {obj_str}  —  DF = objective NA→outer, binned into "
+            f"angle-clustered cells (adjacent LEDs fired together)."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        self.spin_outer = QDoubleSpinBox()
+        self.spin_outer.setRange(0.05, 1.4)
+        self.spin_outer.setSingleStep(0.05)
+        self.spin_outer.setDecimals(2)
+        self.spin_outer.setValue(float(params["outer_na"]))
+        form.addRow("Outer NA", self.spin_outer)
+
+        auto_label = "Use objective NA as inner edge"
+        if objective_na:
+            auto_label += f" ({objective_na:.2f})"
+        self.chk_inner_auto = QCheckBox(auto_label)
+        self.chk_inner_auto.setChecked(params["inner_na"] is None)
+        form.addRow(self.chk_inner_auto)
+        self.spin_inner = QDoubleSpinBox()
+        self.spin_inner.setRange(0.0, 1.4)
+        self.spin_inner.setSingleStep(0.05)
+        self.spin_inner.setDecimals(2)
+        if params["inner_na"] is not None:
+            self.spin_inner.setValue(float(params["inner_na"]))
+        else:
+            self.spin_inner.setValue(float(objective_na) if objective_na else 0.4)
+        self.spin_inner.setEnabled(params["inner_na"] is not None)
+        self.chk_inner_auto.toggled.connect(lambda on: self.spin_inner.setEnabled(not on))
+        form.addRow("Inner NA", self.spin_inner)
+
+        self.spin_overlap = QDoubleSpinBox()
+        self.spin_overlap.setRange(0.1, 0.95)
+        self.spin_overlap.setSingleStep(0.05)
+        self.spin_overlap.setDecimals(2)
+        self.spin_overlap.setValue(float(params["min_overlap"]))
+        form.addRow("DF cell overlap", self.spin_overlap)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        form.addRow("Preview", self.preview_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        for w in (self.spin_outer, self.spin_inner, self.spin_overlap):
+            w.valueChanged.connect(self._update_preview)
+        self.chk_inner_auto.toggled.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self):
+        if not self._objective_na:
+            self.preview_label.setText("objective NA unknown — cannot preview")
+            return
+        try:
+            from control import fpm_led_geometry as fpm
+
+            table = fpm.load_na_table()
+        except Exception:
+            self.preview_label.setText("run the geometry dump (pledposna) to preview counts")
+            return
+        inner = float(self._objective_na) if self.chk_inner_auto.isChecked() else float(self.spin_inner.value())
+        try:
+            cells, rep = fpm.cluster_darkfield_leds(
+                table,
+                inner_na=inner,
+                outer_na=float(self.spin_outer.value()),
+                pupil_radius_na=float(self._objective_na),
+                min_overlap=float(self.spin_overlap.value()),
+            )
+        except Exception as e:  # noqa: BLE001
+            self.preview_label.setText(f"preview error: {e}")
+            return
+        self.preview_label.setText(
+            f"→ {rep.n_candidates} darkfield LEDs in {len(cells)} clustered cells "
+            f"(cell overlap {rep.min_achieved_overlap:.2f})"
+        )
+
+    def get_params(self) -> dict:
+        return {
+            "outer_na": float(self.spin_outer.value()),
+            "inner_na": None if self.chk_inner_auto.isChecked() else float(self.spin_inner.value()),
+            "min_overlap": float(self.spin_overlap.value()),
+        }
+
+
 class CycleEditorDialog(QDialog):
     """Modal editor for named acquisition cycles (two-level: outer repeat ->
     ordered steps, where a step can sit inside a one-level repeatable group).
 
     Steps reference observation-state presets by name. Cycles are saved/loaded
-    via the config repo (``cycles/*.yaml`` under the active profile).
+    via the config repo (``cycles/*.yaml`` under the active profile). A step may
+    also be a source-coded FPM darkfield generator, which expands into N
+    multiplexed darkfield captures at acquisition time.
     """
+
+    _FPM_PARAMS_ROLE = Qt.UserRole + 1
+    _FPM_CDF_ROLE = Qt.UserRole + 2
+    _FPM_BF_ROLE = Qt.UserRole + 3
 
     _TYPE_ROLE = Qt.UserRole
 
@@ -248,6 +625,9 @@ class CycleEditorDialog(QDialog):
             ("Add Step", self._add_step),
             ("Add Wait", self._add_wait),
             ("Add Group", self._add_group),
+            ("Add FPM Darkfield", self._add_fpm),
+            ("Add FPM Brightfield", self._add_fpm_bf),
+            ("Add FPM Clustered DF", self._add_fpm_cdf),
             ("Add → Group", self._add_step_to_group),
             ("Wait → Group", self._add_wait_to_group),
             ("Remove", self._remove_selected),
@@ -295,6 +675,94 @@ class CycleEditorDialog(QDialog):
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, spin)
 
+    def _make_fpm_widgets(self, item, observation_state="", params=None):
+        """FPM darkfield node: base-preset combo (col 0) + params button (col 1).
+
+        The generation parameters live in the item's data role; the button shows
+        a summary and opens the params dialog.
+        """
+        params = {**_default_fpm_params(), **(params or {})}
+        item.setData(0, self._FPM_PARAMS_ROLE, params)
+        combo = QComboBox()
+        names = self._preset_names()
+        combo.addItems(names)
+        if observation_state and observation_state in names:
+            combo.setCurrentText(observation_state)
+        elif observation_state:
+            combo.addItem(observation_state)
+            combo.setCurrentText(observation_state)
+        btn = QPushButton(_fpm_summary(params))
+        btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_params(it, b))
+        self.tree.setItemWidget(item, 0, combo)
+        self.tree.setItemWidget(item, 1, btn)
+
+    def _current_objective_na(self):
+        """Live objective NA from the shared objective store (None if unknown)."""
+        try:
+            na = self.microscope.objective_store.get_current_objective_info().get("NA")
+            return float(na) if na is not None else None
+        except Exception:
+            return None
+
+    def _edit_fpm_params(self, item, btn):
+        current = item.data(0, self._FPM_PARAMS_ROLE) or _default_fpm_params()
+        dlg = FPMDarkfieldParamsDialog(current, objective_na=self._current_objective_na(), parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            params = dlg.get_params()
+            item.setData(0, self._FPM_PARAMS_ROLE, params)
+            btn.setText(_fpm_summary(params))
+
+    def _make_fpm_bf_widgets(self, item, observation_state="", params=None):
+        """Brightfield single-LED-sweep node: base-state combo (col 0) + params
+        button (col 1) for full-sweep vs pseudorandom-N."""
+        params = {**_default_fpm_bf(), **(params or {})}
+        item.setData(0, self._FPM_BF_ROLE, params)
+        combo = QComboBox()
+        names = self._preset_names()
+        combo.addItems(names)
+        if observation_state and observation_state in names:
+            combo.setCurrentText(observation_state)
+        elif observation_state:
+            combo.addItem(observation_state)
+            combo.setCurrentText(observation_state)
+        btn = QPushButton(_fpm_bf_summary(params))
+        btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_bf(it, b))
+        self.tree.setItemWidget(item, 0, combo)
+        self.tree.setItemWidget(item, 1, btn)
+
+    def _edit_fpm_bf(self, item, btn):
+        params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
+        dlg = FPMBrightfieldParamsDialog(params, objective_na=self._current_objective_na(), parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            params = dlg.get_params()
+            item.setData(0, self._FPM_BF_ROLE, params)
+            btn.setText(_fpm_bf_summary(params))
+
+    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None):
+        """Clustered-darkfield node: base-state combo (col 0) + params button (col 1)."""
+        params = {**_default_fpm_cdf(), **(params or {})}
+        item.setData(0, self._FPM_CDF_ROLE, params)
+        combo = QComboBox()
+        names = self._preset_names()
+        combo.addItems(names)
+        if observation_state and observation_state in names:
+            combo.setCurrentText(observation_state)
+        elif observation_state:
+            combo.addItem(observation_state)
+            combo.setCurrentText(observation_state)
+        btn = QPushButton(_fpm_cdf_summary(params))
+        btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_cdf(it, b))
+        self.tree.setItemWidget(item, 0, combo)
+        self.tree.setItemWidget(item, 1, btn)
+
+    def _edit_fpm_cdf(self, item, btn):
+        params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
+        dlg = FPMClusteredDarkfieldParamsDialog(params, objective_na=self._current_objective_na(), parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            params = dlg.get_params()
+            item.setData(0, self._FPM_CDF_ROLE, params)
+            btn.setText(_fpm_cdf_summary(params))
+
     def _make_group_widgets(self, item, repeat=1):
         item.setText(0, "Group")
         spin = QSpinBox()
@@ -329,6 +797,24 @@ class CycleEditorDialog(QDialog):
         item.setData(0, self._TYPE_ROLE, "wait")
         self.tree.addTopLevelItem(item)
         self._make_wait_widgets(item)
+
+    def _add_fpm(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "fpm")
+        self.tree.addTopLevelItem(item)
+        self._make_fpm_widgets(item)
+
+    def _add_fpm_bf(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "fpm_bf")
+        self.tree.addTopLevelItem(item)
+        self._make_fpm_bf_widgets(item)
+
+    def _add_fpm_cdf(self):
+        item = QTreeWidgetItem(self.tree)
+        item.setData(0, self._TYPE_ROLE, "fpm_cdf")
+        self.tree.addTopLevelItem(item)
+        self._make_fpm_cdf_widgets(item)
 
     def _selected_group(self, action):
         sel = self.tree.currentItem()
@@ -386,11 +872,29 @@ class CycleEditorDialog(QDialog):
 
     # ── model <-> tree ──
     def _read_leaf(self, item):
-        """Read a step or wait item into a model dict (None if malformed)."""
+        """Read a step / wait / fpm item into a model dict (None if malformed)."""
         kind = item.data(0, self._TYPE_ROLE)
         if kind == "wait":
             spin = self.tree.itemWidget(item, 1)
             return {"type": "wait", "duration_ms": spin.value() if spin else 0.0}
+        if kind == "fpm":
+            combo = self.tree.itemWidget(item, 0)
+            if combo is None:
+                return None
+            params = item.data(0, self._FPM_PARAMS_ROLE) or _default_fpm_params()
+            return {"type": "fpm", "observation_state": combo.currentText(), **params}
+        if kind == "fpm_bf":
+            combo = self.tree.itemWidget(item, 0)
+            if combo is None:
+                return None
+            params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
+            return {"type": "fpm_bf", "observation_state": combo.currentText(), **params}
+        if kind == "fpm_cdf":
+            combo = self.tree.itemWidget(item, 0)
+            if combo is None:
+                return None
+            params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
+            return {"type": "fpm_cdf", "observation_state": combo.currentText(), **params}
         combo = self.tree.itemWidget(item, 0)
         spin = self.tree.itemWidget(item, 1)
         if combo is None:
@@ -421,6 +925,18 @@ class CycleEditorDialog(QDialog):
         if entry["type"] == "wait":
             item.setData(0, self._TYPE_ROLE, "wait")
             self._make_wait_widgets(item, entry.get("duration_ms", 0.0))
+        elif entry["type"] == "fpm":
+            item.setData(0, self._TYPE_ROLE, "fpm")
+            params = {k: entry[k] for k in _default_fpm_params() if k in entry}
+            self._make_fpm_widgets(item, entry.get("observation_state", ""), params)
+        elif entry["type"] == "fpm_bf":
+            item.setData(0, self._TYPE_ROLE, "fpm_bf")
+            params = {k: entry[k] for k in _default_fpm_bf() if k in entry}
+            self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params)
+        elif entry["type"] == "fpm_cdf":
+            item.setData(0, self._TYPE_ROLE, "fpm_cdf")
+            params = {k: entry[k] for k in _default_fpm_cdf() if k in entry}
+            self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params)
         else:
             item.setData(0, self._TYPE_ROLE, "step")
             self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1))
@@ -451,10 +967,40 @@ class CycleEditorDialog(QDialog):
 
     @staticmethod
     def _leaf_to_dict(item):
-        from control.models.acquisition_cycle import CycleWait
+        from control.models.acquisition_cycle import (
+            CycleWait,
+            CycleFPMDarkfield,
+            CycleFPMBrightfield,
+            CycleFPMClusteredDarkfield,
+        )
 
         if isinstance(item, CycleWait):
             return {"type": "wait", "duration_ms": item.duration_ms}
+        if isinstance(item, CycleFPMBrightfield):
+            return {
+                "type": "fpm_bf",
+                "observation_state": item.observation_state,
+                "n_leds": item.n_leds,
+                "seed": item.seed,
+            }
+        if isinstance(item, CycleFPMClusteredDarkfield):
+            return {
+                "type": "fpm_cdf",
+                "observation_state": item.observation_state,
+                "outer_na": item.outer_na,
+                "inner_na": item.inner_na,
+                "min_overlap": item.min_overlap,
+            }
+        if isinstance(item, CycleFPMDarkfield):
+            return {
+                "type": "fpm",
+                "observation_state": item.observation_state,
+                "outer_na": item.outer_na,
+                "inner_na": item.inner_na,
+                "min_overlap": item.min_overlap,
+                "leds_per_pattern": item.leds_per_pattern,
+                "seed": item.seed,
+            }
         return {"type": "step", "observation_state": item.observation_state, "n_frames": item.n_frames}
 
     def _load_cycle(self, name):
@@ -492,11 +1038,45 @@ class CycleEditorDialog(QDialog):
 
     @staticmethod
     def _dict_to_leaf(entry):
-        """Build a CycleStep/CycleWait from a model dict (None to skip)."""
-        from control.models.acquisition_cycle import CycleStep, CycleWait
+        """Build a Cycle* item from a model dict (None to skip)."""
+        from control.models.acquisition_cycle import (
+            CycleStep,
+            CycleWait,
+            CycleFPMDarkfield,
+            CycleFPMBrightfield,
+            CycleFPMClusteredDarkfield,
+        )
 
         if entry["type"] == "wait":
             return CycleWait(duration_ms=entry["duration_ms"])
+        if entry["type"] == "fpm_bf":
+            if not entry.get("observation_state"):
+                return None
+            return CycleFPMBrightfield(
+                observation_state=entry["observation_state"],
+                n_leds=entry.get("n_leds", 0),
+                seed=entry.get("seed", 0),
+            )
+        if entry["type"] == "fpm_cdf":
+            if not entry.get("observation_state"):
+                return None
+            return CycleFPMClusteredDarkfield(
+                observation_state=entry["observation_state"],
+                outer_na=entry.get("outer_na", 0.8),
+                inner_na=entry.get("inner_na"),
+                min_overlap=entry.get("min_overlap", 0.6),
+            )
+        if entry["type"] == "fpm":
+            if not entry.get("observation_state"):
+                return None
+            return CycleFPMDarkfield(
+                observation_state=entry["observation_state"],
+                outer_na=entry.get("outer_na", 0.8),
+                inner_na=entry.get("inner_na"),
+                min_overlap=entry.get("min_overlap", 0.6),
+                leds_per_pattern=entry.get("leds_per_pattern", 0),
+                seed=entry.get("seed", 0),
+            )
         if entry.get("observation_state"):
             return CycleStep(observation_state=entry["observation_state"], n_frames=entry["n_frames"])
         return None

@@ -27,7 +27,7 @@ the worker iterates and the save layer keys on.
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -75,13 +75,94 @@ class CycleGroup(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class CycleFPMDarkfield(BaseModel):
+    """A source-coded Fourier-Ptychography darkfield acquisition.
+
+    Expands at plan-build time into N **multiplexed darkfield** captures: the
+    darkfield annulus ``[inner_na, outer_na]`` is tiled by the minimal set of
+    darkfield LEDs whose pupils (radius = objective NA) overlap by >=
+    ``min_overlap``, and that set is grouped into patterns of
+    ``leds_per_pattern`` LEDs (random, seeded). Each pattern is one camera frame
+    of the referenced base ``observation_state`` (its exposure/gain/color and the
+    LED-matrix channel), with the LED set lit via the 'mux' matrix mode.
+
+    The brightfield half of source-coded FPM (four DPC half-circles) is captured
+    by adding ordinary ``CycleStep``s for the ``dpc.*`` modes — this item only
+    generates the darkfield patterns. The expansion needs the live objective NA +
+    the cached LED NA table, so it is supplied at resolve time by an injected
+    provider (the model itself stays pure/serializable).
+    """
+
+    observation_state: str = Field(..., description="Base observation-state preset (optical config)")
+    outer_na: float = Field(0.8, gt=0, description="Outer NA of the darkfield region")
+    inner_na: Optional[float] = Field(
+        None, description="Inner NA of the darkfield region (None => current objective NA)"
+    )
+    min_overlap: float = Field(0.6, gt=0, lt=1, description="Minimum Fourier pupil overlap")
+    leds_per_pattern: int = Field(
+        0, ge=0, description="LEDs lit per multiplexed darkfield frame (0 = auto/balanced from geometry)"
+    )
+    seed: int = Field(0, description="Seed for the (reproducible) random LED grouping")
+
+    model_config = {"extra": "forbid"}
+
+
+class CycleFPMBrightfield(BaseModel):
+    """A brightfield single-LED sweep for Fourier Ptychography.
+
+    Expands at plan-build time into one frame per brightfield LED (illumination
+    NA = sin(polar angle) <= objective NA), **single LED at a time**. With
+    ``n_leds > 0`` only a reproducible **pseudorandom subset** of that size is
+    sampled (for a faster, sparser brightfield set); ``n_leds = 0`` sweeps every
+    brightfield LED. One base ``observation_state`` provides exposure/gain/color
+    and the (on) LED-matrix channel. Pair with a darkfield item for a full run.
+    """
+
+    observation_state: str = Field(..., description="Base observation-state preset (optical config)")
+    n_leds: int = Field(0, ge=0, description="Pseudorandom subset size (0 = every brightfield LED)")
+    seed: int = Field(0, description="Seed for the pseudorandom subset")
+
+    model_config = {"extra": "forbid"}
+
+
+class CycleFPMClusteredDarkfield(BaseModel):
+    """An angle-clustered darkfield sweep for (3D/tomography) Fourier Ptychography.
+
+    The objective-NA→``outer_na`` annulus is binned into angular **cells** at the
+    ~``min_overlap`` Fourier-tiling step; each cell (a tight cluster of *adjacent*
+    LEDs at nearly the same angle) is fired as one frame. Unlike the source-coded
+    :class:`CycleFPMDarkfield` (random multiplexing), clustering keeps a frame's
+    members co-located in angle, so each frame maps to one tight patch of the cap
+    and the per-shell angular structure 3D reconstruction needs is preserved.
+    Use a longer exposure than brightfield (SNR scales ~sqrt(cell size)).
+    """
+
+    observation_state: str = Field(..., description="Base observation-state preset (use a longer exposure)")
+    outer_na: float = Field(0.8, gt=0, description="Outer NA of the darkfield region (clipped to the dome's reach)")
+    inner_na: Optional[float] = Field(
+        None, description="Inner NA / BF-DF boundary (None => current objective NA)"
+    )
+    min_overlap: float = Field(0.6, gt=0, lt=1, description="Fourier overlap setting the darkfield cell size")
+
+    model_config = {"extra": "forbid"}
+
+
 class AcquisitionCycle(BaseModel):
     """A named, repeatable per-position acquisition sequence."""
 
     name: str
     version: int = 1
     repeat: int = Field(1, ge=1, description="How many times to repeat the whole cycle")
-    items: List[Union[CycleGroup, CycleStep, CycleWait]] = Field(default_factory=list)
+    items: List[
+        Union[
+            CycleGroup,
+            CycleFPMBrightfield,
+            CycleFPMClusteredDarkfield,
+            CycleFPMDarkfield,
+            CycleStep,
+            CycleWait,
+        ]
+    ] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -106,6 +187,10 @@ class ResolvedEvent:
             preserves interleave / acquisition order across all selected cycles.
         is_wait: True for a timed-delay event (no frame, no stimulus).
         wait_ms: Delay duration in milliseconds (only meaningful when is_wait).
+        multiplexed_leds: For a source-coded FPM darkfield frame, the explicit
+            LED indices lit for this capture (None for ordinary events). The base
+            observation state still provides exposure/gain/color; the worker lights
+            this LED set via the 'mux' matrix mode before capturing.
     """
 
     observation_state: str
@@ -114,35 +199,55 @@ class ResolvedEvent:
     cycle_event_index: int
     is_wait: bool = False
     wait_ms: float = 0.0
+    multiplexed_leds: Optional[Tuple[int, ...]] = None
 
 
 # A predicate telling whether a named observation state is stimulus-only.
 StimulusPredicate = Callable[[str], bool]
 
+# Supplies the per-frame LED sets for an FPM item (CycleFPMDarkfield,
+# CycleFPMBrightfield, or CycleFPMClusteredDarkfield). Injected at resolve time
+# (closes over objective NA + cached LED NA table); the cycle model itself stays
+# pure. Returns a list of ``(observation_state_name, led_indices)`` frames — one
+# camera frame each.
+FpmPatternProvider = Callable[[object], List[Tuple[str, Sequence[int]]]]
 
-# A raw event is a tagged tuple: ("state", preset_name) or ("wait", duration_ms).
+
+# A raw event is a tagged tuple:
+#   ("state", preset_name)               — ordinary imaged/stimulus step
+#   ("wait", duration_ms)                — timed delay
+#   ("mux", (preset_name, leds_tuple))   — one FPM (multiplexed/clustered) frame
 _RawEvent = Tuple[str, object]
 
 
-def _expand_item(item, out: List[_RawEvent]) -> None:
-    """Expand one cycle item (group / step / wait) into raw tagged events."""
+def _expand_item(item, out: List[_RawEvent], fpm_provider: Optional[FpmPatternProvider] = None) -> None:
+    """Expand one cycle item (group / step / wait / fpm) into raw tagged events."""
     if isinstance(item, CycleGroup):
         for _ in range(item.repeat):
             for sub in item.steps:
-                _expand_item(sub, out)
+                _expand_item(sub, out, fpm_provider)
     elif isinstance(item, CycleWait):
         out.append(("wait", float(item.duration_ms)))
+    elif isinstance(item, (CycleFPMDarkfield, CycleFPMBrightfield, CycleFPMClusteredDarkfield)):
+        if fpm_provider is None:
+            logger.warning(
+                "FPM item %s encountered without an FPM pattern provider; no frames generated",
+                type(item).__name__,
+            )
+            return
+        for name, leds in fpm_provider(item) or []:
+            out.append(("mux", (name, tuple(int(i) for i in leds))))
     else:  # CycleStep
         out.extend([("state", item.observation_state)] * item.n_frames)
 
 
-def _raw_events(cycle: AcquisitionCycle) -> List[_RawEvent]:
+def _raw_events(cycle: AcquisitionCycle, fpm_provider: Optional[FpmPatternProvider] = None) -> List[_RawEvent]:
     """Expand a single cycle's outer repeat / groups / steps / waits into an
     ordered list of tagged raw events (one entry per event)."""
     out: List[_RawEvent] = []
     for _ in range(cycle.repeat):
         for item in cycle.items:
-            _expand_item(item, out)
+            _expand_item(item, out, fpm_provider)
     return out
 
 
@@ -172,6 +277,21 @@ def _index_events(
                 )
             )
             continue
+        if kind == "mux":
+            # Source-coded FPM darkfield frame: base preset name + LED index set.
+            name, leds = payload
+            k = per_state.get(name, 0)
+            per_state[name] = k + 1
+            events.append(
+                ResolvedEvent(
+                    observation_state=name,
+                    is_stimulus=False,
+                    state_frame_index=k,
+                    cycle_event_index=position,
+                    multiplexed_leds=tuple(leds),
+                )
+            )
+            continue
         name = payload
         k = per_state.get(name, 0)
         per_state[name] = k + 1
@@ -190,22 +310,25 @@ def _index_events(
 def resolve_cycle(
     cycle: AcquisitionCycle,
     is_stimulus: Optional[StimulusPredicate] = None,
+    fpm_provider: Optional[FpmPatternProvider] = None,
 ) -> List[ResolvedEvent]:
     """Flatten a single cycle into its ordered event list."""
-    return _index_events(_raw_events(cycle), is_stimulus)
+    return _index_events(_raw_events(cycle, fpm_provider), is_stimulus)
 
 
 def resolve_chain(
     cycle_names: List[str],
     load_cycle: Callable[[str], Optional[AcquisitionCycle]],
     is_stimulus: Optional[StimulusPredicate] = None,
+    fpm_provider: Optional[FpmPatternProvider] = None,
 ) -> List[ResolvedEvent]:
     """Flatten a chain of selected cycles (run back-to-back) into one event list.
 
     ``load_cycle`` resolves a cycle name to its definition (e.g.
     ``repo.load_acquisition_cycle``). Unknown / empty cycles are skipped with a
     warning. Per-state frame indices and chain positions are numbered across the
-    *whole* concatenated chain, not per cycle.
+    *whole* concatenated chain, not per cycle. ``fpm_provider`` supplies the
+    multiplexed LED groups for any ``CycleFPMDarkfield`` items.
     """
     raw: List[_RawEvent] = []
     for name in cycle_names:
@@ -213,7 +336,7 @@ def resolve_chain(
         if cycle is None:
             logger.warning("Acquisition cycle %r not found, skipping", name)
             continue
-        raw.extend(_raw_events(cycle))
+        raw.extend(_raw_events(cycle, fpm_provider))
     return _index_events(raw, is_stimulus)
 
 

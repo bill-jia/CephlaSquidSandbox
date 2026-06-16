@@ -215,8 +215,15 @@ When a SciMicroscopy LED array (e.g. SCI DOME) is configured as `led_matrix:
 {driver: scimicroscopy_led_array}`, the array is exposed as a single unified
 `"LED matrix"` channel whose **pattern** is selected by a *mode* (`bf_full`,
 `df`, `low_na`, `left/right/top/bottom_half`, `outer_ring`, `half_ann_{t,b,l,r}`,
-`sg` single-LED). Modes are defined in `_DEFAULT_UNIFIED_MODES`
-(`control/lighting.py`).
+`sg` single-LED, `mux` multiplexed-LED list). Modes are defined in
+`_DEFAULT_UNIFIED_MODES` (`control/lighting.py`).
+
+The `mux` mode lights an explicit list of LED indices simultaneously
+(firmware `l.<i0>.<i1>…`, via `set_multiple_leds`) and is used for source-coded
+Fourier Ptychography darkfield captures — see
+[source-coded-fpm.md](source-coded-fpm.md). The per-LED NA geometry that FPM
+needs is dumped from the firmware (`pledposna`) by
+`tools/dump_sci_dome_geometry.py`.
 
 ### Color, NA, and the config popup
 

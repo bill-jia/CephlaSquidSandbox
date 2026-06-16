@@ -144,6 +144,45 @@ To re-tune for a different sample: drive the dome (`set_matrix_mode` →
   it (`has_high_fullwell` capability) — this model does not, and it is correctly
   skipped with a warning.
 
+**Multipoint → live binning/ROI reset** (`software/control/core/multi_point_controller.py`):
+
+- Symptom: after a multipoint run, live returns at **2×2 binning** (the config
+  default) with the **ROI cropped to a weird location**, even if live was 1×1
+  before the run.
+- Cause: an asymmetry in the acquisition's camera setup/teardown.
+  `_seed_camera_for_first_observation_state` applies the **first observation
+  preset's** `camera_live` snapshot at acquisition start, which sets
+  binning/ROI/pixel_format/camera_mode to the preset's values. The teardown
+  (`_restore_state_after_acquisition`) only called
+  `apply_full_observation_state(prior_config)`, which restores exposure / gain /
+  illumination / optical-path but **not** geometry — so the camera was left in
+  the preset's resolution and ROI. (The "weird location" is the preset's saved
+  ROI applied over the wrong resolution.)
+- Fix: capture a `CameraLiveSnapshot` of the live camera
+  (`obs_controller._collect_camera_live_snapshot()`) at acquisition start and
+  re-apply it via `_apply_camera_live_snapshot(..., apply_trigger_settings=False)`
+  at the end — the symmetric counterpart of the seed step. Trigger mode is
+  restored separately, so trigger settings are skipped in the geometry restore.
+  This is camera-agnostic but was observed on Toupcam.
+
+**Y-flip (frames mirrored vs real-space optics)**:
+
+- The Toupcam sensor reads out **Y-flipped** relative to the real-space optical
+  image. Corrected in **software** via the generic `flip` config
+  (`devices.main_camera.config.flip: Vertical`), applied in
+  `AbstractCamera._process_raw_frame` (`utils.rotate_and_flip_image`) for the
+  normal path — live view and software-trigger multipoint.
+- The **fast-acquisition** path bypasses `_process_raw_frame` (it works on raw
+  bytes for performance), so `toupcam_raw_bytes_to_np` calls a new
+  `_apply_config_flip` helper to apply the same flip — keeping every path's
+  orientation identical (the same idea as Tucsen's `_build_byte_decoding_fn`
+  software Y-flip for its raw DataCallBack path).
+- Why `flip` and not `reverse_x`/`reverse_y`: those are **SDK/sensor mirror**
+  flags wired **only to the Tucsen driver**. Toupcam pulls **RAW** on every path,
+  and the Touptek SDK's `put_VFlip`/`put_HFlip` act on the ISP/processed pipeline,
+  not raw pulls — so they'd be no-ops here. Software `flip` is the reliable
+  mechanism for this camera. Only `Vertical` is applied (X is already correct).
+
 ## Pitfalls / notes for future work
 
 - **Intensity is 0–100 %, never a 0–1 fraction.** Presets authored with `1.0`

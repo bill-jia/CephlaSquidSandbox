@@ -22,9 +22,22 @@ composes several of them into an ordered, repeatable sequence.
   abort-aware (`_interruptible_sleep`), so a long wait still responds to Stop.
 - **`CycleGroup`** — an ordered list of steps/waits repeated `repeat` times
   (exactly one level of nesting; the type structure caps depth).
+- **`CycleFPMDarkfield`** — a source-coded Fourier-Ptychography darkfield
+  generator. Expands at plan-build time into *N* **multiplexed darkfield**
+  captures (one camera frame per LED group). It references a base
+  `observation_state` (for exposure/gain/color and the LED-matrix channel) plus
+  generation params (`outer_na`, `inner_na`, `min_overlap`, `leds_per_pattern`,
+  `seed`). The LED index set per frame is computed from the live objective NA +
+  the cached dome geometry — see [source-coded-fpm.md](source-coded-fpm.md).
+- **`CycleFPMBrightfield`** — a single-LED brightfield sweep (one frame per dome
+  LED with NA ≤ objective NA). One base `observation_state`.
+- **`CycleFPMClusteredDarkfield`** — an angle-**clustered** darkfield sweep
+  (co-located LED cells, one frame each), for 3D/tomography. One base
+  `observation_state` (use a longer exposure). Compose with `CycleFPMBrightfield`
+  for a full run. See [source-coded-fpm.md](source-coded-fpm.md).
 - **`AcquisitionCycle`** — a named, saved sequence: an outer `repeat` over an
-  ordered list of items (steps, waits, and/or groups). References states **by
-  name** so it tracks preset edits.
+  ordered list of items (steps, waits, groups, and/or FPM darkfield items).
+  References states **by name** so it tracks preset edits.
 
 Cycles are saved per profile under `cycles/{name}.yaml`, alongside
 `observation_presets/`, via the config repo
@@ -43,6 +56,15 @@ The controller resolves the selected cycles into a flat, ordered
 Multiple selected cycles run **back-to-back** at each position (chaining). A
 plain (no-cycle) channel selection resolves to a 1-frame-per-state plan — the
 legacy behaviour — so the worker has a single iteration path.
+
+`CycleFPMDarkfield` items are expanded by an injected `fpm_provider`
+(`MultiPointController._fpm_pattern_provider`) so the resolver stays pure — it
+closes over the live objective NA + cached LED NA table and returns one LED-index
+list per multiplexed frame. Each resulting `ResolvedEvent` carries
+`multiplexed_leds`; the worker lights that set via the `"mux"` LED-matrix mode
+before capture, and the set is recorded per frame in `cycles_manifest.yaml` for
+reconstruction. The *N* darkfield frames are frames of the base state (so they
+land on its `T` axis); the count is computed, never hardcoded.
 
 ## Density and save layout
 
