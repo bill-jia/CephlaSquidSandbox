@@ -9,6 +9,7 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
+from control.models import LaserAFReference
 
 
 def _get_checked_names(list_widget: QListWidget) -> list:
@@ -2300,12 +2301,20 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_import_locations = QPushButton("Import Location List")
         self.btn_show_table_location_list = QPushButton("Edit")  # Open / Edit
 
-        # editable points table
+        # editable points table. The "AF Ref" column is a read-only indicator of
+        # the per-region laser-AF focus target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
-        self.table_location_list.setColumnCount(4)
-        header_labels = ["x", "y", "z", "ID"]
+        self.table_location_list.setColumnCount(5)
+        header_labels = ["x", "y", "z", "ID", "AF Ref"]
         self.table_location_list.setHorizontalHeaderLabels(header_labels)
         self.btn_update_z = QPushButton("Update Z")
+        # Re-capture the laser-AF reference for the currently selected region.
+        # Hidden when the rig has no focus camera.
+        self.btn_update_ref = QPushButton("Update Ref")
+        self.btn_update_ref.setToolTip(
+            "Capture the current laser-AF reference (focus target) for the selected region."
+        )
+        self.btn_update_ref.setVisible(self._enable_laser_autofocus)
 
         self.entry_deltaX = QDoubleSpinBox()
         self.entry_deltaX.setMinimum(0)
@@ -2553,7 +2562,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         temp3 = QHBoxLayout()
         temp3.addWidget(QLabel("Location List"))
         temp3.addWidget(self.dropdown_location_list)
-        self.grid_location_list_line1.addLayout(temp3, 0, 0, 1, 6)  # Span across all columns except the last
+        self.grid_location_list_line1.addLayout(temp3, 0, 0, 1, 4)  # Span the left columns
+        self.grid_location_list_line1.addWidget(self.btn_update_ref, 0, 4, 1, 2)
         self.grid_location_list_line1.addWidget(self.btn_update_z, 0, 6, 1, 2)  # Align with other buttons
 
         self.grid_location_list_line2 = QGridLayout()
@@ -2796,6 +2806,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
         self.btn_show_table_location_list.clicked.connect(self.table_location_list.show)
         self.btn_update_z.clicked.connect(self.update_z)
+        self.btn_update_ref.clicked.connect(self.update_reference)
         self.dropdown_location_list.currentIndexChanged.connect(self.go_to)
 
         self.shortcut = QShortcut(QKeySequence(";"), self)
@@ -3273,6 +3284,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                     self.table_location_list.rowCount() - 1, 2, QTableWidgetItem(str(round(z * 1000, 1)))
                 )
                 self.table_location_list.setItem(self.table_location_list.rowCount() - 1, 3, QTableWidgetItem(name))
+                self.table_location_list.setItem(
+                    self.table_location_list.rowCount() - 1,
+                    4,
+                    self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name)),
+                )
                 index = self.dropdown_location_list.count() - 1
                 self.dropdown_location_list.setCurrentIndex(index)
                 print(self.location_list)
@@ -3295,6 +3311,54 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         while f"R{n}" in existing:
             n += 1
         return f"R{n}"
+
+    def _af_ref_item(self, reference):
+        """Read-only "AF Ref" cell showing a region's laser-AF target (x, or "—")."""
+        text = f"{reference.x_reference:.1f}" if reference is not None else "—"
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setTextAlignment(Qt.AlignCenter)
+        return item
+
+    def _set_af_ref_cell_for_region(self, region_id, reference):
+        """Update the "AF Ref" cell for the table row whose ID is ``region_id``."""
+        ids = self.location_ids.tolist()
+        if region_id not in ids:
+            return
+        row = ids.index(region_id)
+        self.table_location_list.blockSignals(True)
+        self.table_location_list.setItem(row, 4, self._af_ref_item(reference))
+        self.table_location_list.blockSignals(False)
+
+    def _capture_region_reference(self, region_id, warn_on_failure=True):
+        """Capture and store the current laser-AF reference for ``region_id``.
+
+        No-op (returns False) when laser AF is unavailable or not enabled. When
+        enabled but the capture fails (e.g. AF not initialized), optionally warns.
+        """
+        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
+            return False
+        reference = self.multipointController.laserAutoFocusController.capture_reference()
+        if reference is None:
+            if warn_on_failure:
+                error_dialog(
+                    "Failed to capture Laser AF reference for this region. "
+                    "Is the laser autofocus initialized?"
+                )
+            return False
+        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+        self._set_af_ref_cell_for_region(region_id, reference)
+        return True
+
+    def update_reference(self):
+        """Re-capture the laser-AF reference for the currently selected region."""
+        index = self.dropdown_location_list.currentIndex()
+        if index < 0 or index >= len(self.location_ids):
+            return
+        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
+            error_dialog("Enable Reflection (Laser) AF before capturing a per-region reference.")
+            return
+        self._capture_region_reference(str(self.location_ids[index]))
 
     def add_location(self):
         # Get raw positions without rounding
@@ -3323,6 +3387,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(region_id))
+            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
 
             # Store actual values in region coordinates
             if self.use_overlap:
@@ -3355,6 +3420,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.blockSignals(False)
             self.dropdown_location_list.blockSignals(False)
             print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
+            # Snapshot this region's laser-AF focus target at add time (when AF is
+            # enabled/initialized), so each region corrects to its own reference.
+            self._capture_region_reference(region_id)
             self._region_obs_state_map = None
             self._update_per_point_button_text()
             _refresh_size_estimate(self)
@@ -3382,6 +3450,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Remove scanCoordinates dictionaries and remove region overlay
             self.scanCoordinates.region_centers.pop(region_id, None)
+            self.scanCoordinates.region_laser_af_references.pop(region_id, None)
             self.navigationViewer.deregister_fovs_from_image(
                 self.scanCoordinates.region_fov_coordinates.pop(region_id, [])
             )
@@ -3484,6 +3553,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.dropdown_location_list.setCurrentIndex(row)
 
     def cell_was_changed(self, row, column):
+        # The "AF Ref" column is a read-only indicator; ignore changes to it.
+        if column >= 4:
+            return
+
         # Get region ID
         region_id = self.location_ids[row]
 
@@ -3535,6 +3608,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.scanCoordinates.region_fov_coordinates[new_id] = self.scanCoordinates.region_fov_coordinates.pop(
                     region_id
                 )
+            if region_id in self.scanCoordinates.region_laser_af_references:
+                self.scanCoordinates.region_laser_af_references[new_id] = (
+                    self.scanCoordinates.region_laser_af_references.pop(region_id)
+                )
 
         # Update UI
         location_str = f"x:{round(self.location_list[row,0],3)} mm  y:{round(self.location_list[row,1],3)} mm  z:{round(1000*self.location_list[row,2],3)} μm"
@@ -3568,15 +3645,69 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.table_location_list.blockSignals(False)
         self.dropdown_location_list.blockSignals(False)
 
+    @staticmethod
+    def _laser_af_sidecar_path(csv_path):
+        """Companion file holding full per-region laser-AF references for a CSV."""
+        return os.path.splitext(csv_path)[0] + ".laser_af.json"
+
+    def _load_laser_af_sidecar(self, csv_path):
+        """Load ``{region_id: reference_dict}`` from a CSV's laser-AF sidecar, if any."""
+        sidecar_path = self._laser_af_sidecar_path(csv_path)
+        if not os.path.exists(sidecar_path):
+            return {}
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self._log.error(f"Failed to read laser AF sidecar {sidecar_path}: {e}")
+            return {}
+
+    def _reference_from_import_row(self, original_id, row, sidecar_refs):
+        """Build a LaserAFReference for an imported row, or ``None``.
+
+        Prefers the full sidecar entry (with crop) keyed by the original exported
+        id; falls back to the numeric ``laser_af_x_reference`` CSV column (spot
+        position only, no crop).
+        """
+        if original_id in sidecar_refs:
+            try:
+                return LaserAFReference(**sidecar_refs[original_id])
+            except Exception as e:
+                self._log.error(f"Bad laser AF sidecar entry for region {original_id}: {e}")
+        xref = row.get("laser_af_x_reference") if hasattr(row, "get") else None
+        if xref is None or (isinstance(xref, float) and math.isnan(xref)) or str(xref).strip() in ("", "nan"):
+            return None
+        try:
+            return LaserAFReference.from_capture(float(xref), None)
+        except (ValueError, TypeError):
+            return None
+
     def export_location_list(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Export Location List", "", "CSV Files (*.csv);;All Files (*)")
         if file_path:
+            refs = self.scanCoordinates.region_laser_af_references
             location_list_df = pd.DataFrame(self.location_list, columns=["x (mm)", "y (mm)", "z (mm)"])
             location_list_df["ID"] = self.location_ids
+            # Human-readable spot position per region; blank when no reference.
+            location_list_df["laser_af_x_reference"] = [
+                (refs[rid].x_reference if rid in refs else "") for rid in self.location_ids
+            ]
             location_list_df["i"] = 0
             location_list_df["j"] = 0
             location_list_df["k"] = 0
             location_list_df.to_csv(file_path, index=False, header=True)
+
+            # Full references (incl. the cross-correlation crop image) go to a
+            # sidecar so the CSV stays readable but the export round-trips fully.
+            sidecar = {
+                str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs
+            }
+            if sidecar:
+                try:
+                    with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
+                        json.dump(sidecar, f)
+                except Exception as e:
+                    self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
 
     def import_location_list(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Import Location List", "", "CSV Files (*.csv);;All Files (*)")
@@ -3592,7 +3723,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 location_list_df_relevant["ID"] = location_list_df["ID"].astype(str)
             else:
                 location_list_df_relevant["ID"] = "None"
+            if "laser_af_x_reference" in location_list_df.columns:
+                location_list_df_relevant["laser_af_x_reference"] = location_list_df["laser_af_x_reference"]
+            # Full per-region references (incl. crops) ride in a sidecar next to
+            # the CSV; the x_reference column is the human-readable fallback.
+            sidecar_refs = self._load_laser_af_sidecar(file_path)
             self.clear_only_location_list()
+            self.scanCoordinates.region_laser_af_references.clear()
 
             self.table_location_list.blockSignals(True)
             self.dropdown_location_list.blockSignals(True)
@@ -3655,6 +3792,15 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                             self.entry_deltaX.value(),
                             self.entry_deltaY.value(),
                         )
+                    # Restore this region's laser-AF reference (sidecar by original
+                    # id, else the x_reference column). row["ID"] is the original
+                    # exported id even when region_id was reassigned above.
+                    reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
+                    if reference is not None:
+                        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+                    self.table_location_list.setItem(
+                        self.table_location_list.rowCount() - 1, 4, self._af_ref_item(reference)
+                    )
                 else:
                     self._log.warning("Duplicate values not added based on x and y.")
             self.table_location_list.blockSignals(False)
@@ -3881,6 +4027,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
+            self.table_location_list.setItem(
+                row, 4, self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name))
+            )
 
             # Add to scan coordinates
             if self.use_overlap:
@@ -7550,6 +7699,9 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(ref_z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(str(self.region_id)))
+            # Template regions don't capture per-region laser-AF references; keep
+            # the AF Ref column populated so it reads "—" rather than blank.
+            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
 
         self.scanCoordinates.add_template_region(
             ref_x, ref_y, ref_z, template_df["x_offset_mm"], template_df["y_offset_mm"], str(self.region_id)

@@ -695,6 +695,18 @@ class MultiPointWorker:
         )
         self.scan_region_coords_mm = acquisition_parameters.scan_position_information.scan_region_coords_mm
         self.scan_region_names = acquisition_parameters.scan_position_information.scan_region_names
+        # Per-region laser-AF focus targets. Regions without an entry fall back to
+        # `_base_laser_af_reference` — the global reference loaded in the controller
+        # at worker construction — so a region that follows one with a distinct
+        # reference still corrects to the right target, independent of scan order.
+        self._region_laser_af_references = dict(
+            acquisition_parameters.scan_position_information.scan_region_laser_af_references
+        )
+        self._base_laser_af_reference = (
+            self.laser_auto_focus_controller.get_active_reference()
+            if self.laser_auto_focus_controller is not None
+            else None
+        )
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
 
@@ -3193,6 +3205,9 @@ class MultiPointWorker:
         seeded = 0
         failed = 0
         for region_id, coords in self.scan_region_fov_coords_mm.items():
+            # Each region's seed measurements must correct to that region's own
+            # focus target, so load it before stepping through the region's FOVs.
+            self._apply_region_laser_af_reference(region_id)
             for fov_idx, coord in enumerate(coords):
                 if self.abort_requested_fn():
                     self._log.info("Abort requested during laser-AF seed scan")
@@ -3258,6 +3273,39 @@ class MultiPointWorker:
             self._fov_z_delta_map[key] = delta
             self._z_pos_proposal[key] = anchor_z_current + delta
 
+    def _resolve_region_laser_af_reference(self, region_id):
+        """Return the effective laser-AF reference for ``region_id``, or ``None``.
+
+        - No per-region reference -> the global reference (the controller's
+          reference snapshotted at worker construction, before this worker began
+          switching references around).
+        - A per-region reference WITH a crop -> used as-is.
+        - A per-region reference carrying only a spot position (no crop, e.g. a
+          spot-only CSV import) -> the region's x_reference but the global crop,
+          so cross-correlation verification still has a valid template. This
+          merge is done here (not in apply_reference) because the controller's
+          currently-active crop is order-dependent and must not leak in.
+        """
+        region_ref = self._region_laser_af_references.get(region_id)
+        base = self._base_laser_af_reference
+        if region_ref is None:
+            return base
+        if region_ref.reference_image is None and base is not None:
+            return base.model_copy(update={"x_reference": region_ref.x_reference})
+        return region_ref
+
+    def _apply_region_laser_af_reference(self, region_id) -> None:
+        """Make ``region_id``'s effective laser-AF target active on the controller.
+
+        No-op when laser AF is unavailable or no reference resolves (the latter
+        is caught earlier by validate_acquisition_settings).
+        """
+        if self.laser_auto_focus_controller is None:
+            return
+        reference = self._resolve_region_laser_af_reference(region_id)
+        if reference is not None:
+            self.laser_auto_focus_controller.apply_reference(reference)
+
     def perform_autofocus(self, region_id, fov):
         # Phase F: the stage move that brought us to this FOV was fired async
         # by move_to_coordinate. When AF will actually touch hardware below,
@@ -3289,6 +3337,11 @@ class MultiPointWorker:
         else:
             # Laser-AF path. Decide between a full laser-AF "refresh" or a
             # table-only Z move, then run consistency checks where possible.
+            # Load this region's focus target before ANY measurement below. Done
+            # every FOV (cheap — just sets x_reference + crop, no hardware I/O)
+            # so correctness never depends on the reference persisting across
+            # FOVs/timepoints or on _last_region_id bookkeeping.
+            self._apply_region_laser_af_reference(region_id)
             new_region_entry = self._last_region_id != region_id
             if new_region_entry:
                 # Reset per-region-entry counters. Refreshes completed in earlier

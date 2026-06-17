@@ -194,6 +194,10 @@ controllers: "Core Controllers" {
       Hardware reflection-based autofocus.
       Monitors laser spot position shift on focus camera
       to infer Z displacement. Per-objective calibration.
+      Reference (spot x + crop) is capture/apply/get-active
+      so flexible multipoint can carry a distinct
+      LaserAFReference per region (via ScanPositionInformation);
+      regions without one fall back to the global reference.
     |
   }
 

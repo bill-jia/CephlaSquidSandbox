@@ -134,6 +134,33 @@ def _save_region_observation_state_csv(experiment_path, region_observation_state
             logger.error("Failed to write region_observation_states.csv: %s", e, exc_info=True)
 
 
+def _save_region_laser_af_references(experiment_path, region_laser_af_references, logger=None):
+    """Record the per-region laser-AF focus targets used for the run.
+
+    Writes ``region_laser_af_references.csv`` (region id, spot x_reference, and
+    whether a verification crop was stored). Only written when at least one
+    region carried a per-region reference. The crop images themselves are part
+    of the exported coordinate sidecar, not this reproducibility summary.
+    """
+    if not region_laser_af_references:
+        return
+    rows = []
+    for region_id, reference in region_laser_af_references.items():
+        rows.append(
+            {
+                "region": region_id,
+                "x_reference": getattr(reference, "x_reference", ""),
+                "has_reference_image": int(getattr(reference, "reference_image", None) is not None),
+            }
+        )
+    csv_path = os.path.join(experiment_path, "region_laser_af_references.csv")
+    try:
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+    except Exception as e:
+        if logger:
+            logger.error("Failed to write region_laser_af_references.csv: %s", e, exc_info=True)
+
+
 def _save_cycle_manifest(experiment_path, params, repo, logger=None):
     """Write the resolved cycle/acquisition-order manifest (the ground truth).
 
@@ -1500,6 +1527,13 @@ class MultiPointController:
                 logger=self._log,
             )
 
+            # Save per-region laser-AF reference summary (laser AF runs only)
+            _save_region_laser_af_references(
+                experiment_path,
+                acquisition_params.scan_position_information.scan_region_laser_af_references,
+                logger=self._log,
+            )
+
             # Save the resolved cycle/acquisition-order manifest (cycle runs only)
             _save_cycle_manifest(
                 experiment_path,
@@ -1761,11 +1795,22 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
-        if self.do_reflection_af and not self.laserAutoFocusController.laser_af_properties.has_reference:
-            self._log.error(
-                "Laser Autofocus Not Ready - Please set the laser autofocus reference position before starting acquisition with laser AF enabled."
-            )
-            return False
+        if self.do_reflection_af:
+            # Acceptable when a global reference is set (regions without their own
+            # reference fall back to it) OR every region carries a per-region
+            # reference (no global needed). Otherwise some region would have no
+            # focus target.
+            has_global = self.laserAutoFocusController.laser_af_properties.has_reference
+            region_refs = getattr(self.scanCoordinates, "region_laser_af_references", {}) or {}
+            region_ids = list(getattr(self.scanCoordinates, "region_centers", {}).keys())
+            all_regions_have_refs = bool(region_ids) and all(rid in region_refs for rid in region_ids)
+            if not has_global and not all_regions_have_refs:
+                self._log.error(
+                    "Laser Autofocus Not Ready - set the laser autofocus reference position "
+                    "(global) or capture a per-region reference for every region before "
+                    "starting acquisition with laser AF enabled."
+                )
+                return False
 
         # When any selected observation state has timed illuminators (capture-
         # window or stimulus-only), the worker arms an NIDAQ pulse waveform.

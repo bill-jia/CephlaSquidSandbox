@@ -15,7 +15,7 @@ from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
-from control.models import LaserAFConfig
+from control.models import LaserAFConfig, LaserAFReference
 from squid.abc import AbstractCamera, AbstractStage
 import squid.logging
 
@@ -423,63 +423,103 @@ class LaserAutofocusController(QObject):
             else:
                 self.stage.move_z(um_to_move / 1000)
 
-    def set_reference(self) -> bool:
-        """Set the current spot position as the reference position.
+    def _normalized_spot_crop(self, image: np.ndarray, x: float) -> np.ndarray:
+        """Crop the spot region around ``x`` (vertically centered) and normalize it.
 
-        Captures and stores both the spot position and a cropped reference image
-        around the spot for later alignment verification.
+        Mean-subtracted and scaled by max, matching the form
+        :meth:`_verify_spot_alignment` compares against.
+        """
+        center_y = int(image.shape[0] / 2)
+        half = self.laser_af_properties.spot_crop_size // 2
+        x_start = max(0, int(x) - half)
+        x_end = min(image.shape[1], int(x) + half)
+        y_start = max(0, center_y - half)
+        y_end = min(image.shape[0], center_y + half)
+        crop = image[y_start:y_end, x_start:x_end].astype(np.float32)
+        return (crop - np.mean(crop)) / np.max(crop)
+
+    def capture_reference(self) -> Optional[LaserAFReference]:
+        """Measure the current spot and return it as a :class:`LaserAFReference`.
+
+        Pure capture: does not mutate the controller's active reference, the live
+        ``reference_crop``, or the per-objective cache. Used to snapshot a focus
+        target for one region without disturbing the global reference. Returns
+        ``None`` if not initialized or spot detection fails.
+        """
+        if not self.is_initialized:
+            self._log.error("Laser autofocus is not initialized, cannot capture reference")
+            return None
+
+        try:
+            self.turn_on_AF_laser()
+        except TimeoutError:
+            self._log.exception("Failed to turn on AF laser for reference capture!")
+            return None
+
+        result = self._get_laser_spot_centroid()
+        reference_image = self.image
+
+        try:
+            self.turn_off_AF_laser()
+        except TimeoutError:
+            self._log.exception("Failed to turn off AF laser after capturing reference, laser is in an unknown state!")
+            # Continue on since we got our reading, but the system is potentially in a weird state!
+
+        if result is None or reference_image is None:
+            self._log.error("Failed to detect laser spot while capturing reference")
+            return None
+
+        x, _ = result
+        crop = self._normalized_spot_crop(reference_image, x)
+        self._log.info(f"Captured laser AF reference at x={x:.1f}")
+        return LaserAFReference.from_capture(x_reference=x, crop=crop)
+
+    def apply_reference(self, reference: LaserAFReference) -> None:
+        """Make ``reference`` the controller's active focus target.
+
+        Sets ``x_reference`` and the live ``reference_crop`` (used by displacement
+        measurement and cross-correlation verification) to exactly what
+        ``reference`` carries — including a ``None`` crop. This is deterministic
+        on purpose: it must NOT inherit whatever crop a previously applied
+        reference left active, or one region's verification image could leak into
+        another's. Crop fallback (borrowing the global crop for a spot-only
+        reference) is the caller's responsibility — see
+        ``MultiPointWorker._resolve_region_laser_af_reference``.
+        """
+        self.reference_crop = reference.reference_crop
+        self.laser_af_properties = self.laser_af_properties.model_copy(
+            update={"x_reference": reference.x_reference, "has_reference": True}
+        )
+
+    def get_active_reference(self) -> Optional[LaserAFReference]:
+        """Snapshot the controller's current active reference, or ``None`` if unset."""
+        if not self.laser_af_properties.has_reference or self.laser_af_properties.x_reference is None:
+            return None
+        return LaserAFReference.from_capture(self.laser_af_properties.x_reference, self.reference_crop)
+
+    def set_reference(self) -> bool:
+        """Set the current spot position as the global reference position.
+
+        Captures the spot position and cropped reference image, makes it the
+        active reference, and persists it to the per-objective cache.
 
         Returns:
             bool: True if reference was set successfully, False if spot detection failed
         """
-        if not self.is_initialized:
-            self._log.error("Laser autofocus is not initialized, cannot set reference")
+        reference = self.capture_reference()
+        if reference is None:
             return False
 
-        # turn on the laser
-        try:
-            self.turn_on_AF_laser()
-        except TimeoutError:
-            self._log.exception("Failed to turn on AF laser for reference setting!")
-            return False
-
-        # get laser spot location and image
-        result = self._get_laser_spot_centroid()
-        reference_image = self.image
-
-        # turn off the laser
-        try:
-            self.turn_off_AF_laser()
-        except TimeoutError:
-            self._log.exception("Failed to turn off AF laser after setting reference, laser is in an unknown state!")
-            # Continue on since we got our reading, but the system is potentially in a weird state!
-
-        if result is None or reference_image is None:
-            self._log.error("Failed to detect laser spot while setting reference")
-            return False
-
-        x, y = result
-
-        # Store cropped and normalized reference image
-        center_y = int(reference_image.shape[0] / 2)
-        x_start = max(0, int(x) - self.laser_af_properties.spot_crop_size // 2)
-        x_end = min(reference_image.shape[1], int(x) + self.laser_af_properties.spot_crop_size // 2)
-        y_start = max(0, center_y - self.laser_af_properties.spot_crop_size // 2)
-        y_end = min(reference_image.shape[0], center_y + self.laser_af_properties.spot_crop_size // 2)
-
-        reference_crop = reference_image[y_start:y_end, x_start:x_end].astype(np.float32)
-        self.reference_crop = (reference_crop - np.mean(reference_crop)) / np.max(reference_crop)
-
+        self.apply_reference(reference)
         self.signal_displacement_um.emit(0)
-        self._log.info(f"Set reference position to ({x:.1f}, {y:.1f})")
 
-        self.laser_af_properties = self.laser_af_properties.model_copy(
-            update={"x_reference": x, "has_reference": True}
-        )  # We don't keep reference_crop here to avoid serializing it
+        x = reference.x_reference
+        self._log.info(f"Set reference position to x={x:.1f}")
 
         # Update cached file. reference_crop needs to be saved.
         if self._current_profile and self.objectiveStore:
-            # Create config for saving with reference image encoded
+            # Create config for saving with reference image encoded. The cache
+            # stores the absolute-sensor x (x + x_offset); load adjusts it back.
             save_config = self.laser_af_properties.model_copy(
                 update={"x_reference": x + self.laser_af_properties.x_offset, "has_reference": True}
             )

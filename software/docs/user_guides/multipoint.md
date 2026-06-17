@@ -337,14 +337,24 @@ Click‑to‑Move), then manage the list with these buttons:
 | **Clear** | Remove all positions. |
 | **Location List** (dropdown) | Lists every saved position as `x … mm  y … mm  z … µm`; selecting one moves the stage there. |
 | **Update Z** | Overwrite the selected position's Z with the current stage Z. |
+| **Update Ref** | Re‑capture the laser‑AF reference (focus target) for the selected position. Only shown on rigs with the laser‑focus camera; see [Per‑region laser autofocus references](#per-region-laser-autofocus-references). |
 
 ### Import / export / edit
 
 - **Import Location List** — load positions from a CSV with columns `x (mm)`,
-  `y (mm)`, `z (mm)`, and optional `ID`. This replaces the current list.
-- **Export Location List** — save the current positions to a CSV.
-- **Edit** — open the position list as an editable table (columns x, y, z, ID); edit a
-  cell to move that position, click a row to select it.
+  `y (mm)`, `z (mm)`, and optional `ID`. This replaces the current list. If the CSV has a
+  `laser_af_x_reference` column and/or a `<name>.laser_af.json` sidecar file next to it,
+  the per‑region laser‑AF references are restored too (see
+  [Per‑region laser autofocus references](#per-region-laser-autofocus-references)).
+- **Export Location List** — save the current positions to a CSV (`x (mm)`, `y (mm)`,
+  `z (mm)`, `ID`, plus a `laser_af_x_reference` column). When any position has a laser‑AF
+  reference, a companion `<name>.laser_af.json` sidecar is written alongside the CSV
+  holding the full references (including the cross‑correlation crop image) so the export
+  round‑trips exactly. Keep the sidecar next to the CSV to re‑import references.
+- **Edit** — open the position list as an editable table (columns x, y, z, ID, and a
+  read‑only **AF Ref**); edit a cell to move/rename that position, click a row to select
+  it. The **AF Ref** column shows each region's stored laser‑AF spot position, or `—`
+  when none is set.
 
 ### Per‑position tile grid
 
@@ -358,6 +368,37 @@ added automatically and removed again when the run finishes.
 
 > Dropping an `acquisition.yaml` onto the Flexible tab is not currently supported (you'll
 > get a "Not Supported" notice). YAML drag‑and‑drop works on the **Wellplate** tab.
+
+### Per‑region laser autofocus references
+
+Normally laser AF corrects every position back to a single reference (the in‑focus
+reflected‑spot position) shared across the whole run. On the **Flexible** tab you can
+instead give **each position its own laser‑AF reference** — useful when positions sit on
+substrates of different thickness, or otherwise focus to a different reference plane, so a
+single global reference would mis‑focus some of them. (A reference is per *region*, not per
+tile: every tile in a position uses that position's reference.)
+
+How to use it:
+
+1. Enable **Laser AF** (the Reflection AF button) and make sure it is initialized (use the
+   *Focus Camera / Laser AF Setup* tool to find the spot and calibrate).
+2. Drive to a position, get it in focus, and click **Add**. The current laser‑AF reference
+   is captured and attached to that position — its spot position appears in the **AF Ref**
+   column of the **Edit** table.
+3. Repeat for each position, focusing each one before adding it.
+4. To re‑capture a position's reference later, select it in the **Location List** and click
+   **Update Ref** (focus first). **Update Z** changes only the stored Z, not the reference.
+
+During acquisition the worker loads each region's own reference before focusing in that
+region, independent of scan order. Positions **without** a captured reference fall back to
+the global reference. Acquisition can therefore start when *either* a global reference is
+set *or* every position has its own — otherwise the start check reports that a reference is
+missing. A `region_laser_af_references.csv` summary is written into the experiment folder
+for reproducibility, and references export/import with the location list (see
+[Import / export / edit](#import--export--edit)).
+
+This per‑region reference plumbing is shared with the wellplate code path, but only the
+Flexible tab captures references today.
 
 ---
 

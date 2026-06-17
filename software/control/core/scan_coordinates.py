@@ -76,6 +76,11 @@ class ScanCoordinates:
         self.region_centers = {}  # {region_id: [x, y, z]}
         self.region_shapes = {}  # {region_id: "Square"}
         self.region_fov_coordinates = {}  # {region_id: [(x,y,z), ...]}
+        # Optional per-region laser-AF focus target (LaserAFReference). Regions
+        # without an entry fall back to the controller's global reference. Shared
+        # plumbing for both flexible and wellplate acquisition; only flexible
+        # populates it today.
+        self.region_laser_af_references = {}  # {region_id: LaserAFReference}
         # 2D grid (rows top-to-bottom, each row left-to-right) for regions that were generated
         # from a rectangular lattice. Kept alongside the flat list so sort_coordinates can
         # re-snake each region from the corner nearest the previous region's exit.
@@ -407,6 +412,7 @@ class ScanCoordinates:
                 del self.region_shapes[well_id]
 
             self.region_fov_rows.pop(well_id, None)
+            self.region_laser_af_references.pop(well_id, None)
 
             if well_id in self.region_fov_coordinates:
                 region_scan_coordinates = self.region_fov_coordinates.pop(well_id)
@@ -421,8 +427,20 @@ class ScanCoordinates:
         self.region_shapes.clear()
         self.region_fov_rows.clear()
         self.region_fov_coordinates.clear()
+        self.region_laser_af_references.clear()
         self._update_callback(ClearedScanCoordinates())
         self._log.debug("Cleared All Regions")
+
+    def set_region_laser_af_reference(self, region_id, reference):
+        """Attach (or, with ``reference=None``, clear) a per-region laser-AF target."""
+        if reference is None:
+            self.region_laser_af_references.pop(region_id, None)
+        else:
+            self.region_laser_af_references[region_id] = reference
+
+    def get_region_laser_af_reference(self, region_id):
+        """Return the per-region laser-AF target for ``region_id``, or ``None``."""
+        return self.region_laser_af_references.get(region_id)
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
