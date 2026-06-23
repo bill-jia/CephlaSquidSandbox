@@ -712,11 +712,24 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         Returns the final (width, height) pixel size of the image after ROI and software crop.
         Falls back to the camera's current-binning resolution if no crop is configured, so
         downstream FOV math always gets real dimensions instead of None.
+
+        The configured crop is clamped to the active hardware ROI: the camera only delivers
+        an ROI-sized frame, so _process_raw_frame's center crop can never make it larger than
+        that. Without this clamp, setting a hardware ROI smaller than the configured crop would
+        leave get_crop_size (and thus get_fov_size_mm) reporting the full crop, so multipoint
+        tile stepping spaces FOVs for an image bigger than what is actually saved and leaves
+        gaps between tiles that should overlap.
         """
         binning_x, binning_y = self.get_binning()
         res_w, res_h = self.get_resolution()
         crop_width = int(self._config.crop_width / binning_x) if self._config.crop_width else res_w
         crop_height = int(self._config.crop_height / binning_y) if self._config.crop_height else res_h
+        # Clamp to the real delivered frame size. get_region_of_interest returns the ROI in the
+        # same binned output pixels as get_resolution, and the ROI can never exceed the sensor,
+        # so this is a no-op when no sub-ROI is set.
+        _, _, roi_w, roi_h = self.get_region_of_interest()
+        crop_width = min(crop_width, roi_w)
+        crop_height = min(crop_height, roi_h)
         crop_width = int(crop_width * self._software_crop_width_ratio)
         crop_height = int(crop_height * self._software_crop_height_ratio)
         return crop_width, crop_height
@@ -953,6 +966,16 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         Returns the region of interest as a tuple of (x corner, y corner, width, height)
         """
         pass
+
+    @property
+    def external_frame_grabbing(self) -> bool:
+        """
+        True when the physical sensor is owned by a separate camera application and Squid
+        should not grab/save frames itself (it still drives the real hardware trigger and,
+        in fast acquisition, the NI-DAQ trigger pulse train).  Real cameras return False;
+        the SimulatedCamera reports True when configured for external frame grabbing.
+        """
+        return False
 
     def get_fast_acquisition_max_frame_bytes(self) -> int:
         """

@@ -1,5 +1,6 @@
 from ._bootstrap import *
 from .common import (
+    check_observation_state_roi_consistency_with_dialog,
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
     error_dialog,
@@ -3226,6 +3227,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
+            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
             if self.checkbox_skipSaving.isChecked():
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
@@ -5913,6 +5919,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
+
+            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
+                self.btn_startAcquisition.setChecked(False)
+                return
 
             if self.checkbox_skipSaving.isChecked():
                 self._log.info("Skipping disk space check - image saving is disabled")

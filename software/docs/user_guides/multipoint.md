@@ -67,7 +67,12 @@ coordinate, or a manually added position. Each region is covered by a grid of
 overlapping fields of view (tiles).
 
 **FOV / tile.** A single field of view (one camera frame). A region is scanned as a
-grid of FOVs with a configurable overlap so the tiles can be stitched later.
+grid of FOVs with a configurable overlap so the tiles can be stitched later. The FOV
+size used to space tiles is the *actually saved* frame — it reflects binning, the
+software crop, **and the hardware ROI**. If you shrink the camera ROI (e.g. a centered
+ROI smaller than the configured crop), the tile spacing shrinks with it so the overlap
+percentage still holds; otherwise tiles would be spaced for a larger image than is saved
+and leave gaps.
 
 **The four acquisition dimensions.** A multipoint run is the product of:
 - **XY** — which regions, and the tile grid within each region;
@@ -229,6 +234,20 @@ For the checklist itself:
 By default every checked channel is imaged at every selected well. To image **different
 channels at different wells**, use **Per‑Point Channels** (see
 [Per‑point / per‑well channels](#per-point--per-well-channels)).
+
+#### Tile spacing vs. channel ROIs
+
+Each observation state carries its own camera ROI, and the saved tile size depends on it.
+Two things keep the overlap correct across a mixed‑ROI acquisition:
+
+- **Tiling is recomputed at run time** for the FOV that will actually be imaged, so the
+  overlap you set is honored even if you changed the camera ROI/binning *after* laying out
+  the regions. (The on‑screen tile preview is refreshed to match.)
+- **The largest ROI in the group sets the spacing.** If the checked channels don't all use
+  the same ROI, tiles are spaced so the largest‑ROI channel keeps its overlap; channels
+  with a smaller ROI then under‑sample (leave gaps between their tiles). Because that may be
+  deliberate subsampling *or* a mistake, starting such an acquisition pops a warning listing
+  the mismatched channels and their FOVs, and asks you to confirm before continuing.
 
 ### Step 6 — (Optional) Z‑stack
 

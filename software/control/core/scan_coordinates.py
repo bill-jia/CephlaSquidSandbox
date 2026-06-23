@@ -86,6 +86,16 @@ class ScanCoordinates:
         # re-snake each region from the corner nearest the previous region's exit.
         self.region_fov_rows = {}  # {region_id: [[(x,y), ...], ...]}
 
+        # Generative parameters for FOV-dependent regions (flexible-overlap, well, manual),
+        # recorded so the tile grid can be rebuilt for a different FOV at acquisition time —
+        # see regenerate_for_fov(). FOV-independent regions (explicit dx/dy step, template,
+        # single FOV) are intentionally absent: their coordinates do not depend on the FOV.
+        self.region_generation_params = {}  # {region_id: {"kind": ..., ...}}
+        # When set to (fov_w_mm, fov_h_mm), the generators use it instead of the live camera
+        # FOV. Lets an acquisition tile for the observation states' ROIs rather than whatever
+        # camera state happened to be live when the regions were drawn.
+        self._fov_override_mm = None
+
     def add_well_selector(self, well_selector):
         self.well_selector = well_selector
 
@@ -314,6 +324,11 @@ class ScanCoordinates:
                     self.region_centers[region_name] = [center[0], center[1]]
                     self.region_shapes[region_name] = "Manual"
                     self.region_fov_coordinates[region_name] = scan_coordinates
+                    self.region_generation_params[region_name] = {
+                        "kind": "manual",
+                        "shape_coords": np.asarray(shape_coords).tolist(),
+                        "overlap_percent": overlap_percent,
+                    }
                     self._log.info(f"Added Manual Region: {region_name}")
                     self._update_callback(
                         AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
@@ -321,12 +336,22 @@ class ScanCoordinates:
         else:
             self._log.info("No Manual ROI found")
 
-    def add_region(self, well_id, center_x, center_y, scan_size_mm, overlap_percent=10, shape="Square"):
-        """add region based on user inputs"""
+    def _fov_mm(self):
+        """Sample-frame FOV (width_mm, height_mm) used to space tiles.
+
+        Returns the acquisition FOV override when one is active (see
+        regenerate_for_fov); otherwise the live camera FOV scaled to the sample
+        frame by the objective's pixel-size factor.
+        """
+        if self._fov_override_mm is not None:
+            return self._fov_override_mm
         pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
         fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
-        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
-        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        return pixel_size_factor * fov_w_mm_sensor, pixel_size_factor * fov_h_mm_sensor
+
+    def add_region(self, well_id, center_x, center_y, scan_size_mm, overlap_percent=10, shape="Square"):
+        """add region based on user inputs"""
+        fov_w_mm, fov_h_mm = self._fov_mm()
         overlap_frac = 1 - overlap_percent / 100
         step_x_mm = fov_w_mm * overlap_frac
         step_y_mm = fov_h_mm * overlap_frac
@@ -397,10 +422,20 @@ class ScanCoordinates:
                 rows = [[(center_x, center_y)]]
                 scan_coordinates = [(center_x, center_y)]
 
+        center_z = float(self.stage.get_pos().z_mm)
         self.region_shapes[well_id] = shape
-        self.region_centers[well_id] = [float(center_x), float(center_y), float(self.stage.get_pos().z_mm)]
+        self.region_centers[well_id] = [float(center_x), float(center_y), center_z]
         self.region_fov_rows[well_id] = rows
         self.region_fov_coordinates[well_id] = scan_coordinates
+        self.region_generation_params[well_id] = {
+            "kind": "well",
+            "center_x": float(center_x),
+            "center_y": float(center_y),
+            "center_z": center_z,
+            "scan_size_mm": scan_size_mm,
+            "overlap_percent": overlap_percent,
+            "shape": shape,
+        }
         self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
 
     def remove_region(self, well_id):
@@ -413,6 +448,7 @@ class ScanCoordinates:
 
             self.region_fov_rows.pop(well_id, None)
             self.region_laser_af_references.pop(well_id, None)
+            self.region_generation_params.pop(well_id, None)
 
             if well_id in self.region_fov_coordinates:
                 region_scan_coordinates = self.region_fov_coordinates.pop(well_id)
@@ -428,8 +464,63 @@ class ScanCoordinates:
         self.region_fov_rows.clear()
         self.region_fov_coordinates.clear()
         self.region_laser_af_references.clear()
+        self.region_generation_params.clear()
         self._update_callback(ClearedScanCoordinates())
         self._log.debug("Cleared All Regions")
+
+    def regenerate_for_fov(self, fov_w_mm, fov_h_mm):
+        """Rebuild FOV-dependent tile grids for an explicit sample-frame FOV.
+
+        Used at acquisition start so the tile spacing matches the FOV that will
+        actually be imaged (derived from the observation states' ROIs) rather
+        than whatever camera state was live when the regions were drawn. Region
+        order and per-region laser-AF references are preserved; FOV-independent
+        regions (explicit dx/dy step, template, single FOV) are left untouched.
+
+        Returns True if any region was rebuilt.
+        """
+        if not self.region_generation_params:
+            return False
+
+        # Replay each generator in place under the FOV override, with UI callbacks
+        # suppressed so we can emit one clean rebuild afterwards instead of N appends.
+        params = dict(self.region_generation_params)
+        prev_override = self._fov_override_mm
+        prev_callback = self._update_callback
+        self._fov_override_mm = (float(fov_w_mm), float(fov_h_mm))
+        self._update_callback = lambda update: None
+        try:
+            for region_id, p in params.items():
+                kind = p["kind"]
+                if kind == "flexible":
+                    self.add_flexible_region(
+                        region_id, p["center_x"], p["center_y"], p["center_z"], p["Nx"], p["Ny"], p["overlap_percent"]
+                    )
+                elif kind == "well":
+                    self.add_region(
+                        region_id, p["center_x"], p["center_y"], p["scan_size_mm"], p["overlap_percent"], p["shape"]
+                    )
+                    # add_region re-reads the stage Z for the region center; restore the
+                    # Z captured when the region was first defined (in both the center and
+                    # the stored params so a later regenerate keeps it too).
+                    if region_id in self.region_centers:
+                        self.region_centers[region_id][2] = p["center_z"]
+                    if region_id in self.region_generation_params:
+                        self.region_generation_params[region_id]["center_z"] = p["center_z"]
+                elif kind == "manual":
+                    coords = self.get_points_for_manual_region(p["shape_coords"], p["overlap_percent"])
+                    if coords:
+                        self.region_fov_coordinates[region_id] = coords
+            self._apply_snake_continuity()
+        finally:
+            self._update_callback = prev_callback
+            self._fov_override_mm = prev_override
+
+        # Rebuild the preview overlay from the regenerated coordinates.
+        self._update_callback(ClearedScanCoordinates())
+        for region_id, coords in self.region_fov_coordinates.items():
+            self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(coords)))
+        return True
 
     def set_region_laser_af_reference(self, region_id, reference):
         """Attach (or, with ``reference=None``, clear) a per-region laser-AF target."""
@@ -444,11 +535,7 @@ class ScanCoordinates:
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
         """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
-        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
-        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
-        # self._log.info(f"Adding flexible region with Nx={Nx}, Ny={Ny}, overlap={overlap_percent}%, pixel_size_factor={pixel_size_factor}, fov_w_mm_sensor={fov_w_mm_sensor}, fov_h_mm_sensor={fov_h_mm_sensor}")
-        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
-        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        fov_w_mm, fov_h_mm = self._fov_mm()
         overlap_frac = 1 - overlap_percent / 100
         step_x_mm = fov_w_mm * overlap_frac
         step_y_mm = fov_h_mm * overlap_frac
@@ -475,6 +562,15 @@ class ScanCoordinates:
             self.region_centers[region_id] = [center_x, center_y, center_z]
             self.region_fov_rows[region_id] = rows
             self.region_fov_coordinates[region_id] = scan_coordinates
+            self.region_generation_params[region_id] = {
+                "kind": "flexible",
+                "center_x": center_x,
+                "center_y": center_y,
+                "center_z": center_z,
+                "Nx": Nx,
+                "Ny": Ny,
+                "overlap_percent": overlap_percent,
+            }
             self._update_callback(
                 AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
             )
@@ -521,10 +617,7 @@ class ScanCoordinates:
             self._log.error("Invalid manual ROI data")
             return []
 
-        pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
-        fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
-        fov_w_mm = pixel_size_factor * fov_w_mm_sensor
-        fov_h_mm = pixel_size_factor * fov_h_mm_sensor
+        fov_w_mm, fov_h_mm = self._fov_mm()
         overlap_frac = 1 - overlap_percent / 100
         step_x_mm = fov_w_mm * overlap_frac
         step_y_mm = fov_h_mm * overlap_frac

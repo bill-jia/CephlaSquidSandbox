@@ -13,6 +13,62 @@ def error_dialog(message: str, title: str = "Error"):
     return
 
 
+def check_observation_state_roi_consistency_with_dialog(
+    multi_point_controller: MultiPointController, logger: logging.Logger
+) -> bool:
+    """Warn and require approval when the run's observation states have mismatched ROIs.
+
+    Tiles are spaced for the largest ROI in the group (so the most complete channel keeps
+    its overlap); states with smaller ROIs then under-sample, which may or may not be the
+    intent. When proceeding, the regions are re-tiled for that FOV up front (via
+    apply_observation_state_tiling) so the disk/RAM estimates and the preview reflect the
+    tile count that will actually be acquired. Returns True to proceed (no mismatch, or the
+    user approved), False to cancel.
+    """
+    try:
+        report = multi_point_controller.build_roi_consistency_report()
+    except Exception:
+        logger.exception("ROI consistency check failed; proceeding without it.")
+        return True
+
+    if not report.get("mismatch"):
+        multi_point_controller.apply_observation_state_tiling()
+        return True
+
+    tiling = report.get("tiling_fov_mm")
+    largest = report.get("largest_name")
+    mismatched = report.get("mismatch_names", [])
+
+    def _fmt(entry):
+        fov = entry.get("fov_mm")
+        if fov is None:
+            return f"  • {entry['name']}: FOV unknown"
+        return f"  • {entry['name']}: {fov[0]:.3f} × {fov[1]:.3f} mm"
+
+    lines = "\n".join(_fmt(e) for e in report.get("entries", []))
+    tiling_str = f"{tiling[0]:.3f} × {tiling[1]:.3f} mm" if tiling else "unknown"
+    message = (
+        "The selected observation states do not all use the same camera ROI.\n\n"
+        f"Tiling overlap will be computed for the largest ROI ('{largest}', {tiling_str}).\n"
+        f"These states have a smaller ROI and will under-sample (intentional subsampling, "
+        f"or possibly a mistake):\n  {', '.join(mismatched)}\n\n"
+        f"Per-state FOV:\n{lines}\n\n"
+        "Proceed with the acquisition?"
+    )
+    logger.warning("Observation-state ROI mismatch; requesting user approval. %s", mismatched)
+
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setWindowTitle("Mismatched Observation-State ROIs")
+    msg.setText(message)
+    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+    msg.setDefaultButton(QMessageBox.Cancel)
+    if msg.exec_() != QMessageBox.Yes:
+        return False
+    multi_point_controller.apply_observation_state_tiling()
+    return True
+
+
 def check_space_available_with_error_dialog(
     multi_point_controller: MultiPointController, logger: logging.Logger, factor_of_safecty: float = 1.03
 ) -> bool:

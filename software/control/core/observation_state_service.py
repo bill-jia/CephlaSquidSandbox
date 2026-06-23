@@ -70,6 +70,89 @@ def infer_roi_centered_from_camera(camera: Any) -> bool:
         return False
 
 
+# ── FOV / ROI tiling consistency ─────────────────────────────────────────────
+
+
+def observation_state_fov_mm(
+    state: ObservationState, camera: Any, pixel_size_factor: float
+) -> Optional[tuple[float, float]]:
+    """Sample-frame FOV (width_mm, height_mm) that ``state`` will actually save.
+
+    Derived from the state's recorded camera ROI/binning, matching the saved-frame
+    geometry that ``AbstractCamera.get_crop_size`` produces: the delivered frame is the
+    ROI, clamped to the configured software crop. ROI/crop are converted to unbinned
+    sensor pixels so binning cancels and two states with the same physical ROI compare
+    equal regardless of their binning. Returns ``None`` if the FOV can't be determined.
+    """
+    snap = state.camera_live
+    try:
+        sensor_um = float(camera.get_pixel_size_unbinned_um())
+    except Exception:
+        return None
+
+    if snap is None or snap.roi_width <= 0 or snap.roi_height <= 0:
+        # No explicit ROI recorded — fall back to the camera's current FOV.
+        try:
+            w_mm, h_mm = camera.get_fov_size_mm()
+            return pixel_size_factor * w_mm, pixel_size_factor * h_mm
+        except Exception:
+            return None
+
+    bx = max(1, int(snap.binning_x or 1))
+    by = max(1, int(snap.binning_y or 1))
+    # get_region_of_interest reports binned pixels; * binning -> unbinned sensor pixels.
+    roi_w_unbinned = int(snap.roi_width) * bx
+    roi_h_unbinned = int(snap.roi_height) * by
+
+    cfg = getattr(camera, "_config", None)
+    crop_w = getattr(cfg, "crop_width", None) if cfg is not None else None
+    crop_h = getattr(cfg, "crop_height", None) if cfg is not None else None
+    frame_w = min(roi_w_unbinned, int(crop_w)) if crop_w else roi_w_unbinned
+    frame_h = min(roi_h_unbinned, int(crop_h)) if crop_h else roi_h_unbinned
+
+    return frame_w * sensor_um * pixel_size_factor / 1000.0, frame_h * sensor_um * pixel_size_factor / 1000.0
+
+
+def observation_state_roi_report(
+    states: List[tuple[str, ObservationState]],
+    camera: Any,
+    pixel_size_factor: float,
+    tolerance_mm: float = 1e-4,
+) -> Dict[str, Any]:
+    """Compare the FOVs of observation states sharing one acquisition.
+
+    Tiling overlap is computed for the *largest* FOV so the most complete channel is
+    fully covered; smaller-ROI states then under-sample (intentional or not), which is
+    flagged via ``mismatch`` so the UI can require user approval.
+
+    Returns a dict with:
+      - ``entries``: ``[{"name", "fov_mm"}]`` per state (fov_mm may be None)
+      - ``tiling_fov_mm``: (w, h) of the largest FOV, or None
+      - ``largest_name``: name of the state with the largest FOV
+      - ``mismatch_names``: states whose FOV differs from the largest
+      - ``mismatch``: True if any state differs beyond ``tolerance_mm``
+    """
+    entries = [{"name": name, "fov_mm": observation_state_fov_mm(st, camera, pixel_size_factor)} for name, st in states]
+    valid = [e for e in entries if e["fov_mm"] is not None]
+    if not valid:
+        return {"entries": entries, "tiling_fov_mm": None, "largest_name": None, "mismatch_names": [], "mismatch": False}
+
+    largest = max(valid, key=lambda e: e["fov_mm"][0] * e["fov_mm"][1])
+    tiling = largest["fov_mm"]
+    mismatch_names = [
+        e["name"]
+        for e in valid
+        if abs(e["fov_mm"][0] - tiling[0]) > tolerance_mm or abs(e["fov_mm"][1] - tiling[1]) > tolerance_mm
+    ]
+    return {
+        "entries": entries,
+        "tiling_fov_mm": tiling,
+        "largest_name": largest["name"],
+        "mismatch_names": mismatch_names,
+        "mismatch": bool(mismatch_names),
+    }
+
+
 # ── Binning/mode helpers ─────────────────────────────────────────────────────
 
 

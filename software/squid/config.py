@@ -727,6 +727,14 @@ class CameraConfig(pydantic.BaseModel):
     reverse_x: Optional[bool] = None
     reverse_y: Optional[bool] = None
 
+    # Only meaningful for a simulated camera.  When True, the physical sensor is owned
+    # by a separate camera application (e.g. for debugging frame grabbing) while Squid
+    # still drives all the real illumination/stage/DAQ hardware.  The SimulatedCamera
+    # then fires the real hardware trigger line on send_trigger (so the external app
+    # receives triggers) and fast acquisition outputs the NI-DAQ camera-trigger pulse
+    # train and records the frame-readout line without grabbing/saving frames itself.
+    external_frame_grabbing: bool = False
+
 
 def _old_camera_variant_to_enum(old_string) -> CameraVariant:
     if old_string == "Toupcam":
@@ -923,6 +931,7 @@ def _build_camera_config_from_device(
         pixel_size_um=cfg.get("pixel_size_um"),
         reverse_x=cfg.get("reverse_x"),
         reverse_y=cfg.get("reverse_y"),
+        external_frame_grabbing=cfg.get("external_frame_grabbing", False),
     )
 
 

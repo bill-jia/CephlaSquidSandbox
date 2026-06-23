@@ -919,6 +919,75 @@ class MultiPointController:
         """
         self.region_cycle_map = mapping
 
+    def _resolve_run_observation_states(self):
+        """[(name, ObservationState)] for every distinct observation state in this run.
+
+        Cycles already expand into ``selected_observation_state_names`` (see
+        set_selected_cycles), so iterating that list covers both the flat and cycle
+        paths. Inline live-snapshot states take precedence over saved presets.
+        """
+        repo = self.liveController.microscope.config_repo
+        inline = getattr(self, "_inline_observation_states_for_run", None) or {}
+        out = []
+        seen = set()
+        for name in self.selected_observation_state_names:
+            if name in seen:
+                continue
+            seen.add(name)
+            st = inline.get(name)
+            if st is None:
+                st = repo.load_observation_preset(name)
+            if st is not None:
+                out.append((name, st))
+        return out
+
+    def build_roi_consistency_report(self):
+        """Report each selected observation state's FOV and whether their ROIs match.
+
+        Used by the GUI to warn (and require approval) when states in one acquisition
+        have mismatched ROIs, and to derive the tiling FOV (largest). See
+        observation_state_roi_report.
+        """
+        from control.core.observation_state_service import observation_state_roi_report
+
+        states = self._resolve_run_observation_states()
+        factor = self.objectiveStore.get_pixel_size_factor()
+        return observation_state_roi_report(states, self.camera, factor)
+
+    def apply_observation_state_tiling(self, scan_coordinates=None):
+        """Regenerate the region tile grids for the largest observation-state ROI.
+
+        Guarantees the saved overlap matches the user's intent regardless of the
+        camera state when the regions were drawn. Idempotent: re-running it for the
+        same observation states reproduces the same coordinates, so it is safe to call
+        once from the GUI (so disk/RAM estimates see the final tile count) and again
+        from run_acquisition (so headless/SiLA paths are covered). Defaults to the
+        controller's own scan coordinates.
+        """
+        if scan_coordinates is None:
+            scan_coordinates = self.scanCoordinates
+        try:
+            report = self.build_roi_consistency_report()
+            tiling_fov = report.get("tiling_fov_mm")
+            if tiling_fov is None:
+                # No explicit observation states (live-snapshot fallback): tile for the
+                # current live camera FOV so a post-definition ROI change is still honored.
+                w_mm, h_mm = self.camera.get_fov_size_mm()
+                factor = self.objectiveStore.get_pixel_size_factor()
+                tiling_fov = (factor * w_mm, factor * h_mm)
+            if scan_coordinates.regenerate_for_fov(tiling_fov[0], tiling_fov[1]):
+                self._log.info(
+                    f"Tiled regions for largest observation-state FOV "
+                    f"{tiling_fov[0]:.4f} x {tiling_fov[1]:.4f} mm (state '{report.get('largest_name')}')."
+                )
+                if report.get("mismatch"):
+                    self._log.warning(
+                        "Observation states have mismatched ROIs; smaller-ROI states "
+                        f"will under-sample: {report.get('mismatch_names')}"
+                    )
+        except Exception:
+            self._log.exception("Could not apply observation-state tiling FOV; using regions as defined.")
+
     def _is_stimulus_predicate(self):
         """Return a cached predicate: is this observation state stimulus-only?
 
@@ -1297,6 +1366,11 @@ class MultiPointController:
                     "current", center_x=pos.x_mm, center_y=pos.y_mm, center_z=pos.z_mm
                 )
                 self.run_acquisition_current_fov = True
+            else:
+                # Re-tile every region for the FOV the acquisition will actually image
+                # (the largest observation-state ROI), so overlap is honored even if the
+                # camera state changed since the regions were drawn.
+                self.apply_observation_state_tiling(acquisition_scan_coordinates)
 
             scan_position_information = ScanPositionInformation.from_scan_coordinates(acquisition_scan_coordinates)
 

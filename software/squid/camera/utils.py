@@ -221,6 +221,21 @@ class SimulatedCamera(AbstractCamera):
         self._streaming_thread: Optional[threading.Thread] = None
         self._last_trigger_timestamp = 0
 
+        # Hardware-trigger pulse width, used by the fast-acquisition UI to size the
+        # acquisition window. Real cameras set this from the SDK; the simulated camera
+        # keeps a sane default so the math in FastAcquisitionWidget does not crash.
+        self._trigger_duration_us = 100
+
+        # When True, the physical sensor is owned by a separate camera application; Squid
+        # only drives the real trigger/illumination/DAQ and synthesizes frames for its own
+        # pipeline. See CameraConfig.external_frame_grabbing.
+        self._external_frame_grabbing = bool(getattr(self._config, "external_frame_grabbing", False))
+        if self._external_frame_grabbing:
+            self._log.info(
+                "SimulatedCamera in external-frame-grabbing mode: the real trigger line will be "
+                "driven on send_trigger and fast acquisition will run trigger/record only (no frame grab)."
+            )
+
         # This is for the migration to AbstractCamera.  It helps us find methods/properties that
         # some cameras had in the pre-AbstractCamera days.
         self._missing_methods = {}
@@ -249,6 +264,14 @@ class SimulatedCamera(AbstractCamera):
     def __getattr__(self, item):
         self._log.warning(f"Creating placeholder missing method: {item}")
         return self._missing_methods.get(item, SimulatedCamera.MissingAttribImpl(item))
+
+    @property
+    def external_frame_grabbing(self) -> bool:
+        return self._external_frame_grabbing
+
+    @debug_log
+    def set_trigger_duration_us(self, trigger_duration_us: int):
+        self._trigger_duration_us = int(trigger_duration_us)
 
     @debug_log
     def set_exposure_time(self, exposure_time_ms: float):
@@ -423,6 +446,13 @@ class SimulatedCamera(AbstractCamera):
             return
         # Record trigger timestamp
         self._last_trigger_timestamp = time.time()
+        # In external-frame-grabbing mode, fire the real hardware trigger line so the separate
+        # camera application that owns the physical sensor receives the trigger. We pass None
+        # (camera-trigger line only); illumination is software-controlled steady-on by the
+        # caller, matching the rig's virtualized software-trigger behavior. We still synthesize
+        # a frame below so the rest of Squid's pipeline keeps running.
+        if self._external_frame_grabbing and self._hw_trigger_fn is not None:
+            self._hw_trigger_fn(None)
         # Wait for exposure time to simulate real camera behavior
         # Use total frame time (exposure + strobe) to match real camera timing
         total_frame_time_s = self.get_total_frame_time() / 1000.0  # Convert ms to seconds

@@ -1,8 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import tests.control.gui_test_stubs as gts
+import squid.camera.utils
 import squid.stage
+from squid.config import CameraConfig, CameraVariant
 from control.core.scan_coordinates import (
     ScanCoordinates,
     ScanCoordinatesUpdate,
@@ -25,6 +29,91 @@ def _make_scan_coordinates(fov_w_mm: float = 1.0, fov_h_mm: float = 1.0) -> Scan
     stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.0)
 
     return ScanCoordinates(objective_store, stage, camera)
+
+
+def test_regenerate_for_fov_retiles_regions():
+    """regenerate_for_fov rebuilds flexible/well/manual grids for a new FOV.
+
+    A smaller FOV must pull flexible tile centers closer (smaller step) and add tiles to a
+    well region to keep coverage, while preserving region order and the region-center Z.
+    """
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+
+    # Flexible 3x1 at 0% overlap -> step == FOV == 1.0 mm; FOVs carry the region Z (0.7).
+    sc.add_flexible_region("f", 30.0, 30.0, 0.7, 3, 1, overlap_percent=0)
+    # Well Square, scan 3 mm, 0% overlap, FOV 1.0 -> 3x3 grid
+    sc.add_region("w", 35.0, 35.0, 3.0, 0, "Square")
+
+    f_xs = sorted(c[0] for c in sc.region_fov_coordinates["f"])
+    assert f_xs[1] - f_xs[0] == pytest.approx(1.0)
+    well_count_before = len(sc.region_fov_coordinates["w"])
+
+    sc.regenerate_for_fov(0.5, 0.5)
+
+    f_coords = sc.region_fov_coordinates["f"]
+    f_xs2 = sorted(c[0] for c in f_coords)
+    assert f_xs2[1] - f_xs2[0] == pytest.approx(0.5), "flexible step must follow the new FOV"
+    assert sum(f_xs2) / len(f_xs2) == pytest.approx(30.0), "grid stays centered"
+    assert all(c[2] == pytest.approx(0.7) for c in f_coords), "flexible FOV Z preserved across regen"
+    assert len(sc.region_fov_coordinates["w"]) > well_count_before, "smaller FOV needs more well tiles"
+    assert list(sc.region_centers.keys()) == ["f", "w"], "region order preserved"
+    # Override is cleared, so a later definition uses the live FOV again.
+    assert sc._fov_override_mm is None
+
+
+def test_flexible_region_tiles_overlap_after_hardware_roi():
+    """Flexible tile stepping must follow the actual (ROI-cropped) FOV, not a stale crop.
+
+    Reproduces the multipoint "gap" bug end-to-end: a centered hardware ROI smaller than the
+    configured crop shrinks the saved frame, so tile centers must move closer together. Before
+    the get_crop_size fix, the FOV stayed at the full crop and tiles were spaced farther apart
+    than the saved image, leaving gaps where they were meant to overlap.
+    """
+    config = CameraConfig(
+        camera_type=CameraVariant.TOUPCAM,
+        camera_model="ITR3CMOS26000KMA",
+        crop_width=4168,
+        crop_height=4168,
+        default_binning=(1, 1),
+        default_pixel_format="MONO16",
+    )
+    camera = squid.camera.utils.get_camera(config, simulated=True)
+
+    objective_store = MagicMock()
+    objective_store.get_pixel_size_factor.return_value = 0.1  # 10x-like sample-frame scaling
+
+    stage = MagicMock()
+    stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.0)
+
+    sc = ScanCoordinates(objective_store, stage, camera)
+    overlap_percent = 10.0
+
+    def measured_step_x():
+        sc.clear_regions()
+        sc.add_flexible_region("r", 30.0, 30.0, 0.0, 3, 1, overlap_percent=overlap_percent)
+        xs = sorted(c[0] for c in sc.region_fov_coordinates["r"])
+        assert len(xs) == 3, "all FOVs should be within stage limits for this test"
+        return xs[1] - xs[0]
+
+    def sample_fov_w():
+        return objective_store.get_pixel_size_factor() * camera.get_fov_size_mm()[0]
+
+    # Full sensor / configured crop: step is fov * (1 - overlap), i.e. real overlap, no gap.
+    fov_full = sample_fov_w()
+    step_full = measured_step_x()
+    assert step_full == pytest.approx(fov_full * (1 - overlap_percent / 100))
+    assert step_full < fov_full  # tiles overlap
+
+    # Apply a centered hardware ROI (2200 of 4168). The FOV — and therefore the tile spacing —
+    # must shrink with it so adjacent tiles still overlap instead of leaving a gap.
+    camera.set_region_of_interest(984, 984, 2200, 2200)
+    fov_roi = sample_fov_w()
+    step_roi = measured_step_x()
+
+    assert fov_roi == pytest.approx(fov_full * 2200 / 4168)
+    assert step_roi == pytest.approx(fov_roi * (1 - overlap_percent / 100))
+    assert step_roi < fov_roi, "tiles must overlap, not leave a gap"
+    assert step_roi < step_full, "smaller ROI must pull tile centers closer together"
 
 
 def test_scan_coordinates_basic_operation():

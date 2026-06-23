@@ -68,7 +68,40 @@ def test_simulated_camera_fallback_to_hardcoded():
     assert height == 540, f"Expected height 540, got {height}"
 
 
+def test_hardware_roi_smaller_than_crop_shrinks_fov():
+    """A hardware ROI smaller than the configured crop must shrink get_crop_size / get_fov_size_mm.
+
+    Regression for the multipoint "gap" bug: a centered hardware ROI (e.g. 2200x2200 on a
+    4168x4168 crop) only delivers an ROI-sized frame, but get_crop_size used to keep reporting
+    the full configured crop. FOV math then spaced tiles for a 4168 px image while only 2200 px
+    were saved, leaving gaps between FOVs that were meant to overlap.
+    """
+    config = CameraConfig(
+        camera_type=CameraVariant.TOUPCAM,
+        camera_model="ITR3CMOS26000KMA",
+        crop_width=4168,
+        crop_height=4168,
+        default_binning=(1, 1),
+        default_pixel_format="MONO16",
+    )
+    sim_cam = squid.camera.utils.get_camera(config, simulated=True)
+
+    # No sub-ROI yet: crop == configured crop, and the clamp is a no-op.
+    assert sim_cam.get_crop_size() == (4168, 4168)
+    full_fov_w, full_fov_h = sim_cam.get_fov_size_mm()
+
+    # Apply a centered hardware ROI smaller than the crop, as the camera-settings UI does.
+    sim_cam.set_region_of_interest(984, 984, 2200, 2200)
+
+    assert sim_cam.get_crop_size() == (2200, 2200), "crop must follow the hardware ROI, not the stale config crop"
+    roi_fov_w, roi_fov_h = sim_cam.get_fov_size_mm()
+    # FOV shrinks in proportion to the ROI (2200 / 4168), so tile stepping matches saved frames.
+    assert roi_fov_w == full_fov_w * 2200 / 4168
+    assert roi_fov_h == full_fov_h * 2200 / 4168
+
+
 if __name__ == "__main__":
     test_simulated_camera_with_crop_dimensions()
     test_simulated_camera_fallback_to_hardcoded()
+    test_hardware_roi_smaller_than_crop_shrinks_fov()
     print("All tests passed!")
