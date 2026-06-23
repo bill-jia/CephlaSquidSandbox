@@ -32,6 +32,12 @@ from control.nidaq import (
 )
 
 
+# Upper bound on RAM for the in-memory frame ring during fast acquisition. The ring
+# is sized to hold the whole capture (so a slow disk writer never has to keep up in
+# real time), bounded here so very long captures don't exhaust host memory.
+FAST_ACQ_RING_BUFFER_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 class AcquisitionCompletionStatus(Enum):
     """Status of acquisition completion."""
     NOT_STARTED = "not_started"
@@ -91,6 +97,13 @@ class FastAcquisitionController:
         self._camera_trigger_dio_line = camera_trigger_dio_line
         self._frame_counter_dio_line = frame_counter_dio_line
         self._daq_only = camera is None
+        # External frame grabbing: the camera is present (so we still output the camera-trigger
+        # pulse train and record the frame-readout line) but a separate application owns the
+        # physical sensor, so we do not grab/buffer/save frames here. Driven by the simulated
+        # camera's external_frame_grabbing flag (CameraConfig.external_frame_grabbing).
+        self._external_frame_grabbing = (
+            camera is not None and bool(getattr(camera, "external_frame_grabbing", False))
+        )
         self._illumination_controller = illumination_controller
         self._illumination_snapshot = None
         self._microscope = microscope
@@ -102,6 +115,7 @@ class FastAcquisitionController:
         self._dtype = None
         self._frame_buffer = None
         self._frame_writer = None
+        self._num_frames = None
 
         # State
         self._is_acquiring = False
@@ -132,6 +146,13 @@ class FastAcquisitionController:
             self._log.info(
                 f"Initialized fast acquisition controller (DAQ-only): output={output_path}"
             )
+        elif self._external_frame_grabbing:
+            self._log.info(
+                f"Initialized fast acquisition controller (external frame grabbing): "
+                f"output={output_path}, trigger_line={camera_trigger_dio_line}, "
+                f"frame_signal_line={frame_counter_dio_line}. The NI-DAQ trigger pulse train and "
+                f"frame-readout recording run, but frames are grabbed by a separate application."
+            )
         else:
             self._log.info(
                 f"Initialized fast acquisition controller: "
@@ -158,12 +179,29 @@ class FastAcquisitionController:
         max_frame_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
         self._frame_shape = frame_shape
         self._dtype = dtype
+
+        # Size the ring to hold the entire capture (bounded by a RAM budget) so the
+        # disk writer, which is slower than the camera, never has to keep up in real
+        # time — it drains the ring during and after the burst. Honor the user's
+        # buffer_size as a floor.
+        ring_size = self._buffer_size
+        if self._num_frames:
+            ring_cap = max(1, FAST_ACQ_RING_BUFFER_MAX_BYTES // max(1, max_frame_bytes))
+            ring_size = max(self._buffer_size, min(int(self._num_frames), ring_cap))
+            if ring_size != self._buffer_size:
+                self._log.info(
+                    f"Ring buffer sized to {ring_size} frames to cover the {self._num_frames}-frame "
+                    f"capture (requested buffer_size={self._buffer_size}, RAM cap={ring_cap})"
+                )
+
         self._frame_buffer = FastAcquisitionFrameBuffer(
-            buffer_size=self._buffer_size,
+            buffer_size=ring_size,
             max_frame_bytes=max_frame_bytes,
             frame_shape=frame_shape,
             dtype=dtype,
-            overwrite_when_full=True,
+            # Drop the newest frame with a warning if the ring ever fills, rather than
+            # silently overwriting already-captured frames.
+            overwrite_when_full=False,
         )
         self._frame_writer = FastAcquisitionWriter(
             frame_buffer=self._frame_buffer,
@@ -216,6 +254,11 @@ class FastAcquisitionController:
                                 f"Fast acquisition frame summary (after writer finished): "
                                 f"expected={expected_frames}, written={frames_written}, "
                                 f"dropped={dropped_frames}"
+                            )
+                            # metadata.json was written during stop, before this drain
+                            # finished, so correct its (otherwise stale) frame counters.
+                            self._patch_metadata_frame_counts(
+                                expected_frames, frames_written, dropped_frames
                             )
                     except Exception as e:
                         self._log.warning(
@@ -324,9 +367,21 @@ class FastAcquisitionController:
             duration_s = num_frames / frame_rate_hz
             num_frames_estimate = num_frames
 
-        # Store expected duration and timeout
+        # Remember the requested frame count so the ring buffer can be sized to the
+        # whole capture and the monitor can detect completion.
+        self._num_frames = None if self._daq_only else num_frames
+
+        # Store expected duration and timeout. For camera mode, allow extra time for
+        # the consumer/disk to drain the ring after the trigger burst (assume a
+        # conservative >=200 Hz sustained drain) so large captures aren't killed by a
+        # fixed wall-clock. Completion is normally reached via the frame count or the
+        # stall detector in _monitor_acquisition; this is only the hard backstop.
         self._expected_duration_s = duration_s
-        self._timeout_s = duration_s + 10
+        if not self._daq_only and num_frames:
+            drain_estimate_s = num_frames / 200.0
+            self._timeout_s = duration_s + max(15.0, drain_estimate_s + 5.0)
+        else:
+            self._timeout_s = duration_s + 10
         self._log.info(f"Expected acquisition duration: {duration_s:.2f}s, timeout: {self._timeout_s:.2f}s")
 
         samples_per_channel = int(sample_rate_hz * duration_s)
@@ -419,7 +474,7 @@ class FastAcquisitionController:
         self._ni_daq.set_waveforms(local_waveforms)
         self._ni_daq.arm()
 
-        if not self._daq_only:
+        if not self._daq_only and not self._external_frame_grabbing:
             if self._camera.get_is_streaming():
                 self._log.info("Stopping existing camera streaming for fast acquisition")
                 self._camera.stop_streaming()
@@ -458,7 +513,7 @@ class FastAcquisitionController:
         self._completion_error_message = None
         expected_decode_bytes = None
 
-        if not self._daq_only:
+        if not self._daq_only and not self._external_frame_grabbing:
             expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
             def frame_callback(
                 frame: Union[bytes, np.ndarray], metadata: Optional[dict] = None
@@ -497,6 +552,31 @@ class FastAcquisitionController:
                         f"Failed to write frame {placeholder_frame_id} to buffer"
                     )
 
+            def frame_sink(src_ptr, n_bytes, metadata):
+                # Preferred single-copy path (cameras that support it, e.g. Tucsen).
+                # Runs on the camera SDK callback thread once per frame; the ring buffer
+                # copies the frame exactly once, straight from the SDK DMA buffer into
+                # its slab — no intermediate Python bytes object on this hot path.
+                md = dict(metadata) if metadata else {}
+                md.setdefault("expected_decode_bytes", expected_decode_bytes)
+                # The SDK header carries height/width; fall back to wall-clock arrival
+                # time when the firmware leaves the frame timestamp at 0.
+                ts = md.get("timestamp")
+                if not ts:
+                    ts = time.time()
+                placeholder_frame_id = self._frame_count
+                success = self._frame_buffer.write_frame_from_ptr(
+                    src_ptr, n_bytes, placeholder_frame_id, ts, md
+                )
+                if success:
+                    self._frame_count += 1
+                    with self._stats_lock:
+                        self._last_frame_time = time.time()
+                else:
+                    self._log.warning(
+                        f"Failed to write frame {placeholder_frame_id} to buffer (ring full)"
+                    )
+
             try:
                 if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
                     self._camera.start_fast_acquisition_frame_grabbing(
@@ -504,6 +584,7 @@ class FastAcquisitionController:
                         n_frames_expected=num_frames,
                         frame_callback=frame_callback,
                         acquisition_mode=acquisition_mode,
+                        frame_sink=frame_sink,
                     )
                 else:
                     raise NotImplementedError(
@@ -518,7 +599,10 @@ class FastAcquisitionController:
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_acquisition,
-            args=(num_frames if not self._daq_only else None,),
+            args=(
+                num_frames if (not self._daq_only and not self._external_frame_grabbing) else None,
+                frame_rate_hz,
+            ),
             daemon=True
         )
         self._monitor_thread.start()
@@ -608,7 +692,7 @@ class FastAcquisitionController:
             self._save_daq_data()
             self._save_metadata()
             
-            if not self._daq_only:
+            if not self._daq_only and not self._external_frame_grabbing:
                 if hasattr(self._camera, 'stop_fast_acquisition_frame_grabbing'):
                     self._camera.stop_fast_acquisition_frame_grabbing()
                 if self._frame_writer is not None:
@@ -639,7 +723,7 @@ class FastAcquisitionController:
             if not completion_error:
                 completion_error = str(e)
         finally:
-            if not self._daq_only:
+            if not self._daq_only and not self._external_frame_grabbing:
                 if not writer_stopped and self._frame_writer is not None:
                     try:
                         self._frame_writer.stop(wait=False)
@@ -681,38 +765,71 @@ class FastAcquisitionController:
         
         return edges.tolist()
     
-    def _monitor_acquisition(self, num_frames: Optional[int]):
-        """Monitor acquisition and stop when frame limit or duration is reached, timeout occurs, or stop event is set."""
-        try:
-            while not self._stop_event.is_set() and self._is_acquiring:
-                elapsed_time = time.time() - self._start_time if self._start_time else 0
+    def _monitor_acquisition(self, num_frames: Optional[int], frame_rate_hz: float = 0.0):
+        """Monitor acquisition; complete on frame limit, stall, duration, or a hard timeout.
 
-                # Check timeout
+        Camera mode normally completes when all expected frames have been delivered to
+        the ring. If delivery stalls after the trigger burst is over (e.g. the camera
+        produced fewer frames than requested), it finishes cleanly rather than waiting
+        out the full wall-clock timeout. The hard timeout remains as a backstop for a
+        genuinely stuck camera/DAQ and is reported as an error.
+        """
+        try:
+            last_progress_count = -1
+            last_progress_time = self._start_time if self._start_time else time.time()
+            stall_s = max(3.0, 5.0 / frame_rate_hz) if frame_rate_hz and frame_rate_hz > 0 else 3.0
+            while not self._stop_event.is_set() and self._is_acquiring:
+                now = time.time()
+                elapsed_time = now - self._start_time if self._start_time else 0
+
+                # Hard backstop: a genuinely stuck camera/DAQ. Reported as an error.
                 if self._timeout_s is not None and self._start_time is not None:
                     if elapsed_time >= self._timeout_s:
                         timeout_message = (
                             f"Acquisition timeout reached: {elapsed_time:.2f}s >= {self._timeout_s:.2f}s "
-                            f"(expected duration: {self._expected_duration_s:.2f}s + 10s buffer). "
-                            f"Frames acquired: {self._frame_count}"
+                            f"(expected duration: {self._expected_duration_s:.2f}s). "
+                            f"Frames delivered: {self._frame_count}"
                         )
                         self._log.error(timeout_message)
                         self._stop_event.set()
                         self.stop_acquisition(manual_stop=False, error_message=timeout_message)
                         break
 
-                # DAQ-only: stop when expected duration has elapsed
-                if self._daq_only and self._expected_duration_s is not None:
+                # DAQ-only / external frame grabbing: stop when expected duration has elapsed
+                # (we don't grab frames here, so there is no callback frame count to wait on).
+                if (self._daq_only or self._external_frame_grabbing) and self._expected_duration_s is not None:
                     if elapsed_time >= self._expected_duration_s:
-                        self._log.info("DAQ-only: expected duration reached, stopping acquisition")
+                        self._log.info("Expected duration reached, stopping acquisition")
                         self._stop_event.set()
                         break
-                # Camera mode: check frame limit
-                elif num_frames is not None and self._frame_count >= num_frames:
-                    self._log.info(f"Reached frame limit ({num_frames}), stopping acquisition")
-                    self._stop_event.set()
-                    break
+                elif num_frames is not None:
+                    fc = self._frame_count
+                    if fc > last_progress_count:
+                        last_progress_count = fc
+                        last_progress_time = now
+                    # Normal completion: all expected frames delivered to the ring.
+                    if fc >= num_frames:
+                        self._log.info(f"Reached frame limit ({num_frames}), stopping acquisition")
+                        self._stop_event.set()
+                        break
+                    # Stall completion: delivery stopped after the trigger burst is over.
+                    # Finish as a success (the DAQ readout count is recorded as the truth);
+                    # any shortfall shows up in the dropped-frame summary.
+                    if (
+                        self._expected_duration_s is not None
+                        and elapsed_time >= self._expected_duration_s
+                        and fc > 0
+                        and (now - last_progress_time) >= stall_s
+                    ):
+                        self._log.warning(
+                            f"Fast acquisition stalled: no new frame for {now - last_progress_time:.1f}s "
+                            f"after the trigger burst; delivered {fc} of {num_frames} frames. Finishing."
+                        )
+                        self._stop_event.set()
+                        self.stop_acquisition(manual_stop=False)
+                        break
 
-                time.sleep(0.1)  # Check every 100 ms (finer for DAQ-only duration)
+                time.sleep(0.02)  # Check every 20 ms (fine enough for stall detection)
         except Exception as e:
             self._log.error(f"Error in monitor thread: {e}", exc_info=True)
             self._stop_event.set()
@@ -824,6 +941,29 @@ class FastAcquisitionController:
             self._log.warning(f"Could not build NIDAQ config snapshot: {e}", exc_info=True)
             return None
     
+    def _patch_metadata_frame_counts(self, frame_count: int, frames_written: int, dropped_frames: int) -> None:
+        """Rewrite the frame counters in metadata.json with the final post-drain values.
+
+        metadata.json is written during stop_acquisition, before the writer's background
+        drain finishes flushing the ring, so its frames_written/frames_dropped would
+        otherwise be a stale mid-drain snapshot.
+        """
+        import json
+
+        path = os.path.join(self._output_path, "metadata.json")
+        try:
+            if not os.path.isfile(path):
+                return
+            with open(path, "r") as f:
+                meta = json.load(f)
+            meta["frame_count"] = int(frame_count)
+            meta["frames_written"] = int(frames_written)
+            meta["frames_dropped"] = int(dropped_frames)
+            with open(path, "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            self._log.warning(f"Could not update frame counts in metadata.json: {e}", exc_info=True)
+
     def _save_metadata(self):
         """Save acquisition metadata."""
         import json

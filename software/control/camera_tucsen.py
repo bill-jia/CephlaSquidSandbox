@@ -164,6 +164,14 @@ TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3,
 }
 
 
+# Depth of the SDK's internal trigger ring during fast acquisition, expressed as
+# seconds of frames at the capture rate. The single-copy consumer (frame_sink ->
+# write_frame_from_ptr) keeps up with the camera, so a small ring is enough to absorb
+# scheduling jitter; increase if drops reappear at higher rates. Bounded by the RAM cap.
+FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS = 0.5
+FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES = 4 * 1024**3  # 4 GiB cap (tune to installed RAM)
+
+
 # ============================================================================
 # Fast acquisition: raw byte packing (HDR 16-bit, CMS 12-bit, HS 11-bit)
 # ============================================================================
@@ -244,10 +252,8 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
 
 
 def decode_tucsen_hs11(raw: bytes, height: int, width: int) -> np.ndarray:
-    """11-bit values in 12-bit packing with LSB zero; unpack as CMS12 then shift right by one."""
-    u12 = decode_tucsen_cms12(raw, height, width)
-    return u12.astype(np.uint16)
-    # return (u12 >> 1).astype(np.uint16)
+    """Decode HS (high-speed) frames: 12-bit pixels packed two per three bytes, same as CMS12."""
+    return decode_tucsen_cms12(raw, height, width)
 
 def tucsen_raw_bytes_to_uint16(raw: bytes, meta: dict, packing: str = "hdr16") -> np.ndarray:
     """Decode one frame; packing comes from the camera (see byte_decoding_fn closure), not metadata."""
@@ -270,16 +276,31 @@ def decode_tucsen_raw_bytes(packing: str, raw: bytes, height: int, width: int) -
 
 
 class TucsenCameraCallBack:
-    """SDK callback: must call TUCAM_Buf_GetData to dequeue each frame (vendor contract)."""
+    """SDK callback: must call TUCAM_Buf_GetData to dequeue each frame (vendor contract).
+
+    Two consumer modes share this callback because both the gated-trigger (live)
+    path and fast acquisition register via TUCAM_Buf_DataCallBack:
+
+    - ``ptr_sink`` (fast acquisition): a callable ``(src_ptr, n_bytes, metadata)``
+      that copies the frame exactly once, straight from the SDK's DMA buffer into
+      its own storage. No intermediate Python ``bytes`` object is created on this
+      GIL-bound thread, so the consumer can keep up with the camera at full rate.
+    - ``callback_function`` (gated trigger): a callable ``(frame_bytes, metadata)``
+      used where the caller needs a decoded/owned bytes object.
+
+    ``ptr_sink`` takes precedence when set.
+    """
 
     def __init__(
         self,
         camera_handle,
-        callback_function: Optional[Callable[..., None]],
+        callback_function: Optional[Callable[..., None]] = None,
         log=None,
+        ptr_sink: Optional[Callable[..., None]] = None,
     ):
         self._camera_handle = camera_handle
         self.callback_function = callback_function
+        self._ptr_sink = ptr_sink
 
     def OnCallbackBuffer(self):
         m_rawHeader = TUCAM_RAWIMG_HEADER()
@@ -287,14 +308,9 @@ class TucsenCameraCallBack:
             result = TUCAM_Buf_GetData(self._camera_handle, pointer(m_rawHeader))
             if result != TUCAMRET.TUCAMRET_SUCCESS:
                 return
-            if self.callback_function is None:
-                return
             size = int(m_rawHeader.uiImgSize)
             if size == 0 or not m_rawHeader.pImgData:
                 return
-            buf = create_string_buffer(size)
-            memmove(buf, m_rawHeader.pImgData, size)
-            frame_bytes = bytes(buf)
             metadata: Dict[str, object] = {
                 "timestamp": m_rawHeader.dblTimeLast,
                 "frame_index": int(m_rawHeader.uiIndex),
@@ -303,9 +319,20 @@ class TucsenCameraCallBack:
                 "width": int(m_rawHeader.usWidth),
                 "ui_img_size": size,
             }
+            if self._ptr_sink is not None:
+                # Single copy: hand the SDK DMA pointer straight to the sink, which
+                # memmoves it once into its ring slab. The previous bytes path did a
+                # zeroing alloc plus two-to-three full-frame copies per frame on this
+                # GIL-bound thread, which made the consumer fall behind the camera and
+                # overflow the SDK trigger buffer (silent frame drops).
+                self._ptr_sink(m_rawHeader.pImgData, size, metadata)
+                return
+            if self.callback_function is None:
+                return
+            frame_bytes = string_at(m_rawHeader.pImgData, size)
             self.callback_function(frame_bytes, metadata)
         except Exception as e:
-            print(f"TucsenCameraCallBack: {e}", exc_info=True)
+            print(f"TucsenCameraCallBack: {e}")
 
 
 # ============================================================================
@@ -1159,21 +1186,28 @@ class TucsenCamera(AbstractCamera):
         n_frames_expected=0,
         frame_callback: Optional[Callable[..., None]] = None,
         acquisition_mode: Optional[CameraAcquisitionMode] = None,
+        frame_sink: Optional[Callable[..., None]] = None,
     ):
         """
         Start fast acquisition using the SDK buffer callback (TUCAM_Buf_DataCallBack).
 
         Call after setting the camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST
         and before firing DAQ waveforms. Each frame is dequeued with TUCAM_Buf_GetData
-        in the SDK thread, then passed to frame_callback.
+        in the SDK thread, then handed to ``frame_sink`` (preferred) or ``frame_callback``.
 
         Args:
             frame_rate_hz: Expected frame rate (used for internal buffer sizing).
-            n_frames_expected: Hint for expected number of frames (informational).
-            frame_callback: Receives (frame: bytes, metadata: dict). Metadata includes
-                timestamp, frame_index, exposure_s, height, width, ui_img_size.
+            n_frames_expected: Expected number of frames; the SDK trigger buffer is
+                sized to hold the whole capture (bounded by a RAM budget) so the SDK
+                does not drop frames while the consumer drains them.
+            frame_callback: Receives (frame: bytes, metadata: dict). Used only when
+                ``frame_sink`` is not provided.
             acquisition_mode: Optional; use when GenICam cannot distinguish HARDWARE_TRIGGER
                 vs HARDWARE_TRIGGER_FIRST from get_acquisition_mode() alone.
+            frame_sink: Preferred zero-intermediate-copy consumer. Receives
+                (src_ptr, n_bytes, metadata) and copies the frame exactly once from the
+                SDK DMA buffer into its own storage, so no per-frame bytes object is
+                created on the GIL-bound SDK callback thread.
         """
         if self._is_streaming.is_set():
             self._log.warning("Camera is already streaming. Stop streaming before starting fast acquisition.")
@@ -1198,9 +1232,29 @@ class TucsenCamera(AbstractCamera):
         if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
             raise CameraError("Fast acquisition requires HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode")
 
-        self._trigger_attr.nBufFrames = int(np.ceil(0.5 * frame_rate_hz))
+        # Size the SDK's internal trigger ring (nBufFrames). The single-copy consumer
+        # (frame_sink -> write_frame_from_ptr) keeps up with the camera, so only a small
+        # cushion is needed to absorb scheduling jitter — a fixed window of frames at the
+        # capture rate, bounded by a RAM budget. (Previously this was sized to the whole
+        # capture as a hedge against the slow multi-copy consumer.)
+        roi = self.get_region_of_interest()  # (x, y, w, h)
+        sdk_slot_bytes = max(1, int(roi[2]) * int(roi[3]) * 2)  # SDK delivers unpacked 16-bit
+        budget_cap = max(4, FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES // sdk_slot_bytes)
+        desired = int(np.ceil(FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS * frame_rate_hz))
+        n_buf = max(4, min(desired, budget_cap))
+        self._log.info(
+            f"Fast-acq SDK trigger buffer: nBufFrames={n_buf} "
+            f"({FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS}s @ {frame_rate_hz:.0f}Hz, "
+            f"slot={sdk_slot_bytes}B, ~{n_buf * sdk_slot_bytes / 1024**2:.0f} MB)"
+        )
+        self._trigger_attr.nBufFrames = n_buf
         if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError(f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}")
+            self._log.warning(f"SDK rejected nBufFrames={n_buf}; falling back to minimal depth")
+            self._trigger_attr.nBufFrames = 4
+            if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
+                raise CameraError(
+                    f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}"
+                )
 
         # Remember the live ROI so stop_fast_acquisition_frame_grabbing can
         # restore it after the vendor close/reopen sequence.
@@ -1213,7 +1267,7 @@ class TucsenCamera(AbstractCamera):
         self._allocate_buffer(max_frame=False)
 
         self._fast_acq_buffer_callback_obj = TucsenCameraCallBack(
-            self._camera, frame_callback, log=self._log
+            self._camera, frame_callback, log=self._log, ptr_sink=frame_sink
         )
         self._fast_acq_buffer_callback_fn = BUFFER_CALLBACK(
             self._fast_acq_buffer_callback_obj.OnCallbackBuffer
@@ -1699,7 +1753,9 @@ class TucsenCamera(AbstractCamera):
         return None
 
     def get_fast_acquisition_max_frame_bytes(self) -> int:
-        # Seems like frame buffer still sending as if it's 16 bits
+        # The SDK reports uiImgSize as if the frame were 16-bit, but in the packed
+        # readout modes (cms12/hs11) the stored/decoded payload is the packed length,
+        # so size the ring slot to that.
         roi = self.get_region_of_interest()
         h, w = roi[3], roi[2]
         packing = camera_mode_name_to_packing(self.get_camera_mode())

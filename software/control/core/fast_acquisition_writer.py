@@ -25,6 +25,10 @@ _JSONL_LAYOUT_KEYS = frozenset(
     {"frame_id", "timestamp", "byte_offset", "byte_length", "frame_byte_length"}
 )
 
+# Classic TIFF uses 32-bit byte offsets, so a single file cannot exceed 4 GiB. Keep each
+# written stack safely under that; larger captures are split across multiple files.
+FAST_ACQ_MAX_TIFF_BYTES = int(3.8 * 1024**3)
+
 
 class FastAcquisitionWriter(threading.Thread):
     """
@@ -73,6 +77,13 @@ class FastAcquisitionWriter(threading.Thread):
         self._jsonl_file = None
         self._raw_byte_offset = 0
 
+        # Flush raw + jsonl together every N frames instead of on every frame. The
+        # per-frame flush was a fsync-class syscall at up to the full camera rate and
+        # slowed the drain; periodic flushing keeps the raw stream and its jsonl index
+        # consistent on disk while bounding worst-case loss on a hard crash to N frames.
+        self._flush_every_n_frames = 64
+        self._frames_since_flush = 0
+
         if self._file_format == "zarr":
             try:
                 import zarr  # noqa: F401
@@ -117,22 +128,20 @@ class FastAcquisitionWriter(threading.Thread):
                     time.sleep(0.001)
                     continue
 
-                frame_bytes, frame_id, timestamp, metadata = frame_data
+                self._consume_frame(frame_data)
 
-                write_start = time.time()
-                success = self._write_frame(frame_bytes, frame_id, timestamp, metadata)
-                write_time = time.time() - write_start
-
-                if success:
-                    with self._stats_lock:
-                        self._frames_written += 1
-                        self._last_write_time = time.time()
-                        self._write_times.append(write_time)
-                        # Keep only last 100 write times for statistics
-                        if len(self._write_times) > 100:
-                            self._write_times.pop(0)
-                else:
-                    self._log.error(f"Failed to write frame {frame_id}")
+            # Drain any frames still in the ring after stop was signaled. The producer
+            # (SDK callback) can deliver a backlog faster than we write it to disk;
+            # exiting the moment _stop_event fires would silently truncate the capture.
+            drained = 0
+            while True:
+                frame_data = self._frame_buffer.read_frame()
+                if frame_data is None:
+                    break
+                self._consume_frame(frame_data)
+                drained += 1
+            if drained:
+                self._log.info(f"Drained {drained} buffered frames after stop")
 
         except Exception as e:
             self._log.error(f"Error in writer thread: {e}", exc_info=True)
@@ -244,48 +253,70 @@ class FastAcquisitionWriter(threading.Thread):
             self._log.warning(f"Raw frame file not found at {raw_path}, skipping TIFF conversion")
             return
 
-        dtype = self._dtype
-        file_size = os.path.getsize(raw_path)
         records = self._read_jsonl_records()
-
         if not records:
             self._log.warning("No frame_metadata.jsonl; cannot recover per-frame byte lengths for TIFF")
             return
 
-        planes: List[np.ndarray] = []
+        # Split into multiple files when the decoded stack would exceed the 4 GiB TIFF
+        # limit. Decode one file's worth of frames at a time so peak RAM stays bounded.
+        first = records[0]
+        fh = int(first.get("height") or (self._frame_shape[0] if self._frame_shape else 0))
+        fw = int(first.get("width") or (self._frame_shape[1] if self._frame_shape else 0))
+        bytes_per_frame = max(1, fh * fw * np.dtype(self._dtype).itemsize)
+        frames_per_file = max(1, FAST_ACQ_MAX_TIFF_BYTES // bytes_per_frame)
+        n_files = (len(records) + frames_per_file - 1) // frames_per_file
+        multi = n_files > 1
+        if multi:
+            self._log.info(
+                f"Decoded TIFF stack (~{len(records) * bytes_per_frame / 1024**3:.1f} GiB) exceeds the "
+                f"4 GiB TIFF limit; splitting {len(records)} frames into {n_files} files "
+                f"of up to {frames_per_file} frames each"
+            )
+
+        written: List[str] = []
         with open(raw_path, "rb") as f:
-            for i, rec in enumerate(records):
-                off = int(rec["byte_offset"])
-                ln = rec["frame_byte_length"]
-                f.seek(off)
-                chunk = f.read(ln)
-                if len(chunk) != ln:
-                    self._log.warning(
-                        f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}"
+            for file_idx in range(n_files):
+                start = file_idx * frames_per_file
+                chunk_records = records[start:start + frames_per_file]
+                planes: List[np.ndarray] = []
+                for i, rec in enumerate(chunk_records, start=start):
+                    off = int(rec["byte_offset"])
+                    ln = rec["frame_byte_length"]
+                    f.seek(off)
+                    chunk = f.read(ln)
+                    if len(chunk) != ln:
+                        self._log.warning(
+                            f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}"
+                        )
+                        break
+                    planes.append(self._decode_frame(chunk, rec))
+                if not planes:
+                    continue
+                h, w = planes[0].shape
+                name = f"frames_stack_{file_idx:03d}.tiff" if multi else "frames_stack.tiff"
+                stack_path = os.path.join(self._frames_dir, name)
+                try:
+                    # imageio wants a sequence of 2D images for a multipage TIFF (a 3D
+                    # ndarray is rejected); the list also avoids an np.stack copy.
+                    iio.mimwrite(stack_path, planes, format="tiff")
+                    written.append(stack_path)
+                    self._log.info(
+                        f"Wrote 3D TIFF stack ({len(planes)} frames, {h}x{w}) to {stack_path}"
+                        + (f" [{file_idx + 1}/{n_files}]" if multi else "")
                     )
-                    break
-                planes.append(self._decode_frame(chunk, rec))
-        if not planes:
+                except Exception as e:
+                    self._log.error(f"Failed to write TIFF stack {stack_path}: {e}", exc_info=True)
+                    return  # leave raw in place for recovery if any chunk fails
+
+        if not written:
             self._log.warning("No frames decoded for TIFF")
             return
-        volume = np.stack(planes, axis=0)
-        _, h, w = volume.shape
-        self._log.info(
-            f"Converting packed raw to 3D TIFF: {volume.shape[0]} frames, "
-            f"shape=({h},{w}), per-frame lengths from jsonl"
-        )
-
-        stack_path = os.path.join(self._frames_dir, "frames_stack.tiff")
         try:
-            iio.mimwrite(stack_path, volume, format="tiff")
-            self._log.info(f"Wrote 3D TIFF stack to {stack_path}")
-            try:
-                os.remove(raw_path)
-                self._log.info(f"Deleted raw file {raw_path} after TIFF conversion")
-            except OSError as e:
-                self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
-        except Exception as e:
-            self._log.error(f"Failed to write TIFF stack: {e}", exc_info=True)
+            os.remove(raw_path)
+            self._log.info(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
+        except OSError as e:
+            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
 
     def _build_zarr_from_raw(self) -> None:
 
@@ -426,7 +457,12 @@ class FastAcquisitionWriter(threading.Thread):
         if self._jsonl_file is None:
             return
         flen = len(frame_bytes)
-        meta_out = {k: v for k, v in metadata.items() if k != "frame_byte_length"}
+        # Drop keys that are authoritative record fields so the metadata copy can't
+        # clobber them. In particular the SDK's per-frame "timestamp" is 0 on this
+        # firmware; the real timestamp is the computed one passed in here.
+        meta_out = {
+            k: v for k, v in metadata.items() if k not in ("frame_byte_length", "timestamp")
+        }
         record = {
             "frame_id": frame_id,
             "timestamp": timestamp,
@@ -437,7 +473,23 @@ class FastAcquisitionWriter(threading.Thread):
         self._raw_byte_offset += len(frame_bytes)
         record.update(self._json_safe(meta_out))
         self._jsonl_file.write(json.dumps(record) + "\n")
-        self._jsonl_file.flush()
+
+    def _consume_frame(self, frame_data: Tuple[bytes, int, float, dict]) -> None:
+        """Write one frame read from the ring buffer and update statistics."""
+        frame_bytes, frame_id, timestamp, metadata = frame_data
+        write_start = time.time()
+        success = self._write_frame(frame_bytes, frame_id, timestamp, metadata)
+        write_time = time.time() - write_start
+        if success:
+            with self._stats_lock:
+                self._frames_written += 1
+                self._last_write_time = time.time()
+                self._write_times.append(write_time)
+                # Keep only last 100 write times for statistics
+                if len(self._write_times) > 100:
+                    self._write_times.pop(0)
+        else:
+            self._log.error(f"Failed to write frame {frame_id}")
 
     def _write_frame(
         self, frame_bytes: bytes, frame_id: int, timestamp: float, metadata: dict
@@ -448,6 +500,13 @@ class FastAcquisitionWriter(threading.Thread):
                 self._bytes_per_frame = len(frame_bytes)
             self._append_jsonl(frame_bytes, frame_id, timestamp, metadata)
             n = self._raw_file.write(frame_bytes)
+            # Flush raw before jsonl so the index never references unflushed raw bytes.
+            self._frames_since_flush += 1
+            if self._frames_since_flush >= self._flush_every_n_frames:
+                self._raw_file.flush()
+                if self._jsonl_file is not None:
+                    self._jsonl_file.flush()
+                self._frames_since_flush = 0
             return n == len(frame_bytes)
         except Exception as e:
             self._log.error(f"Error writing frame {frame_id}: {e}")
