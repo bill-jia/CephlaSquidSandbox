@@ -1659,8 +1659,16 @@ class IlluminationController:
         if channel_name not in self._channel_state:
             logger.debug(f"set_channel_intensity: unknown channel '{channel_name}' (skipped)")
             return
-        if abs(float(intensity) - float(self._channel_state[channel_name].intensity)) < 0.1:
-            # self._log.debug(f"set_channel_intensity: intensity for {channel_name} is the same as the current intensity")
+        cur = self._channel_state[channel_name].intensity
+        # [LED-DBG] log every non-matrix (serial/IO-routed) intensity request, incl.
+        # dedup skips — lets a rig run confirm whether e.g. the 561 CoolLED actually
+        # receives its 100% command before a gated pulse, or is short-circuited here.
+        logger.info(
+            f"[LED-DBG] IC.set_channel_intensity ch='{channel_name}' "
+            f"requested={intensity} current={cur} "
+            f"{'(SKIPPED dedup)' if abs(float(intensity) - float(cur)) < 0.1 else '(SENT)'}"
+        )
+        if abs(float(intensity) - float(cur)) < 0.1:
             return
         dev = self._channel_map.get(channel_name)
         if dev is None:

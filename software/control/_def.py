@@ -1165,7 +1165,9 @@ Z_HOME_SAFETY_POINT = 100
 # When the last stage position cache is missing or unreadable, move here after homing (mm).
 STARTUP_DEFAULT_STAGE_X_MM = 30.0
 STARTUP_DEFAULT_STAGE_Y_MM = 15.0
-STARTUP_DEFAULT_STAGE_Z_MM = 0.05  # 50 µm
+STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # 200 µm; kept above Z_HOME_SAFETY_POINT (0.1 mm) and the
+# z lower software limit (0.05 mm) so the post-homing restore moves *up* to it and never
+# triggers move_z_to's backlash dip into the lower limit (which could stall at the boundary).
 
 USE_XERYON = False
 XERYON_SERIAL_NUMBER = "95130303033351E02050"

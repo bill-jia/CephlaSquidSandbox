@@ -65,6 +65,12 @@ class LiveController:
         self.display_resolution_scaling = 1
         self.enable_channel_auto_filter_switching: bool = True
 
+        # Log-once guards for the waveform-driven (timed-pulse) live preview so a
+        # persistently mis-wired pulse, or a state previewed in CONTINUOUS, does
+        # not spam a message every frame.
+        self._live_pulse_failure_logged = False
+        self._live_waveform_mode_hint_logged = False
+
     # ─────────────────────────────────────────────────────────────────────
     # Live streaming
     # ─────────────────────────────────────────────────────────────────────
@@ -74,7 +80,24 @@ class LiveController:
         # Open the streaming gate and turn on illumination BEFORE camera
         # so the first frame is correctly illuminated.
         if self.control_illumination and self.obs_controller:
-            self.obs_controller.turn_on_illumination()
+            config = self.obs_controller.current_observation_state
+            waveform_driven = bool(config is not None and getattr(config, "is_waveform_driven", False))
+            if waveform_driven and self.trigger_mode == TriggerMode.SOFTWARE:
+                # Gated-pulse preview: don't hold the LED on — the per-frame NIDAQ
+                # pulse in trigger_acquisition gates it. Just stage DC intensities
+                # (timed gates stay LOW) so the first triggered frame is faithful.
+                from control.core.waveform_capture import apply_illumination_for_waveform_capture
+                apply_illumination_for_waveform_capture(self.microscope, config, self._log)
+            else:
+                if waveform_driven and not self._live_waveform_mode_hint_logged:
+                    self._log.info(
+                        "Observation state '%s' uses a timed pulse; set the live trigger to "
+                        "Software to preview the actual gated pulse (other modes show the LED "
+                        "held on for the full exposure).",
+                        getattr(config, "name", "?"),
+                    )
+                    self._live_waveform_mode_hint_logged = True
+                self.obs_controller.turn_on_illumination()
             ic = self.microscope.illumination_controller
             ic.set_streaming_active(True)
 
@@ -136,14 +159,80 @@ class LiveController:
             return False
 
         self._trigger_skip_count = 0
-        if self.trigger_mode == TriggerMode.SOFTWARE and self.control_illumination:
-            if not self.microscope.illumination_controller.is_any_hardware_asserted():
-                if self.obs_controller:
+
+        # Waveform-driven (timed-pulse) states: preview the REAL gated pulse —
+        # stage DC intensities and let a one-shot NIDAQ pulse synced to this
+        # exposure drive the timed gate (the same path multipoint uses), instead
+        # of holding the LED on for the whole frame. Only meaningful in the
+        # per-frame triggered SOFTWARE mode; a free-running CONTINUOUS stream
+        # can't sync a one-shot pulse per frame, so it falls back to full-on.
+        nidaq_pulse_cleanup = None
+        if self.control_illumination and self.obs_controller:
+            config = self.obs_controller.current_observation_state
+            waveform_driven = bool(config is not None and getattr(config, "is_waveform_driven", False))
+            if waveform_driven and self.trigger_mode == TriggerMode.SOFTWARE:
+                nidaq_pulse_cleanup = self._arm_live_waveform_pulse(config)
+            elif waveform_driven and not self._live_waveform_mode_hint_logged:
+                self._log.info(
+                    "Observation state '%s' uses a timed pulse; set the live trigger to "
+                    "Software to preview the actual gated pulse (other modes show the LED "
+                    "held on for the full exposure).",
+                    getattr(config, "name", "?"),
+                )
+                self._live_waveform_mode_hint_logged = True
+
+            if nidaq_pulse_cleanup is None and self.trigger_mode == TriggerMode.SOFTWARE:
+                # Standard (non-waveform) channel, or no NIDAQ to gate it: hold
+                # illumination on for the exposure, exactly as before.
+                if not self.microscope.illumination_controller.is_any_hardware_asserted():
                     self.obs_controller.turn_on_illumination()
 
         self.trigger_ID += 1
         self.camera.send_trigger(self.camera.get_exposure_time())
+        # Bracket the trigger: the cleanup waits for the one-shot pulse to fire
+        # during this exposure, then releases the task and drives the gate LOW.
+        if nidaq_pulse_cleanup is not None:
+            try:
+                nidaq_pulse_cleanup()
+            except Exception as e:
+                self._log.warning("Live waveform pulse cleanup failed: %s", e)
         return True
+
+    def _arm_live_waveform_pulse(self, config):
+        """Stage DC illumination + arm the one-shot NIDAQ pulse for one live frame.
+
+        Returns the cleanup closure (call after ``send_trigger``), or ``None`` to
+        fall back to holding illumination on for the full exposure (no NIDAQ on
+        this rig, or the waveform could not be built).
+        """
+        from control.core.waveform_capture import (
+            apply_illumination_for_waveform_capture,
+            arm_nidaq_pulse_for_capture,
+        )
+        try:
+            apply_illumination_for_waveform_capture(self.microscope, config, self._log)
+            return arm_nidaq_pulse_for_capture(
+                self.microscope,
+                config,
+                log=self._log,
+                on_wait_failure=self._on_live_pulse_wait_failure,
+            )
+        except Exception as e:
+            self._log.warning(
+                "Could not arm live waveform pulse for '%s': %s", getattr(config, "name", "?"), e
+            )
+            return None
+
+    def _on_live_pulse_wait_failure(self, terminal, timeout_s, name, error) -> None:
+        """Log once when the live preview pulse never fired (don't abort live)."""
+        if not self._live_pulse_failure_logged:
+            self._log.warning(
+                "Live preview: NIDAQ pulse for '%s' did not fire within %.2fs "
+                "(check the camera frame-signal terminal %s). Showing whatever the "
+                "camera captured; the gated pulse may not be visible.",
+                name, timeout_s, terminal,
+            )
+            self._live_pulse_failure_logged = True
 
     def _stop_existing_timer(self):
         if self.timer_trigger and self.timer_trigger.is_alive():

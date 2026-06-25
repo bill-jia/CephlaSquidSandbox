@@ -280,6 +280,32 @@ toggle required).
 > combine into an RGB TIFF) was removed along with the R/G/B modes; use the global
 > color setting instead.
 
+## Timed pulses (waveform-driven states) and live preview
+
+An `ObservationState` whose active illuminator carries an `IlluminatorTiming`
+comb is **waveform-driven**: during a capture the LED's DC intensity is set as
+usual, but its digital gate is held LOW and pulsed by a one-shot NIDAQ waveform
+synchronized to the camera exposure (e.g. a 0.6 ms 561 pulse 11 ms into a 15 ms
+frame). Only the *gate* is pulsed — the serial/DC **intensity is unchanged**, so
+the pulse fires at the configured percentage; it simply delivers light for the
+pulse width rather than the whole exposure.
+
+The arm/illuminate/cleanup logic lives in `control/core/waveform_capture.py` and
+is shared by **both** the multipoint worker and the live/snap path, so a live
+preview shows the *identical* gated pulse the cycle captures:
+
+- **Live / Snap** (`LiveController.trigger_acquisition`): when the current state
+  is waveform-driven **and the live trigger is Software**, each frame stages DC
+  intensities, arms the per-frame NIDAQ pulse, triggers, then releases. A
+  free-running **Continuous** stream cannot sync a one-shot pulse per frame, so
+  it falls back to holding the LED on for the full exposure and logs a one-time
+  hint to switch to Software. Snap reads the latest live frame, so it inherits
+  the same gated behavior.
+- A short gated pulse looks **dimmer by eye** than a full-on exposure purely
+  because of its short duration (low duty cycle), not because the peak power is
+  lower — the captured frame integrates the configured 100 % for the pulse
+  width. Previewing in Software trigger is the faithful way to see it.
+
 ## Troubleshooting
 
 ### "Firmware does not support multi-port illumination commands"
