@@ -1,3 +1,4 @@
+import atexit
 import csv
 import glob
 import json
@@ -95,6 +96,14 @@ _log = squid.logging.get_logger(__name__)
 # terminate() only fires if finalize genuinely wedges past this deadline.
 JOB_RUNNER_FINALIZE_TIMEOUT_S = 600
 
+# No-progress stall window for the end-of-run background upload drainer. The
+# UploadWorker stamps a heartbeat on every chunk it moves, so this means "no
+# byte of forward progress for N seconds while uploads are still outstanding"
+# = genuinely wedged (a dead SMB handle), not merely slow. Much tighter than a
+# result-only window because the heartbeat tells a slow large file apart from a
+# stuck one; a wedged worker is force-terminated instead of waited out.
+UPLOAD_DRAINER_STALL_WINDOW_S = 120
+
 
 class SummarizeResult(NamedTuple):
     """Result from processing job output queues."""
@@ -148,6 +157,32 @@ def active_upload_drainer_summary() -> List[dict]:
         return [d.snapshot() for d in _active_upload_drainers]
 
 
+def terminate_all_upload_drainers() -> None:
+    """Force-stop every active drainer's UploadWorker immediately.
+
+    The UploadWorker is a non-daemon ``multiprocessing.Process``; Python's
+    multiprocessing joins non-daemon children at interpreter exit, so a worker
+    wedged in a synchronous SMB I/O wait would block the whole app from
+    closing. Terminating the workers here (from ``MultiPointController.close()``
+    and as an ``atexit`` handler) reaps them via ``terminate()`` — which the OS
+    honors even for a thread stuck in kernel I/O — so exit is never blocked.
+    Uploads abandoned this way are recoverable with the backfill script.
+    """
+    with _active_upload_drainers_lock:
+        drainers = list(_active_upload_drainers)
+    for d in drainers:
+        try:
+            d.force_stop()
+        except Exception:
+            pass
+
+
+# Registered last (after multiprocessing's own atexit), so it runs FIRST at
+# interpreter shutdown — terminating wedged workers before multiprocessing
+# tries (and would hang) to join them.
+atexit.register(terminate_all_upload_drainers)
+
+
 class _BackgroundUploadDrainer:
     """Owns one acquisition's UploadWorker after the MultiPointWorker has gone.
 
@@ -195,6 +230,8 @@ class _BackgroundUploadDrainer:
         self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
+        self._stop_requested = threading.Event()
+        self._last_result_time = 0.0
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -214,6 +251,22 @@ class _BackgroundUploadDrainer:
             "outstanding": outstanding,
             "alive": self._thread.is_alive(),
         }
+
+    def force_stop(self) -> None:
+        """Terminate the owned worker immediately and mark the drainer done.
+
+        Idempotent. The drain loop (running in the daemon thread) checks
+        ``_stop_requested`` each pass and exits promptly. Called by
+        ``terminate_all_upload_drainers`` on app close / at interpreter exit.
+        """
+        self._stop_requested.set()
+        worker = self._worker
+        if worker is not None:
+            try:
+                worker.force_stop()
+            except Exception:
+                pass
+        self._done.set()
 
     def _outstanding(self) -> int:
         return sum(len(s) for s in self._tasks_by_tp.values())
@@ -502,83 +555,116 @@ class _BackgroundUploadDrainer:
             )
 
     def _run(self) -> None:
+        tag = os.path.basename(self._experiment_path or "unknown")
         try:
+            # Fail fast if the share is simply gone: don't pay the stall window
+            # per file when the mount is unreachable. Probe is timeout-bounded
+            # so a wedged mount can't block here either.
+            from control.core.zarr_upload import remote_root_reachable
+            if (
+                self._target is not None
+                and getattr(self._target, "enabled", False)
+                and not remote_root_reachable(self._target.remote_root, timeout_s=5.0)
+            ):
+                self._log.error(
+                    f"[{tag}] remote {self._target.remote_root} is unreachable; "
+                    f"abandoning {self._outstanding()} pending upload(s) without "
+                    f"waiting. Re-run the backfill script over "
+                    f"{self._experiment_path} once the share is back."
+                )
+                self._teardown_worker(tag)
+                return
+
             self._enqueue_post_finalize_metadata_resync()
-            # Stall-based, NOT a wallclock cap: a healthy worker that is still
-            # making progress (results keep arriving) is never abandoned, no
-            # matter how large the backlog or how slow the network. We only
-            # give up if no new result lands for ``stall_window_s`` — i.e. the
-            # worker is genuinely stuck, not merely slow. (A fixed deadline
-            # used to time out mid-upload on large/slow transfers.)
+            # Heartbeat-based wedge detection, NOT a wallclock cap. The worker
+            # stamps ``worker.heartbeat`` on every chunk it moves, so a healthy
+            # transfer — however slow or large its backlog — keeps the idle
+            # clock near zero and is never abandoned. We only give up when
+            # neither a result nor a single byte has moved for
+            # ``stall_window_s`` (a genuinely wedged SMB handle), which the old
+            # result-only window could not tell apart from one slow big file.
             stall_window_s = self._stall_window_s
-            last_progress = time.time()
             last_log = 0.0
+            self._last_result_time = time.time()
             while True:
+                if self._stop_requested.is_set():
+                    break
                 outstanding = self._outstanding()
                 if outstanding == 0:
+                    break
+                # A crashed/terminated worker will never emit more results.
+                if self._worker is None or not self._worker.is_alive():
+                    self._log.error(f"[{tag}] UploadWorker is not alive; stopping drain.")
                     break
                 got = self._drain_available_results()
                 now = time.time()
                 if got:
-                    last_progress = now
-                elif now - last_progress > stall_window_s:
+                    self._last_result_time = now
+                hb = 0.0
+                try:
+                    hb = float(self._worker.heartbeat)
+                except Exception:
+                    pass
+                last_progress = max(hb, self._last_result_time)
+                idle = now - last_progress if last_progress > 0 else 0.0
+                if last_progress > 0 and idle > stall_window_s:
+                    self._log.error(
+                        f"[{tag}] UploadWorker wedged: no progress for "
+                        f"{int(idle)}s with {outstanding} upload(s) outstanding; "
+                        f"terminating. Re-run the backfill script over "
+                        f"{self._experiment_path} to finish the upload."
+                    )
                     break
                 if now - last_log > 30.0:
                     self._log.info(
-                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                        f"upload drainer: {outstanding} in flight "
-                        f"(idle {int(now - last_progress)}s / "
-                        f"stall window {int(stall_window_s)}s)"
+                        f"[{tag}] upload drainer: {outstanding} in flight "
+                        f"(idle {int(idle)}s / stall window {int(stall_window_s)}s)"
                     )
                     last_log = now
                 time.sleep(0.5)
+
             self._drain_available_results()
             remaining = self._outstanding()
             if remaining:
                 self._log.error(
-                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                    f"UploadWorker drain stalled with {remaining} upload(s) "
-                    f"outstanding (no progress for {int(stall_window_s)}s). Run "
-                    f"the standalone backfill script over {self._experiment_path} "
-                    f"to complete the upload."
+                    f"[{tag}] UploadWorker drain ended with {remaining} upload(s) "
+                    f"outstanding. Run the standalone backfill script over "
+                    f"{self._experiment_path} to complete the upload."
                 )
             if self._failed_tasks:
                 self._log.warning(
-                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                    f"{len(self._failed_tasks)} upload task(s) failed during this run; "
-                    f"local files for the affected timepoints have NOT been deleted."
+                    f"[{tag}] {len(self._failed_tasks)} upload task(s) failed during "
+                    f"this run; local files for the affected timepoints have NOT "
+                    f"been deleted."
                 )
-            # Marker only on a fully-clean drain: every task accounted for
-            # AND no task reported failure. If a subsequent backfill run
-            # closes the gap, that run will drop the marker instead.
+            # Marker only on a fully-clean drain: every task accounted for AND
+            # no task reported failure. If a subsequent backfill run closes the
+            # gap, that run will drop the marker instead.
             if remaining == 0 and not self._failed_tasks:
                 self._write_upload_complete_marker()
-            try:
-                self._worker.shutdown()
-                self._worker.join(timeout=10.0)
-                if self._worker.is_alive():
-                    self._log.warning(
-                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                        f"UploadWorker did not exit within 10s; terminating"
-                    )
-                    self._worker.terminate()
-                    self._worker.join(timeout=5.0)
-                try:
-                    self._worker.release_queue_resources()
-                except Exception as e:
-                    self._log.debug(f"release_queue_resources: {e}")
-                try:
-                    self._worker.close()
-                except Exception:
-                    pass
-            except Exception as e:
-                self._log.error(f"Error shutting down UploadWorker: {e}")
+            self._teardown_worker(tag)
         finally:
             self._done.set()
-            self._log.info(
-                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                f"background upload drainer finished."
-            )
+            self._log.info(f"[{tag}] background upload drainer finished.")
+
+    def _teardown_worker(self, tag: str) -> None:
+        """Stop the worker: a healthy idle worker exits on the sentinel; a
+        wedged one is force-terminated. Either way queue feeder threads are
+        released so the host process can exit promptly."""
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.shutdown()
+            worker.join(timeout=5.0)
+        except Exception as e:
+            self._log.debug(f"[{tag}] graceful worker shutdown: {e}")
+        # force_stop() is a no-op if the worker already exited; otherwise it
+        # terminate()s a worker still wedged in SMB I/O and releases queues.
+        try:
+            worker.force_stop()
+        except Exception as e:
+            self._log.error(f"[{tag}] Error force-stopping UploadWorker: {e}")
 
 
 class MultiPointWorker:
@@ -1779,9 +1865,11 @@ class MultiPointWorker:
         # can run concurrently — see ``active_upload_drainer_count()`` for
         # operator visibility.
         # Stall window, not a deadline: the drainer keeps running as long as
-        # uploads make progress; it only gives up after this many seconds of
-        # *no* new results (worker genuinely stuck).
-        self._spawn_background_upload_drainer(stall_window_s=10 * 60)
+        # the worker makes byte-progress (heartbeat advances); it only gives up
+        # after this many seconds of a genuinely wedged worker.
+        self._spawn_background_upload_drainer(
+            stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S
+        )
 
         # Release backpressure resources now that all jobs are complete
         try:

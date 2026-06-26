@@ -69,10 +69,14 @@ JobRunner subprocess (one FIFO queue per job class)
     │
     ▼
 UploadWorker subprocess (separate Process, non-daemon)
-    │  per file: stream-copy local→`<remote>.part` with running sha256,
-    │            re-hash dest, os.replace(<.part>, final), append manifest
-    │            (jsonl + fsync). Retry with exponential backoff on OSError.
-    │  per task: push UploadResult(success, uploaded_paths, ...) → output queue
+    │  N concurrent lanes (ThreadPoolExecutor, UPLOAD_WORKER_THREADS, default 2)
+    │  per file (one lane job): stream-copy local→`<remote>.part` with running
+    │            sha256, re-hash dest, os.replace(<.part>, final), append
+    │            manifest (jsonl + fsync, under a lane lock). Retry with
+    │            exponential backoff on OSError; a per-chunk heartbeat is stamped
+    │            so the parent can tell "slow" from "wedged".
+    │  per task: results aggregate as a task's last file lands, then push
+    │            UploadResult(success, uploaded_paths, ...) → output queue
     │
     ▼
 multi_point_worker (main proc)
@@ -85,6 +89,25 @@ multi_point_worker (main proc)
 The writer subprocess never blocks on network I/O: the upload worker is its
 own process with its own queue. When the network is unavailable, the queue
 grows and deletions defer; acquisition keeps imaging.
+
+**Why concurrent lanes (and why only a few).** Each lane writes a file up
+(send direction) then reads it all back to sha256-verify (receive direction).
+1 GbE is full-duplex, so with ≥2 lanes one file's verify-read overlaps
+another's upload-write instead of serializing after it — the read-back's cost
+is largely hidden rather than doubling wall-clock. Extra lanes also hide
+per-file SMB round-trip latency on the long tail of small pyramid/metadata
+files. Lanes do **not** push past the link's bandwidth ceiling: for large
+shards a single stream already saturates the pipe, so this is latency/duplex
+hiding, not parallelism-beats-bandwidth. `UPLOAD_PIPELINED=False` restores the
+strictly-sequential one-file-at-a-time path as an instant rollback.
+
+**Verification is end-to-end and unavoidable over plain SMB.** There is no
+server-side hash op on an SMB share, so confirming the stored bytes means
+reading them back down — that is what the re-hash does. (`verify_readback=
+False` downgrades to a remote-size check only — catches truncation, not silent
+corruption — and is off by default.) Caveat: the SMB client may serve the
+read-back from its own write cache, so the check is as strong as the client's
+cache coherency, not a guaranteed fresh fetch from the server.
 
 ## Concurrent-write safety
 
@@ -183,6 +206,14 @@ Per shard file:
    (5 attempts). On final failure, leave the `.part` file in place, push
    `UploadResult(success=False)`, and **never** delete the local copy.
 
+   The retry loop only fires when a syscall *returns* an error. A genuine SMB
+   *hang* (a dead/half-open session where `write()` never returns) bypasses it
+   entirely — so the parent watches the worker's per-chunk heartbeat and
+   `terminate()`s a wedged worker rather than waiting forever (see the
+   stall-window section). A terminated worker leaves only `.part` files
+   (never a half-written final file, thanks to the atomic rename), so the
+   remote is never corrupted and the backfill script can finish the job.
+
 Per acquisition:
 - A JSON-lines manifest is appended at
   `{experiment_dir}/upload_manifest.jsonl`, one record per successfully
@@ -190,10 +221,15 @@ Per acquisition:
   ```json
   {"time_point":3,"region_id":"A1","fov":0,"local_path":"...","remote_path":"...","sha256":"...","bytes":1342177280,"elapsed_s":7.412,"verified_utc":"2026-..."}
   ```
-- The shard ordering inside each `(t, fov)` task is: group `zarr.json`, then
-  every pyramid level's `zarr.json` + shard file, then `frame_times` array
-  metadata + chunk. Metadata files are small; re-uploading them every
-  timepoint keeps the remote tree continuously readable.
+  With concurrent lanes the appends are serialized under a per-worker lock, so
+  the "one fsynced record at a time" durability ordering is preserved.
+- The files inside each `(t, fov)` task are: group `zarr.json`, then every
+  pyramid level's `zarr.json` + shard file, then `frame_times` array metadata
+  + chunk. With concurrent lanes these upload out of order, but a task's
+  `UploadResult` is only emitted once **all** its files have landed, so the
+  per-timepoint deletion tally is unaffected. Metadata files are small;
+  re-uploading them every timepoint keeps the remote tree continuously
+  readable.
 
 ## Backfill: applying upload to an existing dataset
 
@@ -327,13 +363,26 @@ immediately — the user can start a new run without waiting for the
 previous one's uploads to finish. Several drainers can be active
 concurrently, one per past-but-not-yet-finished acquisition. The module
 exposes `active_upload_drainer_count()` and
-`active_upload_drainer_summary()` for the UI to surface "N previous
-acquisitions still uploading" if desired.
+`active_upload_drainer_summary()`; the multipoint Start buttons surface
+these in a pre-start "N previous acquisitions still uploading" warning
+(`check_system_load_and_pending_uploads_with_dialog`, alongside high
+CPU/RAM and tight-disk checks) so the operator can choose not to pile a
+new run onto a still-draining one.
 
 Each acquisition writes to a unique `experiment_path`, so concurrent
 drainers' local files, remote paths, and manifests don't collide.
 Bandwidth contention on a shared SMB share is the only real overlap;
 that's an accepted cost of the concurrent design.
+
+**Clean exit, even with a wedged worker.** The UploadWorker is a
+non-daemon `multiprocessing.Process`, which Python joins at interpreter
+exit — so a worker stuck in a synchronous SMB I/O wait would otherwise
+hang the whole app on close. `MultiPointController.close()` calls
+`terminate_all_upload_drainers()` (also registered as an `atexit`
+handler, ahead of multiprocessing's own, so it runs first), which
+`terminate()`s every active worker — the OS reaps even a kernel-I/O-
+blocked process — and releases the queue feeder threads. Uploads
+abandoned this way are recoverable with the backfill script.
 
 ### Lost-task bug fix
 
@@ -360,26 +409,42 @@ correctness.
   defers deletion of the whole timepoint's local data until the failure
   resolves.
 - **Aborts / end-of-run drain.** When an acquisition ends, the background
-  drainer keeps uploading and only gives up after a **stall window** — 10
-  minutes with *no* new verified result — rather than a fixed wallclock
-  deadline. A healthy worker that is merely slow (large backlog, slow share)
-  is never abandoned; only a genuinely stuck one is. If the drain does report
-  outstanding uploads, re-running the backfill against the same experiment
-  dir is the canonical recovery path.
+  drainer keeps uploading and only gives up after a **stall window**
+  (`UPLOAD_DRAINER_STALL_WINDOW_S`, default 120 s) of *no forward progress* —
+  not a fixed wallclock deadline. Progress is measured by the worker's
+  per-chunk **heartbeat**, so a healthy worker that is merely slow (large
+  backlog, slow share, one big file) keeps the idle clock near zero and is
+  never abandoned; only a genuinely wedged worker (a dead SMB handle moving no
+  bytes) trips it, and is then `terminate()`d rather than waited out. This is
+  much tighter and more precise than the old "no new *result* for 10 minutes"
+  window, which could not tell one slow large file apart from a stuck one.
+  Before draining, the drainer also runs a timeout-bounded reachability probe
+  of the remote root and abandons fast if the share is simply gone. Whenever
+  the drain reports outstanding uploads, re-running the backfill against the
+  same experiment dir is the canonical recovery path.
+- **Throughput knobs.** `UPLOAD_WORKER_THREADS` (default 2) sets the number of
+  concurrent copy/verify lanes; `UPLOAD_PIPELINED=False` reverts to the
+  strictly-sequential path; `UPLOAD_VERIFY_READBACK=False` trades end-to-end
+  re-hash for a remote-size check. All live in `zarr_upload.py`.
 
 ## Key files
 
 - `software/control/core/zarr_upload.py` — `UploadTarget`, `UploadTask`,
-  `UploadResult`, `UploadWorker`, `upload_one_file`, manifest helpers.
+  `UploadResult`, `UploadWorker` (pipelined lanes + heartbeat + `force_stop`),
+  `upload_one_file`, `remote_root_reachable`, manifest helpers, and the
+  `UPLOAD_PIPELINED` / `UPLOAD_WORKER_THREADS` / `UPLOAD_VERIFY_READBACK` knobs.
 - `software/control/core/job_processing.py` — `FlushAndStageUploadJob`,
   `BarrierResult`, `JobRunner(upload_target=..., upload_input_queue=...)`.
 - `software/control/core/zarr_writer.py` — `drain_unstaged_shard_paths`
   (stages every shard written since the last barrier).
 - `software/control/core/multi_point_worker.py` — UploadWorker lifecycle,
-  barrier dispatch, batched-delete, drain on shutdown.
+  barrier dispatch, batched-delete, `_BackgroundUploadDrainer` (heartbeat
+  watchdog), `terminate_all_upload_drainers` (+ atexit), `active_upload_
+  drainer_count/summary`, `UPLOAD_DRAINER_STALL_WINDOW_S`.
 - `software/control/core/multi_point_utils.py` — new fields on
   `AcquisitionParameters`.
 - `software/control/core/multi_point_controller.py` —
   `set_zarr_upload_target`.
-- `software/gui/widgets/common.py` — `prompt_enable_network_streaming` UI.
+- `software/gui/widgets/common.py` — `prompt_enable_network_streaming` UI and
+  `check_system_load_and_pending_uploads_with_dialog` (pre-start warning).
 - `software/scripts/zarr_backfill_upload.py` — backfill CLI.
