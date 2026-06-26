@@ -274,6 +274,95 @@ def check_ram_available_with_error_dialog(
     return True
 
 
+def check_system_load_and_pending_uploads_with_dialog(
+    multi_point_controller: MultiPointController,
+    logger: logging.Logger,
+    cpu_pct_threshold: float = 85.0,
+    ram_pct_threshold: float = 85.0,
+    disk_headroom_factor: float = 1.5,
+) -> bool:
+    """Warn before starting when the system is loaded, disk headroom is tight,
+    or a previous run's background upload is still draining.
+
+    None of these is a hard block — concurrent upload drainers are isolated by
+    design, and a busy system can still acquire — but each can degrade the run:
+    a prior upload shares the network share and local-disk I/O, and its
+    verified-pending shards still occupy disk, so there is less free space than
+    "between runs". Returns True to proceed; False if the user cancels. Default
+    button is Cancel so a stray Enter does not start the run.
+    """
+    import psutil
+
+    reasons = []
+
+    # Previous acquisitions still uploading in the background.
+    try:
+        from control.core.multi_point_worker import active_upload_drainer_summary
+
+        summary = active_upload_drainer_summary()
+    except Exception:
+        logger.exception("Could not read active upload drainers; skipping that check.")
+        summary = []
+    if summary:
+        total = sum(int(d.get("outstanding", 0)) for d in summary)
+        reasons.append(
+            f"• {len(summary)} previous acquisition(s) still uploading in the "
+            f"background ({total} task(s) pending) — they share the network "
+            f"share and local disk with this run."
+        )
+
+    # CPU load (interval>0 so the first sample is meaningful).
+    try:
+        cpu = psutil.cpu_percent(interval=0.3)
+        if cpu >= cpu_pct_threshold:
+            reasons.append(f"• CPU load is high ({cpu:.0f}%).")
+    except Exception:
+        logger.exception("CPU load check failed; skipping.")
+
+    # Memory.
+    try:
+        vm = psutil.virtual_memory()
+        if vm.percent >= ram_pct_threshold:
+            reasons.append(
+                f"• Memory is {vm.percent:.0f}% used "
+                f"({vm.available / 1024 / 1024 / 1024:.1f} GB free)."
+            )
+    except Exception:
+        logger.exception("RAM load check failed; skipping.")
+
+    # Soft disk-headroom warning (the hard fail is handled by
+    # check_space_available_with_error_dialog upstream).
+    try:
+        available = utils.get_available_disk_space(multi_point_controller.base_path)
+        required = multi_point_controller.get_estimated_acquisition_disk_storage()
+        if required and available < disk_headroom_factor * required:
+            reasons.append(
+                f"• Local free disk is tight: {int(available / 1024 / 1024):,} MB "
+                f"free vs {int(required / 1024 / 1024):,} MB needed for this run."
+            )
+    except Exception:
+        logger.exception("Disk headroom check failed; skipping.")
+
+    if not reasons:
+        return True
+
+    message = (
+        "The system may be under load or low on resources, which can slow "
+        "acquisition and background data writing:\n\n"
+        + "\n".join(reasons)
+        + "\n\nStart the acquisition anyway?"
+    )
+    logger.warning("Pre-start load/upload warning: %s", " ".join(reasons))
+
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setWindowTitle("System Under Load")
+    msg.setText(message)
+    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+    msg.setDefaultButton(QMessageBox.Cancel)
+    return msg.exec_() == QMessageBox.Yes
+
+
 class WrapperWindow(QMainWindow):
     def __init__(self, content_widget, *args, **kwargs):
         super().__init__(*args, **kwargs)

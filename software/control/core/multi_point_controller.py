@@ -2096,6 +2096,23 @@ class MultiPointController:
             except Exception:
                 self._log.exception("Error closing backpressure controller during shutdown")
 
+        # Force-stop any background upload drainers + their UploadWorker
+        # subprocesses. The workers are non-daemon, so a wedged SMB handle
+        # would otherwise block interpreter exit when multiprocessing joins
+        # them. Abandoned uploads are recoverable with the backfill script.
+        # (Also registered as an atexit backstop in multi_point_worker.)
+        try:
+            from control.core.multi_point_worker import (
+                active_upload_drainer_count,
+                terminate_all_upload_drainers,
+            )
+            n = active_upload_drainer_count()
+            if n:
+                self._log.info(f"Force-stopping {n} background upload drainer(s) during close")
+            terminate_all_upload_drainers()
+        except Exception:
+            self._log.exception("Error stopping upload drainers during close")
+
         # Clear worker reference
         self.multiPointWorker = None
         self.thread = None

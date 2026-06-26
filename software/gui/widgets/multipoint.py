@@ -3,6 +3,7 @@ from .common import (
     check_observation_state_roi_consistency_with_dialog,
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
+    check_system_load_and_pending_uploads_with_dialog,
     error_dialog,
     _load_last_remote_streaming_path,
     _save_last_remote_streaming_path,
@@ -3370,6 +3371,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 self.btn_startAcquisition.setChecked(False)
                 return
 
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
             # @@@ to do: add a widgetManger to enable and disable widget
             # @@@ to do: emit signal to widgetManager to disable other widgets
             self.is_current_acquisition_widget = True  # keep track of what widget started the acquisition
@@ -6076,6 +6082,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
                 return
 
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self.btn_startAcquisition.setChecked(False)
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
+                return
+
             # Update UI to show acquisition is running
             self._set_ui_acquisition_running(self.entry_NZ.value(), self.entry_deltaZ.value())
 
@@ -6967,6 +6978,16 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
+
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
+                # This widget sets the "running" UI state before configuring the
+                # controller, so a pre-start cancel must roll it back by hand.
+                self.is_current_acquisition_widget = False
+                self.setEnabled_all(True)
+                self.btn_startAcquisition.setText("Start\n Acquisition ")
+                self.btn_startAcquisition.setChecked(False)
+                return
 
             # Emit signals
             self.signal_acquisition_started.emit(True)
