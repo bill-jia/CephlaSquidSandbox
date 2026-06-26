@@ -154,3 +154,84 @@ def test_ragged_cycle_makes_per_state_plates():
             assert rfp.shape[:3] == (4, 1, 1)
         finally:
             SaveZarrJob.clear_writers()
+
+
+def test_ragged_by_z_mode_makes_separate_single_z_array():
+    """A full-z step + a reference-z-only step are ragged by Z extent: the full-z
+    state writes a Z=NZ array, the reference-only state its own Z=1 _refz array."""
+    NZ = 3
+    cyc = AcquisitionCycle(
+        name="zmode",
+        items=[
+            CycleStep(observation_state="GFP"),                          # full z-stack
+            CycleStep(observation_state="RFP", acquire_z_stack=False),   # reference plane only
+        ],
+    )
+    plan = RegionPlan.from_events(resolve_cycle(cyc))
+    assert not plan.dense  # mixed z-mode => ragged
+    assert plan.array_keys == ["GFP", "RFP_refz"]
+    colors, waves = ["#00FF00", "#FF0000"], [488, 561]
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            info = ZarrWriterInfo(
+                base_path=tmp,
+                t_size=1,
+                c_size=len(plan.channel_order),
+                z_size=NZ,
+                is_hcs=True,
+                region_fov_counts={"A1": 1},
+                fov_translations_um={"A1": {0: (0.0, 0.0)}},
+                pixel_size_um=0.325,
+                channel_names=list(plan.channel_order),
+                channel_colors=colors,
+                channel_wavelengths=waves,
+            )
+            for ev in plan.events:
+                if ev.is_stimulus:
+                    continue
+                coord = frame_coord(plan, 1, 0, ev)
+                names = list(plan.channel_order) if coord.array_key is None else [ev.observation_state]
+                z_size = NZ if ev.acquire_z_stack else 1
+                z_levels = range(NZ) if ev.acquire_z_stack else [0]
+                for z in z_levels:
+                    cap = CaptureInfo(
+                        position=squid.abc.Pos(x_mm=1.0, y_mm=2.0, z_mm=0.0, theta_rad=None),
+                        z_index=(z if ev.acquire_z_stack else 0),
+                        capture_time=time.time(),
+                        observation_state=_obs(ev.observation_state),
+                        save_directory=tmp,
+                        file_id="A1_0_0",
+                        region_id="A1",
+                        fov=0,
+                        configuration_idx=coord.c_index,
+                        time_point=0,
+                        filename_channel_label=ev.observation_state,
+                        file_saving_option=FileSavingOption.ZARR_V3,
+                        acquisition_root=tmp,
+                        array_key=coord.array_key,
+                        save_t_index=coord.t_index,
+                        save_c_index=coord.c_index,
+                        save_t_size=coord.t_size,
+                        save_c_size=coord.c_size,
+                        save_z_size=z_size,
+                        cycle_event_index=ev.cycle_event_index,
+                        state_frame_index=ev.state_frame_index,
+                        array_channel_names=names,
+                        array_channel_colors=[colors[plan.channel_order.index(n)] for n in names],
+                        array_channel_wavelengths=[waves[plan.channel_order.index(n)] for n in names],
+                    )
+                    job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=np.full((32, 32), 123, np.uint16)))
+                    job.zarr_writer_info = info
+                    assert isinstance(job.run(), ZarrWriteResult)
+            SaveZarrJob.finalize_all_writers()
+
+            assert os.path.isdir(os.path.join(tmp, "GFP.ome.zarr"))
+            assert os.path.isdir(os.path.join(tmp, "RFP_refz.ome.zarr"))
+            assert not os.path.isdir(os.path.join(tmp, "RFP.ome.zarr"))
+            assert not os.path.isdir(os.path.join(tmp, "plate.ome.zarr"))
+            gfp = _read_tensorstore(info.get_output_path("A1", 0, "GFP"))
+            rfp = _read_tensorstore(info.get_output_path("A1", 0, "RFP_refz"))
+            assert gfp.shape[:3] == (1, 1, NZ)   # full z-stack
+            assert rfp.shape[:3] == (1, 1, 1)    # reference plane only
+        finally:
+            SaveZarrJob.clear_writers()

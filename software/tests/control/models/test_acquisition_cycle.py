@@ -361,3 +361,71 @@ class TestFPMBrightfieldAndClustered:
         assert restored.items[0].observation_state == "BF"
         assert restored.items[0].n_leds == 50 and restored.items[0].seed == 7
         assert restored.items[1].outer_na == 0.7 and restored.items[1].min_overlap == 0.65
+
+
+class TestZModeLayout:
+    """Per-step / per-FPM acquire_z_stack: reference-z-only captures become their
+    own single-z (state, z-mode) array; full-z runs are unchanged."""
+
+    @staticmethod
+    def _plan(steps):
+        return RegionPlan.from_events(resolve_cycle(AcquisitionCycle(name="t", items=steps)))
+
+    def test_all_full_z_unchanged(self):
+        p = self._plan([CycleStep(observation_state="GFP"), CycleStep(observation_state="RFP")])
+        assert p.dense is True
+        assert p.frame_counts == {"GFP": 1, "RFP": 1}
+        assert p.array_keys == ["GFP", "RFP"]  # no suffix => backward compatible
+
+    def test_single_reference_only_is_dense_single_z(self):
+        # Uniform z-mode (all ref) => still dense; keyed with the _refz suffix.
+        p = self._plan([CycleStep(observation_state="GFP", acquire_z_stack=False)])
+        assert p.dense is True
+        assert p.frame_counts == {"GFP_refz": 1}
+        fc = frame_coord(p, Nt=1, t_scan=0, event=p.events[0])
+        assert fc.array_key is None  # single dense channel
+
+    def test_mixed_z_mode_is_ragged(self):
+        p = self._plan([
+            CycleStep(observation_state="GFP"),
+            CycleStep(observation_state="RFP", acquire_z_stack=False),
+        ])
+        assert p.dense is False  # mixed Z extent must be ragged
+        assert p.array_keys == ["GFP", "RFP_refz"]
+        assert p.channel_order == ["GFP", "RFP"]  # C-axis labels stay state names
+        coords = {e.observation_state: frame_coord(p, 1, 0, e) for e in p.events}
+        assert coords["GFP"].array_key == "GFP"
+        assert coords["RFP"].array_key == "RFP_refz"
+
+    def test_same_state_both_ways_two_arrays(self):
+        p = self._plan([
+            CycleStep(observation_state="DAPI", n_frames=2),
+            CycleStep(observation_state="DAPI", n_frames=2, acquire_z_stack=False),
+        ])
+        assert p.dense is False
+        assert p.frame_counts == {"DAPI": 2, "DAPI_refz": 2}
+        full = [frame_coord(p, 1, 0, e) for e in p.events if e.acquire_z_stack]
+        ref = [frame_coord(p, 1, 0, e) for e in p.events if not e.acquire_z_stack]
+        assert [c.array_key for c in full] == ["DAPI", "DAPI"]
+        assert [c.t_index for c in full] == [0, 1]
+        assert [c.array_key for c in ref] == ["DAPI_refz", "DAPI_refz"]
+        assert [c.t_index for c in ref] == [0, 1]  # independent T per array
+
+    def test_fpm_item_flag_propagates_to_events(self):
+        events = resolve_cycle(
+            AcquisitionCycle(name="t", items=[
+                CycleFPMBrightfield(observation_state="BF", n_leds=3, acquire_z_stack=False),
+            ]),
+            fpm_provider=lambda item: [("BF", [0]), ("BF", [1]), ("BF", [2])],
+        )
+        assert len(events) == 3
+        assert all(e.acquire_z_stack is False for e in events)  # locked across the sweep
+
+    def test_roundtrip_preserves_flag(self):
+        cyc = AcquisitionCycle(name="c", items=[
+            CycleStep(observation_state="GFP", acquire_z_stack=False),
+            CycleFPMDarkfield(observation_state="rand", acquire_z_stack=False),
+        ])
+        restored = AcquisitionCycle.model_validate(cyc.model_dump(mode="json"))
+        assert restored.items[0].acquire_z_stack is False
+        assert restored.items[1].acquire_z_stack is False

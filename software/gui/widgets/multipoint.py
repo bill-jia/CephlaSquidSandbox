@@ -685,8 +685,8 @@ class CycleEditorDialog(QDialog):
         right.addLayout(name_row)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat"])
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat", "Full z-stack"])
         self.tree.setColumnWidth(0, 220)
         right.addWidget(self.tree)
 
@@ -730,7 +730,26 @@ class CycleEditorDialog(QDialog):
         except Exception:
             return []
 
-    def _make_step_widgets(self, item, observation_state="", n_frames=1):
+    def _make_zstack_checkbox(self, item, acquire_z_stack=True):
+        """Column-2 'Full z-stack' checkbox for a step / FPM sweep.
+
+        Checked = capture every z-plane (default). Unchecked = capture only the
+        reference/focus plane (one z), saved to its own single-z array.
+        """
+        cb = QCheckBox()
+        cb.setChecked(bool(acquire_z_stack))
+        cb.setToolTip(
+            "Acquire the whole z-stack for this step/sweep.\n"
+            "Unchecked: capture only the reference (focus) plane — one z — saved to its own array."
+        )
+        self.tree.setItemWidget(item, 2, cb)
+        return cb
+
+    def _read_zstack_checkbox(self, item):
+        cb = self.tree.itemWidget(item, 2)
+        return cb.isChecked() if cb is not None else True
+
+    def _make_step_widgets(self, item, observation_state="", n_frames=1, acquire_z_stack=True):
         combo = QComboBox()
         names = self._preset_names()
         combo.addItems(names)
@@ -744,12 +763,14 @@ class CycleEditorDialog(QDialog):
         spin.setValue(int(n_frames))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, spin)
+        self._make_zstack_checkbox(item, acquire_z_stack)
 
-    def _make_fpm_widgets(self, item, observation_state="", params=None):
+    def _make_fpm_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
         """FPM darkfield node: base-preset combo (col 0) + params button (col 1).
 
         The generation parameters live in the item's data role; the button shows
-        a summary and opens the params dialog.
+        a summary and opens the params dialog. The col-2 checkbox locks the whole
+        sweep to full-z or reference-plane-only.
         """
         params = {**_default_fpm_params(), **(params or {})}
         item.setData(0, self._FPM_PARAMS_ROLE, params)
@@ -765,6 +786,7 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_params(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
 
     def _current_objective_na(self):
         """Live objective NA from the shared objective store (None if unknown)."""
@@ -782,9 +804,9 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_PARAMS_ROLE, params)
             btn.setText(_fpm_summary(params))
 
-    def _make_fpm_bf_widgets(self, item, observation_state="", params=None):
+    def _make_fpm_bf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
         """Brightfield single-LED-sweep node: base-state combo (col 0) + params
-        button (col 1) for full-sweep vs pseudorandom-N."""
+        button (col 1) for full-sweep vs pseudorandom-N; col-2 full-z checkbox."""
         params = {**_default_fpm_bf(), **(params or {})}
         item.setData(0, self._FPM_BF_ROLE, params)
         combo = QComboBox()
@@ -799,6 +821,7 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_bf(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
 
     def _edit_fpm_bf(self, item, btn):
         params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
@@ -808,8 +831,9 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_BF_ROLE, params)
             btn.setText(_fpm_bf_summary(params))
 
-    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None):
-        """Clustered-darkfield node: base-state combo (col 0) + params button (col 1)."""
+    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
+        """Clustered-darkfield node: base-state combo (col 0) + params button (col 1);
+        col-2 full-z checkbox."""
         params = {**_default_fpm_cdf(), **(params or {})}
         item.setData(0, self._FPM_CDF_ROLE, params)
         combo = QComboBox()
@@ -824,6 +848,7 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_cdf(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
 
     def _edit_fpm_cdf(self, item, btn):
         params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
@@ -952,24 +977,28 @@ class CycleEditorDialog(QDialog):
             if combo is None:
                 return None
             params = item.data(0, self._FPM_PARAMS_ROLE) or _default_fpm_params()
-            return {"type": "fpm", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
         if kind == "fpm_bf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
-            return {"type": "fpm_bf", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm_bf", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
         if kind == "fpm_cdf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
-            return {"type": "fpm_cdf", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm_cdf", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
         combo = self.tree.itemWidget(item, 0)
         spin = self.tree.itemWidget(item, 1)
         if combo is None:
             return None
-        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value()}
+        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value(),
+                "acquire_z_stack": self._read_zstack_checkbox(item)}
 
     def _read_tree(self):
         """Return a list of dicts describing top-level items (steps/waits/groups)."""
@@ -998,18 +1027,22 @@ class CycleEditorDialog(QDialog):
         elif entry["type"] == "fpm":
             item.setData(0, self._TYPE_ROLE, "fpm")
             params = {k: entry[k] for k in _default_fpm_params() if k in entry}
-            self._make_fpm_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_widgets(item, entry.get("observation_state", ""), params,
+                                   entry.get("acquire_z_stack", True))
         elif entry["type"] == "fpm_bf":
             item.setData(0, self._TYPE_ROLE, "fpm_bf")
             params = {k: entry[k] for k in _default_fpm_bf() if k in entry}
-            self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params,
+                                      entry.get("acquire_z_stack", True))
         elif entry["type"] == "fpm_cdf":
             item.setData(0, self._TYPE_ROLE, "fpm_cdf")
             params = {k: entry[k] for k in _default_fpm_cdf() if k in entry}
-            self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params,
+                                       entry.get("acquire_z_stack", True))
         else:
             item.setData(0, self._TYPE_ROLE, "step")
-            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1))
+            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1),
+                                    entry.get("acquire_z_stack", True))
 
     def _load_model(self, name, repeat, model):
         self.tree.clear()
@@ -1052,6 +1085,7 @@ class CycleEditorDialog(QDialog):
                 "observation_state": item.observation_state,
                 "n_leds": item.n_leds,
                 "seed": item.seed,
+                "acquire_z_stack": item.acquire_z_stack,
             }
         if isinstance(item, CycleFPMClusteredDarkfield):
             return {
@@ -1060,6 +1094,7 @@ class CycleEditorDialog(QDialog):
                 "outer_na": item.outer_na,
                 "inner_na": item.inner_na,
                 "min_overlap": item.min_overlap,
+                "acquire_z_stack": item.acquire_z_stack,
             }
         if isinstance(item, CycleFPMDarkfield):
             return {
@@ -1070,8 +1105,14 @@ class CycleEditorDialog(QDialog):
                 "min_overlap": item.min_overlap,
                 "leds_per_pattern": item.leds_per_pattern,
                 "seed": item.seed,
+                "acquire_z_stack": item.acquire_z_stack,
             }
-        return {"type": "step", "observation_state": item.observation_state, "n_frames": item.n_frames}
+        return {
+            "type": "step",
+            "observation_state": item.observation_state,
+            "n_frames": item.n_frames,
+            "acquire_z_stack": item.acquire_z_stack,
+        }
 
     def _load_cycle(self, name):
         from control.models.acquisition_cycle import CycleGroup
@@ -1126,6 +1167,7 @@ class CycleEditorDialog(QDialog):
                 observation_state=entry["observation_state"],
                 n_leds=entry.get("n_leds", 0),
                 seed=entry.get("seed", 0),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
             )
         if entry["type"] == "fpm_cdf":
             if not entry.get("observation_state"):
@@ -1135,6 +1177,7 @@ class CycleEditorDialog(QDialog):
                 outer_na=entry.get("outer_na", 0.8),
                 inner_na=entry.get("inner_na"),
                 min_overlap=entry.get("min_overlap", 0.6),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
             )
         if entry["type"] == "fpm":
             if not entry.get("observation_state"):
@@ -1146,9 +1189,14 @@ class CycleEditorDialog(QDialog):
                 min_overlap=entry.get("min_overlap", 0.6),
                 leds_per_pattern=entry.get("leds_per_pattern", 0),
                 seed=entry.get("seed", 0),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
             )
         if entry.get("observation_state"):
-            return CycleStep(observation_state=entry["observation_state"], n_frames=entry["n_frames"])
+            return CycleStep(
+                observation_state=entry["observation_state"],
+                n_frames=entry["n_frames"],
+                acquire_z_stack=entry.get("acquire_z_stack", True),
+            )
         return None
 
     def _save_cycle(self):

@@ -178,8 +178,12 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
             return None
         return {
             "dense": plan.dense,
+            # frame_counts and array_keys are keyed by (state, z-mode): a
+            # reference-z-only capture appears under "{state}_refz" (its own
+            # single-z array), so the full per-array structure is reconstructable.
             "frame_counts": dict(plan.frame_counts),
             "channel_order": list(plan.channel_order),
+            "array_keys": list(plan.array_keys),
             "events": [
                 {
                     "observation_state": ev.observation_state,
@@ -188,6 +192,8 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
                     "wait_ms": ev.wait_ms,
                     "state_frame_index": ev.state_frame_index,
                     "cycle_event_index": ev.cycle_event_index,
+                    # False => captured only at the reference/focus plane (single z).
+                    "acquire_z_stack": ev.acquire_z_stack,
                     # Source-coded FPM: the exact LED indices lit for this frame,
                     # so the reconstruction can recover each multiplexed pattern.
                     "multiplexed_leds": list(ev.multiplexed_leds) if ev.multiplexed_leds else None,

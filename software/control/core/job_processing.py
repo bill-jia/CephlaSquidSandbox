@@ -108,6 +108,10 @@ class CaptureInfo:
     save_c_index: Optional[int] = None
     save_t_size: Optional[int] = None
     save_c_size: Optional[int] = None
+    # Per-array Z extent. None => the global ``zarr_writer_info.z_size`` (full
+    # stack). Set to 1 for a reference-z-only capture so its array is single-z;
+    # lets a ragged run mix full-z and reference-only states with different Z.
+    save_z_size: Optional[int] = None
     cycle_event_index: Optional[int] = None
     state_frame_index: Optional[int] = None
     frame_suffix: Optional[str] = None
@@ -729,7 +733,7 @@ class SaveZarrJob(Job):
 
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
-        ak, t, c, t_size, c_size = self._effective_save_coords(info)
+        ak, t, c, t_size, c_size, z_size = self._effective_save_coords(info)
         output_path = self.zarr_writer_info.get_output_path(region_id, fov, ak)
 
         region_names = list(self.zarr_writer_info.region_fov_counts.keys())
@@ -742,10 +746,11 @@ class SaveZarrJob(Job):
         )
 
         # Always 5D: (T, C, Z, Y, X) per FOV (dense) or per (FOV, channel) (ragged).
+        # Z is per-array (1 for a reference-z-only state, NZ for full-z).
         shape = (
             t_size,
             c_size,
-            self.zarr_writer_info.z_size,
+            z_size,
             image.shape[0],
             image.shape[1],
         )
@@ -774,11 +779,12 @@ class SaveZarrJob(Job):
         return result
 
     def _effective_save_coords(self, info: CaptureInfo):
-        """Resolve (array_key, t, c, t_size, c_size) for a frame.
+        """Resolve (array_key, t, c, t_size, c_size, z_size) for a frame.
 
         Uses the self-describing ``save_*`` fields when present (cycle layout),
         else falls back to today's global ``(time_point, configuration_idx)`` and
-        the uniform ``zarr_writer_info`` dims.
+        the uniform ``zarr_writer_info`` dims. ``z_size`` is per-array so a
+        reference-z-only state can be single-z alongside full-z states.
         """
         zwi = self.zarr_writer_info
         ak = info.array_key
@@ -786,7 +792,8 @@ class SaveZarrJob(Job):
         c = info.save_c_index if info.save_c_index is not None else info.configuration_idx
         t_size = info.save_t_size if info.save_t_size is not None else zwi.t_size
         c_size = info.save_c_size if info.save_c_size is not None else zwi.c_size
-        return ak, t, c, t_size, c_size
+        z_size = info.save_z_size if info.save_z_size is not None else zwi.z_size
+        return ak, t, c, t_size, c_size, z_size
 
     def _save_zarr(self, image: np.ndarray, info: CaptureInfo, output_path: str) -> None:
         """Write one plane to the per-FOV zarr (level 0 + pyramid via ZarrWriter)."""
@@ -795,15 +802,15 @@ class SaveZarrJob(Job):
 
         region_id = str(info.region_id) if info.region_id is not None else "0"
         fov = info.fov if info.fov is not None else 0
-        ak, t, c, t_size, c_size = self._effective_save_coords(info)
-        writer_key = output_path  # One writer per (FOV[, channel] for ragged)
+        ak, t, c, t_size, c_size, z_size = self._effective_save_coords(info)
+        writer_key = output_path  # One writer per (FOV[, channel/z-mode] for ragged)
 
         zwi = self.zarr_writer_info
         if writer_key not in self._zarr_writers:
             shape = (
                 t_size,
                 c_size,
-                zwi.z_size,
+                z_size,
                 image.shape[0],
                 image.shape[1],
             )

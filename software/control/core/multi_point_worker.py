@@ -1169,23 +1169,28 @@ class MultiPointWorker:
     def _build_save_layout(self, region_plan, event):
         """Build the self-describing SaveLayout for one imaged event at the
         current timepoint, using the dense/ragged layout from the region plan."""
-        from control.models.acquisition_cycle import frame_coord, SaveLayout
+        from control.models.acquisition_cycle import frame_coord, SaveLayout, array_key_for
 
         coord = frame_coord(region_plan, self.Nt, self.time_point, event)
         if coord.array_key is None:
             # Dense: one array, all imaged channels.
             names = list(region_plan.channel_order)
         else:
-            # Ragged: a single-channel per-state array.
+            # Ragged: a single-channel per-(state, z-mode) array.
             names = [event.observation_state]
         colors, wavelengths = [], []
         for n in names:
             c, w = self._channel_display_meta(n)
             colors.append(c)
             wavelengths.append(w)
-        # Only disambiguate filenames when this state repeats within a position.
-        repeats = region_plan.frame_counts.get(event.observation_state, 1) > 1
+        # Only disambiguate filenames when this (state, z-mode) repeats within a
+        # position; key by the array group so a ref-z step is counted correctly.
+        group_key = array_key_for(event.observation_state, event.acquire_z_stack)
+        repeats = region_plan.frame_counts.get(group_key, 1) > 1
         frame_suffix = f"f{event.state_frame_index:0{FILE_ID_PADDING}}" if repeats else None
+        # Z extent of this frame's array: full stack for a normal step, 1 for a
+        # reference-z-only capture (whose single frame is written at z=0).
+        z_size = self.NZ if event.acquire_z_stack else 1
         return SaveLayout(
             array_key=coord.array_key,
             t_index=coord.t_index,
@@ -1198,6 +1203,7 @@ class MultiPointWorker:
             channel_colors=colors,
             channel_wavelengths=wavelengths,
             frame_suffix=frame_suffix,
+            z_size=z_size,
         )
 
     def _seed_camera_for_first_observation_state(self) -> None:
@@ -2897,7 +2903,9 @@ class MultiPointWorker:
                         # Dense -> one array per FOV (array_key=None); ragged ->
                         # one single-channel plate per imaged state, so flush each.
                         region_plan = self._get_region_plan(region_id)
-                        array_keys = [None] if region_plan.dense else list(region_plan.channel_order)
+                        # Ragged plate keys carry the _refz suffix, so use array_keys
+                        # (not channel_order, which is bare state names for the C axis).
+                        array_keys = [None] if region_plan.dense else list(region_plan.array_keys)
                         for array_key in array_keys:
                             output_path = self._zarr_writer_info.get_output_path(
                                 str(region_id), fov, array_key
@@ -2933,6 +2941,11 @@ class MultiPointWorker:
         if self.use_piezo:
             self.z_piezo_um = self.piezo.position
 
+        # Z-plane index of the focus/reference plane (where reference-z-only steps
+        # capture their single frame): the first acquired plane for From Bottom/Top,
+        # the middle plane for From Center. See _reference_z_level.
+        ref_z_level = self._reference_z_level()
+
         for z_level in range(self.NZ):
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 
@@ -2954,6 +2967,11 @@ class MultiPointWorker:
                         # tick. Sleep in short slices so an abort interrupts it.
                         with self._timing.get_timer("cycle_wait"):
                             self._interruptible_sleep(event.wait_ms / 1000.0)
+                        continue
+                    # Reference-z-only step/sweep: capture a single frame at the
+                    # focus/reference plane and skip it at every other z-level.
+                    # Stimulus events are unaffected (they fire at every z as before).
+                    if (not event.acquire_z_stack) and (not event.is_stimulus) and (z_level != ref_z_level):
                         continue
                     preset_name = event.observation_state
                     try:
@@ -3001,13 +3019,16 @@ class MultiPointWorker:
                         continue  # no frame, no progress tick
 
                     save_layout = self._build_save_layout(region_plan, event)
+                    # A reference-z-only frame lives at z=0 of its Z=1 array; a
+                    # normal frame at its stack level.
+                    eff_z_index = z_level if event.acquire_z_stack else 0
                     with self._timing.get_timer("acquire_camera_image"):
                         with self._timing.get_timer("acquire_camera_image_inner"):
                             self.acquire_camera_image(
                                 config,
                                 file_ID,
                                 current_path,
-                                z_level,
+                                eff_z_index,
                                 region_id=region_id,
                                 fov=fov,
                                 config_idx=save_layout.c_index,
@@ -3594,6 +3615,20 @@ class MultiPointWorker:
         except Exception as e:
             self._log.warning(f"Failed to append autofocus_log.csv: {e}")
 
+    def _reference_z_level(self) -> int:
+        """Z-plane index of the focus/reference plane within the stack.
+
+        This is where a reference-z-only step/sweep captures its single frame.
+        It matches the plane autofocus lands on (see _autofocus_and_record /
+        prepare_z_stack): the first acquired plane (z_level 0) for From Bottom and
+        From Top, and the middle plane for From Center. Clamped to [0, NZ-1].
+        """
+        if self.NZ <= 1:
+            return 0
+        if self.z_stacking_config == "FROM CENTER":
+            return max(0, min(self.NZ - 1, int(round((self.NZ - 1) / 2))))
+        return 0
+
     def prepare_z_stack(self):
         # Position the stage at the START slice of the stack, relative to the
         # focal plane established by _autofocus_and_record (which already ran).
@@ -3857,6 +3892,7 @@ class MultiPointWorker:
                 save_c_index=(save_layout.c_index if save_layout else None),
                 save_t_size=(save_layout.t_size if save_layout else None),
                 save_c_size=(save_layout.c_size if save_layout else None),
+                save_z_size=(save_layout.z_size if save_layout else None),
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
                 state_frame_index=(save_layout.state_frame_index if save_layout else None),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
