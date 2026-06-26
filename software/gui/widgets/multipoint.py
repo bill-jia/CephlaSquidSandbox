@@ -2738,6 +2738,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
         grid_af.addWidget(self.checkbox_set_z_range)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        z_stack_mode_row = QHBoxLayout()
+        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
+        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
+        grid_af.addLayout(z_stack_mode_row)
         grid_af.addWidget(self.checkbox_skipSaving)
         grid_af.addLayout(self.fileSavingFormatRow)
         grid_af.addLayout(self.zarrStreamingRow)
@@ -2821,6 +2827,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.entry_NY.valueChanged.connect(self.multipointController.set_NY)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
         self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
+        self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
@@ -2842,7 +2849,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.list_configurations.itemChanged.connect(self._on_channel_list_changed)
-        # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
@@ -3279,6 +3285,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Set acquisition parameters
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
@@ -4675,6 +4682,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        z_stack_mode_row = QHBoxLayout()
+        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
+        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
+        options_layout.addLayout(z_stack_mode_row)
         options_layout.addWidget(self.checkbox_skipSaving)
         options_layout.addLayout(self.fileSavingFormatRow)
         options_layout.addLayout(self.zarrStreamingRow)
@@ -4746,6 +4759,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
+        self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.entry_dt.valueChanged.connect(self.multipointController.set_deltat)
         self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
         self.entry_overlap.valueChanged.connect(self.update_coordinates)
@@ -5974,6 +5988,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())

@@ -2920,6 +2920,13 @@ class MultiPointWorker:
                     return
 
     def acquire_at_position(self, region_id, current_path, fov):
+        # Autofocus once at the FOV's nominal plane to establish the focal
+        # (reference) plane BEFORE the z-stack is positioned around it. The
+        # stacking mode then decides whether that plane becomes the bottom,
+        # center, or top slice (see prepare_z_stack). Also records the AF event
+        # (target vs. corrected Z) to autofocus_log.csv.
+        self._autofocus_and_record(region_id, fov, current_path)
+
         if self.NZ > 1:
             self.prepare_z_stack()
 
@@ -2932,12 +2939,6 @@ class MultiPointWorker:
             acquire_pos = self.stage.get_pos()
             metadata = {"x": acquire_pos.x_mm, "y": acquire_pos.y_mm, "z": acquire_pos.z_mm}
             self._log.debug(f"Acquiring image: ID={file_ID}, Metadata={metadata}")
-
-            # TBD: figure out what this means and how it relates to autofocus
-            if z_level == 0 and (self.do_reflection_af or self.do_autofocus) and self.Nt > 1:
-                self._z_pos_proposal[(region_id, fov)] = acquire_pos.z_mm
-
-
 
             # Iterate the resolved per-position plan (cycles). A flat selection is
             # just a 1-frame-per-state plan, so this single path serves both. The
@@ -2989,23 +2990,8 @@ class MultiPointWorker:
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 
-                    # Run AF once per position, on the first IMAGED frame of the
-                    # first z-plane. Keying on the first imaged event (not the
-                    # first plan event) keeps AF firing even when a cycle leads
-                    # with a stimulus-only step — the same per-active guard the
-                    # old config_idx-vs-active_step fix preserved.
-                    if z_level == 0 and imaged_step == 0 and not event.is_stimulus:
-                        with self._timing.get_timer("perform_autofocus"):
-                            if not self.perform_autofocus(region_id, fov):
-                                self._log.error(
-                                    f"Autofocus failed at region={region_id} fov={fov}.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
-                                )
-
-                        # laser af characterization mode
-                        if self.laser_auto_focus_controller and self.laser_auto_focus_controller.characterization_mode:
-                            image = self.laser_auto_focus_controller.get_image()
-                            saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
-                            iio.imwrite(saving_path, image)
+                    # (Autofocus now runs once per FOV in _autofocus_and_record,
+                    # before the z-stack is positioned — see acquire_at_position.)
 
                     if event.is_stimulus or config.is_stimulus_only:
                         with self._timing.get_timer("run_nidaq_stimulus"):
@@ -3196,10 +3182,12 @@ class MultiPointWorker:
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
         if not self.do_reflection_af:
-            # contrast-based AF; perform AF only if when not taking z stack or doing z stack from center
+            # Contrast-based AF. Runs for any z-stacking mode: AF establishes the
+            # focal/reference plane and acquire_at_position/prepare_z_stack then
+            # position the stack around it (bottom/center/top). Cadence-gated by
+            # NUMBER_OF_FOVS_PER_AF.
             if (
-                ((self.NZ == 1) or self.z_stacking_config == "FROM CENTER")
-                and (self.do_autofocus)
+                (self.do_autofocus)
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
@@ -3510,8 +3498,109 @@ class MultiPointWorker:
         # No prior anchor and no table entry — can't set Z. Match legacy failure path.
         return False
 
+    # Columns for the per-acquisition autofocus log sidecar. position_index is
+    # the FOV/position index; (x, y) disambiguate across regions. z_expected is
+    # the pre-AF target Z; z_actual is the Z after correction (or after a failed
+    # AF). af_status is "ok" or "failed".
+    _AUTOFOCUS_LOG_HEADER = [
+        "position_index",
+        "t_index",
+        "x",
+        "y",
+        "z_expected",
+        "z_actual",
+        "af_status",
+    ]
+
+    def _autofocus_and_record(self, region_id, fov, current_path):
+        """Run autofocus once at the FOV's nominal plane and log the result.
+
+        This establishes the focal/reference plane that the z-stack is built
+        around (see :meth:`prepare_z_stack`). For laser AF the per-region
+        reference captured by the "Update Ref" button is what defines that plane
+        (the worker already loads it inside :meth:`perform_autofocus`), so the
+        secondary AF offset is honored automatically. No-op when no AF is enabled.
+
+        Records the pre-AF (expected/target) and post-AF (after-correction, or
+        after-failure) absolute Z to ``autofocus_log.csv``.
+        """
+        if not (self.do_reflection_af or self.do_autofocus):
+            return
+
+        pos_before = self.stage.get_pos()
+        z_expected_mm = pos_before.z_mm
+
+        # Cache the pre-AF Z for cross-timepoint tracking exactly as before; the
+        # laser-AF focus-map path may overwrite it with a table estimate inside
+        # perform_autofocus.
+        if self.Nt > 1:
+            self._z_pos_proposal[(region_id, fov)] = z_expected_mm
+
+        with self._timing.get_timer("perform_autofocus"):
+            af_ok = self.perform_autofocus(region_id, fov)
+        if not af_ok:
+            self._log.error(
+                f"Autofocus failed at region={region_id} fov={fov}. Continuing to acquire "
+                f"anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+            )
+
+        # Laser-AF characterization debug image (unchanged behavior).
+        if self.laser_auto_focus_controller and getattr(
+            self.laser_auto_focus_controller, "characterization_mode", False
+        ):
+            try:
+                image = self.laser_auto_focus_controller.get_image()
+                file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{0:0{FILE_ID_PADDING}}"
+                iio.imwrite(os.path.join(current_path, file_ID + "_laser af camera" + ".bmp"), image)
+            except Exception as e:
+                self._log.warning(f"Failed to save laser-AF characterization image: {e}")
+
+        pos_after = self.stage.get_pos()
+        self._record_autofocus_event(
+            position_index=fov,
+            x_mm=pos_after.x_mm,
+            y_mm=pos_after.y_mm,
+            z_expected_mm=z_expected_mm,
+            z_actual_mm=pos_after.z_mm,
+            ok=bool(af_ok),
+        )
+
+    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, ok):
+        """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
+
+        Best-effort: a logging failure must never interrupt the acquisition.
+        """
+        if not self.experiment_path:
+            return
+        path = os.path.join(self.experiment_path, "autofocus_log.csv")
+        try:
+            file_exists = os.path.exists(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(self._AUTOFOCUS_LOG_HEADER)
+                writer.writerow(
+                    [
+                        position_index,
+                        self.time_point,
+                        f"{x_mm:.6f}",
+                        f"{y_mm:.6f}",
+                        f"{z_expected_mm:.6f}",
+                        f"{z_actual_mm:.6f}",
+                        "ok" if ok else "failed",
+                    ]
+                )
+        except Exception as e:
+            self._log.warning(f"Failed to append autofocus_log.csv: {e}")
+
     def prepare_z_stack(self):
-        # move to bottom of the z stack
+        # Position the stage at the START slice of the stack, relative to the
+        # focal plane established by _autofocus_and_record (which already ran).
+        # FROM CENTER: step down half the stack so the AF plane is the center.
+        # FROM BOTTOM/TOP: the AF plane is already the bottom/top slice (deltaZ's
+        # sign, set in initialize_z_stack, carries the sweep direction), so no
+        # extra offset is needed here.
         if self.z_stacking_config == "FROM CENTER":
             self.stage.move_z(-self.deltaZ * round((self.NZ - 1) / 2.0))
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)

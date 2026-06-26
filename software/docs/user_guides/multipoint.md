@@ -251,14 +251,27 @@ Two things keep the overlap correct across a mixed‑ROI acquisition:
 
 ### Step 6 — (Optional) Z‑stack
 
-Check the **Z** mode box to acquire a focal stack, then choose a Z mode:
+Check the **Z** mode box to acquire a focal stack. Set **dz** (step size, µm) and
+**Nz** (number of planes), and pick where the stack sits relative to the focal plane
+with the **Z‑stack from** dropdown:
 
-- **From Bottom** — you set **dz** (step size, µm) and **Nz** (number of planes); the
-  stack is built upward from the current focus.
-- **Set Range** — you define **Z‑min** and **Z‑max** explicitly. Use the **Set Z‑min** /
-  **Set Z‑max** buttons to capture the current stage Z, and **Go To** to move there.
-  In this mode **Nz** is computed automatically from the range and dz. (Laser AF is
-  disabled while Set Range is active.)
+- **From Bottom (Z‑min)** — the focal plane is the first (bottom) slice; the stack is
+  built upward (`+dz` per plane).
+- **From Center** — the focal plane is the middle slice; the stack extends
+  `±(Nz‑1)/2 · dz` around it.
+- **From Top (Z‑max)** — the focal plane is the last (top) slice; the stack is built
+  downward.
+
+**Interaction with autofocus:** whatever focal plane autofocus lands on (see Step 8)
+is the reference the dropdown is measured from — AF runs once per position *before* the
+stack is positioned, so the slices are always drawn relative to the freshly focused
+plane (for laser AF this includes the per‑region reference captured with **Update Ref**).
+This works with Contrast AF and Laser AF in all three modes.
+
+- **Set Range** — alternatively define **Z‑min** and **Z‑max** explicitly. Use the
+  **Set Z‑min** / **Set Z‑max** buttons to capture the current stage Z, and **Go To** to
+  move there. In this mode **Nz** is computed automatically from the range and dz.
+  (Laser AF is disabled while Set Range is active.)
 
 If your rig has an objective piezo, the **Piezo Z‑Stack** checkbox uses it to drive the
 stack instead of the stage Z motor.
@@ -281,6 +294,12 @@ Three independent focus aids are available (combine as needed):
 - **Use Focus Map** — fits a focus surface from a set of measured points (configured in
   the **Focus Map** tab) and follows it during the scan. When checked, the surface is
   fitted at Start; if the fit fails the acquisition will not begin.
+
+**Autofocus log.** Whenever autofocus is enabled, every position at which it runs is
+recorded to `autofocus_log.csv` at the dataset root, with columns
+`position_index, t_index, x, y, z_expected, z_actual, af_status`. `z_expected` is the
+target Z before AF; `z_actual` is the Z after correction (or, on `af_status=failed`, the
+Z the acquisition fell back to). Use it to audit focus drift and AF reliability over a run.
 
 ### Step 9 — Saving and output options
 
