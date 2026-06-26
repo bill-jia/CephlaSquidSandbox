@@ -186,3 +186,9 @@ class MultiPointControllerFunctions:
     # views to flush per-timepoint state so peak RAM tracks a single timepoint
     # rather than accumulating across the run.
     signal_new_time_point: Callable[[int], None] = lambda *a, **kw: None
+    # Fires once the background job-runner shutdown has finished, i.e. every zarr
+    # writer has been finalized and all data is durably on disk. This lands AFTER
+    # signal_acquisition_finished (which only signals that capture ended); it is
+    # the point at which it is safe to move/copy the dataset. Used by the GUI to
+    # keep the progress bar up as "Finalizing..." until writeback truly completes.
+    signal_data_writing_complete: Callable[[], None] = lambda *a, **kw: None

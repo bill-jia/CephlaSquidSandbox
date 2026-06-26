@@ -829,6 +829,7 @@ class SaveZarrJob(Job):
                 compression=_def.ZARR_COMPRESSION,
                 translation_um=translation_um,
                 manifest_path=manifest_path,
+                shard_per_z=_def.ZARR_SHARD_PER_Z,
             )
             try:
                 writer = ZarrWriter(config)
@@ -1496,8 +1497,20 @@ class JobRunner(multiprocessing.Process):
             # ValueError: Queue has been closed
             self._log.debug(f"Could not send shutdown sentinel to worker: {e}")
         self.join(timeout=timeout_s)
-        # If process is still alive after timeout, terminate it
+        # If process is still alive after timeout, terminate it. This is a
+        # last-resort kill: the subprocess runs finalize_all_writers() on its
+        # way out, so terminating here can interrupt an in-flight TensorStore
+        # shard commit and leave a half-written shard (last z-slices missing at
+        # level 0) plus a stray ``*.__lock`` file. Callers must pass a timeout
+        # generous enough for finalize to complete (see
+        # JOB_RUNNER_FINALIZE_TIMEOUT_S); reaching this branch means finalize
+        # genuinely wedged.
         if self.is_alive():
+            self._log.error(
+                f"JobRunner subprocess (PID={self.pid}) did not exit within {timeout_s} [s] of shutdown; "
+                f"terminating. Zarr finalization may be incomplete — the most recent FOV(s) may be missing "
+                f"their last z-slices at pyramid level 0."
+            )
             self.terminate()
             self.join(timeout=1.0)
         # Clean up multiprocessing primitives to avoid semaphore leaks

@@ -1185,9 +1185,20 @@ USE_TEMPLATE_MULTIPOINT = False
 FILE_SAVING_OPTION = FileSavingOption.INDIVIDUAL_IMAGES
 
 # Zarr v3 saving configuration.
-# Chunks are always plane-level (1, 1, 1, Y, X); shards are always (1, C, Z, Y, X) per FOV-timepoint.
+# Chunks are always plane-level (1, 1, 1, Y, X).
 # BALANCED (blosc-zstd clevel 3 + bitshuffle) typically yields ~3-5x on fluorescence 16-bit at ~500 MB/s encode.
 ZARR_COMPRESSION = ZarrCompression.BALANCED
+
+# Shard (on-disk file) granularity for zarr saving.
+#   True  -> one shard per z-slice (1, C, 1, Y, X): the writer commits each
+#            z-slice once all its channels arrive, synchronously with the
+#            z-outer/channel-inner acquisition loop. No per-frame read-modify-
+#            write of a giant shard => ~30x faster writeback on deep stacks.
+#   False -> legacy one shard per FOV-timepoint (1, C, Z, Y, X), committed in
+#            one burst (fewest files, but must buffer the whole FOV).
+# Reads are identical either way (the inner chunk is one plane). Flip to False
+# for an instant rollback to the legacy layout.
+ZARR_SHARD_PER_Z = True
 
 ##########################################################
 #### start of loading machine specific configurations ####

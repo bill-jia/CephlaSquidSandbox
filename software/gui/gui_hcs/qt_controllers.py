@@ -184,6 +184,9 @@ class QtAutoFocusController(AutoFocusController, QObject):
 
 class QtMultiPointController(MultiPointController, QObject):
     acquisition_finished = Signal()
+    # Fires after acquisition_finished, once background writeback/finalize is done
+    # (all zarr writers flushed and on disk; safe to move/copy the dataset).
+    data_writing_complete = Signal()
     signal_acquisition_start = Signal()
     image_to_display = Signal(np.ndarray)
     image_to_display_multi = Signal(np.ndarray, int)
@@ -251,6 +254,7 @@ class QtMultiPointController(MultiPointController, QObject):
                 signal_slack_acquisition_finished=self._signal_slack_acquisition_finished_fn,
                 signal_zarr_frame_written=self._signal_zarr_frame_written_fn,
                 signal_new_time_point=self._signal_new_time_point_fn,
+                signal_data_writing_complete=self._signal_data_writing_complete_fn,
             ),
             scan_coordinates=scan_coordinates,
             laser_autofocus_controller=laser_autofocus_controller,
@@ -361,6 +365,11 @@ class QtMultiPointController(MultiPointController, QObject):
         self.acquisition_finished.emit()
         finish_pos = self.stage.get_pos()
         self.signal_register_current_fov.emit(finish_pos.x_mm, finish_pos.y_mm)
+
+    def _signal_data_writing_complete_fn(self):
+        # Called from the worker's background writeback-coordinator thread. Emit
+        # a Qt signal so the GUI-thread handler runs via a queued connection.
+        self.data_writing_complete.emit()
 
     def _signal_new_image_fn(self, frame: squid.abc.CameraFrame, info: CaptureInfo):
         # Hot path — called on the acquisition worker thread.

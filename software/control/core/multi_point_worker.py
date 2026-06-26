@@ -84,6 +84,17 @@ from squid.config import CameraPixelFormat
 # Module-level logger for static methods
 _log = squid.logging.get_logger(__name__)
 
+# Time budget for the JobRunner subprocess to flush + finalize all zarr writers
+# during shutdown. The final commit of a per-FOV shard (one timepoint =
+# (1, C, Z, Y, X), routinely ~1 GB for a deep z-stack) is a single TensorStore
+# read-modify-write that can take tens of seconds. Terminating the subprocess
+# before that commit lands leaves the previous partial shard on disk (only the
+# last-written z-slices missing, and only at pyramid level 0) plus a stray
+# ``*.__lock`` file. This shutdown runs in a background daemon thread, so a
+# generous timeout does not block the UI or the start of the next acquisition;
+# terminate() only fires if finalize genuinely wedges past this deadline.
+JOB_RUNNER_FINALIZE_TIMEOUT_S = 600
+
 
 class SummarizeResult(NamedTuple):
     """Result from processing job output queues."""
@@ -1668,9 +1679,6 @@ class MultiPointWorker:
         def timed_out():
             return time.time() > timeout_time
 
-        def time_left():
-            return max(timeout_time - time.time(), 0)
-
         # Wait for all pending jobs across all runners (round-robin to avoid blocking on one)
         while not timed_out():
             any_pending = False
@@ -1684,23 +1692,35 @@ class MultiPointWorker:
             self._summarize_runner_outputs(drain_all=True)
             time.sleep(0.1)
         else:
-            # Timed out - kill any runners that still have pending jobs
+            # Drain budget exhausted, but DO NOT kill the subprocess here. A
+            # still-pending job may be a FlushAndStageUploadJob whose
+            # ``wait_for_pending()`` is midway through committing a large shard,
+            # or a SaveZarrJob whose level-0 write has not yet been flushed.
+            # Killing the process would corrupt that FOV (the previous partial
+            # shard would be left in place). The graceful shutdown below sends
+            # the stop sentinel, which the run loop only honors *between* jobs,
+            # so the in-flight job finishes and every writer is finalized before
+            # the subprocess exits.
             for job_class, job_runner in active_runners:
                 if job_runner.has_pending():
-                    self._log.error(
-                        f"Timed out after {timeout_s} [s] waiting for jobs to finish. Pending jobs for {job_class.__name__} abandoned!!!"
+                    self._log.warning(
+                        f"Jobs still pending for {job_class.__name__} after {timeout_s} [s]; "
+                        f"they will finish and finalize during shutdown "
+                        f"(up to {JOB_RUNNER_FINALIZE_TIMEOUT_S} [s])."
                     )
-                    job_runner.kill()
 
         # Drain results before shutdown
         self._summarize_runner_outputs(drain_all=True)
 
         # Shut down all job runners in parallel (in background to avoid blocking on subprocess termination).
         # Using daemon threads is safe here because:
-        # 1. All jobs are complete and results are already drained
-        # 2. The subprocess termination is best-effort cleanup only
+        # 1. The subprocess drains any remaining queued jobs and runs
+        #    finalize_all_writers() (the data-durability flush) before exiting;
+        #    shutdown() waits JOB_RUNNER_FINALIZE_TIMEOUT_S for that to finish.
+        # 2. Beyond that flush, subprocess termination is best-effort cleanup only
         # 3. If app exits before threads complete, OS will terminate subprocesses anyway
-        # 4. This prevents slow subprocess termination from blocking acquisition completion
+        # 4. Running in the background prevents the (possibly slow) flush + termination
+        #    from blocking acquisition completion
         log = self._log  # Capture for closure
 
         def shutdown_runner(job_runner, timeout):
@@ -1710,10 +1730,45 @@ class MultiPointWorker:
                 log.error(f"Error shutting down job runner in background: {e}")
 
         self._log.info("Shutting down job runners (non-blocking)...")
-        remaining_time = time_left()
+        # Give the background shutdown the full finalize budget — NOT the
+        # leftover of the short drain timeout above. ``shutdown()`` sends the
+        # stop sentinel and then ``join()``s for this long before resorting to
+        # terminate(), which is exactly the window the subprocess needs to run
+        # ``finalize_all_writers()`` (the large level-0 shard commit). Because
+        # this runs in a daemon thread, the long budget does not block the
+        # controller or the next acquisition.
+        shutdown_threads = []
         for job_class, job_runner in active_runners:
-            t = threading.Thread(target=shutdown_runner, args=(job_runner, remaining_time), daemon=True)
+            t = threading.Thread(
+                target=shutdown_runner,
+                args=(job_runner, JOB_RUNNER_FINALIZE_TIMEOUT_S),
+                daemon=True,
+            )
             t.start()
+            shutdown_threads.append(t)
+
+        # Fire signal_data_writing_complete once every runner has finished
+        # finalizing (writers flushed, zarr.json marked complete, subprocess
+        # exited) — the point at which the local dataset is safe to move/copy.
+        # Runs in its own daemon thread so the controller is not blocked; the
+        # callback always fires (the joined shutdowns each have their own
+        # internal timeout+terminate) so the GUI can never get stuck in the
+        # "Finalizing..." state.
+        signal_writing_complete = self.callbacks.signal_data_writing_complete
+
+        def _announce_writeback_complete(threads):
+            for th in threads:
+                th.join()
+            try:
+                signal_writing_complete()
+            except Exception as e:
+                log.error(f"signal_data_writing_complete callback failed: {e}")
+            else:
+                log.info("Data writing complete (all zarr writers finalized).")
+
+        threading.Thread(
+            target=_announce_writeback_complete, args=(shutdown_threads,), daemon=True
+        ).start()
 
         # Final drain of all output queues (should be empty, but check anyway)
         self._summarize_runner_outputs(drain_all=True)

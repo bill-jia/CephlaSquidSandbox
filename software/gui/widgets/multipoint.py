@@ -64,6 +64,74 @@ def _reorder_list_widget(list_widget: QListWidget, ordered_names: list) -> None:
         list_widget.blockSignals(False)
 
 
+# Upper bound on how long the GUI waits for the background writeback/finalize to
+# report completion before it re-enables the Start button anyway. Sized above
+# JOB_RUNNER_FINALIZE_TIMEOUT_S (600 s) so the safety path only ever fires if the
+# completion signal genuinely never arrives — the button can never get stuck.
+_WRITEBACK_SAFETY_TIMEOUT_MS = 660_000
+
+
+class _WritebackStatusMixin:
+    """Shared "Finalizing… -> complete" UI for the post-capture writeback window.
+
+    When capture ends the dataset is still being flushed to disk by a background
+    thread (see ``signal_data_writing_complete``). This mixin keeps the Start
+    button disabled and the progress bar showing "Finalizing data…" until that
+    signal arrives — so the operator knows when it is safe to move/copy the data
+    — then re-enables and shows a completion message. A one-shot safety timer
+    re-enables regardless if the signal is somehow never delivered.
+
+    Hosts must provide ``btn_startAcquisition``, ``progress_label``,
+    ``progress_bar`` and ``eta_label`` (all three multipoint widgets do), and
+    connect ``data_writing_complete`` to :meth:`_on_data_writing_complete`.
+    """
+
+    def _begin_writeback_wait(self):
+        # The per-z writer can finalize so fast that data_writing_complete
+        # arrives before this runs; in that case it set _writeback_completed_early
+        # (only on the active widget) and there is nothing to wait for.
+        if getattr(self, "_writeback_completed_early", False):
+            self._writeback_completed_early = False
+            self.progress_label.setText("✓ Data writing complete")
+            return
+        self._awaiting_writeback = True
+        self.btn_startAcquisition.setEnabled(False)
+        self.btn_startAcquisition.setText("Finalizing…")
+        self.eta_label.setVisible(False)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_label.setText("Finalizing data… (writing to disk)")
+        # Cancellable safety fallback so the Start button is never stuck if the
+        # completion signal is somehow never delivered.
+        timer = getattr(self, "_writeback_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._on_data_writing_complete)
+            self._writeback_timer = timer
+        timer.start(_WRITEBACK_SAFETY_TIMEOUT_MS)
+
+    def _on_data_writing_complete(self):
+        # One controller signal reaches every multipoint widget; act only for the
+        # widget that is actually waiting.
+        if getattr(self, "_awaiting_writeback", False):
+            self._awaiting_writeback = False
+            timer = getattr(self, "_writeback_timer", None)
+            if timer is not None:
+                timer.stop()
+            self.btn_startAcquisition.setEnabled(True)
+            self.btn_startAcquisition.setText("Start\n Acquisition ")
+            self.progress_bar.setVisible(False)
+            self.progress_label.setText("✓ Data writing complete")
+            return
+        # Arrived before _begin_writeback_wait (fast finalize). Only the widget
+        # that ran this acquisition (still flagged current here, since the finish
+        # handler clears that flag just before calling _begin_writeback_wait)
+        # records it, so the upcoming _begin_writeback_wait skips the wait.
+        if getattr(self, "is_current_acquisition_widget", False):
+            self._writeback_completed_early = True
+
+
 class _ObservationStateListWidget(QListWidget):
     """Checkbox list with internal drag/drop and "float checked to top".
 
@@ -2220,7 +2288,7 @@ def _row_col_to_well_id(row, col):
     return f"{_index_to_row_label(row)}{col + 1}"
 
 
-class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
+class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
     signal_acquisition_channels = Signal(list)  # list channels
@@ -2772,6 +2840,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.list_configurations.itemChanged.connect(self._on_channel_list_changed)
         # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
@@ -3854,6 +3923,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
         self.is_current_acquisition_widget = False
+        # Capture is done but the dataset is still flushing to disk in the
+        # background; hold the Start button + show "Finalizing…" until the
+        # writeback-complete signal (or safety timeout) re-enables.
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled, exclude_btn_startAcquisition=True):
         self.btn_setSavingDir.setEnabled(enabled)
@@ -4061,7 +4134,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 )
 
 
-class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
+class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)
     signal_acquisition_channels = Signal(list)
@@ -4701,6 +4774,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.itemChanged.connect(self._reset_per_point_channels_map)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
@@ -6007,6 +6081,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.focusMapWidget.enable_updating_focus_points_on_signal()
         self.setEnabled_all(True)
         self.toggle_coordinate_controls(self.has_loaded_coordinates)
+        # Hold the Start button + show "Finalizing…" until the dataset finishes
+        # flushing to disk in the background (or the safety timeout elapses).
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled):
         for widget in self.findChildren(QWidget):
@@ -6550,7 +6627,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         return row, col
 
 
-class MultiPointWithFluidicsWidget(QFrame):
+class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
     """A simplified version of WellplateMultiPointWidget for use with fluidics"""
 
     signal_acquisition_started = Signal(bool)
@@ -6759,6 +6836,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
@@ -6897,6 +6975,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.btn_startAcquisition.setChecked(False)
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
+        # Hold the Start button + show "Finalizing…" until the dataset finishes
+        # flushing to disk in the background (or the safety timeout elapses).
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled):
         """Enable/disable all widget controls"""

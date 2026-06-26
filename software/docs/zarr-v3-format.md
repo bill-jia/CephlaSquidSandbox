@@ -11,14 +11,26 @@ feed downstream stitching / segmentation / tracking pipelines.
 |------|-------|
 | Array shape | `(T, C, Z, Y, X)` per FOV |
 | Inner chunk | `(1, 1, 1, Y, X)` — one image plane |
-| Outer shard | `(1, C, Z, Y, X)` — one FOV-timepoint bundle |
+| Outer shard | `(1, C, 1, Y, X)` — one z-slice (default, `ZARR_SHARD_PER_Z=True`); `(1, C, Z, Y, X)` — one FOV-timepoint bundle (legacy) |
 | Compression | blosc-zstd clevel 3 + bitshuffle (default, `BALANCED`) |
-| Pyramid | up to 5 extra levels, written inline per frame |
+| Pyramid | up to 5 extra levels, written inline per z-slice |
 | Per-frame timestamps | `frame_times` zarr array (shape `T×C×Z`, float64) |
 | Metadata | OME-NGFF `multiscales` + `omero` + `_squid.manifest_path` |
 
-File count per FOV ≈ `T × (num_pyramid_levels + 1)`: shards are written once per
-`(FOV, timepoint)` and never reopened.
+A **shard is the unit written to disk as one file**, so it must be committed in
+one pass — TensorStore cannot cheaply append a chunk to an existing shard
+(doing so rewrites the whole file). The default `(1, C, 1, Y, X)` shard matches
+the z-outer/channel-inner acquisition loop: the writer buffers a z-slice's
+channels and commits that shard once the slice is fully captured, synchronously
+with acquisition and with no per-frame read-modify-write. This is ~30× faster
+writeback on deep stacks than writing plane-by-plane into one giant per-FOV
+shard. The inner *chunk* is one plane in both layouts, so reads (scrolling z,
+switching channels) are identical. Set `ZARR_SHARD_PER_Z = False` in `_def.py`
+to fall back to the legacy one-shard-per-FOV layout.
+
+File count per FOV ≈ `T × Z × (num_pyramid_levels + 1)` (per-z, default) or
+`T × (num_pyramid_levels + 1)` (legacy). Each shard is written once and never
+reopened.
 
 ## Output layouts
 
@@ -68,7 +80,7 @@ structure below the FOV group.
 - **Shape**: `(T, C, Z, Y, X)`.
 - **Dtype**: whatever the camera produces (usually `uint16`).
 - **Inner chunk** (`chunks` inside the sharding codec): `(1, 1, 1, Y, X)` — a single image plane. Enables per-`(t, c, z)` random access.
-- **Outer shard** (the zarr-v3 chunk-grid chunk, containing the inner chunks): `(1, C, Z, Y, X)`. One shard per `(FOV, timepoint)`: the stitching pattern downstream reads one whole FOV per tile and only needs a single file open per tile. Acquisition writes each shard once and never reopens it.
+- **Outer shard** (the zarr-v3 chunk-grid chunk, containing the inner chunks): `(1, C, 1, Y, X)` by default — one z-slice (all channels) per file, committed once that slice is fully captured. Set `ZARR_SHARD_PER_Z = False` for the legacy `(1, C, Z, Y, X)` one-shard-per-`(FOV, timepoint)` layout. Either way acquisition writes each shard exactly once and never reopens it; the per-z default avoids the per-frame read-modify-write of a multi-hundred-MB shard that made plane-by-plane writeback ~30× slower.
 
 ## Compression
 
@@ -87,10 +99,10 @@ the codec choice.
 ## Multiscale pyramid (streaming)
 
 Resolution levels `/1` ... `/N` are opened at `ZarrWriter.initialize()` and
-populated inline on every `write_frame(image, t, c, z)` call via a cascade of
-`cv2.pyrDown`. Each level's shape is `((Y+1)//2, (X+1)//2)` relative to the
-previous. Generation stops when `min(Y, X) < 128` or after 5 extra levels
-(defaults on `ZarrAcquisitionConfig`).
+populated as each z-slice is committed (per-z layout) or per frame (legacy),
+via a cascade of `cv2.pyrDown` applied to every channel. Each level's shape is
+`((Y+1)//2, (X+1)//2)` relative to the previous. Generation stops when
+`min(Y, X) < 128` or after 5 extra levels (defaults on `ZarrAcquisitionConfig`).
 
 There is **no serial post-hoc pyramid pass** — `finalize()` does not read back
 or compute anything; it only flushes pending TensorStore writes and flips the

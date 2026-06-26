@@ -242,7 +242,8 @@ def upload_one_file(
     by an active acquisition writer — specifically the per-FOV ``zarr.json``
     metadata (rewritten at finalize) and ``frame_times/c/0/0/0`` (rewritten
     on every ``record_frame_time`` call). For shard files written once and
-    then never touched again (``<level>/c/<t>/0/0/0/0`` after the barrier
+    then never touched again (``<level>/c/<t>/0/<z>/0/0`` per z-slice, or
+    ``<level>/c/<t>/0/0/0/0`` in the legacy per-FOV layout, after the barrier
     drains pending TensorStore futures), ``stable_read=False`` is correct
     and avoids the extra source re-hash.
 

@@ -144,16 +144,19 @@ See [zarr-v3-format.md](zarr-v3-format.md) for full details on output structure,
 
 **Write mechanism:**
 1. On first frame for a given FOV/region, a `ZarrWriter` is lazily initialized with a `ZarrAcquisitionConfig`
-2. TensorStore creates the zarr v3 dataset with fixed per-FOV sharding (shard = `(1, C, Z, Y, X)`, chunk = `(1, 1, 1, Y, X)`) and the selected compression codec
+2. TensorStore creates the zarr v3 dataset. The inner chunk is one plane `(1, 1, 1, Y, X)`; the shard (on-disk file unit) defaults to one z-slice `(1, C, 1, Y, X)` (`ZARR_SHARD_PER_Z=True`), or the legacy whole-FOV `(1, C, Z, Y, X)` when set False
 3. All pyramid levels (`/1`..`/5`) are also opened up-front as sibling arrays, and their entries are registered in `multiscales.datasets` at this point
 4. OME-NGFF 0.5 metadata is written to `zarr.json`, including per-level `scale` and per-FOV `translation` transforms and a `_squid.manifest_path` pointer back to `acquisition.yaml`
-5. Each frame is submitted as a non-blocking TensorStore async write, and is also cascaded through `cv2.pyrDown` into every pyramid level. Futures are pipelined and drained when more than 32 are in flight
+5. In per-z mode (default) each plane is buffered until its z-slice has all channels, then the whole `(1, C, 1, Y, X)` shard (all channels + all pyramid levels for that z) is written in a single non-blocking TensorStore pass — one commit per shard, no read-modify-write. (Legacy mode writes each plane as its own chunk into the big per-FOV shard and cascades pyramids per frame.) Futures are pipelined and drained when more than 32 are in flight
 6. Per-frame timestamps are written directly into a `(T, C, Z)` float64 zarr array named `frame_times` alongside the resolution levels
 7. At acquisition end, each writer `finalize()` just flushes pending writes and flips `_squid.acquisition_complete = True` — there is no read-back or post-hoc pyramid pass
 
 **Key configuration:**
 - Compression: NONE, FAST (LZ4), BALANCED (Zstd-3, default), BEST (Zstd-9)
+- Shard granularity: `ZARR_SHARD_PER_Z` (default True = one shard per z-slice, ~30× faster writeback; False = legacy one shard per FOV)
 - Layout: HCS (wellplate) or per-FOV (flexible). Both are OME-NGFF v0.5 5D.
+
+**Writeback status in the GUI:** capture ending (`acquisition_finished`) is *not* the same as data being on disk. The per-FOV writers finalize in a background thread; the controller fires `data_writing_complete` once they finish, and the multipoint widgets keep the Start button disabled with the progress bar showing "Finalizing…" until then (with a safety timeout so it can never get stuck). Only after "✓ Data writing complete" is it safe to move/copy the dataset.
 
 ## Job Processing Subprocess
 
@@ -191,6 +194,34 @@ When the camera produces frames faster than the disk can write them, the backpre
 - **Pending bytes** vs `ACQUISITION_MAX_PENDING_MB`
 
 If either limit is exceeded, acquisition pauses until the subprocess drains enough jobs. See [acquisition-backpressure.md](development/acquisition-backpressure.md) for details.
+
+### Shutdown and finalize durability
+
+At acquisition end the worker calls `_finish_jobs()`, which drains queued job
+results and then shuts each `JobRunner` down in a **background daemon thread** so
+the controller can return and the next acquisition can start immediately.
+
+The subprocess's exit path runs `SaveZarrJob.finalize_all_writers()`, and that is
+where any **remaining shard commits are flushed**. With the default per-z layout
+this is cheap — each z-slice shard was already committed during the stream, so
+finalize only awaits the last one or two. In the legacy per-FOV layout (or with
+upload disabled and a deep stack) the single `(1, C, Z, Y, X)` shard — routinely
+~1 GB — is written here as one temp-file (`*.__lock`) + atomic rename, which can
+take tens of seconds.
+
+Two rules keep that commit from being killed mid-write (which would leave a
+partial shard whose last z-slices read back as zeros **only at level 0**, plus a
+stray `*.__lock` file and `_squid.acquisition_complete = False`):
+
+1. `_finish_jobs()` never `kill()`s the runner when its drain budget expires — a
+   still-pending job may be a flush/commit in progress. It logs a warning and
+   lets the graceful stop sentinel (honored only *between* jobs) finish the
+   in-flight job and finalize.
+2. The background shutdown is given `JOB_RUNNER_FINALIZE_TIMEOUT_S` (10 min), not
+   the leftover of the short drain budget, before `JobRunner.shutdown()` resorts
+   to `terminate()`. Because it runs in a daemon thread, this generous budget
+   does not block the UI. Reaching `terminate()` now logs an error — it means
+   finalize genuinely wedged and data may be incomplete.
 
 ## Per-Frame Metadata
 
