@@ -599,6 +599,11 @@ class MultiPointController:
             bp_pending_jobs=self._prewarmed_bp_values[0],
             bp_pending_bytes=self._prewarmed_bp_values[1],
             bp_capacity_event=self._prewarmed_bp_values[2],
+            # Without this the prewarmed runner's subprocess writes NO worker log
+            # (its finalize/teardown is invisible) — which is why a 600 s
+            # finalize wedge left nothing to debug. Mirrors the non-prewarmed
+            # construction in multi_point_worker.
+            log_file_path=squid.logging.get_current_log_file_path(),
         )
         self._prewarmed_job_runner.start()
 
@@ -1134,9 +1139,11 @@ class MultiPointController:
             )
         else:
             names = region_state_names if region_state_names is not None else self.selected_observation_state_names
-            # _index_events takes tagged raw events; a flat selection is one ("state", name)
-            # event per checked state (1 frame each) — today's flat behaviour.
-            events = _index_events([("state", n) for n in names], is_stim)
+            # _index_events takes tagged raw events; a flat selection is one
+            # ("state", (name, acquire_z_stack)) event per checked state (1 frame
+            # each). Flat selections have no per-step z-mode, so every state is a
+            # full z-stack (az=True) — the global NZ applies to all of them.
+            events = _index_events([("state", (n, True)) for n in names], is_stim)
         return RegionPlan.from_events(events)
 
     def _build_region_plans(self, scan_region_names):

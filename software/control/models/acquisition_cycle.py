@@ -255,9 +255,9 @@ FpmPatternProvider = Callable[[object], List[Tuple[str, Sequence[int]]]]
 
 
 # A raw event is a tagged tuple:
-#   ("state", preset_name)               — ordinary imaged/stimulus step
-#   ("wait", duration_ms)                — timed delay
-#   ("mux", (preset_name, leds_tuple))   — one FPM (multiplexed/clustered) frame
+#   ("state", (preset_name, acquire_z_stack))   — ordinary imaged/stimulus step
+#   ("wait", duration_ms)                        — timed delay
+#   ("mux", (preset_name, leds_tuple, acquire_z_stack)) — one FPM frame
 _RawEvent = Tuple[str, object]
 
 

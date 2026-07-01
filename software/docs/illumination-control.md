@@ -209,14 +209,50 @@ For low-level debugging or firmware development:
 | SET_WATCHDOG_TIMEOUT | 40 | Set serial watchdog timeout and enable (v1.1+) |
 | HEARTBEAT | 42 | No-op keepalive for serial watchdog (v1.1+) |
 
-## SciMicroscopy LED Matrix (unified mode)
+## LED Matrix (unified mode)
 
-When a SciMicroscopy LED array (e.g. SCI DOME) is configured as `led_matrix:
-{driver: scimicroscopy_led_array}`, the array is exposed as a single unified
-`"LED matrix"` channel whose **pattern** is selected by a *mode* (`bf_full`,
-`df`, `low_na`, `left/right/top/bottom_half`, `outer_ring`, `half_ann_{t,b,l,r}`,
-`sg` single-LED, `mux` multiplexed-LED list). Modes are defined in
-`_DEFAULT_UNIFIED_MODES` (`control/lighting.py`).
+When an LED array is configured as a unified `led_matrix` illumination device,
+it is exposed as a single unified `"LED matrix"` channel whose **pattern** is
+selected by a *mode* (`bf_full`, `df`, `low_na`, `left/right/top/bottom_half`,
+`outer_ring`, `half_ann_{t,b,l,r}`, `sg` single-LED, `mux` multiplexed-LED list).
+Modes are defined in `_DEFAULT_UNIFIED_MODES` (`control/lighting.py`).
+
+### Backends: SciMicroscopy array vs Teensy/MCU matrix
+
+The unified matrix has two backends, chosen by `devices.led_matrix.driver`:
+
+- **SciMicroscopy array** (`driver: scimicroscopy_led_array`, e.g. SCI DOME) —
+  the array firmware computes every pattern from per-LED NA geometry, so **all**
+  modes plus per-pattern NA, annulus inner/outer NA, single-LED index, and the
+  `mux` FPM list are available.
+- **Teensy/Cephla matrix** (`driver: teensy`) — the firmware only knows a fixed
+  set of hardcoded `source_code` patterns (`bf_full`, the four halves, `low_na`)
+  plus one **global RGB color**. NA / annulus / single-LED / `mux` are *not*
+  expressible (no per-LED addressing in firmware) and degrade to plain
+  brightfield. The mode selector still works for the patterns the firmware has.
+
+  **Orientation correction:** the Cephla matrix board is mounted rotated 90°
+  clockwise vs the camera, so the firmware's directional half patterns don't match
+  the on-screen direction (firmware LEFT lights the physical/camera TOP,
+  RIGHT→BOTTOM, TOP→RIGHT, BOTTOM→LEFT). `_MCU_HALF_MODE_SOURCE`
+  (`control/lighting.py`) remaps each logical half mode to the firmware
+  `source_code` that lights the physically-correct half (left→8, right→7, top→1,
+  bottom→2), applied only on the Teensy fire path so the lit half matches the
+  camera image. `bf_full`/`df`/`low_na` are rotation-invariant.
+
+**Color works on both backends.** On the SciMicroscopy array it is the
+`sc.<r>.<g>.<b>` command; on the Teensy it is multiplied into the existing
+`SET_ILLUMINATION_LED_MATRIX` RGB at fire time (`apply_led_matrix_channel_configuration(color=…)`),
+so the color picker, live re-fire, and per-`ObservationState` save/restore behave
+identically. The Teensy color is seeded from `devices.led_matrix.config.default_color`
+and further weighted by the per-machine `r_factor/g_factor/b_factor` calibration.
+
+The `mux` mode lights an explicit list of LED indices simultaneously
+(firmware `l.<i0>.<i1>…`, via `set_multiple_leds`) and is used for source-coded
+Fourier Ptychography darkfield captures — see
+[source-coded-fpm.md](source-coded-fpm.md). The per-LED NA geometry that FPM
+needs is dumped from the firmware (`pledposna`) by
+`tools/dump_sci_dome_geometry.py`. (SciMicroscopy-only.)
 
 The `mux` mode lights an explicit list of LED indices simultaneously
 (firmware `l.<i0>.<i1>…`, via `set_multiple_leds`) and is used for source-coded
@@ -249,13 +285,17 @@ per `ObservationState`:
 - **Single-LED index** — `set_led_matrix_single_led_index(idx)` → firmware
   `l.<idx>`. Recorded as `led_matrix_single_led_index`.
 
-The illumination panel shows a compact mode selector + an inline NA box (the
-active scalar mode's NA), and a **⚙ config popup** (`LEDMatrixConfigDialog`) that
-shows **every variety at once**: RGB color, per-pattern NA (BF / DF / low-NA / DPC),
+The illumination panel shows a compact mode selector and a **⚙ config popup**
+(`LEDMatrixConfigDialog`). On the **SciMicroscopy** backend the popup shows
+**every variety at once**: RGB color, per-pattern NA (BF / DF / low-NA / DPC),
 annulus inner/outer NA, single-LED index, and read-only **1.25× / 0.75×
-objective-NA** references (from the current objective's `NA` via `ObjectiveStore`).
-Changes apply live (the pattern is re-fired) and are recorded on the observation
-state, so they reload and persist across restart.
+objective-NA** references (from the current objective's `NA` via `ObjectiveStore`),
+alongside an inline NA box (the active scalar mode's NA). On the **Teensy/MCU**
+backend the popup is **color-only** (the NA/annulus/single-LED rows and the inline
+NA box are hidden, since the firmware can't express them) — the ⚙ button is still
+shown so the color picker is reachable. Changes apply live (the pattern is
+re-fired) and are recorded on the observation state, so they reload and persist
+across restart.
 
 > Top/bottom DPC half-circles and half-annuli are flipped vs the firmware's array
 > letters so the lit half matches the camera image (camera Y is inverted vs the

@@ -17,6 +17,7 @@ from control.models.acquisition_cycle import (
     CycleStep,
     CycleWait,
     RegionPlan,
+    _index_events,
     all_states_in_order,
     chain_frame_counts,
     frame_coord,
@@ -429,3 +430,22 @@ class TestZModeLayout:
         restored = AcquisitionCycle.model_validate(cyc.model_dump(mode="json"))
         assert restored.items[0].acquire_z_stack is False
         assert restored.items[1].acquire_z_stack is False
+
+
+class TestFlatSelectionRawEvents:
+    """The flat (no-cycle) path in MultiPointController._resolve_plan /
+    MultiPointWorker hand-builds raw ('state', (name, az)) events. _index_events
+    requires the (name, acquire_z_stack) tuple payload — passing a bare name
+    (the prior regression) raised 'too many values to unpack'.
+    """
+
+    def test_flat_state_tuples_resolve(self):
+        names = ["Teensy_BF_Full", "D900_mKO_Toupcam_refz", "D900_mVenus_Toupcam_refz"]
+        plan = RegionPlan.from_events(_index_events([("state", (n, True)) for n in names]))
+        assert plan.frames_per_position == len(names)
+        assert plan.array_keys == names  # az=True => full-z arrays, no _refz suffix
+
+    def test_bare_name_payload_is_rejected(self):
+        # Guards the regression: a flat selection MUST wrap names as (name, az).
+        with pytest.raises(ValueError):
+            _index_events([("state", "GFP")])

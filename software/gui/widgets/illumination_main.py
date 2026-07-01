@@ -149,8 +149,8 @@ class IlluminationWidget(QWidget):
                 mode_combo.setMinimumWidth(130)
                 name_row.addWidget(mode_combo, stretch=1)
 
-                # Compact Array-NA spinbox + a config-popup button. Only present
-                # when the array exposes the API (absent for plain MCU matrices).
+                # Compact Array-NA spinbox: only when the backend exposes array NA
+                # (SciMicroscopy). Absent for the plain Teensy/MCU matrix.
                 cur_na = None
                 if hasattr(self._controller, "get_led_matrix_array_na"):
                     try:
@@ -172,14 +172,23 @@ class IlluminationWidget(QWidget):
                         "pattern when changed while the channel is on."
                     )
                     name_row.addWidget(na_spinbox)
-                    cfg_btn = QToolButton()
-                    cfg_btn.setText("⚙")  # gear
-                    cfg_btn.setFixedWidth(24)
-                    cfg_btn.setToolTip(
-                        "LED matrix configuration: RGB color, inner/outer annulus "
-                        "NA, and objective-NA references (1.25x / 0.75x)."
+                # Config-popup button: always available for the unified matrix. The
+                # popup offers RGB color on every backend (including the Teensy/MCU
+                # matrix); NA / annulus / single-LED are added only when the
+                # SciMicroscopy array exposes them.
+                cfg_btn = QToolButton()
+                cfg_btn.setText("⚙")  # gear
+                cfg_btn.setFixedWidth(24)
+                cfg_btn.setToolTip(
+                    "LED matrix configuration: RGB color"
+                    + (
+                        ", inner/outer annulus NA, and objective-NA references "
+                        "(1.25x / 0.75x)."
+                        if cur_na is not None
+                        else "."
                     )
-                    name_row.addWidget(cfg_btn)
+                )
+                name_row.addWidget(cfg_btn)
                 label = name_cell
             else:
                 label = QLabel(label_text)
@@ -435,10 +444,13 @@ class IlluminationWidget(QWidget):
 
 
 class LEDMatrixConfigDialog(QDialog):
-    """Popup for SciMicroscopy LED matrix configuration — shows EVERY pattern
-    variety at once.
+    """Popup for unified LED matrix configuration.
 
-    - Global RGB color.
+    - Global RGB color (every backend, including the Teensy/MCU matrix).
+
+    The following apply only to the SciMicroscopy array (which computes patterns
+    from per-LED geometry) and are shown only when that backend is active:
+
     - A NA per variety: BF full, Dark field, BF low-NA each own; the four DPC
       half-circles share one NA (partners locked).
     - Inner/outer NA for the annulus family (full + half annuli, shared).
@@ -499,6 +511,10 @@ class LEDMatrixConfigDialog(QDialog):
     def _build_ui(self):
         form = QFormLayout(self)
         obj_na = self._objective_na()
+        # NA / annulus / single-LED only apply to the SciMicroscopy array (the
+        # array computes those patterns from per-LED geometry). On the Teensy/MCU
+        # backend the popup is color-only.
+        supports_na = self._get("get_led_matrix_array_na") is not None
 
         # Global RGB color (0-255). Connect AFTER setValue to avoid an init push.
         cur_rgb = self._get("get_led_matrix_color")
@@ -520,42 +536,43 @@ class LEDMatrixConfigDialog(QDialog):
         for sb in (self._r_sb, self._g_sb, self._b_sb):
             sb.valueChanged.connect(self._on_color_changed)
 
-        if obj_na is not None:
-            form.addRow(
-                "Objective NA:",
-                QLabel(f"{obj_na:.2f}    1.25x = {1.25 * obj_na:.2f}    0.75x = {0.75 * obj_na:.2f}"),
-            )
+        if supports_na:
+            if obj_na is not None:
+                form.addRow(
+                    "Objective NA:",
+                    QLabel(f"{obj_na:.2f}    1.25x = {1.25 * obj_na:.2f}    0.75x = {0.75 * obj_na:.2f}"),
+                )
 
-        # Per-variety scalar NA (each group independent; DPC half-circles share one).
-        for label, group, default in self._GROUPS:
-            cur = self._get("get_led_matrix_group_na", group)
-            sb = self._mk_na_spin(cur if cur is not None else default)
-            sb.valueChanged.connect(lambda v, g=group: self._push("set_led_matrix_group_na", g, float(v)))
-            form.addRow(f"{label} NA:", sb)
+            # Per-variety scalar NA (each group independent; DPC half-circles share one).
+            for label, group, default in self._GROUPS:
+                cur = self._get("get_led_matrix_group_na", group)
+                sb = self._mk_na_spin(cur if cur is not None else default)
+                sb.valueChanged.connect(lambda v, g=group: self._push("set_led_matrix_group_na", g, float(v)))
+                form.addRow(f"{label} NA:", sb)
 
-        # Annulus family (full annulus + half annuli) shares inner/outer NA.
-        ann = self._get("get_led_matrix_annulus_na") or (0.5, 0.95)
-        self._inner_sb = self._mk_na_spin(ann[0])
-        self._outer_sb = self._mk_na_spin(ann[1])
-        form.addRow("Annulus inner NA:", self._inner_sb)
-        form.addRow("Annulus outer NA:", self._outer_sb)
-        self._inner_sb.valueChanged.connect(self._on_annulus_changed)
-        self._outer_sb.valueChanged.connect(self._on_annulus_changed)
-        if obj_na is not None:
-            btn = QPushButton("Set annulus to 0.75x – 1.25x objective NA")
-            btn.setAutoDefault(False)
-            btn.setDefault(False)
-            btn.clicked.connect(lambda _=False, na=obj_na: self._set_annulus_to_objective(na))
-            form.addRow("", btn)
+            # Annulus family (full annulus + half annuli) shares inner/outer NA.
+            ann = self._get("get_led_matrix_annulus_na") or (0.5, 0.95)
+            self._inner_sb = self._mk_na_spin(ann[0])
+            self._outer_sb = self._mk_na_spin(ann[1])
+            form.addRow("Annulus inner NA:", self._inner_sb)
+            form.addRow("Annulus outer NA:", self._outer_sb)
+            self._inner_sb.valueChanged.connect(self._on_annulus_changed)
+            self._outer_sb.valueChanged.connect(self._on_annulus_changed)
+            if obj_na is not None:
+                btn = QPushButton("Set annulus to 0.75x – 1.25x objective NA")
+                btn.setAutoDefault(False)
+                btn.setDefault(False)
+                btn.clicked.connect(lambda _=False, na=obj_na: self._set_annulus_to_objective(na))
+                form.addRow("", btn)
 
-        # Single-LED index.
-        cur_idx = self._get("get_led_matrix_single_led_index")
-        self._sli_sb = QSpinBox()
-        self._sli_sb.setRange(0, 4095)
-        self._sli_sb.setValue(int(cur_idx) if cur_idx is not None else 0)
-        self._sli_sb.setFixedWidth(80)
-        form.addRow("Single LED index:", self._sli_sb)
-        self._sli_sb.valueChanged.connect(lambda v: self._push("set_led_matrix_single_led_index", int(v)))
+            # Single-LED index.
+            cur_idx = self._get("get_led_matrix_single_led_index")
+            self._sli_sb = QSpinBox()
+            self._sli_sb.setRange(0, 4095)
+            self._sli_sb.setValue(int(cur_idx) if cur_idx is not None else 0)
+            self._sli_sb.setFixedWidth(80)
+            form.addRow("Single LED index:", self._sli_sb)
+            self._sli_sb.valueChanged.connect(lambda v: self._push("set_led_matrix_single_led_index", int(v)))
 
         close_btn = QPushButton("Close")
         close_btn.setAutoDefault(False)

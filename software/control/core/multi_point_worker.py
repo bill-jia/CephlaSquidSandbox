@@ -745,9 +745,10 @@ class MultiPointWorker:
         if self._global_plan is None:
             # Defensive fallback (e.g. direct worker construction in tests): treat
             # the channel axis as a 1-frame-per-state chain. _index_events takes
-            # tagged raw events, so wrap each name as a ("state", name) event.
+            # tagged raw events, so wrap each name as a ("state", (name, az)) event;
+            # a flat selection is always a full z-stack (az=True).
             self._global_plan = RegionPlan.from_events(
-                _index_events([("state", n) for n in self.observation_state_names])
+                _index_events([("state", (n, True)) for n in self.observation_state_names])
             )
         self._region_plans = dict(acquisition_parameters.resolved_region_plans or {})
         # Imaged channel axis (C order) and per-channel display metadata, used for

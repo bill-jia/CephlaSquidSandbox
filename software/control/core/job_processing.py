@@ -1,8 +1,10 @@
 import abc
 import csv
+import faulthandler
 import multiprocessing
 import queue
 import os
+import sys
 import time
 import json
 from datetime import datetime, timezone
@@ -34,6 +36,16 @@ from control.core.zarr_upload import (
     UploadTask,
     local_to_remote_path,
 )
+
+
+# If the JobRunner subprocess's finalize + exit takes longer than this, a
+# faulthandler watchdog dumps every thread's stack (repeatedly) to a stacks
+# file, so a wedge in finalize/teardown is captured with an exact culprit
+# frame instead of just the parent's "did not exit within 600s" terminate.
+# Comfortably above a healthy shard-per-z finalize (seconds) and below the
+# parent's JOB_RUNNER_FINALIZE_TIMEOUT_S kill budget so several dumps land
+# before the kill.
+JOB_RUNNER_FINALIZE_WATCHDOG_S = 90
 
 
 @dataclass
@@ -1513,10 +1525,27 @@ class JobRunner(multiprocessing.Process):
         # JOB_RUNNER_FINALIZE_TIMEOUT_S); reaching this branch means finalize
         # genuinely wedged.
         if self.is_alive():
+            if getattr(_def, "ZARR_SHARD_PER_Z", False):
+                # Per-z sharding commits each z-slice during acquisition, so the
+                # wedge is almost always in finalize *teardown* AFTER the data +
+                # completion flags are already durable — not a data-loss event.
+                detail = (
+                    "With per-z sharding, image data is committed to disk during "
+                    "acquisition, so already-finalized FOVs are durable; at worst a "
+                    "single FOV still mid-finalize at this instant could miss its "
+                    "last z-slice(s). Audit the dataset before assuming any loss."
+                )
+            else:
+                detail = (
+                    "With per-FOV sharding the final level-0 commit happens during "
+                    "finalize, so the most recent FOV(s) may be missing their last "
+                    "z-slices at pyramid level 0."
+                )
             self._log.error(
-                f"JobRunner subprocess (PID={self.pid}) did not exit within {timeout_s} [s] of shutdown; "
-                f"terminating. Zarr finalization may be incomplete — the most recent FOV(s) may be missing "
-                f"their last z-slices at pyramid level 0."
+                f"JobRunner subprocess (PID={self.pid}) did not exit within {timeout_s} [s] of "
+                f"shutdown; terminating. Finalization wedged in finalize or teardown. {detail} "
+                f"A faulthandler stack dump of the wedge should be in the '*_finalize_stacks' "
+                f"file next to the worker log."
             )
             self.terminate()
             self.join(timeout=1.0)
@@ -1641,13 +1670,50 @@ class JobRunner(multiprocessing.Process):
                         if self._bp_capacity_event is not None:
                             self._bp_capacity_event.set()
 
+        # Arm a faulthandler watchdog over finalize + process teardown. If the
+        # subprocess wedges on its way out — a TensorStore context/thread that
+        # won't join, or a multiprocessing queue feeder with buffered items —
+        # this dumps EVERY thread's stack to a stacks file every
+        # JOB_RUNNER_FINALIZE_WATCHDOG_S, capturing the exact culprit frame
+        # instead of only the parent's opaque "did not exit within 600s"
+        # terminate. Best-effort; diagnostics must never break finalize. Left
+        # armed (not disarmed): a healthy exit (seconds) beats the timeout, and
+        # staying armed also covers the post-run() interpreter teardown.
+        stacks_path = None
+        try:
+            if worker_log_path:
+                _sb, _se = os.path.splitext(worker_log_path)
+                stacks_path = f"{_sb}_finalize_stacks{_se}"
+            else:
+                stacks_path = os.path.join(
+                    squid.logging.get_default_log_directory(), "jobrunner_finalize_stacks.log"
+                )
+            os.makedirs(os.path.dirname(stacks_path) or ".", exist_ok=True)
+            self._finalize_stacks_file = open(stacks_path, "a", buffering=1)
+            self._finalize_stacks_file.write(
+                f"\n===== JobRunner PID={os.getpid()} finalize watchdog armed @ "
+                f"{datetime.now(timezone.utc).isoformat()} "
+                f"(dumps all thread stacks every {JOB_RUNNER_FINALIZE_WATCHDOG_S}s while wedged) =====\n"
+            )
+            self._finalize_stacks_file.flush()
+            faulthandler.dump_traceback_later(
+                JOB_RUNNER_FINALIZE_WATCHDOG_S, repeat=True, file=self._finalize_stacks_file
+            )
+            self._log.info(f"Finalize watchdog armed; wedge stack dumps -> {stacks_path}")
+        except Exception as e:
+            self._log.warning(f"Could not arm finalize watchdog: {e}")
+
         # Finalize any zarr writers that are still open
+        t_finalize_start = time.perf_counter()
         try:
             success = SaveZarrJob.finalize_all_writers()
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:
             self._log.error(f"Error finalizing zarr writers during shutdown: {e}")
+        self._log.info(
+            f"finalize_all_writers() completed in {time.perf_counter() - t_finalize_start:.1f}s"
+        )
 
         # Flush the upload queue feeder thread so any UploadTask items that
         # FlushAndStageUploadJob.run() put() onto the queue actually reach
@@ -1675,4 +1741,19 @@ class JobRunner(multiprocessing.Process):
         # Stop memory monitoring and log final report
         log_memory("WORKER_SHUTDOWN", include_children=False)
         stop_worker_monitoring()
-        self._log.info("Shutdown request received, exiting run.")
+
+        # Let the subprocess exit promptly even if JobResults remain buffered in
+        # the output queue's feeder thread. Data durability is guaranteed by
+        # finalize_all_writers() above (not by this status queue), and the parent
+        # has already drained the results it needs and tracks completion via the
+        # shared pending counter. Without this, an unflushed output item makes
+        # the feeder block at interpreter exit and the whole subprocess hangs
+        # until the parent's terminate() fires — the leading suspect for the
+        # observed 600s finalize wedge. The watchdog above confirms this (no
+        # dump => exit is now clean) or reveals a different teardown culprit.
+        try:
+            self._output_queue.cancel_join_thread()
+        except Exception as e:
+            self._log.debug(f"output_queue.cancel_join_thread on exit: {e}")
+
+        self._log.info("Shutdown request received, exiting run (interpreter teardown begins).")

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -451,8 +451,14 @@ def _build_led_matrix_device(
     dev_entry: IlluminationDeviceEntry,
     micro: Optional[Microcontroller],
     sci_array: Optional[SciMicroscopyLEDArray],
+    default_color: Optional[Tuple[float, float, float]] = None,
 ) -> LEDMatrixIlluminationDevice:
-    """Build a LEDMatrixIlluminationDevice from an illumination_devices entry."""
+    """Build a LEDMatrixIlluminationDevice from an illumination_devices entry.
+
+    ``default_color`` (0-1 RGB, from ``devices.led_matrix.config.default_color``)
+    seeds the global matrix color on the Teensy/MCU backend so color works there
+    just like on the SciMicroscopy array (which receives it via its own ctor).
+    """
     cfg = dev_entry.config or {}
     unified = bool(cfg.get("unified", False))
     if sci_array is None and micro is None:
@@ -471,6 +477,7 @@ def _build_led_matrix_device(
             unified_channel_name=unified_name,
             modes=modes,
             legacy_channel_to_mode=legacy,
+            default_color=default_color,
         )
     channel_source_codes = {
         ch_name: (ch.source_code if ch.source_code is not None else 0)
@@ -480,6 +487,7 @@ def _build_led_matrix_device(
         channel_source_codes=channel_source_codes,
         microcontroller=micro,
         sci_array=sci_array,
+        default_color=default_color,
     )
 
 
@@ -513,8 +521,17 @@ def _build_illumination_controller(
                         _build_io_routed_device(dev_entry, io_registry, micro, calibrations_dir)
                     )
                 elif driver == "led_matrix":
+                    # Global matrix color lives on the devices.led_matrix entry
+                    # (config.default_color); thread it through so the Teensy/MCU
+                    # backend has the same default color as the SciMicroscopy array.
+                    _lm_dev = mc.get_device("led_matrix")
+                    _lm_color = None
+                    if _lm_dev and _lm_dev.config:
+                        _c = _lm_dev.config.get("default_color")
+                        if _c is not None:
+                            _lm_color = tuple(float(x) for x in _c)
                     devices.append(
-                        _build_led_matrix_device(dev_entry, micro, sci_array)
+                        _build_led_matrix_device(dev_entry, micro, sci_array, default_color=_lm_color)
                     )
                 elif driver == "coolled_pe400" and not simulated:
                     import control.serial_peripherals_coolled as _coolled_module
