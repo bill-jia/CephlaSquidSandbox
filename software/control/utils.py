@@ -17,6 +17,7 @@ Key functions:
 import collections
 import enum
 import inspect
+import math
 import pathlib
 import sys
 import shutil
@@ -252,6 +253,8 @@ def find_spot_location(
     params: Optional[dict] = None,
     filter_sigma: Optional[int] = None,
     debug_plot: bool = False,
+    x_search_range: Optional[Tuple[float, float]] = None,
+    min_intensity: Optional[float] = None,
 ) -> Optional[Tuple[float, float]]:
     """Find the location of a spot in an image.
 
@@ -267,6 +270,16 @@ def find_spot_location(
             - peak_prominence (float): Minimum peak prominence (default: 100)
             - intensity_threshold (float): Threshold for intensity filtering (default: 0.1)
             - spot_spacing (int): Expected spacing between spots for multi-spot modes (default: 100)
+        x_search_range: Optional (x_min, x_max) columns to restrict the search to.
+            When the expected spot position is known (a reference is set), a window
+            around it keeps bright artifacts elsewhere in the frame from being
+            selected — the profile normalization and the DUAL_* leftmost/rightmost
+            peak selection otherwise latch onto whatever is brightest anywhere in
+            x. The returned x is in full-image coordinates.
+        min_intensity: Optional absolute intensity floor. If the (windowed) image
+            maximum is below this, the frame is treated as containing no spot
+            (e.g. laser off / blocked) instead of running peak detection on a
+            normalized noise profile, which always "finds" something.
 
     Returns:
         Optional[Tuple[float, float]]: (x,y) coordinates of selected spot, or None if detection fails
@@ -299,6 +312,25 @@ def find_spot_location(
             filtered = gaussian_filter(image.astype(float), sigma=filter_sigma)
             image = np.clip(filtered, 0, 255).astype(np.uint8)
 
+        # Restrict the search to the requested column window. Done before any
+        # profiling so out-of-window artifacts influence neither the y-profile
+        # argmax nor the normalized x-profile prominence.
+        x_col_offset = 0
+        if x_search_range is not None:
+            x_lo = int(max(0, math.floor(x_search_range[0])))
+            x_hi = int(min(image.shape[1], math.ceil(x_search_range[1])))
+            if x_hi - x_lo < 2 * p["x_window"]:
+                raise ValueError(f"x_search_range ({x_lo}, {x_hi}) too narrow for spot detection")
+            image = image[:, x_lo:x_hi]
+            x_col_offset = x_lo
+
+        if min_intensity is not None and float(np.max(image)) < min_intensity:
+            _log.debug(
+                f"No spot: image max {float(np.max(image)):.1f} below min_intensity {min_intensity:.1f} "
+                f"(laser off / spot absent?)"
+            )
+            return None
+
         # Get the y position of the spots
         y_intensity_profile = np.sum(image, axis=1)
         if np.all(y_intensity_profile == 0):
@@ -306,7 +338,6 @@ def find_spot_location(
 
         peak_y = np.argmax(y_intensity_profile)
 
-        print(f"Detected peak Y position: {peak_y} in image of height {image.shape[0]} with y_window={p['y_window']}")
         # Validate peak_y location
         if peak_y < p["y_window"] or peak_y > image.shape[0] - p["y_window"]:
             raise ValueError("Spot too close to image edge")
@@ -400,7 +431,8 @@ def find_spot_location(
             plt.show()
 
         # Calculate centroid in window around selected peak
-        return _calculate_spot_centroid(cropped_image, peak_x, peak_y, p)
+        centroid_x, centroid_y = _calculate_spot_centroid(cropped_image, peak_x, peak_y, p)
+        return (centroid_x + x_col_offset, centroid_y)
 
     except (ValueError, NotImplementedError) as e:
         raise e

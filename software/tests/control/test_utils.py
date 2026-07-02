@@ -124,6 +124,43 @@ def test_debug_plot(tmp_path):
         find_spot_location(image, debug_plot=True)
 
 
+def test_x_search_range_excludes_artifacts():
+    # True spot at x=700 with a brighter artifact at x=1400. DUAL_RIGHT picks
+    # the rightmost peak, so without a window it latches onto the artifact;
+    # windowed around the expected position it finds the true spot.
+    y, x = np.ogrid[:256, :1536]
+    spot = 0.6 * np.exp(-((x - 700) ** 2 + (y - 128) ** 2) / (2 * 5.0**2))
+    artifact = 1.0 * np.exp(-((x - 1400) ** 2 + (y - 128) ** 2) / (2 * 5.0**2))
+    image = ((spot + artifact) * 255 / (spot + artifact).max()).astype(np.uint8)
+
+    unwindowed = find_spot_location(image, mode=SpotDetectionMode.DUAL_RIGHT)
+    assert unwindowed is not None
+    assert abs(unwindowed[0] - 1400) < 5
+
+    windowed = find_spot_location(image, mode=SpotDetectionMode.DUAL_RIGHT, x_search_range=(400, 1000))
+    assert windowed is not None
+    # Returned coordinates must be in full-image space, not window space.
+    assert abs(windowed[0] - 700) < 5
+    assert abs(windowed[1] - 128) < 5
+
+
+def test_x_search_range_returns_full_image_coordinates():
+    image = create_test_image([(700, 128)], image_size=(256, 1536))
+    result = find_spot_location(image, x_search_range=(600, 800))
+    assert result is not None
+    assert abs(result[0] - 700) < 5
+
+
+def test_min_intensity_rejects_dark_frames():
+    rng = np.random.default_rng(0)
+    dark_noise = rng.integers(0, 6, size=(256, 1536)).astype(np.uint8)  # max 5, e.g. AF laser off
+    assert find_spot_location(dark_noise, mode=SpotDetectionMode.DUAL_RIGHT, min_intensity=10) is None
+
+    # A real spot passes the same floor.
+    image = create_test_image([(700, 128)], image_size=(256, 1536))
+    assert find_spot_location(image, mode=SpotDetectionMode.DUAL_RIGHT, min_intensity=10) is not None
+
+
 def test_get_available_disk_space():
     temp_dir = pathlib.Path(tempfile.mkdtemp())
 
