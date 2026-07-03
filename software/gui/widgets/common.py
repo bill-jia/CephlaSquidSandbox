@@ -77,7 +77,11 @@ def check_space_available_with_error_dialog(
     save_directory = multi_point_controller.base_path
     available_disk_space = utils.get_available_disk_space(save_directory)
     space_required = factor_of_safecty * multi_point_controller.get_estimated_acquisition_disk_storage()
-    image_count = multi_point_controller.get_acquisition_image_count()
+    # Total files written: raw frames (z-mode aware) + derived postprocessing outputs.
+    image_count = (
+        multi_point_controller.get_acquisition_image_count()
+        + multi_point_controller.get_acquisition_derived_image_count()
+    )
 
     logger.info(
         f"Checking space available: {space_required=}, {available_disk_space=}, {image_count=}, {save_directory=}"

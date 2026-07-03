@@ -397,6 +397,59 @@ def test_disk_estimate_excludes_postprocessed_raw_and_adds_derived():
     assert mpc._postprocess_derived_bytes() == int(480_000 * mpc._format_size_factor())
 
 
+def test_image_count_zmode_aware_and_derived_count():
+    """The raw image count must count reference-z (single-plane) steps ONCE, not
+    once per z, and exclude postprocessed inputs; the derived count reports the
+    output plates. Mirrors the '11-z reconstruction + 2 single-plane BF' case."""
+    from types import SimpleNamespace
+
+    import control._def
+    from control.core.multi_point_controller import MultiPointController
+    from control.models.acquisition_cycle import AcquisitionCycle, CycleStep, PostprocessSpec, RegionPlan, resolve_cycle
+
+    cyc = AcquisitionCycle(
+        name="c",
+        items=[
+            # Full-z (11-plane) BF, postprocessed -> reconstruction (raw NOT saved).
+            CycleStep(observation_state="BF", postprocess=PostprocessSpec(routine="stub")),
+            # Two single-plane (reference-z) brightfield saves.
+            CycleStep(observation_state="BF_a", acquire_z_stack=False),
+            CycleStep(observation_state="BF_b", acquire_z_stack=False),
+        ],
+    )
+    plan = RegionPlan.from_events(resolve_cycle(cyc))
+    group = next(iter(plan.postprocess_groups.values()))
+    group.outputs = [
+        OutputSpec(name="phase", z_size=1, dtype="float32"),
+        OutputSpec(name="bf_center", z_size=1, dtype="input"),
+    ]
+
+    class _MPC(MultiPointController):
+        def __init__(self):
+            pass
+
+    mpc = _MPC()
+    mpc.NZ = 11
+    mpc.Nt = 1
+    mpc.selected_cycle_names = ["c"]
+    mpc.selected_observation_state_names = []
+    mpc.region_cycle_map = None
+    mpc.scanCoordinates = SimpleNamespace(region_fov_coordinates={"R0": [0]})  # 1 FOV
+    mpc._resolve_plan = lambda names, region: plan
+
+    merge_saved = control._def.MERGE_CHANNELS
+    control._def.MERGE_CHANNELS = False
+    try:
+        # Two reference-z steps captured ONCE each (NOT ×NZ=11) → 2, not 22.
+        assert mpc.get_acquisition_image_count() == 2
+        # Derived: phase + bf_center, one set per FOV visit → 2.
+        assert mpc.get_acquisition_derived_image_count() == 2
+        # Live-estimate total the user sees: 4.
+        assert mpc.get_acquisition_image_count() + mpc.get_acquisition_derived_image_count() == 4
+    finally:
+        control._def.MERGE_CHANNELS = merge_saved
+
+
 def test_prepare_display_image_is_display_safe():
     """Display previews must be integer dtype (contrast manager uses np.iinfo) at
     native resolution (the shared live viewer holds one size across channels)."""

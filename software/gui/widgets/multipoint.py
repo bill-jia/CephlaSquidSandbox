@@ -1579,13 +1579,14 @@ def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hi
     try:
         if controller.acquisition_in_progress():
             return ""
-        image_count = controller.get_acquisition_image_count()
+        # Total files written = raw captured frames (per-step z-mode aware; a
+        # single-plane/reference-z step is counted once, not once per z) PLUS the
+        # derived postprocessing output plates. Postprocessed raw inputs are
+        # consumed, not saved, so they aren't in either term.
+        image_count = controller.get_acquisition_image_count() + controller.get_acquisition_derived_image_count()
         disk_bytes = controller.estimate_acquisition_disk_bytes()
     except Exception:
         return "—"
-    # A postprocessing-only cycle saves no raw frames (image_count == 0) but still
-    # writes derived output plates (disk_bytes > 0), so key the "no region" hint
-    # on both being empty.
     if image_count <= 0 and disk_bytes <= 0:
         return "Add a region to estimate size"
     fmt = getattr(controller, "file_saving_option", None)

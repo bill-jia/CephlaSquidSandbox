@@ -1220,8 +1220,13 @@ class MultiPointController:
 
     def get_acquisition_image_count(self):
         """
-        Given the current settings on this controller, return how many images an acquisition will
-        capture and save to disk.
+        Given the current settings on this controller, return how many raw images an acquisition
+        will capture and save to disk.
+
+        Accounts for per-step z-mode: a reference-z-only (single-plane) cycle step is captured
+        once per position, NOT once per z-level, so it is not multiplied by ``NZ``. Postprocessed
+        steps save no raw frame (their raw inputs are consumed), so they are excluded — the derived
+        output plates are counted separately by ``get_acquisition_derived_image_count``.
 
         NOTE: This does not cover debug images (eg: auto focus) or user created images (eg: custom scripts).
 
@@ -1229,6 +1234,8 @@ class MultiPointController:
 
         Raises a ValueError if the class is not configured for a valid acquisition.
         """
+        from control.models.acquisition_cycle import REFZ_ARRAY_SUFFIX
+
         try:
             # We have Nt timepoints.  For each timepoint, we capture images at all the regions.  Each
             # region has a list of coordinates that we capture at, and at each coordinate we need to
@@ -1239,14 +1246,20 @@ class MultiPointController:
             ]
             all_regions_coord_count = sum(coords_per_region)
 
-            # Resolve the per-position plan so cycles (multiple frames per state)
-            # and stimulus-only states (no camera frame) are both accounted for:
-            # frames_per_position already excludes stimulus events.
+            # Resolve the per-position plan so cycles (multiple frames per state), stimulus-only
+            # states (no camera frame), postprocessed steps (raw not saved), and per-step z-mode
+            # are all accounted for. frame_counts is keyed by (state, z-mode): a reference-z-only
+            # group carries the _refz suffix and is captured once (×1), full-z groups are ×NZ.
             if self.selected_observation_state_names or self.selected_cycle_names:
-                n_ch = self._resolve_plan(self.selected_cycle_names, None).frames_per_position
+                plan = self._resolve_plan(self.selected_cycle_names, None)
+                planes_per_position = sum(
+                    count * (1 if key.endswith(REFZ_ARRAY_SUFFIX) else self.NZ)
+                    for key, count in plan.frame_counts.items()
+                )
+                non_merged_images = self.Nt * all_regions_coord_count * planes_per_position
             else:
                 n_ch = len(self.selected_configurations)
-            non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
+                non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
             # When capturing merged images, we capture 1 per fov (where all the configurations are merged)
             merged_images = self.Nt * self.NZ * all_regions_coord_count if control._def.MERGE_CHANNELS else 0
 
@@ -1255,6 +1268,28 @@ class MultiPointController:
             # We don't init all fields in __init__, so it's easy to get attribute errors.  We consider
             # this "not configured" and want it to be a ValueError.
             raise ValueError("Not properly configured for an acquisition, cannot calculate image count.")
+
+    def get_acquisition_derived_image_count(self) -> int:
+        """Number of derived output image planes written by online postprocessing.
+
+        Each postprocess group writes one output-set per FOV visit per scan timepoint; an output
+        with ``z_size`` planes contributes ``z_size`` images. Uses the global plan (like
+        ``get_acquisition_image_count``). Returns 0 when no postprocessing is configured or the
+        controller isn't configured for a valid acquisition.
+        """
+        try:
+            if not (self.selected_cycle_names or self.region_cycle_map):
+                return 0
+            plan = self._resolve_plan(self.selected_cycle_names, None)
+            if not plan.postprocess_groups:
+                return 0
+            all_regions_coord_count = sum(
+                len(coords) for coords in self.scanCoordinates.region_fov_coordinates.values()
+            )
+            planes = sum(int(o.z_size) for g in plan.postprocess_groups.values() for o in g.outputs)
+            return self.Nt * all_regions_coord_count * planes
+        except (AttributeError, ValueError):
+            return 0
 
     def _raw_bytes_per_image(self) -> int:
         """Uncompressed bytes for a single captured frame at the current crop / pixel format.
