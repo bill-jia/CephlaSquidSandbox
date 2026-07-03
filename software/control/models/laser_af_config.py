@@ -55,6 +55,14 @@ class LaserAFConfig(BaseModel):
     min_peak_width: float = Field(10.0, description="Minimum peak width")
     min_peak_distance: float = Field(10.0, description="Minimum distance between peaks")
     min_peak_prominence: float = Field(0.25, description="Minimum peak prominence")
+    min_spot_intensity: float = Field(
+        10.0,
+        description=(
+            "Absolute intensity floor for spot detection. Frames whose maximum (within the search "
+            "window) is below this are treated as spot-absent instead of detecting peaks in "
+            "normalized noise (e.g. when the AF laser is off or blocked)."
+        ),
+    )
     spot_spacing: float = Field(100.0, description="Expected spot spacing")
     filter_sigma: Optional[float] = Field(None, description="Gaussian filter sigma (-1 to disable)")
 
