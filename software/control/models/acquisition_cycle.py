@@ -26,10 +26,12 @@ the worker iterates and the save layer keys on.
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, Field
+
+from control.postprocessing.base import InputStateSpec, OutputSpec
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,31 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Serializable cycle definition
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class PostprocessSpec(BaseModel):
+    """Online postprocessing assignment for a step / FPM sweep / group.
+
+    The referenced routine consumes **all frames the item produces per FOV
+    visit** and its declared outputs are saved instead of the raw frames (the
+    inputs are never written to disk). ``routine`` is a built-in name from
+    ``control.postprocessing.registry`` or the literal ``"script"`` with
+    ``script_path`` pointing at a user ``.py`` defining a module-level
+    ``ROUTINE`` instance.
+    """
+
+    routine: str = Field(..., description='Built-in routine name, or "script" for a custom script')
+    script_path: Optional[str] = Field(None, description="Path to the custom routine .py (routine == 'script')")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Routine parameters (routine-defined keys)")
+    label: Optional[str] = Field(
+        None,
+        description=(
+            "Output-array-name prefix ({label}_{output}); defaults to the first input state name. "
+            "Set it to disambiguate two groups using the same routine."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 class CycleStep(BaseModel):
@@ -58,6 +85,9 @@ class CycleStep(BaseModel):
             "its own single-z array (see array_key_for)."
         ),
     )
+    postprocess: Optional[PostprocessSpec] = Field(
+        None, description="Online postprocessing routine consuming this step's frames (raw frames not saved)"
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -76,10 +106,19 @@ class CycleWait(BaseModel):
 
 
 class CycleGroup(BaseModel):
-    """An ordered list of steps/waits repeated ``repeat`` times (one nesting level)."""
+    """An ordered list of steps/waits repeated ``repeat`` times (one nesting level).
+
+    A group-level ``postprocess`` pools the frames of *all* member steps (across
+    all repeats) into one routine invocation per FOV visit — this is how a
+    multi-input routine (e.g. DPC from four half-circle steps) receives its
+    inputs. Member steps must not carry their own ``postprocess``.
+    """
 
     repeat: int = Field(1, ge=1, description="How many times to repeat this group")
     steps: List[Union[CycleStep, CycleWait]] = Field(default_factory=list)
+    postprocess: Optional[PostprocessSpec] = Field(
+        None, description="Online postprocessing pooling all member steps' frames (raw frames not saved)"
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -115,6 +154,9 @@ class CycleFPMDarkfield(BaseModel):
     acquire_z_stack: bool = Field(
         True, description="Acquire every z-plane (True) or only the reference/focus plane (False); locked across the sweep."
     )
+    postprocess: Optional[PostprocessSpec] = Field(
+        None, description="Online postprocessing routine consuming this sweep's frames (raw frames not saved)"
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -135,6 +177,9 @@ class CycleFPMBrightfield(BaseModel):
     seed: int = Field(0, description="Seed for the pseudorandom subset")
     acquire_z_stack: bool = Field(
         True, description="Acquire every z-plane (True) or only the reference/focus plane (False); locked across the sweep."
+    )
+    postprocess: Optional[PostprocessSpec] = Field(
+        None, description="Online postprocessing routine consuming this sweep's frames (raw frames not saved)"
     )
 
     model_config = {"extra": "forbid"}
@@ -160,6 +205,9 @@ class CycleFPMClusteredDarkfield(BaseModel):
     min_overlap: float = Field(0.6, gt=0, lt=1, description="Fourier overlap setting the darkfield cell size")
     acquire_z_stack: bool = Field(
         True, description="Acquire every z-plane (True) or only the reference/focus plane (False); locked across the sweep."
+    )
+    postprocess: Optional[PostprocessSpec] = Field(
+        None, description="Online postprocessing routine consuming this sweep's frames (raw frames not saved)"
     )
 
     model_config = {"extra": "forbid"}
@@ -212,6 +260,14 @@ class ResolvedEvent:
         acquire_z_stack: True (default) to capture this event at every z-plane of
             the acquisition's z-stack; False to capture it only at the reference
             (focus/AF) plane. Carried from the originating CycleStep / FPM item.
+        postprocess: The postprocessing spec of the originating item (or its
+            enclosing group), None for a plain saved frame. A postprocessed
+            frame is routed to the postprocess runner instead of the writers —
+            it has no raw save coordinate.
+        postprocess_group: Stable per-assignment instance id ("pp0", "pp1", …
+            in first-appearance order). All occurrences of one item/group across
+            its repeats share the id — they pool into one routine invocation per
+            FOV visit.
     """
 
     observation_state: str
@@ -222,6 +278,8 @@ class ResolvedEvent:
     wait_ms: float = 0.0
     multiplexed_leds: Optional[Tuple[int, ...]] = None
     acquire_z_stack: bool = True
+    postprocess: Optional[PostprocessSpec] = None
+    postprocess_group: Optional[str] = None
 
 
 # Suffix appended to a ragged array key for a reference-z-only ("single plane")
@@ -254,19 +312,55 @@ StimulusPredicate = Callable[[str], bool]
 FpmPatternProvider = Callable[[object], List[Tuple[str, Sequence[int]]]]
 
 
-# A raw event is a tagged tuple:
-#   ("state", (preset_name, acquire_z_stack))   — ordinary imaged/stimulus step
-#   ("wait", duration_ms)                        — timed delay
-#   ("mux", (preset_name, leds_tuple, acquire_z_stack)) — one FPM frame
+# A raw event is a tagged tuple (``pp`` = None or (PostprocessSpec, group_id)):
+#   ("state", (preset_name, acquire_z_stack, pp))   — ordinary imaged/stimulus step
+#   ("wait", duration_ms)                            — timed delay
+#   ("mux", (preset_name, leds_tuple, acquire_z_stack, pp)) — one FPM frame
 _RawEvent = Tuple[str, object]
 
 
-def _expand_item(item, out: List[_RawEvent], fpm_provider: Optional[FpmPatternProvider] = None) -> None:
-    """Expand one cycle item (group / step / wait / fpm) into raw tagged events."""
+class _PostprocessGroupAllocator:
+    """Assigns stable ``pp{n}`` ids to postprocessed items/groups, numbered in
+    first-appearance order. Keyed on item identity so every occurrence of one
+    item across cycle/group repeats shares the id — all its frames pool into
+    one routine invocation per FOV visit."""
+
+    def __init__(self):
+        self._by_item: Dict[int, str] = {}
+
+    def key_for(self, item) -> str:
+        key = self._by_item.get(id(item))
+        if key is None:
+            key = f"pp{len(self._by_item)}"
+            self._by_item[id(item)] = key
+        return key
+
+
+def _own_pp(item, pp_alloc: Optional[_PostprocessGroupAllocator]):
+    spec = getattr(item, "postprocess", None)
+    if spec is None or pp_alloc is None:
+        return None
+    return (spec, pp_alloc.key_for(item))
+
+
+def _expand_item(
+    item,
+    out: List[_RawEvent],
+    fpm_provider: Optional[FpmPatternProvider] = None,
+    pp_alloc: Optional[_PostprocessGroupAllocator] = None,
+    inherited_pp=None,
+) -> None:
+    """Expand one cycle item (group / step / wait / fpm) into raw tagged events.
+
+    ``inherited_pp`` carries an enclosing group's (spec, group_id) — a group-
+    level postprocess pools all member steps' frames, overriding any (invalid,
+    validation-rejected) member-level spec.
+    """
     if isinstance(item, CycleGroup):
+        pp = _own_pp(item, pp_alloc) or inherited_pp
         for _ in range(item.repeat):
             for sub in item.steps:
-                _expand_item(sub, out, fpm_provider)
+                _expand_item(sub, out, fpm_provider, pp_alloc, pp)
     elif isinstance(item, CycleWait):
         out.append(("wait", float(item.duration_ms)))
     elif isinstance(item, (CycleFPMDarkfield, CycleFPMBrightfield, CycleFPMClusteredDarkfield)):
@@ -277,20 +371,26 @@ def _expand_item(item, out: List[_RawEvent], fpm_provider: Optional[FpmPatternPr
             )
             return
         az = bool(getattr(item, "acquire_z_stack", True))
+        pp = inherited_pp or _own_pp(item, pp_alloc)
         for name, leds in fpm_provider(item) or []:
-            out.append(("mux", (name, tuple(int(i) for i in leds), az)))
+            out.append(("mux", (name, tuple(int(i) for i in leds), az, pp)))
     else:  # CycleStep
         az = bool(getattr(item, "acquire_z_stack", True))
-        out.extend([("state", (item.observation_state, az))] * item.n_frames)
+        pp = inherited_pp or _own_pp(item, pp_alloc)
+        out.extend([("state", (item.observation_state, az, pp))] * item.n_frames)
 
 
-def _raw_events(cycle: AcquisitionCycle, fpm_provider: Optional[FpmPatternProvider] = None) -> List[_RawEvent]:
+def _raw_events(
+    cycle: AcquisitionCycle,
+    fpm_provider: Optional[FpmPatternProvider] = None,
+    pp_alloc: Optional[_PostprocessGroupAllocator] = None,
+) -> List[_RawEvent]:
     """Expand a single cycle's outer repeat / groups / steps / waits into an
     ordered list of tagged raw events (one entry per event)."""
     out: List[_RawEvent] = []
     for _ in range(cycle.repeat):
         for item in cycle.items:
-            _expand_item(item, out, fpm_provider)
+            _expand_item(item, out, fpm_provider, pp_alloc)
     return out
 
 
@@ -322,10 +422,16 @@ def _index_events(
             continue
         if kind == "mux":
             # Source-coded FPM darkfield frame: base preset name + LED index set.
-            name, leds, az = payload
+            name, leds, az, pp = payload
+            spec, gid = pp if pp is not None else (None, None)
             # Count per (state, z-mode) so each array's T runs 0..count-1, even
             # when the same state is captured both full-z and reference-only.
+            # Postprocessed events count under their own namespaced key so a
+            # state used both saved and postprocessed keeps contiguous saved T
+            # indices (the pp ordinal orders the routine's input F axis).
             ckey = array_key_for(name, bool(az))
+            if gid is not None:
+                ckey = f"{ckey}#{gid}"
             k = per_state.get(ckey, 0)
             per_state[ckey] = k + 1
             events.append(
@@ -336,14 +442,26 @@ def _index_events(
                     cycle_event_index=position,
                     multiplexed_leds=tuple(leds),
                     acquire_z_stack=bool(az),
+                    postprocess=spec,
+                    postprocess_group=gid,
                 )
             )
             continue
-        name, az = payload
+        # Flat (no-cycle) callers may hand-build 2-tuple ("state", (name, az))
+        # events with no postprocessing; accept both shapes explicitly (a bare
+        # string payload is a bug — reject it rather than unpacking its chars).
+        if not isinstance(payload, (tuple, list)) or not (2 <= len(payload) <= 3):
+            raise ValueError(f"invalid 'state' event payload: {payload!r}")
+        name, az = payload[0], payload[1]
+        pp = payload[2] if len(payload) == 3 else None
+        stim = bool(is_stimulus(name)) if is_stimulus is not None else False
+        # A stimulus-only event produces no camera frame — nothing to postprocess.
+        spec, gid = (None, None) if (pp is None or stim) else pp
         ckey = array_key_for(name, bool(az))
+        if gid is not None:
+            ckey = f"{ckey}#{gid}"
         k = per_state.get(ckey, 0)
         per_state[ckey] = k + 1
-        stim = bool(is_stimulus(name)) if is_stimulus is not None else False
         events.append(
             ResolvedEvent(
                 observation_state=name,
@@ -351,6 +469,8 @@ def _index_events(
                 state_frame_index=k,
                 cycle_event_index=position,
                 acquire_z_stack=bool(az),
+                postprocess=spec,
+                postprocess_group=gid,
             )
         )
     return events
@@ -362,7 +482,7 @@ def resolve_cycle(
     fpm_provider: Optional[FpmPatternProvider] = None,
 ) -> List[ResolvedEvent]:
     """Flatten a single cycle into its ordered event list."""
-    return _index_events(_raw_events(cycle, fpm_provider), is_stimulus)
+    return _index_events(_raw_events(cycle, fpm_provider, _PostprocessGroupAllocator()), is_stimulus)
 
 
 def resolve_chain(
@@ -380,12 +500,13 @@ def resolve_chain(
     multiplexed LED groups for any ``CycleFPMDarkfield`` items.
     """
     raw: List[_RawEvent] = []
+    pp_alloc = _PostprocessGroupAllocator()  # one allocator ⇒ group ids unique across the chain
     for name in cycle_names:
         cycle = load_cycle(name)
         if cycle is None:
             logger.warning("Acquisition cycle %r not found, skipping", name)
             continue
-        raw.extend(_raw_events(cycle, fpm_provider))
+        raw.extend(_raw_events(cycle, fpm_provider, pp_alloc))
     return _index_events(raw, is_stimulus)
 
 
@@ -400,7 +521,7 @@ def chain_frame_counts(events: List[ResolvedEvent]) -> Dict[str, int]:
     """
     counts: Dict[str, int] = {}
     for ev in events:
-        if ev.is_stimulus or ev.is_wait:
+        if ev.is_stimulus or ev.is_wait or ev.postprocess is not None:
             continue
         key = array_key_for(ev.observation_state, ev.acquire_z_stack)
         counts[key] = counts.get(key, 0) + 1
@@ -413,23 +534,28 @@ def is_dense(events: List[ResolvedEvent]) -> bool:
     Requires both (a) every imaged array-group has the same frame count, AND
     (b) a single z-mode across all imaged events — a stack that mixes full-z and
     reference-only captures has a non-uniform Z extent and so must be ragged
-    (one array per group). An empty chain is trivially dense.
+    (one array per group). An empty chain is trivially dense. Postprocessed
+    events save no raw frame, so — like stimulus events — they don't participate
+    (their derived outputs are always separate side arrays).
     """
     counts = chain_frame_counts(events)
     if len(set(counts.values())) > 1:
         return False
-    z_modes = {ev.acquire_z_stack for ev in events if not (ev.is_stimulus or ev.is_wait)}
+    z_modes = {
+        ev.acquire_z_stack for ev in events if not (ev.is_stimulus or ev.is_wait or ev.postprocess is not None)
+    }
     return len(z_modes) <= 1
 
 
 def imaged_states_in_order(events: List[ResolvedEvent]) -> List[str]:
-    """Distinct imaged observation-state names, in first-appearance order.
+    """Distinct *saved* imaged observation-state names, in first-appearance order.
 
-    This is the channel (``C``) axis ordering for the dense layout.
+    This is the channel (``C``) axis ordering for the dense layout, so
+    postprocessed events (no saved raw frame) are excluded.
     """
     seen: Dict[str, None] = {}
     for ev in events:
-        if ev.is_stimulus or ev.is_wait:
+        if ev.is_stimulus or ev.is_wait or ev.postprocess is not None:
             continue
         if ev.observation_state not in seen:
             seen[ev.observation_state] = None
@@ -454,6 +580,58 @@ def all_states_in_order(events: List[ResolvedEvent]) -> List[str]:
 
 
 @dataclass
+class PostprocessGroupPlan:
+    """One postprocess assignment (step / sweep / group), resolved for a region.
+
+    ``outputs`` is declared by the routine's ``describe_outputs`` and filled in
+    by the controller (``_attach_postprocess_outputs``) so this module stays
+    free of routine imports. ``label`` (spec override or the first input state
+    name) prefixes output names to form the on-disk array keys.
+    """
+
+    group_key: str
+    spec: PostprocessSpec
+    input_states: Dict[str, InputStateSpec]  # first-appearance order
+    label: str
+    outputs: List[OutputSpec] = field(default_factory=list)
+
+    @property
+    def output_keys(self) -> List[str]:
+        """On-disk array keys of the declared outputs (``{label}_{name}``)."""
+        return [f"{self.label}_{o.name}" for o in self.outputs]
+
+    @property
+    def events_per_visit(self) -> int:
+        """Imaged input events per FOV visit (before the per-event z extent)."""
+        return sum(s.frames_per_visit for s in self.input_states.values())
+
+
+def _build_postprocess_groups(events: List[ResolvedEvent]) -> Dict[str, PostprocessGroupPlan]:
+    per_group_states: Dict[str, Dict[str, List[bool]]] = {}
+    specs: Dict[str, PostprocessSpec] = {}
+    for ev in events:
+        gid = ev.postprocess_group
+        if gid is None or ev.is_stimulus or ev.is_wait:
+            continue
+        specs.setdefault(gid, ev.postprocess)
+        per_group_states.setdefault(gid, {}).setdefault(ev.observation_state, []).append(ev.acquire_z_stack)
+    groups: Dict[str, PostprocessGroupPlan] = {}
+    for gid, states in per_group_states.items():
+        spec = specs[gid]
+        input_states = {
+            name: InputStateSpec(state=name, acquire_z_stack=z_modes[0], frames_per_visit=len(z_modes))
+            for name, z_modes in states.items()
+        }
+        groups[gid] = PostprocessGroupPlan(
+            group_key=gid,
+            spec=spec,
+            input_states=input_states,
+            label=spec.label or next(iter(input_states)),
+        )
+    return groups
+
+
+@dataclass
 class RegionPlan:
     """Everything the worker and save layer need for one region.
 
@@ -465,6 +643,8 @@ class RegionPlan:
     dense: bool                          # all imaged states share the same frame count
     frame_counts: Dict[str, int]         # imaged state -> frames per position
     channel_order: List[str]             # distinct imaged states, in C-axis order
+    # Postprocess assignments keyed by group id ("pp0", …). Empty for plain runs.
+    postprocess_groups: Dict[str, PostprocessGroupPlan] = field(default_factory=dict)
 
     @staticmethod
     def from_events(events: List[ResolvedEvent]) -> "RegionPlan":
@@ -473,29 +653,42 @@ class RegionPlan:
             dense=is_dense(events),
             frame_counts=chain_frame_counts(events),
             channel_order=imaged_states_in_order(events),
+            postprocess_groups=_build_postprocess_groups(events),
         )
 
     @property
     def frames_per_position(self) -> int:
-        """Total imaged frames captured at one position per scan timepoint."""
+        """Total *saved* imaged frames at one position per scan timepoint."""
         return sum(self.frame_counts.values())
 
     @property
+    def captured_frames_per_position(self) -> int:
+        """Total camera frames captured at one position per scan timepoint —
+        saved *and* postprocessed (progress/ETA accounting)."""
+        return sum(1 for ev in self.events if not (ev.is_stimulus or ev.is_wait))
+
+    @property
     def array_keys(self) -> List[str]:
-        """Distinct ragged plate keys (``array_key_for`` values), in order.
+        """Distinct *raw* ragged plate keys (``array_key_for`` values), in order.
 
         One per (state, z-mode) array. Unlike ``channel_order`` (bare state names
         for the dense C axis / omero labels), these carry the ``_refz`` suffix for
         reference-only captures, so they match the actual on-disk plate names the
         upload barrier must flush. For an all-full-z run this equals
-        ``channel_order``.
+        ``channel_order``. Postprocessed events save no raw plate — their derived
+        plates are listed by :attr:`derived_output_keys` instead.
         """
         seen: Dict[str, None] = {}
         for ev in self.events:
-            if ev.is_stimulus or ev.is_wait:
+            if ev.is_stimulus or ev.is_wait or ev.postprocess is not None:
                 continue
             seen.setdefault(array_key_for(ev.observation_state, ev.acquire_z_stack), None)
         return list(seen.keys())
+
+    @property
+    def derived_output_keys(self) -> List[str]:
+        """On-disk array keys of all postprocess outputs, in group order."""
+        return [key for group in self.postprocess_groups.values() for key in group.output_keys]
 
 
 @dataclass(frozen=True)
@@ -559,6 +752,8 @@ def frame_coord(plan: RegionPlan, Nt: int, t_scan: int, event: ResolvedEvent) ->
     """
     if event.is_stimulus or event.is_wait:
         raise ValueError("stimulus/wait events have no frame coordinate")
+    if event.postprocess is not None:
+        raise ValueError("postprocessed events save no raw frame and have no frame coordinate")
     name = event.observation_state
     ckey = array_key_for(name, event.acquire_z_stack)
     count = plan.frame_counts[ckey]

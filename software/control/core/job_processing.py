@@ -139,6 +139,10 @@ class CaptureInfo:
     # consolidate output to a single root-level file (e.g. the ZARR_V3
     # acquisition_times.csv) instead of per-timepoint sidecars.
     acquisition_root: Optional[str] = None
+    # Online-postprocessing routing tag. When set, this frame is an input to a
+    # postprocess group (routed to the PostprocessJob runner) — its raw image is
+    # NOT saved, and its save_* fields are None.
+    postprocess_group: Optional[str] = None
 
 
 @dataclass()
@@ -1045,6 +1049,423 @@ class FlushAndStageUploadJob:
         )
 
 
+@dataclass
+class _PPSpecView:
+    """Minimal spec object for ``registry.load_routine`` in the subprocess
+    (reconstructed from the pickled ``spec_dict``)."""
+
+    routine: str
+    script_path: Optional[str]
+    params: Dict
+
+
+def postprocess_routine_key(spec_dict: dict) -> str:
+    """Stable identity key for a routine (routine + script path + params).
+
+    Used to key the process-local routine instance + its persistent cache so
+    (a) warmup and per-FOV compute share one cache, (b) two groups/regions with
+    an identical routine+params share the (expensive) transfer function, and
+    (c) different routines under the same ``group_key`` don't collide."""
+    payload = {
+        "routine": spec_dict.get("routine"),
+        "script_path": spec_dict.get("script_path"),
+        "params": spec_dict.get("params", {}),
+    }
+    import hashlib
+
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+@dataclass
+class PostprocessWarmupResult:
+    """Result of a pre-acquisition routine warmup (see ``PostprocessWarmupJob``)."""
+
+    routine_key: str
+    label: str
+    ok: bool
+    error: Optional[str] = None
+
+
+@dataclass
+class PostprocessResult:
+    """Result of a completed postprocess group invocation for one FOV visit.
+
+    Carries the derived-plate upload barriers (so the main worker's upload
+    accounting is identical to the raw-plate path) and small display previews
+    (so the main process can show each output live). ``error`` is set (and the
+    numeric fields zeroed) when the routine or a write failed.
+    """
+
+    group_key: str
+    time_point: int
+    region_id: str
+    fov: int
+    outputs_written: int
+    barrier_results: List[BarrierResult] = field(default_factory=list)
+    display_images: Dict[str, np.ndarray] = field(default_factory=dict)  # output_key -> small preview
+    # The last input frame's CaptureInfo — lets the main process synthesize a
+    # CameraFrame/CaptureInfo pair for the live-display signal (position, region…).
+    source_capture_info: Optional[CaptureInfo] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class PostprocessJob(Job):
+    """Accumulate one postprocess group's frames per FOV visit, then compute.
+
+    Frames of postprocessed cycle events are routed here (not to the save jobs),
+    so their raw images are never written. This job accumulates them in a
+    process-local ClassVar (the ``DownsampledViewJob`` pattern), and on the last
+    expected frame runs the routine, writes each declared output as its own
+    single-channel plate via an inline ``SaveZarrJob`` (ZARR_V3) or a direct
+    float-safe TIFF write (INDIVIDUAL_IMAGES), and — for ZARR_V3 with upload
+    enabled — runs the derived-plate upload barrier inline (so it deterministically
+    follows the writes in this same subprocess, avoiding the cross-thread
+    ordering race the worker-dispatched barrier would have).
+
+    WARNING: like ``SaveZarrJob`` / ``DownsampledViewJob``, the ClassVars are
+    process-local and only safe because each ``JobRunner`` is its own process.
+    """
+
+    _log: ClassVar = squid.logging.get_logger("PostprocessJob")
+
+    group_key: str = ""
+    label: str = ""
+    spec_dict: Dict = field(default_factory=dict)
+    expected_frames: int = 1
+    output_specs: List[Dict] = field(default_factory=list)  # {name,z_size,dtype,channel_color,wavelength_nm}
+    input_state_specs: Dict[str, Dict] = field(default_factory=dict)  # state -> {acquire_z_stack, frames_per_visit}
+    ctx_meta: Dict = field(default_factory=dict)  # pixel_size_um, dz_um, nz, nt, state_meta
+    # Injected by JobRunner.dispatch (like SaveZarrJob / FlushAndStageUploadJob).
+    zarr_writer_info: Optional[ZarrWriterInfo] = field(default=None)
+    acquisition_info: Optional[AcquisitionInfo] = field(default=None)
+    upload_target: Optional[UploadTarget] = field(default=None)
+
+    # ── process-local state ──
+    _accumulators: ClassVar[Dict[tuple, dict]] = {}
+    _routines: ClassVar[Dict[str, object]] = {}          # group_key -> routine instance
+    _routine_caches: ClassVar[Dict[str, dict]] = {}      # group_key -> ctx.cache dict (TF cache lives here)
+    # Installed by JobRunner.run() so held accumulator bytes stay counted for backpressure.
+    _bp_pending_bytes: ClassVar[Optional[multiprocessing.Value]] = None
+    _bp_capacity_event: ClassVar[Optional[multiprocessing.Event]] = None
+
+    @classmethod
+    def clear_accumulators(cls) -> None:
+        cls._accumulators.clear()
+        cls._routines.clear()
+        cls._routine_caches.clear()
+
+    def _acc_key(self) -> tuple:
+        info = self.capture_info
+        return (info.time_point, str(info.region_id), info.fov, self.group_key)
+
+    def run(self) -> Optional[PostprocessResult]:
+        info = self.capture_info
+        image = self.image_array()
+
+        # Ground-truth timestamp for the (unsaved) raw frame.
+        try:
+            append_frame_acquisition_time_csv(info, f"postprocess/{self.group_key}")
+        except Exception as e:
+            self._log.debug(f"Could not record postprocess input frame time: {e}")
+
+        key = self._acc_key()
+        acc = self._accumulators.get(key)
+        if acc is None:
+            acc = {"frames": [], "held_bytes": 0}
+            self._accumulators[key] = acc
+        acc["frames"].append(
+            {
+                "state": info.observation_state.name,
+                "state_frame_index": info.state_frame_index or 0,
+                "z_index": info.z_index,
+                "image": image,
+                "capture_time": info.capture_time,
+            }
+        )
+        # Hold the frame's bytes against backpressure: the JobRunner's finally
+        # block will subtract this job's image bytes, so re-adding here keeps the
+        # stored frame counted until the group completes.
+        if self._bp_pending_bytes is not None and image is not None:
+            with self._bp_pending_bytes.get_lock():
+                self._bp_pending_bytes.value += image.nbytes
+            acc["held_bytes"] += image.nbytes
+
+        if len(acc["frames"]) < self.expected_frames:
+            return None
+
+        # Group complete — release held bytes and compute.
+        self._accumulators.pop(key, None)
+        if self._bp_pending_bytes is not None and acc["held_bytes"]:
+            with self._bp_pending_bytes.get_lock():
+                self._bp_pending_bytes.value = max(0, self._bp_pending_bytes.value - acc["held_bytes"])
+            if self._bp_capacity_event is not None:
+                self._bp_capacity_event.set()
+
+        t_scan = info.time_point or 0
+        try:
+            outputs = self._compute(acc["frames"])
+        except Exception as e:
+            self._log.exception(f"Postprocess group {self.group_key} failed for t={t_scan} fov={info.fov}")
+            return PostprocessResult(
+                group_key=self.group_key,
+                time_point=t_scan,
+                region_id=str(info.region_id),
+                fov=info.fov,
+                outputs_written=0,
+                error=str(e),
+            )
+
+        barrier_results: List[BarrierResult] = []
+        display_images: Dict[str, np.ndarray] = {}
+        written = 0
+        last_capture_time = acc["frames"][-1]["capture_time"]
+        for spec in self.output_specs:
+            out_key = f"{self.label}_{spec['name']}"
+            arr = outputs.get(spec["name"])
+            if arr is None:
+                self._log.error(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
+                continue
+            arr = self._coerce_output(arr, spec, acc["frames"])
+            written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
+            barrier = self._maybe_barrier(out_key)
+            if barrier is not None:
+                barrier_results.append(barrier)
+            display_images[out_key] = self._prepare_display_image(arr)
+
+        return PostprocessResult(
+            group_key=self.group_key,
+            time_point=t_scan,
+            region_id=str(info.region_id),
+            fov=info.fov,
+            outputs_written=written,
+            barrier_results=barrier_results,
+            display_images=display_images,
+            source_capture_info=info,
+        )
+
+    @classmethod
+    def ensure_routine(cls, spec_dict: dict):
+        """Load (once per process) the routine + its persistent cache, keyed by
+        routine identity (routine/script/params) — so warmup and every FOV of
+        every region that share the same routine also share one instance and its
+        TF cache. Returns ``(routine, cache_dict)``."""
+        from control.postprocessing.registry import load_routine
+
+        key = postprocess_routine_key(spec_dict)
+        routine = cls._routines.get(key)
+        if routine is None:
+            routine = load_routine(
+                _PPSpecView(
+                    routine=spec_dict.get("routine"),
+                    script_path=spec_dict.get("script_path"),
+                    params=spec_dict.get("params", {}),
+                )
+            )
+            cls._routines[key] = routine
+            cls._routine_caches[key] = {}
+        return routine, cls._routine_caches[key]
+
+    @staticmethod
+    def build_context(ctx_meta: dict, cache: dict, logger) -> "PostprocessContext":
+        from control.postprocessing.base import PostprocessContext
+
+        return PostprocessContext(
+            cache=cache,
+            logger=logger,
+            pixel_size_um=ctx_meta.get("pixel_size_um"),
+            dz_um=ctx_meta.get("dz_um"),
+            nz=int(ctx_meta.get("nz", 1)),
+            nt=int(ctx_meta.get("nt", 1)),
+            z_positions_um=ctx_meta.get("z_positions_um"),
+            state_meta=ctx_meta.get("state_meta", {}),
+            yx_shape=tuple(ctx_meta["yx_shape"]) if ctx_meta.get("yx_shape") else None,
+        )
+
+    def _compute(self, frames: List[dict]) -> Dict[str, np.ndarray]:
+        routine, cache = self.ensure_routine(self.spec_dict)
+
+        # Assemble inputs[state] = (F, Z, Y, X), ordered by (state_frame_index, z_index).
+        inputs: Dict[str, np.ndarray] = {}
+        for state, sspec in self.input_state_specs.items():
+            f = int(sspec["frames_per_visit"])
+            z = int(self.ctx_meta["nz"]) if sspec["acquire_z_stack"] else 1
+            state_frames = sorted(
+                (fr for fr in frames if fr["state"] == state),
+                key=lambda fr: (fr["state_frame_index"], fr["z_index"]),
+            )
+            if len(state_frames) != f * z:
+                raise ValueError(
+                    f"postprocess group {self.group_key}: expected {f * z} frames of {state!r} "
+                    f"(F={f} × Z={z}), got {len(state_frames)}"
+                )
+            stack = np.stack([fr["image"] for fr in state_frames], axis=0)
+            inputs[state] = stack.reshape((f, z) + stack.shape[1:])
+
+        ctx = self.build_context(self.ctx_meta, cache, self._log)
+        return routine.process(inputs, ctx, dict(self.spec_dict.get("params", {})))
+
+    def _coerce_output(self, arr: np.ndarray, spec: dict, frames: List[dict]) -> np.ndarray:
+        from control.postprocessing.base import DTYPE_INPUT
+
+        arr = np.asarray(arr)
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, ...]  # (Y,X) -> (1,Y,X)
+        if arr.shape[0] != spec["z_size"]:
+            raise ValueError(
+                f"output {spec['name']!r} declared z_size={spec['z_size']} but returned {arr.shape[0]} planes"
+            )
+        dtype = spec["dtype"]
+        if dtype == DTYPE_INPUT:
+            dtype = frames[0]["image"].dtype
+        return arr.astype(dtype, copy=False)
+
+    def _write_output(self, arr: np.ndarray, out_key: str, spec: dict, t_scan: int, capture_time: float) -> int:
+        info = self.capture_info
+        save_format = info.file_saving_option if info.file_saving_option is not None else _def.FILE_SAVING_OPTION
+        z_size = int(spec["z_size"])
+        nt = int(self.ctx_meta.get("nt", 1))
+        wavelength = spec.get("wavelength_nm")
+        color = spec.get("channel_color", "#FFFFFF")
+
+        if save_format == _def.FileSavingOption.ZARR_V3:
+            for zi in range(z_size):
+                ci = CaptureInfo(
+                    position=info.position,
+                    z_index=zi,
+                    capture_time=capture_time,
+                    observation_state=info.observation_state,
+                    save_directory=info.save_directory,
+                    file_id=info.file_id,
+                    region_id=info.region_id,
+                    fov=info.fov,
+                    configuration_idx=0,
+                    time_point=info.time_point,
+                    filename_channel_label=out_key,
+                    array_key=out_key,
+                    save_t_index=t_scan,
+                    save_c_index=0,
+                    save_t_size=nt,
+                    save_c_size=1,
+                    save_z_size=z_size,
+                    array_channel_names=[out_key],
+                    array_channel_colors=[color],
+                    array_channel_wavelengths=[wavelength],
+                    file_saving_option=save_format,
+                    acquisition_root=info.acquisition_root,
+                )
+                sub = SaveZarrJob(
+                    capture_info=ci,
+                    capture_image=JobImage(image_array=arr[zi]),
+                    zarr_writer_info=self.zarr_writer_info,
+                )
+                sub.run()
+            return 1
+
+        # INDIVIDUAL_IMAGES: float-safe direct TIFF write (avoids save_image's
+        # uint/pseudo-color handling). One file per output (+ z suffix if 3D).
+        from control.core.io_simulation import is_simulation_enabled
+
+        if is_simulation_enabled():
+            return 1
+        pad = _def.FILE_ID_PADDING
+        for zi in range(z_size):
+            zsuffix = "" if z_size == 1 else f"_z{zi:03d}"
+            fname = f"{info.region_id}_{info.fov:0{pad}}_{out_key}{zsuffix}.tiff"
+            out_path = os.path.join(info.save_directory, fname)
+            try:
+                tifffile.imwrite(out_path, arr[zi])
+                append_frame_acquisition_time_csv(info, fname, channel=out_key, channel_index=0)
+            except Exception as e:
+                self._log.error(f"Failed to write postprocess output {out_path}: {e}")
+        return 1
+
+    def _maybe_barrier(self, out_key: str) -> Optional[BarrierResult]:
+        info = self.capture_info
+        save_format = info.file_saving_option if info.file_saving_option is not None else _def.FILE_SAVING_OPTION
+        if save_format != _def.FileSavingOption.ZARR_V3:
+            return None
+        if not (self.upload_target and self.upload_target.enabled):
+            return None
+        output_path = self.zarr_writer_info.get_output_path(str(info.region_id), info.fov, out_key)
+        barrier = FlushAndStageUploadJob(
+            time_point=info.time_point or 0,
+            region_id=str(info.region_id),
+            fov=info.fov,
+            output_path=output_path,
+            upload_target=self.upload_target,
+        )
+        return barrier.run()
+
+    def _prepare_display_image(self, arr: np.ndarray) -> np.ndarray:
+        """Produce a display-safe preview plane for the live viewer.
+
+        The live napari/contrast display assumes a single integer dtype and one
+        image size shared across all channels (it re-inits the whole canvas when
+        either changes). So a float output must be normalized to the raw camera
+        dtype (uint16) and kept at its native resolution (which, for image-in →
+        image-out routines, matches the camera frame) — otherwise it thrashes the
+        viewer every frame. Integer outputs pass through unchanged.
+        """
+        plane = arr[arr.shape[0] // 2] if arr.ndim == 3 else arr
+        if np.issubdtype(plane.dtype, np.integer):
+            return np.ascontiguousarray(plane.astype(np.uint16, copy=False))
+        finite = plane[np.isfinite(plane)]
+        lo = float(finite.min()) if finite.size else 0.0
+        hi = float(finite.max()) if finite.size else 1.0
+        if hi <= lo:
+            return np.zeros(plane.shape, dtype=np.uint16)
+        scaled = (np.clip(plane, lo, hi) - lo) / (hi - lo) * 65535.0
+        return np.ascontiguousarray(scaled.astype(np.uint16))
+
+
+@dataclass
+class PostprocessWarmupJob:
+    """Precompute a routine's FOV-shared state before the first hardware trigger.
+
+    Runs in the PostprocessJob runner subprocess (so it populates the same
+    process-local routine cache the per-FOV ``PostprocessJob``s read). Calls
+    ``routine.warmup(...)`` with the run geometry (incl. camera ``yx_shape``), so
+    e.g. waveorder's transfer function is factorized up front and the first FOV's
+    reconstruction is a cache hit instead of a multi-second stall.
+
+    Like ``FlushAndStageUploadJob`` this is not a frame ``Job``: the ``JobRunner``
+    only needs ``job_id``, ``run()``, and an (empty) ``capture_image``.
+    """
+
+    _log: ClassVar = squid.logging.get_logger("PostprocessWarmupJob")
+
+    label: str = ""
+    spec_dict: Dict = field(default_factory=dict)
+    input_state_specs: Dict[str, Dict] = field(default_factory=dict)
+    ctx_meta: Dict = field(default_factory=dict)
+
+    job_id: str = field(default_factory=lambda: str(uuid4()))
+    capture_image: JobImage = field(default_factory=lambda: JobImage(image_array=None))
+
+    def run(self) -> PostprocessWarmupResult:
+        from control.postprocessing.base import InputStateSpec
+
+        key = postprocess_routine_key(self.spec_dict)
+        try:
+            routine, cache = PostprocessJob.ensure_routine(self.spec_dict)
+            ctx = PostprocessJob.build_context(self.ctx_meta, cache, self._log)
+            input_states = {
+                name: InputStateSpec(
+                    state=name,
+                    acquire_z_stack=bool(s["acquire_z_stack"]),
+                    frames_per_visit=int(s["frames_per_visit"]),
+                )
+                for name, s in self.input_state_specs.items()
+            }
+            routine.warmup(input_states, ctx, dict(self.spec_dict.get("params", {})))
+            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=True)
+        except Exception as e:
+            # Non-fatal: fall back to lazy compute on the first FOV.
+            self._log.warning(f"Postprocess warmup for {self.label!r} failed (will compute lazily): {e}")
+            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=False, error=str(e))
+
+
 # These are debugging jobs - they should not be used in normal usage!
 class HangForeverJob(Job):
     def run(self) -> bool:
@@ -1409,6 +1830,13 @@ class JobRunner(multiprocessing.Process):
         if isinstance(job, FlushAndStageUploadJob):
             job.upload_target = self._upload_target
 
+        # PostprocessJob writes derived zarr plates + runs its own upload barriers
+        # inline, so it needs the same injected context as the zarr runner.
+        if isinstance(job, PostprocessJob):
+            job.zarr_writer_info = self._zarr_writer_info
+            job.acquisition_info = self._acquisition_info
+            job.upload_target = self._upload_target
+
         # Calculate image bytes for backpressure tracking
         image_bytes = 0
         if self._bp_pending_jobs is not None:
@@ -1598,6 +2026,11 @@ class JobRunner(multiprocessing.Process):
         if self._upload_input_queue is not None:
             FlushAndStageUploadJob._upload_input_queue = self._upload_input_queue
             self._log.info("Upload input queue installed on FlushAndStageUploadJob")
+
+        # PostprocessJob holds accumulated frame bytes across job completions, so
+        # give it the shared backpressure Value/Event to keep them accounted for.
+        PostprocessJob._bp_pending_bytes = self._bp_pending_bytes
+        PostprocessJob._bp_capacity_event = self._bp_capacity_event
 
         # Signal to main process that we're ready to receive jobs
         self._ready_event.set()

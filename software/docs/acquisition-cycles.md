@@ -41,6 +41,11 @@ composes several of them into an ordered, repeatable sequence.
 - **`AcquisitionCycle`** — a named, saved sequence: an outer `repeat` over an
   ordered list of items (steps, waits, groups, and/or FPM darkfield items).
   References states **by name** so it tracks preset edits.
+- **`PostprocessSpec`** — an optional online-postprocessing assignment on a
+  `CycleStep`, FPM item, or `CycleGroup`. The referenced routine consumes all
+  frames the item produces per FOV visit and its outputs are saved *instead* of
+  the raw frames (raw inputs are never written). Group-level = pool all member
+  steps into one invocation. See [online-postprocessing.md](online-postprocessing.md).
 
 Cycles are saved per profile under `cycles/{name}.yaml`, alongside
 `observation_presets/`, via the config repo
@@ -74,8 +79,13 @@ land on its `T` axis); the count is computed, never hardcoded.
 Density is decided **statically per region** at plan-build time, over the
 *flattened concatenation of all selected cycles for that region*:
 
-> **Dense** ⟺ every *imaged* state has the same total frame count
-> (stimulus-only steps are zero-frame events, excluded). Otherwise **ragged**.
+> **Dense** ⟺ every *imaged, saved* state has the same total frame count
+> (stimulus-only steps are zero-frame events, excluded; postprocessed steps save
+> no raw frame, so they are excluded too). Otherwise **ragged**.
+
+Postprocessed events are excluded from the dense/ragged decision and the raw
+`array_keys` — their derived outputs are always separate side plates
+(`{label}_{output}.ome.zarr`). See [online-postprocessing.md](online-postprocessing.md).
 
 | Layout | ZARR_V3 | OME-TIFF | INDIVIDUAL_IMAGES |
 |---|---|---|---|
@@ -147,6 +157,10 @@ filenames are unchanged.
   sweep has a **Full z-stack** checkbox (column 3, default on); unchecking it
   captures that step/sweep only at the reference/focus plane (see *Z-stack
   interaction*). For an FPM sweep the one checkbox locks all its frames.
+  A **Postprocess** column (column 4) assigns an online routine to a step, FPM
+  sweep, or group (group-level pools all member steps). "Save raw" (default)
+  saves normally; a routine's outputs are saved instead of the raw frames. See
+  [online-postprocessing.md](online-postprocessing.md).
 - **Per-Point Channels** assigns different selected cycles (advanced) or observation
   states (simple) per region. The widget pushes the selection via a single mode-aware
   `_push_channel_selection_to_controller`, wired to `set_region_cycle_map` (advanced) or
@@ -163,6 +177,7 @@ filenames are unchanged.
 | `control/core/job_processing.py` | dense/ragged routing from self-describing `CaptureInfo` |
 | `control/core/utils_ome_tiff_writer.py` | OME-TIFF dense T-fold / ragged per-state files |
 | `gui/widgets/multipoint.py` | cycle checklist + `CycleEditorDialog` |
+| `control/postprocessing/` | online-postprocessing routines + registry (see [online-postprocessing.md](online-postprocessing.md)) |
 
 ## Tests
 

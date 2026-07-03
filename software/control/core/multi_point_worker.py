@@ -63,6 +63,10 @@ from control.core.job_processing import (
     DownsampledViewResult,
     FlushAndStageUploadJob,
     BarrierResult,
+    PostprocessJob,
+    PostprocessResult,
+    PostprocessWarmupJob,
+    PostprocessWarmupResult,
     append_frame_acquisition_time_csv,
 )
 from control.core.zarr_upload import (
@@ -751,6 +755,16 @@ class MultiPointWorker:
                 _index_events([("state", (n, True)) for n in self.observation_state_names])
             )
         self._region_plans = dict(acquisition_parameters.resolved_region_plans or {})
+        # True if any plan carries online-postprocessing assignments (adds a
+        # PostprocessJob runner + routes those frames away from the save jobs).
+        self._has_postprocess = any(
+            p is not None and p.postprocess_groups
+            for p in [self._global_plan, *self._region_plans.values()]
+        )
+        # Size of the most recent frame sent to the live display; postprocess
+        # output previews are only displayed when they match it (the shared
+        # napari/contrast viewer holds one image size across all channels).
+        self._last_raw_display_shape: Optional[Tuple[int, int]] = None
         # Imaged channel axis (C order) and per-channel display metadata, used for
         # zarr/omero naming. Resolved lazily so a None pixel/illumination config
         # in tests doesn't break construction.
@@ -916,6 +930,12 @@ class MultiPointWorker:
         if extra_job_classes:
             job_classes.extend(extra_job_classes)
 
+        # Online postprocessing runs in its own runner (created only when a plan
+        # uses it). It writes derived plates via inline SaveZarrJob / direct TIFF
+        # and needs the zarr writer info + upload pipeline like the zarr runner.
+        if self._has_postprocess and not self.skip_saving:
+            job_classes.append(PostprocessJob)
+
         # Downsampled view generation setup
         # Only generate downsampled views for well-based acquisitions
         is_select_wells = acquisition_parameters.xy_mode == "Select Wells"
@@ -1063,11 +1083,20 @@ class MultiPointWorker:
                 f"-> {self._upload_target.remote_root}, "
                 f"delete_after_verify={self._upload_target.delete_after_verify}"
             )
-            fovs_per_tp = sum(
-                len(coords) for coords in self.scan_region_fov_coords_mm.values()
-            )
+            # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
+            # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
+            # run has len(array_keys) raw plates, and postprocessing adds one per
+            # derived output. Seeding to bare FOV count made _maybe_batched_delete
+            # fire after only 1/N barriers for ragged/postprocess runs (deletion
+            # would then never reclaim later shards). Count keys per FOV per region.
+            barriers_per_tp = 0
+            for region_id, coords in self.scan_region_fov_coords_mm.items():
+                plan = self._get_region_plan(region_id)
+                raw_keys = 1 if plan.dense else len(plan.array_keys)
+                keys_per_fov = raw_keys + len(plan.derived_output_keys)
+                barriers_per_tp += len(coords) * keys_per_fov
             for tp in range(self.Nt):
-                self._upload_expected_count_by_tp[tp] = fovs_per_tp
+                self._upload_expected_count_by_tp[tp] = barriers_per_tp
                 self._upload_tasks_by_tp[tp] = set()
                 self._upload_results_by_tp[tp] = []
 
@@ -1118,12 +1147,12 @@ class MultiPointWorker:
                     # Only the SaveZarrJob runner needs the upload pipeline — barriers
                     # are dispatched onto its queue so they FIFO-order behind preceding
                     # SaveZarrJobs for the same (t, fov).
-                    runner_upload_target = (
-                        self._upload_target if job_class is SaveZarrJob else None
-                    )
-                    runner_upload_queue = (
-                        upload_queue_for_zarr_runner if job_class is SaveZarrJob else None
-                    )
+                    # The zarr runner AND the postprocess runner both flush+stage
+                    # uploads (the latter for its derived plates, via inline
+                    # FlushAndStageUploadJob), so both need the upload pipeline.
+                    needs_upload = job_class in (SaveZarrJob, PostprocessJob)
+                    runner_upload_target = self._upload_target if needs_upload else None
+                    runner_upload_queue = upload_queue_for_zarr_runner if needs_upload else None
                     job_runner = control.core.job_processing.JobRunner(
                         self.acquisition_info,
                         cleanup_stale_ome_files=use_ome_tiff,
@@ -2484,27 +2513,109 @@ class MultiPointWorker:
             # and enqueued the upload task; track its task_id so we can match
             # the matching UploadResult later.
             elif isinstance(job_result.result, BarrierResult):
-                br = job_result.result
-                if br.submitted:
-                    self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
-                elif self._upload_target is not None:
-                    # Barrier ran but didn't submit (no writer / no shards).
-                    # Account it as completed-non-uploading so the timepoint
-                    # tally can still close.
-                    self._upload_results_by_tp.setdefault(br.time_point, []).append(
-                        UploadResult(
-                            task_id=br.task_id,
-                            time_point=br.time_point,
-                            region_id=br.region_id,
-                            fov=br.fov,
-                            success=True,
-                            uploaded_paths=[],
-                            failed_paths=[],
-                            error=None,
-                        )
+                self._handle_barrier_result(job_result.result)
+            # Handle PostprocessResult - derived plates were written; feed each
+            # embedded upload barrier through the same accounting as raw plates
+            # and push the output previews to the live display.
+            elif isinstance(job_result.result, PostprocessResult):
+                pr = job_result.result
+                if pr.error is not None:
+                    self._log.error(
+                        "Postprocess group %s failed at t=%d region=%s fov=%d: %s",
+                        pr.group_key, pr.time_point, pr.region_id, pr.fov, pr.error,
                     )
-                    self._maybe_batched_delete(br.time_point)
+                    self._acquisition_error_count += 1
+                    if self._slack_notifier is not None:
+                        try:
+                            self._slack_notifier.notify_error(
+                                f"Postprocess {pr.group_key} failed: {pr.error}",
+                                {"time_point": pr.time_point, "region_id": pr.region_id, "fov": pr.fov},
+                            )
+                        except Exception as e:
+                            self._log.warning(f"Failed to send Slack error notification: {e}")
+                for br in pr.barrier_results:
+                    self._handle_barrier_result(br)
+                self._emit_postprocess_display(pr)
+                return pr.error is None
+            # Pre-acquisition routine warmup finished (non-fatal if it failed).
+            elif isinstance(job_result.result, PostprocessWarmupResult):
+                wr = job_result.result
+                if wr.ok:
+                    self._log.info(f"Postprocess routine warmup complete: {wr.label}")
+                else:
+                    self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
             return True
+
+    def _handle_barrier_result(self, br: "BarrierResult") -> None:
+        """Track an upload barrier: register its task_id (submitted) or account it
+        as completed-non-uploading (no writer/shards) so the timepoint tally can
+        still close. Shared by the raw-plate and derived-plate (postprocess) paths."""
+        if br.submitted:
+            self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
+        elif self._upload_target is not None:
+            self._upload_results_by_tp.setdefault(br.time_point, []).append(
+                UploadResult(
+                    task_id=br.task_id,
+                    time_point=br.time_point,
+                    region_id=br.region_id,
+                    fov=br.fov,
+                    success=True,
+                    uploaded_paths=[],
+                    failed_paths=[],
+                    error=None,
+                )
+            )
+            self._maybe_batched_delete(br.time_point)
+
+    def _emit_postprocess_display(self, pr: "PostprocessResult") -> None:
+        """Push each derived output preview to the live image display.
+
+        Synthesizes a CameraFrame + CaptureInfo (labelled with the output key) so
+        the derived image flows through the same signal_new_image path as raw
+        frames. Best-effort — display must never break the acquisition.
+        """
+        src = pr.source_capture_info
+        if src is None or not pr.display_images:
+            return
+        import dataclasses
+        import squid.abc
+        from squid.config import CameraPixelFormat
+
+        for out_key, image in pr.display_images.items():
+            # The live display shares one image size + integer dtype across all
+            # channels; a preview that doesn't match the current raw-frame size
+            # would thrash the viewer (re-init every frame). Skip mismatches —
+            # the output is still saved to its plate.
+            if self._last_raw_display_shape is not None and image.shape[:2] != self._last_raw_display_shape:
+                self._log.debug(
+                    "Skipping live display of %s: shape %s != live frame %s",
+                    out_key, image.shape[:2], self._last_raw_display_shape,
+                )
+                continue
+            try:
+                os_copy = src.observation_state.model_copy(update={"name": out_key})
+                info = dataclasses.replace(
+                    src,
+                    observation_state=os_copy,
+                    filename_channel_label=out_key,
+                    postprocess_group=None,
+                    array_key=None,
+                    save_t_index=None,
+                    save_c_index=None,
+                    save_t_size=None,
+                    save_c_size=None,
+                    save_z_size=None,
+                )
+                frame = squid.abc.CameraFrame(
+                    frame_id=0,
+                    timestamp=src.capture_time,
+                    frame=image,
+                    frame_format=squid.abc.CameraFrameFormat.RAW,
+                    frame_pixel_format=CameraPixelFormat.MONO16,
+                )
+                self.callbacks.signal_new_image(frame, info)
+            except Exception as e:
+                self._log.debug(f"Could not display postprocess output {out_key}: {e}")
 
     def _handle_downsampled_view_result(self, result: DownsampledViewResult) -> None:
         """Update plate view with completed well image."""
@@ -2555,12 +2666,158 @@ class MultiPointWorker:
     def _create_job(self, job_class: Type[Job], info: CaptureInfo, image: np.ndarray) -> Optional[Job]:
         """Create a job instance for the given job class.
 
-        Returns None if the job should be skipped.
+        Returns None if the job should be skipped for this frame. Postprocessed
+        frames (``info.postprocess_group`` set) go ONLY to the PostprocessJob
+        runner — their raw image is never saved and must not feed the save jobs
+        or the downsampled-view accumulators. Non-postprocessed frames skip the
+        PostprocessJob runner.
         """
+        is_postprocessed = info.postprocess_group is not None
+        if job_class is PostprocessJob:
+            return self._create_postprocess_job(info, image) if is_postprocessed else None
+        if is_postprocessed:
+            return None  # raw frame not saved / not downsampled
         if job_class == DownsampledViewJob:
             return self._create_downsampled_view_job(info, image)
-        else:
-            return job_class(capture_info=info, capture_image=JobImage(image_array=image))
+        return job_class(capture_info=info, capture_image=JobImage(image_array=image))
+
+    def _create_postprocess_job(self, info: CaptureInfo, image: np.ndarray) -> Optional[PostprocessJob]:
+        """Build a PostprocessJob for one accumulated frame of a postprocess group."""
+        plan = self._get_region_plan(info.region_id)
+        group = plan.postprocess_groups.get(info.postprocess_group)
+        if group is None:
+            self._log.error(
+                "Postprocess frame for unknown group %r in region %s; skipping.",
+                info.postprocess_group,
+                info.region_id,
+            )
+            return None
+        expected = 0
+        for s in group.input_states.values():
+            expected += s.frames_per_visit * (self.NZ if s.acquire_z_stack else 1)
+        ctx_meta = self._postprocess_ctx_meta(group)
+        output_specs = [
+            {
+                "name": o.name,
+                "z_size": o.z_size,
+                "dtype": o.dtype,
+                "channel_color": o.channel_color,
+                "wavelength_nm": o.wavelength_nm,
+            }
+            for o in group.outputs
+        ]
+        input_state_specs = {
+            name: {"acquire_z_stack": s.acquire_z_stack, "frames_per_visit": s.frames_per_visit}
+            for name, s in group.input_states.items()
+        }
+        return PostprocessJob(
+            capture_info=info,
+            capture_image=JobImage(image_array=image),
+            group_key=info.postprocess_group,
+            label=group.label,
+            spec_dict=group.spec.model_dump(mode="json"),
+            expected_frames=expected,
+            output_specs=output_specs,
+            input_state_specs=input_state_specs,
+            ctx_meta=ctx_meta,
+        )
+
+    def _postprocess_frame_shape(self):
+        """Expected camera frame (Y, X) for this run, or None if unknown.
+
+        Known before the first capture (from the configured ROI + software crop),
+        so routine warmup can precompute frame-shape-dependent state.
+        """
+        try:
+            w, h = self.camera.get_crop_size()
+            return (int(h), int(w))
+        except Exception:
+            return None
+
+    def _postprocess_ctx_meta(self, group) -> dict:
+        """Run geometry + per-group state metadata handed to a routine's context.
+        Shared by the per-FOV job and the pre-acquisition warmup so their cache
+        keys match (first FOV is then a cache hit)."""
+        state_meta = {}
+        for name in group.input_states:
+            _color, wl = self._channel_display_meta(name)
+            state_meta[name] = {"wavelength_nm": wl}
+        return {
+            "pixel_size_um": self._pixel_size_um,
+            # self.deltaZ is the mechanical z step in MILLIMETRES (stage units);
+            # convert to micrometres for the routine geometry.
+            "dz_um": (self.deltaZ * 1000.0) if self.NZ > 1 else None,
+            "nz": self.NZ,
+            "nt": self.Nt,
+            "state_meta": state_meta,
+            "yx_shape": self._postprocess_frame_shape(),
+        }
+
+    def _prewarm_postprocess_routines(self) -> None:
+        """Precompute FOV-shared routine state (e.g. transfer functions) BEFORE
+        the first hardware trigger, so the first FOV's compute is a cache hit and
+        never stalls saving/display or backpressures the run.
+
+        Dispatches one PostprocessWarmupJob per distinct routine (deduped by
+        routine identity) to the postprocess runner and waits for them (bounded).
+        A warmup failure is non-fatal — the routine falls back to lazy compute.
+        """
+        if not self._has_postprocess:
+            return
+        runner = None
+        for job_class, jr in self._job_runners:
+            if job_class is PostprocessJob:
+                runner = jr
+                break
+        # Distinct warmup jobs across the global + per-region plans, deduped by
+        # routine identity so an identical routine+params is warmed only once.
+        from control.core.job_processing import postprocess_routine_key
+
+        seen = set()
+        jobs = []
+        for plan in [self._global_plan, *self._region_plans.values()]:
+            if plan is None:
+                continue
+            for group in plan.postprocess_groups.values():
+                spec_dict = group.spec.model_dump(mode="json")
+                key = postprocess_routine_key(spec_dict)
+                if key in seen:
+                    continue
+                seen.add(key)
+                jobs.append(
+                    PostprocessWarmupJob(
+                        label=group.label,
+                        spec_dict=spec_dict,
+                        input_state_specs={
+                            name: {"acquire_z_stack": s.acquire_z_stack, "frames_per_visit": s.frames_per_visit}
+                            for name, s in group.input_states.items()
+                        },
+                        ctx_meta=self._postprocess_ctx_meta(group),
+                    )
+                )
+        if not jobs:
+            return
+        self._log.info(f"Pre-computing {len(jobs)} postprocess routine(s) before acquisition...")
+        if runner is None:
+            # No multiprocessing runner (e.g. USE_MULTIPROCESSING False): run inline.
+            for job in jobs:
+                job.run()
+            return
+        # Make sure the subprocess is up before dispatching (bounded).
+        runner.wait_ready(timeout_s=15.0)
+        for job in jobs:
+            runner.dispatch(job)
+        # Wait for warmups to finish so the first FOV is a cache hit. Bounded so a
+        # hung warmup can't wedge the run — on timeout we proceed (lazy compute).
+        deadline = time.time() + 180.0
+        while runner.has_pending() and time.time() < deadline:
+            if self.abort_requested_fn():
+                break
+            self._summarize_runner_outputs()
+            time.sleep(0.05)
+        self._summarize_runner_outputs()
+        if runner.has_pending():
+            self._log.warning("Postprocess warmup did not finish within timeout; routines will compute lazily.")
 
     def _create_downsampled_view_job(self, info: CaptureInfo, image: np.ndarray) -> Optional[DownsampledViewJob]:
         """Create a DownsampledViewJob for the given capture.
@@ -2940,6 +3197,11 @@ class MultiPointWorker:
         # per-capture stats. Amortizes to ~zero over long runs.
         self._prewarm_observation_states()
 
+        # Precompute FOV-shared postprocessing state (e.g. transfer functions)
+        # before any hardware fires, so the first FOV's compute is a cache hit
+        # and never stalls the first save/display.
+        self._prewarm_postprocess_routines()
+
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
@@ -3047,7 +3309,9 @@ class MultiPointWorker:
             # plan's ordered events preserve interleave / chain order; imaged
             # events capture a frame, stimulus events fire an NIDAQ pulse comb.
             region_plan = self._get_region_plan(region_id)
-            frames_per_pos = region_plan.frames_per_position  # imaged frames per (FOV, z)
+            # Captured (not just saved) frames per (FOV, z): postprocessed events
+            # are captured too, so include them so imaged_step stays aligned.
+            frames_per_pos = region_plan.captured_frames_per_position
             if region_plan.events:
                 imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
                 for event in region_plan.events:
@@ -3107,7 +3371,18 @@ class MultiPointWorker:
                             self.handle_z_offset(config, False)
                         continue  # no frame, no progress tick
 
-                    save_layout = self._build_save_layout(region_plan, event)
+                    # Postprocessed frames are routed to the PostprocessJob runner
+                    # (raw not saved), so they carry no save layout — the group id
+                    # tags the frame for accumulation. A ref-z-only postprocessed
+                    # step still passes NZ frames? No: it is captured only at the
+                    # reference plane like any ref-z step (skip handled above), so
+                    # eff_z_index follows the same rule.
+                    if event.postprocess is not None:
+                        save_layout = None
+                        config_idx = 0
+                    else:
+                        save_layout = self._build_save_layout(region_plan, event)
+                        config_idx = save_layout.c_index
                     # A reference-z-only frame lives at z=0 of its Z=1 array; a
                     # normal frame at its stack level.
                     eff_z_index = z_level if event.acquire_z_stack else 0
@@ -3120,9 +3395,10 @@ class MultiPointWorker:
                                 eff_z_index,
                                 region_id=region_id,
                                 fov=fov,
-                                config_idx=save_layout.c_index,
+                                config_idx=config_idx,
                                 filename_channel_label=preset_name,
                                 save_layout=save_layout,
+                                postprocess_group=event.postprocess_group,
                             )
 
                     if self.NZ == 1:
@@ -3829,9 +4105,15 @@ class MultiPointWorker:
                 self.image_count += 1
 
                 with self._timing.get_timer("job creation and dispatch"):
-                    # Wait for subprocess to be ready before first dispatch
+                    # Wait for subprocess to be ready before first dispatch.
+                    # Skip the PostprocessJob runner here: it only accumulates
+                    # frames (compute happens at group completion), so blocking
+                    # the first capture on its ~1-2s warmup would stall the run
+                    # with illumination on. Its jobs queue fine before it's ready.
                     if not self._first_job_dispatched:
                         for job_class, job_runner in self._job_runners:
+                            if job_class is PostprocessJob:
+                                continue
                             if job_runner is not None:
                                 t_wait_start = time.perf_counter()
                                 if job_runner.wait_ready(timeout_s=10.0):
@@ -3870,6 +4152,11 @@ class MultiPointWorker:
                 #         round(height * self.display_resolution_scaling),
                 #     )
                 with self._timing.get_timer("image_to_display*.emit"):
+                    # Remember the live-display frame size: the shared napari /
+                    # contrast display holds one image size across all channels,
+                    # so a postprocess output preview is only safe to display when
+                    # it matches this (see _emit_postprocess_display).
+                    self._last_raw_display_shape = image.shape[:2]
                     self.callbacks.signal_new_image(camera_frame, info)
 
         finally:
@@ -3893,6 +4180,7 @@ class MultiPointWorker:
         *,
         filename_channel_label: Optional[str] = None,
         save_layout=None,
+        postprocess_group: Optional[str] = None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -3988,6 +4276,7 @@ class MultiPointWorker:
                 array_channel_names=(list(save_layout.channel_names) if save_layout else None),
                 array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
                 array_channel_wavelengths=(list(save_layout.channel_wavelengths) if save_layout else None),
+                postprocess_group=postprocess_group,
             )
             self._current_capture_info = current_capture_info
         # Hot path — demoted to debug so formatting CaptureInfo (dataclass with Pos and

@@ -633,6 +633,125 @@ class FPMClusteredDarkfieldParamsDialog(QDialog):
         }
 
 
+class Phase2DParamsDialog(QDialog):
+    """Edit z-defocus 2D quantitative-phase (waveorder) parameters.
+
+    Pixel size, z-step, and NZ come from the acquisition at run time; only the
+    optical/regularization knobs are set here. Wavelength defaults to the input
+    state's illumination wavelength, detection NA to the current objective NA.
+    """
+
+    _DEFAULTS = {
+        "wavelength_nm": None,
+        "na_detection": None,
+        "na_illumination": None,
+        "index_of_refraction_media": 1.333,
+        "regularization": 0.05,
+        "invert_phase_contrast": False,
+    }
+
+    def __init__(self, params: dict, objective_na=None, default_wavelength_nm=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Phase 2D Parameters")
+        p = {**self._DEFAULTS, **(params or {})}
+        form = QFormLayout(self)
+
+        info = QLabel(
+            "Reconstructs 2D quantitative phase from the brightfield defocus "
+            "z-stack (needs 'Full z-stack' ON, NZ > 1). Pixel size / z-step / NZ "
+            "are taken from the acquisition."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        self.spin_wavelength = QDoubleSpinBox()
+        self.spin_wavelength.setRange(200.0, 2000.0)
+        self.spin_wavelength.setDecimals(0)
+        self.spin_wavelength.setValue(float(p["wavelength_nm"] or default_wavelength_nm or 532))
+        form.addRow("Illumination wavelength (nm)", self.spin_wavelength)
+
+        self.spin_na_det = QDoubleSpinBox()
+        self.spin_na_det.setRange(0.01, 1.6)
+        self.spin_na_det.setSingleStep(0.05)
+        self.spin_na_det.setDecimals(3)
+        self.spin_na_det.setValue(float(p["na_detection"] or objective_na or 0.5))
+        form.addRow("Detection NA", self.spin_na_det)
+
+        self.spin_na_ill = QDoubleSpinBox()
+        self.spin_na_ill.setRange(0.01, 1.6)
+        self.spin_na_ill.setSingleStep(0.05)
+        self.spin_na_ill.setDecimals(3)
+        self.spin_na_ill.setValue(float(p["na_illumination"] or objective_na or 0.4))
+        form.addRow("Illumination NA", self.spin_na_ill)
+
+        self.spin_ri = QDoubleSpinBox()
+        self.spin_ri.setRange(1.0, 2.0)
+        self.spin_ri.setSingleStep(0.01)
+        self.spin_ri.setDecimals(3)
+        self.spin_ri.setValue(float(p["index_of_refraction_media"]))
+        form.addRow("Medium refractive index", self.spin_ri)
+
+        self.spin_reg = QDoubleSpinBox()
+        self.spin_reg.setRange(1e-6, 1.0)
+        self.spin_reg.setDecimals(6)
+        self.spin_reg.setSingleStep(1e-3)
+        self.spin_reg.setValue(float(p["regularization"]))
+        form.addRow("Regularization", self.spin_reg)
+
+        self.chk_invert = QCheckBox("Invert phase contrast")
+        self.chk_invert.setChecked(bool(p["invert_phase_contrast"]))
+        form.addRow(self.chk_invert)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def get_params(self) -> dict:
+        return {
+            "wavelength_nm": int(self.spin_wavelength.value()),
+            "na_detection": float(self.spin_na_det.value()),
+            "na_illumination": float(self.spin_na_ill.value()),
+            "index_of_refraction_media": float(self.spin_ri.value()),
+            "regularization": float(self.spin_reg.value()),
+            "invert_phase_contrast": self.chk_invert.isChecked(),
+        }
+
+
+class ScriptParamsDialog(QDialog):
+    """Generic JSON key/value editor for a custom-script routine's params."""
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Routine Parameters")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Routine params (JSON object passed to the routine):"))
+        self.edit = QPlainTextEdit()
+        self.edit.setPlainText(json.dumps(params or {}, indent=2))
+        layout.addWidget(self.edit)
+        self.err = QLabel("")
+        self.err.setStyleSheet("color: red")
+        layout.addWidget(self.err)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._params = params or {}
+
+    def _on_accept(self):
+        try:
+            parsed = json.loads(self.edit.toPlainText() or "{}")
+            if not isinstance(parsed, dict):
+                raise ValueError("must be a JSON object")
+            self._params = parsed
+            self.accept()
+        except Exception as e:
+            self.err.setText(f"Invalid JSON: {e}")
+
+    def get_params(self) -> dict:
+        return self._params
+
+
 class CycleEditorDialog(QDialog):
     """Modal editor for named acquisition cycles (two-level: outer repeat ->
     ordered steps, where a step can sit inside a one-level repeatable group).
@@ -646,6 +765,7 @@ class CycleEditorDialog(QDialog):
     _FPM_PARAMS_ROLE = Qt.UserRole + 1
     _FPM_CDF_ROLE = Qt.UserRole + 2
     _FPM_BF_ROLE = Qt.UserRole + 3
+    _PP_ROLE = Qt.UserRole + 4  # stored postprocess spec dict (or None = save raw)
 
     _TYPE_ROLE = Qt.UserRole
 
@@ -686,9 +806,10 @@ class CycleEditorDialog(QDialog):
         right.addLayout(name_row)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat", "Full z-stack"])
-        self.tree.setColumnWidth(0, 220)
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat", "Full z-stack", "Postprocess"])
+        self.tree.setColumnWidth(0, 200)
+        self.tree.setColumnWidth(3, 200)
         right.addWidget(self.tree)
 
         tools = QHBoxLayout()
@@ -750,7 +871,154 @@ class CycleEditorDialog(QDialog):
         cb = self.tree.itemWidget(item, 2)
         return cb.isChecked() if cb is not None else True
 
-    def _make_step_widgets(self, item, observation_state="", n_frames=1, acquire_z_stack=True):
+    _PP_SAVE_RAW = "Save raw"
+    _PP_CUSTOM = "Custom script…"
+
+    def _make_postprocess_widgets(self, item, spec=None):
+        """Column-3 postprocess picker: a routine dropdown + a params '…' button.
+
+        The selected spec (routine name / script path / params / label) is stashed
+        on the item's ``_PP_ROLE`` data; ``_read_postprocess`` reads it back. "Save
+        raw" (the default) stores None — the item's frames are saved normally.
+        Placed on step / FPM leaves and on a group (group-level = pool all member
+        steps into one routine invocation).
+        """
+        from control.postprocessing.registry import routine_display_names
+
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(2)
+        combo = QComboBox()
+        combo.addItem(self._PP_SAVE_RAW, None)
+        for rname, disp in routine_display_names():
+            combo.addItem(disp, rname)
+        combo.addItem(self._PP_CUSTOM, "script")
+        btn = QPushButton("Params…")
+        btn.setToolTip("Edit this routine's parameters")
+        h.addWidget(combo, 1)
+        h.addWidget(btn)
+        self.tree.setItemWidget(item, 3, container)
+        item.setData(0, self._PP_ROLE, spec or None)
+        self._sync_pp_widgets(item, combo, btn)
+        combo.currentIndexChanged.connect(
+            lambda _i, it=item, c=combo, b=btn: self._on_pp_combo_changed(it, c, b)
+        )
+        btn.clicked.connect(lambda _c=False, it=item, c=combo, b=btn: self._edit_pp_params(it, c, b))
+
+    def _sync_pp_widgets(self, item, combo, btn):
+        """Set the combo selection + button enabled-state from the item's spec."""
+        spec = item.data(0, self._PP_ROLE)
+        routine = (spec or {}).get("routine")
+        combo.blockSignals(True)
+        if routine is None:
+            combo.setCurrentIndex(0)
+        else:
+            idx = combo.findData(routine)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        btn.setEnabled(routine is not None)
+
+    def _on_pp_combo_changed(self, item, combo, btn):
+        routine = combo.currentData()
+        if routine is None:
+            item.setData(0, self._PP_ROLE, None)
+            btn.setEnabled(False)
+            return
+        spec = dict(item.data(0, self._PP_ROLE) or {})
+        if routine == "script":
+            path, _ = QFileDialog.getOpenFileName(self, "Select routine script", "", "Python (*.py)")
+            if not path:
+                # Cancelled — revert to the previous selection.
+                self._sync_pp_widgets(item, combo, btn)
+                return
+            spec["routine"] = "script"
+            spec["script_path"] = path
+        else:
+            spec["routine"] = routine
+            spec.pop("script_path", None)
+        # Pre-populate params from the routine's defaults so a routine that needs
+        # them (e.g. phase2d: wavelength, NA) works even if the user never opens
+        # the params dialog — then open the dialog so the values are visible and
+        # editable (this is the discoverable mechanism to set/repopulate them).
+        spec.setdefault("params", {})
+        if not spec["params"]:
+            spec["params"] = self._default_params_for(routine, item)
+        item.setData(0, self._PP_ROLE, spec)
+        btn.setEnabled(True)
+        self._edit_pp_params(item, combo, btn)
+
+    def _default_params_for(self, routine, item):
+        """Resolved default params for a freshly-selected routine (empty for a
+        script — its keys are routine-defined)."""
+        if routine == "phase2d":
+            state = self._first_input_state_for(item)
+            wl = None
+            try:
+                _color, wl = self._preset_display_meta(state) if state else (None, None)
+            except Exception:
+                pass
+            dlg = Phase2DParamsDialog(
+                {}, objective_na=self._current_objective_na(), default_wavelength_nm=wl, parent=self
+            )
+            return dlg.get_params()
+        return {}
+
+    def _edit_pp_params(self, item, combo, btn):
+        spec = dict(item.data(0, self._PP_ROLE) or {})
+        routine = spec.get("routine")
+        if routine is None:
+            return
+        if routine == "phase2d":
+            state = self._first_input_state_for(item)
+            _color, wl = (None, None)
+            try:
+                _color, wl = self._preset_display_meta(state) if state else (None, None)
+            except Exception:
+                pass
+            dlg = Phase2DParamsDialog(
+                spec.get("params", {}),
+                objective_na=self._current_objective_na(),
+                default_wavelength_nm=wl,
+                parent=self,
+            )
+        else:
+            dlg = ScriptParamsDialog(spec.get("params", {}), parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            spec["params"] = dlg.get_params()
+            item.setData(0, self._PP_ROLE, spec)
+
+    def _first_input_state_for(self, item):
+        """Best-effort first observation-state name feeding this item/group (for
+        param defaults). For a group, the first member step's state."""
+        kind = item.data(0, self._TYPE_ROLE)
+        if kind == "group":
+            for j in range(item.childCount()):
+                combo = self.tree.itemWidget(item.child(j), 0)
+                if combo is not None and hasattr(combo, "currentText"):
+                    return combo.currentText()
+            return None
+        combo = self.tree.itemWidget(item, 0)
+        return combo.currentText() if (combo is not None and hasattr(combo, "currentText")) else None
+
+    def _preset_display_meta(self, state):
+        """(color, wavelength_nm) for an observation-state preset, best-effort."""
+        preset = self.repo.load_observation_preset(state)
+        wl = None
+        if preset is not None:
+            for ist in getattr(preset, "illuminator_states", []) or []:
+                w = getattr(ist, "emission_wavelength_nm", None) or getattr(ist, "wavelength_nm", None)
+                if w:
+                    wl = int(w)
+                    break
+        return None, wl
+
+    def _read_postprocess(self, item):
+        """Return the stored postprocess spec dict, or None for 'Save raw'."""
+        spec = item.data(0, self._PP_ROLE)
+        return dict(spec) if spec else None
+
+    def _make_step_widgets(self, item, observation_state="", n_frames=1, acquire_z_stack=True, postprocess=None):
         combo = QComboBox()
         names = self._preset_names()
         combo.addItems(names)
@@ -765,8 +1033,9 @@ class CycleEditorDialog(QDialog):
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, spin)
         self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
-    def _make_fpm_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
+    def _make_fpm_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
         """FPM darkfield node: base-preset combo (col 0) + params button (col 1).
 
         The generation parameters live in the item's data role; the button shows
@@ -788,6 +1057,7 @@ class CycleEditorDialog(QDialog):
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
         self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _current_objective_na(self):
         """Live objective NA from the shared objective store (None if unknown)."""
@@ -805,7 +1075,7 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_PARAMS_ROLE, params)
             btn.setText(_fpm_summary(params))
 
-    def _make_fpm_bf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
+    def _make_fpm_bf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
         """Brightfield single-LED-sweep node: base-state combo (col 0) + params
         button (col 1) for full-sweep vs pseudorandom-N; col-2 full-z checkbox."""
         params = {**_default_fpm_bf(), **(params or {})}
@@ -823,6 +1093,7 @@ class CycleEditorDialog(QDialog):
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
         self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _edit_fpm_bf(self, item, btn):
         params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
@@ -832,7 +1103,7 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_BF_ROLE, params)
             btn.setText(_fpm_bf_summary(params))
 
-    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True):
+    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
         """Clustered-darkfield node: base-state combo (col 0) + params button (col 1);
         col-2 full-z checkbox."""
         params = {**_default_fpm_cdf(), **(params or {})}
@@ -850,6 +1121,7 @@ class CycleEditorDialog(QDialog):
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
         self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _edit_fpm_cdf(self, item, btn):
         params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
@@ -859,12 +1131,14 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_CDF_ROLE, params)
             btn.setText(_fpm_cdf_summary(params))
 
-    def _make_group_widgets(self, item, repeat=1):
+    def _make_group_widgets(self, item, repeat=1, postprocess=None):
         item.setText(0, "Group")
         spin = QSpinBox()
         spin.setRange(1, 100000)
         spin.setValue(int(repeat))
         self.tree.setItemWidget(item, 1, spin)
+        # Group-level postprocess pools all member steps into one invocation.
+        self._make_postprocess_widgets(item, postprocess)
 
     def _make_wait_widgets(self, item, duration_ms=1000.0):
         item.setText(0, "Wait (ms)")
@@ -979,27 +1253,31 @@ class CycleEditorDialog(QDialog):
                 return None
             params = item.data(0, self._FPM_PARAMS_ROLE) or _default_fpm_params()
             return {"type": "fpm", "observation_state": combo.currentText(),
-                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         if kind == "fpm_bf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
             return {"type": "fpm_bf", "observation_state": combo.currentText(),
-                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         if kind == "fpm_cdf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
             return {"type": "fpm_cdf", "observation_state": combo.currentText(),
-                    "acquire_z_stack": self._read_zstack_checkbox(item), **params}
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         combo = self.tree.itemWidget(item, 0)
         spin = self.tree.itemWidget(item, 1)
         if combo is None:
             return None
         return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value(),
-                "acquire_z_stack": self._read_zstack_checkbox(item)}
+                "acquire_z_stack": self._read_zstack_checkbox(item),
+                "postprocess": self._read_postprocess(item)}
 
     def _read_tree(self):
         """Return a list of dicts describing top-level items (steps/waits/groups)."""
@@ -1013,7 +1291,8 @@ class CycleEditorDialog(QDialog):
                     leaf = self._read_leaf(item.child(j))
                     if leaf is not None:
                         steps.append(leaf)
-                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps})
+                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps,
+                            "postprocess": self._read_postprocess(item)})
             else:
                 leaf = self._read_leaf(item)
                 if leaf is not None:
@@ -1029,21 +1308,21 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._TYPE_ROLE, "fpm")
             params = {k: entry[k] for k in _default_fpm_params() if k in entry}
             self._make_fpm_widgets(item, entry.get("observation_state", ""), params,
-                                   entry.get("acquire_z_stack", True))
+                                   entry.get("acquire_z_stack", True), entry.get("postprocess"))
         elif entry["type"] == "fpm_bf":
             item.setData(0, self._TYPE_ROLE, "fpm_bf")
             params = {k: entry[k] for k in _default_fpm_bf() if k in entry}
             self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params,
-                                      entry.get("acquire_z_stack", True))
+                                      entry.get("acquire_z_stack", True), entry.get("postprocess"))
         elif entry["type"] == "fpm_cdf":
             item.setData(0, self._TYPE_ROLE, "fpm_cdf")
             params = {k: entry[k] for k in _default_fpm_cdf() if k in entry}
             self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params,
-                                       entry.get("acquire_z_stack", True))
+                                       entry.get("acquire_z_stack", True), entry.get("postprocess"))
         else:
             item.setData(0, self._TYPE_ROLE, "step")
             self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1),
-                                    entry.get("acquire_z_stack", True))
+                                    entry.get("acquire_z_stack", True), entry.get("postprocess"))
 
     def _load_model(self, name, repeat, model):
         self.tree.clear()
@@ -1053,7 +1332,7 @@ class CycleEditorDialog(QDialog):
             if entry["type"] == "group":
                 gitem = QTreeWidgetItem(self.tree)
                 gitem.setData(0, self._TYPE_ROLE, "group")
-                self._make_group_widgets(gitem, entry.get("repeat", 1))
+                self._make_group_widgets(gitem, entry.get("repeat", 1), entry.get("postprocess"))
                 for st in entry.get("steps", []):
                     self._make_leaf_item(gitem, st)
                 gitem.setExpanded(True)
@@ -1078,6 +1357,9 @@ class CycleEditorDialog(QDialog):
             CycleFPMClusteredDarkfield,
         )
 
+        def _pp(it):
+            return it.postprocess.model_dump(mode="json") if getattr(it, "postprocess", None) else None
+
         if isinstance(item, CycleWait):
             return {"type": "wait", "duration_ms": item.duration_ms}
         if isinstance(item, CycleFPMBrightfield):
@@ -1087,6 +1369,7 @@ class CycleEditorDialog(QDialog):
                 "n_leds": item.n_leds,
                 "seed": item.seed,
                 "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
         if isinstance(item, CycleFPMClusteredDarkfield):
             return {
@@ -1096,6 +1379,7 @@ class CycleEditorDialog(QDialog):
                 "inner_na": item.inner_na,
                 "min_overlap": item.min_overlap,
                 "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
         if isinstance(item, CycleFPMDarkfield):
             return {
@@ -1107,12 +1391,14 @@ class CycleEditorDialog(QDialog):
                 "leds_per_pattern": item.leds_per_pattern,
                 "seed": item.seed,
                 "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
         return {
             "type": "step",
             "observation_state": item.observation_state,
             "n_frames": item.n_frames,
             "acquire_z_stack": item.acquire_z_stack,
+            "postprocess": _pp(item),
         }
 
     def _load_cycle(self, name):
@@ -1129,6 +1415,7 @@ class CycleEditorDialog(QDialog):
                         "type": "group",
                         "repeat": item.repeat,
                         "steps": [self._leaf_to_dict(s) for s in item.steps],
+                        "postprocess": item.postprocess.model_dump(mode="json") if item.postprocess else None,
                     }
                 )
             else:
@@ -1157,7 +1444,12 @@ class CycleEditorDialog(QDialog):
             CycleFPMDarkfield,
             CycleFPMBrightfield,
             CycleFPMClusteredDarkfield,
+            PostprocessSpec,
         )
+
+        def _pp(e):
+            spec = e.get("postprocess")
+            return PostprocessSpec(**spec) if spec else None
 
         if entry["type"] == "wait":
             return CycleWait(duration_ms=entry["duration_ms"])
@@ -1169,6 +1461,7 @@ class CycleEditorDialog(QDialog):
                 n_leds=entry.get("n_leds", 0),
                 seed=entry.get("seed", 0),
                 acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry["type"] == "fpm_cdf":
             if not entry.get("observation_state"):
@@ -1179,6 +1472,7 @@ class CycleEditorDialog(QDialog):
                 inner_na=entry.get("inner_na"),
                 min_overlap=entry.get("min_overlap", 0.6),
                 acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry["type"] == "fpm":
             if not entry.get("observation_state"):
@@ -1191,17 +1485,19 @@ class CycleEditorDialog(QDialog):
                 leds_per_pattern=entry.get("leds_per_pattern", 0),
                 seed=entry.get("seed", 0),
                 acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry.get("observation_state"):
             return CycleStep(
                 observation_state=entry["observation_state"],
                 n_frames=entry["n_frames"],
                 acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         return None
 
     def _save_cycle(self):
-        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup
+        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, PostprocessSpec
 
         name = self.edit_name.text().strip()
         if not name:
@@ -1211,9 +1507,21 @@ class CycleEditorDialog(QDialog):
         items = []
         for entry in model:
             if entry["type"] == "group":
-                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in entry["steps"]) if leaf is not None]
+                group_pp = entry.get("postprocess")
+                # A group-level routine pools all member steps, so members must
+                # not carry their own spec (validation rejects that) — clear them.
+                member_dicts = entry["steps"]
+                if group_pp:
+                    member_dicts = [{**s, "postprocess": None} for s in member_dicts]
+                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in member_dicts) if leaf is not None]
                 if steps:
-                    items.append(CycleGroup(repeat=entry["repeat"], steps=steps))
+                    items.append(
+                        CycleGroup(
+                            repeat=entry["repeat"],
+                            steps=steps,
+                            postprocess=PostprocessSpec(**group_pp) if group_pp else None,
+                        )
+                    )
             else:
                 leaf = self._dict_to_leaf(entry)
                 if leaf is not None:
@@ -1272,15 +1580,19 @@ def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hi
         if controller.acquisition_in_progress():
             return ""
         image_count = controller.get_acquisition_image_count()
-        if image_count <= 0:
-            return "Add a region to estimate size"
         disk_bytes = controller.estimate_acquisition_disk_bytes()
     except Exception:
         return "—"
+    # A postprocessing-only cycle saves no raw frames (image_count == 0) but still
+    # writes derived output plates (disk_bytes > 0), so key the "no region" hint
+    # on both being empty.
+    if image_count <= 0 and disk_bytes <= 0:
+        return "Add a region to estimate size"
     fmt = getattr(controller, "file_saving_option", None)
     # ZARR_V3 size is data-dependent (compression); flag it as approximate.
     approx = "≈" if fmt is not None and getattr(fmt, "name", "") == "ZARR_V3" else "~"
-    return f"{image_count:,} images · {approx}{_human_bytes(disk_bytes)}"
+    count_str = f"{image_count:,} images" if image_count > 0 else "postprocessed outputs"
+    return f"{count_str} · {approx}{_human_bytes(disk_bytes)}"
 
 
 def _refresh_size_estimate(widget) -> None:

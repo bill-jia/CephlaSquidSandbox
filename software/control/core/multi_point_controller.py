@@ -184,6 +184,27 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
             "frame_counts": dict(plan.frame_counts),
             "channel_order": list(plan.channel_order),
             "array_keys": list(plan.array_keys),
+            # Online postprocessing: each group's routine spec, member input
+            # states, and the derived output plates (raw inputs are NOT saved).
+            "postprocess_groups": {
+                gid: {
+                    "spec": group.spec.model_dump(mode="json"),
+                    "label": group.label,
+                    "input_states": {
+                        name: {
+                            "acquire_z_stack": s.acquire_z_stack,
+                            "frames_per_visit": s.frames_per_visit,
+                        }
+                        for name, s in group.input_states.items()
+                    },
+                    "outputs": [
+                        {"key": key, "z_size": o.z_size, "dtype": o.dtype}
+                        for key, o in zip(group.output_keys, group.outputs)
+                    ],
+                }
+                for gid, group in plan.postprocess_groups.items()
+            },
+            "derived_output_keys": list(plan.derived_output_keys),
             "events": [
                 {
                     "observation_state": ev.observation_state,
@@ -197,6 +218,8 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
                     # Source-coded FPM: the exact LED indices lit for this frame,
                     # so the reconstruction can recover each multiplexed pattern.
                     "multiplexed_leds": list(ev.multiplexed_leds) if ev.multiplexed_leds else None,
+                    # Postprocess group id this frame feeds (raw frame not saved).
+                    "postprocess_group": ev.postprocess_group,
                 }
                 for ev in plan.events
             ],
@@ -1144,7 +1167,39 @@ class MultiPointController:
             # each). Flat selections have no per-step z-mode, so every state is a
             # full z-stack (az=True) — the global NZ applies to all of them.
             events = _index_events([("state", (n, True)) for n in names], is_stim)
-        return RegionPlan.from_events(events)
+        plan = RegionPlan.from_events(events)
+        self._attach_postprocess_outputs(plan)
+        return plan
+
+    def _attach_postprocess_outputs(self, plan):
+        """Fill each PostprocessGroupPlan's declared outputs by asking its routine.
+
+        Kept out of the (pure) model layer so it can import the routine registry.
+        Raises ValueError with a user-actionable message on any routine/output
+        problem — surfaced pre-flight by validate_acquisition_settings, and again
+        here as a hard stop if resolution is reached without validation.
+        """
+        if not plan.postprocess_groups:
+            return
+        from control.postprocessing.registry import load_routine
+
+        seen_keys = {}
+        for gid, group in plan.postprocess_groups.items():
+            routine = load_routine(group.spec)
+            outputs = routine.describe_outputs(group.input_states, dict(group.spec.params))
+            group.outputs = list(outputs)
+            for key in group.output_keys:
+                if key in seen_keys:
+                    raise ValueError(
+                        f"Postprocess output plate {key!r} is produced by two groups "
+                        f"({seen_keys[key]} and {gid}); set a distinct 'label' on one of them"
+                    )
+                if key in plan.array_keys or key in plan.channel_order:
+                    raise ValueError(
+                        f"Postprocess output plate {key!r} collides with a saved raw array; "
+                        "set a distinct 'label' on the routine"
+                    )
+                seen_keys[key] = gid
 
     def _build_region_plans(self, scan_region_names):
         """Build (global_plan, {region_id: RegionPlan}) for an acquisition.
@@ -1229,6 +1284,60 @@ class MultiPointController:
             return _ZARR_PYRAMID_OVERHEAD / ratio
         return 1.0
 
+    def _output_bytes_per_pixel(self, dtype_str: str) -> int:
+        """Bytes/pixel for a postprocessing output plate of numpy ``dtype_str``.
+
+        The ``"input"`` sentinel inherits the captured frame's single-plane dtype
+        (uint16 grayscale, or 3-byte colour — no pseudo-colour expansion, since the
+        derived array is written as-is). An unknown dtype conservatively assumes
+        float32 (4 bytes).
+        """
+        from control.postprocessing.base import DTYPE_INPUT
+
+        if dtype_str == DTYPE_INPUT:
+            is_color = squid.abc.CameraPixelFormat.is_color_format(self.camera.get_pixel_format())
+            return 3 if is_color else 2
+        try:
+            return int(np.dtype(dtype_str).itemsize)
+        except TypeError:
+            return 4
+
+    def _postprocess_derived_bytes(self) -> int:
+        """On-disk bytes for the derived output plates of any online-postprocessing
+        routines (Advanced cycles).
+
+        Postprocessed steps do NOT save their raw frames, so those are already
+        excluded from ``get_acquisition_image_count`` / ``frames_per_position``.
+        Each routine instead writes its declared outputs: one output-set per FOV
+        visit per scan timepoint, so an output contributes
+        ``Nt × FOVs × z_size × (W × H × dtype_bytes)``, scaled by the same format
+        factor as raw frames (zarr compression + pyramid overhead).
+
+        Like ``get_acquisition_image_count`` this uses the global plan and the
+        total FOV count across regions; the output Y×X is assumed equal to the
+        camera frame (exact for image-in/image-out routines such as phase2d, and
+        a safe over-estimate otherwise). Returns 0 when no postprocessing is
+        configured.
+        """
+        if not (self.selected_cycle_names or self.region_cycle_map):
+            return 0  # postprocessing is an Advanced-cycle feature only
+        plan = self._resolve_plan(self.selected_cycle_names, None)
+        if not plan.postprocess_groups:
+            return 0
+        all_regions_coord_count = sum(
+            len(coords) for coords in self.scanCoordinates.region_fov_coordinates.values()
+        )
+        if all_regions_coord_count == 0:
+            return 0
+        width, height = self.camera.get_crop_size()
+        plane_px = width * height
+        total = 0
+        for group in plan.postprocess_groups.values():
+            for out in group.outputs:
+                bytes_per_plane = plane_px * self._output_bytes_per_pixel(out.dtype)
+                total += self.Nt * all_regions_coord_count * int(out.z_size) * bytes_per_plane
+        return int(total * self._format_size_factor())
+
     def estimate_acquisition_disk_bytes(self) -> int:
         """Fast, format-aware estimate of the image bytes this acquisition will write.
 
@@ -1236,15 +1345,21 @@ class MultiPointController:
         live as the user edits settings. Accounts for:
 
           * cycles / ragged plans (frames per position) via ``get_acquisition_image_count``,
+          * online-postprocessing derived output plates (``_postprocess_derived_bytes``);
+            the postprocessed raw inputs are not saved, so they are already excluded
+            from the raw count and only the derived outputs are added,
           * the selected ``file_saving_option`` (zarr compression + pyramid overhead).
 
-        Returns 0 if nothing would be captured. Raises ValueError if the controller is not
+        Returns 0 if nothing would be written. Raises ValueError if the controller is not
         configured for a valid acquisition.
         """
         image_count = self.get_acquisition_image_count()
-        if image_count == 0:
-            return 0
-        return int(self._raw_bytes_per_image() * self._format_size_factor() * image_count)
+        raw_bytes = (
+            int(self._raw_bytes_per_image() * self._format_size_factor() * image_count)
+            if image_count > 0
+            else 0
+        )
+        return raw_bytes + self._postprocess_derived_bytes()
 
     def get_estimated_acquisition_disk_storage(self):
         """
@@ -2004,6 +2119,80 @@ class MultiPointController:
                         matrix_name,
                     )
                     return False
+
+        # Online postprocessing: routines must load, declare valid outputs whose
+        # plate names don't collide, and only run under supported save formats.
+        if not self._validate_postprocessing():
+            return False
+        return True
+
+    def _validate_postprocessing(self) -> bool:
+        """Pre-flight checks for any online-postprocessing assignments.
+
+        Resolves every selected cycle chain into a plan (which loads each routine
+        and calls describe_outputs — surfacing routine/import/collision errors),
+        then enforces save-format and phase2d-specific constraints. Returns True
+        (with no side effects) when no postprocessing is configured.
+        """
+        try:
+            global_plan, region_plans = self._build_region_plans(
+                list(self.scanCoordinates.region_fov_coordinates.keys())
+                if getattr(self, "scanCoordinates", None) is not None
+                else []
+            )
+        except ValueError as e:
+            # Raised by _attach_postprocess_outputs (unknown routine, bad inputs,
+            # output-name collision) — the message is already user-actionable.
+            self._log.error("Postprocessing configuration error: %s", e)
+            return False
+        except Exception as e:
+            self._log.error("Could not resolve acquisition plan for postprocessing validation: %s", e)
+            return False
+
+        plans = [global_plan, *region_plans.values()]
+        if not any(p is not None and p.postprocess_groups for p in plans):
+            return True  # no postprocessing configured
+
+        if self.skip_saving:
+            self._log.error("Online postprocessing is enabled but 'skip saving' is set — nothing would be written.")
+            return False
+        allowed = (control._def.FileSavingOption.ZARR_V3, control._def.FileSavingOption.INDIVIDUAL_IMAGES)
+        if self.file_saving_option not in allowed:
+            self._log.error(
+                "Online postprocessing supports only ZARR_V3 and INDIVIDUAL_IMAGES saving (current: %s).",
+                getattr(self.file_saving_option, "name", self.file_saving_option),
+            )
+            return False
+
+        waveorder_checked = False
+        for plan in plans:
+            if plan is None:
+                continue
+            for gid, group in plan.postprocess_groups.items():
+                # Group-level assignment already pooled all member steps; a
+                # member also carrying its own spec is a modelling error.
+                # (The resolver overrides members with the group spec, but flag
+                # it so the user's intent isn't silently changed.)
+                if group.spec.routine == "phase2d":
+                    if self.NZ <= 1:
+                        self._log.error("phase2d postprocessing requires a z-stack (NZ > 1); current NZ=%d.", self.NZ)
+                        return False
+                    if not waveorder_checked:
+                        try:
+                            from waveorder.api import phase  # noqa: F401  (pulls in xarray too)
+                        except Exception:
+                            self._log.error(
+                                "phase2d postprocessing needs 'waveorder' (+ xarray, PyWavelets). Install into the squid env:\n"
+                                "  pip install PyWavelets xarray\n"
+                                "  pip install --no-deps --ignore-requires-python -e C:\\Code\\waveorder"
+                            )
+                            return False
+                        waveorder_checked = True
+
+        if control._def.SAVE_DOWNSAMPLED_WELL_IMAGES or control._def.DISPLAY_PLATE_VIEW:
+            self._log.warning(
+                "Downsampled well views are enabled; postprocessed states are excluded from well mosaics."
+            )
         return True
 
     def get_plate_view(self) -> np.ndarray:
