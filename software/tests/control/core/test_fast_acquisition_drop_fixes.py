@@ -159,6 +159,35 @@ def test_writer_drains_ring_on_stop(tmp_path):
     assert writer.get_write_statistics()["frames_written"] == n
 
 
+def test_deferred_writer_holds_then_drains_on_stop(tmp_path):
+    """In deferred mode the writer writes nothing until stop is signaled, then the
+    post-stop drain writes the whole capture held in the RAM ring."""
+    import time
+
+    h, w = 2, 2
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=16, max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    n = 8
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="raw",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    writer.start()
+    # While "capture" is running (stop not signaled), deferred mode must not drain.
+    time.sleep(0.1)
+    assert writer.get_write_statistics()["frames_written"] == 0
+    assert buf.get_buffer_status()["available_frames"] == n  # all still held in RAM
+    # Burst complete -> post-stop drain writes everything.
+    writer.stop(wait=True)
+    assert not writer.is_alive()
+    assert writer.get_write_statistics()["frames_written"] == n
+
+
 def _run_tiff_writer(tmp_path, n, h, w):
     buf = FastAcquisitionFrameBuffer(
         buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16

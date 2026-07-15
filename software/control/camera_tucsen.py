@@ -165,11 +165,18 @@ TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3,
 
 
 # Depth of the SDK's internal trigger ring during fast acquisition, expressed as
-# seconds of frames at the capture rate. The single-copy consumer (frame_sink ->
-# write_frame_from_ptr) keeps up with the camera, so a small ring is enough to absorb
-# scheduling jitter; increase if drops reappear at higher rates. Bounded by the RAM cap.
-FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS = 0.5
-FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES = 4 * 1024**3  # 4 GiB cap (tune to installed RAM)
+# seconds of frames at the capture rate. This is the ONLY buffer that can absorb a
+# stall of the SDK callback thread (the thread that copies SDK->ring): while that
+# thread is stalled, frames cannot reach our ring at all, so the (large) host ring
+# does not help — only SDK-side depth does. It must therefore exceed the worst
+# callback-thread stall. Observed callback stalls at 2400x600 800 Hz reach a few
+# hundred ms (GIL contention with the writer's per-frame copy + OS scheduling of a
+# ~20 GiB working set), so 0.5s dropped ~2% of frames; 2.0s rides them out with
+# margin. Bounded by the RAM cap below — keep it consistent with the ring-buffer
+# RAM headroom in fast_acquisition_controller (the SDK ring is allocated in addition
+# to the host ring). Increase if drops reappear at higher rates / larger frames.
+FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS = 2.0
+FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES = 6 * 1024**3  # 6 GiB cap (tune to installed RAM)
 
 
 # ============================================================================
@@ -1232,11 +1239,11 @@ class TucsenCamera(AbstractCamera):
         if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
             raise CameraError("Fast acquisition requires HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode")
 
-        # Size the SDK's internal trigger ring (nBufFrames). The single-copy consumer
-        # (frame_sink -> write_frame_from_ptr) keeps up with the camera, so only a small
-        # cushion is needed to absorb scheduling jitter — a fixed window of frames at the
-        # capture rate, bounded by a RAM budget. (Previously this was sized to the whole
-        # capture as a hedge against the slow multi-copy consumer.)
+        # Size the SDK's internal trigger ring (nBufFrames). This is the only buffer that
+        # absorbs a stall of the SDK callback thread (frames cannot reach our host ring
+        # while that thread is stalled), so it is sized as a window of seconds at the
+        # capture rate — deep enough to ride out the worst callback stall — bounded by a
+        # RAM budget. See FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS.
         roi = self.get_region_of_interest()  # (x, y, w, h)
         sdk_slot_bytes = max(1, int(roi[2]) * int(roi[3]) * 2)  # SDK delivers unpacked 16-bit
         budget_cap = max(4, FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES // sdk_slot_bytes)

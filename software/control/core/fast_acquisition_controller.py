@@ -38,10 +38,26 @@ from control.nidaq import (
 # ~1.7 GiB/s ingest for 2400x600 12-bit-packed at 800 Hz), so RAM — not the disk —
 # must absorb the burst; the writer keeps draining during and after it. The budget
 # is the RAM available at start minus a headroom that covers the camera SDK trigger
-# buffer, the post-capture TIFF/Zarr conversion chunks, and the OS.
-FAST_ACQ_RING_RAM_HEADROOM_BYTES = 8 * 1024**3
+# buffer, the post-capture TIFF/Zarr conversion chunks, and the OS. The camera SDK
+# trigger ring (camera_tucsen.FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES, up to 6 GiB) is
+# allocated *after* this ring, so the headroom must stay above it or the two together
+# can over-commit RAM and induce swapping (which would worsen the very callback stalls
+# the SDK ring exists to absorb).
+FAST_ACQ_RING_RAM_HEADROOM_BYTES = 10 * 1024**3
 # Floor for the ring budget on a RAM-starved host.
 FAST_ACQ_RING_BUFFER_MIN_BYTES = 4 * 1024**3
+
+# When the whole capture fits in the RAM ring, hold every frame in RAM and write
+# NOTHING to disk until the trigger burst completes, so the capture window generates
+# no NVMe write DMA. This removes disk<->camera DMA/interrupt contention (the leading
+# cause of the residual isolated single-frame drops that survive ample buffering and
+# a sub-max frame rate). Trade-off: no incremental on-disk persistence during the
+# burst (data lives only in RAM until the burst ends, then flushes), and peak ring
+# occupancy is the whole capture instead of just the disk deficit. Set False to
+# restore the stream-to-disk-during-capture path as an instant rollback.
+# Only applied when the capture is bounded and fits in the ring (never in continuous
+# mode or when the capture exceeds RAM — those must drain to disk during the burst).
+FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE = True
 
 
 def ring_frames_for_capture(
@@ -237,6 +253,20 @@ class FastAcquisitionController:
             # silently overwriting already-captured frames.
             overwrite_when_full=False,
         )
+        # Defer disk writes to after the burst only when the whole capture is held in
+        # the ring — a bounded capture that fits. In continuous mode or when the
+        # capture exceeds the ring, the writer must drain to disk during the burst.
+        defer_writes = bool(
+            FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE
+            and self._num_frames
+            and ring_size >= int(self._num_frames)
+        )
+        if defer_writes:
+            self._log.info(
+                f"Deferring disk writes until capture completes: the {ring_size}-frame ring holds "
+                f"the whole {self._num_frames}-frame capture, so the burst window stays free of NVMe "
+                f"write DMA (writes flush afterward)"
+            )
         self._frame_writer = FastAcquisitionWriter(
             frame_buffer=self._frame_buffer,
             output_path=self._output_path,
@@ -244,6 +274,7 @@ class FastAcquisitionController:
             byte_decoding_fn=self._camera._byte_decoding_fn,
             frame_shape=frame_shape,
             dtype=dtype,
+            defer_writes_until_stop=defer_writes,
         )
 
     def _cleanup_camera_acquisition_resources(self) -> None:

@@ -44,7 +44,8 @@ class FastAcquisitionWriter(threading.Thread):
         frames_per_file: int = 1000,
         byte_decoding_fn: Optional[Callable[[bytes, dict], np.ndarray]] = None,
         frame_shape: Optional[Tuple[int, int]] = None,
-        dtype: Optional[np.dtype] = None
+        dtype: Optional[np.dtype] = None,
+        defer_writes_until_stop: bool = False,
     ):
         super().__init__(daemon=True)
         self._log = squid.logging.get_logger(self.__class__.__name__)
@@ -52,6 +53,12 @@ class FastAcquisitionWriter(threading.Thread):
         self._frame_buffer = frame_buffer
         self._output_path = output_path
         self._file_format = file_format.lower()
+        # When True, do not drain the ring to disk while capture is running; hold every
+        # frame in the RAM ring and let the post-stop drain write them all once the burst
+        # ends. Keeps the capture window free of NVMe write DMA (see the controller's
+        # FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE). The caller guarantees the ring holds
+        # the whole capture before enabling this.
+        self._defer_writes_until_stop = defer_writes_until_stop
         self._frame_timestamps_ms: List[float] = []
         self._frames_per_file = frames_per_file
         self._byte_decoding_fn = byte_decoding_fn
@@ -120,19 +127,29 @@ class FastAcquisitionWriter(threading.Thread):
             self._stop_event.set()
 
         try:
-            while not self._stop_event.is_set():
-                # Read frame from buffer
-                frame_data = self._frame_buffer.read_frame()
+            if self._defer_writes_until_stop:
+                # Hold: leave every frame in the RAM ring while capture runs so the burst
+                # window issues no disk writes (no NVMe DMA to contend with camera capture
+                # DMA). The whole capture fits in the ring; the post-stop drain below writes
+                # it all once the burst ends.
+                self._log.info("Writer holding frames in RAM until capture completes (deferred disk writes)")
+                while not self._stop_event.is_set():
+                    time.sleep(0.005)
+            else:
+                while not self._stop_event.is_set():
+                    # Read frame from buffer
+                    frame_data = self._frame_buffer.read_frame()
 
-                if frame_data is None:
-                    time.sleep(0.001)
-                    continue
+                    if frame_data is None:
+                        time.sleep(0.001)
+                        continue
 
-                self._consume_frame(frame_data)
+                    self._consume_frame(frame_data)
 
             # Drain any frames still in the ring after stop was signaled. The producer
             # (SDK callback) can deliver a backlog faster than we write it to disk;
             # exiting the moment _stop_event fires would silently truncate the capture.
+            # In deferred mode this drain writes the entire capture.
             drained = 0
             while True:
                 frame_data = self._frame_buffer.read_frame()
