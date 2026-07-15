@@ -2181,17 +2181,28 @@ class FastAcquisitionWidget(QWidget):
         self._updating_acquisition_params = False  # Flag to prevent circular updates
         self._camera_state_before_acquisition: Optional[CameraState] = None  # Store camera state before fast acquisition
         self._was_live_before_fast_acquisition: bool = False  # Track live state to restore after acquisition
-        
+        self._max_frame_rate_shown: Optional[Tuple[str, bool]] = None  # (label text, over-max) last rendered
+
         # Initialize UI
         self.init_ui()
-        
+
         # Connect signals to update NIDAQWidget when parameters change
         self._connect_ni_daq_signals()
-        
+
         # Statistics update timer
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self.update_statistics)
         self._stats_timer.setInterval(500)  # Update every 500ms
+
+        # Poll the camera's cached max frame rate so the label tracks ROI /
+        # binning / camera-mode changes made anywhere in the GUI (camera
+        # settings tab, observation-state loads, ...). The camera refreshes
+        # its cache on every such change, so this poll reads an attribute —
+        # no SDK traffic.
+        self._max_frame_rate_timer = QTimer(self)
+        self._max_frame_rate_timer.timeout.connect(self._refresh_max_frame_rate)
+        self._max_frame_rate_timer.start(500)
+        self._refresh_max_frame_rate()
     
     def init_ui(self):
         """Initialize UI components."""
@@ -2242,7 +2253,16 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.setDecimals(2)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
         self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
-        acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
+        self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
+        self.max_frame_rate_label = QLabel("")
+        self.max_frame_rate_label.setToolTip(
+            "Maximum frame rate reported by the camera for the current ROI, binning and camera mode"
+        )
+        frame_rate_cell = QHBoxLayout()
+        frame_rate_cell.setSpacing(4)
+        frame_rate_cell.addWidget(self.frame_rate_spinbox, 1)
+        frame_rate_cell.addWidget(self.max_frame_rate_label)
+        acq_layout.addLayout(frame_rate_cell, 0, 1)
 
         acq_layout.addWidget(QLabel("Exposure Time (ms):"), 0, 2)
         self.exposure_time_spinbox = QDoubleSpinBox()
@@ -2417,6 +2437,31 @@ class FastAcquisitionWidget(QWidget):
         self.output_path = save_dir_base
         self.base_path_is_set = True
     
+    def _refresh_max_frame_rate(self):
+        """
+        Update the max-frame-rate readout beside the frame rate spinbox from the
+        camera's reported maximum for the current ROI / binning / camera mode.
+        Turns red when the requested frame rate exceeds it. Cameras that cannot
+        report a maximum (get_max_acquisition_frame_rate() -> None) show nothing.
+        """
+        try:
+            max_rate_hz = self.camera.get_max_acquisition_frame_rate()
+        except Exception as e:
+            self._log.debug(f"Failed to read max acquisition frame rate: {e}")
+            max_rate_hz = None
+
+        if max_rate_hz is None:
+            text, over = "", False
+        else:
+            text = f"max {max_rate_hz:.1f} Hz"
+            over = self.frame_rate_spinbox.value() > max_rate_hz
+
+        if (text, over) == self._max_frame_rate_shown:
+            return
+        self._max_frame_rate_shown = (text, over)
+        self.max_frame_rate_label.setText(text)
+        self.max_frame_rate_label.setStyleSheet("color: red;" if over else "")
+
     def _update_max_exposure_time(self):
         """
         Update maximum exposure time based on frame rate and camera readout time.

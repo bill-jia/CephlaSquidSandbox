@@ -86,6 +86,50 @@ def test_overwrite_when_full_false_drops_newest():
     assert buf.read_frame() is None
 
 
+def test_ring_full_drops_are_counted():
+    """Every ring-full drop is counted (logging is throttled, counting is not)."""
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=2, max_frame_bytes=4, frame_shape=(1, 2), dtype=np.uint16,
+        overwrite_when_full=False,
+    )
+    payload = np.array([1, 2], dtype=np.uint16).tobytes()
+    assert buf.write_frame(payload, 0, 0.0)
+    assert buf.write_frame(payload, 1, 0.0)
+    for i in range(2, 9):  # 7 drops via both write paths
+        if i % 2:
+            assert buf.write_frame(payload, i, 0.0) is False
+        else:
+            ptr, _keep = _ptr_to(payload)
+            assert buf.write_frame_from_ptr(ptr, len(payload), i, 0.0) is False
+    assert buf.get_buffer_status()["dropped_frames"] == 7
+    buf.clear()
+    assert buf.get_buffer_status()["dropped_frames"] == 0
+
+
+def test_ring_sized_to_available_ram():
+    """The ring covers the whole capture when RAM allows; otherwise it is capped by
+    (available - headroom), with the old 4 GiB budget as the floor."""
+    from control.core.fast_acquisition_controller import (
+        FAST_ACQ_RING_BUFFER_MIN_BYTES,
+        FAST_ACQ_RING_RAM_HEADROOM_BYTES,
+        ring_frames_for_capture,
+    )
+
+    frame_bytes = 2_160_000  # 2400x600 12-bit packed (the Aries "speed" mode frame)
+
+    # 21.6 GB capture, 37 GiB free: whole capture fits in the ring -> zero drops.
+    assert ring_frames_for_capture(500, 10_000, frame_bytes, 37 * 1024**3) == 10_000
+
+    # RAM-starved host: budget floors at the old 4 GiB cap.
+    starved = ring_frames_for_capture(
+        500, 10_000, frame_bytes, FAST_ACQ_RING_RAM_HEADROOM_BYTES + 1024**3
+    )
+    assert starved == FAST_ACQ_RING_BUFFER_MIN_BYTES // frame_bytes
+
+    # Small captures never allocate more than needed; requested size stays the floor.
+    assert ring_frames_for_capture(500, 100, frame_bytes, 37 * 1024**3) == 500
+
+
 def test_writer_drains_ring_on_stop(tmp_path):
     """Frames buffered before stop must be written by the post-loop drain, not lost."""
     h, w = 2, 2

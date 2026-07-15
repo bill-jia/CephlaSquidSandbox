@@ -1639,6 +1639,12 @@ class TucsenCamera(AbstractCamera):
         else:
             return self._trigger_attr.nFrameRate
 
+    def get_max_acquisition_frame_rate(self) -> Optional[float]:
+        # Cached value; _update_internal_settings refreshes it from
+        # AcquisitionMaxFrameRate on every ROI / binning / camera-mode /
+        # trigger-mode change, so reading here costs no SDK traffic.
+        return self._max_acquisition_rate_hz
+
     def get_exposure_limits(self) -> Tuple[float, float]:
         if self._model_properties.is_genicam:
             param_info = self._get_genicam_parameter("ExposureTime")

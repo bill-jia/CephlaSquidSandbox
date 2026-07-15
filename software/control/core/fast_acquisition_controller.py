@@ -15,6 +15,7 @@ import time
 from enum import Enum
 from typing import Any, Optional, Dict, Callable, Union
 import numpy as np
+import psutil
 from scipy import ndimage
 import squid.logging
 import matplotlib.pyplot as plt
@@ -32,10 +33,28 @@ from control.nidaq import (
 )
 
 
-# Upper bound on RAM for the in-memory frame ring during fast acquisition. The ring
-# is sized to hold the whole capture (so a slow disk writer never has to keep up in
-# real time), bounded here so very long captures don't exhaust host memory.
-FAST_ACQ_RING_BUFFER_MAX_BYTES = 4 * 1024**3  # 4 GiB
+# The in-memory frame ring is sized to hold the whole capture whenever RAM allows:
+# the disk is often slower than the camera (e.g. ~1.1 GiB/s sustained NVMe vs
+# ~1.7 GiB/s ingest for 2400x600 12-bit-packed at 800 Hz), so RAM — not the disk —
+# must absorb the burst; the writer keeps draining during and after it. The budget
+# is the RAM available at start minus a headroom that covers the camera SDK trigger
+# buffer, the post-capture TIFF/Zarr conversion chunks, and the OS.
+FAST_ACQ_RING_RAM_HEADROOM_BYTES = 8 * 1024**3
+# Floor for the ring budget on a RAM-starved host.
+FAST_ACQ_RING_BUFFER_MIN_BYTES = 4 * 1024**3
+
+
+def ring_frames_for_capture(
+    requested_buffer_size: int, num_frames: int, max_frame_bytes: int, available_ram_bytes: int
+) -> int:
+    """Ring size (frames) for a finite capture: the whole capture when the RAM budget
+    allows, otherwise as many frames as the budget holds; never below the requested
+    buffer_size."""
+    ring_budget = max(
+        FAST_ACQ_RING_BUFFER_MIN_BYTES, available_ram_bytes - FAST_ACQ_RING_RAM_HEADROOM_BYTES
+    )
+    ring_cap = max(1, int(ring_budget // max(1, max_frame_bytes)))
+    return max(requested_buffer_size, min(int(num_frames), ring_cap))
 
 
 class AcquisitionCompletionStatus(Enum):
@@ -161,7 +180,7 @@ class FastAcquisitionController:
                 f"frame_signal_line={frame_counter_dio_line}"
             )
 
-    def _create_camera_acquisition_resources(self) -> None:
+    def _create_camera_acquisition_resources(self, frame_rate_hz: Optional[float] = None) -> None:
         """Allocate the ring buffer and writer for the current camera ROI and format."""
         if self._daq_only or self._camera is None:
             return
@@ -180,18 +199,33 @@ class FastAcquisitionController:
         self._frame_shape = frame_shape
         self._dtype = dtype
 
-        # Size the ring to hold the entire capture (bounded by a RAM budget) so the
-        # disk writer, which is slower than the camera, never has to keep up in real
-        # time — it drains the ring during and after the burst. Honor the user's
-        # buffer_size as a floor.
+        # Size the ring to hold the entire capture (bounded by the RAM actually
+        # available right now) so the disk writer, which is slower than the camera,
+        # never has to keep up in real time — it drains the ring during and after
+        # the burst. Honor the user's buffer_size as a floor.
         ring_size = self._buffer_size
         if self._num_frames:
-            ring_cap = max(1, FAST_ACQ_RING_BUFFER_MAX_BYTES // max(1, max_frame_bytes))
-            ring_size = max(self._buffer_size, min(int(self._num_frames), ring_cap))
+            available = psutil.virtual_memory().available
+            ring_size = ring_frames_for_capture(
+                self._buffer_size, self._num_frames, max_frame_bytes, available
+            )
             if ring_size != self._buffer_size:
                 self._log.info(
                     f"Ring buffer sized to {ring_size} frames to cover the {self._num_frames}-frame "
-                    f"capture (requested buffer_size={self._buffer_size}, RAM cap={ring_cap})"
+                    f"capture (requested buffer_size={self._buffer_size}, "
+                    f"{available / 1024**3:.1f} GiB RAM available)"
+                )
+            if ring_size < int(self._num_frames):
+                ingest = (
+                    f" arriving at {frame_rate_hz * max_frame_bytes / 1024**2:.0f} MiB/s"
+                    if frame_rate_hz
+                    else ""
+                )
+                self._log.warning(
+                    f"Capture ({self._num_frames} frames, "
+                    f"{self._num_frames * max_frame_bytes / 1024**3:.1f} GiB{ingest}) does not fit in "
+                    f"the in-RAM ring ({ring_size} frames); frames will be dropped once the ring fills "
+                    f"unless the disk sustains the camera data rate for the whole capture"
                 )
 
         self._frame_buffer = FastAcquisitionFrameBuffer(
@@ -498,7 +532,7 @@ class FastAcquisitionController:
                     self._camera._optimize_for_fast_acquisition()
                 except Exception as e:
                     self._log.warning(f"Could not optimize camera for fast acquisition: {e}")
-            self._create_camera_acquisition_resources()
+            self._create_camera_acquisition_resources(frame_rate_hz)
             try:
                 self._frame_writer.start()
             except Exception:
@@ -547,10 +581,7 @@ class FastAcquisitionController:
                     self._frame_count += 1
                     with self._stats_lock:
                         self._last_frame_time = time.time()
-                else:
-                    self._log.warning(
-                        f"Failed to write frame {placeholder_frame_id} to buffer"
-                    )
+                # Ring-full drops are counted and logged (throttled) by the buffer.
 
             def frame_sink(src_ptr, n_bytes, metadata):
                 # Preferred single-copy path (cameras that support it, e.g. Tucsen).
@@ -572,10 +603,7 @@ class FastAcquisitionController:
                     self._frame_count += 1
                     with self._stats_lock:
                         self._last_frame_time = time.time()
-                else:
-                    self._log.warning(
-                        f"Failed to write frame {placeholder_frame_id} to buffer (ring full)"
-                    )
+                # Ring-full drops are counted and logged (throttled) by the buffer.
 
             try:
                 if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
@@ -942,27 +970,45 @@ class FastAcquisitionController:
             return None
     
     def _patch_metadata_frame_counts(self, frame_count: int, frames_written: int, dropped_frames: int) -> None:
-        """Rewrite the frame counters in metadata.json with the final post-drain values.
+        """Rewrite the frame counters in metadata.json and acquisition_metadata.yaml
+        with the final post-drain values.
 
-        metadata.json is written during stop_acquisition, before the writer's background
-        drain finishes flushing the ring, so its frames_written/frames_dropped would
-        otherwise be a stale mid-drain snapshot.
+        Both files are written during stop_acquisition, before the writer's background
+        drain finishes flushing the ring, so their frames_written/frames_dropped would
+        otherwise be a stale mid-drain snapshot (and disagree with each other).
         """
         import json
+        import yaml
 
         path = os.path.join(self._output_path, "metadata.json")
         try:
-            if not os.path.isfile(path):
-                return
-            with open(path, "r") as f:
-                meta = json.load(f)
-            meta["frame_count"] = int(frame_count)
-            meta["frames_written"] = int(frames_written)
-            meta["frames_dropped"] = int(dropped_frames)
-            with open(path, "w") as f:
-                json.dump(meta, f, indent=2)
+            if os.path.isfile(path):
+                with open(path, "r") as f:
+                    meta = json.load(f)
+                meta["frame_count"] = int(frame_count)
+                meta["frames_written"] = int(frames_written)
+                meta["frames_dropped"] = int(dropped_frames)
+                with open(path, "w") as f:
+                    json.dump(meta, f, indent=2)
         except Exception as e:
             self._log.warning(f"Could not update frame counts in metadata.json: {e}", exc_info=True)
+
+        yaml_path = os.path.join(self._output_path, "acquisition_metadata.yaml")
+        try:
+            if os.path.isfile(yaml_path):
+                with open(yaml_path, "r") as f:
+                    doc = yaml.safe_load(f) or {}
+                scan_parameters = doc.get("scan_parameters")
+                if isinstance(scan_parameters, dict):
+                    scan_parameters["frame_count"] = int(frame_count)
+                    scan_parameters["frames_written"] = int(frames_written)
+                    scan_parameters["frames_dropped"] = int(dropped_frames)
+                    with open(yaml_path, "w") as f:
+                        yaml.safe_dump(doc, f, sort_keys=False)
+        except Exception as e:
+            self._log.warning(
+                f"Could not update frame counts in acquisition_metadata.yaml: {e}", exc_info=True
+            )
 
     def _save_metadata(self):
         """Save acquisition metadata."""

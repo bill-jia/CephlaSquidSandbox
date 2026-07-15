@@ -977,6 +977,13 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         return False
 
+    def get_max_acquisition_frame_rate(self) -> Optional[float]:
+        """
+        Camera-reported maximum acquisition frame rate (Hz) for the current
+        ROI / binning / camera mode, or None if this camera cannot report one.
+        """
+        return None
+
     def get_fast_acquisition_max_frame_bytes(self) -> int:
         """
         Maximum bytes per frame for the fast-acquisition ring buffer.
