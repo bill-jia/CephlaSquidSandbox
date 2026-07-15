@@ -73,6 +73,11 @@ class FastAcquisitionWriter(threading.Thread):
         self._stop_event = threading.Event()
         self._running = False
         self._conversion_in_progress = False
+        # Post-capture format-conversion progress (raw -> TIFF/BigTIFF/Zarr/HDF5). Plain
+        # ints updated from the conversion loop and read by the UI poll; a stale read just
+        # shows a slightly-behind percentage, so no lock is needed.
+        self._frames_to_convert = 0
+        self._frames_converted = 0
         os.makedirs(output_path, exist_ok=True)
         self._frames_dir = os.path.join(output_path, "frames")
         os.makedirs(self._frames_dir, exist_ok=True)
@@ -203,6 +208,20 @@ class FastAcquisitionWriter(threading.Thread):
         """True while post-capture decode/write (TIFF/Zarr/HDF5) is running on the writer thread."""
         return self._conversion_in_progress
 
+    def get_finalize_progress(self) -> Dict[str, Any]:
+        """Snapshot of post-capture disk work for the UI: how many frames have been
+        drained to the raw stream and, once conversion starts, how far the raw ->
+        encoded-format pass has gotten. ``frames_to_convert`` is 0 until conversion
+        begins (or for the raw format, which needs no conversion)."""
+        with self._stats_lock:
+            frames_written = self._frames_written
+        return {
+            "converting": self._conversion_in_progress,
+            "frames_written": frames_written,
+            "frames_converted": self._frames_converted,
+            "frames_to_convert": self._frames_to_convert,
+        }
+
     def _finalize_after_raw_closed(self) -> None:
         """Decode raw bytestream into TIFF / Zarr / HDF5 when applicable."""
         if self._file_format == "raw":
@@ -215,6 +234,8 @@ class FastAcquisitionWriter(threading.Thread):
         try:
             if self._file_format in ("tiff", "tif"):
                 self._convert_raw_to_tiff_stack()
+            elif self._file_format == "bigtiff":
+                self._convert_raw_to_bigtiff()
             elif self._file_format == "zarr":
                 self._build_zarr_from_raw()
             elif self._file_format == "hdf5":
@@ -291,6 +312,8 @@ class FastAcquisitionWriter(threading.Thread):
                 f"of up to {frames_per_file} frames each"
             )
 
+        self._frames_to_convert = len(records)
+        self._frames_converted = 0
         written: List[str] = []
         with open(raw_path, "rb") as f:
             for file_idx in range(n_files):
@@ -308,6 +331,7 @@ class FastAcquisitionWriter(threading.Thread):
                         )
                         break
                     planes.append(self._decode_frame(chunk, rec))
+                    self._frames_converted += 1
                 if not planes:
                     continue
                 h, w = planes[0].shape
@@ -332,6 +356,65 @@ class FastAcquisitionWriter(threading.Thread):
         try:
             os.remove(raw_path)
             self._log.info(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
+        except OSError as e:
+            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
+
+    def _convert_raw_to_bigtiff(self) -> None:
+        """Decode the raw bytestream into a SINGLE BigTIFF stack.
+
+        Unlike the classic-TIFF path (32-bit offsets, split into <4 GiB files), BigTIFF
+        uses 64-bit offsets so the whole capture lands in one file that ImageJ/Fiji opens
+        as a stack regardless of size. Frames are decoded and appended one at a time so
+        peak RAM stays at a single plane no matter how large the capture is.
+        """
+        import tifffile
+
+        raw_path = self._raw_file_path
+        if not os.path.exists(raw_path):
+            self._log.warning(f"Raw frame file not found at {raw_path}, skipping BigTIFF conversion")
+            return
+
+        records = self._read_jsonl_records()
+        if not records:
+            self._log.warning("No frame_metadata.jsonl; cannot recover per-frame byte lengths for BigTIFF")
+            return
+
+        stack_path = os.path.join(self._frames_dir, "frames_stack.tiff")
+        self._frames_to_convert = len(records)
+        self._frames_converted = 0
+        n_written = 0
+        try:
+            # contiguous=True appends every frame as a page of one series written back to
+            # back — the layout ImageJ reads as a single stack, and the fastest to write.
+            with open(raw_path, "rb") as f, tifffile.TiffWriter(stack_path, bigtiff=True) as tif:
+                for i, rec in enumerate(records):
+                    off = int(rec["byte_offset"])
+                    ln = int(rec["frame_byte_length"])
+                    f.seek(off)
+                    chunk = f.read(ln)
+                    if len(chunk) != ln:
+                        self._log.warning(
+                            f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}"
+                        )
+                        break
+                    plane = self._decode_frame(chunk, rec)
+                    tif.write(plane, photometric="minisblack", contiguous=True)
+                    n_written += 1
+                    self._frames_converted = n_written
+        except Exception as e:
+            self._log.error(f"Failed to write BigTIFF stack {stack_path}: {e}", exc_info=True)
+            return  # leave raw in place for recovery if the write fails
+
+        if n_written == 0:
+            self._log.warning("No frames decoded for BigTIFF")
+            return
+        size_gib = os.path.getsize(stack_path) / 1024**3
+        self._log.info(
+            f"Wrote BigTIFF stack ({n_written} frames, {size_gib:.1f} GiB) to {stack_path}"
+        )
+        try:
+            os.remove(raw_path)
+            self._log.info(f"Deleted raw file {raw_path} after BigTIFF conversion")
         except OSError as e:
             self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
 

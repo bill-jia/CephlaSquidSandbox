@@ -229,3 +229,96 @@ def test_tiff_writer_splits_over_4gb_limit(tmp_path, monkeypatch):
     assert total == n
     # raw file removed only after all chunks wrote
     assert not (frames_dir / "frames.raw").exists()
+
+
+def _run_bigtiff_writer(tmp_path, n, h, w):
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+    return tmp_path / "frames"
+
+
+def test_bigtiff_writer_single_file_all_frames(tmp_path):
+    """BigTIFF always writes ONE file (never the numbered split scheme), it is flagged
+    BigTIFF (64-bit offsets), every frame is present in order, and raw is cleaned up."""
+    import tifffile
+
+    h, w, n = 4, 4, 7
+    frames_dir = _run_bigtiff_writer(tmp_path, n=n, h=h, w=w)
+
+    stack = frames_dir / "frames_stack.tiff"
+    assert stack.exists()
+    assert not list(frames_dir.glob("frames_stack_*.tiff"))  # single file, never split
+    assert not (frames_dir / "frames.raw").exists()  # raw removed after conversion
+
+    with tifffile.TiffFile(str(stack)) as tf:
+        assert tf.is_bigtiff
+        data = tf.asarray()
+    assert data.shape == (n, h, w)
+    for i in range(n):
+        assert int(data[i, 0, 0]) == i  # frames land in capture order, values intact
+
+
+def test_finalize_progress_counts_converted_frames(tmp_path):
+    """After a BigTIFF run, the writer's finalize-progress snapshot reports every frame
+    drained and converted (this is what drives the post-capture progress bar)."""
+    h, w, n = 4, 4, 6
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+
+    prog = writer.get_finalize_progress()
+    assert prog["converting"] is False  # finished
+    assert prog["frames_written"] == n
+    assert prog["frames_to_convert"] == n
+    assert prog["frames_converted"] == n
+
+
+def test_estimate_finalize_seconds_scales_with_size_and_format(tmp_path):
+    """The post-capture timeout estimate is proportional to captured bytes, larger for
+    encoded formats (which re-read + re-write) than for raw, and zero in DAQ-only mode."""
+    from control.core.fast_acquisition_controller import (
+        FastAcquisitionController,
+        FAST_ACQ_SATURATING_WRITE_BYTES_PER_S,
+    )
+
+    c = FastAcquisitionController(camera=None, ni_daq=None, output_path=str(tmp_path))
+    # DAQ-only (camera is None) never writes frames, so no estimate.
+    assert c.estimate_finalize_seconds() == 0.0
+
+    # Pretend a capture happened with a known geometry.
+    c._daq_only = False
+    c._frame_shape = (600, 2400)
+    c._dtype = np.uint16
+    c._frame_count = 1000
+    bytes_total = 600 * 2400 * 2 * 1000
+
+    c._file_format = "raw"
+    raw_est = c.estimate_finalize_seconds()
+    assert raw_est == bytes_total / FAST_ACQ_SATURATING_WRITE_BYTES_PER_S
+
+    c._file_format = "bigtiff"
+    # Encoded formats move the data ~3x (drain, then read + write on conversion).
+    assert c.estimate_finalize_seconds() == 3.0 * raw_est

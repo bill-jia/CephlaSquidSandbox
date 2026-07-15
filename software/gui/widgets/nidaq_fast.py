@@ -18,6 +18,16 @@ from control.nidaq import (
 )
 from control.models.io_endpoint_config import IOControllerType, IOSignalType, IODirection
 
+import time
+
+# After a capture ends the writer keeps draining/encoding to disk. The Start button
+# stays blocked until that finishes or until this multiple of the size-based estimate
+# elapses (a safety net so the UI can't wedge if writing hangs — see the finalize-hang
+# history). The floor keeps tiny captures from timing out on estimator noise.
+FAST_ACQ_FINALIZE_TIMEOUT_SAFETY = 3.0
+FAST_ACQ_FINALIZE_MIN_TIMEOUT_S = 30.0
+
+
 class NIDAQWidget(QWidget):
     """
     Widget for controlling National Instruments DAQ devices.
@@ -2149,7 +2159,7 @@ class FastAcquisitionWidget(QWidget):
     - Trigger source selection (TI Microcontroller / NI DAQ)
     - Frame rate and exposure time settings
     - Buffer size configuration
-    - File format selection (TIFF / Zarr / HDF5 / Raw)
+    - File format selection (TIFF / BigTIFF / Zarr / HDF5 / Raw)
     - Output directory selection
     - Start/Stop acquisition controls
     - Real-time statistics (FPS, buffer fill, write speed)
@@ -2183,6 +2193,12 @@ class FastAcquisitionWidget(QWidget):
         self._was_live_before_fast_acquisition: bool = False  # Track live state to restore after acquisition
         self._max_frame_rate_shown: Optional[Tuple[str, bool]] = None  # (label text, over-max) last rendered
 
+        # Post-capture write ("finalize") phase: the capture has ended but the writer is
+        # still draining/encoding to disk. Start stays blocked and the progress bar tracks
+        # write progress until it finishes or the size-based deadline passes.
+        self._finalize_active = False
+        self._finalize_deadline = 0.0  # time.monotonic() value
+
         # Initialize UI
         self.init_ui()
 
@@ -2193,6 +2209,11 @@ class FastAcquisitionWidget(QWidget):
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self.update_statistics)
         self._stats_timer.setInterval(500)  # Update every 500ms
+
+        # Polls post-capture write progress and enforces the finalize timeout.
+        self._finalize_timer = QTimer(self)
+        self._finalize_timer.timeout.connect(self._poll_finalize)
+        self._finalize_timer.setInterval(300)
 
         # Poll the camera's cached max frame rate so the label tracks ROI /
         # binning / camera-mode changes made anywhere in the GUI (camera
@@ -2256,7 +2277,8 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
         self.max_frame_rate_label = QLabel("")
         self.max_frame_rate_label.setToolTip(
-            "Maximum frame rate reported by the camera for the current ROI, binning and camera mode"
+            "Readout-limited maximum frame rate for the current ROI, binning and camera mode. "
+            "This is the fixed sensor ceiling (independent of exposure time)."
         )
         frame_rate_cell = QHBoxLayout()
         frame_rate_cell.setSpacing(4)
@@ -2298,7 +2320,7 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("File Format:"), 2, 2)
         self.file_format_combo = QComboBox()
-        self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5", "Raw"])
+        self.file_format_combo.addItems(["TIFF", "BigTIFF", "Zarr", "HDF5", "Raw"])
         acq_layout.addWidget(self.file_format_combo, 2, 3)
 
         acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
@@ -2601,7 +2623,19 @@ class FastAcquisitionWidget(QWidget):
         if self._is_acquiring:
             self._log.warning("Acquisition already running")
             return
-        
+
+        # The previous run may still be draining/encoding to disk (deferred writes +
+        # format conversion). Starting now would create a second writer contending for
+        # the disk and RAM, so refuse until it finishes (the controller enforces this
+        # too, but surface it to the user instead of failing silently).
+        if self._controller is not None and self._controller.is_finalizing_writes:
+            error_dialog(
+                "The previous acquisition is still writing to disk. "
+                "Please wait for it to finish before starting a new one.",
+                "Please wait",
+            )
+            return
+
         # Store camera state before fast acquisition
         try:
             acquisition_mode = self.camera.get_acquisition_mode()
@@ -2741,6 +2775,7 @@ class FastAcquisitionWidget(QWidget):
             # Create main controller
             file_format_map = {
                 "TIFF": "tiff",
+                "BigTIFF": "bigtiff",
                 "Zarr": "zarr",
                 "HDF5": "hdf5",
                 "Raw": "raw",
@@ -2785,6 +2820,10 @@ class FastAcquisitionWidget(QWidget):
             self._is_acquiring = True
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
+            # Reset the progress bar to buffer-fill semantics (a prior finalize may have
+            # left it showing write progress with a custom format string).
+            self.buffer_progress_bar.setFormat("%p%")
+            self.buffer_progress_bar.setValue(0)
             self._stats_timer.start()
             self.signal_acquisition_started.emit()
             
@@ -2821,15 +2860,20 @@ class FastAcquisitionWidget(QWidget):
             error_message: Optional error message
         """
         from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
-        
+
+        # Completion can be delivered twice (the controller callback and the stats-timer
+        # safety net); handle only the first, while still acquiring.
+        if not self._is_acquiring:
+            return
+
         # Update state
         self._is_acquiring = False
-        
+
         # Stop statistics timer
         self._stats_timer.stop()
-        
-        # Update button states
-        self.start_button.setEnabled(True)
+
+        # Capture is done, so the Stop button is finished. The Start button stays disabled
+        # until post-capture writing completes — decided at the end of this handler.
         self.stop_button.setEnabled(False)
         
         # Update status label based on completion status
@@ -2850,9 +2894,6 @@ class FastAcquisitionWidget(QWidget):
         else:
             self.stats_label.setText("Acquisition ended")
             self.stats_label.setStyleSheet("")
-        
-        # Reset buffer progress bar
-        self.buffer_progress_bar.setValue(0)
         
         # Restore camera state to original configuration
         self._restore_camera_state()
@@ -2884,7 +2925,77 @@ class FastAcquisitionWidget(QWidget):
         
         # Emit signal
         self.signal_acquisition_finished.emit()
-    
+
+        # The instrument is back to a ready state, but the writer may still be draining the
+        # RAM ring and encoding it to disk. Keep Start blocked and track write progress
+        # until that finishes or the size-based deadline passes.
+        if self._controller and self._controller.is_finalizing_writes:
+            self._enter_finalize_phase()
+        else:
+            self.buffer_progress_bar.setValue(0)
+            self.buffer_progress_bar.setFormat("%p%")
+            self.start_button.setEnabled(True)
+
+    def _enter_finalize_phase(self):
+        """Block Start and repurpose the progress bar to track post-capture disk writing
+        until it finishes or a size-based deadline passes."""
+        est = 0.0
+        try:
+            est = self._controller.estimate_finalize_seconds()
+        except Exception as e:
+            self._log.debug(f"Could not estimate finalize time: {e}")
+        timeout_s = max(FAST_ACQ_FINALIZE_MIN_TIMEOUT_S, FAST_ACQ_FINALIZE_TIMEOUT_SAFETY * est)
+        self._finalize_active = True
+        self._finalize_deadline = time.monotonic() + timeout_s
+        self.start_button.setEnabled(False)
+        self.buffer_progress_bar.setValue(0)
+        self._log.info(
+            f"Post-acquisition writing in progress; blocking new acquisition "
+            f"(est {est:.0f}s, timeout {timeout_s:.0f}s)"
+        )
+        self._poll_finalize()  # paint an immediate first frame
+        self._finalize_timer.start()
+
+    def _poll_finalize(self):
+        """Refresh the write-progress bar; exit when writing completes or times out."""
+        if not self._finalize_active:
+            return
+        try:
+            status = self._controller.get_finalize_status() if self._controller else {"finalizing": False}
+        except Exception as e:
+            self._log.warning(f"Error polling write-finalize status: {e}")
+            self._exit_finalize_phase(timed_out=False)
+            return
+
+        if not status.get("finalizing"):
+            self._exit_finalize_phase(timed_out=False)
+            return
+
+        pct = int(round(status.get("fraction", 0.0) * 100))
+        detail = status.get("detail") or "Writing to disk"
+        self.buffer_progress_bar.setFormat(f"{detail}… %p%")
+        self.buffer_progress_bar.setValue(pct)
+
+        if time.monotonic() >= self._finalize_deadline:
+            self._log.warning(
+                "Post-acquisition writing exceeded its estimated deadline; unblocking Start "
+                "(writing may still be running in the background)"
+            )
+            self._exit_finalize_phase(timed_out=True)
+
+    def _exit_finalize_phase(self, timed_out: bool):
+        """Leave the finalize phase: stop polling, restore the bar, re-enable Start."""
+        self._finalize_active = False
+        self._finalize_timer.stop()
+        self.buffer_progress_bar.setValue(0)
+        self.buffer_progress_bar.setFormat("%p%")
+        self.start_button.setEnabled(True)
+        if timed_out:
+            self.stats_label.setText(self.stats_label.text() + " — write timed out")
+            self.stats_label.setStyleSheet("color: orange;")
+        else:
+            self._log.info("Post-acquisition writing complete; Start re-enabled")
+
     def _restore_camera_state(self):
         """
         Restore camera state to original configuration before fast acquisition.

@@ -59,6 +59,13 @@ FAST_ACQ_RING_BUFFER_MIN_BYTES = 4 * 1024**3
 # mode or when the capture exceeds RAM — those must drain to disk during the burst).
 FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE = True
 
+# Sustained disk write throughput used to estimate how long post-capture writing takes
+# (deferred drain + format conversion). Deliberately conservative — the estimate only
+# bounds how long the UI waits before it stops blocking a new acquisition, so under-
+# estimating the disk speed just makes the wait more generous. The rig's NVMe measured
+# ~1.1 GiB/s sustained; 1.0 GiB/s leaves margin.
+FAST_ACQ_SATURATING_WRITE_BYTES_PER_S = 1.0 * 1024**3
+
 
 def ring_frames_for_capture(
     requested_buffer_size: int, num_frames: int, max_frame_bytes: int, available_ram_bytes: int
@@ -115,7 +122,9 @@ class FastAcquisitionController:
             ni_daq: NI DAQ instance (for triggering and waveform recording)
             output_path: Base directory for saving data
             buffer_size: Ring buffer capacity in frames (used when a camera acquisition starts)
-            file_format: File format for saving ("tiff", "zarr", "hdf5", or "raw") (ignored when camera is None)
+            file_format: File format for saving ("tiff", "bigtiff", "zarr", "hdf5", or "raw") (ignored when camera is None).
+                "tiff" splits captures over the 4 GiB classic-TIFF limit into multiple files; "bigtiff" writes
+                one 64-bit-offset file that ImageJ opens as a single stack at any size.
             camera_trigger_dio_line: Digital output line for camera triggers (default: 1); unused in DAQ-only
             frame_counter_dio_line: Digital input line for camera frame signal (default: 0); unused in DAQ-only
             illumination_controller: Optional IlluminationController; when provided its
@@ -1190,6 +1199,52 @@ class FastAcquisitionController:
     def is_acquiring(self) -> bool:
         """Check if acquisition is running."""
         return self._is_acquiring
+
+    @property
+    def is_finalizing_writes(self) -> bool:
+        """True while the writer is still draining the ring and/or converting to the
+        output format after the capture itself has ended. start_acquisition() refuses to
+        start a new run in this state; the UI uses it to keep the Start button blocked."""
+        return self._is_previous_writer_busy()
+
+    def get_finalize_status(self) -> Dict:
+        """Progress of post-capture disk writing for the UI.
+
+        Two sub-phases: draining the RAM ring to the raw stream (frames_written climbs to
+        the captured count), then converting raw -> TIFF/BigTIFF/Zarr/HDF5. ``fraction`` is
+        0..1 within whichever phase is running; ``detail`` names it for the progress bar.
+        """
+        idle = {"finalizing": False, "phase": "done", "fraction": 1.0, "detail": "",
+                "done": 0, "total": 0}
+        w = self._frame_writer
+        if self._daq_only or w is None or not self._is_previous_writer_busy():
+            return idle
+        expected = max(1, int(self._frame_count))
+        prog = w.get_finalize_progress()
+        if prog["converting"] and prog["frames_to_convert"] > 0:
+            done, total = prog["frames_converted"], prog["frames_to_convert"]
+            detail = f"Converting to {self._file_format.upper()}"
+            phase = "converting"
+        else:
+            done, total = prog["frames_written"], expected
+            detail = "Writing frames to disk"
+            phase = "draining"
+        fraction = min(1.0, max(0.0, done / total)) if total else 0.0
+        return {"finalizing": True, "phase": phase, "fraction": fraction,
+                "detail": detail, "done": done, "total": total}
+
+    def estimate_finalize_seconds(self) -> float:
+        """Rough post-capture write time from the captured data size and a saturating
+        disk write speed. Encoded formats move the data more than once (drain the raw
+        stream, then read it back and write the encoded file), so they use a larger IO
+        multiplier than raw. Used only to bound the UI's blocking wait, so it favors
+        over- rather than under-estimating."""
+        if self._daq_only or not self._frame_shape or not self._frame_count:
+            return 0.0
+        bytes_per_frame = int(np.prod(self._frame_shape)) * int(np.dtype(self._dtype).itemsize)
+        total_bytes = bytes_per_frame * int(self._frame_count)
+        io_multiplier = 1.0 if self._file_format == "raw" else 3.0
+        return io_multiplier * total_bytes / FAST_ACQ_SATURATING_WRITE_BYTES_PER_S
     
     def set_completion_callback(self, callback: Optional[Callable[[AcquisitionCompletionStatus, Optional[str]], None]]):
         """

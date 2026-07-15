@@ -549,6 +549,11 @@ class TucsenCamera(AbstractCamera):
         # self._strobe_delay_ms: float = 0.0
 
         self._rolling_shutter_readout_ms: float = 0.0
+        # Exposure-independent frame readout period (ms) for the current ROI/binning/mode,
+        # backed out from the camera's exposure-limited AcquisitionMaxFrameRate. Its
+        # reciprocal is the fixed sensor frame-rate ceiling reported to the UI. 0.0 until
+        # first computed (then get_max_acquisition_frame_rate falls back to the raw value).
+        self._readout_period_ms: float = 0.0
         self.temperature_reading_callback = None
         # GenICam writes need ≥100 ms between them or the camera returns errors.
         # Track the last write so _set_genicam_parameter can gate only when
@@ -1626,7 +1631,6 @@ class TucsenCamera(AbstractCamera):
             return False
         mode = self.get_acquisition_mode()
         return mode in (CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST)
-        self._update_internal_settings()
 
     def get_exposure_time(self) -> float:
         return self._exposure_time_ms
@@ -1647,9 +1651,14 @@ class TucsenCamera(AbstractCamera):
             return self._trigger_attr.nFrameRate
 
     def get_max_acquisition_frame_rate(self) -> Optional[float]:
-        # Cached value; _update_internal_settings refreshes it from
-        # AcquisitionMaxFrameRate on every ROI / binning / camera-mode /
-        # trigger-mode change, so reading here costs no SDK traffic.
+        # Fixed, exposure-INDEPENDENT readout ceiling for the current ROI/binning/mode.
+        # Derived (in _update_readout_period, on every ROI/binning/mode/trigger change) by
+        # subtracting the exposure out of the camera's exposure-limited
+        # AcquisitionMaxFrameRate, so it no longer drops from ~800 Hz to ~560 Hz after a
+        # run leaves a longer exposure set. Falls back to the raw camera value until the
+        # readout period has been computed (and for non-genicam models, which never do).
+        if self._readout_period_ms and self._readout_period_ms > 0.0:
+            return 1000.0 / self._readout_period_ms
         return self._max_acquisition_rate_hz
 
     def get_exposure_limits(self) -> Tuple[float, float]:
@@ -1861,6 +1870,22 @@ class TucsenCamera(AbstractCamera):
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
             self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+            self._update_readout_period()
+
+    def _update_readout_period(self):
+        """Back out the exposure-independent readout period from the camera's
+        AcquisitionMaxFrameRate ( = 1/(exposure + readout) ) using the exposure that value
+        was read at. The reciprocal is the fixed frame-rate ceiling for the current
+        ROI/binning/mode, so the UI stops showing it drop (and going red) after a run
+        leaves a longer exposure set. Exposure is subtracted here — while it and the
+        just-read max correspond — so later exposure changes don't shift the ceiling."""
+        v = self._max_acquisition_rate_hz
+        e_ms = self._exposure_time_ms or 0.0
+        if not v or v <= 0.0:
+            self._readout_period_ms = 0.0
+            return
+        readout_ms = 1000.0 / v - e_ms
+        self._readout_period_ms = readout_ms if readout_ms > 0.0 else 0.0
         packing = camera_mode_name_to_packing(self.get_camera_mode())
         self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
         self.update_config_crop()
