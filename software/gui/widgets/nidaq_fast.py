@@ -20,12 +20,7 @@ from control.models.io_endpoint_config import IOControllerType, IOSignalType, IO
 
 import time
 
-# After a capture ends the writer keeps draining/encoding to disk. The Start button
-# stays blocked until that finishes or until this multiple of the size-based estimate
-# elapses (a safety net so the UI can't wedge if writing hangs — see the finalize-hang
-# history). The floor keeps tiny captures from timing out on estimator noise.
-FAST_ACQ_FINALIZE_TIMEOUT_SAFETY = 3.0
-FAST_ACQ_FINALIZE_MIN_TIMEOUT_S = 30.0
+from control.core.fast_acquisition_controller import fast_acq_finalize_stall_grace_s
 
 
 class NIDAQWidget(QWidget):
@@ -2195,9 +2190,11 @@ class FastAcquisitionWidget(QWidget):
 
         # Post-capture write ("finalize") phase: the capture has ended but the writer is
         # still draining/encoding to disk. Start stays blocked and the progress bar tracks
-        # write progress until it finishes or the size-based deadline passes.
+        # write progress until it finishes or the writer looks hung (adaptive stall grace).
         self._finalize_active = False
-        self._finalize_deadline = 0.0  # time.monotonic() value
+        self._finalize_write_start = 0.0     # time.monotonic() when finalize began
+        self._finalize_last_written = 0      # frames_written at last observed progress
+        self._finalize_last_progress_t = 0.0  # time.monotonic() of last observed progress
 
         # Initialize UI
         self.init_ui()
@@ -2938,23 +2935,26 @@ class FastAcquisitionWidget(QWidget):
 
     def _enter_finalize_phase(self):
         """Block Start and repurpose the progress bar to track post-capture disk writing
-        until it finishes or a size-based deadline passes."""
-        est = 0.0
-        try:
-            est = self._controller.estimate_finalize_seconds()
-        except Exception as e:
-            self._log.debug(f"Could not estimate finalize time: {e}")
-        timeout_s = max(FAST_ACQ_FINALIZE_MIN_TIMEOUT_S, FAST_ACQ_FINALIZE_TIMEOUT_SAFETY * est)
+        until it finishes or the writer looks hung (adaptive stall grace, no fixed
+        throughput estimate)."""
+        now = time.monotonic()
         self._finalize_active = True
-        self._finalize_deadline = time.monotonic() + timeout_s
+        self._finalize_write_start = now
+        self._finalize_last_written = 0
+        self._finalize_last_progress_t = now
         self.start_button.setEnabled(False)
         self.buffer_progress_bar.setValue(0)
         self._log.info(
-            f"Post-acquisition writing in progress; blocking new acquisition "
-            f"(est {est:.0f}s, timeout {timeout_s:.0f}s)"
+            "Post-acquisition writing in progress; blocking new acquisition until it "
+            "completes or the writer stalls"
         )
         self._poll_finalize()  # paint an immediate first frame
         self._finalize_timer.start()
+
+    def _finalize_stall_grace_s(self, written: int, expected: int) -> float:
+        """Instance wrapper over fast_acq_finalize_stall_grace_s using this phase's start."""
+        write_elapsed = time.monotonic() - self._finalize_write_start
+        return fast_acq_finalize_stall_grace_s(write_elapsed, written, expected)
 
     def _poll_finalize(self):
         """Refresh the write-progress bar; exit when writing completes or times out."""
@@ -2976,10 +2976,28 @@ class FastAcquisitionWidget(QWidget):
         self.buffer_progress_bar.setFormat(f"{detail}… %p%")
         self.buffer_progress_bar.setValue(pct)
 
-        if time.monotonic() >= self._finalize_deadline:
+        # Keep the "Written" / "Write rate" stats text live during the write phase (the
+        # capture-time stats timer has stopped). In deferred/direct-encode mode this is the
+        # only window where frames are actually written, so it starts from 0 here.
+        written = int(status.get("frames_written", 0))
+        expected = int(status.get("expected_frames", 0))
+        write_rate = status.get("write_rate", 0.0)
+        self.stats_label.setText(f"Written: {written}/{expected} | Write Rate: {write_rate:.1f} fps")
+        self.stats_label.setStyleSheet("")
+
+        # Stall watchdog: reset the clock whenever progress is made, then declare the writer
+        # hung only if it goes with no progress for longer than the adaptive grace.
+        now = time.monotonic()
+        if written > self._finalize_last_written:
+            self._finalize_last_written = written
+            self._finalize_last_progress_t = now
+        no_progress_for = now - self._finalize_last_progress_t
+        grace = self._finalize_stall_grace_s(written, max(1, expected))
+        if no_progress_for > grace:
             self._log.warning(
-                "Post-acquisition writing exceeded its estimated deadline; unblocking Start "
-                "(writing may still be running in the background)"
+                f"Post-acquisition writing made no progress for {no_progress_for:.0f}s "
+                f"(grace {grace:.0f}s); unblocking Start — writing may still be running "
+                "in the background"
             )
             self._exit_finalize_phase(timed_out=True)
 
@@ -2994,6 +3012,8 @@ class FastAcquisitionWidget(QWidget):
             self.stats_label.setText(self.stats_label.text() + " — write timed out")
             self.stats_label.setStyleSheet("color: orange;")
         else:
+            self.stats_label.setText("Done — data written to disk")
+            self.stats_label.setStyleSheet("")
             self._log.info("Post-acquisition writing complete; Start re-enabled")
 
     def _restore_camera_state(self):

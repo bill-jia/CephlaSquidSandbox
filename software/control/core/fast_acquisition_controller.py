@@ -59,12 +59,35 @@ FAST_ACQ_RING_BUFFER_MIN_BYTES = 4 * 1024**3
 # mode or when the capture exceeds RAM — those must drain to disk during the burst).
 FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE = True
 
-# Sustained disk write throughput used to estimate how long post-capture writing takes
-# (deferred drain + format conversion). Deliberately conservative — the estimate only
-# bounds how long the UI waits before it stops blocking a new acquisition, so under-
-# estimating the disk speed just makes the wait more generous. The rig's NVMe measured
-# ~1.1 GiB/s sustained; 1.0 GiB/s leaves margin.
-FAST_ACQ_SATURATING_WRITE_BYTES_PER_S = 1.0 * 1024**3
+# --- Post-capture write ("finalize") stall watchdog policy ---
+# After a capture ends the writer keeps draining/encoding to disk and the UI blocks a new
+# acquisition until it finishes or looks HUNG. "Hung" is judged from observed progress, not
+# a fixed byte/throughput estimate (which was wrong for direct-encode, where decode+compress
+# throughput != raw disk speed): time how long the writer goes with NO progress and compare
+# it to a grace that is extremely conservative at first and tightens toward the projected
+# remaining time as the write rate stabilizes.
+# Grace before any reliable rate exists (also if nothing is written yet): very long.
+FAST_ACQ_FINALIZE_INITIAL_GRACE_S = 300.0
+# Minimum elapsed write time before the observed rate is trusted (avoids a noisy first-poll
+# rate tightening the grace prematurely).
+FAST_ACQ_FINALIZE_RATE_MIN_ELAPSED_S = 2.0
+# Once trusted, tolerate a stall of up to SAFETY x (projected remaining time), floored.
+FAST_ACQ_FINALIZE_SAFETY = 3.0
+FAST_ACQ_FINALIZE_MIN_GRACE_S = 30.0
+
+
+def fast_acq_finalize_stall_grace_s(write_elapsed_s: float, written: int, expected: int) -> float:
+    """Adaptive no-progress grace for the finalize stall watchdog: how long the writer may
+    go with NO progress before it is judged hung. Extremely conservative until enough write
+    time has elapsed to trust the observed rate, then SAFETY x the projected time to write
+    the remaining frames (floored). Never assumes a fixed throughput. Pure function so the
+    policy is unit-testable without Qt/hardware."""
+    if write_elapsed_s < FAST_ACQ_FINALIZE_RATE_MIN_ELAPSED_S or written <= 0:
+        return FAST_ACQ_FINALIZE_INITIAL_GRACE_S
+    rate = written / write_elapsed_s  # frames/sec observed so far
+    remaining = max(0, expected - written)
+    projected_remaining_s = remaining / rate if rate > 0 else FAST_ACQ_FINALIZE_INITIAL_GRACE_S
+    return max(FAST_ACQ_FINALIZE_MIN_GRACE_S, FAST_ACQ_FINALIZE_SAFETY * projected_remaining_s)
 
 
 def ring_frames_for_capture(
@@ -1210,18 +1233,26 @@ class FastAcquisitionController:
     def get_finalize_status(self) -> Dict:
         """Progress of post-capture disk writing for the UI.
 
-        Two sub-phases: draining the RAM ring to the raw stream (frames_written climbs to
-        the captured count), then converting raw -> TIFF/BigTIFF/Zarr/HDF5. ``fraction`` is
-        0..1 within whichever phase is running; ``detail`` names it for the progress bar.
+        Direct-encode (deferred bigtiff/zarr/hdf5) decodes the RAM ring straight into the
+        output file — one phase, ``frames_written`` climbs to the captured count. The raw
+        round-trip has two: drain the ring to the raw stream, then convert raw -> encoded.
+        ``fraction`` is 0..1 within whichever phase is running; ``detail`` names it for the
+        progress bar, and ``frames_written`` / ``write_rate`` drive the stats text.
         """
         idle = {"finalizing": False, "phase": "done", "fraction": 1.0, "detail": "",
-                "done": 0, "total": 0}
+                "done": 0, "total": 0, "frames_written": 0, "write_rate": 0.0,
+                "expected_frames": 0}
         w = self._frame_writer
         if self._daq_only or w is None or not self._is_previous_writer_busy():
             return idle
         expected = max(1, int(self._frame_count))
         prog = w.get_finalize_progress()
-        if prog["converting"] and prog["frames_to_convert"] > 0:
+        wstats = w.get_write_statistics()
+        if prog.get("direct_encode") and prog["converting"]:
+            done, total = prog["frames_written"], expected
+            detail = f"Writing to {self._file_format.upper()}"
+            phase = "encoding"
+        elif prog["converting"] and prog["frames_to_convert"] > 0:
             done, total = prog["frames_converted"], prog["frames_to_convert"]
             detail = f"Converting to {self._file_format.upper()}"
             phase = "converting"
@@ -1231,21 +1262,11 @@ class FastAcquisitionController:
             phase = "draining"
         fraction = min(1.0, max(0.0, done / total)) if total else 0.0
         return {"finalizing": True, "phase": phase, "fraction": fraction,
-                "detail": detail, "done": done, "total": total}
+                "detail": detail, "done": done, "total": total,
+                "frames_written": int(wstats.get("frames_written", 0)),
+                "write_rate": float(wstats.get("write_rate", 0.0)),
+                "expected_frames": expected}
 
-    def estimate_finalize_seconds(self) -> float:
-        """Rough post-capture write time from the captured data size and a saturating
-        disk write speed. Encoded formats move the data more than once (drain the raw
-        stream, then read it back and write the encoded file), so they use a larger IO
-        multiplier than raw. Used only to bound the UI's blocking wait, so it favors
-        over- rather than under-estimating."""
-        if self._daq_only or not self._frame_shape or not self._frame_count:
-            return 0.0
-        bytes_per_frame = int(np.prod(self._frame_shape)) * int(np.dtype(self._dtype).itemsize)
-        total_bytes = bytes_per_frame * int(self._frame_count)
-        io_multiplier = 1.0 if self._file_format == "raw" else 3.0
-        return io_multiplier * total_bytes / FAST_ACQ_SATURATING_WRITE_BYTES_PER_S
-    
     def set_completion_callback(self, callback: Optional[Callable[[AcquisitionCompletionStatus, Optional[str]], None]]):
         """
         Set callback function to be called when acquisition completes.

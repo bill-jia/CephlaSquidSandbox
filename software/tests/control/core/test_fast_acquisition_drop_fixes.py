@@ -12,6 +12,7 @@ These cover, without any camera/DAQ hardware:
 import ctypes
 
 import numpy as np
+import pytest
 
 from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
@@ -270,6 +271,120 @@ def test_bigtiff_writer_single_file_all_frames(tmp_path):
         assert int(data[i, 0, 0]) == i  # frames land in capture order, values intact
 
 
+def test_direct_encode_bigtiff_skips_raw(tmp_path):
+    """Deferred + BigTIFF decodes the RAM ring straight into one BigTIFF: frames.raw is
+    never created (no raw write / read-back), yet every frame lands in order and the
+    metadata sidecar is still written."""
+    import json
+    import time
+
+    import tifffile
+
+    h, w, n = 4, 4, 6
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    assert writer.is_direct_encode is True
+    frames_dir = tmp_path / "frames"
+
+    writer.start()
+    time.sleep(0.1)  # deferred hold: nothing written, and no raw file opened
+    assert writer.get_write_statistics()["frames_written"] == 0
+    assert not (frames_dir / "frames.raw").exists()
+
+    writer.stop(wait=True)  # burst ends -> direct-encode drain writes the BigTIFF
+    assert not writer.is_alive()
+
+    stack = frames_dir / "frames_stack.tiff"
+    assert stack.exists()
+    assert not (frames_dir / "frames.raw").exists()  # raw never created in direct-encode
+    assert writer.get_write_statistics()["frames_written"] == n
+
+    with tifffile.TiffFile(str(stack)) as tf:
+        assert tf.is_bigtiff
+        data = tf.asarray()
+    assert data.shape == (n, h, w)
+    for i in range(n):
+        assert int(data[i, 0, 0]) == i
+
+    recs = [json.loads(ln) for ln in (frames_dir / "frame_metadata.jsonl").read_text().splitlines() if ln.strip()]
+    assert len(recs) == n
+    assert "byte_offset" not in recs[0]  # direct path writes lean records (no raw offsets)
+
+
+def test_direct_encode_hdf5_skips_raw(tmp_path):
+    """Deferred + HDF5 direct-encodes the RAM ring into frames.h5 with no frames.raw."""
+    import time
+
+    import h5py
+
+    h, w, n = 3, 3, 5
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="hdf5",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    assert writer.is_direct_encode is True
+    writer.start()
+    time.sleep(0.05)
+    assert not (tmp_path / "frames" / "frames.raw").exists()
+    writer.stop(wait=True)
+
+    assert not (tmp_path / "frames" / "frames.raw").exists()
+    assert writer.get_write_statistics()["frames_written"] == n
+    with h5py.File(str(tmp_path / "frames.h5"), "r") as f:
+        assert f["frames"].shape == (n, h, w)
+        assert list(f["frame_ids"][:]) == list(range(n))
+        for i in range(n):
+            assert int(f["frames"][i, 0, 0]) == i
+
+
+def test_zarr_raw_path_roundtrip(tmp_path):
+    """Non-deferred Zarr goes through the raw round-trip (_encode_from_raw + zarr appender):
+    frames.raw is written then removed, leaving a valid frames.zarr. Also guards the old
+    latent bug where the zarr builder referenced `zarr` without importing it."""
+    zarr = pytest.importorskip("zarr")
+
+    h, w, n = 3, 3, 4
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="zarr",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    assert writer.is_direct_encode is False  # non-deferred -> raw path
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+
+    assert not (tmp_path / "frames" / "frames.raw").exists()  # removed after conversion
+    g = zarr.open(str(tmp_path / "frames.zarr"), mode="r")
+    assert g["frames"].shape == (n, h, w)
+    assert list(g["frame_ids"][:]) == list(range(n))
+    for i in range(n):
+        assert int(g["frames"][i, 0, 0]) == i
+
+
 def test_finalize_progress_counts_converted_frames(tmp_path):
     """After a BigTIFF run, the writer's finalize-progress snapshot reports every frame
     drained and converted (this is what drives the post-capture progress bar)."""
@@ -296,29 +411,27 @@ def test_finalize_progress_counts_converted_frames(tmp_path):
     assert prog["frames_converted"] == n
 
 
-def test_estimate_finalize_seconds_scales_with_size_and_format(tmp_path):
-    """The post-capture timeout estimate is proportional to captured bytes, larger for
-    encoded formats (which re-read + re-write) than for raw, and zero in DAQ-only mode."""
+def test_finalize_stall_grace_conservative_then_tightens():
+    """The finalize stall grace is huge before a rate is trusted, then becomes
+    SAFETY x projected-remaining, floored — never a fixed throughput estimate."""
     from control.core.fast_acquisition_controller import (
-        FastAcquisitionController,
-        FAST_ACQ_SATURATING_WRITE_BYTES_PER_S,
+        fast_acq_finalize_stall_grace_s as grace,
+        FAST_ACQ_FINALIZE_INITIAL_GRACE_S as INIT,
+        FAST_ACQ_FINALIZE_RATE_MIN_ELAPSED_S as MIN_ELAPSED,
+        FAST_ACQ_FINALIZE_SAFETY as SAFETY,
+        FAST_ACQ_FINALIZE_MIN_GRACE_S as FLOOR,
     )
 
-    c = FastAcquisitionController(camera=None, ni_daq=None, output_path=str(tmp_path))
-    # DAQ-only (camera is None) never writes frames, so no estimate.
-    assert c.estimate_finalize_seconds() == 0.0
+    # Extremely conservative at the start: nothing written yet, or too little write time.
+    assert grace(0.5, 0, 10000) == INIT
+    assert grace(MIN_ELAPSED - 0.01, 5000, 10000) == INIT
+    assert grace(5.0, 0, 10000) == INIT
 
-    # Pretend a capture happened with a known geometry.
-    c._daq_only = False
-    c._frame_shape = (600, 2400)
-    c._dtype = np.uint16
-    c._frame_count = 1000
-    bytes_total = 600 * 2400 * 2 * 1000
+    # Rate trusted (2000 frames in 10 s -> 200 fps; 8000 remaining -> 40 s projected).
+    assert grace(10.0, 2000, 10000) == SAFETY * (8000 / 200.0)  # 120 s, > floor
 
-    c._file_format = "raw"
-    raw_est = c.estimate_finalize_seconds()
-    assert raw_est == bytes_total / FAST_ACQ_SATURATING_WRITE_BYTES_PER_S
+    # Near the end: tiny projected remaining -> floored, not near-zero.
+    assert grace(10.0, 9990, 10000) == FLOOR
 
-    c._file_format = "bigtiff"
-    # Encoded formats move the data ~3x (drain, then read + write on conversion).
-    assert c.estimate_finalize_seconds() == 3.0 * raw_est
+    # Slow writer with lots remaining -> grace grows large (stays conservative).
+    assert grace(10.0, 100, 10000) == SAFETY * (9900 / 10.0)  # 2970 s
