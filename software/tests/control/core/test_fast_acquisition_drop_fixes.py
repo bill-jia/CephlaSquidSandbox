@@ -411,6 +411,84 @@ def test_finalize_progress_counts_converted_frames(tmp_path):
     assert prog["frames_converted"] == n
 
 
+def test_camera_trigger_offsets_match_generated_pulse_train():
+    """The plot's camera-trigger offsets must equal the rising edges of the pulse train the
+    controller actually emits, so the overlay marks exactly where frames are triggered."""
+    from control.core.fast_acquisition_controller import camera_trigger_offset_samples
+    from control.nidaq import generate_pulse_train
+
+    sample_rate, frame_rate, num_frames, camera_offset_ms = 10000.0, 800.0, 50, 0.3
+    num_samples = int(sample_rate * num_frames / frame_rate) + 100
+    n_off = int(np.ceil(camera_offset_ms * sample_rate / 1000.0)) + 1
+    period = int(sample_rate / frame_rate)
+
+    pattern = generate_pulse_train(
+        pulse_width_samples=4, period_samples=period, num_samples=num_samples,
+        n_samples_offset=n_off, inverted=False, max_num_pulses=num_frames,
+    ).astype(int)
+    rising = list(np.flatnonzero(np.diff(pattern) == 1) + 1)  # 0->1 transitions
+
+    offsets = camera_trigger_offset_samples(sample_rate, frame_rate, num_frames, camera_offset_ms, num_samples)
+    assert offsets == rising
+    assert len(offsets) == num_frames
+
+
+def test_camera_trigger_offsets_edge_cases():
+    from control.core.fast_acquisition_controller import camera_trigger_offset_samples
+
+    # Continuous (num_frames None/0): fill every period that fits the window.
+    off = camera_trigger_offset_samples(10000.0, 1000.0, None, 0.0, 51)
+    assert off == [1, 11, 21, 31, 41]  # n_off=1, period=10, last < 51
+    assert camera_trigger_offset_samples(10000.0, 1000.0, 0, 0.0, 51) == off
+
+    # A frame cap smaller than what fits is honored.
+    assert camera_trigger_offset_samples(10000.0, 1000.0, 3, 0.0, 51) == [1, 11, 21]
+
+    # Degenerate inputs -> no markers (no crash).
+    assert camera_trigger_offset_samples(0.0, 800.0, 10, 0.0, 1000) == []
+    assert camera_trigger_offset_samples(10000.0, 0.0, 10, 0.0, 1000) == []
+    assert camera_trigger_offset_samples(10000.0, 800.0, 10, 0.0, 0) == []
+
+
+def _approx_bars(bars):
+    return [(pytest.approx(s), pytest.approx(w)) for s, w in bars]
+
+
+def test_camera_exposure_window_bars_rolling():
+    """Rolling shutter: any-row window = [t, t+exp+readout]; all-rows co-exposure sits in
+    [t+readout, t+exp] and vanishes when exposure <= readout."""
+    from control.core.fast_acquisition_controller import camera_exposure_window_bars
+
+    # exposure (5 ms) > readout (2 ms): co-exposure exists.
+    b = camera_exposure_window_bars([0.0, 0.1], exposure_s=0.005, readout_s=0.002, shutter_mode="ROLLING")
+    assert b["union"] == _approx_bars([(0.0, 0.007), (0.1, 0.007)])          # exp + readout
+    assert b["coexposure"] == _approx_bars([(0.002, 0.003), (0.102, 0.003)])  # [t+readout, t+exp]
+
+    # exposure (1 ms) <= readout (2 ms): no instant where all rows overlap.
+    b2 = camera_exposure_window_bars([0.0], exposure_s=0.001, readout_s=0.002, shutter_mode="ROLLING")
+    assert b2["union"] == _approx_bars([(0.0, 0.003)])
+    assert b2["coexposure"] == []
+
+
+def test_camera_exposure_window_bars_global_reset_and_global():
+    from control.core.fast_acquisition_controller import camera_exposure_window_bars
+
+    # Global reset: all rows start together -> co-exposure = [t, t+exp]; union still + readout.
+    gr = camera_exposure_window_bars([0.0], exposure_s=0.005, readout_s=0.002,
+                                     shutter_mode="ROLLING_WITH_GLOBAL_RESET")
+    assert gr["union"] == _approx_bars([(0.0, 0.007)])
+    assert gr["coexposure"] == _approx_bars([(0.0, 0.005)])
+
+    # True global shutter: readout ignored, both windows = [t, t+exp].
+    g = camera_exposure_window_bars([0.0], exposure_s=0.005, readout_s=0.002, shutter_mode="GLOBAL")
+    assert g["union"] == _approx_bars([(0.0, 0.005)])
+    assert g["coexposure"] == _approx_bars([(0.0, 0.005)])
+
+    # No triggers -> empty bands (no crash).
+    empty = camera_exposure_window_bars([], exposure_s=0.005, readout_s=0.002, shutter_mode="ROLLING")
+    assert empty == {"union": [], "coexposure": []}
+
+
 def test_finalize_stall_grace_conservative_then_tightens():
     """The finalize stall grace is huge before a rate is trusted, then becomes
     SAFETY x projected-remaining, floored — never a fixed throughput estimate."""

@@ -554,6 +554,9 @@ class TucsenCamera(AbstractCamera):
         # reciprocal is the fixed sensor frame-rate ceiling reported to the UI. 0.0 until
         # first computed (then get_max_acquisition_frame_rate falls back to the raw value).
         self._readout_period_ms: float = 0.0
+        # Current shutter/readout mode (Aries: ROLLING or ROLLING_WITH_GLOBAL_RESET). Cached
+        # software-side; the source of truth is the SensorShutterMode GenICam node.
+        self._readout_mode: Optional[CameraReadoutMode] = None
         self.temperature_reading_callback = None
         # GenICam writes need ≥100 ms between them or the camera returns errors.
         # Track the last write so _set_genicam_parameter can gate only when
@@ -1020,8 +1023,8 @@ class TucsenCamera(AbstractCamera):
 
         To be transparent to callers, snapshots and restores every piece of
         caller-observable camera configuration across the reopen:
-        ROI, binning, camera mode, exposure time, acquisition mode. Each is
-        restored via the public setter so Python cache and hardware register
+        ROI, binning, camera mode, exposure time, acquisition mode, shutter mode.
+        Each is restored via the public setter so Python cache and hardware register
         are written together.
         """
         roi_to_restore = self._region_of_interest
@@ -1029,6 +1032,12 @@ class TucsenCamera(AbstractCamera):
         camera_mode_enum_to_restore = self._camera_mode
         exposure_to_restore = self._exposure_time_ms
         acq_mode_to_restore = self._acquisition_mode
+        # SensorShutterMode reverts to its factory default (Rolling) on a device reopen, just
+        # like SensorOperationMode/ExposureTime, so a user-selected Global Reset would be
+        # silently lost mid-run (the reopen fires from stop_fast_acquisition/streaming
+        # transitions). Snapshot and re-assert it below so captured frames keep the intended
+        # shutter geometry.
+        readout_mode_to_restore = self._readout_mode
 
         if self.temperature_reading_thread is not None:
             self._terminate_temperature_event.set()
@@ -1061,6 +1070,13 @@ class TucsenCamera(AbstractCamera):
             self.set_acquisition_mode(acq_mode_to_restore)
         if roi_to_restore is not None:
             self.set_region_of_interest(*roi_to_restore)
+        # Re-assert the shutter mode last (needs a valid _camera_mode, restored above). Only
+        # the Aries exposes SensorShutterMode; other models revert harmlessly.
+        if readout_mode_to_restore is not None and self._is_aries():
+            try:
+                self.set_readout_mode(readout_mode_to_restore)
+            except Exception as e:
+                self._log.warning(f"Could not restore shutter mode after SDK reset: {e}", exc_info=True)
 
     def _on_sdk_trigger_frame(self, frame_bytes: bytes, metadata: dict) -> None:
         """Handler for TUCAM_Buf_DataCallBack in trigger capture mode.
@@ -1726,25 +1742,72 @@ class TucsenCamera(AbstractCamera):
     # Readout Mode (AbstractCamera interface)
     # =========================================================================
 
+    # Aries GenICam SensorShutterMode symbolic values (manual §5.4.2) <-> our enum.
+    # The Aries has no true global shutter — only rolling and (rolling-readout) global reset.
+    _SHUTTER_MODE_TO_SYMBOL = {
+        CameraReadoutMode.ROLLING: "Rolling",
+        CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET: "GlobalReset",
+    }
+    _SHUTTER_SYMBOL_TO_MODE = {
+        "Rolling": CameraReadoutMode.ROLLING,
+        "GlobalReset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+    }
+
+    def _is_aries(self) -> bool:
+        return self._config.camera_model in (TucsenCameraModel.ARIES_6506, TucsenCameraModel.ARIES_6510)
+
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
-        """Set readout mode."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            if readout_mode != CameraReadoutMode.ROLLING:
-                raise ValueError(f"Tucsen camera {self._config.camera_model} does not support readout mode {readout_mode}")
-                # TBD: add support for global with reset (grayed out in SamplePro for some reason, figure it out)
-        elif readout_mode != CameraReadoutMode.GLOBAL:
-            raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
+        """Set the sensor shutter mode. On the Aries this writes the GenICam SensorShutterMode
+        enumeration node (Rolling / GlobalReset). Global reset resets all rows simultaneously
+        then reads out rolling, emulating a global shutter (manual §3.3)."""
+        if not self._is_aries():
+            if readout_mode != CameraReadoutMode.GLOBAL:
+                raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
+            self._readout_mode = readout_mode
+            return
+
+        symbol = self._SHUTTER_MODE_TO_SYMBOL.get(readout_mode)
+        if symbol is None:
+            raise ValueError(
+                f"Tucsen {self._config.camera_model.value} supports Rolling and Global Reset "
+                f"(ROLLING / ROLLING_WITH_GLOBAL_RESET), got {readout_mode}"
+            )
+        # Resolve the symbolic value to its enum index (the SetElementValue enum path takes an
+        # integer index, not a string), so we don't hardcode 0/1 in case the XML order differs.
+        info = self._get_genicam_parameter("SensorShutterMode")
+        entries = info.get("enum_entries") or []
+        if symbol not in entries:
+            raise CameraError(
+                f"Camera SensorShutterMode node has no '{symbol}' entry (available: {entries})"
+            )
+        index = entries.index(symbol)
+        with self._pause_streaming():
+            self._set_genicam_parameter(
+                "SensorShutterMode", index, TUELEM_TYPE.TU_ElemEnumeration.value, log_info=True
+            )
+        self._readout_mode = readout_mode
+        # Shutter mode changes the readout timing model; refresh readout period / strobe.
+        self._update_internal_settings()
+        self._log.info(f"Set readout mode to {readout_mode.value} (SensorShutterMode={symbol})")
 
     def get_readout_mode(self) -> CameraReadoutMode:
-        """Get current readout mode."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            return CameraReadoutMode.ROLLING
-        return CameraReadoutMode.GLOBAL
+        """Get the current sensor shutter mode, reading the SensorShutterMode node on the Aries."""
+        if not self._is_aries():
+            return CameraReadoutMode.GLOBAL
+        try:
+            symbol = self._get_genicam_parameter("SensorShutterMode")["value"]
+            mode = self._SHUTTER_SYMBOL_TO_MODE.get(symbol)
+            if mode is not None:
+                self._readout_mode = mode
+                return mode
+        except Exception as e:
+            self._log.debug(f"Could not read SensorShutterMode: {e}")
+        return self._readout_mode or CameraReadoutMode.ROLLING
 
     def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
         """Get available readout modes."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            return [CameraReadoutMode.ROLLING]
+        if self._is_aries():
+            return [CameraReadoutMode.ROLLING, CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET]
         return [CameraReadoutMode.GLOBAL]
 
     # =========================================================================
@@ -1869,26 +1932,52 @@ class TucsenCamera(AbstractCamera):
     def _update_internal_settings(self):
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
-            self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
             self._update_readout_period()
+            packing = camera_mode_name_to_packing(self.get_camera_mode())
+            self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
+            self.update_config_crop()
 
     def _update_readout_period(self):
-        """Back out the exposure-independent readout period from the camera's
-        AcquisitionMaxFrameRate ( = 1/(exposure + readout) ) using the exposure that value
-        was read at. The reciprocal is the fixed frame-rate ceiling for the current
-        ROI/binning/mode, so the UI stops showing it drop (and going red) after a run
-        leaves a longer exposure set. Exposure is subtracted here — while it and the
-        just-read max correspond — so later exposure changes don't shift the ceiling."""
-        v = self._max_acquisition_rate_hz
-        e_ms = self._exposure_time_ms or 0.0
+        """Isolate the exposure-INDEPENDENT sensor readout period from the camera's
+        AcquisitionMaxFrameRate node. Per the Aries manual (§3.13), the max frame rate is
+        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure. The
+        reciprocal, 1/readout, is the fixed readout-limited ceiling the UI shows — it must
+        NOT drop as the exposure changes.
+
+        Both AcquisitionMaxFrameRate and ExposureTime are read FRESH from the nodes here,
+        back to back, so they correspond. Using the cached self._exposure_time_ms instead
+        was the bug behind the ~4000 Hz readouts: a mode/ROI change resets the camera's
+        exposure while the cache still held the old (larger) value, so 1/AMFR - stale_exp
+        over-subtracted and inflated the ceiling. Reading exposure fresh removes that skew;
+        because readout is exposure-independent, the cached result stays correct afterward."""
+        v = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+        self._max_acquisition_rate_hz = v
         if not v or v <= 0.0:
             self._readout_period_ms = 0.0
             return
+        try:
+            e_ms = self._get_genicam_parameter("ExposureTime")["value"] / 1000.0  # us -> ms
+        except Exception as e:
+            # If exposure can't be read fresh, do NOT fall back to the (possibly stale) cache —
+            # that stale value is exactly what inflated the ceiling before. Leave the readout
+            # unset so the UI uses the raw camera max until the next successful update.
+            self._log.debug(f"Could not read ExposureTime for readout back-calc: {e}")
+            self._readout_period_ms = 0.0
+            return
         readout_ms = 1000.0 / v - e_ms
+        # readout must be a positive fraction of the frame period; if the model is violated
+        # (readout <= 0), leave it unset so get_max_acquisition_frame_rate falls back to the
+        # raw node value rather than reporting an impossible ceiling.
         self._readout_period_ms = readout_ms if readout_ms > 0.0 else 0.0
-        packing = camera_mode_name_to_packing(self.get_camera_mode())
-        self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
-        self.update_config_crop()
+
+    def get_readout_time_ms(self) -> float:
+        """Exposure-independent sensor readout time (rolling-shutter row-0-to-last-row skew)
+        for the current ROI / binning / camera mode, in ms. Derived from the camera's
+        AcquisitionMaxFrameRate; 0 until first computed, then the geometric estimate as a
+        fallback. Used for the co-exposure/exposure-window visualization and strobe timing."""
+        if self._readout_period_ms and self._readout_period_ms > 0.0:
+            return self._readout_period_ms
+        return self._rolling_shutter_readout_ms
 
     def _raw_set_resolution(self, bin_value: int):
         with self._pause_streaming():

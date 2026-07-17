@@ -566,6 +566,16 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         return self.get_exposure_time() + self.get_strobe_time()
 
+    def get_readout_time_ms(self) -> float:
+        """
+        Sensor readout time in milliseconds: for a rolling shutter, the time from the first
+        row starting exposure to the last row starting exposure (the row-to-row skew); for a
+        global shutter, 0. Used to visualize the true per-frame exposure window (which spans
+        exposure + readout for a rolling sensor). Defaults to 0 (global-shutter assumption);
+        rolling-shutter cameras override this.
+        """
+        return 0.0
+
     @abc.abstractmethod
     def set_frame_format(self, frame_format: CameraFrameFormat):
         """

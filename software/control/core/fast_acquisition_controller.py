@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from enum import Enum
-from typing import Any, Optional, Dict, Callable, Union
+from typing import Any, Optional, Dict, Callable, List, Union
 import numpy as np
 import psutil
 from scipy import ndimage
@@ -74,6 +74,68 @@ FAST_ACQ_FINALIZE_RATE_MIN_ELAPSED_S = 2.0
 # Once trusted, tolerate a stall of up to SAFETY x (projected remaining time), floored.
 FAST_ACQ_FINALIZE_SAFETY = 3.0
 FAST_ACQ_FINALIZE_MIN_GRACE_S = 30.0
+
+
+def camera_trigger_offset_samples(
+    sample_rate_hz: float,
+    frame_rate_hz: float,
+    num_frames: Optional[int],
+    camera_offset_ms: float,
+    num_samples: int,
+) -> List[int]:
+    """Sample indices of the camera-trigger rising edges that start_acquisition() will emit
+    for these fast-acquisition parameters. Mirrors the generate_pulse_train() call there
+    exactly (same n_samples_offset, period, and max-pulses cap) so the NIDAQ plot can mark
+    where each frame is triggered. num_frames None/<=0 means continuous: every pulse that
+    fits within num_samples."""
+    if sample_rate_hz <= 0 or frame_rate_hz <= 0 or num_samples <= 0:
+        return []
+    n_samples_offset = int(np.ceil(camera_offset_ms * sample_rate_hz / 1000.0)) + 1
+    period_samples = int(sample_rate_hz / frame_rate_hz)
+    if period_samples <= 0:
+        return []
+    cap = num_frames if (num_frames and num_frames > 0) else None
+    offsets: List[int] = []
+    start = n_samples_offset
+    while start < num_samples:
+        offsets.append(start)
+        if cap is not None and len(offsets) >= cap:
+            break
+        start += period_samples
+    return offsets
+
+
+def camera_exposure_window_bars(starts_s, exposure_s: float, readout_s: float, shutter_mode: str) -> Dict[str, list]:
+    """Shaded-band geometry for the NIDAQ plot's camera-exposure overlay.
+
+    Given the per-frame trigger start times (seconds), the per-row exposure duration, the
+    rolling-shutter readout skew (row-0-start to last-row-start), and the shutter mode, return
+    (start, width) bars for two bands per frame:
+      - 'union': the ANY-row-exposing window (the sensor is integrating on at least one row).
+      - 'coexposure': the ALL-rows-simultaneously-exposing window (matters for strobed light).
+
+    Timing (Aries manual §3.3/§3.17.2):
+      - Rolling: row r starts at t+r·Tline, so any-row = [t, t+exp+readout]; all-rows co-expose
+        only in [t+readout, t+exp] (empty when exp <= readout).
+      - Global reset: all rows reset at t and read out rolling, so any-row = [t, t+exp+readout]
+        but all-rows co-expose in [t, t+exp] (until the first row finishes).
+      - True global shutter (readout 0): both windows = [t, t+exp].
+
+    ``shutter_mode`` is a CameraReadoutMode value/name string (e.g. "ROLLING",
+    "ROLLING_WITH_GLOBAL_RESET", "GLOBAL")."""
+    name = (shutter_mode or "").upper()
+    is_global_reset = "GLOBAL_RESET" in name  # ROLLING_WITH_GLOBAL_RESET
+    is_true_global = name == "GLOBAL"
+    exposure_s = max(0.0, float(exposure_s))
+    readout_s = 0.0 if is_true_global else max(0.0, float(readout_s))
+    union_w = exposure_s + readout_s
+    if is_global_reset or is_true_global:
+        co_off, co_w = 0.0, exposure_s
+    else:  # rolling
+        co_off, co_w = readout_s, max(0.0, exposure_s - readout_s)
+    union = [(float(s), union_w) for s in starts_s]
+    coexposure = [(float(s) + co_off, co_w) for s in starts_s] if co_w > 0.0 else []
+    return {"union": union, "coexposure": coexposure}
 
 
 def fast_acq_finalize_stall_grace_s(write_elapsed_s: float, written: int, expected: int) -> float:
