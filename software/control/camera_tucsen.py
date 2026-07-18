@@ -164,6 +164,21 @@ TUCSEN_CAMERA_MODES: Dict[TucsenCameraModel, Dict[str, Tuple[Union[Mode400BSIV3,
 }
 
 
+# Depth of the SDK's internal trigger ring during fast acquisition, expressed as
+# seconds of frames at the capture rate. This is the ONLY buffer that can absorb a
+# stall of the SDK callback thread (the thread that copies SDK->ring): while that
+# thread is stalled, frames cannot reach our ring at all, so the (large) host ring
+# does not help — only SDK-side depth does. It must therefore exceed the worst
+# callback-thread stall. Observed callback stalls at 2400x600 800 Hz reach a few
+# hundred ms (GIL contention with the writer's per-frame copy + OS scheduling of a
+# ~20 GiB working set), so 0.5s dropped ~2% of frames; 2.0s rides them out with
+# margin. Bounded by the RAM cap below — keep it consistent with the ring-buffer
+# RAM headroom in fast_acquisition_controller (the SDK ring is allocated in addition
+# to the host ring). Increase if drops reappear at higher rates / larger frames.
+FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS = 2.0
+FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES = 6 * 1024**3  # 6 GiB cap (tune to installed RAM)
+
+
 # ============================================================================
 # Fast acquisition: raw byte packing (HDR 16-bit, CMS 12-bit, HS 11-bit)
 # ============================================================================
@@ -244,10 +259,8 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
 
 
 def decode_tucsen_hs11(raw: bytes, height: int, width: int) -> np.ndarray:
-    """11-bit values in 12-bit packing with LSB zero; unpack as CMS12 then shift right by one."""
-    u12 = decode_tucsen_cms12(raw, height, width)
-    return u12.astype(np.uint16)
-    # return (u12 >> 1).astype(np.uint16)
+    """Decode HS (high-speed) frames: 12-bit pixels packed two per three bytes, same as CMS12."""
+    return decode_tucsen_cms12(raw, height, width)
 
 def tucsen_raw_bytes_to_uint16(raw: bytes, meta: dict, packing: str = "hdr16") -> np.ndarray:
     """Decode one frame; packing comes from the camera (see byte_decoding_fn closure), not metadata."""
@@ -270,16 +283,31 @@ def decode_tucsen_raw_bytes(packing: str, raw: bytes, height: int, width: int) -
 
 
 class TucsenCameraCallBack:
-    """SDK callback: must call TUCAM_Buf_GetData to dequeue each frame (vendor contract)."""
+    """SDK callback: must call TUCAM_Buf_GetData to dequeue each frame (vendor contract).
+
+    Two consumer modes share this callback because both the gated-trigger (live)
+    path and fast acquisition register via TUCAM_Buf_DataCallBack:
+
+    - ``ptr_sink`` (fast acquisition): a callable ``(src_ptr, n_bytes, metadata)``
+      that copies the frame exactly once, straight from the SDK's DMA buffer into
+      its own storage. No intermediate Python ``bytes`` object is created on this
+      GIL-bound thread, so the consumer can keep up with the camera at full rate.
+    - ``callback_function`` (gated trigger): a callable ``(frame_bytes, metadata)``
+      used where the caller needs a decoded/owned bytes object.
+
+    ``ptr_sink`` takes precedence when set.
+    """
 
     def __init__(
         self,
         camera_handle,
-        callback_function: Optional[Callable[..., None]],
+        callback_function: Optional[Callable[..., None]] = None,
         log=None,
+        ptr_sink: Optional[Callable[..., None]] = None,
     ):
         self._camera_handle = camera_handle
         self.callback_function = callback_function
+        self._ptr_sink = ptr_sink
 
     def OnCallbackBuffer(self):
         m_rawHeader = TUCAM_RAWIMG_HEADER()
@@ -287,14 +315,9 @@ class TucsenCameraCallBack:
             result = TUCAM_Buf_GetData(self._camera_handle, pointer(m_rawHeader))
             if result != TUCAMRET.TUCAMRET_SUCCESS:
                 return
-            if self.callback_function is None:
-                return
             size = int(m_rawHeader.uiImgSize)
             if size == 0 or not m_rawHeader.pImgData:
                 return
-            buf = create_string_buffer(size)
-            memmove(buf, m_rawHeader.pImgData, size)
-            frame_bytes = bytes(buf)
             metadata: Dict[str, object] = {
                 "timestamp": m_rawHeader.dblTimeLast,
                 "frame_index": int(m_rawHeader.uiIndex),
@@ -303,9 +326,20 @@ class TucsenCameraCallBack:
                 "width": int(m_rawHeader.usWidth),
                 "ui_img_size": size,
             }
+            if self._ptr_sink is not None:
+                # Single copy: hand the SDK DMA pointer straight to the sink, which
+                # memmoves it once into its ring slab. The previous bytes path did a
+                # zeroing alloc plus two-to-three full-frame copies per frame on this
+                # GIL-bound thread, which made the consumer fall behind the camera and
+                # overflow the SDK trigger buffer (silent frame drops).
+                self._ptr_sink(m_rawHeader.pImgData, size, metadata)
+                return
+            if self.callback_function is None:
+                return
+            frame_bytes = string_at(m_rawHeader.pImgData, size)
             self.callback_function(frame_bytes, metadata)
         except Exception as e:
-            print(f"TucsenCameraCallBack: {e}", exc_info=True)
+            print(f"TucsenCameraCallBack: {e}")
 
 
 # ============================================================================
@@ -515,6 +549,15 @@ class TucsenCamera(AbstractCamera):
         # self._strobe_delay_ms: float = 0.0
 
         self._rolling_shutter_readout_ms: float = 0.0
+        # Exposure-independent frame readout period (ms) for the current ROI/binning/mode,
+        # backed out from the camera's exposure-limited AcquisitionMaxFrameRate. Backs
+        # get_readout_time_ms() (the exposure-window / strobe-timing visualization), NOT the
+        # UI max-frame-rate label (that reads AcquisitionMaxFrameRate fresh). 0.0 until first
+        # computed by _update_readout_period.
+        self._readout_period_ms: float = 0.0
+        # Current shutter/readout mode (Aries: ROLLING or ROLLING_WITH_GLOBAL_RESET). Cached
+        # software-side; the source of truth is the SensorShutterMode GenICam node.
+        self._readout_mode: Optional[CameraReadoutMode] = None
         self.temperature_reading_callback = None
         # GenICam writes need ≥100 ms between them or the camera returns errors.
         # Track the last write so _set_genicam_parameter can gate only when
@@ -981,8 +1024,8 @@ class TucsenCamera(AbstractCamera):
 
         To be transparent to callers, snapshots and restores every piece of
         caller-observable camera configuration across the reopen:
-        ROI, binning, camera mode, exposure time, acquisition mode. Each is
-        restored via the public setter so Python cache and hardware register
+        ROI, binning, camera mode, exposure time, acquisition mode, shutter mode.
+        Each is restored via the public setter so Python cache and hardware register
         are written together.
         """
         roi_to_restore = self._region_of_interest
@@ -990,6 +1033,12 @@ class TucsenCamera(AbstractCamera):
         camera_mode_enum_to_restore = self._camera_mode
         exposure_to_restore = self._exposure_time_ms
         acq_mode_to_restore = self._acquisition_mode
+        # SensorShutterMode reverts to its factory default (Rolling) on a device reopen, just
+        # like SensorOperationMode/ExposureTime, so a user-selected Global Reset would be
+        # silently lost mid-run (the reopen fires from stop_fast_acquisition/streaming
+        # transitions). Snapshot and re-assert it below so captured frames keep the intended
+        # shutter geometry.
+        readout_mode_to_restore = self._readout_mode
 
         if self.temperature_reading_thread is not None:
             self._terminate_temperature_event.set()
@@ -1022,6 +1071,17 @@ class TucsenCamera(AbstractCamera):
             self.set_acquisition_mode(acq_mode_to_restore)
         if roi_to_restore is not None:
             self.set_region_of_interest(*roi_to_restore)
+        # Re-assert the shutter mode last (needs a valid _camera_mode, restored above). Only
+        # the Aries exposes SensorShutterMode; other models revert harmlessly.
+        if readout_mode_to_restore is not None and self._is_aries():
+            try:
+                self.set_readout_mode(readout_mode_to_restore)
+            except Exception as e:
+                # The re-assert failed, so the hardware is still at its factory-reverted mode
+                # (Rolling). Invalidate the cache so the next cache-first get_readout_mode
+                # re-seeds from the SensorShutterMode node instead of serving the stale value.
+                self._readout_mode = None
+                self._log.warning(f"Could not restore shutter mode after SDK reset: {e}", exc_info=True)
 
     def _on_sdk_trigger_frame(self, frame_bytes: bytes, metadata: dict) -> None:
         """Handler for TUCAM_Buf_DataCallBack in trigger capture mode.
@@ -1159,21 +1219,28 @@ class TucsenCamera(AbstractCamera):
         n_frames_expected=0,
         frame_callback: Optional[Callable[..., None]] = None,
         acquisition_mode: Optional[CameraAcquisitionMode] = None,
+        frame_sink: Optional[Callable[..., None]] = None,
     ):
         """
         Start fast acquisition using the SDK buffer callback (TUCAM_Buf_DataCallBack).
 
         Call after setting the camera to HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST
         and before firing DAQ waveforms. Each frame is dequeued with TUCAM_Buf_GetData
-        in the SDK thread, then passed to frame_callback.
+        in the SDK thread, then handed to ``frame_sink`` (preferred) or ``frame_callback``.
 
         Args:
             frame_rate_hz: Expected frame rate (used for internal buffer sizing).
-            n_frames_expected: Hint for expected number of frames (informational).
-            frame_callback: Receives (frame: bytes, metadata: dict). Metadata includes
-                timestamp, frame_index, exposure_s, height, width, ui_img_size.
+            n_frames_expected: Expected number of frames; the SDK trigger buffer is
+                sized to hold the whole capture (bounded by a RAM budget) so the SDK
+                does not drop frames while the consumer drains them.
+            frame_callback: Receives (frame: bytes, metadata: dict). Used only when
+                ``frame_sink`` is not provided.
             acquisition_mode: Optional; use when GenICam cannot distinguish HARDWARE_TRIGGER
                 vs HARDWARE_TRIGGER_FIRST from get_acquisition_mode() alone.
+            frame_sink: Preferred zero-intermediate-copy consumer. Receives
+                (src_ptr, n_bytes, metadata) and copies the frame exactly once from the
+                SDK DMA buffer into its own storage, so no per-frame bytes object is
+                created on the GIL-bound SDK callback thread.
         """
         if self._is_streaming.is_set():
             self._log.warning("Camera is already streaming. Stop streaming before starting fast acquisition.")
@@ -1198,9 +1265,29 @@ class TucsenCamera(AbstractCamera):
         if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
             raise CameraError("Fast acquisition requires HARDWARE_TRIGGER or HARDWARE_TRIGGER_FIRST mode")
 
-        self._trigger_attr.nBufFrames = int(np.ceil(0.5 * frame_rate_hz))
+        # Size the SDK's internal trigger ring (nBufFrames). This is the only buffer that
+        # absorbs a stall of the SDK callback thread (frames cannot reach our host ring
+        # while that thread is stalled), so it is sized as a window of seconds at the
+        # capture rate — deep enough to ride out the worst callback stall — bounded by a
+        # RAM budget. See FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS.
+        roi = self.get_region_of_interest()  # (x, y, w, h)
+        sdk_slot_bytes = max(1, int(roi[2]) * int(roi[3]) * 2)  # SDK delivers unpacked 16-bit
+        budget_cap = max(4, FAST_ACQ_SDK_TRIGGER_BUFFER_MAX_BYTES // sdk_slot_bytes)
+        desired = int(np.ceil(FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS * frame_rate_hz))
+        n_buf = max(4, min(desired, budget_cap))
+        self._log.info(
+            f"Fast-acq SDK trigger buffer: nBufFrames={n_buf} "
+            f"({FAST_ACQ_SDK_TRIGGER_BUFFER_SECONDS}s @ {frame_rate_hz:.0f}Hz, "
+            f"slot={sdk_slot_bytes}B, ~{n_buf * sdk_slot_bytes / 1024**2:.0f} MB)"
+        )
+        self._trigger_attr.nBufFrames = n_buf
         if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
-            raise CameraError(f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}")
+            self._log.warning(f"SDK rejected nBufFrames={n_buf}; falling back to minimal depth")
+            self._trigger_attr.nBufFrames = 4
+            if TUCAM_Cap_SetTrigger(self._camera, self._trigger_attr) != TUCAMRET.TUCAMRET_SUCCESS:
+                raise CameraError(
+                    f"Failed to set trigger buffer for fast acquisition to {self._trigger_attr.nBufFrames}"
+                )
 
         # Remember the live ROI so stop_fast_acquisition_frame_grabbing can
         # restore it after the vendor close/reopen sequence.
@@ -1213,7 +1300,7 @@ class TucsenCamera(AbstractCamera):
         self._allocate_buffer(max_frame=False)
 
         self._fast_acq_buffer_callback_obj = TucsenCameraCallBack(
-            self._camera, frame_callback, log=self._log
+            self._camera, frame_callback, log=self._log, ptr_sink=frame_sink
         )
         self._fast_acq_buffer_callback_fn = BUFFER_CALLBACK(
             self._fast_acq_buffer_callback_obj.OnCallbackBuffer
@@ -1565,7 +1652,6 @@ class TucsenCamera(AbstractCamera):
             return False
         mode = self.get_acquisition_mode()
         return mode in (CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST)
-        self._update_internal_settings()
 
     def get_exposure_time(self) -> float:
         return self._exposure_time_ms
@@ -1584,6 +1670,22 @@ class TucsenCamera(AbstractCamera):
             return self._get_genicam_parameter("AcquisitionFrameRate")["value"]
         else:
             return self._trigger_attr.nFrameRate
+
+    def get_max_acquisition_frame_rate(self) -> Optional[float]:
+        """The camera's reported max acquisition frame rate (Hz) — the SAME AcquisitionMaxFrameRate
+        GenICam node used in the streaming log messages, read fresh so the value always matches
+        the camera's current state (it reflects the current exposure / ROI / mode). Non-genicam
+        models return their cached/default value."""
+        if not self._model_properties.is_genicam:
+            return self._max_acquisition_rate_hz
+        try:
+            # Read-only for the label; do NOT write self._max_acquisition_rate_hz (that cache
+            # is the internal frame-rate clamp, maintained by _update_readout_period /
+            # start_fast_acquisition) so a UI poll can't perturb the clamp value.
+            return self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+        except Exception as e:
+            self._log.debug(f"Could not read AcquisitionMaxFrameRate: {e}")
+            return self._max_acquisition_rate_hz
 
     def get_exposure_limits(self) -> Tuple[float, float]:
         if self._model_properties.is_genicam:
@@ -1650,25 +1752,77 @@ class TucsenCamera(AbstractCamera):
     # Readout Mode (AbstractCamera interface)
     # =========================================================================
 
+    # Aries GenICam SensorShutterMode symbolic values (manual §5.4.2) <-> our enum.
+    # The Aries has no true global shutter — only rolling and (rolling-readout) global reset.
+    _SHUTTER_MODE_TO_SYMBOL = {
+        CameraReadoutMode.ROLLING: "Rolling",
+        CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET: "GlobalReset",
+    }
+    _SHUTTER_SYMBOL_TO_MODE = {
+        "Rolling": CameraReadoutMode.ROLLING,
+        "GlobalReset": CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET,
+    }
+
+    def _is_aries(self) -> bool:
+        return self._config.camera_model in (TucsenCameraModel.ARIES_6506, TucsenCameraModel.ARIES_6510)
+
     def set_readout_mode(self, readout_mode: CameraReadoutMode):
-        """Set readout mode."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            if readout_mode != CameraReadoutMode.ROLLING:
-                raise ValueError(f"Tucsen camera {self._config.camera_model} does not support readout mode {readout_mode}")
-                # TBD: add support for global with reset (grayed out in SamplePro for some reason, figure it out)
-        elif readout_mode != CameraReadoutMode.GLOBAL:
-            raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
+        """Set the sensor shutter mode. On the Aries this writes the GenICam SensorShutterMode
+        enumeration node (Rolling / GlobalReset). Global reset resets all rows simultaneously
+        then reads out rolling, emulating a global shutter (manual §3.3)."""
+        if not self._is_aries():
+            if readout_mode != CameraReadoutMode.GLOBAL:
+                raise ValueError(f"Tucsen camera only supports GLOBAL readout mode, got {readout_mode}")
+            self._readout_mode = readout_mode
+            return
+
+        symbol = self._SHUTTER_MODE_TO_SYMBOL.get(readout_mode)
+        if symbol is None:
+            raise ValueError(
+                f"Tucsen {self._config.camera_model.value} supports Rolling and Global Reset "
+                f"(ROLLING / ROLLING_WITH_GLOBAL_RESET), got {readout_mode}"
+            )
+        # Resolve the symbolic value to its enum index (the SetElementValue enum path takes an
+        # integer index, not a string), so we don't hardcode 0/1 in case the XML order differs.
+        info = self._get_genicam_parameter("SensorShutterMode")
+        entries = info.get("enum_entries") or []
+        if symbol not in entries:
+            raise CameraError(
+                f"Camera SensorShutterMode node has no '{symbol}' entry (available: {entries})"
+            )
+        index = entries.index(symbol)
+        with self._pause_streaming():
+            self._set_genicam_parameter(
+                "SensorShutterMode", index, TUELEM_TYPE.TU_ElemEnumeration.value, log_info=True
+            )
+        self._readout_mode = readout_mode
+        # Shutter mode changes the readout timing model; refresh readout period / strobe.
+        self._update_internal_settings()
+        self._log.info(f"Set readout mode to {readout_mode.value} (SensorShutterMode={symbol})")
 
     def get_readout_mode(self) -> CameraReadoutMode:
-        """Get current readout mode."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            return CameraReadoutMode.ROLLING
-        return CameraReadoutMode.GLOBAL
+        """Get the current sensor shutter mode. Cache-first: the cache is authoritative because
+        only set_readout_mode (and the reopen re-apply) change the hardware, and both update it —
+        so this is a cheap attribute read safe to call from a UI poll. The SensorShutterMode node
+        is read only once to seed the cache."""
+        if not self._is_aries():
+            return CameraReadoutMode.GLOBAL
+        if self._readout_mode is not None:
+            return self._readout_mode
+        try:
+            symbol = self._get_genicam_parameter("SensorShutterMode")["value"]
+            mode = self._SHUTTER_SYMBOL_TO_MODE.get(symbol)
+            if mode is not None:
+                self._readout_mode = mode
+                return mode
+        except Exception as e:
+            self._log.debug(f"Could not read SensorShutterMode: {e}")
+        return CameraReadoutMode.ROLLING
 
     def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
         """Get available readout modes."""
-        if self._config.camera_model == TucsenCameraModel.ARIES_6506 or self._config.camera_model == TucsenCameraModel.ARIES_6510:
-            return [CameraReadoutMode.ROLLING]
+        if self._is_aries():
+            return [CameraReadoutMode.ROLLING, CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET]
         return [CameraReadoutMode.GLOBAL]
 
     # =========================================================================
@@ -1699,7 +1853,9 @@ class TucsenCamera(AbstractCamera):
         return None
 
     def get_fast_acquisition_max_frame_bytes(self) -> int:
-        # Seems like frame buffer still sending as if it's 16 bits
+        # The SDK reports uiImgSize as if the frame were 16-bit, but in the packed
+        # readout modes (cms12/hs11) the stored/decoded payload is the packed length,
+        # so size the ring slot to that.
         roi = self.get_region_of_interest()
         h, w = roi[3], roi[2]
         packing = camera_mode_name_to_packing(self.get_camera_mode())
@@ -1762,10 +1918,44 @@ class TucsenCamera(AbstractCamera):
                     )
                 except (CameraError, Exception):
                     pass
+                # SensorOperationMode only selects Dynamic/Speed/Sensitivity; the gain within
+                # that mode is a separate same-named GenICam node (Aries6506 params). Pin the
+                # gain sub-mode to its canonical value so the mode isn't left on a stale gain
+                # (e.g. Speed must use High gain).
+                self._apply_aries_gain_submode(enum_member)
             self._camera_mode = enum_member
             self._update_internal_settings()
             self._reset_buffer()
         self._log.info(f"Set camera mode to '{spec.display_name or mode_name}' ({spec.bit_depth}-bit)")
+
+    # Aries gain sub-mode to pin per operation mode. After SensorOperationMode selects
+    # Dynamic/Speed/Sensitivity, a same-named GenICam enum node selects the gain within that
+    # mode (Aries6506_Parameters.xlsx: Speed = 0:HighGain, 1:MidGain, 2:LowGain). Speed must
+    # run at High gain. (Dynamic and Sensitivity are intentionally left at their existing
+    # value — add entries here if they should be pinned too.)
+    _ARIES_GAIN_SUBMODE: Dict[ModeAries, Tuple[str, str]] = {
+        ModeAries.SPEED: ("Speed", "HighGain"),
+    }
+
+    def _apply_aries_gain_submode(self, mode: ModeAries) -> None:
+        """Pin the gain sub-mode for the just-selected Aries operation mode (see
+        _ARIES_GAIN_SUBMODE). Resolves the symbolic gain to its enum index so we don't hardcode
+        the ordering, and no-ops for modes/cameras without a mapping."""
+        entry = self._ARIES_GAIN_SUBMODE.get(mode)
+        if entry is None:
+            return
+        node_name, gain_symbol = entry
+        try:
+            entries = self._get_genicam_parameter(node_name).get("enum_entries") or []
+            if gain_symbol not in entries:
+                self._log.warning(f"{node_name} node has no '{gain_symbol}' gain (available: {entries})")
+                return
+            self._set_genicam_parameter(
+                node_name, entries.index(gain_symbol), TUELEM_TYPE.TU_ElemEnumeration.value
+            )
+            self._log.info(f"Pinned {node_name} gain sub-mode to {gain_symbol}")
+        except Exception as e:
+            self._log.warning(f"Could not set {node_name} gain sub-mode to {gain_symbol}: {e}")
 
     def get_camera_mode_spec(self, mode_name: str) -> Optional[TucsenCameraModeSpec]:
         """Get the specification for a camera mode by name."""
@@ -1791,10 +1981,52 @@ class TucsenCamera(AbstractCamera):
     def _update_internal_settings(self):
         self._calculate_strobe_delay()
         if self._model_properties.is_genicam:
-            self._max_acquisition_rate_hz = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
-        packing = camera_mode_name_to_packing(self.get_camera_mode())
-        self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
-        self.update_config_crop()
+            self._update_readout_period()
+            packing = camera_mode_name_to_packing(self.get_camera_mode())
+            self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
+            self.update_config_crop()
+
+    def _update_readout_period(self):
+        """Isolate the exposure-INDEPENDENT sensor readout period from the camera's
+        AcquisitionMaxFrameRate node. Per the Aries manual (§3.13), the max frame rate is
+        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure. This feeds
+        get_readout_time_ms() for the exposure-window / strobe-timing visualization (the UI
+        max-frame-rate label reads AcquisitionMaxFrameRate directly, not this).
+
+        Both AcquisitionMaxFrameRate and ExposureTime are read FRESH from the nodes here,
+        back to back, so they correspond. Using the cached self._exposure_time_ms instead
+        was the bug behind the ~4000 Hz readouts: a mode/ROI change resets the camera's
+        exposure while the cache still held the old (larger) value, so 1/AMFR - stale_exp
+        over-subtracted and inflated the ceiling. Reading exposure fresh removes that skew;
+        because readout is exposure-independent, the cached result stays correct afterward."""
+        v = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+        self._max_acquisition_rate_hz = v
+        if not v or v <= 0.0:
+            self._readout_period_ms = 0.0
+            return
+        try:
+            e_ms = self._get_genicam_parameter("ExposureTime")["value"] / 1000.0  # us -> ms
+        except Exception as e:
+            # If exposure can't be read fresh, do NOT fall back to the (possibly stale) cache —
+            # that stale value is exactly what inflated the ceiling before. Leave the readout
+            # unset so the UI uses the raw camera max until the next successful update.
+            self._log.debug(f"Could not read ExposureTime for readout back-calc: {e}")
+            self._readout_period_ms = 0.0
+            return
+        readout_ms = 1000.0 / v - e_ms
+        # readout must be a positive fraction of the frame period; if the model is violated
+        # (readout <= 0), leave it unset so get_max_acquisition_frame_rate falls back to the
+        # raw node value rather than reporting an impossible ceiling.
+        self._readout_period_ms = readout_ms if readout_ms > 0.0 else 0.0
+
+    def get_readout_time_ms(self) -> float:
+        """Exposure-independent sensor readout time (rolling-shutter row-0-to-last-row skew)
+        for the current ROI / binning / camera mode, in ms. Derived from the camera's
+        AcquisitionMaxFrameRate; 0 until first computed, then the geometric estimate as a
+        fallback. Used for the co-exposure/exposure-window visualization and strobe timing."""
+        if self._readout_period_ms and self._readout_period_ms > 0.0:
+            return self._readout_period_ms
+        return self._rolling_shutter_readout_ms
 
     def _raw_set_resolution(self, bin_value: int):
         with self._pause_streaming():

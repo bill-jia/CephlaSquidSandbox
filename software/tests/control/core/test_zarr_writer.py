@@ -139,6 +139,7 @@ def _make_writer(
     z=1,
     y=64,
     x=64,
+    shard_per_z: bool = True,
 ):
     from control.core.zarr_writer import ZarrAcquisitionConfig, ZarrWriter
 
@@ -156,18 +157,20 @@ def _make_writer(
         compression=compression,
         translation_um=translation_um,
         manifest_path=manifest_path,
+        shard_per_z=shard_per_z,
     )
     return ZarrWriter(cfg), out
 
 
 class TestSharding:
-    """Shard shape is always (1, C, Z, Y, X), regardless of compression."""
+    """Shard shape follows the layout mode; inner chunk is always one plane."""
 
     @pytest.mark.parametrize(
         "compression",
         [ZarrCompression.NONE, ZarrCompression.FAST, ZarrCompression.BALANCED, ZarrCompression.BEST],
     )
-    def test_shard_shape_constant(self, compression: ZarrCompression):
+    def test_shard_per_z_shape(self, compression: ZarrCompression):
+        """Default layout: shard = one z-slice (1, C, 1, Y, X)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             writer, out_path = _make_writer(tmpdir, compression=compression, c=3, z=4, y=64, x=96)
             writer.initialize()
@@ -175,10 +178,26 @@ class TestSharding:
                 with open(os.path.join(out_path, "zarr.json"), "r") as f:
                     array_meta = json.load(f)
                 chunk_grid = array_meta["chunk_grid"]["configuration"]["chunk_shape"]
-                # The outer chunk (shard) is (1, C, Z, Y, X) for level 0
-                assert chunk_grid == [1, 3, 4, 64, 96]
+                # The outer chunk (shard) is one z-slice, all channels
+                assert chunk_grid == [1, 3, 1, 64, 96]
 
                 # Inner chunk is one plane, inside the sharding_indexed codec
+                codecs = array_meta["codecs"]
+                sharding = next(c for c in codecs if c.get("name") == "sharding_indexed")
+                assert sharding["configuration"]["chunk_shape"] == [1, 1, 1, 64, 96]
+            finally:
+                writer.finalize()
+
+    def test_shard_per_fov_shape(self):
+        """Legacy layout: shard = whole FOV timepoint (1, C, Z, Y, X)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, out_path = _make_writer(tmpdir, c=3, z=4, y=64, x=96, shard_per_z=False)
+            writer.initialize()
+            try:
+                with open(os.path.join(out_path, "zarr.json"), "r") as f:
+                    array_meta = json.load(f)
+                chunk_grid = array_meta["chunk_grid"]["configuration"]["chunk_shape"]
+                assert chunk_grid == [1, 3, 4, 64, 96]
                 codecs = array_meta["codecs"]
                 sharding = next(c for c in codecs if c.get("name") == "sharding_indexed")
                 assert sharding["configuration"]["chunk_shape"] == [1, 1, 1, 64, 96]
@@ -380,6 +399,35 @@ class TestDrainUnstagedShardPaths:
                 assert len(staged2) == 3 * n_levels
                 ts2 = {p.replace("\\", "/").split("/c/")[1].split("/")[0] for p in staged2}
                 assert ts2 == {"5", "6", "7"}
+            finally:
+                writer.finalize()
+
+    def test_per_z_stages_each_zslice_once(self):
+        """Shard-per-z: a deep stack stages one shard per (z, level), each once,
+        and the writer reads back complete (no missing tail slices)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            C, Z = 2, 6
+            writer, out_path = _make_writer(tmpdir, t=1, c=C, z=Z, y=256, x=256, shard_per_z=True)
+            writer.initialize()
+            try:
+                rng = np.random.default_rng(1)
+                # z-outer, channel-inner (matches the acquisition loop)
+                for z in range(Z):
+                    for c in range(C):
+                        writer.write_frame((rng.random((256, 256)) * 1000 + 1).astype(np.uint16), t=0, c=c, z=z)
+                writer.wait_for_pending()
+                n_levels = len(writer._level_shapes)
+
+                staged = writer.drain_unstaged_shard_paths()
+                # One shard per (z, level): Z z-slices x n_levels.
+                assert len(staged) == Z * n_levels
+                assert all(os.path.isfile(p) for p in staged)
+                # Path tail after "/c/" is <t>/<c_grid>/<z_grid>/<y_grid>/<x_grid>;
+                # z_grid is index 2.
+                z_grids = {p.replace("\\", "/").split("/c/")[1].split("/")[2] for p in staged}
+                assert z_grids == {str(z) for z in range(Z)}
+                # Each shard staged exactly once.
+                assert writer.drain_unstaged_shard_paths() == []
             finally:
                 writer.finalize()
 

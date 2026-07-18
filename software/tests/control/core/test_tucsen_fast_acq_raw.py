@@ -92,19 +92,18 @@ def test_decode_cms12_small_frame():
     assert int(out[1, 1]) == 0x400
 
 
-def test_decode_hs11_shift():
-    """11-bit values as 12-bit container with LSB zero: unpack CMS then >> 1."""
+def test_decode_hs11_matches_cms12():
+    """HS (high-speed) frames decode identically to CMS12: 12-bit packed values, no shift."""
     h, w = 1, 2
-    p0_11, p1_11 = 0x5AB, 0x123
-    p0_12 = (p0_11 << 1) & 0xFFF
-    p1_12 = (p1_11 << 1) & 0xFFF
-    b0 = (p0_12 >> 4) & 0xFF
-    b1 = ((p0_12 & 0xF) << 4) | (p1_12 & 0xF)
-    b2 = (p1_12 >> 4) & 0xFF
+    p0, p1 = 0x5AB, 0x123  # arbitrary 12-bit values
+    b0 = (p0 >> 4) & 0xFF
+    b1 = ((p0 & 0xF) << 4) | (p1 & 0xF)
+    b2 = (p1 >> 4) & 0xFF
     raw = bytes([b0, b1, b2])
     out = decode_tucsen_hs11(raw, h, w)
-    assert int(out[0, 0]) == p0_11
-    assert int(out[0, 1]) == p1_11
+    assert int(out[0, 0]) == p0
+    assert int(out[0, 1]) == p1
+    np.testing.assert_array_equal(out, decode_tucsen_cms12(raw, h, w))
 
 
 def test_decode_tucsen_raw_bytes_dispatch():
@@ -115,11 +114,11 @@ def test_decode_tucsen_raw_bytes_dispatch():
 
 
 def test_pack_roundtrip_cms12_hs11():
+    """Pack 12-bit pixels in CMS12 layout and decode via hs11 -> identity (no shift)."""
     h, w = 2, 2
-    pixels_11 = np.array([[100, 200], [300, 400]], dtype=np.uint16)
-    p12 = (pixels_11.astype(np.int32) << 1) & 0xFFF
+    pixels = np.array([[100, 200], [300, 400]], dtype=np.uint16)  # 12-bit values
     raw = bytearray((h * w * 3 + 1) // 2)
-    flat = p12.ravel()
+    flat = pixels.ravel()
     i = 0
     for j in range(0, len(flat), 2):
         p0 = int(flat[j])
@@ -129,4 +128,4 @@ def test_pack_roundtrip_cms12_hs11():
         raw[i + 2] = (p1 >> 4) & 0xFF
         i += 3
     out_hs = decode_tucsen_hs11(bytes(raw), h, w)
-    np.testing.assert_array_equal(out_hs, pixels_11)
+    np.testing.assert_array_equal(out_hs, pixels)

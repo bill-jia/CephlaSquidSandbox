@@ -27,7 +27,7 @@ import threading
 import time
 import sys
 from abc import abstractmethod
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import serial
@@ -859,19 +859,31 @@ class Microcontroller:
         channel_name: str,
         illumination_source: int,
         intensity: float,
+        color: Optional[Tuple[float, float, float]] = None,
     ) -> None:
         """Map a logical LED-matrix channel to RGB and send it to firmware.
 
-        RGB weighting is taken from the instance attributes
-        ``self._led_matrix_{r,g,b}_factor`` (set via :meth:`set_led_matrix_factors`,
-        typically from the MachineConfig white-LED factors), not from parameters.
-        NA / annulus / color patterns are SciMicroscopy-only and degrade to plain
-        brightfield on this MCU backend.
+        Final RGB = intensity(0-1) x color x per-machine calibration factor:
+
+        - ``color`` is the global LED-matrix color (0-1 RGB), mirroring the
+          SciMicroscopy ``sc.<r>.<g>.<b>`` color. ``None`` means white (no tint),
+          so brightfield uses the calibration factors alone (legacy behaviour).
+        - ``self._led_matrix_{r,g,b}_factor`` (set via :meth:`set_led_matrix_factors`,
+          from the MachineConfig white-LED factors) stays a pure per-machine
+          calibration weighting.
+
+        NA / annulus / single-LED patterns remain SciMicroscopy-only and degrade
+        to plain brightfield on this MCU backend; only color is honoured here.
         """
         scale = intensity / 100.0
-        r = scale * self._led_matrix_r_factor
-        g = scale * self._led_matrix_g_factor
-        b = scale * self._led_matrix_b_factor
+        cr, cg, cb = (
+            (1.0, 1.0, 1.0)
+            if color is None
+            else (float(color[0]), float(color[1]), float(color[2]))
+        )
+        r = scale * cr * self._led_matrix_r_factor
+        g = scale * cg * self._led_matrix_g_factor
+        b = scale * cb * self._led_matrix_b_factor
 
         self.set_illumination_led_matrix(illumination_source, r, g, b)
 

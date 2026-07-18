@@ -1,0 +1,515 @@
+"""Regression tests for the fast-acquisition frame-drop fixes.
+
+These cover, without any camera/DAQ hardware:
+- FastAcquisitionFrameBuffer.write_frame_from_ptr: the single-copy ctypes path the
+  Tucsen SDK callback uses (copy straight from a source pointer into the ring slab).
+- The writer's post-loop drain: frames sitting in the ring when stop is signaled must
+  be written, not silently truncated.
+- overwrite_when_full=False: a full ring drops the newest frame loudly instead of
+  silently overwriting already-captured frames.
+"""
+
+import ctypes
+
+import numpy as np
+import pytest
+
+from control.core.fast_acquisition_buffer import FastAcquisitionFrameBuffer
+from control.core.fast_acquisition_writer import FastAcquisitionWriter
+
+
+def _ptr_to(data: bytes):
+    """A ctypes void pointer to a freshly allocated copy of ``data`` (kept alive by caller)."""
+    buf = ctypes.create_string_buffer(data, len(data))
+    return ctypes.cast(buf, ctypes.c_void_p), buf
+
+
+def test_write_frame_from_ptr_roundtrip():
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=4, max_frame_bytes=8, frame_shape=(2, 2), dtype=np.uint16
+    )
+    payload = np.array([1, 2, 3, 4], dtype=np.uint16).tobytes()  # 8 bytes
+    ptr, _keep = _ptr_to(payload)
+
+    assert buf.write_frame_from_ptr(ptr, len(payload), frame_id=7, timestamp=1.5, metadata={"k": "v"})
+
+    frame_bytes, frame_id, timestamp, metadata = buf.read_frame()
+    assert frame_bytes == payload
+    assert frame_id == 7
+    assert timestamp == 1.5
+    assert metadata["k"] == "v"
+    assert metadata["frame_byte_length"] == len(payload)
+
+
+def test_write_frame_from_ptr_truncates_to_max():
+    # SDK delivers more bytes (e.g. unpacked 16-bit) than the packed ring slot holds.
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=2, max_frame_bytes=6, frame_shape=(2, 2), dtype=np.uint16
+    )
+    payload = bytes(range(10))  # 10 bytes, slot holds 6
+    ptr, _keep = _ptr_to(payload)
+
+    assert buf.write_frame_from_ptr(ptr, len(payload), frame_id=0, timestamp=0.0)
+    frame_bytes, *_ = buf.read_frame()
+    assert frame_bytes == payload[:6]
+
+
+def test_write_frame_from_ptr_matches_write_frame_bytes():
+    """The pointer path stores exactly what the bytes path would."""
+    payload = np.arange(8, dtype=np.uint16).tobytes()
+
+    a = FastAcquisitionFrameBuffer(buffer_size=2, max_frame_bytes=16, frame_shape=(2, 4), dtype=np.uint16)
+    a.write_frame(payload, frame_id=0, timestamp=0.0)
+    bytes_path, *_ = a.read_frame()
+
+    b = FastAcquisitionFrameBuffer(buffer_size=2, max_frame_bytes=16, frame_shape=(2, 4), dtype=np.uint16)
+    ptr, _keep = _ptr_to(payload)
+    b.write_frame_from_ptr(ptr, len(payload), frame_id=0, timestamp=0.0)
+    ptr_path, *_ = b.read_frame()
+
+    assert bytes_path == ptr_path == payload
+
+
+def test_overwrite_when_full_false_drops_newest():
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=2, max_frame_bytes=4, frame_shape=(1, 2), dtype=np.uint16,
+        overwrite_when_full=False,
+    )
+    f0 = np.array([10, 11], dtype=np.uint16).tobytes()
+    f1 = np.array([20, 21], dtype=np.uint16).tobytes()
+    f2 = np.array([30, 31], dtype=np.uint16).tobytes()
+    assert buf.write_frame(f0, 0, 0.0)
+    assert buf.write_frame(f1, 1, 0.0)
+    # Ring full -> newest dropped, oldest preserved.
+    assert buf.write_frame(f2, 2, 0.0) is False
+    assert buf.read_frame()[0] == f0
+    assert buf.read_frame()[0] == f1
+    assert buf.read_frame() is None
+
+
+def test_ring_full_drops_are_counted():
+    """Every ring-full drop is counted (logging is throttled, counting is not)."""
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=2, max_frame_bytes=4, frame_shape=(1, 2), dtype=np.uint16,
+        overwrite_when_full=False,
+    )
+    payload = np.array([1, 2], dtype=np.uint16).tobytes()
+    assert buf.write_frame(payload, 0, 0.0)
+    assert buf.write_frame(payload, 1, 0.0)
+    for i in range(2, 9):  # 7 drops via both write paths
+        if i % 2:
+            assert buf.write_frame(payload, i, 0.0) is False
+        else:
+            ptr, _keep = _ptr_to(payload)
+            assert buf.write_frame_from_ptr(ptr, len(payload), i, 0.0) is False
+    assert buf.get_buffer_status()["dropped_frames"] == 7
+    buf.clear()
+    assert buf.get_buffer_status()["dropped_frames"] == 0
+
+
+def test_ring_sized_to_available_ram():
+    """The ring covers the whole capture when RAM allows; otherwise it is capped by
+    (available - headroom), with the old 4 GiB budget as the floor."""
+    from control.core.fast_acquisition_controller import (
+        FAST_ACQ_RING_BUFFER_MIN_BYTES,
+        FAST_ACQ_RING_RAM_HEADROOM_BYTES,
+        ring_frames_for_capture,
+    )
+
+    frame_bytes = 2_160_000  # 2400x600 12-bit packed (the Aries "speed" mode frame)
+
+    # 21.6 GB capture, 37 GiB free: whole capture fits in the ring -> zero drops.
+    assert ring_frames_for_capture(500, 10_000, frame_bytes, 37 * 1024**3) == 10_000
+
+    # RAM-starved host: budget floors at the old 4 GiB cap.
+    starved = ring_frames_for_capture(
+        500, 10_000, frame_bytes, FAST_ACQ_RING_RAM_HEADROOM_BYTES + 1024**3
+    )
+    assert starved == FAST_ACQ_RING_BUFFER_MIN_BYTES // frame_bytes
+
+    # Small captures never allocate more than needed; requested size stays the floor.
+    assert ring_frames_for_capture(500, 100, frame_bytes, 37 * 1024**3) == 500
+
+
+def test_writer_drains_ring_on_stop(tmp_path):
+    """Frames buffered before stop must be written by the post-loop drain, not lost."""
+    h, w = 2, 2
+    max_bytes = h * w * 2
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=16, max_frame_bytes=max_bytes, frame_shape=(h, w), dtype=np.uint16
+    )
+    n = 8
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i),
+                        metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf,
+        output_path=str(tmp_path),
+        file_format="raw",  # skip TIFF/Zarr conversion
+        frame_shape=(h, w),
+        dtype=np.uint16,
+    )
+    # Signal stop before the run loop starts: the main loop is skipped entirely, so
+    # only the post-loop drain can account for the pre-buffered frames.
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=10.0)
+    assert not writer.is_alive()
+    assert writer.get_write_statistics()["frames_written"] == n
+
+
+def test_deferred_writer_holds_then_drains_on_stop(tmp_path):
+    """In deferred mode the writer writes nothing until stop is signaled, then the
+    post-stop drain writes the whole capture held in the RAM ring."""
+    import time
+
+    h, w = 2, 2
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=16, max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    n = 8
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="raw",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    writer.start()
+    # While "capture" is running (stop not signaled), deferred mode must not drain.
+    time.sleep(0.1)
+    assert writer.get_write_statistics()["frames_written"] == 0
+    assert buf.get_buffer_status()["available_frames"] == n  # all still held in RAM
+    # Burst complete -> post-stop drain writes everything.
+    writer.stop(wait=True)
+    assert not writer.is_alive()
+    assert writer.get_write_statistics()["frames_written"] == n
+
+
+def _run_tiff_writer(tmp_path, n, h, w):
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="tiff",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+    return tmp_path / "frames"
+
+
+def test_tiff_writer_single_file_when_under_limit(tmp_path):
+    frames_dir = _run_tiff_writer(tmp_path, n=5, h=4, w=4)
+    assert (frames_dir / "frames_stack.tiff").exists()
+    assert not list(frames_dir.glob("frames_stack_*.tiff"))
+
+
+def test_tiff_writer_splits_over_4gb_limit(tmp_path, monkeypatch):
+    import imageio as iio
+    from control.core import fast_acquisition_writer as faw
+
+    h, w, n = 4, 4, 10
+    # Force splitting at 3 frames per file (32 bytes/frame * 3).
+    monkeypatch.setattr(faw, "FAST_ACQ_MAX_TIFF_BYTES", 3 * h * w * 2)
+    frames_dir = _run_tiff_writer(tmp_path, n=n, h=h, w=w)
+
+    parts = sorted(frames_dir.glob("frames_stack_*.tiff"))
+    assert len(parts) == 4  # ceil(10 / 3)
+    assert not (frames_dir / "frames_stack.tiff").exists()  # numbered scheme when split
+
+    total = sum(len(iio.mimread(str(p), format="tiff")) for p in parts)
+    assert total == n
+    # raw file removed only after all chunks wrote
+    assert not (frames_dir / "frames.raw").exists()
+
+
+def _run_bigtiff_writer(tmp_path, n, h, w):
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+    return tmp_path / "frames"
+
+
+def test_bigtiff_writer_single_file_all_frames(tmp_path):
+    """BigTIFF always writes ONE file (never the numbered split scheme), it is flagged
+    BigTIFF (64-bit offsets), every frame is present in order, and raw is cleaned up."""
+    import tifffile
+
+    h, w, n = 4, 4, 7
+    frames_dir = _run_bigtiff_writer(tmp_path, n=n, h=h, w=w)
+
+    stack = frames_dir / "frames_stack.tiff"
+    assert stack.exists()
+    assert not list(frames_dir.glob("frames_stack_*.tiff"))  # single file, never split
+    assert not (frames_dir / "frames.raw").exists()  # raw removed after conversion
+
+    with tifffile.TiffFile(str(stack)) as tf:
+        assert tf.is_bigtiff
+        data = tf.asarray()
+    assert data.shape == (n, h, w)
+    for i in range(n):
+        assert int(data[i, 0, 0]) == i  # frames land in capture order, values intact
+
+
+def test_direct_encode_bigtiff_skips_raw(tmp_path):
+    """Deferred + BigTIFF decodes the RAM ring straight into one BigTIFF: frames.raw is
+    never created (no raw write / read-back), yet every frame lands in order and the
+    metadata sidecar is still written."""
+    import json
+    import time
+
+    import tifffile
+
+    h, w, n = 4, 4, 6
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    assert writer.is_direct_encode is True
+    frames_dir = tmp_path / "frames"
+
+    writer.start()
+    time.sleep(0.1)  # deferred hold: nothing written, and no raw file opened
+    assert writer.get_write_statistics()["frames_written"] == 0
+    assert not (frames_dir / "frames.raw").exists()
+
+    writer.stop(wait=True)  # burst ends -> direct-encode drain writes the BigTIFF
+    assert not writer.is_alive()
+
+    stack = frames_dir / "frames_stack.tiff"
+    assert stack.exists()
+    assert not (frames_dir / "frames.raw").exists()  # raw never created in direct-encode
+    assert writer.get_write_statistics()["frames_written"] == n
+
+    with tifffile.TiffFile(str(stack)) as tf:
+        assert tf.is_bigtiff
+        data = tf.asarray()
+    assert data.shape == (n, h, w)
+    for i in range(n):
+        assert int(data[i, 0, 0]) == i
+
+    recs = [json.loads(ln) for ln in (frames_dir / "frame_metadata.jsonl").read_text().splitlines() if ln.strip()]
+    assert len(recs) == n
+    assert "byte_offset" not in recs[0]  # direct path writes lean records (no raw offsets)
+
+
+def test_direct_encode_hdf5_skips_raw(tmp_path):
+    """Deferred + HDF5 direct-encodes the RAM ring into frames.h5 with no frames.raw."""
+    import time
+
+    import h5py
+
+    h, w, n = 3, 3, 5
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="hdf5",
+        frame_shape=(h, w), dtype=np.uint16, defer_writes_until_stop=True,
+    )
+    assert writer.is_direct_encode is True
+    writer.start()
+    time.sleep(0.05)
+    assert not (tmp_path / "frames" / "frames.raw").exists()
+    writer.stop(wait=True)
+
+    assert not (tmp_path / "frames" / "frames.raw").exists()
+    assert writer.get_write_statistics()["frames_written"] == n
+    with h5py.File(str(tmp_path / "frames.h5"), "r") as f:
+        assert f["frames"].shape == (n, h, w)
+        assert list(f["frame_ids"][:]) == list(range(n))
+        for i in range(n):
+            assert int(f["frames"][i, 0, 0]) == i
+
+
+def test_zarr_raw_path_roundtrip(tmp_path):
+    """Non-deferred Zarr goes through the raw round-trip (_encode_from_raw + zarr appender):
+    frames.raw is written then removed, leaving a valid frames.zarr. Also guards the old
+    latent bug where the zarr builder referenced `zarr` without importing it."""
+    zarr = pytest.importorskip("zarr")
+
+    h, w, n = 3, 3, 4
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="zarr",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    assert writer.is_direct_encode is False  # non-deferred -> raw path
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+
+    assert not (tmp_path / "frames" / "frames.raw").exists()  # removed after conversion
+    g = zarr.open(str(tmp_path / "frames.zarr"), mode="r")
+    assert g["frames"].shape == (n, h, w)
+    assert list(g["frame_ids"][:]) == list(range(n))
+    for i in range(n):
+        assert int(g["frames"][i, 0, 0]) == i
+
+
+def test_finalize_progress_counts_converted_frames(tmp_path):
+    """After a BigTIFF run, the writer's finalize-progress snapshot reports every frame
+    drained and converted (this is what drives the post-capture progress bar)."""
+    h, w, n = 4, 4, 6
+    buf = FastAcquisitionFrameBuffer(
+        buffer_size=max(n, 4), max_frame_bytes=h * w * 2, frame_shape=(h, w), dtype=np.uint16
+    )
+    for i in range(n):
+        payload = np.full(h * w, i, dtype=np.uint16).tobytes()
+        buf.write_frame(payload, frame_id=i, timestamp=float(i), metadata={"height": h, "width": w})
+    writer = FastAcquisitionWriter(
+        frame_buffer=buf, output_path=str(tmp_path), file_format="bigtiff",
+        frame_shape=(h, w), dtype=np.uint16,
+    )
+    writer._stop_event.set()
+    writer.start()
+    writer.join(timeout=30.0)
+    assert not writer.is_alive()
+
+    prog = writer.get_finalize_progress()
+    assert prog["converting"] is False  # finished
+    assert prog["frames_written"] == n
+    assert prog["frames_to_convert"] == n
+    assert prog["frames_converted"] == n
+
+
+def test_camera_trigger_offsets_match_generated_pulse_train():
+    """The plot's camera-trigger offsets must equal the rising edges of the pulse train the
+    controller actually emits, so the overlay marks exactly where frames are triggered."""
+    from control.core.fast_acquisition_controller import camera_trigger_offset_samples
+    from control.nidaq import generate_pulse_train
+
+    sample_rate, frame_rate, num_frames, camera_offset_ms = 10000.0, 800.0, 50, 0.3
+    num_samples = int(sample_rate * num_frames / frame_rate) + 100
+    n_off = int(np.ceil(camera_offset_ms * sample_rate / 1000.0)) + 1
+    period = int(sample_rate / frame_rate)
+
+    pattern = generate_pulse_train(
+        pulse_width_samples=4, period_samples=period, num_samples=num_samples,
+        n_samples_offset=n_off, inverted=False, max_num_pulses=num_frames,
+    ).astype(int)
+    rising = list(np.flatnonzero(np.diff(pattern) == 1) + 1)  # 0->1 transitions
+
+    offsets = camera_trigger_offset_samples(sample_rate, frame_rate, num_frames, camera_offset_ms, num_samples)
+    assert offsets == rising
+    assert len(offsets) == num_frames
+
+
+def test_camera_trigger_offsets_edge_cases():
+    from control.core.fast_acquisition_controller import camera_trigger_offset_samples
+
+    # Continuous (num_frames None/0): fill every period that fits the window.
+    off = camera_trigger_offset_samples(10000.0, 1000.0, None, 0.0, 51)
+    assert off == [1, 11, 21, 31, 41]  # n_off=1, period=10, last < 51
+    assert camera_trigger_offset_samples(10000.0, 1000.0, 0, 0.0, 51) == off
+
+    # A frame cap smaller than what fits is honored.
+    assert camera_trigger_offset_samples(10000.0, 1000.0, 3, 0.0, 51) == [1, 11, 21]
+
+    # Degenerate inputs -> no markers (no crash).
+    assert camera_trigger_offset_samples(0.0, 800.0, 10, 0.0, 1000) == []
+    assert camera_trigger_offset_samples(10000.0, 0.0, 10, 0.0, 1000) == []
+    assert camera_trigger_offset_samples(10000.0, 800.0, 10, 0.0, 0) == []
+
+
+def _approx_bars(bars):
+    return [(pytest.approx(s), pytest.approx(w)) for s, w in bars]
+
+
+def test_camera_exposure_window_bars_rolling():
+    """Rolling shutter: any-row window = [t, t+exp+readout]; all-rows co-exposure sits in
+    [t+readout, t+exp] and vanishes when exposure <= readout."""
+    from control.core.fast_acquisition_controller import camera_exposure_window_bars
+
+    # exposure (5 ms) > readout (2 ms): co-exposure exists.
+    b = camera_exposure_window_bars([0.0, 0.1], exposure_s=0.005, readout_s=0.002, shutter_mode="ROLLING")
+    assert b["union"] == _approx_bars([(0.0, 0.007), (0.1, 0.007)])          # exp + readout
+    assert b["coexposure"] == _approx_bars([(0.002, 0.003), (0.102, 0.003)])  # [t+readout, t+exp]
+
+    # exposure (1 ms) <= readout (2 ms): no instant where all rows overlap.
+    b2 = camera_exposure_window_bars([0.0], exposure_s=0.001, readout_s=0.002, shutter_mode="ROLLING")
+    assert b2["union"] == _approx_bars([(0.0, 0.003)])
+    assert b2["coexposure"] == []
+
+
+def test_camera_exposure_window_bars_global_reset_and_global():
+    from control.core.fast_acquisition_controller import camera_exposure_window_bars
+
+    # Global reset: all rows start together -> co-exposure = [t, t+exp]; union still + readout.
+    gr = camera_exposure_window_bars([0.0], exposure_s=0.005, readout_s=0.002,
+                                     shutter_mode="ROLLING_WITH_GLOBAL_RESET")
+    assert gr["union"] == _approx_bars([(0.0, 0.007)])
+    assert gr["coexposure"] == _approx_bars([(0.0, 0.005)])
+
+    # True global shutter: readout ignored, both windows = [t, t+exp].
+    g = camera_exposure_window_bars([0.0], exposure_s=0.005, readout_s=0.002, shutter_mode="GLOBAL")
+    assert g["union"] == _approx_bars([(0.0, 0.005)])
+    assert g["coexposure"] == _approx_bars([(0.0, 0.005)])
+
+    # No triggers -> empty bands (no crash).
+    empty = camera_exposure_window_bars([], exposure_s=0.005, readout_s=0.002, shutter_mode="ROLLING")
+    assert empty == {"union": [], "coexposure": []}
+
+
+def test_finalize_stall_grace_conservative_then_tightens():
+    """The finalize stall grace is huge before a rate is trusted, then becomes
+    SAFETY x projected-remaining, floored — never a fixed throughput estimate."""
+    from control.core.fast_acquisition_controller import (
+        fast_acq_finalize_stall_grace_s as grace,
+        FAST_ACQ_FINALIZE_INITIAL_GRACE_S as INIT,
+        FAST_ACQ_FINALIZE_RATE_MIN_ELAPSED_S as MIN_ELAPSED,
+        FAST_ACQ_FINALIZE_SAFETY as SAFETY,
+        FAST_ACQ_FINALIZE_MIN_GRACE_S as FLOOR,
+    )
+
+    # Extremely conservative at the start: nothing written yet, or too little write time.
+    assert grace(0.5, 0, 10000) == INIT
+    assert grace(MIN_ELAPSED - 0.01, 5000, 10000) == INIT
+    assert grace(5.0, 0, 10000) == INIT
+
+    # Rate trusted (2000 frames in 10 s -> 200 fps; 8000 remaining -> 40 s projected).
+    assert grace(10.0, 2000, 10000) == SAFETY * (8000 / 200.0)  # 120 s, > floor
+
+    # Near the end: tiny projected remaining -> floored, not near-zero.
+    assert grace(10.0, 9990, 10000) == FLOOR
+
+    # Slow writer with lots remaining -> grace grows large (stays conservative).
+    assert grace(10.0, 100, 10000) == SAFETY * (9900 / 10.0)  # 2970 s

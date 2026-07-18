@@ -16,6 +16,9 @@ composes several of them into an ordered, repeatable sequence.
 
 - **`CycleStep`** — capture `n_frames` of one observation state (or, for a
   stimulus-only state, fire `n_frames` NIDAQ pulses with no camera frame).
+  `acquire_z_stack` (default True) controls z behavior: when False the step is
+  captured only at the **reference/focus plane** (one z), not at every z of the
+  acquisition's z-stack — see *Z-stack interaction* below.
 - **`CycleWait`** — pause `duration_ms` milliseconds (no frame, no stimulus).
   Allowed at **any nesting level** — a top-level item or inside a group — so its
   repeat count comes from the enclosing group/cycle. The worker sleeps
@@ -38,6 +41,11 @@ composes several of them into an ordered, repeatable sequence.
 - **`AcquisitionCycle`** — a named, saved sequence: an outer `repeat` over an
   ordered list of items (steps, waits, groups, and/or FPM darkfield items).
   References states **by name** so it tracks preset edits.
+- **`PostprocessSpec`** — an optional online-postprocessing assignment on a
+  `CycleStep`, FPM item, or `CycleGroup`. The referenced routine consumes all
+  frames the item produces per FOV visit and its outputs are saved *instead* of
+  the raw frames (raw inputs are never written). Group-level = pool all member
+  steps into one invocation. See [online-postprocessing.md](online-postprocessing.md).
 
 Cycles are saved per profile under `cycles/{name}.yaml`, alongside
 `observation_presets/`, via the config repo
@@ -71,8 +79,13 @@ land on its `T` axis); the count is computed, never hardcoded.
 Density is decided **statically per region** at plan-build time, over the
 *flattened concatenation of all selected cycles for that region*:
 
-> **Dense** ⟺ every *imaged* state has the same total frame count
-> (stimulus-only steps are zero-frame events, excluded). Otherwise **ragged**.
+> **Dense** ⟺ every *imaged, saved* state has the same total frame count
+> (stimulus-only steps are zero-frame events, excluded; postprocessed steps save
+> no raw frame, so they are excluded too). Otherwise **ragged**.
+
+Postprocessed events are excluded from the dense/ragged decision and the raw
+`array_keys` — their derived outputs are always separate side plates
+(`{label}_{output}.ome.zarr`). See [online-postprocessing.md](online-postprocessing.md).
 
 | Layout | ZARR_V3 | OME-TIFF | INDIVIDUAL_IMAGES |
 |---|---|---|---|
@@ -80,12 +93,36 @@ Density is decided **statically per region** at plan-build time, over the
 | **Ragged** | one **single-channel plate per state** (`{state}.ome.zarr`), each with its own `T` | one stack per state | per-frame files |
 
 Each captured frame is **self-describing** (`CaptureInfo.array_key`,
-`save_t_index`, `save_c_index`, `save_t_size`, `save_c_size`, per-array channel
-metadata), computed by the worker from the `RegionPlan` via `frame_coord` /
-`SaveLayout`. The save layer (`job_processing.py`) routes on these fields, so
-per-region cycles and ragged counts don't require a global uniform `(T, C, Z)`
-assumption. Dense + flat reproduce today's `(t=time_point, c=channel)`
-coordinates exactly.
+`save_t_index`, `save_c_index`, `save_t_size`, `save_c_size`, `save_z_size`,
+per-array channel metadata), computed by the worker from the `RegionPlan` via
+`frame_coord` / `SaveLayout`. The save layer (`job_processing.py`) routes on
+these fields, so per-region cycles and ragged counts don't require a global
+uniform `(T, C, Z)` assumption. Dense + flat reproduce today's
+`(t=time_point, c=channel)` coordinates exactly.
+
+### Z-stack interaction (`acquire_z_stack`)
+
+Each `CycleStep` and FPM item carries `acquire_z_stack` (default True). With a
+z-stack (`NZ > 1`):
+
+- **True** — the step/sweep is captured at every z-plane (today's behavior).
+- **False** — captured **only at the reference/focus plane**: `z_level 0` for
+  *From Bottom* / *From Top*, the middle plane for *From Center* (the plane
+  autofocus lands on). The worker skips that event at all other z-levels and
+  writes its single frame at `z=0`.
+
+This makes Z a per-(state, z-mode) extent, so the **array grouping key** is
+`array_key_for(state, acquire_z_stack)`: the bare state name for a full stack,
+`{state}_refz` for a reference-only capture. The dense/ragged decision then
+keys on (state, z-mode) and additionally requires a **single z-mode** to stay
+dense — a stack that mixes full-z and reference-only captures is ragged, with
+each group its own array (`{state}.ome.zarr` at `Z=NZ`,
+`{state}_refz.ome.zarr` at `Z=1`). A state captured *both* ways yields both
+arrays. All-full-z runs (the default) are byte-for-byte unchanged. An FPM
+sweep's flag is locked across all the frames it expands to.
+
+Non-zarr formats place a reference-only frame at the reference z within the
+full-Z stack (functionally present); the per-array Z=1 optimization is zarr-only.
 
 ### Metadata backbone
 
@@ -116,7 +153,14 @@ filenames are unchanged.
   and the **Edit Cycles** button appears.
 - **Edit Cycles** button → `CycleEditorDialog`: a two-level tree builder
   (outer repeat, add Step / add Group / add Step→Group, reorder, save/load via
-  the repo). Steps pick from `list_observation_presets()`.
+  the repo). Steps pick from `list_observation_presets()`. Each step and FPM
+  sweep has a **Full z-stack** checkbox (column 3, default on); unchecking it
+  captures that step/sweep only at the reference/focus plane (see *Z-stack
+  interaction*). For an FPM sweep the one checkbox locks all its frames.
+  A **Postprocess** column (column 4) assigns an online routine to a step, FPM
+  sweep, or group (group-level pools all member steps). "Save raw" (default)
+  saves normally; a routine's outputs are saved instead of the raw frames. See
+  [online-postprocessing.md](online-postprocessing.md).
 - **Per-Point Channels** assigns different selected cycles (advanced) or observation
   states (simple) per region. The widget pushes the selection via a single mode-aware
   `_push_channel_selection_to_controller`, wired to `set_region_cycle_map` (advanced) or
@@ -133,6 +177,7 @@ filenames are unchanged.
 | `control/core/job_processing.py` | dense/ragged routing from self-describing `CaptureInfo` |
 | `control/core/utils_ome_tiff_writer.py` | OME-TIFF dense T-fold / ragged per-state files |
 | `gui/widgets/multipoint.py` | cycle checklist + `CycleEditorDialog` |
+| `control/postprocessing/` | online-postprocessing routines + registry (see [online-postprocessing.md](online-postprocessing.md)) |
 
 ## Tests
 

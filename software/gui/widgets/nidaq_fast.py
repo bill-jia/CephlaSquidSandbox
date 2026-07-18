@@ -18,6 +18,15 @@ from control.nidaq import (
 )
 from control.models.io_endpoint_config import IOControllerType, IOSignalType, IODirection
 
+import time
+
+from control.core.fast_acquisition_controller import (
+    fast_acq_finalize_stall_grace_s,
+    camera_trigger_offset_samples,
+    camera_exposure_window_bars,
+)
+
+
 class NIDAQWidget(QWidget):
     """
     Widget for controlling National Instruments DAQ devices.
@@ -34,7 +43,11 @@ class NIDAQWidget(QWidget):
     signal_acquisition_finished = Signal()
     # Emitted when DAQ-only acquisition completes (status, error_message); use so main thread updates UI
     signal_daq_only_completed = Signal(object, object)
-    
+    # Emitted from the completion-listener thread when acquired AI data is ready (result-or-None,
+    # status_text); the connected slot updates the plot on the GUI thread. Touching the shared
+    # matplotlib canvas off the main thread races the toolbar/repaint and can crash.
+    signal_ai_data_ready = Signal(object, object)
+
     def __init__(self, ni_daq: AbstractNIDAQ, is_simulation: bool = False, parent=None):
         super().__init__(parent)
         self._log = squid.logging.get_logger(self.__class__.__name__)
@@ -92,9 +105,18 @@ class NIDAQWidget(QWidget):
         # Waveform data storage
         self._ao_waveforms: dict = {}  # channel -> np.ndarray
         self._do_patterns: dict = {}   # line -> np.ndarray
+        # Camera-trigger rising-edge times (seconds), overlaid on the plot so the user can
+        # see when each frame is exposing (any row / all rows) relative to the AO/DO
+        # waveforms, accounting for rolling vs global-reset shutter. Pushed by the Fast
+        # Acquisition widget when its parameters change; None = no overlay. Shape:
+        # {"starts": np.ndarray, "exposure_s": float, "readout_s": float, "mode": str}.
+        self._camera_exposure: Optional[dict] = None
+        # x-span (s) last plotted; lets a redraw at the same duration preserve interactive zoom.
+        self._last_plot_xspan_s: Optional[float] = None
         
         # DAQ-only completion: signal ensures slot runs on main thread when callback is from worker thread
         self.signal_daq_only_completed.connect(self._on_daq_only_acquisition_completed)
+        self.signal_ai_data_ready.connect(self._on_ai_data_ready)
         
         # Initialize UI
         self.init_ui()
@@ -184,7 +206,17 @@ class NIDAQWidget(QWidget):
             "will update this widget's waveforms and sample rate."
         )
         device_layout.addWidget(self.link_to_fast_acquisition_checkbox)
-        
+
+        # Toggle the camera exposure/trigger overlay. Computing and drawing thousands of frame
+        # bands is expensive, so allow turning it off. Off by default for that reason.
+        self.show_camera_overlay_checkbox = QCheckBox("Show camera exposure overlay")
+        self.show_camera_overlay_checkbox.setChecked(False)
+        self.show_camera_overlay_checkbox.setToolTip(
+            "Overlay when the camera is exposing (any row / all rows) on the AO/DO plots. "
+            "Drawing many frames can be slow, so this is off by default."
+        )
+        device_layout.addWidget(self.show_camera_overlay_checkbox)
+
         device_group.setLayout(device_layout)
         left_panel.addWidget(device_group)
         
@@ -420,14 +452,20 @@ class NIDAQWidget(QWidget):
         
         # Waveform Plot
         from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
         from matplotlib.figure import Figure
-        
+
         self.fig = Figure(figsize=(8, 6))
         self.canvas = FigureCanvas(self.fig)
         self.ax_ao = self.fig.add_subplot(311)
-        self.ax_do = self.fig.add_subplot(312)
+        # Share the x (time) axis between the two OUTPUT plots so interactive zoom/pan moves
+        # them together — the point is to line up triggers/exposure with the AO/DO waveforms.
+        # The acquired-input plot (ax_ai) has its own timebase and lifecycle (_update_ai_plot
+        # autoscales it to the acquired timestamps), so it is left independent — the toolbar
+        # still zooms it on its own.
+        self.ax_do = self.fig.add_subplot(312, sharex=self.ax_ao)
         self.ax_ai = self.fig.add_subplot(313)
-        
+
         self.ax_ao.set_title("Analog Output")
         self.ax_ao.set_ylabel("Voltage (V)")
         self.ax_do.set_title("Digital Output")
@@ -435,8 +473,11 @@ class NIDAQWidget(QWidget):
         self.ax_ai.set_title("Analog Input (Acquired)")
         self.ax_ai.set_xlabel("Time (s)")
         self.ax_ai.set_ylabel("Voltage (V)")
-        
+
         self.fig.tight_layout()
+        # Matplotlib navigation toolbar: pan, box-zoom, back/forward, home (reset), save.
+        self.plot_toolbar = NavigationToolbar2QT(self.canvas, self)
+        right_panel.addWidget(self.plot_toolbar)
         right_panel.addWidget(self.canvas)
         
         # Control buttons
@@ -669,6 +710,10 @@ class NIDAQWidget(QWidget):
     def is_linked_to_fast_acquisition(self) -> bool:
         """Return True if this widget should be updated when Fast Acquisition parameters change."""
         return self.link_to_fast_acquisition_checkbox.isChecked()
+
+    def is_camera_overlay_enabled(self) -> bool:
+        """Return True if the camera exposure/trigger overlay should be drawn on the plot."""
+        return self.show_camera_overlay_checkbox.isChecked()
     
     def _update_config(self):
         """Update the configuration from UI values."""
@@ -856,12 +901,24 @@ class NIDAQWidget(QWidget):
 
     def _update_waveform_plot(self):
         """Update the waveform display plot."""
+        # Preserve the user's interactive zoom/pan across redraws at the same time-span:
+        # ax.clear() below wipes the view, so capture the current x-limits and restore them
+        # afterward. When the acquisition duration changes (new x-span), snap back to the
+        # full view instead — the old window would no longer make sense.
+        samples = self._ni_daq.samples_per_channel
+        rate = self._ni_daq.sample_rate_hz or 1.0
+        xspan_s = samples / rate if rate else 0.0
+        keep_xlim = (self.ax_ao.get_xlim()
+                     if self._last_plot_xspan_s is not None
+                     and abs(self._last_plot_xspan_s - xspan_s) < 1e-9
+                     else None)
+
         # Clear all axes
         self.ax_ao.clear()
         self.ax_do.clear()
-        
-        t = np.arange(self._ni_daq.samples_per_channel) / self._ni_daq.sample_rate_hz
-        
+
+        t = np.arange(samples) / rate
+
         # Plot AO waveforms
         self.ax_ao.set_title("Analog Output")
         self.ax_ao.set_ylabel("Voltage (V)")
@@ -886,10 +943,85 @@ class NIDAQWidget(QWidget):
         if self._do_patterns:
             self.ax_do.legend(loc='upper right')
             self.ax_do.grid(True, alpha=0.3)
-        
+
+        self._draw_camera_exposure_windows()
+
+        # tight_layout FIRST, so the toolbar snapshots below capture the final subplot
+        # positions (push_current stores position as well as view limits; Home/Back restore
+        # both, so a stale position would nudge the subplots).
         self.fig.tight_layout()
+
+        # Make the navigation toolbar's Home button target the full (autoscaled) view. The nav
+        # history from before the ax.clear() references the destroyed view, so Home was doing
+        # nothing / restoring a stale range. Autoscale to the full limits (no render needed),
+        # record that as Home, then restore any preserved interactive zoom on top — so Home
+        # still returns to the full FOV while the current view keeps the user's zoom. A single
+        # draw at the end renders whichever view we end on.
+        for ax in (self.ax_ao, self.ax_do):
+            ax.relim()
+            ax.autoscale_view()
+        tb = getattr(self, "plot_toolbar", None)
+        if tb is not None:
+            tb.update()          # drop stale nav history
+            tb.push_current()    # Home = full view
+        if keep_xlim is not None:
+            self.ax_ao.set_xlim(keep_xlim)  # shared x propagates to ax_do
+            if tb is not None:
+                tb.push_current()  # current view = preserved zoom (Home still = full)
+        self._last_plot_xspan_s = xspan_s
+
         self.canvas.draw()
-    
+
+    def set_camera_exposure_windows(self, starts_s, exposure_s, readout_s, shutter_mode, redraw: bool = True):
+        """Set the camera exposure overlay: per-frame trigger start times (seconds), the
+        per-row exposure duration (s), the rolling-shutter readout skew (s), and the shutter
+        mode name. None/empty starts clears it. Called by the Fast Acquisition widget when
+        its parameters change so the plot shows when the sensor is actually exposing."""
+        if starts_s is None or len(starts_s) == 0:
+            self._camera_exposure = None
+        else:
+            self._camera_exposure = {
+                "starts": np.asarray(starts_s, dtype=float),
+                "exposure_s": float(exposure_s),
+                "readout_s": float(readout_s),
+                "mode": str(shutter_mode),
+            }
+        if redraw:
+            self._update_waveform_plot()
+
+    def _draw_camera_exposure_windows(self):
+        """Shade, per frame, when the camera sensor is exposing, on both waveform axes:
+        a light band for the ANY-row-exposing window (exposure + rolling readout skew) and a
+        darker band for the ALL-rows co-exposing window (its position depends on rolling vs
+        global-reset shutter). One broken_barh collection per band keeps thousands of frames
+        cheap. A thin line marks each trigger/exposure start for precision."""
+        info = self._camera_exposure
+        if not info or len(info["starts"]) == 0:
+            return
+        bands = camera_exposure_window_bars(
+            info["starts"], info["exposure_s"], info["readout_s"], info["mode"]
+        )
+        n = len(info["starts"])
+        mode_short = "global reset" if "GLOBAL_RESET" in info["mode"].upper() else (
+            "global" if info["mode"].upper() == "GLOBAL" else "rolling")
+        union_label = f"exposing · any row ({mode_short}, x{n})"
+        co_label = "exposing · all rows (co-exposure)"
+        for ax in (self.ax_ao, self.ax_do):
+            ymin, ymax = ax.get_ylim()  # waveforms already plotted -> real limits (or (0,1) if empty)
+            height = ymax - ymin
+            if bands["union"]:
+                ax.broken_barh(bands["union"], (ymin, height), facecolors="red",
+                               alpha=0.12, edgecolors="none", label=union_label)
+            if bands["coexposure"]:
+                ax.broken_barh(bands["coexposure"], (ymin, height), facecolors="red",
+                               alpha=0.30, edgecolors="none", label=co_label)
+            ax.vlines(info["starts"], ymin, ymax, colors="red", linestyles="dotted",
+                      linewidth=0.6, alpha=0.5)
+            ax.set_ylim(ymin, ymax)  # collections can nudge the y-range; keep the waveform's
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels, loc="upper right", fontsize="small")
+
     def get_waveforms(self) -> 'WaveformData':
         """
         Get current waveforms configured in the widget.
@@ -1689,17 +1821,21 @@ class NIDAQWidget(QWidget):
         success = self._ni_daq.wait_until_done(timeout)
         self._log.info(f"Acquisition completed: {success}")
         
+        # Hand the result to the GUI thread — never touch the shared matplotlib canvas or
+        # any QWidget from this daemon thread (it races the main-thread toolbar/repaint).
         if success:
-            # Get acquired data
             result = self._ni_daq.get_acquired_data()
-            
-            # Update AI plot on main thread
-            self._update_ai_plot(result)
-            self.status_label.setText("Acquisition complete")
+            self.signal_ai_data_ready.emit(result, "Acquisition complete")
         else:
-            self.status_label.setText("Acquisition timeout")
+            self.signal_ai_data_ready.emit(None, "Acquisition timeout")
 
         self.signal_acquisition_finished.emit()
+
+    def _on_ai_data_ready(self, result, status_text: str):
+        """GUI-thread slot: plot the acquired AI data (if any) and update the status label."""
+        if result is not None:
+            self._update_ai_plot(result)
+        self.status_label.setText(status_text)
     
     def _update_ai_plot(self, result):
         """Update the analog input plot with acquired data."""
@@ -1716,8 +1852,15 @@ class NIDAQWidget(QWidget):
                 self.ax_ai.plot(result.timestamps, data, label=ai_label)
             self.ax_ai.legend(loc='upper right')
             self.ax_ai.grid(True, alpha=0.3)
-        
+
         self.fig.tight_layout()
+        # Re-establish the toolbar Home baseline to include the newly framed AI axis; the
+        # baseline recorded by _update_waveform_plot captured ax_ai's stale (pre-acquisition)
+        # view, so Home would otherwise revert ax_ai to that.
+        tb = getattr(self, "plot_toolbar", None)
+        if tb is not None:
+            tb.update()
+            tb.push_current()
         self.canvas.draw()
     
     def stop_tasks(self):
@@ -2149,7 +2292,7 @@ class FastAcquisitionWidget(QWidget):
     - Trigger source selection (TI Microcontroller / NI DAQ)
     - Frame rate and exposure time settings
     - Buffer size configuration
-    - File format selection (TIFF / Zarr / HDF5 / Raw)
+    - File format selection (TIFF / BigTIFF / Zarr / HDF5 / Raw)
     - Output directory selection
     - Start/Stop acquisition controls
     - Real-time statistics (FPS, buffer fill, write speed)
@@ -2181,18 +2324,59 @@ class FastAcquisitionWidget(QWidget):
         self._updating_acquisition_params = False  # Flag to prevent circular updates
         self._camera_state_before_acquisition: Optional[CameraState] = None  # Store camera state before fast acquisition
         self._was_live_before_fast_acquisition: bool = False  # Track live state to restore after acquisition
-        
+        self._max_frame_rate_shown: Optional[Tuple[str, bool]] = None  # (label text, over-max) last rendered
+        self._overlay_shutter_mode_shown: Optional[str] = None  # last shutter mode rendered in the overlay
+
+        # Post-capture write ("finalize") phase: the capture has ended but the writer is
+        # still draining/encoding to disk. Start stays blocked and the progress bar tracks
+        # write progress until it finishes or the writer looks hung (adaptive stall grace).
+        self._finalize_active = False
+        self._finalize_write_start = 0.0     # time.monotonic() when finalize began
+        self._finalize_last_written = 0      # frames_written at last observed progress
+        self._finalize_last_progress_t = 0.0  # time.monotonic() of last observed progress
+
         # Initialize UI
         self.init_ui()
-        
+
         # Connect signals to update NIDAQWidget when parameters change
         self._connect_ni_daq_signals()
-        
+
         # Statistics update timer
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self.update_statistics)
         self._stats_timer.setInterval(500)  # Update every 500ms
-    
+
+        # Polls post-capture write progress and enforces the finalize timeout.
+        self._finalize_timer = QTimer(self)
+        self._finalize_timer.timeout.connect(self._poll_finalize)
+        self._finalize_timer.setInterval(300)
+
+        # Poll the camera's cached max frame rate so the label tracks ROI /
+        # binning / camera-mode changes made anywhere in the GUI (camera
+        # settings tab, observation-state loads, ...). The camera refreshes
+        # its cache on every such change, so this poll reads an attribute —
+        # no SDK traffic.
+        self._max_frame_rate_timer = QTimer(self)
+        self._max_frame_rate_timer.timeout.connect(self._refresh_max_frame_rate)
+        self._max_frame_rate_timer.start(500)
+        self._refresh_max_frame_rate()
+
+        # Overlay when the camera is exposing on the linked NIDAQ plot, and keep it in sync
+        # as the fast-acquisition parameters (frame rate, count, duration, sample rate, and
+        # exposure — which sets the window width) or the link change.
+        for _spin in (self.frame_rate_spinbox, self.num_frames_spinbox,
+                      self.total_time_spinbox, self.daq_sample_rate_spinbox,
+                      self.exposure_time_spinbox):
+            _spin.valueChanged.connect(lambda _=None: self._push_camera_trigger_markers())
+        if self.ni_daq_widget is not None:
+            self.ni_daq_widget.link_to_fast_acquisition_checkbox.toggled.connect(
+                lambda _=None: self._push_camera_trigger_markers()
+            )
+            self.ni_daq_widget.show_camera_overlay_checkbox.toggled.connect(
+                lambda _=None: self._push_camera_trigger_markers()
+            )
+        self._push_camera_trigger_markers()  # initial overlay
+
     def init_ui(self):
         """Initialize UI components."""
         _compact = 4  # margins/spacing for denser layout (matches multipoint-style tabs)
@@ -2242,7 +2426,17 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.setDecimals(2)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
         self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
-        acq_layout.addWidget(self.frame_rate_spinbox, 0, 1)
+        self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
+        self.max_frame_rate_label = QLabel("")
+        self.max_frame_rate_label.setToolTip(
+            "Readout-limited maximum frame rate for the current ROI, binning and camera mode. "
+            "This is the fixed sensor ceiling (independent of exposure time)."
+        )
+        frame_rate_cell = QHBoxLayout()
+        frame_rate_cell.setSpacing(4)
+        frame_rate_cell.addWidget(self.frame_rate_spinbox, 1)
+        frame_rate_cell.addWidget(self.max_frame_rate_label)
+        acq_layout.addLayout(frame_rate_cell, 0, 1)
 
         acq_layout.addWidget(QLabel("Exposure Time (ms):"), 0, 2)
         self.exposure_time_spinbox = QDoubleSpinBox()
@@ -2278,7 +2472,7 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("File Format:"), 2, 2)
         self.file_format_combo = QComboBox()
-        self.file_format_combo.addItems(["TIFF", "Zarr", "HDF5", "Raw"])
+        self.file_format_combo.addItems(["TIFF", "BigTIFF", "Zarr", "HDF5", "Raw"])
         acq_layout.addWidget(self.file_format_combo, 2, 3)
 
         acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
@@ -2405,7 +2599,67 @@ class FastAcquisitionWidget(QWidget):
             
         except Exception as e:
             self._log.warning(f"Failed to update NI DAQ waveforms for sample rate change: {e}")
-    
+
+    def _camera_readout_time_ms(self) -> float:
+        """Best-available rolling-shutter readout skew (ms) for the current camera settings,
+        for the exposure-window overlay. 0 if the camera can't report one (global shutter)."""
+        try:
+            return max(0.0, float(self.camera.get_readout_time_ms()))
+        except Exception:
+            return 0.0
+
+    def _camera_shutter_mode_name(self) -> str:
+        """Current shutter mode as a CameraReadoutMode name string (e.g. 'ROLLING',
+        'ROLLING_WITH_GLOBAL_RESET') for the exposure-window geometry. The shutter mode is now
+        selected in the live Camera Settings block; read it from the camera (a cheap cache read
+        on the Tucsen) so the overlay reflects that choice."""
+        try:
+            return self.camera.get_readout_mode().value
+        except Exception:
+            return "ROLLING"
+
+    def _push_camera_trigger_markers(self, redraw: bool = True):
+        """Overlay when the camera is exposing (any row / all rows), for the current
+        fast-acquisition parameters and shutter mode, on the linked NIDAQ plot. Cleared when
+        not linked (the plot's timebase is then independent of these parameters) or while
+        acquiring."""
+        if self.ni_daq_widget is None:
+            return
+        # Skip transient states inside a parameter cascade; the direct change that started it
+        # fires its own push afterwards, so we still end on the correct overlay.
+        if self._updating_acquisition_params:
+            return
+        # Clear (and skip the expensive computation/redraw) when the overlay is toggled off,
+        # while acquiring, or when not linked to fast-acquisition params.
+        if (self._is_acquiring
+                or not self.ni_daq_widget.is_linked_to_fast_acquisition()
+                or not self.ni_daq_widget.is_camera_overlay_enabled()):
+            self.ni_daq_widget.set_camera_exposure_windows(None, 0.0, 0.0, "", redraw=redraw)
+            return
+        try:
+            sample_rate_hz = self.daq_sample_rate_spinbox.value()
+            frame_rate_hz = self.frame_rate_spinbox.value()
+            nf = self.num_frames_spinbox.value()
+            num_frames = nf if nf > 0 else None  # 0 = continuous
+            total_time_s = self.total_time_spinbox.value()
+            num_samples = int(sample_rate_hz * total_time_s)
+            # camera_offset_ms is 0 here (no UI control); matches start_acquisition's default.
+            offsets = camera_trigger_offset_samples(
+                sample_rate_hz, frame_rate_hz, num_frames, 0.0, num_samples
+            )
+            starts = [o / sample_rate_hz for o in offsets] if sample_rate_hz > 0 else []
+            exposure_s = self.exposure_time_spinbox.value() / 1000.0
+            readout_s = self._camera_readout_time_ms() / 1000.0
+            mode_name = self._camera_shutter_mode_name()
+            # Record the mode we just drew so the shutter-mode poll (in _refresh_max_frame_rate)
+            # only redraws on an actual change, not once right after the overlay is enabled.
+            self._overlay_shutter_mode_shown = mode_name
+            self.ni_daq_widget.set_camera_exposure_windows(
+                starts, exposure_s, readout_s, mode_name, redraw=redraw
+            )
+        except Exception as e:
+            self._log.warning(f"Failed to update camera exposure overlay: {e}")
+
     def set_saving_dir(self):
         """Set saving directory (matching RecordingWidget style)."""
         dialog = QFileDialog()
@@ -2417,6 +2671,49 @@ class FastAcquisitionWidget(QWidget):
         self.output_path = save_dir_base
         self.base_path_is_set = True
     
+    def _refresh_max_frame_rate(self):
+        """
+        Update the max-frame-rate readout beside the frame rate spinbox from the camera's
+        reported AcquisitionMaxFrameRate (the same value used in the camera log messages),
+        read fresh so it matches the camera's current state. Turns red when the requested
+        frame rate exceeds it. Cameras that cannot report a maximum show nothing.
+
+        Also polled here (on the same 500 ms timer): pick up a shutter-mode change made in the
+        live Camera Settings block and refresh the exposure overlay, since that mode is no
+        longer set from this panel.
+        """
+        # Don't issue GenICam reads during a fast-acquisition capture — the high-speed trigger
+        # burst must not contend with SDK traffic. The label/overlay aren't changing then anyway.
+        if self._is_acquiring:
+            return
+        try:
+            max_rate_hz = self.camera.get_max_acquisition_frame_rate()
+        except Exception as e:
+            self._log.debug(f"Failed to read max acquisition frame rate: {e}")
+            max_rate_hz = None
+
+        if max_rate_hz is None:
+            text, over = "", False
+        else:
+            text = f"max {max_rate_hz:.1f} Hz"
+            over = self.frame_rate_spinbox.value() > max_rate_hz
+
+        if (text, over) != self._max_frame_rate_shown:
+            self._max_frame_rate_shown = (text, over)
+            self.max_frame_rate_label.setText(text)
+            self.max_frame_rate_label.setStyleSheet("color: red;" if over else "")
+
+        # Refresh the exposure overlay if the shutter mode changed elsewhere (only worthwhile
+        # when the overlay is actually being drawn).
+        if self.ni_daq_widget is not None and self.ni_daq_widget.is_camera_overlay_enabled():
+            try:
+                mode_name = self.camera.get_readout_mode().value
+            except Exception:
+                mode_name = None
+            if mode_name != self._overlay_shutter_mode_shown:
+                self._overlay_shutter_mode_shown = mode_name
+                self._push_camera_trigger_markers()
+
     def _update_max_exposure_time(self):
         """
         Update maximum exposure time based on frame rate and camera readout time.
@@ -2556,7 +2853,19 @@ class FastAcquisitionWidget(QWidget):
         if self._is_acquiring:
             self._log.warning("Acquisition already running")
             return
-        
+
+        # The previous run may still be draining/encoding to disk (deferred writes +
+        # format conversion). Starting now would create a second writer contending for
+        # the disk and RAM, so refuse until it finishes (the controller enforces this
+        # too, but surface it to the user instead of failing silently).
+        if self._controller is not None and self._controller.is_finalizing_writes:
+            error_dialog(
+                "The previous acquisition is still writing to disk. "
+                "Please wait for it to finish before starting a new one.",
+                "Please wait",
+            )
+            return
+
         # Store camera state before fast acquisition
         try:
             acquisition_mode = self.camera.get_acquisition_mode()
@@ -2696,6 +3005,7 @@ class FastAcquisitionWidget(QWidget):
             # Create main controller
             file_format_map = {
                 "TIFF": "tiff",
+                "BigTIFF": "bigtiff",
                 "Zarr": "zarr",
                 "HDF5": "hdf5",
                 "Raw": "raw",
@@ -2740,6 +3050,10 @@ class FastAcquisitionWidget(QWidget):
             self._is_acquiring = True
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
+            # Reset the progress bar to buffer-fill semantics (a prior finalize may have
+            # left it showing write progress with a custom format string).
+            self.buffer_progress_bar.setFormat("%p%")
+            self.buffer_progress_bar.setValue(0)
             self._stats_timer.start()
             self.signal_acquisition_started.emit()
             
@@ -2776,15 +3090,20 @@ class FastAcquisitionWidget(QWidget):
             error_message: Optional error message
         """
         from control.core.fast_acquisition_controller import AcquisitionCompletionStatus
-        
+
+        # Completion can be delivered twice (the controller callback and the stats-timer
+        # safety net); handle only the first, while still acquiring.
+        if not self._is_acquiring:
+            return
+
         # Update state
         self._is_acquiring = False
-        
+
         # Stop statistics timer
         self._stats_timer.stop()
-        
-        # Update button states
-        self.start_button.setEnabled(True)
+
+        # Capture is done, so the Stop button is finished. The Start button stays disabled
+        # until post-capture writing completes — decided at the end of this handler.
         self.stop_button.setEnabled(False)
         
         # Update status label based on completion status
@@ -2805,9 +3124,6 @@ class FastAcquisitionWidget(QWidget):
         else:
             self.stats_label.setText("Acquisition ended")
             self.stats_label.setStyleSheet("")
-        
-        # Reset buffer progress bar
-        self.buffer_progress_bar.setValue(0)
         
         # Restore camera state to original configuration
         self._restore_camera_state()
@@ -2839,7 +3155,100 @@ class FastAcquisitionWidget(QWidget):
         
         # Emit signal
         self.signal_acquisition_finished.emit()
-    
+
+        # The instrument is back to a ready state, but the writer may still be draining the
+        # RAM ring and encoding it to disk. Keep Start blocked and track write progress
+        # until that finishes or the size-based deadline passes.
+        if self._controller and self._controller.is_finalizing_writes:
+            self._enter_finalize_phase()
+        else:
+            self.buffer_progress_bar.setValue(0)
+            self.buffer_progress_bar.setFormat("%p%")
+            self.start_button.setEnabled(True)
+
+    def _enter_finalize_phase(self):
+        """Block Start and repurpose the progress bar to track post-capture disk writing
+        until it finishes or the writer looks hung (adaptive stall grace, no fixed
+        throughput estimate)."""
+        now = time.monotonic()
+        self._finalize_active = True
+        self._finalize_write_start = now
+        self._finalize_last_written = 0
+        self._finalize_last_progress_t = now
+        self.start_button.setEnabled(False)
+        self.buffer_progress_bar.setValue(0)
+        self._log.info(
+            "Post-acquisition writing in progress; blocking new acquisition until it "
+            "completes or the writer stalls"
+        )
+        self._poll_finalize()  # paint an immediate first frame
+        self._finalize_timer.start()
+
+    def _finalize_stall_grace_s(self, written: int, expected: int) -> float:
+        """Instance wrapper over fast_acq_finalize_stall_grace_s using this phase's start."""
+        write_elapsed = time.monotonic() - self._finalize_write_start
+        return fast_acq_finalize_stall_grace_s(write_elapsed, written, expected)
+
+    def _poll_finalize(self):
+        """Refresh the write-progress bar; exit when writing completes or times out."""
+        if not self._finalize_active:
+            return
+        try:
+            status = self._controller.get_finalize_status() if self._controller else {"finalizing": False}
+        except Exception as e:
+            self._log.warning(f"Error polling write-finalize status: {e}")
+            self._exit_finalize_phase(timed_out=False)
+            return
+
+        if not status.get("finalizing"):
+            self._exit_finalize_phase(timed_out=False)
+            return
+
+        pct = int(round(status.get("fraction", 0.0) * 100))
+        detail = status.get("detail") or "Writing to disk"
+        self.buffer_progress_bar.setFormat(f"{detail}… %p%")
+        self.buffer_progress_bar.setValue(pct)
+
+        # Keep the "Written" / "Write rate" stats text live during the write phase (the
+        # capture-time stats timer has stopped). In deferred/direct-encode mode this is the
+        # only window where frames are actually written, so it starts from 0 here.
+        written = int(status.get("frames_written", 0))
+        expected = int(status.get("expected_frames", 0))
+        write_rate = status.get("write_rate", 0.0)
+        self.stats_label.setText(f"Written: {written}/{expected} | Write Rate: {write_rate:.1f} fps")
+        self.stats_label.setStyleSheet("")
+
+        # Stall watchdog: reset the clock whenever progress is made, then declare the writer
+        # hung only if it goes with no progress for longer than the adaptive grace.
+        now = time.monotonic()
+        if written > self._finalize_last_written:
+            self._finalize_last_written = written
+            self._finalize_last_progress_t = now
+        no_progress_for = now - self._finalize_last_progress_t
+        grace = self._finalize_stall_grace_s(written, max(1, expected))
+        if no_progress_for > grace:
+            self._log.warning(
+                f"Post-acquisition writing made no progress for {no_progress_for:.0f}s "
+                f"(grace {grace:.0f}s); unblocking Start — writing may still be running "
+                "in the background"
+            )
+            self._exit_finalize_phase(timed_out=True)
+
+    def _exit_finalize_phase(self, timed_out: bool):
+        """Leave the finalize phase: stop polling, restore the bar, re-enable Start."""
+        self._finalize_active = False
+        self._finalize_timer.stop()
+        self.buffer_progress_bar.setValue(0)
+        self.buffer_progress_bar.setFormat("%p%")
+        self.start_button.setEnabled(True)
+        if timed_out:
+            self.stats_label.setText(self.stats_label.text() + " — write timed out")
+            self.stats_label.setStyleSheet("color: orange;")
+        else:
+            self.stats_label.setText("Done — data written to disk")
+            self.stats_label.setStyleSheet("")
+            self._log.info("Post-acquisition writing complete; Start re-enabled")
+
     def _restore_camera_state(self):
         """
         Restore camera state to original configuration before fast acquisition.

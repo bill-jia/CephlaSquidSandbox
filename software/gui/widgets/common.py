@@ -13,6 +13,62 @@ def error_dialog(message: str, title: str = "Error"):
     return
 
 
+def check_observation_state_roi_consistency_with_dialog(
+    multi_point_controller: MultiPointController, logger: logging.Logger
+) -> bool:
+    """Warn and require approval when the run's observation states have mismatched ROIs.
+
+    Tiles are spaced for the largest ROI in the group (so the most complete channel keeps
+    its overlap); states with smaller ROIs then under-sample, which may or may not be the
+    intent. When proceeding, the regions are re-tiled for that FOV up front (via
+    apply_observation_state_tiling) so the disk/RAM estimates and the preview reflect the
+    tile count that will actually be acquired. Returns True to proceed (no mismatch, or the
+    user approved), False to cancel.
+    """
+    try:
+        report = multi_point_controller.build_roi_consistency_report()
+    except Exception:
+        logger.exception("ROI consistency check failed; proceeding without it.")
+        return True
+
+    if not report.get("mismatch"):
+        multi_point_controller.apply_observation_state_tiling()
+        return True
+
+    tiling = report.get("tiling_fov_mm")
+    largest = report.get("largest_name")
+    mismatched = report.get("mismatch_names", [])
+
+    def _fmt(entry):
+        fov = entry.get("fov_mm")
+        if fov is None:
+            return f"  • {entry['name']}: FOV unknown"
+        return f"  • {entry['name']}: {fov[0]:.3f} × {fov[1]:.3f} mm"
+
+    lines = "\n".join(_fmt(e) for e in report.get("entries", []))
+    tiling_str = f"{tiling[0]:.3f} × {tiling[1]:.3f} mm" if tiling else "unknown"
+    message = (
+        "The selected observation states do not all use the same camera ROI.\n\n"
+        f"Tiling overlap will be computed for the largest ROI ('{largest}', {tiling_str}).\n"
+        f"These states have a smaller ROI and will under-sample (intentional subsampling, "
+        f"or possibly a mistake):\n  {', '.join(mismatched)}\n\n"
+        f"Per-state FOV:\n{lines}\n\n"
+        "Proceed with the acquisition?"
+    )
+    logger.warning("Observation-state ROI mismatch; requesting user approval. %s", mismatched)
+
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setWindowTitle("Mismatched Observation-State ROIs")
+    msg.setText(message)
+    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+    msg.setDefaultButton(QMessageBox.Cancel)
+    if msg.exec_() != QMessageBox.Yes:
+        return False
+    multi_point_controller.apply_observation_state_tiling()
+    return True
+
+
 def check_space_available_with_error_dialog(
     multi_point_controller: MultiPointController, logger: logging.Logger, factor_of_safecty: float = 1.03
 ) -> bool:
@@ -21,7 +77,11 @@ def check_space_available_with_error_dialog(
     save_directory = multi_point_controller.base_path
     available_disk_space = utils.get_available_disk_space(save_directory)
     space_required = factor_of_safecty * multi_point_controller.get_estimated_acquisition_disk_storage()
-    image_count = multi_point_controller.get_acquisition_image_count()
+    # Total files written: raw frames (z-mode aware) + derived postprocessing outputs.
+    image_count = (
+        multi_point_controller.get_acquisition_image_count()
+        + multi_point_controller.get_acquisition_derived_image_count()
+    )
 
     logger.info(
         f"Checking space available: {space_required=}, {available_disk_space=}, {image_count=}, {save_directory=}"
@@ -216,6 +276,95 @@ def check_ram_available_with_error_dialog(
         error_dialog(error_message, title="Not Enough RAM")
         return False
     return True
+
+
+def check_system_load_and_pending_uploads_with_dialog(
+    multi_point_controller: MultiPointController,
+    logger: logging.Logger,
+    cpu_pct_threshold: float = 85.0,
+    ram_pct_threshold: float = 85.0,
+    disk_headroom_factor: float = 1.5,
+) -> bool:
+    """Warn before starting when the system is loaded, disk headroom is tight,
+    or a previous run's background upload is still draining.
+
+    None of these is a hard block — concurrent upload drainers are isolated by
+    design, and a busy system can still acquire — but each can degrade the run:
+    a prior upload shares the network share and local-disk I/O, and its
+    verified-pending shards still occupy disk, so there is less free space than
+    "between runs". Returns True to proceed; False if the user cancels. Default
+    button is Cancel so a stray Enter does not start the run.
+    """
+    import psutil
+
+    reasons = []
+
+    # Previous acquisitions still uploading in the background.
+    try:
+        from control.core.multi_point_worker import active_upload_drainer_summary
+
+        summary = active_upload_drainer_summary()
+    except Exception:
+        logger.exception("Could not read active upload drainers; skipping that check.")
+        summary = []
+    if summary:
+        total = sum(int(d.get("outstanding", 0)) for d in summary)
+        reasons.append(
+            f"• {len(summary)} previous acquisition(s) still uploading in the "
+            f"background ({total} task(s) pending) — they share the network "
+            f"share and local disk with this run."
+        )
+
+    # CPU load (interval>0 so the first sample is meaningful).
+    try:
+        cpu = psutil.cpu_percent(interval=0.3)
+        if cpu >= cpu_pct_threshold:
+            reasons.append(f"• CPU load is high ({cpu:.0f}%).")
+    except Exception:
+        logger.exception("CPU load check failed; skipping.")
+
+    # Memory.
+    try:
+        vm = psutil.virtual_memory()
+        if vm.percent >= ram_pct_threshold:
+            reasons.append(
+                f"• Memory is {vm.percent:.0f}% used "
+                f"({vm.available / 1024 / 1024 / 1024:.1f} GB free)."
+            )
+    except Exception:
+        logger.exception("RAM load check failed; skipping.")
+
+    # Soft disk-headroom warning (the hard fail is handled by
+    # check_space_available_with_error_dialog upstream).
+    try:
+        available = utils.get_available_disk_space(multi_point_controller.base_path)
+        required = multi_point_controller.get_estimated_acquisition_disk_storage()
+        if required and available < disk_headroom_factor * required:
+            reasons.append(
+                f"• Local free disk is tight: {int(available / 1024 / 1024):,} MB "
+                f"free vs {int(required / 1024 / 1024):,} MB needed for this run."
+            )
+    except Exception:
+        logger.exception("Disk headroom check failed; skipping.")
+
+    if not reasons:
+        return True
+
+    message = (
+        "The system may be under load or low on resources, which can slow "
+        "acquisition and background data writing:\n\n"
+        + "\n".join(reasons)
+        + "\n\nStart the acquisition anyway?"
+    )
+    logger.warning("Pre-start load/upload warning: %s", " ".join(reasons))
+
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setWindowTitle("System Under Load")
+    msg.setText(message)
+    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+    msg.setDefaultButton(QMessageBox.Cancel)
+    return msg.exec_() == QMessageBox.Yes
 
 
 class WrapperWindow(QMainWindow):

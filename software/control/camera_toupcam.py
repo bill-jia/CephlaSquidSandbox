@@ -1327,6 +1327,7 @@ class ToupcamCamera(AbstractCamera):
         n_frames_expected: int = 0,
         frame_callback: Optional[Callable] = None,
         acquisition_mode: Optional[CameraAcquisitionMode] = None,
+        frame_sink: Optional[Callable] = None,
     ):
         """Start fast acquisition frame grabbing for FastAcquisitionController.
 
@@ -1338,6 +1339,8 @@ class ToupcamCamera(AbstractCamera):
             n_frames_expected: Expected number of frames (informational).
             frame_callback: Receives (frame_bytes: bytes, metadata: dict).
             acquisition_mode: If provided and differs from current mode, switches to it.
+            frame_sink: Single-copy pointer sink (accepted for interface parity with
+                cameras that support it, e.g. Tucsen; ToupCam uses frame_callback).
         """
         if frame_callback is None:
             raise ValueError("frame_callback is required for fast acquisition")

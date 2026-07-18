@@ -1,7 +1,9 @@
 from ._bootstrap import *
 from .common import (
+    check_observation_state_roi_consistency_with_dialog,
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
+    check_system_load_and_pending_uploads_with_dialog,
     error_dialog,
     _load_last_remote_streaming_path,
     _save_last_remote_streaming_path,
@@ -9,6 +11,7 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
+from control.models import LaserAFReference
 
 
 def _get_checked_names(list_widget: QListWidget) -> list:
@@ -60,6 +63,74 @@ def _reorder_list_widget(list_widget: QListWidget, ordered_names: list) -> None:
             list_widget.addItem(item)
     finally:
         list_widget.blockSignals(False)
+
+
+# Upper bound on how long the GUI waits for the background writeback/finalize to
+# report completion before it re-enables the Start button anyway. Sized above
+# JOB_RUNNER_FINALIZE_TIMEOUT_S (600 s) so the safety path only ever fires if the
+# completion signal genuinely never arrives — the button can never get stuck.
+_WRITEBACK_SAFETY_TIMEOUT_MS = 660_000
+
+
+class _WritebackStatusMixin:
+    """Shared "Finalizing… -> complete" UI for the post-capture writeback window.
+
+    When capture ends the dataset is still being flushed to disk by a background
+    thread (see ``signal_data_writing_complete``). This mixin keeps the Start
+    button disabled and the progress bar showing "Finalizing data…" until that
+    signal arrives — so the operator knows when it is safe to move/copy the data
+    — then re-enables and shows a completion message. A one-shot safety timer
+    re-enables regardless if the signal is somehow never delivered.
+
+    Hosts must provide ``btn_startAcquisition``, ``progress_label``,
+    ``progress_bar`` and ``eta_label`` (all three multipoint widgets do), and
+    connect ``data_writing_complete`` to :meth:`_on_data_writing_complete`.
+    """
+
+    def _begin_writeback_wait(self):
+        # The per-z writer can finalize so fast that data_writing_complete
+        # arrives before this runs; in that case it set _writeback_completed_early
+        # (only on the active widget) and there is nothing to wait for.
+        if getattr(self, "_writeback_completed_early", False):
+            self._writeback_completed_early = False
+            self.progress_label.setText("✓ Data writing complete")
+            return
+        self._awaiting_writeback = True
+        self.btn_startAcquisition.setEnabled(False)
+        self.btn_startAcquisition.setText("Finalizing…")
+        self.eta_label.setVisible(False)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_label.setText("Finalizing data… (writing to disk)")
+        # Cancellable safety fallback so the Start button is never stuck if the
+        # completion signal is somehow never delivered.
+        timer = getattr(self, "_writeback_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._on_data_writing_complete)
+            self._writeback_timer = timer
+        timer.start(_WRITEBACK_SAFETY_TIMEOUT_MS)
+
+    def _on_data_writing_complete(self):
+        # One controller signal reaches every multipoint widget; act only for the
+        # widget that is actually waiting.
+        if getattr(self, "_awaiting_writeback", False):
+            self._awaiting_writeback = False
+            timer = getattr(self, "_writeback_timer", None)
+            if timer is not None:
+                timer.stop()
+            self.btn_startAcquisition.setEnabled(True)
+            self.btn_startAcquisition.setText("Start\n Acquisition ")
+            self.progress_bar.setVisible(False)
+            self.progress_label.setText("✓ Data writing complete")
+            return
+        # Arrived before _begin_writeback_wait (fast finalize). Only the widget
+        # that ran this acquisition (still flagged current here, since the finish
+        # handler clears that flag just before calling _begin_writeback_wait)
+        # records it, so the upcoming _begin_writeback_wait skips the wait.
+        if getattr(self, "is_current_acquisition_widget", False):
+            self._writeback_completed_early = True
 
 
 class _ObservationStateListWidget(QListWidget):
@@ -562,6 +633,125 @@ class FPMClusteredDarkfieldParamsDialog(QDialog):
         }
 
 
+class Phase2DParamsDialog(QDialog):
+    """Edit z-defocus 2D quantitative-phase (waveorder) parameters.
+
+    Pixel size, z-step, and NZ come from the acquisition at run time; only the
+    optical/regularization knobs are set here. Wavelength defaults to the input
+    state's illumination wavelength, detection NA to the current objective NA.
+    """
+
+    _DEFAULTS = {
+        "wavelength_nm": None,
+        "na_detection": None,
+        "na_illumination": None,
+        "index_of_refraction_media": 1.333,
+        "regularization": 0.05,
+        "invert_phase_contrast": False,
+    }
+
+    def __init__(self, params: dict, objective_na=None, default_wavelength_nm=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Phase 2D Parameters")
+        p = {**self._DEFAULTS, **(params or {})}
+        form = QFormLayout(self)
+
+        info = QLabel(
+            "Reconstructs 2D quantitative phase from the brightfield defocus "
+            "z-stack (needs 'Full z-stack' ON, NZ > 1). Pixel size / z-step / NZ "
+            "are taken from the acquisition."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        self.spin_wavelength = QDoubleSpinBox()
+        self.spin_wavelength.setRange(200.0, 2000.0)
+        self.spin_wavelength.setDecimals(0)
+        self.spin_wavelength.setValue(float(p["wavelength_nm"] or default_wavelength_nm or 532))
+        form.addRow("Illumination wavelength (nm)", self.spin_wavelength)
+
+        self.spin_na_det = QDoubleSpinBox()
+        self.spin_na_det.setRange(0.01, 1.6)
+        self.spin_na_det.setSingleStep(0.05)
+        self.spin_na_det.setDecimals(3)
+        self.spin_na_det.setValue(float(p["na_detection"] or objective_na or 0.5))
+        form.addRow("Detection NA", self.spin_na_det)
+
+        self.spin_na_ill = QDoubleSpinBox()
+        self.spin_na_ill.setRange(0.01, 1.6)
+        self.spin_na_ill.setSingleStep(0.05)
+        self.spin_na_ill.setDecimals(3)
+        self.spin_na_ill.setValue(float(p["na_illumination"] or objective_na or 0.4))
+        form.addRow("Illumination NA", self.spin_na_ill)
+
+        self.spin_ri = QDoubleSpinBox()
+        self.spin_ri.setRange(1.0, 2.0)
+        self.spin_ri.setSingleStep(0.01)
+        self.spin_ri.setDecimals(3)
+        self.spin_ri.setValue(float(p["index_of_refraction_media"]))
+        form.addRow("Medium refractive index", self.spin_ri)
+
+        self.spin_reg = QDoubleSpinBox()
+        self.spin_reg.setRange(1e-6, 1.0)
+        self.spin_reg.setDecimals(6)
+        self.spin_reg.setSingleStep(1e-3)
+        self.spin_reg.setValue(float(p["regularization"]))
+        form.addRow("Regularization", self.spin_reg)
+
+        self.chk_invert = QCheckBox("Invert phase contrast")
+        self.chk_invert.setChecked(bool(p["invert_phase_contrast"]))
+        form.addRow(self.chk_invert)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def get_params(self) -> dict:
+        return {
+            "wavelength_nm": int(self.spin_wavelength.value()),
+            "na_detection": float(self.spin_na_det.value()),
+            "na_illumination": float(self.spin_na_ill.value()),
+            "index_of_refraction_media": float(self.spin_ri.value()),
+            "regularization": float(self.spin_reg.value()),
+            "invert_phase_contrast": self.chk_invert.isChecked(),
+        }
+
+
+class ScriptParamsDialog(QDialog):
+    """Generic JSON key/value editor for a custom-script routine's params."""
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Routine Parameters")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Routine params (JSON object passed to the routine):"))
+        self.edit = QPlainTextEdit()
+        self.edit.setPlainText(json.dumps(params or {}, indent=2))
+        layout.addWidget(self.edit)
+        self.err = QLabel("")
+        self.err.setStyleSheet("color: red")
+        layout.addWidget(self.err)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._params = params or {}
+
+    def _on_accept(self):
+        try:
+            parsed = json.loads(self.edit.toPlainText() or "{}")
+            if not isinstance(parsed, dict):
+                raise ValueError("must be a JSON object")
+            self._params = parsed
+            self.accept()
+        except Exception as e:
+            self.err.setText(f"Invalid JSON: {e}")
+
+    def get_params(self) -> dict:
+        return self._params
+
+
 class CycleEditorDialog(QDialog):
     """Modal editor for named acquisition cycles (two-level: outer repeat ->
     ordered steps, where a step can sit inside a one-level repeatable group).
@@ -575,6 +765,7 @@ class CycleEditorDialog(QDialog):
     _FPM_PARAMS_ROLE = Qt.UserRole + 1
     _FPM_CDF_ROLE = Qt.UserRole + 2
     _FPM_BF_ROLE = Qt.UserRole + 3
+    _PP_ROLE = Qt.UserRole + 4  # stored postprocess spec dict (or None = save raw)
 
     _TYPE_ROLE = Qt.UserRole
 
@@ -615,9 +806,10 @@ class CycleEditorDialog(QDialog):
         right.addLayout(name_row)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat"])
-        self.tree.setColumnWidth(0, 220)
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Step / Group", "Frames / Repeat", "Full z-stack", "Postprocess"])
+        self.tree.setColumnWidth(0, 200)
+        self.tree.setColumnWidth(3, 200)
         right.addWidget(self.tree)
 
         tools = QHBoxLayout()
@@ -660,7 +852,173 @@ class CycleEditorDialog(QDialog):
         except Exception:
             return []
 
-    def _make_step_widgets(self, item, observation_state="", n_frames=1):
+    def _make_zstack_checkbox(self, item, acquire_z_stack=True):
+        """Column-2 'Full z-stack' checkbox for a step / FPM sweep.
+
+        Checked = capture every z-plane (default). Unchecked = capture only the
+        reference/focus plane (one z), saved to its own single-z array.
+        """
+        cb = QCheckBox()
+        cb.setChecked(bool(acquire_z_stack))
+        cb.setToolTip(
+            "Acquire the whole z-stack for this step/sweep.\n"
+            "Unchecked: capture only the reference (focus) plane — one z — saved to its own array."
+        )
+        self.tree.setItemWidget(item, 2, cb)
+        return cb
+
+    def _read_zstack_checkbox(self, item):
+        cb = self.tree.itemWidget(item, 2)
+        return cb.isChecked() if cb is not None else True
+
+    _PP_SAVE_RAW = "Save raw"
+    _PP_CUSTOM = "Custom script…"
+
+    def _make_postprocess_widgets(self, item, spec=None):
+        """Column-3 postprocess picker: a routine dropdown + a params '…' button.
+
+        The selected spec (routine name / script path / params / label) is stashed
+        on the item's ``_PP_ROLE`` data; ``_read_postprocess`` reads it back. "Save
+        raw" (the default) stores None — the item's frames are saved normally.
+        Placed on step / FPM leaves and on a group (group-level = pool all member
+        steps into one routine invocation).
+        """
+        from control.postprocessing.registry import routine_display_names
+
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(2)
+        combo = QComboBox()
+        combo.addItem(self._PP_SAVE_RAW, None)
+        for rname, disp in routine_display_names():
+            combo.addItem(disp, rname)
+        combo.addItem(self._PP_CUSTOM, "script")
+        btn = QPushButton("Params…")
+        btn.setToolTip("Edit this routine's parameters")
+        h.addWidget(combo, 1)
+        h.addWidget(btn)
+        self.tree.setItemWidget(item, 3, container)
+        item.setData(0, self._PP_ROLE, spec or None)
+        self._sync_pp_widgets(item, combo, btn)
+        combo.currentIndexChanged.connect(
+            lambda _i, it=item, c=combo, b=btn: self._on_pp_combo_changed(it, c, b)
+        )
+        btn.clicked.connect(lambda _c=False, it=item, c=combo, b=btn: self._edit_pp_params(it, c, b))
+
+    def _sync_pp_widgets(self, item, combo, btn):
+        """Set the combo selection + button enabled-state from the item's spec."""
+        spec = item.data(0, self._PP_ROLE)
+        routine = (spec or {}).get("routine")
+        combo.blockSignals(True)
+        if routine is None:
+            combo.setCurrentIndex(0)
+        else:
+            idx = combo.findData(routine)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        btn.setEnabled(routine is not None)
+
+    def _on_pp_combo_changed(self, item, combo, btn):
+        routine = combo.currentData()
+        if routine is None:
+            item.setData(0, self._PP_ROLE, None)
+            btn.setEnabled(False)
+            return
+        spec = dict(item.data(0, self._PP_ROLE) or {})
+        if routine == "script":
+            path, _ = QFileDialog.getOpenFileName(self, "Select routine script", "", "Python (*.py)")
+            if not path:
+                # Cancelled — revert to the previous selection.
+                self._sync_pp_widgets(item, combo, btn)
+                return
+            spec["routine"] = "script"
+            spec["script_path"] = path
+        else:
+            spec["routine"] = routine
+            spec.pop("script_path", None)
+        # Pre-populate params from the routine's defaults so a routine that needs
+        # them (e.g. phase2d: wavelength, NA) works even if the user never opens
+        # the params dialog — then open the dialog so the values are visible and
+        # editable (this is the discoverable mechanism to set/repopulate them).
+        spec.setdefault("params", {})
+        if not spec["params"]:
+            spec["params"] = self._default_params_for(routine, item)
+        item.setData(0, self._PP_ROLE, spec)
+        btn.setEnabled(True)
+        self._edit_pp_params(item, combo, btn)
+
+    def _default_params_for(self, routine, item):
+        """Resolved default params for a freshly-selected routine (empty for a
+        script — its keys are routine-defined)."""
+        if routine == "phase2d":
+            state = self._first_input_state_for(item)
+            wl = None
+            try:
+                _color, wl = self._preset_display_meta(state) if state else (None, None)
+            except Exception:
+                pass
+            dlg = Phase2DParamsDialog(
+                {}, objective_na=self._current_objective_na(), default_wavelength_nm=wl, parent=self
+            )
+            return dlg.get_params()
+        return {}
+
+    def _edit_pp_params(self, item, combo, btn):
+        spec = dict(item.data(0, self._PP_ROLE) or {})
+        routine = spec.get("routine")
+        if routine is None:
+            return
+        if routine == "phase2d":
+            state = self._first_input_state_for(item)
+            _color, wl = (None, None)
+            try:
+                _color, wl = self._preset_display_meta(state) if state else (None, None)
+            except Exception:
+                pass
+            dlg = Phase2DParamsDialog(
+                spec.get("params", {}),
+                objective_na=self._current_objective_na(),
+                default_wavelength_nm=wl,
+                parent=self,
+            )
+        else:
+            dlg = ScriptParamsDialog(spec.get("params", {}), parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            spec["params"] = dlg.get_params()
+            item.setData(0, self._PP_ROLE, spec)
+
+    def _first_input_state_for(self, item):
+        """Best-effort first observation-state name feeding this item/group (for
+        param defaults). For a group, the first member step's state."""
+        kind = item.data(0, self._TYPE_ROLE)
+        if kind == "group":
+            for j in range(item.childCount()):
+                combo = self.tree.itemWidget(item.child(j), 0)
+                if combo is not None and hasattr(combo, "currentText"):
+                    return combo.currentText()
+            return None
+        combo = self.tree.itemWidget(item, 0)
+        return combo.currentText() if (combo is not None and hasattr(combo, "currentText")) else None
+
+    def _preset_display_meta(self, state):
+        """(color, wavelength_nm) for an observation-state preset, best-effort."""
+        preset = self.repo.load_observation_preset(state)
+        wl = None
+        if preset is not None:
+            for ist in getattr(preset, "illuminator_states", []) or []:
+                w = getattr(ist, "emission_wavelength_nm", None) or getattr(ist, "wavelength_nm", None)
+                if w:
+                    wl = int(w)
+                    break
+        return None, wl
+
+    def _read_postprocess(self, item):
+        """Return the stored postprocess spec dict, or None for 'Save raw'."""
+        spec = item.data(0, self._PP_ROLE)
+        return dict(spec) if spec else None
+
+    def _make_step_widgets(self, item, observation_state="", n_frames=1, acquire_z_stack=True, postprocess=None):
         combo = QComboBox()
         names = self._preset_names()
         combo.addItems(names)
@@ -674,12 +1032,15 @@ class CycleEditorDialog(QDialog):
         spin.setValue(int(n_frames))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, spin)
+        self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
-    def _make_fpm_widgets(self, item, observation_state="", params=None):
+    def _make_fpm_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
         """FPM darkfield node: base-preset combo (col 0) + params button (col 1).
 
         The generation parameters live in the item's data role; the button shows
-        a summary and opens the params dialog.
+        a summary and opens the params dialog. The col-2 checkbox locks the whole
+        sweep to full-z or reference-plane-only.
         """
         params = {**_default_fpm_params(), **(params or {})}
         item.setData(0, self._FPM_PARAMS_ROLE, params)
@@ -695,6 +1056,8 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_params(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _current_objective_na(self):
         """Live objective NA from the shared objective store (None if unknown)."""
@@ -712,9 +1075,9 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_PARAMS_ROLE, params)
             btn.setText(_fpm_summary(params))
 
-    def _make_fpm_bf_widgets(self, item, observation_state="", params=None):
+    def _make_fpm_bf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
         """Brightfield single-LED-sweep node: base-state combo (col 0) + params
-        button (col 1) for full-sweep vs pseudorandom-N."""
+        button (col 1) for full-sweep vs pseudorandom-N; col-2 full-z checkbox."""
         params = {**_default_fpm_bf(), **(params or {})}
         item.setData(0, self._FPM_BF_ROLE, params)
         combo = QComboBox()
@@ -729,6 +1092,8 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_bf(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _edit_fpm_bf(self, item, btn):
         params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
@@ -738,8 +1103,9 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_BF_ROLE, params)
             btn.setText(_fpm_bf_summary(params))
 
-    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None):
-        """Clustered-darkfield node: base-state combo (col 0) + params button (col 1)."""
+    def _make_fpm_cdf_widgets(self, item, observation_state="", params=None, acquire_z_stack=True, postprocess=None):
+        """Clustered-darkfield node: base-state combo (col 0) + params button (col 1);
+        col-2 full-z checkbox."""
         params = {**_default_fpm_cdf(), **(params or {})}
         item.setData(0, self._FPM_CDF_ROLE, params)
         combo = QComboBox()
@@ -754,6 +1120,8 @@ class CycleEditorDialog(QDialog):
         btn.clicked.connect(lambda _checked=False, it=item, b=btn: self._edit_fpm_cdf(it, b))
         self.tree.setItemWidget(item, 0, combo)
         self.tree.setItemWidget(item, 1, btn)
+        self._make_zstack_checkbox(item, acquire_z_stack)
+        self._make_postprocess_widgets(item, postprocess)
 
     def _edit_fpm_cdf(self, item, btn):
         params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
@@ -763,12 +1131,14 @@ class CycleEditorDialog(QDialog):
             item.setData(0, self._FPM_CDF_ROLE, params)
             btn.setText(_fpm_cdf_summary(params))
 
-    def _make_group_widgets(self, item, repeat=1):
+    def _make_group_widgets(self, item, repeat=1, postprocess=None):
         item.setText(0, "Group")
         spin = QSpinBox()
         spin.setRange(1, 100000)
         spin.setValue(int(repeat))
         self.tree.setItemWidget(item, 1, spin)
+        # Group-level postprocess pools all member steps into one invocation.
+        self._make_postprocess_widgets(item, postprocess)
 
     def _make_wait_widgets(self, item, duration_ms=1000.0):
         item.setText(0, "Wait (ms)")
@@ -882,24 +1252,32 @@ class CycleEditorDialog(QDialog):
             if combo is None:
                 return None
             params = item.data(0, self._FPM_PARAMS_ROLE) or _default_fpm_params()
-            return {"type": "fpm", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         if kind == "fpm_bf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_BF_ROLE) or _default_fpm_bf()
-            return {"type": "fpm_bf", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm_bf", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         if kind == "fpm_cdf":
             combo = self.tree.itemWidget(item, 0)
             if combo is None:
                 return None
             params = item.data(0, self._FPM_CDF_ROLE) or _default_fpm_cdf()
-            return {"type": "fpm_cdf", "observation_state": combo.currentText(), **params}
+            return {"type": "fpm_cdf", "observation_state": combo.currentText(),
+                    "acquire_z_stack": self._read_zstack_checkbox(item),
+                    "postprocess": self._read_postprocess(item), **params}
         combo = self.tree.itemWidget(item, 0)
         spin = self.tree.itemWidget(item, 1)
         if combo is None:
             return None
-        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value()}
+        return {"type": "step", "observation_state": combo.currentText(), "n_frames": spin.value(),
+                "acquire_z_stack": self._read_zstack_checkbox(item),
+                "postprocess": self._read_postprocess(item)}
 
     def _read_tree(self):
         """Return a list of dicts describing top-level items (steps/waits/groups)."""
@@ -913,7 +1291,8 @@ class CycleEditorDialog(QDialog):
                     leaf = self._read_leaf(item.child(j))
                     if leaf is not None:
                         steps.append(leaf)
-                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps})
+                out.append({"type": "group", "repeat": spin.value() if spin else 1, "steps": steps,
+                            "postprocess": self._read_postprocess(item)})
             else:
                 leaf = self._read_leaf(item)
                 if leaf is not None:
@@ -928,18 +1307,22 @@ class CycleEditorDialog(QDialog):
         elif entry["type"] == "fpm":
             item.setData(0, self._TYPE_ROLE, "fpm")
             params = {k: entry[k] for k in _default_fpm_params() if k in entry}
-            self._make_fpm_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_widgets(item, entry.get("observation_state", ""), params,
+                                   entry.get("acquire_z_stack", True), entry.get("postprocess"))
         elif entry["type"] == "fpm_bf":
             item.setData(0, self._TYPE_ROLE, "fpm_bf")
             params = {k: entry[k] for k in _default_fpm_bf() if k in entry}
-            self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_bf_widgets(item, entry.get("observation_state", ""), params,
+                                      entry.get("acquire_z_stack", True), entry.get("postprocess"))
         elif entry["type"] == "fpm_cdf":
             item.setData(0, self._TYPE_ROLE, "fpm_cdf")
             params = {k: entry[k] for k in _default_fpm_cdf() if k in entry}
-            self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params)
+            self._make_fpm_cdf_widgets(item, entry.get("observation_state", ""), params,
+                                       entry.get("acquire_z_stack", True), entry.get("postprocess"))
         else:
             item.setData(0, self._TYPE_ROLE, "step")
-            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1))
+            self._make_step_widgets(item, entry.get("observation_state", ""), entry.get("n_frames", 1),
+                                    entry.get("acquire_z_stack", True), entry.get("postprocess"))
 
     def _load_model(self, name, repeat, model):
         self.tree.clear()
@@ -949,7 +1332,7 @@ class CycleEditorDialog(QDialog):
             if entry["type"] == "group":
                 gitem = QTreeWidgetItem(self.tree)
                 gitem.setData(0, self._TYPE_ROLE, "group")
-                self._make_group_widgets(gitem, entry.get("repeat", 1))
+                self._make_group_widgets(gitem, entry.get("repeat", 1), entry.get("postprocess"))
                 for st in entry.get("steps", []):
                     self._make_leaf_item(gitem, st)
                 gitem.setExpanded(True)
@@ -974,6 +1357,9 @@ class CycleEditorDialog(QDialog):
             CycleFPMClusteredDarkfield,
         )
 
+        def _pp(it):
+            return it.postprocess.model_dump(mode="json") if getattr(it, "postprocess", None) else None
+
         if isinstance(item, CycleWait):
             return {"type": "wait", "duration_ms": item.duration_ms}
         if isinstance(item, CycleFPMBrightfield):
@@ -982,6 +1368,8 @@ class CycleEditorDialog(QDialog):
                 "observation_state": item.observation_state,
                 "n_leds": item.n_leds,
                 "seed": item.seed,
+                "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
         if isinstance(item, CycleFPMClusteredDarkfield):
             return {
@@ -990,6 +1378,8 @@ class CycleEditorDialog(QDialog):
                 "outer_na": item.outer_na,
                 "inner_na": item.inner_na,
                 "min_overlap": item.min_overlap,
+                "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
         if isinstance(item, CycleFPMDarkfield):
             return {
@@ -1000,8 +1390,16 @@ class CycleEditorDialog(QDialog):
                 "min_overlap": item.min_overlap,
                 "leds_per_pattern": item.leds_per_pattern,
                 "seed": item.seed,
+                "acquire_z_stack": item.acquire_z_stack,
+                "postprocess": _pp(item),
             }
-        return {"type": "step", "observation_state": item.observation_state, "n_frames": item.n_frames}
+        return {
+            "type": "step",
+            "observation_state": item.observation_state,
+            "n_frames": item.n_frames,
+            "acquire_z_stack": item.acquire_z_stack,
+            "postprocess": _pp(item),
+        }
 
     def _load_cycle(self, name):
         from control.models.acquisition_cycle import CycleGroup
@@ -1017,6 +1415,7 @@ class CycleEditorDialog(QDialog):
                         "type": "group",
                         "repeat": item.repeat,
                         "steps": [self._leaf_to_dict(s) for s in item.steps],
+                        "postprocess": item.postprocess.model_dump(mode="json") if item.postprocess else None,
                     }
                 )
             else:
@@ -1045,7 +1444,12 @@ class CycleEditorDialog(QDialog):
             CycleFPMDarkfield,
             CycleFPMBrightfield,
             CycleFPMClusteredDarkfield,
+            PostprocessSpec,
         )
+
+        def _pp(e):
+            spec = e.get("postprocess")
+            return PostprocessSpec(**spec) if spec else None
 
         if entry["type"] == "wait":
             return CycleWait(duration_ms=entry["duration_ms"])
@@ -1056,6 +1460,8 @@ class CycleEditorDialog(QDialog):
                 observation_state=entry["observation_state"],
                 n_leds=entry.get("n_leds", 0),
                 seed=entry.get("seed", 0),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry["type"] == "fpm_cdf":
             if not entry.get("observation_state"):
@@ -1065,6 +1471,8 @@ class CycleEditorDialog(QDialog):
                 outer_na=entry.get("outer_na", 0.8),
                 inner_na=entry.get("inner_na"),
                 min_overlap=entry.get("min_overlap", 0.6),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry["type"] == "fpm":
             if not entry.get("observation_state"):
@@ -1076,13 +1484,20 @@ class CycleEditorDialog(QDialog):
                 min_overlap=entry.get("min_overlap", 0.6),
                 leds_per_pattern=entry.get("leds_per_pattern", 0),
                 seed=entry.get("seed", 0),
+                acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
             )
         if entry.get("observation_state"):
-            return CycleStep(observation_state=entry["observation_state"], n_frames=entry["n_frames"])
+            return CycleStep(
+                observation_state=entry["observation_state"],
+                n_frames=entry["n_frames"],
+                acquire_z_stack=entry.get("acquire_z_stack", True),
+                postprocess=_pp(entry),
+            )
         return None
 
     def _save_cycle(self):
-        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup
+        from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, PostprocessSpec
 
         name = self.edit_name.text().strip()
         if not name:
@@ -1092,9 +1507,21 @@ class CycleEditorDialog(QDialog):
         items = []
         for entry in model:
             if entry["type"] == "group":
-                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in entry["steps"]) if leaf is not None]
+                group_pp = entry.get("postprocess")
+                # A group-level routine pools all member steps, so members must
+                # not carry their own spec (validation rejects that) — clear them.
+                member_dicts = entry["steps"]
+                if group_pp:
+                    member_dicts = [{**s, "postprocess": None} for s in member_dicts]
+                steps = [leaf for leaf in (self._dict_to_leaf(s) for s in member_dicts) if leaf is not None]
                 if steps:
-                    items.append(CycleGroup(repeat=entry["repeat"], steps=steps))
+                    items.append(
+                        CycleGroup(
+                            repeat=entry["repeat"],
+                            steps=steps,
+                            postprocess=PostprocessSpec(**group_pp) if group_pp else None,
+                        )
+                    )
             else:
                 leaf = self._dict_to_leaf(entry)
                 if leaf is not None:
@@ -1152,16 +1579,21 @@ def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hi
     try:
         if controller.acquisition_in_progress():
             return ""
-        image_count = controller.get_acquisition_image_count()
-        if image_count <= 0:
-            return "Add a region to estimate size"
+        # Total files written = raw captured frames (per-step z-mode aware; a
+        # single-plane/reference-z step is counted once, not once per z) PLUS the
+        # derived postprocessing output plates. Postprocessed raw inputs are
+        # consumed, not saved, so they aren't in either term.
+        image_count = controller.get_acquisition_image_count() + controller.get_acquisition_derived_image_count()
         disk_bytes = controller.estimate_acquisition_disk_bytes()
     except Exception:
         return "—"
+    if image_count <= 0 and disk_bytes <= 0:
+        return "Add a region to estimate size"
     fmt = getattr(controller, "file_saving_option", None)
     # ZARR_V3 size is data-dependent (compression); flag it as approximate.
     approx = "≈" if fmt is not None and getattr(fmt, "name", "") == "ZARR_V3" else "~"
-    return f"{image_count:,} images · {approx}{_human_bytes(disk_bytes)}"
+    count_str = f"{image_count:,} images" if image_count > 0 else "postprocessed outputs"
+    return f"{count_str} · {approx}{_human_bytes(disk_bytes)}"
 
 
 def _refresh_size_estimate(widget) -> None:
@@ -2218,7 +2650,7 @@ def _row_col_to_well_id(row, col):
     return f"{_index_to_row_label(row)}{col + 1}"
 
 
-class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
+class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
     signal_acquisition_channels = Signal(list)  # list channels
@@ -2300,12 +2732,20 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_import_locations = QPushButton("Import Location List")
         self.btn_show_table_location_list = QPushButton("Edit")  # Open / Edit
 
-        # editable points table
+        # editable points table. The "AF Ref" column is a read-only indicator of
+        # the per-region laser-AF focus target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
-        self.table_location_list.setColumnCount(4)
-        header_labels = ["x", "y", "z", "ID"]
+        self.table_location_list.setColumnCount(5)
+        header_labels = ["x", "y", "z", "ID", "AF Ref"]
         self.table_location_list.setHorizontalHeaderLabels(header_labels)
         self.btn_update_z = QPushButton("Update Z")
+        # Re-capture the laser-AF reference for the currently selected region.
+        # Hidden when the rig has no focus camera.
+        self.btn_update_ref = QPushButton("Update Ref")
+        self.btn_update_ref.setToolTip(
+            "Capture the current laser-AF reference (focus target) for the selected region."
+        )
+        self.btn_update_ref.setVisible(self._enable_laser_autofocus)
 
         self.entry_deltaX = QDoubleSpinBox()
         self.entry_deltaX.setMinimum(0)
@@ -2553,7 +2993,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         temp3 = QHBoxLayout()
         temp3.addWidget(QLabel("Location List"))
         temp3.addWidget(self.dropdown_location_list)
-        self.grid_location_list_line1.addLayout(temp3, 0, 0, 1, 6)  # Span across all columns except the last
+        self.grid_location_list_line1.addLayout(temp3, 0, 0, 1, 4)  # Span the left columns
+        self.grid_location_list_line1.addWidget(self.btn_update_ref, 0, 4, 1, 2)
         self.grid_location_list_line1.addWidget(self.btn_update_z, 0, 6, 1, 2)  # Align with other buttons
 
         self.grid_location_list_line2 = QGridLayout()
@@ -2659,6 +3100,12 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
         grid_af.addWidget(self.checkbox_set_z_range)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        z_stack_mode_row = QHBoxLayout()
+        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
+        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
+        grid_af.addLayout(z_stack_mode_row)
         grid_af.addWidget(self.checkbox_skipSaving)
         grid_af.addLayout(self.fileSavingFormatRow)
         grid_af.addLayout(self.zarrStreamingRow)
@@ -2742,6 +3189,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.entry_NY.valueChanged.connect(self.multipointController.set_NY)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
         self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
+        self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
@@ -2761,8 +3209,8 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.list_configurations.itemChanged.connect(self._on_channel_list_changed)
-        # self.combobox_z_stack.currentIndexChanged.connect(self.signal_z_stacking.emit)
 
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
@@ -2796,6 +3244,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
         self.btn_show_table_location_list.clicked.connect(self.table_location_list.show)
         self.btn_update_z.clicked.connect(self.update_z)
+        self.btn_update_ref.clicked.connect(self.update_reference)
         self.dropdown_location_list.currentIndexChanged.connect(self.go_to)
 
         self.shortcut = QShortcut(QKeySequence(";"), self)
@@ -3198,6 +3647,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             # Set acquisition parameters
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
@@ -3215,6 +3665,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
+            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
             if self.checkbox_skipSaving.isChecked():
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
@@ -3226,6 +3681,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
@@ -3273,6 +3733,11 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                     self.table_location_list.rowCount() - 1, 2, QTableWidgetItem(str(round(z * 1000, 1)))
                 )
                 self.table_location_list.setItem(self.table_location_list.rowCount() - 1, 3, QTableWidgetItem(name))
+                self.table_location_list.setItem(
+                    self.table_location_list.rowCount() - 1,
+                    4,
+                    self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name)),
+                )
                 index = self.dropdown_location_list.count() - 1
                 self.dropdown_location_list.setCurrentIndex(index)
                 print(self.location_list)
@@ -3295,6 +3760,54 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         while f"R{n}" in existing:
             n += 1
         return f"R{n}"
+
+    def _af_ref_item(self, reference):
+        """Read-only "AF Ref" cell showing a region's laser-AF target (x, or "—")."""
+        text = f"{reference.x_reference:.1f}" if reference is not None else "—"
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setTextAlignment(Qt.AlignCenter)
+        return item
+
+    def _set_af_ref_cell_for_region(self, region_id, reference):
+        """Update the "AF Ref" cell for the table row whose ID is ``region_id``."""
+        ids = self.location_ids.tolist()
+        if region_id not in ids:
+            return
+        row = ids.index(region_id)
+        self.table_location_list.blockSignals(True)
+        self.table_location_list.setItem(row, 4, self._af_ref_item(reference))
+        self.table_location_list.blockSignals(False)
+
+    def _capture_region_reference(self, region_id, warn_on_failure=True):
+        """Capture and store the current laser-AF reference for ``region_id``.
+
+        No-op (returns False) when laser AF is unavailable or not enabled. When
+        enabled but the capture fails (e.g. AF not initialized), optionally warns.
+        """
+        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
+            return False
+        reference = self.multipointController.laserAutoFocusController.capture_reference()
+        if reference is None:
+            if warn_on_failure:
+                error_dialog(
+                    "Failed to capture Laser AF reference for this region. "
+                    "Is the laser autofocus initialized?"
+                )
+            return False
+        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+        self._set_af_ref_cell_for_region(region_id, reference)
+        return True
+
+    def update_reference(self):
+        """Re-capture the laser-AF reference for the currently selected region."""
+        index = self.dropdown_location_list.currentIndex()
+        if index < 0 or index >= len(self.location_ids):
+            return
+        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
+            error_dialog("Enable Reflection (Laser) AF before capturing a per-region reference.")
+            return
+        self._capture_region_reference(str(self.location_ids[index]))
 
     def add_location(self):
         # Get raw positions without rounding
@@ -3323,6 +3836,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(region_id))
+            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
 
             # Store actual values in region coordinates
             if self.use_overlap:
@@ -3355,6 +3869,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.blockSignals(False)
             self.dropdown_location_list.blockSignals(False)
             print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
+            # Snapshot this region's laser-AF focus target at add time (when AF is
+            # enabled/initialized), so each region corrects to its own reference.
+            self._capture_region_reference(region_id)
             self._region_obs_state_map = None
             self._update_per_point_button_text()
             _refresh_size_estimate(self)
@@ -3382,6 +3899,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             # Remove scanCoordinates dictionaries and remove region overlay
             self.scanCoordinates.region_centers.pop(region_id, None)
+            self.scanCoordinates.region_laser_af_references.pop(region_id, None)
             self.navigationViewer.deregister_fovs_from_image(
                 self.scanCoordinates.region_fov_coordinates.pop(region_id, [])
             )
@@ -3484,6 +4002,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.dropdown_location_list.setCurrentIndex(row)
 
     def cell_was_changed(self, row, column):
+        # The "AF Ref" column is a read-only indicator; ignore changes to it.
+        if column >= 4:
+            return
+
         # Get region ID
         region_id = self.location_ids[row]
 
@@ -3535,6 +4057,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 self.scanCoordinates.region_fov_coordinates[new_id] = self.scanCoordinates.region_fov_coordinates.pop(
                     region_id
                 )
+            if region_id in self.scanCoordinates.region_laser_af_references:
+                self.scanCoordinates.region_laser_af_references[new_id] = (
+                    self.scanCoordinates.region_laser_af_references.pop(region_id)
+                )
 
         # Update UI
         location_str = f"x:{round(self.location_list[row,0],3)} mm  y:{round(self.location_list[row,1],3)} mm  z:{round(1000*self.location_list[row,2],3)} μm"
@@ -3568,15 +4094,69 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.table_location_list.blockSignals(False)
         self.dropdown_location_list.blockSignals(False)
 
+    @staticmethod
+    def _laser_af_sidecar_path(csv_path):
+        """Companion file holding full per-region laser-AF references for a CSV."""
+        return os.path.splitext(csv_path)[0] + ".laser_af.json"
+
+    def _load_laser_af_sidecar(self, csv_path):
+        """Load ``{region_id: reference_dict}`` from a CSV's laser-AF sidecar, if any."""
+        sidecar_path = self._laser_af_sidecar_path(csv_path)
+        if not os.path.exists(sidecar_path):
+            return {}
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self._log.error(f"Failed to read laser AF sidecar {sidecar_path}: {e}")
+            return {}
+
+    def _reference_from_import_row(self, original_id, row, sidecar_refs):
+        """Build a LaserAFReference for an imported row, or ``None``.
+
+        Prefers the full sidecar entry (with crop) keyed by the original exported
+        id; falls back to the numeric ``laser_af_x_reference`` CSV column (spot
+        position only, no crop).
+        """
+        if original_id in sidecar_refs:
+            try:
+                return LaserAFReference(**sidecar_refs[original_id])
+            except Exception as e:
+                self._log.error(f"Bad laser AF sidecar entry for region {original_id}: {e}")
+        xref = row.get("laser_af_x_reference") if hasattr(row, "get") else None
+        if xref is None or (isinstance(xref, float) and math.isnan(xref)) or str(xref).strip() in ("", "nan"):
+            return None
+        try:
+            return LaserAFReference.from_capture(float(xref), None)
+        except (ValueError, TypeError):
+            return None
+
     def export_location_list(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Export Location List", "", "CSV Files (*.csv);;All Files (*)")
         if file_path:
+            refs = self.scanCoordinates.region_laser_af_references
             location_list_df = pd.DataFrame(self.location_list, columns=["x (mm)", "y (mm)", "z (mm)"])
             location_list_df["ID"] = self.location_ids
+            # Human-readable spot position per region; blank when no reference.
+            location_list_df["laser_af_x_reference"] = [
+                (refs[rid].x_reference if rid in refs else "") for rid in self.location_ids
+            ]
             location_list_df["i"] = 0
             location_list_df["j"] = 0
             location_list_df["k"] = 0
             location_list_df.to_csv(file_path, index=False, header=True)
+
+            # Full references (incl. the cross-correlation crop image) go to a
+            # sidecar so the CSV stays readable but the export round-trips fully.
+            sidecar = {
+                str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs
+            }
+            if sidecar:
+                try:
+                    with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
+                        json.dump(sidecar, f)
+                except Exception as e:
+                    self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
 
     def import_location_list(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Import Location List", "", "CSV Files (*.csv);;All Files (*)")
@@ -3592,7 +4172,13 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 location_list_df_relevant["ID"] = location_list_df["ID"].astype(str)
             else:
                 location_list_df_relevant["ID"] = "None"
+            if "laser_af_x_reference" in location_list_df.columns:
+                location_list_df_relevant["laser_af_x_reference"] = location_list_df["laser_af_x_reference"]
+            # Full per-region references (incl. crops) ride in a sidecar next to
+            # the CSV; the x_reference column is the human-readable fallback.
+            sidecar_refs = self._load_laser_af_sidecar(file_path)
             self.clear_only_location_list()
+            self.scanCoordinates.region_laser_af_references.clear()
 
             self.table_location_list.blockSignals(True)
             self.dropdown_location_list.blockSignals(True)
@@ -3655,6 +4241,15 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                             self.entry_deltaX.value(),
                             self.entry_deltaY.value(),
                         )
+                    # Restore this region's laser-AF reference (sidecar by original
+                    # id, else the x_reference column). row["ID"] is the original
+                    # exported id even when region_id was reassigned above.
+                    reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
+                    if reference is not None:
+                        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+                    self.table_location_list.setItem(
+                        self.table_location_list.rowCount() - 1, 4, self._af_ref_item(reference)
+                    )
                 else:
                     self._log.warning("Duplicate values not added based on x and y.")
             self.table_location_list.blockSignals(False)
@@ -3702,6 +4297,10 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
         self.is_current_acquisition_widget = False
+        # Capture is done but the dataset is still flushing to disk in the
+        # background; hold the Start button + show "Finalizing…" until the
+        # writeback-complete signal (or safety timeout) re-enables.
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled, exclude_btn_startAcquisition=True):
         self.btn_setSavingDir.setEnabled(enabled)
@@ -3881,6 +4480,9 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
+            self.table_location_list.setItem(
+                row, 4, self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name))
+            )
 
             # Add to scan coordinates
             if self.use_overlap:
@@ -3906,7 +4508,7 @@ class FlexibleMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
                 )
 
 
-class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
+class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)
     signal_acquisition_channels = Signal(list)
@@ -4447,6 +5049,12 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        z_stack_mode_row = QHBoxLayout()
+        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
+        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
+        options_layout.addLayout(z_stack_mode_row)
         options_layout.addWidget(self.checkbox_skipSaving)
         options_layout.addLayout(self.fileSavingFormatRow)
         options_layout.addLayout(self.zarrStreamingRow)
@@ -4518,6 +5126,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
         self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
+        self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.entry_dt.valueChanged.connect(self.multipointController.set_deltat)
         self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
         self.entry_overlap.valueChanged.connect(self.update_coordinates)
@@ -4546,6 +5155,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         self.list_configurations.itemChanged.connect(self._reset_per_point_channels_map)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
@@ -5745,6 +6355,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
 
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
             self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
             self.multipointController.set_Nt(self.entry_Nt.value())
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
@@ -5765,6 +6376,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self._push_channel_selection_to_controller()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
+            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
             if self.checkbox_skipSaving.isChecked():
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
@@ -5777,6 +6393,11 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             ):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
+                return
+
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self.btn_startAcquisition.setChecked(False)
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
                 return
 
             # Update UI to show acquisition is running
@@ -5847,6 +6468,9 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
             self.focusMapWidget.enable_updating_focus_points_on_signal()
         self.setEnabled_all(True)
         self.toggle_coordinate_controls(self.has_loaded_coordinates)
+        # Hold the Start button + show "Finalizing…" until the dataset finishes
+        # flushing to disk in the background (or the safety timeout elapses).
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled):
         for widget in self.findChildren(QWidget):
@@ -6390,7 +7014,7 @@ class WellplateMultiPointWidget(AcquisitionYAMLDropMixin, QFrame):
         return row, col
 
 
-class MultiPointWithFluidicsWidget(QFrame):
+class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
     """A simplified version of WellplateMultiPointWidget for use with fluidics"""
 
     signal_acquisition_started = Signal(bool)
@@ -6599,6 +7223,7 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
+        self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
         self.multipointController.signal_acquisition_progress.connect(self.update_acquisition_progress)
         self.multipointController.signal_region_progress.connect(self.update_region_progress)
         self.signal_acquisition_started.connect(self.display_progress_bar)
@@ -6666,6 +7291,16 @@ class MultiPointWithFluidicsWidget(QFrame):
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
+
+            if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over system load / pending uploads.")
+                # This widget sets the "running" UI state before configuring the
+                # controller, so a pre-start cancel must roll it back by hand.
+                self.is_current_acquisition_widget = False
+                self.setEnabled_all(True)
+                self.btn_startAcquisition.setText("Start\n Acquisition ")
+                self.btn_startAcquisition.setChecked(False)
+                return
 
             # Emit signals
             self.signal_acquisition_started.emit(True)
@@ -6737,6 +7372,9 @@ class MultiPointWithFluidicsWidget(QFrame):
         self.btn_startAcquisition.setChecked(False)
         self.btn_startAcquisition.setText("Start\n Acquisition ")
         self.setEnabled_all(True)
+        # Hold the Start button + show "Finalizing…" until the dataset finishes
+        # flushing to disk in the background (or the safety timeout elapses).
+        self._begin_writeback_wait()
 
     def setEnabled_all(self, enabled):
         """Enable/disable all widget controls"""
@@ -7550,6 +8188,9 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(ref_z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(str(self.region_id)))
+            # Template regions don't capture per-region laser-AF references; keep
+            # the AF Ref column populated so it reads "—" rather than blank.
+            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
 
         self.scanCoordinates.add_template_region(
             ref_x, ref_y, ref_z, template_df["x_offset_mm"], template_df["y_offset_mm"], str(self.region_id)

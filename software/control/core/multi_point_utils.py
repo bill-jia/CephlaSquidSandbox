@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from control.slack_notifier import TimepointStats, AcquisitionStats
     from control.models.observation_state import ObservationState
     from control.models.acquisition_cycle import RegionPlan
+    from control.models.laser_af_reference import LaserAFReference
 
 
 @dataclass
@@ -17,6 +18,9 @@ class ScanPositionInformation:
     scan_region_coords_mm: List[Tuple[float, float]]
     scan_region_names: List[str]
     scan_region_fov_coords_mm: Dict[str, List[Tuple[float, float, float]]]
+    # Optional per-region laser-AF focus targets, keyed by region id. Regions
+    # without an entry fall back to the controller's global reference.
+    scan_region_laser_af_references: Dict[str, "LaserAFReference"] = field(default_factory=dict)
 
     @staticmethod
     def from_scan_coordinates(scan_coordinates: ScanCoordinates):
@@ -24,6 +28,9 @@ class ScanPositionInformation:
             scan_region_coords_mm=list(scan_coordinates.region_centers.values()),
             scan_region_names=list(scan_coordinates.region_centers.keys()),
             scan_region_fov_coords_mm=dict(scan_coordinates.region_fov_coordinates),
+            scan_region_laser_af_references=dict(
+                getattr(scan_coordinates, "region_laser_af_references", {})
+            ),
         )
 
 
@@ -179,3 +186,9 @@ class MultiPointControllerFunctions:
     # views to flush per-timepoint state so peak RAM tracks a single timepoint
     # rather than accumulating across the run.
     signal_new_time_point: Callable[[int], None] = lambda *a, **kw: None
+    # Fires once the background job-runner shutdown has finished, i.e. every zarr
+    # writer has been finalized and all data is durably on disk. This lands AFTER
+    # signal_acquisition_finished (which only signals that capture ended); it is
+    # the point at which it is safe to move/copy the dataset. Used by the GUI to
+    # keep the progress bar up as "Finalizing..." until writeback truly completes.
+    signal_data_writing_complete: Callable[[], None] = lambda *a, **kw: None

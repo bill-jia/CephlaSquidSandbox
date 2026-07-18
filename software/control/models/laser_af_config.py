@@ -5,13 +5,13 @@ These models define per-objective laser autofocus settings, including
 calibration data and detection parameters.
 """
 
-import base64
 from typing import List, Optional
 
 import numpy as np
 from pydantic import BaseModel, Field
 
 from control._def import SpotDetectionMode
+from control.models.laser_af_reference import decode_reference_image, encode_reference_image
 
 
 class LaserAFConfig(BaseModel):
@@ -55,6 +55,14 @@ class LaserAFConfig(BaseModel):
     min_peak_width: float = Field(10.0, description="Minimum peak width")
     min_peak_distance: float = Field(10.0, description="Minimum distance between peaks")
     min_peak_prominence: float = Field(0.25, description="Minimum peak prominence")
+    min_spot_intensity: float = Field(
+        10.0,
+        description=(
+            "Absolute intensity floor for spot detection. Frames whose maximum (within the search "
+            "window) is below this are treated as spot-absent instead of detecting peaks in "
+            "normalized noise (e.g. when the AF laser is off or blocked)."
+        ),
+    )
     spot_spacing: float = Field(100.0, description="Expected spot spacing")
     filter_sigma: Optional[float] = Field(None, description="Gaussian filter sigma (-1 to disable)")
 
@@ -80,20 +88,9 @@ class LaserAFConfig(BaseModel):
     @property
     def reference_image_cropped(self) -> Optional[np.ndarray]:
         """Convert stored base64 data back to numpy array."""
-        if self.reference_image is None:
-            return None
-        data = base64.b64decode(self.reference_image.encode("utf-8"))
-        return np.frombuffer(data, dtype=np.dtype(self.reference_image_dtype)).reshape(self.reference_image_shape)
+        return decode_reference_image(self.reference_image, self.reference_image_shape, self.reference_image_dtype)
 
     def set_reference_image(self, image: Optional[np.ndarray]) -> None:
         """Convert numpy array to base64 encoded string or clear reference if None."""
-        if image is None:
-            self.reference_image = None
-            self.reference_image_shape = None
-            self.reference_image_dtype = None
-            self.has_reference = False
-            return
-        self.reference_image = base64.b64encode(image.tobytes()).decode("utf-8")
-        self.reference_image_shape = list(image.shape)
-        self.reference_image_dtype = str(image.dtype)
-        self.has_reference = True
+        self.reference_image, self.reference_image_shape, self.reference_image_dtype = encode_reference_image(image)
+        self.has_reference = image is not None

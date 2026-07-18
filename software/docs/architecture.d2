@@ -194,6 +194,10 @@ controllers: "Core Controllers" {
       Hardware reflection-based autofocus.
       Monitors laser spot position shift on focus camera
       to infer Z displacement. Per-objective calibration.
+      Reference (spot x + crop) is capture/apply/get-active
+      so flexible multipoint can carry a distinct
+      LaserAFReference per region (via ScanPositionInformation);
+      regions without one fall back to the global reference.
     |
   }
 
@@ -628,7 +632,21 @@ writers: "Data Output" {
       so the save layer needs no global uniform
       (T,C,Z) assumption.
       Job types: SaveImage, SaveOMETiff,
-      SaveZarr, DownsampledView.
+      SaveZarr, DownsampledView, Postprocess.
+    |
+  }
+
+  postprocess: "PostprocessJob\n(online routines)" {
+    class: storage
+    tooltip: |md
+      Optional online postprocessing (Advanced cycles).
+      Accumulates a step/group's frames per FOV in a
+      dedicated runner, runs a routine (built-in phase2d
+      or a custom script), and writes the outputs as
+      their own {label}_{output} plates via inline
+      SaveZarrJob / TIFF — raw inputs are NOT saved.
+      TF cache persists across FOVs. ZARR_V3 +
+      INDIVIDUAL_IMAGES only. See online-postprocessing.md.
     |
   }
 
@@ -680,6 +698,8 @@ writers: "Data Output" {
 
   mp_worker -> zarr_writer: "SaveZarrJob"
   mp_worker -> ome_tiff: "SaveOMETiffJob"
+  mp_worker -> postprocess: "PostprocessJob\n(postprocessed frames)"
+  postprocess -> zarr_writer: "derived output plates"
 }
 
 # ============================================================================

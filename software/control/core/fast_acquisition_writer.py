@@ -1,8 +1,14 @@
 """
 Frame writer thread for fast acquisition.
 
-Streams raw frame bytes to frames.raw + frame_metadata.jsonl during capture, then runs
-byte_decoding_fn (when set) to produce TIFF / Zarr / HDF5 after the raw stream is closed.
+Two write paths:
+- Raw round-trip (streaming/non-deferred capture, plus deferred raw/classic-tiff): stream
+  raw frame bytes to frames.raw + frame_metadata.jsonl, then decode raw -> TIFF / BigTIFF /
+  Zarr / HDF5 after the raw stream is closed.
+- Direct-encode (deferred capture into bigtiff/zarr/hdf5): the whole capture is already held
+  in the RAM ring, so decode it straight into the output file — no frames.raw write and no
+  read-back (~1x disk IO instead of ~3x). Per-format writing lives in one place (the
+  _make_*_appender factories), shared by both paths.
 
 Underfilled packed frames: when ``expected_decode_bytes`` is present in per-frame metadata,
 raw bytes are truncated or zero-padded to that length before ``byte_decoding_fn`` is called.
@@ -25,6 +31,10 @@ _JSONL_LAYOUT_KEYS = frozenset(
     {"frame_id", "timestamp", "byte_offset", "byte_length", "frame_byte_length"}
 )
 
+# Classic TIFF uses 32-bit byte offsets, so a single file cannot exceed 4 GiB. Keep each
+# written stack safely under that; larger captures are split across multiple files.
+FAST_ACQ_MAX_TIFF_BYTES = int(3.8 * 1024**3)
+
 
 class FastAcquisitionWriter(threading.Thread):
     """
@@ -40,7 +50,8 @@ class FastAcquisitionWriter(threading.Thread):
         frames_per_file: int = 1000,
         byte_decoding_fn: Optional[Callable[[bytes, dict], np.ndarray]] = None,
         frame_shape: Optional[Tuple[int, int]] = None,
-        dtype: Optional[np.dtype] = None
+        dtype: Optional[np.dtype] = None,
+        defer_writes_until_stop: bool = False,
     ):
         super().__init__(daemon=True)
         self._log = squid.logging.get_logger(self.__class__.__name__)
@@ -48,6 +59,12 @@ class FastAcquisitionWriter(threading.Thread):
         self._frame_buffer = frame_buffer
         self._output_path = output_path
         self._file_format = file_format.lower()
+        # When True, do not drain the ring to disk while capture is running; hold every
+        # frame in the RAM ring and let the post-stop drain write them all once the burst
+        # ends. Keeps the capture window free of NVMe write DMA (see the controller's
+        # FAST_ACQ_DEFER_DISK_WRITES_DURING_CAPTURE). The caller guarantees the ring holds
+        # the whole capture before enabling this.
+        self._defer_writes_until_stop = defer_writes_until_stop
         self._frame_timestamps_ms: List[float] = []
         self._frames_per_file = frames_per_file
         self._byte_decoding_fn = byte_decoding_fn
@@ -56,12 +73,21 @@ class FastAcquisitionWriter(threading.Thread):
         self._bytes_per_frame: Optional[int] = None
         self._frames_written = 0
         self._start_time: Optional[float] = None
+        # Wall-clock of the first frame actually written to disk. In deferred mode nothing
+        # is written during the burst, so the write rate must be measured from here (not
+        # from _start_time) or the burst-hold time would dilute it to nonsense.
+        self._first_write_time: Optional[float] = None
         self._last_write_time: Optional[float] = None
         self._write_times: List[float] = []
         self._stats_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._running = False
         self._conversion_in_progress = False
+        # Post-capture format-conversion progress (raw -> TIFF/BigTIFF/Zarr/HDF5). Plain
+        # ints updated from the conversion loop and read by the UI poll; a stale read just
+        # shows a slightly-behind percentage, so no lock is needed.
+        self._frames_to_convert = 0
+        self._frames_converted = 0
         os.makedirs(output_path, exist_ok=True)
         self._frames_dir = os.path.join(output_path, "frames")
         os.makedirs(self._frames_dir, exist_ok=True)
@@ -72,6 +98,13 @@ class FastAcquisitionWriter(threading.Thread):
         self._jsonl_path = os.path.join(self._frames_dir, "frame_metadata.jsonl")
         self._jsonl_file = None
         self._raw_byte_offset = 0
+
+        # Flush raw + jsonl together every N frames instead of on every frame. The
+        # per-frame flush was a fsync-class syscall at up to the full camera rate and
+        # slowed the drain; periodic flushing keeps the raw stream and its jsonl index
+        # consistent on disk while bounding worst-case loss on a hard crash to N frames.
+        self._flush_every_n_frames = 64
+        self._frames_since_flush = 0
 
         if self._file_format == "zarr":
             try:
@@ -86,8 +119,20 @@ class FastAcquisitionWriter(threading.Thread):
                 self._log.warning("h5py not available, falling back to TIFF")
                 self._file_format = "tiff"
 
+        # Direct-encode: when the whole capture is held in RAM (deferred) AND the target is
+        # a single-file incremental format, decode the ring straight into the output file
+        # and skip frames.raw entirely — no raw write, no raw read-back (~1x IO instead of
+        # ~3x). Classic split "tiff" stays on the raw path (its <4 GiB file rollover needs
+        # the frame count up front, which a streaming ring drain doesn't have); "raw" is
+        # its own output. Requires deferred mode: a streaming (non-deferred) capture must
+        # keep draining to raw during the burst.
+        self._direct_encode = bool(
+            self._defer_writes_until_stop and self._file_format in ("bigtiff", "zarr", "hdf5")
+        )
+
         self._log.info(
-            f"Initialized writer: format={self._file_format}, output={output_path}"
+            f"Initialized writer: format={self._file_format}, output={output_path}, "
+            f"direct_encode={self._direct_encode}"
         )
 
     def run(self) -> None:
@@ -101,38 +146,54 @@ class FastAcquisitionWriter(threading.Thread):
             self._log.error(f"Failed to open frame metadata jsonl: {e}", exc_info=True)
             self._stop_event.set()
 
-        try:
-            self._raw_file = open(self._raw_file_path, "wb")
-            self._log.info(f"Opened raw frame file at {self._raw_file_path}")
-        except Exception as e:
-            self._log.error(f"Failed to open raw frame file: {e}", exc_info=True)
-            self._stop_event.set()
+        # frames.raw is only the intermediate for the raw round-trip path. Direct-encode
+        # never touches it (it writes the final file straight from the ring).
+        if not self._direct_encode:
+            try:
+                self._raw_file = open(self._raw_file_path, "wb")
+                self._log.info(f"Opened raw frame file at {self._raw_file_path}")
+            except Exception as e:
+                self._log.error(f"Failed to open raw frame file: {e}", exc_info=True)
+                self._stop_event.set()
 
         try:
-            while not self._stop_event.is_set():
-                # Read frame from buffer
-                frame_data = self._frame_buffer.read_frame()
+            # Phase 1 — capture: hold in RAM (deferred) or stream to raw during the burst.
+            if self._defer_writes_until_stop:
+                # Hold: leave every frame in the RAM ring while capture runs so the burst
+                # window issues no disk writes (no NVMe DMA to contend with camera capture
+                # DMA). The whole capture fits in the ring.
+                self._log.info("Writer holding frames in RAM until capture completes (deferred disk writes)")
+                while not self._stop_event.is_set():
+                    time.sleep(0.005)
+            else:
+                while not self._stop_event.is_set():
+                    frame_data = self._frame_buffer.read_frame()
+                    if frame_data is None:
+                        time.sleep(0.001)
+                        continue
+                    self._consume_frame(frame_data)
 
-                if frame_data is None:
-                    time.sleep(0.001)
-                    continue
-
-                frame_bytes, frame_id, timestamp, metadata = frame_data
-
-                write_start = time.time()
-                success = self._write_frame(frame_bytes, frame_id, timestamp, metadata)
-                write_time = time.time() - write_start
-
-                if success:
-                    with self._stats_lock:
-                        self._frames_written += 1
-                        self._last_write_time = time.time()
-                        self._write_times.append(write_time)
-                        # Keep only last 100 write times for statistics
-                        if len(self._write_times) > 100:
-                            self._write_times.pop(0)
-                else:
-                    self._log.error(f"Failed to write frame {frame_id}")
+            # Phase 2 — finalize the ring. The producer (SDK callback) can deliver a
+            # backlog faster than we write, so exiting the moment _stop_event fires would
+            # truncate the capture; drain the ring fully. In deferred mode this writes the
+            # entire capture.
+            if self._direct_encode:
+                # Decode the ring straight into the output file (bigtiff/zarr/hdf5), no raw.
+                self._conversion_in_progress = True
+                try:
+                    self._run_direct_encode()
+                finally:
+                    self._conversion_in_progress = False
+            else:
+                drained = 0
+                while True:
+                    frame_data = self._frame_buffer.read_frame()
+                    if frame_data is None:
+                        break
+                    self._consume_frame(frame_data)
+                    drained += 1
+                if drained:
+                    self._log.info(f"Drained {drained} buffered frames after stop")
 
         except Exception as e:
             self._log.error(f"Error in writer thread: {e}", exc_info=True)
@@ -151,10 +212,12 @@ class FastAcquisitionWriter(threading.Thread):
             except Exception as e:
                 self._log.warning(f"Error closing jsonl: {e}", exc_info=True)
 
-            try:
-                self._finalize_after_raw_closed()
-            except Exception as e:
-                self._log.error(f"Post-process after raw capture failed: {e}", exc_info=True)
+            # Raw round-trip path converts raw -> encoded here; direct-encode is already done.
+            if not self._direct_encode:
+                try:
+                    self._finalize_after_raw_closed()
+                except Exception as e:
+                    self._log.error(f"Post-process after raw capture failed: {e}", exc_info=True)
 
             self._running = False
             self._frame_timestamps_ms = np.array(self._frame_timestamps_ms)
@@ -177,6 +240,27 @@ class FastAcquisitionWriter(threading.Thread):
         """True while post-capture decode/write (TIFF/Zarr/HDF5) is running on the writer thread."""
         return self._conversion_in_progress
 
+    @property
+    def is_direct_encode(self) -> bool:
+        """True when this run decodes the RAM ring straight into the output file, skipping
+        the frames.raw round-trip (deferred + bigtiff/zarr/hdf5)."""
+        return self._direct_encode
+
+    def get_finalize_progress(self) -> Dict[str, Any]:
+        """Snapshot of post-capture disk work for the UI: how many frames have been
+        drained to the raw stream and, once conversion starts, how far the raw ->
+        encoded-format pass has gotten. ``frames_to_convert`` is 0 until conversion
+        begins (or for the raw format, which needs no conversion)."""
+        with self._stats_lock:
+            frames_written = self._frames_written
+        return {
+            "converting": self._conversion_in_progress,
+            "direct_encode": self._direct_encode,
+            "frames_written": frames_written,
+            "frames_converted": self._frames_converted,
+            "frames_to_convert": self._frames_to_convert,
+        }
+
     def _finalize_after_raw_closed(self) -> None:
         """Decode raw bytestream into TIFF / Zarr / HDF5 when applicable."""
         if self._file_format == "raw":
@@ -189,10 +273,12 @@ class FastAcquisitionWriter(threading.Thread):
         try:
             if self._file_format in ("tiff", "tif"):
                 self._convert_raw_to_tiff_stack()
+            elif self._file_format == "bigtiff":
+                self._encode_from_raw(self._make_bigtiff_appender)
             elif self._file_format == "zarr":
-                self._build_zarr_from_raw()
+                self._encode_from_raw(self._make_zarr_appender)
             elif self._file_format == "hdf5":
-                self._build_hdf5_from_raw()
+                self._encode_from_raw(self._make_hdf5_appender)
         finally:
             self._conversion_in_progress = False
 
@@ -244,163 +330,261 @@ class FastAcquisitionWriter(threading.Thread):
             self._log.warning(f"Raw frame file not found at {raw_path}, skipping TIFF conversion")
             return
 
-        dtype = self._dtype
-        file_size = os.path.getsize(raw_path)
         records = self._read_jsonl_records()
-
         if not records:
             self._log.warning("No frame_metadata.jsonl; cannot recover per-frame byte lengths for TIFF")
             return
 
-        planes: List[np.ndarray] = []
+        # Split into multiple files when the decoded stack would exceed the 4 GiB TIFF
+        # limit. Decode one file's worth of frames at a time so peak RAM stays bounded.
+        first = records[0]
+        fh = int(first.get("height") or (self._frame_shape[0] if self._frame_shape else 0))
+        fw = int(first.get("width") or (self._frame_shape[1] if self._frame_shape else 0))
+        bytes_per_frame = max(1, fh * fw * np.dtype(self._dtype).itemsize)
+        frames_per_file = max(1, FAST_ACQ_MAX_TIFF_BYTES // bytes_per_frame)
+        n_files = (len(records) + frames_per_file - 1) // frames_per_file
+        multi = n_files > 1
+        if multi:
+            self._log.info(
+                f"Decoded TIFF stack (~{len(records) * bytes_per_frame / 1024**3:.1f} GiB) exceeds the "
+                f"4 GiB TIFF limit; splitting {len(records)} frames into {n_files} files "
+                f"of up to {frames_per_file} frames each"
+            )
+
+        self._frames_to_convert = len(records)
+        self._frames_converted = 0
+        written: List[str] = []
         with open(raw_path, "rb") as f:
-            for i, rec in enumerate(records):
-                off = int(rec["byte_offset"])
-                ln = rec["frame_byte_length"]
-                f.seek(off)
-                chunk = f.read(ln)
-                if len(chunk) != ln:
-                    self._log.warning(
-                        f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}"
-                    )
-                    break
-                planes.append(self._decode_frame(chunk, rec))
-        if not planes:
-            self._log.warning("No frames decoded for TIFF")
-            return
-        volume = np.stack(planes, axis=0)
-        _, h, w = volume.shape
-        self._log.info(
-            f"Converting packed raw to 3D TIFF: {volume.shape[0]} frames, "
-            f"shape=({h},{w}), per-frame lengths from jsonl"
-        )
-
-        stack_path = os.path.join(self._frames_dir, "frames_stack.tiff")
-        try:
-            iio.mimwrite(stack_path, volume, format="tiff")
-            self._log.info(f"Wrote 3D TIFF stack to {stack_path}")
-            try:
-                os.remove(raw_path)
-                self._log.info(f"Deleted raw file {raw_path} after TIFF conversion")
-            except OSError as e:
-                self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
-        except Exception as e:
-            self._log.error(f"Failed to write TIFF stack: {e}", exc_info=True)
-
-    def _build_zarr_from_raw(self) -> None:
-
-        records = self._read_jsonl_records()
-        if not records:
-            self._log.warning("No jsonl records for Zarr build")
-            return
-        raw_path = self._raw_file_path
-        zarr_path = os.path.join(self._output_path, "frames.zarr")
-        group = zarr.open(zarr_path, mode="w")
-        ds_frames = None
-        ds_ids = None
-        ds_ts = None
-
-        with open(raw_path, "rb") as raw_f:
-            for rec in records:
-                off = int(rec["byte_offset"])
-                ln = rec["frame_byte_length"]
-                frame_id = int(rec["frame_id"])
-                ts = float(rec["timestamp"])
-                raw_f.seek(off)
-                chunk = raw_f.read(ln)
-                meta = FastAcquisitionWriter._meta_for_decode(rec)
-                frame = self._decode_frame(chunk, meta)
-                if ds_frames is None:
-                    shape = (0, *frame.shape)
-                    chunks = (100, *frame.shape)
-                    ds_frames = group.create_dataset(
-                        "frames",
-                        shape=shape,
-                        chunks=chunks,
-                        dtype=frame.dtype,
-                        compressor=zarr.Blosc(cname="lz4", clevel=5),
-                    )
-                    ds_ids = group.create_dataset(
-                        "frame_ids", shape=(0,), chunks=(1000,), dtype=np.int64
-                    )
-                    ds_ts = group.create_dataset(
-                        "timestamps", shape=(0,), chunks=(1000,), dtype=np.float64
-                    )
-                ds_frames.append(frame[np.newaxis, ...])
-                ds_ids.append(np.array([frame_id]))
-                ds_ts.append(np.array([ts]))
-        group.close()
-        self._log.info(f"Wrote Zarr dataset to {zarr_path}")
-        try:
-            os.remove(raw_path)
-        except OSError as e:
-            self._log.warning(f"Could not delete raw after Zarr: {e}", exc_info=True)
-
-    def _build_hdf5_from_raw(self) -> None:
-        import h5py
-
-        records = self._read_jsonl_records()
-        if not records:
-            self._log.warning("No jsonl records for HDF5 build")
-            return
-        raw_path = self._raw_file_path
-        h5_path = os.path.join(self._output_path, "frames.h5")
-        h5 = h5py.File(h5_path, "w")
-        ds_frames = None
-        ds_ids = None
-        ds_ts = None
-
-        try:
-            with open(raw_path, "rb") as raw_f:
-                for rec in records:
+            for file_idx in range(n_files):
+                start = file_idx * frames_per_file
+                chunk_records = records[start:start + frames_per_file]
+                planes: List[np.ndarray] = []
+                for i, rec in enumerate(chunk_records, start=start):
                     off = int(rec["byte_offset"])
                     ln = rec["frame_byte_length"]
-                    frame_id = int(rec["frame_id"])
-                    ts = float(rec["timestamp"])
-                    raw_f.seek(off)
-                    chunk = raw_f.read(ln)
-                    meta = FastAcquisitionWriter._meta_for_decode(rec)
-                    frame = self._decode_frame(chunk, meta)
-                    if ds_frames is None:
-                        shape = (0, *frame.shape)
-                        maxshape = (None, *frame.shape)
-                        ds_frames = h5.create_dataset(
-                            "frames",
-                            shape=shape,
-                            maxshape=maxshape,
-                            dtype=frame.dtype,
-                            chunks=(100, *frame.shape),
-                            compression="gzip",
-                            compression_opts=4,
+                    f.seek(off)
+                    chunk = f.read(ln)
+                    if len(chunk) != ln:
+                        self._log.warning(
+                            f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}"
                         )
-                        ds_ids = h5.create_dataset(
-                            "frame_ids",
-                            shape=(0,),
-                            maxshape=(None,),
-                            dtype=np.int64,
-                            chunks=(1000,),
-                        )
-                        ds_ts = h5.create_dataset(
-                            "timestamps",
-                            shape=(0,),
-                            maxshape=(None,),
-                            dtype=np.float64,
-                            chunks=(1000,),
-                        )
-                    cur = ds_frames.shape[0]
-                    ds_frames.resize((cur + 1, *frame.shape))
-                    ds_frames[cur] = frame
-                    ds_ids.resize((cur + 1,))
-                    ds_ids[cur] = frame_id
-                    ds_ts.resize((cur + 1,))
-                    ds_ts[cur] = ts
-        finally:
-            h5.close()
-        self._log.info(f"Wrote HDF5 to {h5_path}")
+                        break
+                    planes.append(self._decode_frame(chunk, rec))
+                    self._frames_converted += 1
+                if not planes:
+                    continue
+                h, w = planes[0].shape
+                name = f"frames_stack_{file_idx:03d}.tiff" if multi else "frames_stack.tiff"
+                stack_path = os.path.join(self._frames_dir, name)
+                try:
+                    # imageio wants a sequence of 2D images for a multipage TIFF (a 3D
+                    # ndarray is rejected); the list also avoids an np.stack copy.
+                    iio.mimwrite(stack_path, planes, format="tiff")
+                    written.append(stack_path)
+                    self._log.info(
+                        f"Wrote 3D TIFF stack ({len(planes)} frames, {h}x{w}) to {stack_path}"
+                        + (f" [{file_idx + 1}/{n_files}]" if multi else "")
+                    )
+                except Exception as e:
+                    self._log.error(f"Failed to write TIFF stack {stack_path}: {e}", exc_info=True)
+                    return  # leave raw in place for recovery if any chunk fails
+
+        if not written:
+            self._log.warning("No frames decoded for TIFF")
+            return
         try:
             os.remove(raw_path)
+            self._log.info(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
         except OSError as e:
-            self._log.warning(f"Could not delete raw after HDF5: {e}", exc_info=True)
+            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
+
+    # --- Per-format incremental appenders (shared by the raw and direct-encode paths) ---
+    # Each returns (append, close, describe): append(plane, frame_id, timestamp) writes one
+    # decoded frame, close() finalizes the file, describe(n) is a one-line log summary. The
+    # same appender serves both the raw round-trip (_encode_from_raw) and the RAM
+    # direct-encode (_run_direct_encode) paths, so there is a single definition of how each
+    # format is written.
+
+    def _make_bigtiff_appender(self):
+        import tifffile
+
+        stack_path = os.path.join(self._frames_dir, "frames_stack.tiff")
+        # contiguous=True appends every frame as a page of one series written back to back —
+        # the layout ImageJ reads as a single stack, and the fastest to write. 64-bit
+        # offsets (bigtiff) mean the whole capture lands in one file at any size.
+        tif = tifffile.TiffWriter(stack_path, bigtiff=True)
+
+        def append(plane, frame_id, timestamp):
+            tif.write(plane, photometric="minisblack", contiguous=True)
+
+        def describe(n):
+            size_gib = os.path.getsize(stack_path) / 1024**3 if os.path.exists(stack_path) else 0.0
+            return f"BigTIFF stack ({n} frames, {size_gib:.1f} GiB) at {stack_path}"
+
+        return append, tif.close, describe
+
+    def _make_zarr_appender(self):
+        import zarr
+
+        zarr_path = os.path.join(self._output_path, "frames.zarr")
+        group = zarr.open(zarr_path, mode="w")
+        ds: Dict[str, Any] = {}
+
+        def append(plane, frame_id, timestamp):
+            if not ds:
+                ds["frames"] = group.create_dataset(
+                    "frames", shape=(0, *plane.shape), chunks=(100, *plane.shape),
+                    dtype=plane.dtype, compressor=zarr.Blosc(cname="lz4", clevel=5),
+                )
+                ds["ids"] = group.create_dataset("frame_ids", shape=(0,), chunks=(1000,), dtype=np.int64)
+                ds["ts"] = group.create_dataset("timestamps", shape=(0,), chunks=(1000,), dtype=np.float64)
+            ds["frames"].append(plane[np.newaxis, ...])
+            ds["ids"].append(np.array([int(frame_id)]))
+            ds["ts"].append(np.array([float(timestamp)]))
+
+        def close():
+            # zarr 2 Groups have no close(); a DirectoryStore persists on each write. Close
+            # the store only if it actually supports it (e.g. a zip store).
+            store = getattr(group, "store", None)
+            if store is not None and hasattr(store, "close"):
+                store.close()
+
+        return append, close, lambda n: f"Zarr dataset ({n} frames) at {zarr_path}"
+
+    def _make_hdf5_appender(self):
+        import h5py
+
+        h5_path = os.path.join(self._output_path, "frames.h5")
+        h5 = h5py.File(h5_path, "w")
+        ds: Dict[str, Any] = {}
+
+        def append(plane, frame_id, timestamp):
+            if not ds:
+                ds["frames"] = h5.create_dataset(
+                    "frames", shape=(0, *plane.shape), maxshape=(None, *plane.shape),
+                    dtype=plane.dtype, chunks=(100, *plane.shape), compression="gzip", compression_opts=4,
+                )
+                ds["ids"] = h5.create_dataset("frame_ids", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=(1000,))
+                ds["ts"] = h5.create_dataset("timestamps", shape=(0,), maxshape=(None,), dtype=np.float64, chunks=(1000,))
+            cur = ds["frames"].shape[0]
+            ds["frames"].resize((cur + 1, *plane.shape))
+            ds["frames"][cur] = plane
+            ds["ids"].resize((cur + 1,))
+            ds["ids"][cur] = int(frame_id)
+            ds["ts"].resize((cur + 1,))
+            ds["ts"][cur] = float(timestamp)
+
+        return append, h5.close, lambda n: f"HDF5 ({n} frames) at {h5_path}"
+
+    def _encode_from_raw(self, make_appender) -> None:
+        """Raw round-trip: read frames.raw (via the jsonl byte-offset index), decode, and
+        stream them through the format appender. Used when frames were streamed to disk
+        during capture (non-deferred), or for deferred formats that keep the raw path."""
+        raw_path = self._raw_file_path
+        if not os.path.exists(raw_path):
+            self._log.warning(f"Raw frame file not found at {raw_path}, skipping {self._file_format} conversion")
+            return
+        records = self._read_jsonl_records()
+        if not records:
+            self._log.warning(f"No frame_metadata.jsonl; cannot convert to {self._file_format}")
+            return
+
+        self._frames_to_convert = len(records)
+        self._frames_converted = 0
+        append, close, describe = make_appender()
+        n = 0
+        finished = False
+        try:
+            with open(raw_path, "rb") as f:
+                for i, rec in enumerate(records):
+                    off = int(rec["byte_offset"])
+                    ln = int(rec["frame_byte_length"])
+                    f.seek(off)
+                    chunk = f.read(ln)
+                    if len(chunk) != ln:
+                        self._log.warning(f"Short read at frame {i}: got {len(chunk)} bytes, expected {ln}")
+                        break
+                    append(self._decode_frame(chunk, self._meta_for_decode(rec)),
+                           int(rec["frame_id"]), float(rec["timestamp"]))
+                    n += 1
+                    self._frames_converted = n
+            finished = True
+        except Exception as e:
+            self._log.error(f"Failed to encode {self._file_format} from raw: {e}", exc_info=True)
+        finally:
+            try:
+                close()
+            except Exception as e:
+                self._log.warning(f"Error closing {self._file_format} output: {e}", exc_info=True)
+
+        if not finished or n == 0:
+            if n == 0:
+                self._log.warning(f"No frames decoded for {self._file_format}")
+            return  # leave raw in place for recovery on a hard failure
+        self._log.info(f"Wrote {describe(n)} from raw")
+        try:
+            os.remove(raw_path)
+            self._log.info(f"Deleted raw file {raw_path} after {self._file_format} conversion")
+        except OSError as e:
+            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
+
+    def _run_direct_encode(self) -> None:
+        """Direct-encode: decode the RAM ring straight into the output file (bigtiff/zarr/
+        hdf5), skipping frames.raw entirely. Writes the jsonl sidecar + timestamps and
+        updates write stats per frame so the UI reports live 'Written' / 'Write rate'."""
+        make = {
+            "bigtiff": self._make_bigtiff_appender,
+            "zarr": self._make_zarr_appender,
+            "hdf5": self._make_hdf5_appender,
+        }[self._file_format]
+        append, close, describe = make()
+        n = 0
+        finished = False
+        try:
+            while True:
+                frame_data = self._frame_buffer.read_frame()
+                if frame_data is None:
+                    break
+                frame_bytes, frame_id, timestamp, metadata = frame_data
+                if self._bytes_per_frame is None:
+                    self._bytes_per_frame = len(frame_bytes)
+                t0 = time.time()
+                append(self._decode_frame(frame_bytes, metadata), frame_id, timestamp)
+                dt = time.time() - t0
+                self._frame_timestamps_ms.append(timestamp)
+                self._append_jsonl_direct(frame_id, timestamp, metadata)
+                n += 1
+                with self._stats_lock:
+                    if self._first_write_time is None:
+                        self._first_write_time = time.time()
+                    self._frames_written = n
+                    self._last_write_time = time.time()
+                    self._write_times.append(dt)
+                    if len(self._write_times) > 100:
+                        self._write_times.pop(0)
+                self._frames_converted = n
+            finished = True
+        except Exception as e:
+            self._log.error(f"Direct encode to {self._file_format} failed: {e}", exc_info=True)
+        finally:
+            try:
+                close()
+            except Exception as e:
+                self._log.warning(f"Error closing {self._file_format} output: {e}", exc_info=True)
+        if finished and n > 0:
+            self._log.info(f"Wrote {describe(n)} directly from RAM (skipped raw round-trip)")
+        elif n == 0:
+            self._log.warning(f"No frames to encode for {self._file_format}")
+
+    def _append_jsonl_direct(self, frame_id: int, timestamp: float, metadata: dict) -> None:
+        """jsonl sidecar for the direct-encode path: no byte_offset/byte_length (there is
+        no frames.raw), just the per-frame id, timestamp and metadata."""
+        if self._jsonl_file is None:
+            return
+        meta_out = {k: v for k, v in metadata.items() if k not in ("frame_byte_length", "timestamp")}
+        record = {"frame_id": int(frame_id), "timestamp": float(timestamp)}
+        record.update(self._json_safe(meta_out))
+        self._jsonl_file.write(json.dumps(record) + "\n")
 
     @staticmethod
     def _json_safe(obj: Any) -> Any:
@@ -426,7 +610,12 @@ class FastAcquisitionWriter(threading.Thread):
         if self._jsonl_file is None:
             return
         flen = len(frame_bytes)
-        meta_out = {k: v for k, v in metadata.items() if k != "frame_byte_length"}
+        # Drop keys that are authoritative record fields so the metadata copy can't
+        # clobber them. In particular the SDK's per-frame "timestamp" is 0 on this
+        # firmware; the real timestamp is the computed one passed in here.
+        meta_out = {
+            k: v for k, v in metadata.items() if k not in ("frame_byte_length", "timestamp")
+        }
         record = {
             "frame_id": frame_id,
             "timestamp": timestamp,
@@ -437,7 +626,25 @@ class FastAcquisitionWriter(threading.Thread):
         self._raw_byte_offset += len(frame_bytes)
         record.update(self._json_safe(meta_out))
         self._jsonl_file.write(json.dumps(record) + "\n")
-        self._jsonl_file.flush()
+
+    def _consume_frame(self, frame_data: Tuple[bytes, int, float, dict]) -> None:
+        """Write one frame read from the ring buffer and update statistics."""
+        frame_bytes, frame_id, timestamp, metadata = frame_data
+        write_start = time.time()
+        success = self._write_frame(frame_bytes, frame_id, timestamp, metadata)
+        write_time = time.time() - write_start
+        if success:
+            with self._stats_lock:
+                if self._first_write_time is None:
+                    self._first_write_time = time.time()
+                self._frames_written += 1
+                self._last_write_time = time.time()
+                self._write_times.append(write_time)
+                # Keep only last 100 write times for statistics
+                if len(self._write_times) > 100:
+                    self._write_times.pop(0)
+        else:
+            self._log.error(f"Failed to write frame {frame_id}")
 
     def _write_frame(
         self, frame_bytes: bytes, frame_id: int, timestamp: float, metadata: dict
@@ -448,6 +655,13 @@ class FastAcquisitionWriter(threading.Thread):
                 self._bytes_per_frame = len(frame_bytes)
             self._append_jsonl(frame_bytes, frame_id, timestamp, metadata)
             n = self._raw_file.write(frame_bytes)
+            # Flush raw before jsonl so the index never references unflushed raw bytes.
+            self._frames_since_flush += 1
+            if self._frames_since_flush >= self._flush_every_n_frames:
+                self._raw_file.flush()
+                if self._jsonl_file is not None:
+                    self._jsonl_file.flush()
+                self._frames_since_flush = 0
             return n == len(frame_bytes)
         except Exception as e:
             self._log.error(f"Error writing frame {frame_id}: {e}")
@@ -463,8 +677,12 @@ class FastAcquisitionWriter(threading.Thread):
                     "max_write_time": 0.0,
                 }
 
-            elapsed = time.time() - self._start_time if self._start_time else 1.0
-            write_rate = self._frames_written / elapsed
+            # Measure the rate from the first actual write, not capture start: in deferred
+            # mode nothing is written during the burst, so using _start_time would divide by
+            # the whole capture+hold time and under-report the true write/encode rate.
+            rate_start = self._first_write_time or self._start_time
+            elapsed = time.time() - rate_start if rate_start else 1.0
+            write_rate = self._frames_written / elapsed if elapsed > 0 else 0.0
 
             if self._write_times:
                 avg_write_time = np.mean(self._write_times) * 1000

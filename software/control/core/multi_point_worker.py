@@ -1,3 +1,4 @@
+import atexit
 import csv
 import glob
 import json
@@ -38,6 +39,10 @@ from control.core.waveform_observation_state import (
     build_pulse_waveform_for_state,
     nidaq_lines_for_state,
 )
+from control.core.waveform_capture import (
+    apply_illumination_for_waveform_capture,
+    arm_nidaq_pulse_for_capture,
+)
 from control.nidaq import TriggerSource
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 from control._sdk_watchdog import CameraTimeoutError
@@ -59,6 +64,10 @@ from control.core.job_processing import (
     DownsampledViewResult,
     FlushAndStageUploadJob,
     BarrierResult,
+    PostprocessJob,
+    PostprocessResult,
+    PostprocessWarmupJob,
+    PostprocessWarmupResult,
     append_frame_acquisition_time_csv,
 )
 from control.core.zarr_upload import (
@@ -85,6 +94,25 @@ _log = squid.logging.get_logger(__name__)
 # before giving up and aborting. Each recovery costs at most the current FOV. Set to
 # 0 to disable reinit entirely and always fall back to the clean-abort behavior (P0).
 MAX_CAMERA_REINIT_ATTEMPTS = 3
+
+# Time budget for the JobRunner subprocess to flush + finalize all zarr writers
+# during shutdown. The final commit of a per-FOV shard (one timepoint =
+# (1, C, Z, Y, X), routinely ~1 GB for a deep z-stack) is a single TensorStore
+# read-modify-write that can take tens of seconds. Terminating the subprocess
+# before that commit lands leaves the previous partial shard on disk (only the
+# last-written z-slices missing, and only at pyramid level 0) plus a stray
+# ``*.__lock`` file. This shutdown runs in a background daemon thread, so a
+# generous timeout does not block the UI or the start of the next acquisition;
+# terminate() only fires if finalize genuinely wedges past this deadline.
+JOB_RUNNER_FINALIZE_TIMEOUT_S = 600
+
+# No-progress stall window for the end-of-run background upload drainer. The
+# UploadWorker stamps a heartbeat on every chunk it moves, so this means "no
+# byte of forward progress for N seconds while uploads are still outstanding"
+# = genuinely wedged (a dead SMB handle), not merely slow. Much tighter than a
+# result-only window because the heartbeat tells a slow large file apart from a
+# stuck one; a wedged worker is force-terminated instead of waited out.
+UPLOAD_DRAINER_STALL_WINDOW_S = 120
 
 
 class SummarizeResult(NamedTuple):
@@ -139,6 +167,32 @@ def active_upload_drainer_summary() -> List[dict]:
         return [d.snapshot() for d in _active_upload_drainers]
 
 
+def terminate_all_upload_drainers() -> None:
+    """Force-stop every active drainer's UploadWorker immediately.
+
+    The UploadWorker is a non-daemon ``multiprocessing.Process``; Python's
+    multiprocessing joins non-daemon children at interpreter exit, so a worker
+    wedged in a synchronous SMB I/O wait would block the whole app from
+    closing. Terminating the workers here (from ``MultiPointController.close()``
+    and as an ``atexit`` handler) reaps them via ``terminate()`` — which the OS
+    honors even for a thread stuck in kernel I/O — so exit is never blocked.
+    Uploads abandoned this way are recoverable with the backfill script.
+    """
+    with _active_upload_drainers_lock:
+        drainers = list(_active_upload_drainers)
+    for d in drainers:
+        try:
+            d.force_stop()
+        except Exception:
+            pass
+
+
+# Registered last (after multiprocessing's own atexit), so it runs FIRST at
+# interpreter shutdown — terminating wedged workers before multiprocessing
+# tries (and would hang) to join them.
+atexit.register(terminate_all_upload_drainers)
+
+
 class _BackgroundUploadDrainer:
     """Owns one acquisition's UploadWorker after the MultiPointWorker has gone.
 
@@ -186,6 +240,8 @@ class _BackgroundUploadDrainer:
         self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
+        self._stop_requested = threading.Event()
+        self._last_result_time = 0.0
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -205,6 +261,22 @@ class _BackgroundUploadDrainer:
             "outstanding": outstanding,
             "alive": self._thread.is_alive(),
         }
+
+    def force_stop(self) -> None:
+        """Terminate the owned worker immediately and mark the drainer done.
+
+        Idempotent. The drain loop (running in the daemon thread) checks
+        ``_stop_requested`` each pass and exits promptly. Called by
+        ``terminate_all_upload_drainers`` on app close / at interpreter exit.
+        """
+        self._stop_requested.set()
+        worker = self._worker
+        if worker is not None:
+            try:
+                worker.force_stop()
+            except Exception:
+                pass
+        self._done.set()
 
     def _outstanding(self) -> int:
         return sum(len(s) for s in self._tasks_by_tp.values())
@@ -493,83 +565,116 @@ class _BackgroundUploadDrainer:
             )
 
     def _run(self) -> None:
+        tag = os.path.basename(self._experiment_path or "unknown")
         try:
+            # Fail fast if the share is simply gone: don't pay the stall window
+            # per file when the mount is unreachable. Probe is timeout-bounded
+            # so a wedged mount can't block here either.
+            from control.core.zarr_upload import remote_root_reachable
+            if (
+                self._target is not None
+                and getattr(self._target, "enabled", False)
+                and not remote_root_reachable(self._target.remote_root, timeout_s=5.0)
+            ):
+                self._log.error(
+                    f"[{tag}] remote {self._target.remote_root} is unreachable; "
+                    f"abandoning {self._outstanding()} pending upload(s) without "
+                    f"waiting. Re-run the backfill script over "
+                    f"{self._experiment_path} once the share is back."
+                )
+                self._teardown_worker(tag)
+                return
+
             self._enqueue_post_finalize_metadata_resync()
-            # Stall-based, NOT a wallclock cap: a healthy worker that is still
-            # making progress (results keep arriving) is never abandoned, no
-            # matter how large the backlog or how slow the network. We only
-            # give up if no new result lands for ``stall_window_s`` — i.e. the
-            # worker is genuinely stuck, not merely slow. (A fixed deadline
-            # used to time out mid-upload on large/slow transfers.)
+            # Heartbeat-based wedge detection, NOT a wallclock cap. The worker
+            # stamps ``worker.heartbeat`` on every chunk it moves, so a healthy
+            # transfer — however slow or large its backlog — keeps the idle
+            # clock near zero and is never abandoned. We only give up when
+            # neither a result nor a single byte has moved for
+            # ``stall_window_s`` (a genuinely wedged SMB handle), which the old
+            # result-only window could not tell apart from one slow big file.
             stall_window_s = self._stall_window_s
-            last_progress = time.time()
             last_log = 0.0
+            self._last_result_time = time.time()
             while True:
+                if self._stop_requested.is_set():
+                    break
                 outstanding = self._outstanding()
                 if outstanding == 0:
+                    break
+                # A crashed/terminated worker will never emit more results.
+                if self._worker is None or not self._worker.is_alive():
+                    self._log.error(f"[{tag}] UploadWorker is not alive; stopping drain.")
                     break
                 got = self._drain_available_results()
                 now = time.time()
                 if got:
-                    last_progress = now
-                elif now - last_progress > stall_window_s:
+                    self._last_result_time = now
+                hb = 0.0
+                try:
+                    hb = float(self._worker.heartbeat)
+                except Exception:
+                    pass
+                last_progress = max(hb, self._last_result_time)
+                idle = now - last_progress if last_progress > 0 else 0.0
+                if last_progress > 0 and idle > stall_window_s:
+                    self._log.error(
+                        f"[{tag}] UploadWorker wedged: no progress for "
+                        f"{int(idle)}s with {outstanding} upload(s) outstanding; "
+                        f"terminating. Re-run the backfill script over "
+                        f"{self._experiment_path} to finish the upload."
+                    )
                     break
                 if now - last_log > 30.0:
                     self._log.info(
-                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                        f"upload drainer: {outstanding} in flight "
-                        f"(idle {int(now - last_progress)}s / "
-                        f"stall window {int(stall_window_s)}s)"
+                        f"[{tag}] upload drainer: {outstanding} in flight "
+                        f"(idle {int(idle)}s / stall window {int(stall_window_s)}s)"
                     )
                     last_log = now
                 time.sleep(0.5)
+
             self._drain_available_results()
             remaining = self._outstanding()
             if remaining:
                 self._log.error(
-                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                    f"UploadWorker drain stalled with {remaining} upload(s) "
-                    f"outstanding (no progress for {int(stall_window_s)}s). Run "
-                    f"the standalone backfill script over {self._experiment_path} "
-                    f"to complete the upload."
+                    f"[{tag}] UploadWorker drain ended with {remaining} upload(s) "
+                    f"outstanding. Run the standalone backfill script over "
+                    f"{self._experiment_path} to complete the upload."
                 )
             if self._failed_tasks:
                 self._log.warning(
-                    f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                    f"{len(self._failed_tasks)} upload task(s) failed during this run; "
-                    f"local files for the affected timepoints have NOT been deleted."
+                    f"[{tag}] {len(self._failed_tasks)} upload task(s) failed during "
+                    f"this run; local files for the affected timepoints have NOT "
+                    f"been deleted."
                 )
-            # Marker only on a fully-clean drain: every task accounted for
-            # AND no task reported failure. If a subsequent backfill run
-            # closes the gap, that run will drop the marker instead.
+            # Marker only on a fully-clean drain: every task accounted for AND
+            # no task reported failure. If a subsequent backfill run closes the
+            # gap, that run will drop the marker instead.
             if remaining == 0 and not self._failed_tasks:
                 self._write_upload_complete_marker()
-            try:
-                self._worker.shutdown()
-                self._worker.join(timeout=10.0)
-                if self._worker.is_alive():
-                    self._log.warning(
-                        f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                        f"UploadWorker did not exit within 10s; terminating"
-                    )
-                    self._worker.terminate()
-                    self._worker.join(timeout=5.0)
-                try:
-                    self._worker.release_queue_resources()
-                except Exception as e:
-                    self._log.debug(f"release_queue_resources: {e}")
-                try:
-                    self._worker.close()
-                except Exception:
-                    pass
-            except Exception as e:
-                self._log.error(f"Error shutting down UploadWorker: {e}")
+            self._teardown_worker(tag)
         finally:
             self._done.set()
-            self._log.info(
-                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                f"background upload drainer finished."
-            )
+            self._log.info(f"[{tag}] background upload drainer finished.")
+
+    def _teardown_worker(self, tag: str) -> None:
+        """Stop the worker: a healthy idle worker exits on the sentinel; a
+        wedged one is force-terminated. Either way queue feeder threads are
+        released so the host process can exit promptly."""
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.shutdown()
+            worker.join(timeout=5.0)
+        except Exception as e:
+            self._log.debug(f"[{tag}] graceful worker shutdown: {e}")
+        # force_stop() is a no-op if the worker already exited; otherwise it
+        # terminate()s a worker still wedged in SMB I/O and releases queues.
+        try:
+            worker.force_stop()
+        except Exception as e:
+            self._log.error(f"[{tag}] Error force-stopping UploadWorker: {e}")
 
 
 class MultiPointWorker:
@@ -650,11 +755,22 @@ class MultiPointWorker:
         if self._global_plan is None:
             # Defensive fallback (e.g. direct worker construction in tests): treat
             # the channel axis as a 1-frame-per-state chain. _index_events takes
-            # tagged raw events, so wrap each name as a ("state", name) event.
+            # tagged raw events, so wrap each name as a ("state", (name, az)) event;
+            # a flat selection is always a full z-stack (az=True).
             self._global_plan = RegionPlan.from_events(
-                _index_events([("state", n) for n in self.observation_state_names])
+                _index_events([("state", (n, True)) for n in self.observation_state_names])
             )
         self._region_plans = dict(acquisition_parameters.resolved_region_plans or {})
+        # True if any plan carries online-postprocessing assignments (adds a
+        # PostprocessJob runner + routes those frames away from the save jobs).
+        self._has_postprocess = any(
+            p is not None and p.postprocess_groups
+            for p in [self._global_plan, *self._region_plans.values()]
+        )
+        # Size of the most recent frame sent to the live display; postprocess
+        # output previews are only displayed when they match it (the shared
+        # napari/contrast viewer holds one image size across all channels).
+        self._last_raw_display_shape: Optional[Tuple[int, int]] = None
         # Imaged channel axis (C order) and per-channel display metadata, used for
         # zarr/omero naming. Resolved lazily so a None pixel/illumination config
         # in tests doesn't break construction.
@@ -704,6 +820,18 @@ class MultiPointWorker:
         )
         self.scan_region_coords_mm = acquisition_parameters.scan_position_information.scan_region_coords_mm
         self.scan_region_names = acquisition_parameters.scan_position_information.scan_region_names
+        # Per-region laser-AF focus targets. Regions without an entry fall back to
+        # `_base_laser_af_reference` — the global reference loaded in the controller
+        # at worker construction — so a region that follows one with a distinct
+        # reference still corrects to the right target, independent of scan order.
+        self._region_laser_af_references = dict(
+            acquisition_parameters.scan_position_information.scan_region_laser_af_references
+        )
+        self._base_laser_af_reference = (
+            self.laser_auto_focus_controller.get_active_reference()
+            if self.laser_auto_focus_controller is not None
+            else None
+        )
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
 
@@ -810,6 +938,12 @@ class MultiPointWorker:
 
         if extra_job_classes:
             job_classes.extend(extra_job_classes)
+
+        # Online postprocessing runs in its own runner (created only when a plan
+        # uses it). It writes derived plates via inline SaveZarrJob / direct TIFF
+        # and needs the zarr writer info + upload pipeline like the zarr runner.
+        if self._has_postprocess and not self.skip_saving:
+            job_classes.append(PostprocessJob)
 
         # Downsampled view generation setup
         # Only generate downsampled views for well-based acquisitions
@@ -958,11 +1092,20 @@ class MultiPointWorker:
                 f"-> {self._upload_target.remote_root}, "
                 f"delete_after_verify={self._upload_target.delete_after_verify}"
             )
-            fovs_per_tp = sum(
-                len(coords) for coords in self.scan_region_fov_coords_mm.values()
-            )
+            # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
+            # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
+            # run has len(array_keys) raw plates, and postprocessing adds one per
+            # derived output. Seeding to bare FOV count made _maybe_batched_delete
+            # fire after only 1/N barriers for ragged/postprocess runs (deletion
+            # would then never reclaim later shards). Count keys per FOV per region.
+            barriers_per_tp = 0
+            for region_id, coords in self.scan_region_fov_coords_mm.items():
+                plan = self._get_region_plan(region_id)
+                raw_keys = 1 if plan.dense else len(plan.array_keys)
+                keys_per_fov = raw_keys + len(plan.derived_output_keys)
+                barriers_per_tp += len(coords) * keys_per_fov
             for tp in range(self.Nt):
-                self._upload_expected_count_by_tp[tp] = fovs_per_tp
+                self._upload_expected_count_by_tp[tp] = barriers_per_tp
                 self._upload_tasks_by_tp[tp] = set()
                 self._upload_results_by_tp[tp] = []
 
@@ -1013,12 +1156,12 @@ class MultiPointWorker:
                     # Only the SaveZarrJob runner needs the upload pipeline — barriers
                     # are dispatched onto its queue so they FIFO-order behind preceding
                     # SaveZarrJobs for the same (t, fov).
-                    runner_upload_target = (
-                        self._upload_target if job_class is SaveZarrJob else None
-                    )
-                    runner_upload_queue = (
-                        upload_queue_for_zarr_runner if job_class is SaveZarrJob else None
-                    )
+                    # The zarr runner AND the postprocess runner both flush+stage
+                    # uploads (the latter for its derived plates, via inline
+                    # FlushAndStageUploadJob), so both need the upload pipeline.
+                    needs_upload = job_class in (SaveZarrJob, PostprocessJob)
+                    runner_upload_target = self._upload_target if needs_upload else None
+                    runner_upload_queue = upload_queue_for_zarr_runner if needs_upload else None
                     job_runner = control.core.job_processing.JobRunner(
                         self.acquisition_info,
                         cleanup_stale_ome_files=use_ome_tiff,
@@ -1151,23 +1294,28 @@ class MultiPointWorker:
     def _build_save_layout(self, region_plan, event):
         """Build the self-describing SaveLayout for one imaged event at the
         current timepoint, using the dense/ragged layout from the region plan."""
-        from control.models.acquisition_cycle import frame_coord, SaveLayout
+        from control.models.acquisition_cycle import frame_coord, SaveLayout, array_key_for
 
         coord = frame_coord(region_plan, self.Nt, self.time_point, event)
         if coord.array_key is None:
             # Dense: one array, all imaged channels.
             names = list(region_plan.channel_order)
         else:
-            # Ragged: a single-channel per-state array.
+            # Ragged: a single-channel per-(state, z-mode) array.
             names = [event.observation_state]
         colors, wavelengths = [], []
         for n in names:
             c, w = self._channel_display_meta(n)
             colors.append(c)
             wavelengths.append(w)
-        # Only disambiguate filenames when this state repeats within a position.
-        repeats = region_plan.frame_counts.get(event.observation_state, 1) > 1
+        # Only disambiguate filenames when this (state, z-mode) repeats within a
+        # position; key by the array group so a ref-z step is counted correctly.
+        group_key = array_key_for(event.observation_state, event.acquire_z_stack)
+        repeats = region_plan.frame_counts.get(group_key, 1) > 1
         frame_suffix = f"f{event.state_frame_index:0{FILE_ID_PADDING}}" if repeats else None
+        # Z extent of this frame's array: full stack for a normal step, 1 for a
+        # reference-z-only capture (whose single frame is written at z=0).
+        z_size = self.NZ if event.acquire_z_stack else 1
         return SaveLayout(
             array_key=coord.array_key,
             t_index=coord.t_index,
@@ -1180,6 +1328,7 @@ class MultiPointWorker:
             channel_colors=colors,
             channel_wavelengths=wavelengths,
             frame_suffix=frame_suffix,
+            z_size=z_size,
         )
 
     def _seed_camera_for_first_observation_state(self) -> None:
@@ -1260,225 +1409,44 @@ class MultiPointWorker:
             self._log.warning("Could not turn off capture illumination after snap: %s", e)
 
     def _apply_illumination_for_waveform_capture(self, config: ObservationState) -> None:
-        """Apply illumination for a waveform-driven capture.
+        """Apply illumination for a waveform-driven capture (DC on, timed gates LOW).
 
-        DC intensities for every active illuminator are set as usual, but the
-        digital gating line for any illuminator with a ``timing`` block is
-        left LOW — the NIDAQ one-shot waveform is the only thing that pulls
-        it HIGH during the exposure. Standard (un-timed) illuminators in the
-        same observation state are turned on for the full exposure, exactly
-        like the regular path.
+        Thin delegator to :func:`control.core.waveform_capture.apply_illumination_for_waveform_capture`
+        so multipoint and live preview drive the gated pulse identically.
         """
-        ic = self.microscope.illumination_controller
-        active = config.active_illuminator_states
-        if not active:
-            return
-        try:
-            ic.apply_observation_illumination(
-                active,
-                turn_on=True,
-                force_hardware=True,
-                gate_timed_illuminators=False,
-            )
-        except Exception as e:
-            self._log.warning("Could not apply waveform-capture illumination: %s", e)
-
-    def _resolve_camera_frame_signal_terminal(self, nidaq) -> str:
-        """Resolve the NIDAQ terminal carrying the camera's frame readout edge.
-
-        Reads the ``main_camera.frame_readout`` endpoint from the machine
-        config's ``io:`` declarations (e.g. ``port0/line7``), then translates
-        the channel id into a form ``cfg_dig_edge_start_trig`` accepts. NI-DAQ
-        won't take ``port0/lineN`` as a start-trigger source on X-series
-        devices — for triggering you need the corresponding ``PFIN`` alias
-        (same physical pin for N=0..7). Read/write paths still address the
-        line as ``port0/lineN``; only the trigger source needs translation.
-        Falls back to ``control._def.NIDAQ_FRAME_SIGNAL_TERMINAL`` when the
-        endpoint is missing.
-        """
-        try:
-            mc = self.microscope.config_repo.get_machine_config()
-            io_config = mc.collect_io_endpoints()
-            ep = io_config.get("main_camera.frame_readout")
-            if ep is not None and ep.channel_id:
-                device = getattr(nidaq, "device_name", None) or "Dev1"
-                cid = ep.channel_id.strip()
-                # Translate "port0/lineN" -> "PFIN" for the trigger-source path.
-                if cid.startswith("port0/line"):
-                    try:
-                        n = int(cid.rsplit("line", 1)[-1])
-                        return f"/{device}/PFI{n}"
-                    except ValueError:
-                        pass
-                # Already a PFI/PXI/internal terminal — use as-is.
-                return f"/{device}/{cid}"
-            self._log.debug(
-                "main_camera.frame_readout not declared in machine config; "
-                "using NIDAQ_FRAME_SIGNAL_TERMINAL fallback %s",
-                control._def.NIDAQ_FRAME_SIGNAL_TERMINAL,
-            )
-        except Exception:
-            self._log.exception(
-                "Failed to resolve camera frame signal terminal; using fallback"
-            )
-        return control._def.NIDAQ_FRAME_SIGNAL_TERMINAL
+        apply_illumination_for_waveform_capture(self.microscope, config, self._log)
 
     def _arm_nidaq_pulse_for_capture(self, config: ObservationState) -> Optional[Callable[[], None]]:
-        """Arm an NIDAQ one-shot pulse waveform for a waveform-driven capture.
+        """Arm the per-frame NIDAQ pulse for a waveform-driven capture.
 
-        Builds the per-frame ``WaveformData`` from the observation state's
-        timed illuminators, configures the NIDAQ for an EXTERNAL start
-        trigger latched on the camera's exposure-active line, and arms the
-        task. Returns a cleanup closure that callers must invoke after the
-        camera frame has been read; the closure waits for the waveform to
-        finish, releases the tasks, restores any prior live-output state,
-        and rewrites the NIDAQ timing/trigger config back to whatever the
-        previous user (fast acquisition, DAQ-only widget, etc.) had set.
-        Returns ``None`` (and logs a warning) when the NIDAQ is not
-        configured on this rig — the surrounding controller validation
-        should prevent this from happening in practice.
+        Thin delegator to :func:`control.core.waveform_capture.arm_nidaq_pulse_for_capture`.
+        On a wait-timeout the failure handler logs once and aborts the run, so the
+        user fixes the wiring rather than watching every FOV produce dark frames.
         """
-        nidaq = getattr(self.microscope.addons, "nidaq", None)
-        if nidaq is None:
-            self._log.warning(
-                "Waveform-driven observation state '%s' selected but no NIDAQ is configured; "
-                "falling back to standard capture (illumination will stay on for the full exposure)",
-                config.name,
-            )
-            return None
+        return arm_nidaq_pulse_for_capture(
+            self.microscope,
+            config,
+            log=self._log,
+            get_timer=self._timing.get_timer,
+            on_wait_failure=self._on_nidaq_pulse_wait_failure,
+        )
 
-        ic = self.microscope.illumination_controller
-        sample_rate_hz = float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ)
+    def _on_nidaq_pulse_wait_failure(self, terminal, timeout_s, name, error) -> None:
+        """Abort the acquisition (logging once) when the per-frame pulse never fired."""
+        if not getattr(self, "_nidaq_pulse_failure_logged", False):
+            self._log.error(
+                "NIDAQ pulse waveform did not fire for state '%s' within %.2fs. "
+                "Check that the camera frame-signal terminal (%s) is wired to the "
+                "camera's exposure-active / frame-signal output on this rig. "
+                "Aborting acquisition to avoid producing dark frames on every FOV.",
+                name, timeout_s, terminal,
+            )
+            self._log.debug("NIDAQ wait_until_done error detail: %s", error)
+            self._nidaq_pulse_failure_logged = True
         try:
-            waveform = build_pulse_waveform_for_state(
-                config, ic, sample_rate_hz=sample_rate_hz,
-            )
-            do_lines = nidaq_lines_for_state(config, ic)
-        except ValueError:
-            self._log.exception("Failed to build NIDAQ pulse waveform for state '%s'", config.name)
-            raise
-
-        terminal = self._resolve_camera_frame_signal_terminal(nidaq)
-        # The NIDAQ instance is shared with the fast-acquisition widget and the
-        # DAQ-only acquisition controller — both write sample_rate_hz /
-        # samples_per_channel / trigger_source / external_trigger_terminal
-        # directly. Snapshot those values now so we can put them back when our
-        # one-shot waveform is done.
-        prev_sample_rate_hz = float(getattr(nidaq, "sample_rate_hz", sample_rate_hz))
-        prev_samples_per_channel = int(getattr(nidaq, "samples_per_channel", 0))
-        prev_trigger_source = getattr(nidaq, "trigger_source", TriggerSource.SOFTWARE)
-        prev_external_terminal = getattr(nidaq, "external_trigger_terminal", terminal)
-
-        # Pick our own task length to match the per-frame waveform — never
-        # inherit whatever the previous run left behind.
-        per_frame_samples = next(iter(waveform.digital_output.values())).size
-
-        with self._timing.get_timer("nidaq_waveform_arm"):
-            try:
-                nidaq.sample_rate_hz = sample_rate_hz
-                nidaq.samples_per_channel = per_frame_samples
-                nidaq.trigger_source = TriggerSource.EXTERNAL
-                nidaq.external_trigger_terminal = terminal
-                nidaq.configure_task_io(
-                    ao_channels=[],
-                    do_lines=do_lines,
-                    di_lines=[],
-                    ai_channels=[],
-                )
-                nidaq.prepare_for_acquisition()
-                nidaq.set_waveforms(waveform)
-                nidaq.arm()
-                nidaq.start_trigger()
-            except Exception:
-                # Best-effort cleanup if any step in the arm sequence failed.
-                try:
-                    nidaq.release_tasks()
-                except Exception:
-                    pass
-                try:
-                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
-                    if callable(restore_fn):
-                        restore_fn()
-                except Exception:
-                    pass
-                # Put the NIDAQ timing/trigger config back to whatever it was.
-                try:
-                    nidaq.sample_rate_hz = prev_sample_rate_hz
-                    if prev_samples_per_channel:
-                        nidaq.samples_per_channel = prev_samples_per_channel
-                    nidaq.trigger_source = prev_trigger_source
-                    nidaq.external_trigger_terminal = prev_external_terminal
-                except Exception:
-                    pass
-                raise
-
-        exposure_s = float(config.exposure_time) / 1000.0
-        # Just enough to cover exposure + camera readout + DMA dispatch. A long
-        # wait here only delays surfacing a wiring problem (e.g. the configured
-        # NIDAQ_FRAME_SIGNAL_TERMINAL doesn't match where the camera signal is
-        # actually wired) and stretches every FOV needlessly.
-        timeout_s = max(exposure_s + 0.2, 0.3)
-
-        def _cleanup() -> None:
-            with self._timing.get_timer("nidaq_waveform_done"):
-                wait_failed = False
-                try:
-                    nidaq.wait_until_done(timeout_s=timeout_s)
-                except Exception as e:
-                    wait_failed = True
-                    if not getattr(self, "_nidaq_pulse_failure_logged", False):
-                        self._log.error(
-                            "NIDAQ pulse waveform did not fire for state '%s' within %.2fs. "
-                            "Check that NIDAQ_FRAME_SIGNAL_TERMINAL (%s) is wired to the "
-                            "camera's exposure-active / frame-signal output on this rig. "
-                            "Aborting acquisition to avoid producing dark frames on every FOV.",
-                            config.name,
-                            timeout_s,
-                            terminal,
-                        )
-                        self._log.debug("NIDAQ wait_until_done error detail: %s", e)
-                        self._nidaq_pulse_failure_logged = True
-                try:
-                    nidaq.release_tasks()
-                except Exception as e:
-                    self._log.warning("NIDAQ release_tasks failed for '%s': %s", config.name, e)
-                # Drive each timed DO line LOW before the live-output restore —
-                # see _run_nidaq_stimulus for the rationale. Same hazard here:
-                # a pulse that ends at the exposure boundary leaves the gate
-                # HIGH and the snapshot can't fix it for never-live lines.
-                try:
-                    nidaq.start_live_output(do_values={line: False for line in do_lines})
-                except Exception as e:
-                    self._log.warning(
-                        "Post-capture DO clear failed for '%s' on lines %s: %s",
-                        config.name, do_lines, e,
-                    )
-                try:
-                    restore_fn = getattr(nidaq, "restore_after_acquisition", None)
-                    if callable(restore_fn):
-                        restore_fn()
-                except Exception as e:
-                    self._log.warning("NIDAQ restore_after_acquisition failed for '%s': %s", config.name, e)
-                # Restore the timing/trigger config snapshot so the next user
-                # (fast acquisition widget, DAQ-only acquisition) sees the
-                # NIDAQ in the same shape it was before the multipoint run.
-                try:
-                    nidaq.sample_rate_hz = prev_sample_rate_hz
-                    if prev_samples_per_channel:
-                        nidaq.samples_per_channel = prev_samples_per_channel
-                    nidaq.trigger_source = prev_trigger_source
-                    nidaq.external_trigger_terminal = prev_external_terminal
-                except Exception as e:
-                    self._log.warning("NIDAQ config restore failed for '%s': %s", config.name, e)
-                if wait_failed:
-                    # One failure is enough — abort so the user can fix the
-                    # wiring rather than watching every subsequent FOV time out.
-                    try:
-                        self.request_abort_fn()
-                    except Exception:
-                        pass
-
-        return _cleanup
+            self.request_abort_fn()
+        except Exception:
+            pass
 
     def _run_nidaq_stimulus(self, config: ObservationState) -> None:
         """Fire an NIDAQ pulse-comb stimulus step (no camera capture).
@@ -1854,9 +1822,6 @@ class MultiPointWorker:
         def timed_out():
             return time.time() > timeout_time
 
-        def time_left():
-            return max(timeout_time - time.time(), 0)
-
         # Wait for all pending jobs across all runners (round-robin to avoid blocking on one)
         while not timed_out():
             any_pending = False
@@ -1870,23 +1835,35 @@ class MultiPointWorker:
             self._summarize_runner_outputs(drain_all=True)
             time.sleep(0.1)
         else:
-            # Timed out - kill any runners that still have pending jobs
+            # Drain budget exhausted, but DO NOT kill the subprocess here. A
+            # still-pending job may be a FlushAndStageUploadJob whose
+            # ``wait_for_pending()`` is midway through committing a large shard,
+            # or a SaveZarrJob whose level-0 write has not yet been flushed.
+            # Killing the process would corrupt that FOV (the previous partial
+            # shard would be left in place). The graceful shutdown below sends
+            # the stop sentinel, which the run loop only honors *between* jobs,
+            # so the in-flight job finishes and every writer is finalized before
+            # the subprocess exits.
             for job_class, job_runner in active_runners:
                 if job_runner.has_pending():
-                    self._log.error(
-                        f"Timed out after {timeout_s} [s] waiting for jobs to finish. Pending jobs for {job_class.__name__} abandoned!!!"
+                    self._log.warning(
+                        f"Jobs still pending for {job_class.__name__} after {timeout_s} [s]; "
+                        f"they will finish and finalize during shutdown "
+                        f"(up to {JOB_RUNNER_FINALIZE_TIMEOUT_S} [s])."
                     )
-                    job_runner.kill()
 
         # Drain results before shutdown
         self._summarize_runner_outputs(drain_all=True)
 
         # Shut down all job runners in parallel (in background to avoid blocking on subprocess termination).
         # Using daemon threads is safe here because:
-        # 1. All jobs are complete and results are already drained
-        # 2. The subprocess termination is best-effort cleanup only
+        # 1. The subprocess drains any remaining queued jobs and runs
+        #    finalize_all_writers() (the data-durability flush) before exiting;
+        #    shutdown() waits JOB_RUNNER_FINALIZE_TIMEOUT_S for that to finish.
+        # 2. Beyond that flush, subprocess termination is best-effort cleanup only
         # 3. If app exits before threads complete, OS will terminate subprocesses anyway
-        # 4. This prevents slow subprocess termination from blocking acquisition completion
+        # 4. Running in the background prevents the (possibly slow) flush + termination
+        #    from blocking acquisition completion
         log = self._log  # Capture for closure
 
         def shutdown_runner(job_runner, timeout):
@@ -1896,10 +1873,45 @@ class MultiPointWorker:
                 log.error(f"Error shutting down job runner in background: {e}")
 
         self._log.info("Shutting down job runners (non-blocking)...")
-        remaining_time = time_left()
+        # Give the background shutdown the full finalize budget — NOT the
+        # leftover of the short drain timeout above. ``shutdown()`` sends the
+        # stop sentinel and then ``join()``s for this long before resorting to
+        # terminate(), which is exactly the window the subprocess needs to run
+        # ``finalize_all_writers()`` (the large level-0 shard commit). Because
+        # this runs in a daemon thread, the long budget does not block the
+        # controller or the next acquisition.
+        shutdown_threads = []
         for job_class, job_runner in active_runners:
-            t = threading.Thread(target=shutdown_runner, args=(job_runner, remaining_time), daemon=True)
+            t = threading.Thread(
+                target=shutdown_runner,
+                args=(job_runner, JOB_RUNNER_FINALIZE_TIMEOUT_S),
+                daemon=True,
+            )
             t.start()
+            shutdown_threads.append(t)
+
+        # Fire signal_data_writing_complete once every runner has finished
+        # finalizing (writers flushed, zarr.json marked complete, subprocess
+        # exited) — the point at which the local dataset is safe to move/copy.
+        # Runs in its own daemon thread so the controller is not blocked; the
+        # callback always fires (the joined shutdowns each have their own
+        # internal timeout+terminate) so the GUI can never get stuck in the
+        # "Finalizing..." state.
+        signal_writing_complete = self.callbacks.signal_data_writing_complete
+
+        def _announce_writeback_complete(threads):
+            for th in threads:
+                th.join()
+            try:
+                signal_writing_complete()
+            except Exception as e:
+                log.error(f"signal_data_writing_complete callback failed: {e}")
+            else:
+                log.info("Data writing complete (all zarr writers finalized).")
+
+        threading.Thread(
+            target=_announce_writeback_complete, args=(shutdown_threads,), daemon=True
+        ).start()
 
         # Final drain of all output queues (should be empty, but check anyway)
         self._summarize_runner_outputs(drain_all=True)
@@ -1910,9 +1922,11 @@ class MultiPointWorker:
         # can run concurrently — see ``active_upload_drainer_count()`` for
         # operator visibility.
         # Stall window, not a deadline: the drainer keeps running as long as
-        # uploads make progress; it only gives up after this many seconds of
-        # *no* new results (worker genuinely stuck).
-        self._spawn_background_upload_drainer(stall_window_s=10 * 60)
+        # the worker makes byte-progress (heartbeat advances); it only gives up
+        # after this many seconds of a genuinely wedged worker.
+        self._spawn_background_upload_drainer(
+            stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S
+        )
 
         # Release backpressure resources now that all jobs are complete
         try:
@@ -2520,27 +2534,109 @@ class MultiPointWorker:
             # and enqueued the upload task; track its task_id so we can match
             # the matching UploadResult later.
             elif isinstance(job_result.result, BarrierResult):
-                br = job_result.result
-                if br.submitted:
-                    self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
-                elif self._upload_target is not None:
-                    # Barrier ran but didn't submit (no writer / no shards).
-                    # Account it as completed-non-uploading so the timepoint
-                    # tally can still close.
-                    self._upload_results_by_tp.setdefault(br.time_point, []).append(
-                        UploadResult(
-                            task_id=br.task_id,
-                            time_point=br.time_point,
-                            region_id=br.region_id,
-                            fov=br.fov,
-                            success=True,
-                            uploaded_paths=[],
-                            failed_paths=[],
-                            error=None,
-                        )
+                self._handle_barrier_result(job_result.result)
+            # Handle PostprocessResult - derived plates were written; feed each
+            # embedded upload barrier through the same accounting as raw plates
+            # and push the output previews to the live display.
+            elif isinstance(job_result.result, PostprocessResult):
+                pr = job_result.result
+                if pr.error is not None:
+                    self._log.error(
+                        "Postprocess group %s failed at t=%d region=%s fov=%d: %s",
+                        pr.group_key, pr.time_point, pr.region_id, pr.fov, pr.error,
                     )
-                    self._maybe_batched_delete(br.time_point)
+                    self._acquisition_error_count += 1
+                    if self._slack_notifier is not None:
+                        try:
+                            self._slack_notifier.notify_error(
+                                f"Postprocess {pr.group_key} failed: {pr.error}",
+                                {"time_point": pr.time_point, "region_id": pr.region_id, "fov": pr.fov},
+                            )
+                        except Exception as e:
+                            self._log.warning(f"Failed to send Slack error notification: {e}")
+                for br in pr.barrier_results:
+                    self._handle_barrier_result(br)
+                self._emit_postprocess_display(pr)
+                return pr.error is None
+            # Pre-acquisition routine warmup finished (non-fatal if it failed).
+            elif isinstance(job_result.result, PostprocessWarmupResult):
+                wr = job_result.result
+                if wr.ok:
+                    self._log.info(f"Postprocess routine warmup complete: {wr.label}")
+                else:
+                    self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
             return True
+
+    def _handle_barrier_result(self, br: "BarrierResult") -> None:
+        """Track an upload barrier: register its task_id (submitted) or account it
+        as completed-non-uploading (no writer/shards) so the timepoint tally can
+        still close. Shared by the raw-plate and derived-plate (postprocess) paths."""
+        if br.submitted:
+            self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
+        elif self._upload_target is not None:
+            self._upload_results_by_tp.setdefault(br.time_point, []).append(
+                UploadResult(
+                    task_id=br.task_id,
+                    time_point=br.time_point,
+                    region_id=br.region_id,
+                    fov=br.fov,
+                    success=True,
+                    uploaded_paths=[],
+                    failed_paths=[],
+                    error=None,
+                )
+            )
+            self._maybe_batched_delete(br.time_point)
+
+    def _emit_postprocess_display(self, pr: "PostprocessResult") -> None:
+        """Push each derived output preview to the live image display.
+
+        Synthesizes a CameraFrame + CaptureInfo (labelled with the output key) so
+        the derived image flows through the same signal_new_image path as raw
+        frames. Best-effort — display must never break the acquisition.
+        """
+        src = pr.source_capture_info
+        if src is None or not pr.display_images:
+            return
+        import dataclasses
+        import squid.abc
+        from squid.config import CameraPixelFormat
+
+        for out_key, image in pr.display_images.items():
+            # The live display shares one image size + integer dtype across all
+            # channels; a preview that doesn't match the current raw-frame size
+            # would thrash the viewer (re-init every frame). Skip mismatches —
+            # the output is still saved to its plate.
+            if self._last_raw_display_shape is not None and image.shape[:2] != self._last_raw_display_shape:
+                self._log.debug(
+                    "Skipping live display of %s: shape %s != live frame %s",
+                    out_key, image.shape[:2], self._last_raw_display_shape,
+                )
+                continue
+            try:
+                os_copy = src.observation_state.model_copy(update={"name": out_key})
+                info = dataclasses.replace(
+                    src,
+                    observation_state=os_copy,
+                    filename_channel_label=out_key,
+                    postprocess_group=None,
+                    array_key=None,
+                    save_t_index=None,
+                    save_c_index=None,
+                    save_t_size=None,
+                    save_c_size=None,
+                    save_z_size=None,
+                )
+                frame = squid.abc.CameraFrame(
+                    frame_id=0,
+                    timestamp=src.capture_time,
+                    frame=image,
+                    frame_format=squid.abc.CameraFrameFormat.RAW,
+                    frame_pixel_format=CameraPixelFormat.MONO16,
+                )
+                self.callbacks.signal_new_image(frame, info)
+            except Exception as e:
+                self._log.debug(f"Could not display postprocess output {out_key}: {e}")
 
     def _handle_downsampled_view_result(self, result: DownsampledViewResult) -> None:
         """Update plate view with completed well image."""
@@ -2591,12 +2687,158 @@ class MultiPointWorker:
     def _create_job(self, job_class: Type[Job], info: CaptureInfo, image: np.ndarray) -> Optional[Job]:
         """Create a job instance for the given job class.
 
-        Returns None if the job should be skipped.
+        Returns None if the job should be skipped for this frame. Postprocessed
+        frames (``info.postprocess_group`` set) go ONLY to the PostprocessJob
+        runner — their raw image is never saved and must not feed the save jobs
+        or the downsampled-view accumulators. Non-postprocessed frames skip the
+        PostprocessJob runner.
         """
+        is_postprocessed = info.postprocess_group is not None
+        if job_class is PostprocessJob:
+            return self._create_postprocess_job(info, image) if is_postprocessed else None
+        if is_postprocessed:
+            return None  # raw frame not saved / not downsampled
         if job_class == DownsampledViewJob:
             return self._create_downsampled_view_job(info, image)
-        else:
-            return job_class(capture_info=info, capture_image=JobImage(image_array=image))
+        return job_class(capture_info=info, capture_image=JobImage(image_array=image))
+
+    def _create_postprocess_job(self, info: CaptureInfo, image: np.ndarray) -> Optional[PostprocessJob]:
+        """Build a PostprocessJob for one accumulated frame of a postprocess group."""
+        plan = self._get_region_plan(info.region_id)
+        group = plan.postprocess_groups.get(info.postprocess_group)
+        if group is None:
+            self._log.error(
+                "Postprocess frame for unknown group %r in region %s; skipping.",
+                info.postprocess_group,
+                info.region_id,
+            )
+            return None
+        expected = 0
+        for s in group.input_states.values():
+            expected += s.frames_per_visit * (self.NZ if s.acquire_z_stack else 1)
+        ctx_meta = self._postprocess_ctx_meta(group)
+        output_specs = [
+            {
+                "name": o.name,
+                "z_size": o.z_size,
+                "dtype": o.dtype,
+                "channel_color": o.channel_color,
+                "wavelength_nm": o.wavelength_nm,
+            }
+            for o in group.outputs
+        ]
+        input_state_specs = {
+            name: {"acquire_z_stack": s.acquire_z_stack, "frames_per_visit": s.frames_per_visit}
+            for name, s in group.input_states.items()
+        }
+        return PostprocessJob(
+            capture_info=info,
+            capture_image=JobImage(image_array=image),
+            group_key=info.postprocess_group,
+            label=group.label,
+            spec_dict=group.spec.model_dump(mode="json"),
+            expected_frames=expected,
+            output_specs=output_specs,
+            input_state_specs=input_state_specs,
+            ctx_meta=ctx_meta,
+        )
+
+    def _postprocess_frame_shape(self):
+        """Expected camera frame (Y, X) for this run, or None if unknown.
+
+        Known before the first capture (from the configured ROI + software crop),
+        so routine warmup can precompute frame-shape-dependent state.
+        """
+        try:
+            w, h = self.camera.get_crop_size()
+            return (int(h), int(w))
+        except Exception:
+            return None
+
+    def _postprocess_ctx_meta(self, group) -> dict:
+        """Run geometry + per-group state metadata handed to a routine's context.
+        Shared by the per-FOV job and the pre-acquisition warmup so their cache
+        keys match (first FOV is then a cache hit)."""
+        state_meta = {}
+        for name in group.input_states:
+            _color, wl = self._channel_display_meta(name)
+            state_meta[name] = {"wavelength_nm": wl}
+        return {
+            "pixel_size_um": self._pixel_size_um,
+            # self.deltaZ is the mechanical z step in MILLIMETRES (stage units);
+            # convert to micrometres for the routine geometry.
+            "dz_um": (self.deltaZ * 1000.0) if self.NZ > 1 else None,
+            "nz": self.NZ,
+            "nt": self.Nt,
+            "state_meta": state_meta,
+            "yx_shape": self._postprocess_frame_shape(),
+        }
+
+    def _prewarm_postprocess_routines(self) -> None:
+        """Precompute FOV-shared routine state (e.g. transfer functions) BEFORE
+        the first hardware trigger, so the first FOV's compute is a cache hit and
+        never stalls saving/display or backpressures the run.
+
+        Dispatches one PostprocessWarmupJob per distinct routine (deduped by
+        routine identity) to the postprocess runner and waits for them (bounded).
+        A warmup failure is non-fatal — the routine falls back to lazy compute.
+        """
+        if not self._has_postprocess:
+            return
+        runner = None
+        for job_class, jr in self._job_runners:
+            if job_class is PostprocessJob:
+                runner = jr
+                break
+        # Distinct warmup jobs across the global + per-region plans, deduped by
+        # routine identity so an identical routine+params is warmed only once.
+        from control.core.job_processing import postprocess_routine_key
+
+        seen = set()
+        jobs = []
+        for plan in [self._global_plan, *self._region_plans.values()]:
+            if plan is None:
+                continue
+            for group in plan.postprocess_groups.values():
+                spec_dict = group.spec.model_dump(mode="json")
+                key = postprocess_routine_key(spec_dict)
+                if key in seen:
+                    continue
+                seen.add(key)
+                jobs.append(
+                    PostprocessWarmupJob(
+                        label=group.label,
+                        spec_dict=spec_dict,
+                        input_state_specs={
+                            name: {"acquire_z_stack": s.acquire_z_stack, "frames_per_visit": s.frames_per_visit}
+                            for name, s in group.input_states.items()
+                        },
+                        ctx_meta=self._postprocess_ctx_meta(group),
+                    )
+                )
+        if not jobs:
+            return
+        self._log.info(f"Pre-computing {len(jobs)} postprocess routine(s) before acquisition...")
+        if runner is None:
+            # No multiprocessing runner (e.g. USE_MULTIPROCESSING False): run inline.
+            for job in jobs:
+                job.run()
+            return
+        # Make sure the subprocess is up before dispatching (bounded).
+        runner.wait_ready(timeout_s=15.0)
+        for job in jobs:
+            runner.dispatch(job)
+        # Wait for warmups to finish so the first FOV is a cache hit. Bounded so a
+        # hung warmup can't wedge the run — on timeout we proceed (lazy compute).
+        deadline = time.time() + 180.0
+        while runner.has_pending() and time.time() < deadline:
+            if self.abort_requested_fn():
+                break
+            self._summarize_runner_outputs()
+            time.sleep(0.05)
+        self._summarize_runner_outputs()
+        if runner.has_pending():
+            self._log.warning("Postprocess warmup did not finish within timeout; routines will compute lazily.")
 
     def _create_downsampled_view_job(self, info: CaptureInfo, image: np.ndarray) -> Optional[DownsampledViewJob]:
         """Create a DownsampledViewJob for the given capture.
@@ -2976,6 +3218,11 @@ class MultiPointWorker:
         # per-capture stats. Amortizes to ~zero over long runs.
         self._prewarm_observation_states()
 
+        # Precompute FOV-shared postprocessing state (e.g. transfer functions)
+        # before any hardware fires, so the first FOV's compute is a cache hit
+        # and never stalls the first save/display.
+        self._prewarm_postprocess_routines()
+
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
@@ -3062,7 +3309,9 @@ class MultiPointWorker:
                         # Dense -> one array per FOV (array_key=None); ragged ->
                         # one single-channel plate per imaged state, so flush each.
                         region_plan = self._get_region_plan(region_id)
-                        array_keys = [None] if region_plan.dense else list(region_plan.channel_order)
+                        # Ragged plate keys carry the _refz suffix, so use array_keys
+                        # (not channel_order, which is bare state names for the C axis).
+                        array_keys = [None] if region_plan.dense else list(region_plan.array_keys)
                         for array_key in array_keys:
                             output_path = self._zarr_writer_info.get_output_path(
                                 str(region_id), fov, array_key
@@ -3141,11 +3390,23 @@ class MultiPointWorker:
         return True
 
     def acquire_at_position(self, region_id, current_path, fov):
+        # Autofocus once at the FOV's nominal plane to establish the focal
+        # (reference) plane BEFORE the z-stack is positioned around it. The
+        # stacking mode then decides whether that plane becomes the bottom,
+        # center, or top slice (see prepare_z_stack). Also records the AF event
+        # (target vs. corrected Z) to autofocus_log.csv.
+        self._autofocus_and_record(region_id, fov, current_path)
+
         if self.NZ > 1:
             self.prepare_z_stack()
 
         if self.use_piezo:
             self.z_piezo_um = self.piezo.position
+
+        # Z-plane index of the focus/reference plane (where reference-z-only steps
+        # capture their single frame): the first acquired plane for From Bottom/Top,
+        # the middle plane for From Center. See _reference_z_level.
+        ref_z_level = self._reference_z_level()
 
         for z_level in range(self.NZ):
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
@@ -3154,18 +3415,14 @@ class MultiPointWorker:
             metadata = {"x": acquire_pos.x_mm, "y": acquire_pos.y_mm, "z": acquire_pos.z_mm}
             self._log.debug(f"Acquiring image: ID={file_ID}, Metadata={metadata}")
 
-            # TBD: figure out what this means and how it relates to autofocus
-            if z_level == 0 and (self.do_reflection_af or self.do_autofocus) and self.Nt > 1:
-                self._z_pos_proposal[(region_id, fov)] = acquire_pos.z_mm
-
-
-
             # Iterate the resolved per-position plan (cycles). A flat selection is
             # just a 1-frame-per-state plan, so this single path serves both. The
             # plan's ordered events preserve interleave / chain order; imaged
             # events capture a frame, stimulus events fire an NIDAQ pulse comb.
             region_plan = self._get_region_plan(region_id)
-            frames_per_pos = region_plan.frames_per_position  # imaged frames per (FOV, z)
+            # Captured (not just saved) frames per (FOV, z): postprocessed events
+            # are captured too, so include them so imaged_step stays aligned.
+            frames_per_pos = region_plan.captured_frames_per_position
             if region_plan.events:
                 imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
                 for event in region_plan.events:
@@ -3174,6 +3431,11 @@ class MultiPointWorker:
                         # tick. Sleep in short slices so an abort interrupts it.
                         with self._timing.get_timer("cycle_wait"):
                             self._interruptible_sleep(event.wait_ms / 1000.0)
+                        continue
+                    # Reference-z-only step/sweep: capture a single frame at the
+                    # focus/reference plane and skip it at every other z-level.
+                    # Stimulus events are unaffected (they fire at every z as before).
+                    if (not event.acquire_z_stack) and (not event.is_stimulus) and (z_level != ref_z_level):
                         continue
                     preset_name = event.observation_state
                     try:
@@ -3210,23 +3472,8 @@ class MultiPointWorker:
                     if self.NZ == 1:  # TODO: handle z offset for z stack
                         self.handle_z_offset(config, True)
 
-                    # Run AF once per position, on the first IMAGED frame of the
-                    # first z-plane. Keying on the first imaged event (not the
-                    # first plan event) keeps AF firing even when a cycle leads
-                    # with a stimulus-only step — the same per-active guard the
-                    # old config_idx-vs-active_step fix preserved.
-                    if z_level == 0 and imaged_step == 0 and not event.is_stimulus:
-                        with self._timing.get_timer("perform_autofocus"):
-                            if not self.perform_autofocus(region_id, fov):
-                                self._log.error(
-                                    f"Autofocus failed at region={region_id} fov={fov}.  Continuing to acquire anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
-                                )
-
-                        # laser af characterization mode
-                        if self.laser_auto_focus_controller and self.laser_auto_focus_controller.characterization_mode:
-                            image = self.laser_auto_focus_controller.get_image()
-                            saving_path = os.path.join(current_path, file_ID + "_laser af camera" + ".bmp")
-                            iio.imwrite(saving_path, image)
+                    # (Autofocus now runs once per FOV in _autofocus_and_record,
+                    # before the z-stack is positioned — see acquire_at_position.)
 
                     if event.is_stimulus or config.is_stimulus_only:
                         with self._timing.get_timer("run_nidaq_stimulus"):
@@ -3235,19 +3482,34 @@ class MultiPointWorker:
                             self.handle_z_offset(config, False)
                         continue  # no frame, no progress tick
 
-                    save_layout = self._build_save_layout(region_plan, event)
+                    # Postprocessed frames are routed to the PostprocessJob runner
+                    # (raw not saved), so they carry no save layout — the group id
+                    # tags the frame for accumulation. A ref-z-only postprocessed
+                    # step still passes NZ frames? No: it is captured only at the
+                    # reference plane like any ref-z step (skip handled above), so
+                    # eff_z_index follows the same rule.
+                    if event.postprocess is not None:
+                        save_layout = None
+                        config_idx = 0
+                    else:
+                        save_layout = self._build_save_layout(region_plan, event)
+                        config_idx = save_layout.c_index
+                    # A reference-z-only frame lives at z=0 of its Z=1 array; a
+                    # normal frame at its stack level.
+                    eff_z_index = z_level if event.acquire_z_stack else 0
                     with self._timing.get_timer("acquire_camera_image"):
                         with self._timing.get_timer("acquire_camera_image_inner"):
                             self.acquire_camera_image(
                                 config,
                                 file_ID,
                                 current_path,
-                                z_level,
+                                eff_z_index,
                                 region_id=region_id,
                                 fov=fov,
-                                config_idx=save_layout.c_index,
+                                config_idx=config_idx,
                                 filename_channel_label=preset_name,
                                 save_layout=save_layout,
+                                postprocess_group=event.postprocess_group,
                             )
 
                     if self.NZ == 1:
@@ -3304,6 +3566,9 @@ class MultiPointWorker:
         seeded = 0
         failed = 0
         for region_id, coords in self.scan_region_fov_coords_mm.items():
+            # Each region's seed measurements must correct to that region's own
+            # focus target, so load it before stepping through the region's FOVs.
+            self._apply_region_laser_af_reference(region_id)
             for fov_idx, coord in enumerate(coords):
                 if self.abort_requested_fn():
                     self._log.info("Abort requested during laser-AF seed scan")
@@ -3369,6 +3634,39 @@ class MultiPointWorker:
             self._fov_z_delta_map[key] = delta
             self._z_pos_proposal[key] = anchor_z_current + delta
 
+    def _resolve_region_laser_af_reference(self, region_id):
+        """Return the effective laser-AF reference for ``region_id``, or ``None``.
+
+        - No per-region reference -> the global reference (the controller's
+          reference snapshotted at worker construction, before this worker began
+          switching references around).
+        - A per-region reference WITH a crop -> used as-is.
+        - A per-region reference carrying only a spot position (no crop, e.g. a
+          spot-only CSV import) -> the region's x_reference but the global crop,
+          so cross-correlation verification still has a valid template. This
+          merge is done here (not in apply_reference) because the controller's
+          currently-active crop is order-dependent and must not leak in.
+        """
+        region_ref = self._region_laser_af_references.get(region_id)
+        base = self._base_laser_af_reference
+        if region_ref is None:
+            return base
+        if region_ref.reference_image is None and base is not None:
+            return base.model_copy(update={"x_reference": region_ref.x_reference})
+        return region_ref
+
+    def _apply_region_laser_af_reference(self, region_id) -> None:
+        """Make ``region_id``'s effective laser-AF target active on the controller.
+
+        No-op when laser AF is unavailable or no reference resolves (the latter
+        is caught earlier by validate_acquisition_settings).
+        """
+        if self.laser_auto_focus_controller is None:
+            return
+        reference = self._resolve_region_laser_af_reference(region_id)
+        if reference is not None:
+            self.laser_auto_focus_controller.apply_reference(reference)
+
     def perform_autofocus(self, region_id, fov):
         # Phase F: the stage move that brought us to this FOV was fired async
         # by move_to_coordinate. When AF will actually touch hardware below,
@@ -3381,10 +3679,12 @@ class MultiPointWorker:
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
         if not self.do_reflection_af:
-            # contrast-based AF; perform AF only if when not taking z stack or doing z stack from center
+            # Contrast-based AF. Runs for any z-stacking mode: AF establishes the
+            # focal/reference plane and acquire_at_position/prepare_z_stack then
+            # position the stack around it (bottom/center/top). Cadence-gated by
+            # NUMBER_OF_FOVS_PER_AF.
             if (
-                ((self.NZ == 1) or self.z_stacking_config == "FROM CENTER")
-                and (self.do_autofocus)
+                (self.do_autofocus)
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
@@ -3400,6 +3700,11 @@ class MultiPointWorker:
         else:
             # Laser-AF path. Decide between a full laser-AF "refresh" or a
             # table-only Z move, then run consistency checks where possible.
+            # Load this region's focus target before ANY measurement below. Done
+            # every FOV (cheap — just sets x_reference + crop, no hardware I/O)
+            # so correctness never depends on the reference persisting across
+            # FOVs/timepoints or on _last_region_id bookkeeping.
+            self._apply_region_laser_af_reference(region_id)
             new_region_entry = self._last_region_id != region_id
             if new_region_entry:
                 # Reset per-region-entry counters. Refreshes completed in earlier
@@ -3690,8 +3995,123 @@ class MultiPointWorker:
         # No prior anchor and no table entry — can't set Z. Match legacy failure path.
         return False
 
+    # Columns for the per-acquisition autofocus log sidecar. position_index is
+    # the FOV/position index; (x, y) disambiguate across regions. z_expected is
+    # the pre-AF target Z; z_actual is the Z after correction (or after a failed
+    # AF). af_status is "ok" or "failed".
+    _AUTOFOCUS_LOG_HEADER = [
+        "position_index",
+        "t_index",
+        "x",
+        "y",
+        "z_expected",
+        "z_actual",
+        "af_status",
+    ]
+
+    def _autofocus_and_record(self, region_id, fov, current_path):
+        """Run autofocus once at the FOV's nominal plane and log the result.
+
+        This establishes the focal/reference plane that the z-stack is built
+        around (see :meth:`prepare_z_stack`). For laser AF the per-region
+        reference captured by the "Update Ref" button is what defines that plane
+        (the worker already loads it inside :meth:`perform_autofocus`), so the
+        secondary AF offset is honored automatically. No-op when no AF is enabled.
+
+        Records the pre-AF (expected/target) and post-AF (after-correction, or
+        after-failure) absolute Z to ``autofocus_log.csv``.
+        """
+        if not (self.do_reflection_af or self.do_autofocus):
+            return
+
+        pos_before = self.stage.get_pos()
+        z_expected_mm = pos_before.z_mm
+
+        # Cache the pre-AF Z for cross-timepoint tracking exactly as before; the
+        # laser-AF focus-map path may overwrite it with a table estimate inside
+        # perform_autofocus.
+        if self.Nt > 1:
+            self._z_pos_proposal[(region_id, fov)] = z_expected_mm
+
+        with self._timing.get_timer("perform_autofocus"):
+            af_ok = self.perform_autofocus(region_id, fov)
+        if not af_ok:
+            self._log.error(
+                f"Autofocus failed at region={region_id} fov={fov}. Continuing to acquire "
+                f"anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
+            )
+
+        # Laser-AF characterization debug image (unchanged behavior).
+        if self.laser_auto_focus_controller and getattr(
+            self.laser_auto_focus_controller, "characterization_mode", False
+        ):
+            try:
+                image = self.laser_auto_focus_controller.get_image()
+                file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{0:0{FILE_ID_PADDING}}"
+                iio.imwrite(os.path.join(current_path, file_ID + "_laser af camera" + ".bmp"), image)
+            except Exception as e:
+                self._log.warning(f"Failed to save laser-AF characterization image: {e}")
+
+        pos_after = self.stage.get_pos()
+        self._record_autofocus_event(
+            position_index=fov,
+            x_mm=pos_after.x_mm,
+            y_mm=pos_after.y_mm,
+            z_expected_mm=z_expected_mm,
+            z_actual_mm=pos_after.z_mm,
+            ok=bool(af_ok),
+        )
+
+    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, ok):
+        """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
+
+        Best-effort: a logging failure must never interrupt the acquisition.
+        """
+        if not self.experiment_path:
+            return
+        path = os.path.join(self.experiment_path, "autofocus_log.csv")
+        try:
+            file_exists = os.path.exists(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(self._AUTOFOCUS_LOG_HEADER)
+                writer.writerow(
+                    [
+                        position_index,
+                        self.time_point,
+                        f"{x_mm:.6f}",
+                        f"{y_mm:.6f}",
+                        f"{z_expected_mm:.6f}",
+                        f"{z_actual_mm:.6f}",
+                        "ok" if ok else "failed",
+                    ]
+                )
+        except Exception as e:
+            self._log.warning(f"Failed to append autofocus_log.csv: {e}")
+
+    def _reference_z_level(self) -> int:
+        """Z-plane index of the focus/reference plane within the stack.
+
+        This is where a reference-z-only step/sweep captures its single frame.
+        It matches the plane autofocus lands on (see _autofocus_and_record /
+        prepare_z_stack): the first acquired plane (z_level 0) for From Bottom and
+        From Top, and the middle plane for From Center. Clamped to [0, NZ-1].
+        """
+        if self.NZ <= 1:
+            return 0
+        if self.z_stacking_config == "FROM CENTER":
+            return max(0, min(self.NZ - 1, int(round((self.NZ - 1) / 2))))
+        return 0
+
     def prepare_z_stack(self):
-        # move to bottom of the z stack
+        # Position the stage at the START slice of the stack, relative to the
+        # focal plane established by _autofocus_and_record (which already ran).
+        # FROM CENTER: step down half the stack so the AF plane is the center.
+        # FROM BOTTOM/TOP: the AF plane is already the bottom/top slice (deltaZ's
+        # sign, set in initialize_z_stack, carries the sweep direction), so no
+        # extra offset is needed here.
         if self.z_stacking_config == "FROM CENTER":
             self.stage.move_z(-self.deltaZ * round((self.NZ - 1) / 2.0))
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
@@ -3796,9 +4216,15 @@ class MultiPointWorker:
                 self.image_count += 1
 
                 with self._timing.get_timer("job creation and dispatch"):
-                    # Wait for subprocess to be ready before first dispatch
+                    # Wait for subprocess to be ready before first dispatch.
+                    # Skip the PostprocessJob runner here: it only accumulates
+                    # frames (compute happens at group completion), so blocking
+                    # the first capture on its ~1-2s warmup would stall the run
+                    # with illumination on. Its jobs queue fine before it's ready.
                     if not self._first_job_dispatched:
                         for job_class, job_runner in self._job_runners:
+                            if job_class is PostprocessJob:
+                                continue
                             if job_runner is not None:
                                 t_wait_start = time.perf_counter()
                                 if job_runner.wait_ready(timeout_s=10.0):
@@ -3837,6 +4263,11 @@ class MultiPointWorker:
                 #         round(height * self.display_resolution_scaling),
                 #     )
                 with self._timing.get_timer("image_to_display*.emit"):
+                    # Remember the live-display frame size: the shared napari /
+                    # contrast display holds one image size across all channels,
+                    # so a postprocess output preview is only safe to display when
+                    # it matches this (see _emit_postprocess_display).
+                    self._last_raw_display_shape = image.shape[:2]
                     self.callbacks.signal_new_image(camera_frame, info)
 
         finally:
@@ -3860,6 +4291,7 @@ class MultiPointWorker:
         *,
         filename_channel_label: Optional[str] = None,
         save_layout=None,
+        postprocess_group: Optional[str] = None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -3948,12 +4380,14 @@ class MultiPointWorker:
                 save_c_index=(save_layout.c_index if save_layout else None),
                 save_t_size=(save_layout.t_size if save_layout else None),
                 save_c_size=(save_layout.c_size if save_layout else None),
+                save_z_size=(save_layout.z_size if save_layout else None),
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
                 state_frame_index=(save_layout.state_frame_index if save_layout else None),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
                 array_channel_names=(list(save_layout.channel_names) if save_layout else None),
                 array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
                 array_channel_wavelengths=(list(save_layout.channel_wavelengths) if save_layout else None),
+                postprocess_group=postprocess_group,
             )
             self._current_capture_info = current_capture_info
         # Hot path — demoted to debug so formatting CaptureInfo (dataclass with Pos and

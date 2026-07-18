@@ -67,7 +67,12 @@ coordinate, or a manually added position. Each region is covered by a grid of
 overlapping fields of view (tiles).
 
 **FOV / tile.** A single field of view (one camera frame). A region is scanned as a
-grid of FOVs with a configurable overlap so the tiles can be stitched later.
+grid of FOVs with a configurable overlap so the tiles can be stitched later. The FOV
+size used to space tiles is the *actually saved* frame — it reflects binning, the
+software crop, **and the hardware ROI**. If you shrink the camera ROI (e.g. a centered
+ROI smaller than the configured crop), the tile spacing shrinks with it so the overlap
+percentage still holds; otherwise tiles would be spaced for a larger image than is saved
+and leave gaps.
 
 **The four acquisition dimensions.** A multipoint run is the product of:
 - **XY** — which regions, and the tile grid within each region;
@@ -230,16 +235,43 @@ By default every checked channel is imaged at every selected well. To image **di
 channels at different wells**, use **Per‑Point Channels** (see
 [Per‑point / per‑well channels](#per-point--per-well-channels)).
 
+#### Tile spacing vs. channel ROIs
+
+Each observation state carries its own camera ROI, and the saved tile size depends on it.
+Two things keep the overlap correct across a mixed‑ROI acquisition:
+
+- **Tiling is recomputed at run time** for the FOV that will actually be imaged, so the
+  overlap you set is honored even if you changed the camera ROI/binning *after* laying out
+  the regions. (The on‑screen tile preview is refreshed to match.)
+- **The largest ROI in the group sets the spacing.** If the checked channels don't all use
+  the same ROI, tiles are spaced so the largest‑ROI channel keeps its overlap; channels
+  with a smaller ROI then under‑sample (leave gaps between their tiles). Because that may be
+  deliberate subsampling *or* a mistake, starting such an acquisition pops a warning listing
+  the mismatched channels and their FOVs, and asks you to confirm before continuing.
+
 ### Step 6 — (Optional) Z‑stack
 
-Check the **Z** mode box to acquire a focal stack, then choose a Z mode:
+Check the **Z** mode box to acquire a focal stack. Set **dz** (step size, µm) and
+**Nz** (number of planes), and pick where the stack sits relative to the focal plane
+with the **Z‑stack from** dropdown:
 
-- **From Bottom** — you set **dz** (step size, µm) and **Nz** (number of planes); the
-  stack is built upward from the current focus.
-- **Set Range** — you define **Z‑min** and **Z‑max** explicitly. Use the **Set Z‑min** /
-  **Set Z‑max** buttons to capture the current stage Z, and **Go To** to move there.
-  In this mode **Nz** is computed automatically from the range and dz. (Laser AF is
-  disabled while Set Range is active.)
+- **From Bottom (Z‑min)** — the focal plane is the first (bottom) slice; the stack is
+  built upward (`+dz` per plane).
+- **From Center** — the focal plane is the middle slice; the stack extends
+  `±(Nz‑1)/2 · dz` around it.
+- **From Top (Z‑max)** — the focal plane is the last (top) slice; the stack is built
+  downward.
+
+**Interaction with autofocus:** whatever focal plane autofocus lands on (see Step 8)
+is the reference the dropdown is measured from — AF runs once per position *before* the
+stack is positioned, so the slices are always drawn relative to the freshly focused
+plane (for laser AF this includes the per‑region reference captured with **Update Ref**).
+This works with Contrast AF and Laser AF in all three modes.
+
+- **Set Range** — alternatively define **Z‑min** and **Z‑max** explicitly. Use the
+  **Set Z‑min** / **Set Z‑max** buttons to capture the current stage Z, and **Go To** to
+  move there. In this mode **Nz** is computed automatically from the range and dz.
+  (Laser AF is disabled while Set Range is active.)
 
 If your rig has an objective piezo, the **Piezo Z‑Stack** checkbox uses it to drive the
 stack instead of the stage Z motor.
@@ -262,6 +294,12 @@ Three independent focus aids are available (combine as needed):
 - **Use Focus Map** — fits a focus surface from a set of measured points (configured in
   the **Focus Map** tab) and follows it during the scan. When checked, the surface is
   fitted at Start; if the fit fails the acquisition will not begin.
+
+**Autofocus log.** Whenever autofocus is enabled, every position at which it runs is
+recorded to `autofocus_log.csv` at the dataset root, with columns
+`position_index, t_index, x, y, z_expected, z_actual, af_status`. `z_expected` is the
+target Z before AF; `z_actual` is the Z after correction (or, on `af_status=failed`, the
+Z the acquisition fell back to). Use it to audit focus drift and AF reliability over a run.
 
 ### Step 9 — Saving and output options
 
@@ -337,14 +375,24 @@ Click‑to‑Move), then manage the list with these buttons:
 | **Clear** | Remove all positions. |
 | **Location List** (dropdown) | Lists every saved position as `x … mm  y … mm  z … µm`; selecting one moves the stage there. |
 | **Update Z** | Overwrite the selected position's Z with the current stage Z. |
+| **Update Ref** | Re‑capture the laser‑AF reference (focus target) for the selected position. Only shown on rigs with the laser‑focus camera; see [Per‑region laser autofocus references](#per-region-laser-autofocus-references). |
 
 ### Import / export / edit
 
 - **Import Location List** — load positions from a CSV with columns `x (mm)`,
-  `y (mm)`, `z (mm)`, and optional `ID`. This replaces the current list.
-- **Export Location List** — save the current positions to a CSV.
-- **Edit** — open the position list as an editable table (columns x, y, z, ID); edit a
-  cell to move that position, click a row to select it.
+  `y (mm)`, `z (mm)`, and optional `ID`. This replaces the current list. If the CSV has a
+  `laser_af_x_reference` column and/or a `<name>.laser_af.json` sidecar file next to it,
+  the per‑region laser‑AF references are restored too (see
+  [Per‑region laser autofocus references](#per-region-laser-autofocus-references)).
+- **Export Location List** — save the current positions to a CSV (`x (mm)`, `y (mm)`,
+  `z (mm)`, `ID`, plus a `laser_af_x_reference` column). When any position has a laser‑AF
+  reference, a companion `<name>.laser_af.json` sidecar is written alongside the CSV
+  holding the full references (including the cross‑correlation crop image) so the export
+  round‑trips exactly. Keep the sidecar next to the CSV to re‑import references.
+- **Edit** — open the position list as an editable table (columns x, y, z, ID, and a
+  read‑only **AF Ref**); edit a cell to move/rename that position, click a row to select
+  it. The **AF Ref** column shows each region's stored laser‑AF spot position, or `—`
+  when none is set.
 
 ### Per‑position tile grid
 
@@ -358,6 +406,37 @@ added automatically and removed again when the run finishes.
 
 > Dropping an `acquisition.yaml` onto the Flexible tab is not currently supported (you'll
 > get a "Not Supported" notice). YAML drag‑and‑drop works on the **Wellplate** tab.
+
+### Per‑region laser autofocus references
+
+Normally laser AF corrects every position back to a single reference (the in‑focus
+reflected‑spot position) shared across the whole run. On the **Flexible** tab you can
+instead give **each position its own laser‑AF reference** — useful when positions sit on
+substrates of different thickness, or otherwise focus to a different reference plane, so a
+single global reference would mis‑focus some of them. (A reference is per *region*, not per
+tile: every tile in a position uses that position's reference.)
+
+How to use it:
+
+1. Enable **Laser AF** (the Reflection AF button) and make sure it is initialized (use the
+   *Focus Camera / Laser AF Setup* tool to find the spot and calibrate).
+2. Drive to a position, get it in focus, and click **Add**. The current laser‑AF reference
+   is captured and attached to that position — its spot position appears in the **AF Ref**
+   column of the **Edit** table.
+3. Repeat for each position, focusing each one before adding it.
+4. To re‑capture a position's reference later, select it in the **Location List** and click
+   **Update Ref** (focus first). **Update Z** changes only the stored Z, not the reference.
+
+During acquisition the worker loads each region's own reference before focusing in that
+region, independent of scan order. Positions **without** a captured reference fall back to
+the global reference. Acquisition can therefore start when *either* a global reference is
+set *or* every position has its own — otherwise the start check reports that a reference is
+missing. A `region_laser_af_references.csv` summary is written into the experiment folder
+for reproducibility, and references export/import with the location list (see
+[Import / export / edit](#import--export--edit)).
+
+This per‑region reference plumbing is shared with the wellplate code path, but only the
+Flexible tab captures references today.
 
 ---
 

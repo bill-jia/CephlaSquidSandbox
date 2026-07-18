@@ -815,6 +815,23 @@ _NA_GROUP_OF_MODE: Dict[str, str] = {
 }
 _NA_GROUPS: Tuple[str, ...] = ("bf", "df", "low_na", "dpc")
 
+# Physical-orientation correction for the plain Teensy/Cephla LED matrix. The board
+# is mounted rotated 90° clockwise relative to the camera, so the firmware's
+# directional half patterns don't match the on-screen direction: firmware LEFT
+# lights the physical/camera TOP, RIGHT→BOTTOM, TOP→RIGHT, BOTTOM→LEFT. Map each
+# logical half mode to the firmware source_code that lights the physically-correct
+# half so the lit half matches the camera image. Only the directional half modes
+# need this; bf_full/df/low_na are rotation-invariant. The SciMicroscopy backend
+# does its own orientation handling (channel-name → dpc.<half> with a top/bottom
+# flip) and is unaffected. Firmware codes: LEFT_HALF=1, RIGHT_HALF=2, TOP_HALF=7,
+# BOTTOM_HALF=8.
+_MCU_HALF_MODE_SOURCE: Dict[str, int] = {
+    "left_half": 8,    # logical left   -> firmware BOTTOM (lights physical left)
+    "right_half": 7,   # logical right  -> firmware TOP    (lights physical right)
+    "top_half": 1,     # logical top    -> firmware LEFT   (lights physical top)
+    "bottom_half": 2,  # logical bottom -> firmware RIGHT  (lights physical bottom)
+}
+
 
 # ---------------------------------------------------------------------------
 # Concrete device: LED matrix (SciMicroscopy array or plain MCU patterns)
@@ -852,6 +869,7 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         unified_channel_name: str = "LED matrix",
         modes: Optional[Dict[str, Dict[str, Any]]] = None,
         legacy_channel_to_mode: Optional[Dict[str, str]] = None,
+        default_color: Optional[Tuple[float, float, float]] = None,
     ):
         """
         Args:
@@ -895,6 +913,19 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
             self._is_on_state = {n: False for n in channel_source_codes}
 
         self._active_channel: Optional[str] = None
+        # Global LED-matrix RGB color (0-1), mirroring SciMicroscopy's sc.<r>.<g>.<b>.
+        # Single source of truth on BOTH backends: pushed to the SciMicroscopy array
+        # when present, and multiplied into the MCU's RGB at fire time so color works
+        # on the Teensy too. Seed from the sci array (already given the config color)
+        # when present, else from the config default_color, else white.
+        if sci_array is not None and getattr(sci_array, "_default_color", None) is not None:
+            self._default_color: Tuple[float, float, float] = tuple(
+                float(c) for c in sci_array._default_color
+            )
+        elif default_color is not None:
+            self._default_color = tuple(float(c) for c in default_color)
+        else:
+            self._default_color = (1.0, 1.0, 1.0)
         # Per-state inner/outer NA override for annulus modes (None => mode default).
         self._annulus_na_override: Optional[List[float]] = None
         # Per-group scalar NA (keys: bf/df/low_na/dpc) applied when the matching
@@ -992,10 +1023,16 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         if self._sci_array is not None:
             self._sci_array.apply_channel_configuration(mcu_name, intensity, mode_spec=spec)
         elif self._microcontroller is not None:
-            # Plain MCU path only understands source_code; NA/annulus modes are
-            # SciMicroscopy-only and silently degrade to brightfield here.
+            # Plain MCU path understands source_code + global color; NA / annulus /
+            # single-LED / mux patterns are SciMicroscopy-only and degrade to plain
+            # brightfield here. The global color IS honoured via _default_color.
+            #
+            # Apply the 90° physical-orientation correction so a logical half mode
+            # lights the physically-correct half (see _MCU_HALF_MODE_SOURCE). Non-
+            # directional modes pass their source_code through unchanged.
+            mcu_source = _MCU_HALF_MODE_SOURCE.get(self._active_mode_key, source_code)
             self._microcontroller.apply_led_matrix_channel_configuration(
-                mcu_name, source_code, intensity
+                mcu_name, mcu_source, intensity, color=self._default_color
             )
 
     def set_array_na(self, na: float) -> None:
@@ -1072,20 +1109,21 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         return bool(spec and spec.get("annulus") is not None)
 
     def set_array_color(self, rgb) -> None:
-        """Set the global LED matrix RGB color (0-1 floats; no-op for MCU)."""
-        if self._sci_array is None:
-            return
-        try:
-            self._sci_array.set_default_color(tuple(float(c) for c in rgb))
-        except Exception as exc:
-            logger.warning(f"set_array_color({rgb}) failed: {exc}")
+        """Set the global LED matrix RGB color (0-1 floats).
+
+        Stored on the device for BOTH backends; additionally pushed to the
+        SciMicroscopy array when present. The MCU/Teensy backend applies it at
+        fire time via ``apply_led_matrix_channel_configuration(color=...)``."""
+        self._default_color = tuple(float(c) for c in rgb)
+        if self._sci_array is not None:
+            try:
+                self._sci_array.set_default_color(self._default_color)
+            except Exception as exc:
+                logger.warning(f"set_array_color({rgb}) failed: {exc}")
 
     def get_array_color(self) -> Optional[Tuple[float, float, float]]:
-        """Current global RGB color (0-1 floats), or None for MCU/unavailable."""
-        if self._sci_array is None:
-            return None
-        c = getattr(self._sci_array, "_default_color", None)
-        return tuple(float(x) for x in c) if c is not None else None
+        """Current global RGB color (0-1 floats). Available on both backends."""
+        return tuple(float(c) for c in self._default_color)
 
     @property
     def channel_names(self) -> List[str]:
@@ -1551,9 +1589,10 @@ class IlluminationController:
 
     def set_led_matrix_color(self, rgb: Tuple[float, float, float]) -> bool:
         """Set the global LED matrix RGB color (0-1 floats); re-fire if on.
-        Returns False when no SciMicroscopy LED array is available."""
+        Works on both the SciMicroscopy and Teensy/MCU backends. Returns False
+        only when there is no unified LED matrix."""
         dev = self._led_matrix_unified
-        if dev is None or getattr(dev, "_sci_array", None) is None:
+        if dev is None:
             return False
         logger.info(f"[LED-DBG] IC.set_led_matrix_color rgb={rgb}")
         dev.set_array_color(rgb)
@@ -1659,8 +1698,16 @@ class IlluminationController:
         if channel_name not in self._channel_state:
             logger.debug(f"set_channel_intensity: unknown channel '{channel_name}' (skipped)")
             return
-        if abs(float(intensity) - float(self._channel_state[channel_name].intensity)) < 0.1:
-            # self._log.debug(f"set_channel_intensity: intensity for {channel_name} is the same as the current intensity")
+        cur = self._channel_state[channel_name].intensity
+        # [LED-DBG] log every non-matrix (serial/IO-routed) intensity request, incl.
+        # dedup skips — lets a rig run confirm whether e.g. the 561 CoolLED actually
+        # receives its 100% command before a gated pulse, or is short-circuited here.
+        logger.info(
+            f"[LED-DBG] IC.set_channel_intensity ch='{channel_name}' "
+            f"requested={intensity} current={cur} "
+            f"{'(SKIPPED dedup)' if abs(float(intensity) - float(cur)) < 0.1 else '(SENT)'}"
+        )
+        if abs(float(intensity) - float(cur)) < 0.1:
             return
         dev = self._channel_map.get(channel_name)
         if dev is None:
