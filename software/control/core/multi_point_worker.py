@@ -95,6 +95,12 @@ _log = squid.logging.get_logger(__name__)
 # 0 to disable reinit entirely and always fall back to the clean-abort behavior (P0).
 MAX_CAMERA_REINIT_ATTEMPTS = 3
 
+# A single timepoint dropping at least this many camera frames aborts the acquisition
+# (clean finalize). 0 = disabled: drops are always logged but never abort. Off by
+# default because the safe reaction is visibility; enable to hard-stop a run whose
+# camera is shedding frames instead of letting it silently degrade to a wedge.
+CAMERA_DROP_ABORT_PER_TIMEPOINT = 0
+
 # Time budget for the JobRunner subprocess to flush + finalize all zarr writers
 # during shutdown. The final commit of a per-FOV shard (one timepoint =
 # (1, C, Z, Y, X), routinely ~1 GB for a deep z-stack) is a single TensorStore
@@ -1686,9 +1692,11 @@ class MultiPointWorker:
                         self._log.debug("Abort requested after fluidics, skipping imaging")
                         break
 
+                cam_drops_before = self._camera_dropped_frame_count()
                 with self._timing.get_timer("run_single_time_point"):
                     self.timestamp_prev_timepoint_started = time.time()
                     self.run_single_time_point()
+                self._report_timepoint_frame_drops(cam_drops_before)
 
                 if self.fluidics and self.use_fluidics:
                     # For MERFISH, after imaging, run the following 2 sequences (Cleavage buffer, SSC rinse)
@@ -3338,6 +3346,46 @@ class MultiPointWorker:
                 if self.abort_requested_fn():
                     self.handle_acquisition_abort(current_path)
                     return
+
+    def _camera_dropped_frame_count(self):
+        """Cumulative camera-dropped-frame count, or None if the camera doesn't track it."""
+        getter = getattr(self.camera, "get_dropped_frame_count", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def _report_timepoint_frame_drops(self, count_before):
+        """Aggregate the just-finished timepoint's camera frame drops into one loud line.
+
+        The per-gap ``[FRAME-DROP]`` warnings from the camera are easy to lose in the
+        stream; this correlates a total to the timepoint (the exact signal missing when
+        the 2026-07-02 run silently shed frames). Optionally aborts if a single
+        timepoint's drops reach CAMERA_DROP_ABORT_PER_TIMEPOINT. ``count_before`` is the
+        cumulative count captured before the timepoint, or None if unsupported.
+        """
+        if count_before is None:
+            return
+        count_after = self._camera_dropped_frame_count()
+        if count_after is None:
+            return
+        # A mid-timepoint reopen() resets the per-stream counter; if so, count_after is
+        # the post-reset total and is the best available estimate for this timepoint.
+        dropped = count_after - count_before if count_after >= count_before else count_after
+        if dropped <= 0:
+            return
+        self._log.warning(
+            f"[FRAME-DROP] timepoint {self.time_point}: camera dropped {dropped} frame(s) "
+            f"during this timepoint — escalating camera/USB frame-delivery trouble."
+        )
+        if CAMERA_DROP_ABORT_PER_TIMEPOINT > 0 and dropped >= CAMERA_DROP_ABORT_PER_TIMEPOINT:
+            self._log.error(
+                f"Camera dropped {dropped} frame(s) in timepoint {self.time_point}, at/above the "
+                f"abort threshold ({CAMERA_DROP_ABORT_PER_TIMEPOINT}); aborting and finalizing."
+            )
+            self.request_abort_fn()
 
     def _recover_wedged_camera(self, err) -> bool:
         """Try to reopen a camera that wedged mid-capture so acquisition can continue.

@@ -87,8 +87,18 @@ nothing. `_on_frame_callback` now pulls the camera's real hardware frame sequenc
 (`ToupcamFrameInfoV2.seq`, previously discarded by passing `None` to `PullImageV2`) and,
 on the normal capture path, `_note_frame_seq()` flags any gap (`seq − prev − 1 > 0`) as
 a `[FRAME-DROP]` warning and accumulates `get_dropped_frame_count()`. A reset/wrap goes
-negative and is ignored (no false alarm); the tracker resets on every stream (re)start
-and on `reopen()`. The fast-acquisition path is excluded (it has its own accounting).
+negative and is ignored (no false alarm); the counter and seq tracker reset on every
+stream (re)start and on `reopen()`. The fast-acquisition path is excluded (it has its
+own accounting).
+
+`MultiPointWorker` reads the counter around each timepoint (`_report_timepoint_frame_drops`)
+and, if any frames were dropped, logs one aggregate `[FRAME-DROP] timepoint N: dropped K
+frame(s)` line — correlating drops to the timepoint (0-based, matching the data files),
+which is the signal that was missing when the 2026-07-02 run silently shed frames. If a
+single timepoint's drops reach `CAMERA_DROP_ABORT_PER_TIMEPOINT` (default `0` =
+disabled), it triggers a clean abort+finalize rather than letting the run degrade toward
+a wedge. The abort is off by default because the safe reaction is visibility; enable it
+to hard-stop a camera that is shedding frames.
 
 ## Autofocus status
 
@@ -104,9 +114,10 @@ hiding behind `ok`.
 
 ## Follow-ups (not implemented)
 
-- **Act on drops** — drop detection currently surfaces gaps (warning + counter); it does
-  not yet abort the timepoint or trigger a reinit on a shortfall. Wiring
-  `get_dropped_frame_count()` into the worker to react (not just log) is the next step.
+- **Proactive reinit on drops** — the per-timepoint reaction currently logs always and
+  can abort (opt-in); it does not yet trigger a *reinit* (reopen) on sustained drops to
+  try to recover the camera before a full wedge. The plumbing (`get_dropped_frame_count`
+  + `reopen`) is in place if wanted.
 - **Teardown calls** — `_stop_exposure` still issues unguarded SDK calls (`stop_streaming`
   and `close` are now guarded); a wedge there is benign since a restart is expected.
 
