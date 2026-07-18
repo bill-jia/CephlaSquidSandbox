@@ -16,6 +16,7 @@ from control.core.zarr_upload import (
     UploadTarget,
     UploadTask,
     UploadWorker,
+    collect_sidecar_files,
     drain_output_queue_nonblocking,
     local_to_remote_path,
     read_manifest,
@@ -320,6 +321,35 @@ def test_same_destination_from_two_tasks_is_safe(tmp_path):
         assert leftovers == []
     finally:
         _stop(worker)
+
+
+def test_collect_sidecar_files_prunes_zarr_and_pipeline_outputs(tmp_path):
+    """Sidecar sweep must take everything EXCEPT zarr plate subtrees (covered
+    by live streaming + metadata resync) and the pipeline's own root files."""
+    exp = tmp_path / "exp"
+    # HCS plate + non-HCS tree: both pruned wholesale.
+    (exp / "plate.ome.zarr" / "A" / "1").mkdir(parents=True)
+    (exp / "plate.ome.zarr" / "zarr.json").write_text("{}")
+    (exp / "zarr" / "R0" / "fov_0.ome.zarr" / "0").mkdir(parents=True)
+    (exp / "zarr" / "R0" / "fov_0.ome.zarr" / "zarr.json").write_text("{}")
+    # Sidecars: root files + a per-timepoint folder + a stray non-plate file
+    # inside the zarr/ container dir.
+    (exp / "acquisition.yaml").write_text("a: 1")
+    (exp / "000").mkdir()
+    (exp / "000" / "well_A1.png").write_bytes(b"x")
+    (exp / "zarr" / "R0" / "notes.txt").write_text("hi")
+    # Pipeline outputs at the root: skipped there, kept elsewhere.
+    (exp / "upload_manifest.jsonl").write_text("")
+    (exp / "000" / "upload_manifest.jsonl").write_text("not-root-so-kept")
+
+    got = collect_sidecar_files(str(exp), frozenset({"upload_manifest.jsonl"}))
+    rel = {os.path.relpath(p, str(exp)).replace(os.sep, "/") for p in got}
+    assert rel == {
+        "acquisition.yaml",
+        "000/well_A1.png",
+        "000/upload_manifest.jsonl",
+        "zarr/R0/notes.txt",
+    }
 
 
 def test_force_stop_terminates_worker(tmp_path):

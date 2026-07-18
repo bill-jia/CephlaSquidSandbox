@@ -413,6 +413,31 @@ def append_manifest_record(
         )
 
 
+def collect_sidecar_files(
+    experiment_dir: str, skip_root_names: Set[str] = frozenset()
+) -> List[str]:
+    """Every non-zarr file under ``experiment_dir``, recursively.
+
+    Zarr plate subtrees (any ``*.ome.zarr`` directory, at the experiment root
+    or under ``zarr/<region>/``) are pruned — their shards stream live during
+    the acquisition and their metadata has its own post-finalize resync. What
+    remains are the sidecars: ``acquisition.yaml``, run logs, config dumps,
+    coordinate CSVs, per-timepoint folders (downsampled well views, laser-AF
+    debug images), etc. ``skip_root_names`` are excluded at the experiment
+    root only (the upload pipeline's own outputs).
+    """
+    out: List[str] = []
+    exp_norm = os.path.normpath(experiment_dir)
+    for root, dirs, files in os.walk(experiment_dir):
+        dirs[:] = [d for d in dirs if not d.endswith(".ome.zarr")]
+        at_root = os.path.normpath(root) == exp_norm
+        for name in files:
+            if at_root and name in skip_root_names:
+                continue
+            out.append(os.path.join(root, name))
+    return out
+
+
 def read_manifest(manifest_path: str) -> List[dict]:
     """Read all records from a JSON-lines manifest. Skips malformed lines."""
     out: List[dict] = []
@@ -583,6 +608,15 @@ class UploadWorker(multiprocessing.Process):
             f"pipelined={self._pipelined} threads={self._threads} "
             f"verify_readback={self._verify_readback}"
         )
+        # Pre-create the per-experiment remote root so reachability probes
+        # (os.path.isdir) see it even before the first file lands. Best-effort
+        # and off the acquisition-critical path — a down share just means the
+        # per-file makedirs/retries carry on as before.
+        try:
+            if self._target.remote_root:
+                os.makedirs(self._target.remote_root, exist_ok=True)
+        except OSError as e:
+            log.warning(f"could not pre-create remote root {self._target.remote_root}: {e}")
         try:
             if self._pipelined:
                 self._run_pipelined(log)

@@ -16,7 +16,17 @@ write data in shapes that are not safe to copy incrementally.
    `file_saving_option`:
    - `zarr_upload_enabled` — master switch.
    - `zarr_upload_remote_root` — UNC (`\\server\share\dest`) or POSIX
-     (`/Volumes/share/dest`) path that the OS can write to.
+     (`/Volumes/share/dest`) path that the OS can write to. **This is the
+     PARENT folder**: each acquisition is mirrored into its own subfolder
+     named after the experiment
+     (`<selected>/<experiment_ID>/…`), exactly like the local
+     `{base_path}/{experiment_ID}` layout — so the cached path can be reused
+     across runs without their files intermixing. (The worker expands the
+     selection at acquisition start; `UploadTarget.remote_root` and every
+     on-disk record carry the already-expanded per-experiment path. The
+     backfill script's `--remote` is unchanged: it takes the exact
+     destination experiment directory, which is what
+     `UPLOAD_INCOMPLETE.txt` records.)
    - `zarr_upload_delete_after_verify` — when true, local shard files are
      deleted in batches at the end of every timepoint, once every shard for
      that timepoint has been sha256-verified on the remote.
@@ -388,12 +398,18 @@ file has been verified on the remote:
    `delete_after_verify` pass. The parent `c/`, the level `<n>/`
    (containing `zarr.json`), the FOV group dir, and the `frame_times/`
    subtree all stay so the directory remains a valid OME-NGFF reader.
-2. **Experiment-root metadata is mirrored too.** All files at the root of
-   the experiment dir — `acquisition.yaml`, run logs, config dumps, the
-   downsampled plate views, etc. — are pushed to the remote as one
-   additional `UploadTask` during the final / post-finalize pass. The
-   set excludes `upload_manifest.jsonl`, `upload_manifest_backfill.jsonl`,
-   and `RAW_DATA_UPLOADED.txt` since those are upload-pipeline outputs.
+2. **Every sidecar is mirrored, recursively.** The final pass
+   (`_enqueue_sidecar_resync`, via `collect_sidecar_files`) walks the whole
+   experiment dir and uploads every non-zarr file — `acquisition.yaml`, run
+   logs, config dumps, coordinate CSVs, AND sidecar subdirectories such as
+   the per-timepoint folders (downsampled well views, laser-AF debug
+   images). Zarr plate subtrees (`*.ome.zarr`) are pruned from the walk —
+   their shards streamed live and their metadata has its own resync — so
+   nothing is uploaded twice. `upload_manifest.jsonl`,
+   `upload_manifest_backfill.jsonl`, `RAW_DATA_UPLOADED.txt`, and
+   `UPLOAD_INCOMPLETE.txt` are excluded at the root (upload-pipeline
+   outputs). Net effect: the remote experiment folder is a complete mirror
+   of the local one.
 3. **A `RAW_DATA_UPLOADED.txt` marker** is dropped into the local
    experiment dir when *and only when* the drain finished with zero failed
    tasks, zero outstanding tasks, **and the worker exited cooperatively with

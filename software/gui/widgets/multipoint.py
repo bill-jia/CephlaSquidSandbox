@@ -1690,12 +1690,18 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     enable_cb = QCheckBox("Stream to network")
     enable_cb.setToolTip(
         "Stream ZARR_V3 output to a mounted network share as the acquisition "
-        "runs. Each timepoint is sha256-verified on the remote before local "
-        "files are deleted. See Settings > Preferences for related tuning."
+        "runs. The selected folder is the PARENT: each acquisition mirrors "
+        "into its own subfolder named after the experiment, sidecars included. "
+        "Each timepoint is sha256-verified on the remote before local files "
+        "are deleted."
     )
 
     path_edit = QLineEdit()
-    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions")
+    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions  (experiment subfolder is created inside)")
+    path_edit.setToolTip(
+        "Parent folder on the share. The experiment directory "
+        "({experiment_ID}) is created inside it, mirroring the local layout."
+    )
     last_path = _load_last_remote_streaming_path()
     if last_path:
         path_edit.setText(last_path)

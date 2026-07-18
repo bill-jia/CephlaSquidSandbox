@@ -616,12 +616,19 @@ class _BackgroundUploadDrainer:
             f"in {submitted} task(s)"
         )
 
-        # Also push every experiment-root file (acquisition.yaml, run logs,
-        # config dumps, …) so the remote ends up with the full acquisition
-        # record, not just the zarr-internal metadata.
-        self._enqueue_experiment_root_resync()
+        # Also mirror every sidecar so the remote holds the FULL acquisition
+        # record, not just the zarr trees.
+        self._enqueue_sidecar_resync()
 
-    def _enqueue_experiment_root_resync(self) -> None:
+    def _enqueue_sidecar_resync(self) -> None:
+        """Mirror every non-zarr file in the experiment dir, recursively.
+
+        Covers what the live barriers and metadata resync do not: top-level
+        records (acquisition.yaml, logs, config dumps, coordinate CSVs) AND
+        sidecar subdirectories — per-timepoint folders with downsampled well
+        views, laser-AF debug images, etc. The old top-level-files-only pass
+        silently left every sidecar folder behind.
+        """
         if (
             self._target is None
             or not self._target.enabled
@@ -629,47 +636,53 @@ class _BackgroundUploadDrainer:
         ):
             return
         from uuid import uuid4
-        from control.core.zarr_upload import UploadTask, local_to_remote_path
+        from control.core.zarr_upload import (
+            UploadTask,
+            collect_sidecar_files,
+            local_to_remote_path,
+        )
         try:
-            entries = sorted(os.listdir(self._experiment_path))
+            sidecars = sorted(
+                collect_sidecar_files(
+                    self._experiment_path, self._EXPERIMENT_ROOT_SKIP_NAMES
+                )
+            )
         except OSError as e:
             self._log.warning(
-                f"Could not list experiment root {self._experiment_path}: {e}"
+                f"Could not enumerate sidecars under {self._experiment_path}: {e}"
             )
             return
-        root_files: List[str] = []
-        for name in entries:
-            if name in self._EXPERIMENT_ROOT_SKIP_NAMES:
-                continue
-            full = os.path.join(self._experiment_path, name)
-            if os.path.isfile(full):
-                root_files.append(full)
-        if not root_files:
+        if not sidecars:
             return
-        files = [
-            (
-                local,
-                local_to_remote_path(
-                    local, self._target.local_base, self._target.remote_root,
-                ),
+        submitted = 0
+        batch_size = 100
+        for i in range(0, len(sidecars), batch_size):
+            batch = sidecars[i : i + batch_size]
+            files = [
+                (
+                    local,
+                    local_to_remote_path(
+                        local, self._target.local_base, self._target.remote_root,
+                    ),
+                )
+                for local in batch
+            ]
+            task = UploadTask(
+                task_id=str(uuid4()),
+                time_point=-1,
+                region_id="(sidecars)",
+                fov=-1,
+                files=files,
+                deletable_local_paths=set(),
+                stable_read_paths=set(batch),
             )
-            for local in root_files
-        ]
-        task = UploadTask(
-            task_id=str(uuid4()),
-            time_point=-1,
-            region_id="",
-            fov=-1,
-            files=files,
-            deletable_local_paths=set(),
-            stable_read_paths=set(root_files),
-        )
-        self._worker.submit(task)
-        self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
-        self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+            self._worker.submit(task)
+            self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+            self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+            submitted += 1
         self._log.info(
             f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-            f"Submitted experiment-root resync ({len(root_files)} file(s))"
+            f"Submitted sidecar resync: {len(sidecars)} file(s) in {submitted} task(s)"
         )
 
     def _write_upload_complete_marker(self) -> None:
@@ -795,6 +808,19 @@ class _BackgroundUploadDrainer:
         # Sweep any barriers that landed right before the runners exited.
         self._drain_runner_barrier_results()
 
+    def _remote_reachable(self, timeout_s: float = 5.0) -> bool:
+        """Reachability of the per-experiment remote root, falling back to
+        its parent (the folder the user actually selected): the experiment
+        subdir may not exist yet when no upload has completed, and that must
+        not read as "share gone"."""
+        from control.core.zarr_upload import remote_root_reachable
+
+        root = getattr(self._target, "remote_root", "") or ""
+        if remote_root_reachable(root, timeout_s=timeout_s):
+            return True
+        parent = os.path.dirname(root.rstrip("/\\"))
+        return bool(parent) and remote_root_reachable(parent, timeout_s=timeout_s)
+
     def _worker_alive(self) -> bool:
         """is_alive() that tolerates a concurrently force-stopped (closed)
         Process handle — close() makes is_alive() raise ValueError."""
@@ -811,14 +837,13 @@ class _BackgroundUploadDrainer:
         crashed = False
         abandon_reason: Optional[str] = None
         try:
-            from control.core.zarr_upload import remote_root_reachable
             # Fail fast if the share is simply gone: don't pay the stall window
             # per file when the mount is unreachable. Probe is timeout-bounded
             # so a wedged mount can't block here either.
             if (
                 self._target is not None
                 and getattr(self._target, "enabled", False)
-                and not remote_root_reachable(self._target.remote_root, timeout_s=5.0)
+                and not self._remote_reachable()
             ):
                 self._log.error(
                     f"[{tag}] remote {self._target.remote_root} is unreachable; "
@@ -872,7 +897,7 @@ class _BackgroundUploadDrainer:
                 # went away mid-drain: re-probe instead of grinding the whole
                 # backlog through 5-attempt retry ladders.
                 if self._consecutive_failed_tasks >= 5:
-                    if not remote_root_reachable(self._target.remote_root, timeout_s=5.0):
+                    if not self._remote_reachable():
                         self._log.error(
                             f"[{tag}] remote became unreachable mid-drain "
                             f"({self._consecutive_failed_tasks} consecutive task "
@@ -889,7 +914,7 @@ class _BackgroundUploadDrainer:
                 last_progress = max(hb, self._last_result_time)
                 idle = now - last_progress if last_progress > 0 else 0.0
                 if last_progress > 0 and idle > stall_window_s:
-                    if not remote_root_reachable(self._target.remote_root, timeout_s=5.0):
+                    if not self._remote_reachable():
                         self._log.error(
                             f"[{tag}] no progress for {int(idle)}s and the remote is "
                             f"unreachable; abandoning {outstanding} upload(s). Re-run "
@@ -1477,9 +1502,18 @@ class MultiPointWorker:
             and getattr(acquisition_parameters, "zarr_upload_enabled", False)
             and getattr(acquisition_parameters, "zarr_upload_remote_root", "")
         ):
+            # The user-selected folder is the PARENT: each acquisition mirrors
+            # into its own subfolder named after the experiment, exactly like
+            # local {base_path}/{experiment_ID}. Mapping the selection to the
+            # experiment dir itself made every run reusing the cached path
+            # spray its files into the same remote folder.
+            remote_experiment_root = os.path.join(
+                acquisition_parameters.zarr_upload_remote_root,
+                os.path.basename(os.path.normpath(self.experiment_path)),
+            )
             self._upload_target = UploadTarget(
                 enabled=True,
-                remote_root=acquisition_parameters.zarr_upload_remote_root,
+                remote_root=remote_experiment_root,
                 local_base=self.experiment_path,
                 delete_after_verify=acquisition_parameters.zarr_upload_delete_after_verify,
             )

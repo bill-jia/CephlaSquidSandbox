@@ -1364,7 +1364,15 @@ def run_backfill_follow(
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("experiment_dir", type=Path, help="Local experiment directory (contains zarr/ or plate.ome.zarr/)")
-    parser.add_argument("--remote", required=True, help=r"Remote destination root, e.g. \\server\share\dest")
+    parser.add_argument(
+        "--remote",
+        required=True,
+        help=r"Exact remote EXPERIMENT directory the local experiment_dir maps to, "
+        r"e.g. \\server\share\dest\my_experiment_2026-07-18. Note this differs from "
+        r"the GUI's streaming picker, which selects the PARENT and creates the "
+        r"experiment subfolder automatically — UPLOAD_INCOMPLETE.txt records the "
+        r"already-expanded path to pass here.",
+    )
     parser.add_argument("--delete-after-verify", action="store_true",
                         help="Delete local shard files after the remote copy is sha256-verified.")
     parser.add_argument("--in-progress", action="store_true",

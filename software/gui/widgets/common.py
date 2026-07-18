@@ -241,9 +241,11 @@ def prompt_enable_network_streaming(
         f"{megabytes_available:,} MB is available locally."
     ))
     layout.addWidget(QLabel(
-        "Stream OME-Zarr output to a mounted network drive. Each timepoint "
-        "is verified on the remote and then deleted locally, so peak local "
-        "usage stays small."
+        "Stream OME-Zarr output to a mounted network drive. The selected "
+        "folder is the parent: this acquisition is mirrored into its own "
+        "subfolder there (named after the experiment), sidecars included. "
+        "Each timepoint is verified on the remote and then deleted locally, "
+        "so peak local usage stays small."
     ))
 
     path_row = QHBoxLayout()
