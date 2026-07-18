@@ -1,4 +1,5 @@
 from ._bootstrap import *
+from squid.config import CameraReadoutMode
 
 # Live-view cap for the laser AF camera. The focus exposure is sub-millisecond,
 # so without an explicit cap the camera can free-run at hundreds of fps and
@@ -1320,6 +1321,37 @@ class CameraSettingsWidget(QFrame):
             pass
         self.dropdown_binning.setMaximumWidth(88)
 
+        # Shutter mode (rolling vs global reset). Only shown for cameras that actually expose
+        # more than one shutter mode (e.g. the Tucsen Aries); single-mode cameras omit it.
+        self._shutter_mode_labels = {
+            CameraReadoutMode.ROLLING: "Rolling",
+            CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET: "Global Reset",
+            CameraReadoutMode.GLOBAL: "Global",
+        }
+        self.dropdown_shutterMode = QComboBox()
+        self.dropdown_shutterMode.setMaximumWidth(120)
+        try:
+            _readout_modes = list(self.camera.get_available_readout_modes())
+        except Exception as e:
+            self._log.debug(f"Camera has no selectable readout modes: {e}")
+            _readout_modes = []
+        for _m in _readout_modes:
+            self.dropdown_shutterMode.addItem(
+                self._shutter_mode_labels.get(_m, str(getattr(_m, "value", _m))), _m
+            )
+        self._has_shutter_mode_control = len(_readout_modes) > 1
+        if self._has_shutter_mode_control:
+            try:
+                _cur = self.camera.get_readout_mode()
+                _idx = self.dropdown_shutterMode.findData(_cur)
+                if _idx >= 0:
+                    self.dropdown_shutterMode.blockSignals(True)
+                    self.dropdown_shutterMode.setCurrentIndex(_idx)
+                    self.dropdown_shutterMode.blockSignals(False)
+            except Exception:
+                pass
+            self.dropdown_shutterMode.currentIndexChanged.connect(self._on_shutter_mode_changed)
+
         if include_trigger_controls and self.live_controller is not None:
             self.dropdown_triggerMode = QComboBox()
             self.dropdown_triggerMode.addItems([TriggerMode.SOFTWARE, TriggerMode.HARDWARE, TriggerMode.CONTINUOUS])
@@ -1382,6 +1414,9 @@ class CameraSettingsWidget(QFrame):
         format_row.addWidget(self.dropdown_cameraMode)
         format_row.addWidget(QLabel("Binning"))
         format_row.addWidget(self.dropdown_binning)
+        if self._has_shutter_mode_control:
+            format_row.addWidget(QLabel("Shutter"))
+            format_row.addWidget(self.dropdown_shutterMode)
         format_row.addStretch()
         left_col.addLayout(format_row)
 
@@ -1587,6 +1622,26 @@ class CameraSettingsWidget(QFrame):
 
     def update_measured_temperature(self, temperature):
         self.label_temperature_measured.setNum(temperature)
+
+    def _on_shutter_mode_changed(self, *args):
+        """Apply the selected sensor shutter mode to the camera; revert the combo on failure."""
+        mode = self.dropdown_shutterMode.currentData()
+        if mode is None:
+            return
+        try:
+            self.camera.set_readout_mode(mode)
+            self._log.info(f"Shutter mode set to {mode.value}")
+        except Exception as e:
+            self._log.error(f"Failed to set shutter mode {mode}: {e}", exc_info=True)
+            # Revert the combo to the camera's actual mode.
+            try:
+                idx = self.dropdown_shutterMode.findData(self.camera.get_readout_mode())
+                if idx >= 0:
+                    self.dropdown_shutterMode.blockSignals(True)
+                    self.dropdown_shutterMode.setCurrentIndex(idx)
+                    self.dropdown_shutterMode.blockSignals(False)
+            except Exception:
+                pass
 
     def set_binning(self, binning_text):
         binning_parts = binning_text.split("x")

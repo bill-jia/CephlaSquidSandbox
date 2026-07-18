@@ -25,7 +25,6 @@ from control.core.fast_acquisition_controller import (
     camera_trigger_offset_samples,
     camera_exposure_window_bars,
 )
-from squid.config import CameraReadoutMode
 
 
 class NIDAQWidget(QWidget):
@@ -207,7 +206,17 @@ class NIDAQWidget(QWidget):
             "will update this widget's waveforms and sample rate."
         )
         device_layout.addWidget(self.link_to_fast_acquisition_checkbox)
-        
+
+        # Toggle the camera exposure/trigger overlay. Computing and drawing thousands of frame
+        # bands is expensive, so allow turning it off. Off by default for that reason.
+        self.show_camera_overlay_checkbox = QCheckBox("Show camera exposure overlay")
+        self.show_camera_overlay_checkbox.setChecked(False)
+        self.show_camera_overlay_checkbox.setToolTip(
+            "Overlay when the camera is exposing (any row / all rows) on the AO/DO plots. "
+            "Drawing many frames can be slow, so this is off by default."
+        )
+        device_layout.addWidget(self.show_camera_overlay_checkbox)
+
         device_group.setLayout(device_layout)
         left_panel.addWidget(device_group)
         
@@ -701,6 +710,10 @@ class NIDAQWidget(QWidget):
     def is_linked_to_fast_acquisition(self) -> bool:
         """Return True if this widget should be updated when Fast Acquisition parameters change."""
         return self.link_to_fast_acquisition_checkbox.isChecked()
+
+    def is_camera_overlay_enabled(self) -> bool:
+        """Return True if the camera exposure/trigger overlay should be drawn on the plot."""
+        return self.show_camera_overlay_checkbox.isChecked()
     
     def _update_config(self):
         """Update the configuration from UI values."""
@@ -933,13 +946,30 @@ class NIDAQWidget(QWidget):
 
         self._draw_camera_exposure_windows()
 
-        # Restore the preserved zoom (shared x propagates to ax_do/ax_ai), or record the new
-        # span so the next redraw at this duration can preserve the user's view.
+        # tight_layout FIRST, so the toolbar snapshots below capture the final subplot
+        # positions (push_current stores position as well as view limits; Home/Back restore
+        # both, so a stale position would nudge the subplots).
+        self.fig.tight_layout()
+
+        # Make the navigation toolbar's Home button target the full (autoscaled) view. The nav
+        # history from before the ax.clear() references the destroyed view, so Home was doing
+        # nothing / restoring a stale range. Autoscale to the full limits (no render needed),
+        # record that as Home, then restore any preserved interactive zoom on top — so Home
+        # still returns to the full FOV while the current view keeps the user's zoom. A single
+        # draw at the end renders whichever view we end on.
+        for ax in (self.ax_ao, self.ax_do):
+            ax.relim()
+            ax.autoscale_view()
+        tb = getattr(self, "plot_toolbar", None)
+        if tb is not None:
+            tb.update()          # drop stale nav history
+            tb.push_current()    # Home = full view
         if keep_xlim is not None:
-            self.ax_ao.set_xlim(keep_xlim)
+            self.ax_ao.set_xlim(keep_xlim)  # shared x propagates to ax_do
+            if tb is not None:
+                tb.push_current()  # current view = preserved zoom (Home still = full)
         self._last_plot_xspan_s = xspan_s
 
-        self.fig.tight_layout()
         self.canvas.draw()
 
     def set_camera_exposure_windows(self, starts_s, exposure_s, readout_s, shutter_mode, redraw: bool = True):
@@ -1822,8 +1852,15 @@ class NIDAQWidget(QWidget):
                 self.ax_ai.plot(result.timestamps, data, label=ai_label)
             self.ax_ai.legend(loc='upper right')
             self.ax_ai.grid(True, alpha=0.3)
-        
+
         self.fig.tight_layout()
+        # Re-establish the toolbar Home baseline to include the newly framed AI axis; the
+        # baseline recorded by _update_waveform_plot captured ax_ai's stale (pre-acquisition)
+        # view, so Home would otherwise revert ax_ai to that.
+        tb = getattr(self, "plot_toolbar", None)
+        if tb is not None:
+            tb.update()
+            tb.push_current()
         self.canvas.draw()
     
     def stop_tasks(self):
@@ -2288,7 +2325,7 @@ class FastAcquisitionWidget(QWidget):
         self._camera_state_before_acquisition: Optional[CameraState] = None  # Store camera state before fast acquisition
         self._was_live_before_fast_acquisition: bool = False  # Track live state to restore after acquisition
         self._max_frame_rate_shown: Optional[Tuple[str, bool]] = None  # (label text, over-max) last rendered
-        self._syncing_shutter_combo = False  # guards programmatic shutter-combo updates
+        self._overlay_shutter_mode_shown: Optional[str] = None  # last shutter mode rendered in the overlay
 
         # Post-capture write ("finalize") phase: the capture has ended but the writer is
         # still draining/encoding to disk. Start stays blocked and the progress bar tracks
@@ -2333,6 +2370,9 @@ class FastAcquisitionWidget(QWidget):
             _spin.valueChanged.connect(lambda _=None: self._push_camera_trigger_markers())
         if self.ni_daq_widget is not None:
             self.ni_daq_widget.link_to_fast_acquisition_checkbox.toggled.connect(
+                lambda _=None: self._push_camera_trigger_markers()
+            )
+            self.ni_daq_widget.show_camera_overlay_checkbox.toggled.connect(
                 lambda _=None: self._push_camera_trigger_markers()
             )
         self._push_camera_trigger_markers()  # initial overlay
@@ -2434,20 +2474,6 @@ class FastAcquisitionWidget(QWidget):
         self.file_format_combo = QComboBox()
         self.file_format_combo.addItems(["TIFF", "BigTIFF", "Zarr", "HDF5", "Raw"])
         acq_layout.addWidget(self.file_format_combo, 2, 3)
-
-        # Shutter mode: rolling vs global reset (Tucsen Aries). Global reset resets all rows
-        # at once then reads rolling (emulates a global shutter) — see the exposure overlay.
-        acq_layout.addWidget(QLabel("Shutter Mode:"), 3, 0)
-        self.shutter_mode_combo = QComboBox()
-        self.shutter_mode_combo.setToolTip(
-            "Sensor shutter mode. Rolling: rows expose staggered by the line time. "
-            "Global Reset: all rows start exposure together, read out rolling."
-        )
-        self._populate_shutter_mode_combo()
-        self.shutter_mode_combo.currentIndexChanged.connect(
-            lambda _=None: self._on_shutter_mode_changed()
-        )
-        acq_layout.addWidget(self.shutter_mode_combo, 3, 1)
 
         acq_layout.setContentsMargins(_compact, _compact, _compact, _compact)
         acq_group.setLayout(acq_layout)
@@ -2574,66 +2600,6 @@ class FastAcquisitionWidget(QWidget):
         except Exception as e:
             self._log.warning(f"Failed to update NI DAQ waveforms for sample rate change: {e}")
 
-    _SHUTTER_MODE_LABELS = {
-        CameraReadoutMode.ROLLING: "Rolling",
-        CameraReadoutMode.ROLLING_WITH_GLOBAL_RESET: "Global Reset",
-        CameraReadoutMode.GLOBAL: "Global",
-    }
-
-    def _populate_shutter_mode_combo(self):
-        """Fill the shutter-mode combo from the camera's available readout modes and select
-        the current one. Disabled when the camera exposes fewer than two modes."""
-        self._syncing_shutter_combo = True
-        try:
-            self.shutter_mode_combo.clear()
-            try:
-                modes = list(self.camera.get_available_readout_modes())
-            except Exception as e:
-                self._log.debug(f"Camera has no selectable readout modes: {e}")
-                modes = []
-            for m in modes:
-                self.shutter_mode_combo.addItem(self._SHUTTER_MODE_LABELS.get(m, m.value), m)
-            self.shutter_mode_combo.setEnabled(len(modes) > 1)
-            self._select_current_shutter_mode()
-        finally:
-            self._syncing_shutter_combo = False
-
-    def _select_current_shutter_mode(self):
-        """Point the combo at the camera's current shutter mode without firing the handler."""
-        try:
-            cur = self.camera.get_readout_mode()
-        except Exception:
-            return
-        idx = self.shutter_mode_combo.findData(cur)
-        if idx >= 0 and idx != self.shutter_mode_combo.currentIndex():
-            was = self._syncing_shutter_combo
-            self._syncing_shutter_combo = True
-            self.shutter_mode_combo.setCurrentIndex(idx)
-            self._syncing_shutter_combo = was
-
-    def _on_shutter_mode_changed(self):
-        """Apply the selected shutter mode to the camera and refresh the readout-dependent
-        UI (max frame rate + exposure overlay). Reverts on failure or during acquisition."""
-        if self._syncing_shutter_combo:
-            return
-        mode = self.shutter_mode_combo.currentData()
-        if mode is None:
-            return
-        if self._is_acquiring:
-            self._log.warning("Cannot change shutter mode during acquisition")
-            self._select_current_shutter_mode()  # revert
-            return
-        try:
-            self.camera.set_readout_mode(mode)
-        except Exception as e:
-            self._log.error(f"Failed to set shutter mode {mode}: {e}", exc_info=True)
-            error_dialog(f"Failed to set shutter mode: {e}", "Camera error")
-            self._select_current_shutter_mode()  # revert to actual hardware state
-            return
-        self._log.info(f"Shutter mode set to {mode.value}")
-        self._refresh_max_frame_rate()        # readout changed -> ceiling may change
-        self._push_camera_trigger_markers()   # exposure window depends on the mode
-
     def _camera_readout_time_ms(self) -> float:
         """Best-available rolling-shutter readout skew (ms) for the current camera settings,
         for the exposure-window overlay. 0 if the camera can't report one (global shutter)."""
@@ -2644,11 +2610,9 @@ class FastAcquisitionWidget(QWidget):
 
     def _camera_shutter_mode_name(self) -> str:
         """Current shutter mode as a CameraReadoutMode name string (e.g. 'ROLLING',
-        'ROLLING_WITH_GLOBAL_RESET'), for the exposure-window geometry. Read from the combo
-        (kept in sync with the camera) to avoid per-keystroke SDK reads."""
-        mode = self.shutter_mode_combo.currentData() if hasattr(self, "shutter_mode_combo") else None
-        if mode is not None:
-            return mode.value
+        'ROLLING_WITH_GLOBAL_RESET') for the exposure-window geometry. The shutter mode is now
+        selected in the live Camera Settings block; read it from the camera (a cheap cache read
+        on the Tucsen) so the overlay reflects that choice."""
         try:
             return self.camera.get_readout_mode().value
         except Exception:
@@ -2665,7 +2629,11 @@ class FastAcquisitionWidget(QWidget):
         # fires its own push afterwards, so we still end on the correct overlay.
         if self._updating_acquisition_params:
             return
-        if self._is_acquiring or not self.ni_daq_widget.is_linked_to_fast_acquisition():
+        # Clear (and skip the expensive computation/redraw) when the overlay is toggled off,
+        # while acquiring, or when not linked to fast-acquisition params.
+        if (self._is_acquiring
+                or not self.ni_daq_widget.is_linked_to_fast_acquisition()
+                or not self.ni_daq_widget.is_camera_overlay_enabled()):
             self.ni_daq_widget.set_camera_exposure_windows(None, 0.0, 0.0, "", redraw=redraw)
             return
         try:
@@ -2682,8 +2650,12 @@ class FastAcquisitionWidget(QWidget):
             starts = [o / sample_rate_hz for o in offsets] if sample_rate_hz > 0 else []
             exposure_s = self.exposure_time_spinbox.value() / 1000.0
             readout_s = self._camera_readout_time_ms() / 1000.0
+            mode_name = self._camera_shutter_mode_name()
+            # Record the mode we just drew so the shutter-mode poll (in _refresh_max_frame_rate)
+            # only redraws on an actual change, not once right after the overlay is enabled.
+            self._overlay_shutter_mode_shown = mode_name
             self.ni_daq_widget.set_camera_exposure_windows(
-                starts, exposure_s, readout_s, self._camera_shutter_mode_name(), redraw=redraw
+                starts, exposure_s, readout_s, mode_name, redraw=redraw
             )
         except Exception as e:
             self._log.warning(f"Failed to update camera exposure overlay: {e}")
@@ -2701,11 +2673,19 @@ class FastAcquisitionWidget(QWidget):
     
     def _refresh_max_frame_rate(self):
         """
-        Update the max-frame-rate readout beside the frame rate spinbox from the
-        camera's reported maximum for the current ROI / binning / camera mode.
-        Turns red when the requested frame rate exceeds it. Cameras that cannot
-        report a maximum (get_max_acquisition_frame_rate() -> None) show nothing.
+        Update the max-frame-rate readout beside the frame rate spinbox from the camera's
+        reported AcquisitionMaxFrameRate (the same value used in the camera log messages),
+        read fresh so it matches the camera's current state. Turns red when the requested
+        frame rate exceeds it. Cameras that cannot report a maximum show nothing.
+
+        Also polled here (on the same 500 ms timer): pick up a shutter-mode change made in the
+        live Camera Settings block and refresh the exposure overlay, since that mode is no
+        longer set from this panel.
         """
+        # Don't issue GenICam reads during a fast-acquisition capture — the high-speed trigger
+        # burst must not contend with SDK traffic. The label/overlay aren't changing then anyway.
+        if self._is_acquiring:
+            return
         try:
             max_rate_hz = self.camera.get_max_acquisition_frame_rate()
         except Exception as e:
@@ -2718,11 +2698,21 @@ class FastAcquisitionWidget(QWidget):
             text = f"max {max_rate_hz:.1f} Hz"
             over = self.frame_rate_spinbox.value() > max_rate_hz
 
-        if (text, over) == self._max_frame_rate_shown:
-            return
-        self._max_frame_rate_shown = (text, over)
-        self.max_frame_rate_label.setText(text)
-        self.max_frame_rate_label.setStyleSheet("color: red;" if over else "")
+        if (text, over) != self._max_frame_rate_shown:
+            self._max_frame_rate_shown = (text, over)
+            self.max_frame_rate_label.setText(text)
+            self.max_frame_rate_label.setStyleSheet("color: red;" if over else "")
+
+        # Refresh the exposure overlay if the shutter mode changed elsewhere (only worthwhile
+        # when the overlay is actually being drawn).
+        if self.ni_daq_widget is not None and self.ni_daq_widget.is_camera_overlay_enabled():
+            try:
+                mode_name = self.camera.get_readout_mode().value
+            except Exception:
+                mode_name = None
+            if mode_name != self._overlay_shutter_mode_shown:
+                self._overlay_shutter_mode_shown = mode_name
+                self._push_camera_trigger_markers()
 
     def _update_max_exposure_time(self):
         """

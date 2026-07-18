@@ -550,9 +550,10 @@ class TucsenCamera(AbstractCamera):
 
         self._rolling_shutter_readout_ms: float = 0.0
         # Exposure-independent frame readout period (ms) for the current ROI/binning/mode,
-        # backed out from the camera's exposure-limited AcquisitionMaxFrameRate. Its
-        # reciprocal is the fixed sensor frame-rate ceiling reported to the UI. 0.0 until
-        # first computed (then get_max_acquisition_frame_rate falls back to the raw value).
+        # backed out from the camera's exposure-limited AcquisitionMaxFrameRate. Backs
+        # get_readout_time_ms() (the exposure-window / strobe-timing visualization), NOT the
+        # UI max-frame-rate label (that reads AcquisitionMaxFrameRate fresh). 0.0 until first
+        # computed by _update_readout_period.
         self._readout_period_ms: float = 0.0
         # Current shutter/readout mode (Aries: ROLLING or ROLLING_WITH_GLOBAL_RESET). Cached
         # software-side; the source of truth is the SensorShutterMode GenICam node.
@@ -1076,6 +1077,10 @@ class TucsenCamera(AbstractCamera):
             try:
                 self.set_readout_mode(readout_mode_to_restore)
             except Exception as e:
+                # The re-assert failed, so the hardware is still at its factory-reverted mode
+                # (Rolling). Invalidate the cache so the next cache-first get_readout_mode
+                # re-seeds from the SensorShutterMode node instead of serving the stale value.
+                self._readout_mode = None
                 self._log.warning(f"Could not restore shutter mode after SDK reset: {e}", exc_info=True)
 
     def _on_sdk_trigger_frame(self, frame_bytes: bytes, metadata: dict) -> None:
@@ -1667,15 +1672,20 @@ class TucsenCamera(AbstractCamera):
             return self._trigger_attr.nFrameRate
 
     def get_max_acquisition_frame_rate(self) -> Optional[float]:
-        # Fixed, exposure-INDEPENDENT readout ceiling for the current ROI/binning/mode.
-        # Derived (in _update_readout_period, on every ROI/binning/mode/trigger change) by
-        # subtracting the exposure out of the camera's exposure-limited
-        # AcquisitionMaxFrameRate, so it no longer drops from ~800 Hz to ~560 Hz after a
-        # run leaves a longer exposure set. Falls back to the raw camera value until the
-        # readout period has been computed (and for non-genicam models, which never do).
-        if self._readout_period_ms and self._readout_period_ms > 0.0:
-            return 1000.0 / self._readout_period_ms
-        return self._max_acquisition_rate_hz
+        """The camera's reported max acquisition frame rate (Hz) — the SAME AcquisitionMaxFrameRate
+        GenICam node used in the streaming log messages, read fresh so the value always matches
+        the camera's current state (it reflects the current exposure / ROI / mode). Non-genicam
+        models return their cached/default value."""
+        if not self._model_properties.is_genicam:
+            return self._max_acquisition_rate_hz
+        try:
+            # Read-only for the label; do NOT write self._max_acquisition_rate_hz (that cache
+            # is the internal frame-rate clamp, maintained by _update_readout_period /
+            # start_fast_acquisition) so a UI poll can't perturb the clamp value.
+            return self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+        except Exception as e:
+            self._log.debug(f"Could not read AcquisitionMaxFrameRate: {e}")
+            return self._max_acquisition_rate_hz
 
     def get_exposure_limits(self) -> Tuple[float, float]:
         if self._model_properties.is_genicam:
@@ -1791,9 +1801,14 @@ class TucsenCamera(AbstractCamera):
         self._log.info(f"Set readout mode to {readout_mode.value} (SensorShutterMode={symbol})")
 
     def get_readout_mode(self) -> CameraReadoutMode:
-        """Get the current sensor shutter mode, reading the SensorShutterMode node on the Aries."""
+        """Get the current sensor shutter mode. Cache-first: the cache is authoritative because
+        only set_readout_mode (and the reopen re-apply) change the hardware, and both update it —
+        so this is a cheap attribute read safe to call from a UI poll. The SensorShutterMode node
+        is read only once to seed the cache."""
         if not self._is_aries():
             return CameraReadoutMode.GLOBAL
+        if self._readout_mode is not None:
+            return self._readout_mode
         try:
             symbol = self._get_genicam_parameter("SensorShutterMode")["value"]
             mode = self._SHUTTER_SYMBOL_TO_MODE.get(symbol)
@@ -1802,7 +1817,7 @@ class TucsenCamera(AbstractCamera):
                 return mode
         except Exception as e:
             self._log.debug(f"Could not read SensorShutterMode: {e}")
-        return self._readout_mode or CameraReadoutMode.ROLLING
+        return CameraReadoutMode.ROLLING
 
     def get_available_readout_modes(self) -> Sequence[CameraReadoutMode]:
         """Get available readout modes."""
@@ -1903,10 +1918,44 @@ class TucsenCamera(AbstractCamera):
                     )
                 except (CameraError, Exception):
                     pass
+                # SensorOperationMode only selects Dynamic/Speed/Sensitivity; the gain within
+                # that mode is a separate same-named GenICam node (Aries6506 params). Pin the
+                # gain sub-mode to its canonical value so the mode isn't left on a stale gain
+                # (e.g. Speed must use High gain).
+                self._apply_aries_gain_submode(enum_member)
             self._camera_mode = enum_member
             self._update_internal_settings()
             self._reset_buffer()
         self._log.info(f"Set camera mode to '{spec.display_name or mode_name}' ({spec.bit_depth}-bit)")
+
+    # Aries gain sub-mode to pin per operation mode. After SensorOperationMode selects
+    # Dynamic/Speed/Sensitivity, a same-named GenICam enum node selects the gain within that
+    # mode (Aries6506_Parameters.xlsx: Speed = 0:HighGain, 1:MidGain, 2:LowGain). Speed must
+    # run at High gain. (Dynamic and Sensitivity are intentionally left at their existing
+    # value — add entries here if they should be pinned too.)
+    _ARIES_GAIN_SUBMODE: Dict[ModeAries, Tuple[str, str]] = {
+        ModeAries.SPEED: ("Speed", "HighGain"),
+    }
+
+    def _apply_aries_gain_submode(self, mode: ModeAries) -> None:
+        """Pin the gain sub-mode for the just-selected Aries operation mode (see
+        _ARIES_GAIN_SUBMODE). Resolves the symbolic gain to its enum index so we don't hardcode
+        the ordering, and no-ops for modes/cameras without a mapping."""
+        entry = self._ARIES_GAIN_SUBMODE.get(mode)
+        if entry is None:
+            return
+        node_name, gain_symbol = entry
+        try:
+            entries = self._get_genicam_parameter(node_name).get("enum_entries") or []
+            if gain_symbol not in entries:
+                self._log.warning(f"{node_name} node has no '{gain_symbol}' gain (available: {entries})")
+                return
+            self._set_genicam_parameter(
+                node_name, entries.index(gain_symbol), TUELEM_TYPE.TU_ElemEnumeration.value
+            )
+            self._log.info(f"Pinned {node_name} gain sub-mode to {gain_symbol}")
+        except Exception as e:
+            self._log.warning(f"Could not set {node_name} gain sub-mode to {gain_symbol}: {e}")
 
     def get_camera_mode_spec(self, mode_name: str) -> Optional[TucsenCameraModeSpec]:
         """Get the specification for a camera mode by name."""
@@ -1940,9 +1989,9 @@ class TucsenCamera(AbstractCamera):
     def _update_readout_period(self):
         """Isolate the exposure-INDEPENDENT sensor readout period from the camera's
         AcquisitionMaxFrameRate node. Per the Aries manual (§3.13), the max frame rate is
-        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure. The
-        reciprocal, 1/readout, is the fixed readout-limited ceiling the UI shows — it must
-        NOT drop as the exposure changes.
+        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure. This feeds
+        get_readout_time_ms() for the exposure-window / strobe-timing visualization (the UI
+        max-frame-rate label reads AcquisitionMaxFrameRate directly, not this).
 
         Both AcquisitionMaxFrameRate and ExposureTime are read FRESH from the nodes here,
         back to back, so they correspond. Using the cached self._exposure_time_ms instead
