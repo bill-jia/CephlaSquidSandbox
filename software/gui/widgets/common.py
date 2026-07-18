@@ -69,6 +69,47 @@ def check_observation_state_roi_consistency_with_dialog(
     return True
 
 
+def _probe_remote_writable(remote: str, timeout_s: float = 10.0) -> "Tuple[bool, str]":
+    """isdir + write-probe on a worker thread with a bounded join.
+
+    A UNC path whose server is down blocks synchronous filesystem calls for
+    the SMB session timeout (10-40s+); running the probe inline froze the
+    whole GUI. Returns ``(ok, error_message)``; a probe that does not finish
+    within ``timeout_s`` counts as unreachable.
+    """
+    if not remote:
+        return False, "No network path given."
+    result = {"ok": False, "err": "", "done": False}
+
+    def _probe():
+        try:
+            if not os.path.isdir(remote):
+                result["err"] = (
+                    f"'{remote}' is not a directory the OS can see. "
+                    f"Mount the share first, then try again."
+                )
+                return
+            probe = os.path.join(remote, f".squid_upload_probe_{os.getpid()}")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            result["ok"] = True
+        except OSError as e:
+            result["err"] = f"Cannot write to '{remote}': {e}"
+        finally:
+            result["done"] = True
+
+    t = threading.Thread(target=_probe, daemon=True, name="streaming-path-probe")
+    t.start()
+    t.join(timeout_s)
+    if not result["done"]:
+        return False, (
+            f"'{remote}' did not respond within {int(timeout_s)}s "
+            f"(share offline or wedged)."
+        )
+    return bool(result["ok"]), result["err"]
+
+
 def check_space_available_with_error_dialog(
     multi_point_controller: MultiPointController, logger: logging.Logger, factor_of_safecty: float = 1.03
 ) -> bool:
@@ -83,21 +124,35 @@ def check_space_available_with_error_dialog(
         + multi_point_controller.get_acquisition_derived_image_count()
     )
 
+    zarr_v3 = getattr(multi_point_controller, "file_saving_option", None)
+    zarr_v3_selected = zarr_v3 is not None and getattr(zarr_v3, "name", "") == "ZARR_V3"
+    nt = max(1, int(getattr(multi_point_controller, "Nt", 1) or 1))
+    streaming_reclaims = (
+        zarr_v3_selected
+        and nt > 1
+        and bool(getattr(multi_point_controller, "zarr_upload_enabled", False))
+        and bool(getattr(multi_point_controller, "zarr_upload_delete_after_verify", False))
+    )
+    if streaming_reclaims:
+        # Streaming with delete-after-verify reclaims per timepoint, so local
+        # peak usage is a handful of timepoints (upload + verify lag), not the
+        # whole run. Requiring the full size would spuriously fail exactly the
+        # runs streaming exists for. Keep a 3-timepoint cushion.
+        space_required = min(space_required, factor_of_safecty * 3.0 * (space_required / nt))
+
     logger.info(
-        f"Checking space available: {space_required=}, {available_disk_space=}, {image_count=}, {save_directory=}"
+        f"Checking space available: {space_required=}, {available_disk_space=}, {image_count=}, "
+        f"{save_directory=}, streaming_reclaims={streaming_reclaims}"
     )
     if space_required > available_disk_space:
         megabytes_required = int(space_required / 1024 / 1024)
         megabytes_available = int(available_disk_space / 1024 / 1024)
         # ZARR_V3 acquisitions can stream to a network share so the local disk
-        # only ever holds about one timepoint at a time. Offer that route
-        # before failing the acquisition.
-        zarr_v3 = getattr(multi_point_controller, "file_saving_option", None)
-        zarr_v3_selected = (
-            zarr_v3 is not None
-            and getattr(zarr_v3, "name", "") == "ZARR_V3"
-        )
-        if zarr_v3_selected and prompt_enable_network_streaming(
+        # only ever holds a few timepoints at a time. Offer that route before
+        # failing the acquisition — but only when it actually helps: local
+        # space is reclaimed per verified TIMEPOINT, so a single-timepoint run
+        # still needs the full size locally and streaming cannot save it.
+        if zarr_v3_selected and nt > 1 and prompt_enable_network_streaming(
             multi_point_controller,
             megabytes_required=megabytes_required,
             megabytes_available=megabytes_available,
@@ -108,10 +163,56 @@ def check_space_available_with_error_dialog(
             f"This acquisition will capture {image_count:,} images, which will"
             f" require {megabytes_required:,} [MB], but '{save_directory}' only has {megabytes_available:,} [MB] available."
         )
+        if zarr_v3_selected and nt <= 1:
+            error_message += (
+                "\n\nNetwork streaming cannot work around this: local space is "
+                "reclaimed per verified timepoint, and this run has a single "
+                "timepoint — the whole acquisition must fit locally first."
+            )
         logger.error(error_message)
         error_dialog(error_message, title="Not Enough Disk Space")
         return False
     return True
+
+
+def check_streaming_target_with_dialog(
+    multi_point_controller: MultiPointController, logger: logging.Logger
+) -> bool:
+    """Pre-start validation of the streaming upload target.
+
+    The inline 'Stream to network' row accepts any text without probing, and
+    a run against an unreachable/read-only share used to proceed silently —
+    every upload failed in the log while the GUI showed a normal acquisition.
+    Returns True to proceed (streaming off, probe passed, or user chose to
+    continue without streaming); False to cancel the start.
+    """
+    if not getattr(multi_point_controller, "zarr_upload_enabled", False):
+        return True
+    fmt = getattr(multi_point_controller, "file_saving_option", None)
+    if getattr(fmt, "name", "") != "ZARR_V3":
+        return True
+    remote = getattr(multi_point_controller, "zarr_upload_remote_root", "")
+    ok, err = _probe_remote_writable(remote, timeout_s=10.0)
+    if ok:
+        return True
+    logger.warning(f"Streaming target probe failed: {err}")
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Warning)
+    msg.setWindowTitle("Streaming Target Not Available")
+    msg.setText(
+        f"The network streaming target is not usable:\n\n{err}\n\n"
+        f"Start the acquisition WITHOUT streaming (all data stays local), "
+        f"or cancel to fix the path?"
+    )
+    without_btn = msg.addButton("Start without streaming", QMessageBox.AcceptRole)
+    msg.addButton(QMessageBox.Cancel)
+    msg.setDefaultButton(QMessageBox.Cancel)
+    msg.exec_()
+    if msg.clickedButton() is without_btn:
+        multi_point_controller.set_zarr_upload_target(enabled=False)
+        logger.info("User chose to start without streaming; upload target disabled for this run.")
+        return True
+    return False
 
 
 def prompt_enable_network_streaming(
@@ -162,8 +263,20 @@ def prompt_enable_network_streaming(
     path_row.addWidget(browse_btn)
     layout.addLayout(path_row)
 
+    if getattr(multi_point_controller, "zarr_upload_enabled", False):
+        already = getattr(multi_point_controller, "zarr_upload_remote_root", "")
+        if already:
+            path_edit.setText(already)
     delete_local_cb = QCheckBox("Delete each timepoint locally after verified upload")
+    # This dialog exists to work around a FAILED local disk-space check;
+    # per-timepoint deletion IS the mechanism that makes that valid, so it is
+    # not optional here (the inline row is where delete-off streaming lives).
     delete_local_cb.setChecked(True)
+    delete_local_cb.setEnabled(False)
+    delete_local_cb.setToolTip(
+        "Required here: this run does not fit on local disk, so local shards "
+        "must be deleted as timepoints are verified on the remote."
+    )
     layout.addWidget(delete_local_cb)
 
     btns = QHBoxLayout()
@@ -181,26 +294,18 @@ def prompt_enable_network_streaming(
         if not remote:
             QMessageBox.warning(dlg, "Network path required", "Please enter a network path.")
             return
-        if not os.path.isdir(remote):
-            QMessageBox.warning(
-                dlg,
-                "Path not reachable",
-                f"'{remote}' is not a directory the OS can see. "
-                f"Mount the share first, then try again.",
-            )
-            return
-        # Quick write probe so we fail fast on read-only mounts.
-        probe = os.path.join(remote, ".squid_upload_probe")
+        # Threaded, timeout-bounded probe: a wedged UNC used to block these
+        # filesystem calls on the GUI thread and freeze the whole app.
+        accept_btn.setEnabled(False)
+        accept_btn.setText("Checking path…")
+        QApplication.processEvents()
         try:
-            with open(probe, "w") as f:
-                f.write("ok")
-            os.remove(probe)
-        except OSError as e:
-            QMessageBox.warning(
-                dlg,
-                "Path not writable",
-                f"Cannot write to '{remote}': {e}",
-            )
+            ok, err = _probe_remote_writable(remote, timeout_s=10.0)
+        finally:
+            accept_btn.setEnabled(True)
+            accept_btn.setText("Enable streaming and start")
+        if not ok:
+            QMessageBox.warning(dlg, "Path not usable", err)
             return
         dlg.accept()
 

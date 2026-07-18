@@ -39,12 +39,27 @@ write data in shapes that are not safe to copy incrementally.
    is cached at `cache/last_streaming_path.txt` so the next session
    pre-fills it.
 
+   Because the flexible and wellplate tabs each have their own row bound to
+   the one controller, **Start re-pushes the active tab's save-format and
+   streaming state** — the run always uses what the tab that started it
+   displays, never a stale edit from the other tab or a previous run.
+   At Start, if streaming is enabled, the target path is probed
+   (timeout-bounded, off the GUI thread); an unreachable/read-only share
+   raises a dialog offering "start without streaming" or cancel, instead of
+   silently burning every upload against a dead share.
+
 3. **UI entry point — disk-space fallback.** As a safety net, if you start
    an acquisition that would exceed local free space without having
    enabled streaming in the inline row,
    `check_space_available_with_error_dialog` opens a modal that lets you
-   enable streaming on the spot (write-probe + path validation) instead of
-   failing. Same `cache/last_streaming_path.txt` pre-fill.
+   enable streaming on the spot (write-probe + path validation, both
+   timeout-bounded off the GUI thread) instead of failing. Same
+   `cache/last_streaming_path.txt` pre-fill. Two rules keep this honest:
+   the bypass is only offered for `Nt > 1` (space is reclaimed per verified
+   *timepoint*, so a single-timepoint run must fit locally regardless), and
+   when streaming with delete-after-verify is already configured the space
+   check compares against a ~3-timepoint local peak instead of the full run
+   size.
 
 4. **Headless / scripted use.** Call
    `MultiPointController.set_zarr_upload_target(enabled=True,
@@ -88,7 +103,33 @@ multi_point_worker (main proc)
 
 The writer subprocess never blocks on network I/O: the upload worker is its
 own process with its own queue. When the network is unavailable, the queue
-grows and deletions defer; acquisition keeps imaging.
+grows and deletions defer; acquisition keeps imaging. A throttled mid-run
+health check (`_maybe_warn_upload_health`, every 60 s) warns via log + Slack
+when the worker died, the backlog exceeds ~100 tasks, upload tasks have
+failed, or no byte has moved for the stall window — previously a mid-run
+wedge was completely invisible until the end-of-run drain.
+
+**Completion accounting is counter-based, not task-id-based.** Every producer
+increments a shared `tasks_submitted` `multiprocessing.Value`
+(`UploadWorker.tasks_submitted_value`) immediately before putting a task on
+the input queue — the barrier does it inside the JobRunner subprocess, the
+resync/root uploads via `UploadWorker.submit()`. Outstanding work is then
+simply `tasks_submitted − UploadResults consumed`. This is immune to the two
+failure modes that used to corrupt the old registration scheme
+(`BarrierResult` task_ids matched against `UploadResult` task_ids across two
+independent queues):
+
+- an `UploadResult` arriving *before* its `BarrierResult` had been consumed
+  left a phantom task_id registered forever → the drainer waited out its
+  stall window on nothing, declared a healthy worker "wedged", terminated
+  it, and withheld the completion marker;
+- `BarrierResult`s produced during the backgrounded JobRunner shutdown were
+  never consumed at all → the drainer *undercounted*, tore the worker down
+  mid-backlog, and could write a **false** `RAW_DATA_UPLOADED.txt`.
+
+The per-task_id maps still exist, but only as bookkeeping for the
+per-timepoint deletion tally and the registry snapshot; a completed-task_id
+set guards the late-registration race there too.
 
 **Why concurrent lanes (and why only a few).** Each lane writes a file up
 (send direction) then reads it all back to sha256-verify (receive direction).
@@ -136,22 +177,24 @@ authoritative:
    ``stable_read``; shard files (no concurrent writes possible after the
    barrier's ``wait_for_pending()``) are uploaded with ``stable_read=False``
    to avoid the extra hash.
-2. **Post-finalize metadata resync.** After the JobRunner subprocess exits
-   (which is when ``finalize_all_writers()`` runs in the subprocess and
-   rewrites every FOV's ``zarr.json`` with ``acquisition_complete = True``),
-   the background drainer enqueues a final metadata resync. This pass reads
-   files that no writer can be touching, so the upload is guaranteed clean.
-   The remote ends up reflecting the finalized local state even if every
-   intermediate barrier upload of ``frame_times`` had been torn. It covers
-   three tiers, all marked non-deletable:
-   - **per-FOV** group + level ``zarr.json`` and ``frame_times``
-     (``_enqueue_post_finalize_metadata_resync``);
-   - **plate/well group metadata** — every ``*.ome.zarr`` plate's root
-     ``zarr.json`` and per-well ``<row>/<col>/zarr.json``
-     (``_enqueue_plate_metadata_resync``). Without these the remote tree is a
-     headless collection of images, not a readable OME-NGFF plate;
-   - **experiment-root files** — ``acquisition.yaml`` and any other
-     top-level record (``_enqueue_experiment_root_resync``).
+2. **Post-finalize metadata resync.** The background drainer first **waits
+   for every JobRunner shutdown to complete** (an event set by
+   ``_finish_jobs``'s writeback-complete watcher, capped at the 600 s
+   finalize budget + 60 s) — that is the moment ``finalize_all_writers()``
+   has rewritten every FOV's ``zarr.json`` with
+   ``acquisition_complete = True``. Only then does it enqueue the resync,
+   so the pass reads files no writer can be touching and the remote is
+   guaranteed to end up reflecting the *finalized* local state. (It used to
+   fire at drain start, racing a finalize that could still be minutes away —
+   the remote could permanently miss ``acquisition_complete``.) While
+   waiting, the drainer keeps consuming late ``BarrierResult``s from the
+   runners' still-open output queues. The resync enumerates by **filesystem
+   walk**: every ``zarr.json`` under the experiment dir (per-FOV group +
+   level metadata, plate roots, per-well groups — for the dense plate,
+   ragged per-state plates, ``*_refz`` plates and derived postprocess plates
+   alike) plus every ``frame_times`` chunk, batched ~100 files per task, all
+   non-deletable; then the experiment-root files
+   (``_enqueue_experiment_root_resync``).
 
 ### Staging every shard a FOV visit writes
 
@@ -160,11 +203,16 @@ The barrier does **not** key on the scan ``time_point``. A dense or ragged
 *contiguous block* of array-``t`` indices (``T = Nt × frames/visit``), so one
 visit seals several shards. ``ZarrWriter`` records every array-``t`` it writes
 in ``_unstaged_t_indices`` (in ``write_frame``); ``drain_unstaged_shard_paths``
-returns the shard files for **all** of them across every pyramid level, then
-clears only the timepoints whose shards are fully on disk (an unflushed ``t``
-stays pending for the next barrier — a written timepoint is never dropped).
-Keying on the scan ``time_point`` instead would stage one shard per visit and
-silently skip the rest.
+returns the shard files for **all** of them across every pyramid level.
+Because callers run ``wait_for_pending()`` first, a level file absent at
+drain time is *permanently* absent (TensorStore elides all-fill-value
+shards — e.g. a pyramid level that downsampled to exactly zero), so the
+drain stages whatever level files exist and clears the cell as long as its
+level-0 shard is present; only a cell with no level-0 file stays pending
+(its write may land before a later barrier, or the frame was all-fill and
+no file will ever exist). Demanding all levels used to strand real level-0
+data in the pending set forever. Keying on the scan ``time_point`` instead
+would stage one shard per visit and silently skip the rest.
 
 In the manifest, each record carries:
 - ``"deletable": true|false`` — whether the file was eligible for local
@@ -198,12 +246,17 @@ acquisition needs.
 ## File-level guarantees
 
 Per shard file:
-1. Stream-copy local → `<remote>.part`, computing sha256 of the source bytes.
-2. Re-read `<remote>.part` and compute its sha256.
-3. If they match, `os.replace(<.part>, <final>)` — atomic on Windows and
+1. Stream-copy local → `<remote>.part-<uuid>`, computing sha256 of the source
+   bytes. The temp name is unique **per call**: shared metadata files recur in
+   every barrier task and the lanes run across task boundaries, so a fixed
+   `.part` name let two lanes truncate/delete each other's temp file. Lanes
+   additionally hold a per-remote-path lock, so one destination is never
+   written by two lanes at once.
+2. Re-read the temp file and compute its sha256.
+3. If they match, `os.replace(<.part-uuid>, <final>)` — atomic on Windows and
    POSIX SMB.
 4. On `OSError` or sha256 mismatch, retry with backoff 1s, 2s, 4s, 8s, 16s
-   (5 attempts). On final failure, leave the `.part` file in place, push
+   (5 attempts). On final failure, best-effort remove the temp file, push
    `UploadResult(success=False)`, and **never** delete the local copy.
 
    The retry loop only fires when a syscall *returns* an error. A genuine SMB
@@ -342,11 +395,22 @@ file has been verified on the remote:
    set excludes `upload_manifest.jsonl`, `upload_manifest_backfill.jsonl`,
    and `RAW_DATA_UPLOADED.txt` since those are upload-pipeline outputs.
 3. **A `RAW_DATA_UPLOADED.txt` marker** is dropped into the local
-   experiment dir when *and only when* the run finished with zero failed
-   tasks and zero abandoned tasks. The marker carries the remote root URL,
-   an ISO-8601 UTC timestamp, and a pointer to the manifest, and explains
-   that local zarr metadata has been preserved so the directory is still
-   a valid OME-NGFF reader pointer.
+   experiment dir when *and only when* the drain finished with zero failed
+   tasks, zero outstanding tasks, **and the worker exited cooperatively with
+   exit code 0** — the marker is written *after* worker teardown, never
+   before, so a worker that had to be terminated can no longer leave a
+   marker claiming success. The marker carries the remote root URL, an
+   ISO-8601 UTC timestamp, and a pointer to the manifest; its deletion note
+   is accurate to the run (delete-after-verify off → says the local copy is
+   intact; N files survived deletion due to Windows file locks → says so).
+
+4. **An `UPLOAD_INCOMPLETE.txt` record** is written whenever uploads are
+   abandoned — drain stall, share unreachable, drainer crash, app close /
+   `atexit` force-stop. It carries the reason, the outstanding/failed task
+   counts, the remote root, and the exact backfill command to finish the
+   job. This is the only record that survives an app restart (the drainer
+   registry is in-memory), so an abandoned upload is no longer silent. A
+   later clean completion removes it.
 
 A re-run that picks up where an earlier (incomplete) run stopped will
 write the marker once *its* run is clean. The marker is overwritten
@@ -379,23 +443,52 @@ non-daemon `multiprocessing.Process`, which Python joins at interpreter
 exit — so a worker stuck in a synchronous SMB I/O wait would otherwise
 hang the whole app on close. `MultiPointController.close()` calls
 `terminate_all_upload_drainers()` (also registered as an `atexit`
-handler, ahead of multiprocessing's own, so it runs first), which
-`terminate()`s every active worker — the OS reaps even a kernel-I/O-
-blocked process — and releases the queue feeder threads. Uploads
-abandoned this way are recoverable with the backfill script.
+handler), which `terminate()`s every active worker — the OS reaps even a
+kernel-I/O-blocked process — and releases the queue feeder threads. Three
+details make this hold in every window:
 
-### Lost-task bug fix
+- the atexit ordering is forced by an explicit `import multiprocessing.util`
+  immediately before our `atexit.register` — plain `import multiprocessing`
+  does *not* register multiprocessing's child-join `_exit_function`, so
+  without the forced import the LIFO ordering was luck-of-first-Queue-
+  construction and our handler could run *after* the hang it exists to
+  prevent;
+- workers are registered in a module-level live-worker list **at spawn
+  time** (`register_live_upload_worker`), not only when the end-of-run
+  drainer takes ownership — a setup crash or app close mid-acquisition can
+  no longer strand an unreachable worker;
+- abandoning uploads this way writes `UPLOAD_INCOMPLETE.txt` next to the
+  data, and the GUI warns before both app exit and restart when drainers
+  are still active ("N uploads still pending — exit anyway?").
 
-Until the fix in `JobRunner.run()` that calls `close()` + `join_thread()`
-on the upload queue before the subprocess exits, items that
-`FlushAndStageUploadJob.run()` had `put()` onto the upload queue could
-be silently lost when the JobRunner subprocess died: the per-process
-feeder thread holding buffered items is killed without flushing.
-Symptom was `pending_task_ids` stuck at a non-zero count after abort,
-because the matching BarrierResults had already been processed in the
-main process but the UploadWorker never received the actual tasks. The
-explicit feeder flush before subprocess exit is required for
-correctness.
+Uploads abandoned this way are recoverable with the backfill script.
+
+### JobRunner shutdown correctness
+
+Three related fixes keep the runner honest at end of run:
+
+- **Queued jobs run before finalize.** The subprocess loop exit is
+  sentinel-driven: after `shutdown()` it keeps draining the input queue and
+  executes every job dispatched before the sentinel. The old
+  `while not shutdown_event` form exited after the in-flight job and
+  silently dropped the whole queued backlog — frames vanished (their pixels
+  lived in the dropped queue items), upload barriers never staged, and
+  `finalize_all_writers()` stamped `acquisition_complete=true` over the
+  truncated data. The parent's 600 s join + `terminate()` remains the only
+  hard stop.
+- **Upload-queue feeder flush** (`close()` + `join_thread()`) before the
+  subprocess exits, so `UploadTask`s buffered in the feeder actually reach
+  the UploadWorker. With uploads enabled the *output* queue feeder is
+  flushed too (the drainer is still reading BarrierResults from it);
+  without uploads it is abandoned (`cancel_join_thread`) so an unread
+  status item can never wedge subprocess exit.
+- **No feeder join after terminate.** When the parent had to `terminate()`
+  the subprocess, `shutdown()` abandons the input-queue feeder instead of
+  joining it — the consumer is dead, so a feeder still holding items would
+  block that join forever (this exact hang was reproducible in
+  `test_shutdown_with_pending_jobs`, and in production would wedge the
+  background shutdown thread and with it the "data writing complete"
+  signal).
 
 ## Caveats and current limitations
 
@@ -414,14 +507,19 @@ correctness.
   not a fixed wallclock deadline. Progress is measured by the worker's
   per-chunk **heartbeat**, so a healthy worker that is merely slow (large
   backlog, slow share, one big file) keeps the idle clock near zero and is
-  never abandoned; only a genuinely wedged worker (a dead SMB handle moving no
-  bytes) trips it, and is then `terminate()`d rather than waited out. This is
-  much tighter and more precise than the old "no new *result* for 10 minutes"
-  window, which could not tell one slow large file apart from a stuck one.
-  Before draining, the drainer also runs a timeout-bounded reachability probe
-  of the remote root and abandons fast if the share is simply gone. Whenever
-  the drain reports outstanding uploads, re-running the backfill against the
-  same experiment dir is the canonical recovery path.
+  never abandoned. The heartbeat is stamped **only by byte movement and
+  verified completions** — failing uploads do not refresh it, so a
+  dead-share failure grind looks idle instead of keeping the drain alive for
+  hours of guaranteed failures. When the watchdog fires (or ≥5 consecutive
+  tasks fail), the drainer re-probes the remote root: share gone → abandon
+  fast with an `UPLOAD_INCOMPLETE.txt` record; share reachable but no bytes
+  moving → genuinely wedged worker, `terminate()`d, same record. Worker
+  teardown after a clean drain is progress-aware too: the shutdown sentinel
+  queues behind any remaining tasks, and the join keeps extending while
+  bytes move (the old flat 5 s join could kill a worker mid-upload).
+  Whenever the drain reports outstanding uploads, re-running the backfill
+  against the same experiment dir is the canonical recovery path — the
+  `UPLOAD_INCOMPLETE.txt` record contains the exact command.
 - **Throughput knobs.** `UPLOAD_WORKER_THREADS` (default 2) sets the number of
   concurrent copy/verify lanes; `UPLOAD_PIPELINED=False` reverts to the
   strictly-sequential path; `UPLOAD_VERIFY_READBACK=False` trades end-to-end

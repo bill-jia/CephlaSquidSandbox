@@ -929,6 +929,11 @@ class FlushAndStageUploadJob:
     # Set in each ``JobRunner`` subprocess by ``JobRunner.run()`` so the job
     # can reach the upload worker without pickling the queue per-job.
     _upload_input_queue: ClassVar[Optional[multiprocessing.Queue]] = None
+    # Shared submitted-tasks counter (UploadWorker.tasks_submitted_value),
+    # installed alongside the queue. Incremented BEFORE every put so the main
+    # process's outstanding arithmetic can never undercount a task that
+    # reached the worker.
+    _upload_tasks_submitted: ClassVar[Optional[multiprocessing.Value]] = None
 
     def run(self) -> BarrierResult:
         from uuid import uuid4
@@ -1034,6 +1039,9 @@ class FlushAndStageUploadJob:
             deletable_local_paths=deletable,
             stable_read_paths=stable_read,
         )
+        if FlushAndStageUploadJob._upload_tasks_submitted is not None:
+            with FlushAndStageUploadJob._upload_tasks_submitted.get_lock():
+                FlushAndStageUploadJob._upload_tasks_submitted.value += 1
         FlushAndStageUploadJob._upload_input_queue.put(task)
         self._log.debug(
             f"Staged upload task {task_id} for t={self.time_point} fov={self.fov} "
@@ -1771,6 +1779,11 @@ class JobRunner(multiprocessing.Process):
         # owned by the main process; this subprocess only writes to it.
         upload_target: Optional[UploadTarget] = None,
         upload_input_queue: Optional[multiprocessing.Queue] = None,
+        # Shared counter (UploadWorker.tasks_submitted_value): incremented by
+        # every barrier in this subprocess right before it puts an UploadTask
+        # on ``upload_input_queue``, so the main process can compute
+        # outstanding uploads without depending on BarrierResult delivery.
+        upload_tasks_submitted: Optional[multiprocessing.Value] = None,
     ):
         super().__init__()
         # Daemon processes are terminated when the main process exits, ensuring
@@ -1783,6 +1796,7 @@ class JobRunner(multiprocessing.Process):
         self._zarr_writer_info = zarr_writer_info
         self._upload_target = upload_target
         self._upload_input_queue = upload_input_queue
+        self._upload_tasks_submitted = upload_tasks_submitted
         self._log_file_path = log_file_path  # Will be used in subprocess to set up file logging
 
         self._input_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -1930,7 +1944,14 @@ class JobRunner(multiprocessing.Process):
         """Check if the subprocess is ready without blocking."""
         return self._ready_event.is_set()
 
-    def shutdown(self, timeout_s=1.0):
+    def shutdown(self, timeout_s=1.0, close_output_queue: bool = True):
+        """Stop the subprocess: sentinel, join, last-resort terminate.
+
+        ``close_output_queue=False`` leaves the parent-side output queue open
+        and readable after the join — required when a background upload
+        drainer keeps consuming late BarrierResults from it. The caller that
+        passed False owns closing the queue when it is done.
+        """
         # Guard against double shutdown
         if self._shutdown_event is None:
             return
@@ -1952,6 +1973,7 @@ class JobRunner(multiprocessing.Process):
         # generous enough for finalize to complete (see
         # JOB_RUNNER_FINALIZE_TIMEOUT_S); reaching this branch means finalize
         # genuinely wedged.
+        terminated = False
         if self.is_alive():
             if getattr(_def, "ZARR_SHARD_PER_Z", False):
                 # Per-z sharding commits each z-slice during acquisition, so the
@@ -1977,14 +1999,23 @@ class JobRunner(multiprocessing.Process):
             )
             self.terminate()
             self.join(timeout=1.0)
-        # Clean up multiprocessing primitives to avoid semaphore leaks
+            terminated = True
+        # Clean up multiprocessing primitives to avoid semaphore leaks.
         self._input_queue.close()
-        self._input_queue.join_thread()
-        self._output_queue.close()
-        self._output_queue.join_thread()
+        if terminated:
+            # The consumer is dead; whatever the feeder still holds can never
+            # drain into the (possibly full) pipe, and join_thread() would
+            # block this thread forever. Abandon the buffered items — the
+            # subprocess that would have run them is gone either way.
+            self._input_queue.cancel_join_thread()
+        else:
+            self._input_queue.join_thread()
+        if close_output_queue:
+            self._output_queue.close()
+            self._output_queue.join_thread()
+            self._output_queue = None
         # Clear references to allow garbage collection of Event and Value semaphores
         self._input_queue = None
-        self._output_queue = None
         self._shutdown_event = None
         self._pending_count = None
 
@@ -2025,6 +2056,7 @@ class JobRunner(multiprocessing.Process):
         # ``UploadWorker``; we are only a producer here.
         if self._upload_input_queue is not None:
             FlushAndStageUploadJob._upload_input_queue = self._upload_input_queue
+            FlushAndStageUploadJob._upload_tasks_submitted = self._upload_tasks_submitted
             self._log.info("Upload input queue installed on FlushAndStageUploadJob")
 
         # PostprocessJob holds accumulated frame bytes across job completions, so
@@ -2035,15 +2067,41 @@ class JobRunner(multiprocessing.Process):
         # Signal to main process that we're ready to receive jobs
         self._ready_event.set()
 
-        while not self._shutdown_event.is_set():
+        # Loop exit is SENTINEL-driven, not event-driven: shutdown() sets the
+        # event and then enqueues a trailing ``None``. Jobs already queued sit
+        # AHEAD of that sentinel, so draining until we see it (or until the
+        # queue is empty with the event set — covers a lost sentinel) runs
+        # every dispatched job before finalize. The old
+        # ``while not shutdown_event`` form exited after the in-flight job and
+        # silently dropped the whole queued backlog: frames vanished,
+        # upload barriers never staged, and finalize stamped
+        # ``acquisition_complete`` over the truncated data.
+        while True:
             job = None
             try:
                 t_wait_start = time.perf_counter()
-                job = self._input_queue.get(timeout=self._input_timeout)
+                try:
+                    job = self._input_queue.get(timeout=self._input_timeout)
+                except queue.Empty:
+                    if self._shutdown_event.is_set():
+                        # Covers a lost sentinel — but only exit once nothing
+                        # is still owed. The pipe can be transiently empty
+                        # while the parent feeder is mid-pickle of a large
+                        # job; pending_count (incremented at dispatch, before
+                        # the put) is the authoritative "jobs still coming"
+                        # signal, so waiting on it cannot drop a queued job.
+                        with self._pending_count.get_lock():
+                            still_owed = self._pending_count.value > 0
+                        if not still_owed:
+                            break
+                    continue
                 t_got_job = time.perf_counter()
 
-                # None is a shutdown sentinel - skip processing and check shutdown flag
+                # None is the shutdown sentinel: everything dispatched before
+                # shutdown has now been processed.
                 if job is None:
+                    if self._shutdown_event.is_set():
+                        break
                     continue
 
                 self._log.debug(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
@@ -2175,18 +2233,28 @@ class JobRunner(multiprocessing.Process):
         log_memory("WORKER_SHUTDOWN", include_children=False)
         stop_worker_monitoring()
 
-        # Let the subprocess exit promptly even if JobResults remain buffered in
-        # the output queue's feeder thread. Data durability is guaranteed by
-        # finalize_all_writers() above (not by this status queue), and the parent
-        # has already drained the results it needs and tracks completion via the
-        # shared pending counter. Without this, an unflushed output item makes
-        # the feeder block at interpreter exit and the whole subprocess hangs
-        # until the parent's terminate() fires — the leading suspect for the
-        # observed 600s finalize wedge. The watchdog above confirms this (no
-        # dump => exit is now clean) or reveals a different teardown culprit.
+        # Output-queue exit policy depends on whether uploads are wired in.
+        #
+        # WITHOUT uploads: abandon buffered JobResults (cancel_join_thread) so
+        # an unread status item can never block interpreter exit — data
+        # durability comes from finalize_all_writers(), and nobody reads this
+        # queue after the parent's final drain (the old 600s teardown wedge).
+        #
+        # WITH uploads: the buffered items include BarrierResults, which the
+        # background upload drainer DOES keep reading after the parent's final
+        # drain — abandoning them silently corrupted the upload accounting
+        # (undercounted outstanding tasks → early worker teardown → false
+        # RAW_DATA_UPLOADED marker). Flush the feeder instead; the drainer
+        # polls this queue continuously, so the flush completes quickly. If
+        # the drainer died first, the parent's shutdown() join/terminate is
+        # the backstop.
         try:
-            self._output_queue.cancel_join_thread()
+            if self._upload_input_queue is not None:
+                self._output_queue.close()
+                self._output_queue.join_thread()
+            else:
+                self._output_queue.cancel_join_thread()
         except Exception as e:
-            self._log.debug(f"output_queue.cancel_join_thread on exit: {e}")
+            self._log.debug(f"output_queue flush/cancel on exit: {e}")
 
         self._log.info("Shutdown request received, exiting run (interpreter teardown begins).")

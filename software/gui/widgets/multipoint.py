@@ -3,6 +3,7 @@ from .common import (
     check_observation_state_roi_consistency_with_dialog,
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
+    check_streaming_target_with_dialog,
     check_system_load_and_pending_uploads_with_dialog,
     error_dialog,
     _load_last_remote_streaming_path,
@@ -3663,10 +3664,25 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             )
             self.multipointController.set_widget_type("flexible")
             self._push_channel_selection_to_controller()
+            # Re-push THIS tab's visible save-format + streaming state. The
+            # flexible and wellplate tabs each have their own combo/row bound
+            # to the one controller, so without this the run would use the
+            # last edit made in ANY tab, not what this tab displays.
+            self.multipointController.set_file_saving_option(self.combobox_fileSavingFormat.currentText())
+            self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
+            # Probe the streaming target BEFORE the disk-space check: choosing
+            # "start without streaming" here disables the upload target, and
+            # the space check must then be evaluated against full local
+            # retention rather than the streaming per-timepoint discount.
+            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
@@ -6374,11 +6390,23 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self._push_channel_selection_to_controller()
+            # Re-push THIS tab's visible save-format + streaming state (the
+            # flexible tab shares the controller; last-edit-anywhere must not
+            # override what this tab displays at Start).
+            self.multipointController.set_file_saving_option(self.combobox_fileSavingFormat.currentText())
+            self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
             if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
+                return
+
+            # Probe the streaming target BEFORE the disk-space check (see the
+            # flexible widget's start flow for the rationale).
+            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self.btn_startAcquisition.setChecked(False)
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 return
 
             if self.checkbox_skipSaving.isChecked():
@@ -7291,6 +7319,16 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
+
+            # This widget has no streaming row: a target configured in another
+            # tab silently applies here, so at minimum probe it before starting.
+            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
+                self.is_current_acquisition_widget = False
+                self.setEnabled_all(True)
+                self.btn_startAcquisition.setText("Start\n Acquisition ")
+                self.btn_startAcquisition.setChecked(False)
+                return
 
             if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over system load / pending uploads.")

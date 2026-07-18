@@ -285,7 +285,32 @@ def upload_one_file(
         return False, None, None, f"source missing: {local_path}"
 
     remote_dir = os.path.dirname(remote_path)
-    part_path = remote_path + ".part"
+    # Unique temp name per call: two concurrent uploads of the SAME remote
+    # path (shared metadata is staged by every barrier, and the pipelined
+    # worker runs lanes across task boundaries) must never write into each
+    # other's temp file. A fixed ``remote + ".part"`` did exactly that —
+    # lane B's open("wb") truncated the .part lane A was mid-writing, and
+    # B's stale-.part cleanup deleted A's live file.
+    from uuid import uuid4 as _uuid4
+    part_path = f"{remote_path}.part-{_uuid4().hex[:8]}"
+    # Sweep temp files orphaned by a terminated/crashed earlier run for this
+    # same destination. Age-gated at 24h since last modification: generous
+    # enough that server/client clock skew (or a slow concurrent uploader of
+    # the same file) can never make a LIVE temp look stale, while orphans
+    # still get reclaimed the next time the file is uploaded. One listdir per
+    # upload is noise next to the copy + read-back.
+    stale_prefix = os.path.basename(remote_path) + ".part-"
+    try:
+        for entry in os.listdir(remote_dir):
+            if entry.startswith(stale_prefix):
+                stale = os.path.join(remote_dir, entry)
+                try:
+                    if time.time() - os.path.getmtime(stale) > 24 * 3600.0:
+                        os.remove(stale)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
     last_error: Optional[str] = None
     for attempt in range(max_attempts):
@@ -297,12 +322,6 @@ def upload_one_file(
             log.warning(last_error)
         else:
             try:
-                # Best-effort clear of any stale .part from a previous attempt.
-                if os.path.exists(part_path):
-                    try:
-                        os.remove(part_path)
-                    except OSError:
-                        pass
                 src_hash, n_bytes = _stream_copy_with_hash(
                     local_path, part_path, heartbeat=heartbeat
                 )
@@ -360,6 +379,12 @@ def upload_one_file(
             wait = initial_backoff_s * (2 ** attempt)
             time.sleep(wait)
 
+    # Best-effort: don't leave our own temp file behind on final failure.
+    try:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+    except OSError:
+        pass
     return False, None, None, last_error
 
 
@@ -446,7 +471,16 @@ class UploadWorker(multiprocessing.Process):
         # progress, shared with the parent so it can tell "slow but alive"
         # from "wedged" in seconds instead of waiting out a coarse no-result
         # window. lock=False: a single double read approximately; races benign.
+        # Stamped ONLY on genuine byte movement / verified completion — a
+        # failure grind against a dead share must look idle to the watchdog.
         self._heartbeat = multiprocessing.Value("d", 0.0, lock=False)
+        # Authoritative count of tasks ever put on the input queue, shared
+        # with every producer (JobRunner subprocess barriers increment it via
+        # the same Value; local submit() increments it here). The drain-side
+        # "outstanding" is (tasks_submitted - results consumed), which cannot
+        # be corrupted by lost/duplicated BarrierResults the way the old
+        # per-task_id registration could.
+        self._tasks_submitted = multiprocessing.Value("i", 0)
 
     @property
     def heartbeat(self) -> float:
@@ -468,7 +502,26 @@ class UploadWorker(multiprocessing.Process):
     def output_queue(self) -> multiprocessing.Queue:
         return self._output_queue
 
+    @property
+    def tasks_submitted_value(self) -> multiprocessing.Value:
+        """Shared counter of tasks ever enqueued. Hand this to any producer
+        that puts tasks on ``input_queue`` directly (the JobRunner subprocess);
+        it must increment BEFORE the put — see ``count_submitted``."""
+        return self._tasks_submitted
+
+    @property
+    def tasks_submitted(self) -> int:
+        with self._tasks_submitted.get_lock():
+            return int(self._tasks_submitted.value)
+
+    @staticmethod
+    def count_submitted(tasks_submitted: multiprocessing.Value) -> None:
+        """Increment the shared submitted-tasks counter (producer-side helper)."""
+        with tasks_submitted.get_lock():
+            tasks_submitted.value += 1
+
     def submit(self, task: UploadTask) -> None:
+        self.count_submitted(self._tasks_submitted)
         self._input_queue.put(task)
 
     def shutdown(self) -> None:
@@ -560,23 +613,38 @@ class UploadWorker(multiprocessing.Process):
 
     def _do_upload(
         self, local_path, remote_path, stable_read, task_fields, deletable,
-        manifest_lock, heartbeat, log,
+        manifest_lock, heartbeat, log, path_lock=None,
     ) -> Tuple[bool, Optional[str]]:
         """Upload one file and append its manifest record. Runs on a lane
-        thread in the pipelined path. Returns ``(ok, error)``."""
+        thread in the pipelined path. Returns ``(ok, error)``.
+
+        ``path_lock`` (if given) serializes uploads that target the same
+        remote path — shared metadata files are staged by every barrier, and
+        without this two lanes could interleave writes to one destination.
+        """
         t_start = time.perf_counter()
-        ok, sha, n_bytes, err = upload_one_file(
-            local_path,
-            remote_path,
-            log=log,
-            max_attempts=self._max_attempts,
-            initial_backoff_s=self._initial_backoff_s,
-            stable_read=stable_read,
-            verify_readback=self._verify_readback,
-            heartbeat=heartbeat,
-        )
+        if path_lock is not None:
+            path_lock.acquire()
+        try:
+            ok, sha, n_bytes, err = upload_one_file(
+                local_path,
+                remote_path,
+                log=log,
+                max_attempts=self._max_attempts,
+                initial_backoff_s=self._initial_backoff_s,
+                stable_read=stable_read,
+                verify_readback=self._verify_readback,
+                heartbeat=heartbeat,
+            )
+        finally:
+            if path_lock is not None:
+                path_lock.release()
         elapsed = time.perf_counter() - t_start
-        heartbeat(0)
+        if ok:
+            # Only verified completion counts as watchdog progress; a failure
+            # grind against a dead share must look idle so the drainer can
+            # re-probe and abandon fast instead of grinding for hours.
+            heartbeat(0)
         if ok:
             # Serialize manifest appends across lanes: one fsynced record at a
             # time keeps the durability ordering the recovery path relies on.
@@ -619,6 +687,18 @@ class UploadWorker(multiprocessing.Process):
         executor = ThreadPoolExecutor(
             max_workers=self._threads, thread_name_prefix="upload-lane"
         )
+        # One lock per distinct remote path so the same destination is never
+        # written by two lanes at once (metadata files recur in every task).
+        path_locks: dict = {}
+        path_locks_guard = threading.Lock()
+
+        def lock_for(remote_path: str) -> threading.Lock:
+            with path_locks_guard:
+                lk = path_locks.get(remote_path)
+                if lk is None:
+                    lk = threading.Lock()
+                    path_locks[remote_path] = lk
+                return lk
 
         def touch(_n: int = 0) -> None:
             self._heartbeat.value = time.time()
@@ -631,7 +711,8 @@ class UploadWorker(multiprocessing.Process):
                     ok, err = fut.result()
                 except Exception as e:
                     ok, err = False, f"{type(e).__name__}: {e}"
-                touch()
+                if ok:
+                    touch()
                 finished = None
                 with state_lock:
                     st = pending.get(task_id)
@@ -660,7 +741,6 @@ class UploadWorker(multiprocessing.Process):
                 if item == _SHUTDOWN_SENTINEL:
                     log.info("shutdown sentinel received; finishing in-flight uploads")
                     break
-                touch()
                 task: UploadTask = item
                 base = {
                     "task_id": task.task_id,
@@ -686,6 +766,7 @@ class UploadWorker(multiprocessing.Process):
                         self._do_upload,
                         local_path, remote_path, stable_read, task_fields,
                         deletable, manifest_lock, touch, log,
+                        lock_for(remote_path),
                     )
                     fut.add_done_callback(
                         lambda f, tid=task.task_id, lp=local_path, dl=deletable: on_done(
@@ -717,7 +798,6 @@ class UploadWorker(multiprocessing.Process):
             if item == _SHUTDOWN_SENTINEL:
                 log.info("shutdown sentinel received; exiting")
                 break
-            touch()
             self._process_task(item, log, touch)
 
     def _process_task(self, task: UploadTask, log, heartbeat=None) -> None:
@@ -738,7 +818,7 @@ class UploadWorker(multiprocessing.Process):
                 heartbeat=heartbeat,
             )
             elapsed = time.perf_counter() - t_start
-            if heartbeat is not None:
+            if ok and heartbeat is not None:
                 heartbeat(0)
             if ok:
                 uploaded.append(local_path)
