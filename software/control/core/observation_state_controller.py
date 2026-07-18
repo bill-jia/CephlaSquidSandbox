@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import squid.logging
 from control._def import *
+from control._sdk_watchdog import CameraTimeoutError
 from control.models.observation_state import (
     CameraLiveSnapshot,
     CameraSettings,
@@ -554,6 +555,11 @@ class ObservationStateController:
             try:
                 with self._time("obs:fos:set_analog_gain"):
                     self.camera.set_analog_gain(state.analog_gain)
+            except CameraTimeoutError:
+                # A wedged camera is fatal, not a per-op glitch — must not be
+                # swallowed here (that would let the acquisition limp on against a
+                # dead camera). Propagate so the worker aborts and finalizes.
+                raise
             except Exception as e:
                 self._log.warning("Could not set analog gain: %s", e)
 
