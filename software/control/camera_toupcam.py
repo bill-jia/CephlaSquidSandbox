@@ -368,8 +368,11 @@ class ToupcamCamera(AbstractCamera):
             self._camera.StartPullModeWithCallback(self._event_callback, self)
             self._raw_camera_stream_started = True
             # The SDK frame sequence restarts with the stream; reset our tracker so the
-            # first frame after a (re)start isn't mis-counted as a drop.
+            # first frame after a (re)start isn't mis-counted as a drop, and zero the
+            # per-stream drop count so get_dropped_frame_count()/the log genuinely mean
+            # "since this stream start".
             self._last_seq = None
+            self._dropped_frame_count = 0
         except toupcam.HRESULTException as ex:
             self._raw_camera_stream_started = False
             self._log.exception("failed to start camera, hr=0x{:x}".format(ex.hr))
@@ -447,9 +450,16 @@ class ToupcamCamera(AbstractCamera):
                 fast_acq_frame_bytes = bytes(self._internal_read_buffer)
             else:
                 # Normal frame processing path
-                # Drop detection runs only here (not the fast-acquisition branch, which
-                # has its own accounting) so normal-mode frames are contiguous in seq.
-                self._note_frame_seq(frame_info.seq)
+                # Drop detection runs only in TRIGGERED acquisition, where every
+                # delivered frame is expected to be consumed. CONTINUOUS live view drops
+                # preview frames benignly when the consumer can't keep up, so counting
+                # those would spam false [FRAME-DROP] warnings. (Fast acquisition has its
+                # own accounting and never reaches this branch.)
+                if self._acquisition_mode in (
+                    CameraAcquisitionMode.SOFTWARE_TRIGGER,
+                    CameraAcquisitionMode.HARDWARE_TRIGGER,
+                ):
+                    self._note_frame_seq(frame_info.seq)
                 this_frame_id = (self._current_frame.frame_id if self._current_frame else 0) + 1
                 this_timestamp = time.time()
                 this_frame_format = self.get_frame_format()

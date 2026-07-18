@@ -79,16 +79,36 @@ cleanly**: frames captured up to the wedge are saved (shard-per-z commits land d
 capture), the store is finalized, and the operator is alerted — instead of a silent
 multi-day freeze. A camera that keeps wedging needs an app restart; the log says so.
 
+## Frame-drop detection
+
+`CameraFrame.frame_id` is a synthetic `+1` counter, so it can never reveal a drop —
+which is why the 2026-07-02 collapse from 3240 to 79 frames/timepoint logged almost
+nothing. `_on_frame_callback` now pulls the camera's real hardware frame sequence
+(`ToupcamFrameInfoV2.seq`, previously discarded by passing `None` to `PullImageV2`) and,
+on the normal capture path, `_note_frame_seq()` flags any gap (`seq − prev − 1 > 0`) as
+a `[FRAME-DROP]` warning and accumulates `get_dropped_frame_count()`. A reset/wrap goes
+negative and is ignored (no false alarm); the tracker resets on every stream (re)start
+and on `reopen()`. The fast-acquisition path is excluded (it has its own accounting).
+
+## Autofocus status
+
+`autofocus_log.csv` wrote `af_status='ok'` for every row despite chronic focus-camera
+read timeouts, because `_run_laser_af_refresh` returned `True` both for a live
+measurement **and** for the stale-anchor+table fallback, and the table path never reads
+the focus camera at all. `perform_autofocus`/`_run_laser_af_refresh` now record a
+distinct `self._last_af_status` — `ok` (live measurement), `stale` (live read failed →
+fell back to the stale anchor + table offset), `table` (no live read this FOV), `failed`
+(no Z set), `skipped` (AF enabled but not performed) — and `_record_autofocus_event`
+writes it. Focus-camera read failures now surface as `stale`/`failed` rows instead of
+hiding behind `ok`.
+
 ## Follow-ups (not implemented)
 
-- **Silent-drop detection** — frames-per-timepoint collapsed 3240→79 before the
-  wedge with only one benign Toupcam warning logged; track frame-id gaps and
-  raise/abort on shortfall so a degrading run alerts hours earlier.
-- **Autofocus status** — `af_status='ok'` was logged for every row despite chronic
-  focus-camera (`DefaultCamera`) read timeouts, because the pre-seeded focus-map path
-  returns `True` without a live read; record `stale`/`table_fallback` distinctly.
-- **Teardown calls** — `_stop_exposure`/`close` still issue unguarded SDK calls; a
-  wedge can make app shutdown hang (a restart is expected after a wedge anyway).
+- **Act on drops** — drop detection currently surfaces gaps (warning + counter); it does
+  not yet abort the timepoint or trigger a reinit on a shortfall. Wiring
+  `get_dropped_frame_count()` into the worker to react (not just log) is the next step.
+- **Teardown calls** — `_stop_exposure` still issues unguarded SDK calls (`stop_streaming`
+  and `close` are now guarded); a wedge there is benign since a restart is expected.
 
 ## Tests
 

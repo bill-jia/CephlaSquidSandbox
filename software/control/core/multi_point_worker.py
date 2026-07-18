@@ -812,6 +812,12 @@ class MultiPointWorker:
         # Count of camera reopen recoveries performed this run (bounded by
         # MAX_CAMERA_REINIT_ATTEMPTS). See _recover_wedged_camera.
         self._camera_reinit_attempts = 0
+        # Outcome of the last perform_autofocus() call, recorded to autofocus_log.csv:
+        # "ok" (live measurement), "stale" (live read failed -> stale-anchor+table
+        # fallback), "table" (no live read this FOV; used the z-map), "failed" (no Z
+        # set), "skipped" (AF enabled but not performed this FOV). Distinguishing these
+        # is what surfaces focus-camera trouble that a bare "ok"/"failed" hid.
+        self._last_af_status = "skipped"
         self.num_fovs = 0
         self.total_scans = 0
         self._z_pos_proposal = {}
@@ -3676,6 +3682,9 @@ class MultiPointWorker:
         # first capture can continue to run in parallel with motion — the
         # trigger-site _wait_for_move_settled() in acquire_camera_image is
         # the final gate.
+        # Reset per call so a prior FOV's status can't leak; the branches below set
+        # the real value (ok / stale / table / failed).
+        self._last_af_status = "skipped"
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
         if not self.do_reflection_af:
@@ -3697,6 +3706,7 @@ class MultiPointWorker:
                 ) or self.autofocusController.use_focus_map:
                     self.autofocusController.autofocus()
                     self.autofocusController.wait_till_autofocus_has_completed()
+                    self._last_af_status = "ok"
         else:
             # Laser-AF path. Decide between a full laser-AF "refresh" or a
             # table-only Z move, then run consistency checks where possible.
@@ -3768,6 +3778,8 @@ class MultiPointWorker:
                 #     self.stage.move_z_to(target_z)
                 #     self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
                 self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
+                # Table path: no live focus-camera measurement this FOV.
+                self._last_af_status = "table"
 
                 # TEMPORARY audit: measure laser-AF displacement at every
                 # non-anchor FOV without correcting, to gauge how accurate the
@@ -3975,6 +3987,7 @@ class MultiPointWorker:
             # anchor keeps both the fallback path and `move_to_coordinate`'s
             # non-blocking Z pre-move consistent.
             self._recompute_region_proposals(region_id, anchor_fov=fov)
+            self._last_af_status = "ok"
             return True
 
         # Refresh failed (exception caught above or move_to_target returned False).
@@ -3990,15 +4003,20 @@ class MultiPointWorker:
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
             self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
             self._log.warning(f"Laser-AF refresh failed at region={region_id} fov={fov}; using stale anchor + table offset")
+            # Live read failed; Z came from the stale anchor + table, not a measurement.
+            self._last_af_status = "stale"
             return True
 
         # No prior anchor and no table entry — can't set Z. Match legacy failure path.
+        self._last_af_status = "failed"
         return False
 
     # Columns for the per-acquisition autofocus log sidecar. position_index is
     # the FOV/position index; (x, y) disambiguate across regions. z_expected is
     # the pre-AF target Z; z_actual is the Z after correction (or after a failed
-    # AF). af_status is "ok" or "failed".
+    # AF). af_status is one of: "ok" (live measurement), "stale" (live read failed,
+    # fell back to stale anchor + table offset), "table" (no live read this FOV),
+    # "failed" (no Z set), "skipped" (AF enabled but not performed this FOV).
     _AUTOFOCUS_LOG_HEADER = [
         "position_index",
         "t_index",
@@ -4059,10 +4077,10 @@ class MultiPointWorker:
             y_mm=pos_after.y_mm,
             z_expected_mm=z_expected_mm,
             z_actual_mm=pos_after.z_mm,
-            ok=bool(af_ok),
+            status=self._last_af_status,
         )
 
-    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, ok):
+    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status):
         """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
 
         Best-effort: a logging failure must never interrupt the acquisition.
@@ -4085,7 +4103,7 @@ class MultiPointWorker:
                         f"{y_mm:.6f}",
                         f"{z_expected_mm:.6f}",
                         f"{z_actual_mm:.6f}",
-                        "ok" if ok else "failed",
+                        status,
                     ]
                 )
         except Exception as e:
