@@ -40,6 +40,7 @@ from control.core.waveform_observation_state import (
 )
 from control.nidaq import TriggerSource
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
+from control._sdk_watchdog import CameraTimeoutError
 import squid.logging
 import control.core.job_processing
 from control.core.job_processing import ZarrWriteResult
@@ -79,6 +80,11 @@ from squid.config import CameraPixelFormat
 
 # Module-level logger for static methods
 _log = squid.logging.get_logger(__name__)
+
+# Max times a wedged camera will be reopened-and-resumed within a single acquisition
+# before giving up and aborting. Each recovery costs at most the current FOV. Set to
+# 0 to disable reinit entirely and always fall back to the clean-abort behavior (P0).
+MAX_CAMERA_REINIT_ATTEMPTS = 3
 
 
 class SummarizeResult(NamedTuple):
@@ -687,6 +693,9 @@ class MultiPointWorker:
         self.time_point = 0
         self._first_fov_pre_moved = False
         self.af_fov_count = 0
+        # Count of camera reopen recoveries performed this run (bounded by
+        # MAX_CAMERA_REINIT_ATTEMPTS). See _recover_wedged_camera.
+        self._camera_reinit_attempts = 0
         self.num_fovs = 0
         self.total_scans = 0
         self._z_pos_proposal = {}
@@ -1747,6 +1756,18 @@ class MultiPointWorker:
             # Since we use callback based acquisition, make sure to wait for any final images to come in
             self._wait_for_outstanding_callback_images()
             self._log.info(f"Time taken for acquisition/processing: {(time.perf_counter_ns() - start_time) / 1e9} [s]")
+        except CameraTimeoutError as ce:
+            # A camera SDK control call wedged in native code (unrecoverable — the
+            # watchdog cannot cancel a blocked ctypes call). Abort cleanly so the
+            # store is finalized and the operator is alerted, instead of the
+            # historical failure mode: the worker frozen mid-frame for days until a
+            # manual kill, leaving the run unfinalized. Data through the last
+            # committed frame is already saved (shard-per-z commits during capture).
+            self._log.error(
+                f"Camera SDK wedged during acquisition ({ce}); aborting and finalizing. "
+                f"Frames captured so far are saved; restart the app to recover the camera."
+            )
+            self.request_abort_fn()
         except TimeoutError as te:
             origin = None
             tb = te.__traceback__
@@ -2989,8 +3010,42 @@ class MultiPointWorker:
                 else:
                     with self._timing.get_timer("move_to_coordinate"):
                         self.move_to_coordinate(coordinate_mm, region_id, fov)
-                with self._timing.get_timer("acquire_at_position"):
-                    self.acquire_at_position(region_id, current_path, fov)
+                # Absolute Z and piezo position before the capture, so a mid-z-stack
+                # wedge — which unwinds before move_z_back_after_stack() and leaves the
+                # stage (stage-Z stacks) or the piezo (use_piezo stacks) advanced by the
+                # relative stack moves — can be undone on recovery. Without this the next
+                # FOV images silently defocused: 2D-coord/AF-off runs only move X/Y, and
+                # every piezo stack re-seeds its base from the current self.piezo.position.
+                z_before_capture_mm = self.stage.get_pos().z_mm
+                z_piezo_before_um = self.piezo.position if self.use_piezo else None
+                try:
+                    with self._timing.get_timer("acquire_at_position"):
+                        self.acquire_at_position(region_id, current_path, fov)
+                except CameraTimeoutError as ce:
+                    # Camera wedged mid-capture in a native SDK call. Try to reopen the
+                    # camera and continue — losing at most this FOV — instead of losing
+                    # the rest of the run. If reinit is disabled, exhausted, or fails,
+                    # re-raise to run()'s handler for a clean abort + finalize.
+                    if not self._recover_wedged_camera(ce):
+                        raise
+                    if self.NZ > 1:
+                        # Undo any relative z-stack motion left in flight by the wedge —
+                        # the stage for stage-Z stacks, the piezo for use_piezo stacks
+                        # (the stage move is a harmless no-op in piezo mode, and vice versa).
+                        try:
+                            self.stage.move_z_to(z_before_capture_mm)
+                            if self.use_piezo and z_piezo_before_um is not None:
+                                self.piezo.move_to(z_piezo_before_um)
+                                self.z_piezo_um = z_piezo_before_um
+                        except Exception:
+                            self._log.exception(
+                                "Could not restore Z after camera recovery; the next FOV may be defocused."
+                            )
+                    self._log.warning(
+                        f"Abandoning region={region_id} fov={fov} at t={self.time_point} "
+                        f"after camera reinit; continuing with the next FOV."
+                    )
+                    continue
 
                 # Barrier: after every SaveZarrJob for this (t, region, fov)
                 # has been dispatched, queue a FlushAndStageUploadJob behind
@@ -3028,6 +3083,62 @@ class MultiPointWorker:
                 if self.abort_requested_fn():
                     self.handle_acquisition_abort(current_path)
                     return
+
+    def _recover_wedged_camera(self, err) -> bool:
+        """Try to reopen a camera that wedged mid-capture so acquisition can continue.
+
+        Returns True only if the camera was reopened and reconfigured (the caller then
+        skips the current FOV and resumes). On any failure — reinit disabled, budget
+        exhausted, the reopen itself wedging, or any other error — returns False and
+        the caller re-raises so run() does the P0 clean abort + finalize. Worst case is
+        therefore never worse than the abort-only behavior.
+        """
+        if MAX_CAMERA_REINIT_ATTEMPTS <= 0 or not hasattr(self.camera, "reopen"):
+            return False  # reinit disabled, or this camera can't reopen -> clean abort
+
+        self._camera_reinit_attempts += 1
+        if self._camera_reinit_attempts > MAX_CAMERA_REINIT_ATTEMPTS:
+            self._log.error(
+                f"Camera wedged again after {MAX_CAMERA_REINIT_ATTEMPTS} reinit attempt(s) this run; "
+                f"giving up and aborting the acquisition."
+            )
+            return False
+
+        self._log.error(
+            f"Camera wedged mid-capture ({err}). Attempting reinit "
+            f"{self._camera_reinit_attempts}/{MAX_CAMERA_REINIT_ATTEMPTS}..."
+        )
+        # The wedge may have left an illuminator on; drop it before recovering.
+        try:
+            self.liveController.obs_controller.turn_off_illumination()
+        except Exception:
+            self._log.warning("Could not turn off illumination during camera recovery", exc_info=True)
+
+        try:
+            with self._timing.get_timer("camera_reinit"):
+                self.camera.reopen()
+                # Re-apply the first observation state's camera_live snapshot the same
+                # way run() seeds the camera at startup, so post-reopen frames match the
+                # pre-wedge configuration (conversion-gain camera_mode in particular,
+                # which the base reopen does not restore).
+                self._seed_camera_for_first_observation_state()
+        except CameraTimeoutError as reopen_err:
+            self._log.error(f"Camera reinit itself wedged ({reopen_err}); aborting the acquisition.")
+            return False
+        except Exception:
+            self._log.exception("Camera reinit failed; aborting the acquisition.")
+            return False
+
+        # The fresh handle has no trigger in flight, and frame callbacks are preserved
+        # on the camera object. Reset worker-side readiness so the next FOV can capture,
+        # and force illumination to reassert on the next capture.
+        self._ready_for_next_trigger.set()
+        self._image_callback_idle.set()
+        self._last_illumination_config_name = None
+        self._log.info(
+            f"Camera reinit {self._camera_reinit_attempts} succeeded; resuming at the next FOV."
+        )
+        return True
 
     def acquire_at_position(self, region_id, current_path, fov):
         if self.NZ > 1:
@@ -3896,7 +4007,11 @@ class MultiPointWorker:
                 with self._timing.get_timer("send_trigger"):
                     self.camera.send_trigger(illumination_time=camera_illumination_time)
                 self._capture_ts["post_trigger"] = time.perf_counter()
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: a wedged trigger raises CameraTimeoutError
+                # (a BaseException), and the armed NIDAQ DO pulse MUST still be released —
+                # otherwise it survives into recovery and the next waveform FOV re-arms
+                # against a stray pulse task.
                 if nidaq_pulse_cleanup is not None:
                     try:
                         nidaq_pulse_cleanup()

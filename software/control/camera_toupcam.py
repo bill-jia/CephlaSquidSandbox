@@ -21,8 +21,24 @@ from control._def import *
 import threading
 import control.toupcam as toupcam
 from control.toupcam_exceptions import hresult_checker
+from control._sdk_watchdog import BoundedSdkCaller, CameraTimeoutError
 
 log = squid.logging.get_logger(__name__)
+
+# Watchdog timeout for per-capture Toupcam control/reconfigure SDK calls (set
+# exposure, set gain, software trigger). These normally complete in well under a
+# second; a call that blocks past this is a wedged native driver transaction (the
+# failure mode that froze a timelapse mid-frame for ~2.5 days). Chosen generous
+# enough never to false-trip a legitimate call, small enough to fail fast relative
+# to a multi-minute timepoint. See control/_sdk_watchdog.py.
+TOUPCAM_CONTROL_CALL_TIMEOUT_S = 15.0
+
+# Budget for reopen() — recovering a wedged camera does more than one control call
+# (enumerate + open the device, base-configure, restore ROI/mode, restart the pull
+# stream), so it gets a larger timeout. If even this times out (e.g. the USB
+# endpoint itself is dead) reopen raises CameraTimeoutError and the caller falls
+# back to a clean acquisition abort.
+TOUPCAM_REOPEN_TIMEOUT_S = 30.0
 
 
 class ToupCamCapabilities(pydantic.BaseModel):
@@ -230,6 +246,29 @@ class ToupcamCamera(AbstractCamera):
     def __init__(self, config: CameraConfig, hw_trigger_fn, hw_set_strobe_delay_ms_fn):
         super().__init__(config, hw_trigger_fn, hw_set_strobe_delay_ms_fn)
 
+        # Watchdog for blocking per-capture control SDK calls. Created before
+        # _configure_camera() below because that path calls the (now watchdogged)
+        # set_analog_gain. A wedged native call raises CameraTimeoutError instead of
+        # hanging the acquisition forever. See control/_sdk_watchdog.py.
+        self._sdk = BoundedSdkCaller(
+            default_timeout_s=TOUPCAM_CONTROL_CALL_TIMEOUT_S, log=self._log, name="toupcam"
+        )
+
+        # Logical state tracked in Python (NOT read back from the handle) so reopen()
+        # can restore it after a wedge without touching the dead handle. get_acquisition_mode
+        # / get_region_of_interest read the handle, so they are unusable once wedged.
+        self._acquisition_mode: Optional[CameraAcquisitionMode] = None
+        self._roi: Optional[Tuple[int, int, int, int]] = None
+
+        # Drop detection: the camera's real hardware frame sequence
+        # (ToupcamFrameInfoV2.seq) from the last processed frame, plus the cumulative
+        # count of frames the SDK/USB dropped (detected as gaps in that sequence). The
+        # CameraFrame.frame_id below is only a synthetic +1 counter and can never reveal
+        # a drop, which is why the 2026-07-02 run's frame collapse (3240 -> 79 per
+        # timepoint) was almost entirely silent.
+        self._last_seq: Optional[int] = None
+        self._dropped_frame_count: int = 0
+
         self._current_frame: Optional[CameraFrame] = None
         self._camera: Optional[toupcam.Toupcam] = None
 
@@ -328,10 +367,38 @@ class ToupcamCamera(AbstractCamera):
             self._log.debug("Starting raw stream in PullModeWithCallback.")
             self._camera.StartPullModeWithCallback(self._event_callback, self)
             self._raw_camera_stream_started = True
+            # The SDK frame sequence restarts with the stream; reset our tracker so the
+            # first frame after a (re)start isn't mis-counted as a drop.
+            self._last_seq = None
         except toupcam.HRESULTException as ex:
             self._raw_camera_stream_started = False
             self._log.exception("failed to start camera, hr=0x{:x}".format(ex.hr))
             raise ex
+
+    def _note_frame_seq(self, seq: int) -> None:
+        """Detect SDK/USB-level frame drops from the camera's hardware frame sequence.
+
+        ToupcamFrameInfoV2.seq increments by 1 per delivered frame; a jump means the
+        driver dropped frames before we ever saw them. Those drops are otherwise
+        invisible (CameraFrame.frame_id is a synthetic +1 counter), which is why the
+        2026-07-02 collapse from 3240 to 79 frames/timepoint logged almost nothing.
+        """
+        prev = self._last_seq
+        self._last_seq = seq
+        if prev is None:
+            return
+        gap = seq - prev - 1
+        if gap > 0:  # >0 only; a reset/wrap goes negative and is ignored (no false alarm)
+            self._dropped_frame_count += gap
+            self._log.warning(
+                f"[FRAME-DROP] Toupcam dropped {gap} frame(s) at the SDK/USB level "
+                f"(hardware seq {prev} -> {seq}); cumulative dropped this stream="
+                f"{self._dropped_frame_count}"
+            )
+
+    def get_dropped_frame_count(self) -> int:
+        """Cumulative frames the camera/SDK dropped (seq gaps) since the last stream start."""
+        return self._dropped_frame_count
 
     def _on_frame_callback(self):
         """
@@ -343,6 +410,10 @@ class ToupcamCamera(AbstractCamera):
         current_frame = None
 
         with self._raw_frame_callback_lock:
+            # A reopen() may be swapping the native handle; ignore any stale callback
+            # from the abandoned handle during the brief window self._camera is None.
+            if self._camera is None:
+                return
             # Since we are receiving a frame callback, we know things are setup properly.
             self._raw_camera_stream_started = True
 
@@ -350,11 +421,13 @@ class ToupcamCamera(AbstractCamera):
             # while waiting for this frame, that we allow subsequent software triggers.
             self._trigger_sent = False
 
-            # get the image from the camera
+            # get the image from the camera; frame_info carries the camera's real
+            # hardware frame sequence, used for drop detection on the normal path below.
+            frame_info = toupcam.ToupcamFrameInfoV2()
             try:
                 self._camera.PullImageV2(
-                    self._internal_read_buffer, self._get_pixel_size_in_bytes() * 8, None
-                )  # the second camera is number of bits per pixel - ignored in RAW mode
+                    self._internal_read_buffer, self._get_pixel_size_in_bytes() * 8, frame_info
+                )  # the second arg is bits per pixel - ignored in RAW mode
             except toupcam.HRESULTException as ex:
                 self._log.error("pull image failed, hr=0x{:x}".format(ex.hr))
                 return
@@ -374,6 +447,9 @@ class ToupcamCamera(AbstractCamera):
                 fast_acq_frame_bytes = bytes(self._internal_read_buffer)
             else:
                 # Normal frame processing path
+                # Drop detection runs only here (not the fast-acquisition branch, which
+                # has its own accounting) so normal-mode frames are contiguous in seq.
+                self._note_frame_seq(frame_info.seq)
                 this_frame_id = (self._current_frame.frame_id if self._current_frame else 0) + 1
                 this_timestamp = time.time()
                 this_frame_format = self.get_frame_format()
@@ -476,7 +552,17 @@ class ToupcamCamera(AbstractCamera):
     def _check_temperature(self):
         while not self.terminate_read_temperature_thread:
             time.sleep(2)
-            temperature = self.get_temperature()
+            # reopen() briefly sets self._camera = None while swapping handles, and a
+            # freshly-opened handle can transiently error. Either would otherwise raise
+            # out of this loop and kill the temperature/TEC monitor for the rest of the
+            # run, so skip the poll instead of dying.
+            if self._camera is None:
+                continue
+            try:
+                temperature = self.get_temperature()
+            except Exception as ex:
+                self._log.debug(f"Temperature read skipped (camera may be reopening): {ex!r}")
+                continue
             if self.temperature_reading_callback is not None:
                 try:
                     self.temperature_reading_callback(temperature)
@@ -555,10 +641,102 @@ class ToupcamCamera(AbstractCamera):
 
     def close(self):
         self.terminate_read_temperature_thread = True
-        self.thread_read_temperature.join()
-        self._set_fan_speed(0)
-        self._camera.Close()
+        # Bounded join: the poll thread could be blocked in an unbounded native
+        # get_Temperature() on a wedged handle; it is a daemon thread, so abandoning it
+        # is fine and keeps app shutdown from hanging here.
+        self.thread_read_temperature.join(timeout=3)
+        # Skip the SDK teardown calls on a wedged handle — they could block on the same
+        # stuck driver lock and hang app shutdown. The handle is unrecoverable anyway.
+        if not self._sdk.is_wedged:
+            self._set_fan_speed(0)
+            self._camera.Close()
         self._camera = None
+        self._sdk.shutdown()
+
+    def reopen(self):
+        """Recover a wedged camera so acquisition can continue.
+
+        A watchdog timeout means the current native handle is stuck in a call that
+        will never return; it cannot be closed safely. So we ABANDON it (and its
+        stuck daemon watchdog thread), stand up a fresh watchdog, open a brand-new
+        handle, and restore the tracked logical state (pixel format / binning via
+        _configure_camera, acquisition mode, ROI, exposure) plus the pull stream.
+
+        Frame callbacks are stored on this object (not the handle), so they carry
+        over untouched — the worker does not need to re-register them.
+
+        NOT restored here: the conversion-gain camera_mode (LCG/HCG/HDR) and the active
+        analog gain — _configure_camera resets gain to the configured default. The
+        caller is responsible for reasserting those (the MultiPointWorker does so by
+        re-running _seed_camera_for_first_observation_state after reopen). A future
+        caller must do the same or post-reopen frames may use the power-on gain mode.
+
+        The whole sequence runs under the fresh watchdog, so if the reopen itself
+        hangs (e.g. the USB endpoint is dead) it raises CameraTimeoutError instead of
+        blocking, and the caller falls back to a clean abort. Raises on any failure.
+        """
+        self._log.warning(
+            "Reopening wedged Toupcam: abandoning the stuck handle and its watchdog thread, opening a fresh device."
+        )
+        old_sdk = self._sdk
+        # Fresh, un-wedged watchdog for the new handle, keeping the NORMAL per-call
+        # budget so later control calls still fail fast; the reopen itself gets a
+        # larger budget via a per-call timeout below.
+        self._sdk = BoundedSdkCaller(
+            default_timeout_s=TOUPCAM_CONTROL_CALL_TIMEOUT_S, log=self._log, name="toupcam"
+        )
+        old_sdk.shutdown()  # non-blocking; the wedged daemon thread is left abandoned
+
+        # Snapshot logical state from tracked fields — NEVER read the dead handle.
+        exposure_ms = self._exposure_time
+        acq_mode = self._acquisition_mode
+        roi = self._roi
+        # Reopen does device enumeration + open + full reconfigure, so give this one
+        # call a larger budget; subsequent control calls keep the 15s default.
+        self._sdk.call(
+            "reopen",
+            lambda: self._reopen_impl(exposure_ms, acq_mode, roi),
+            timeout_s=TOUPCAM_REOPEN_TIMEOUT_S,
+        )
+        self._log.info("Toupcam reopened and reconfigured successfully.")
+
+    def _reopen_impl(self, exposure_ms, acq_mode, roi):
+        # Swap the handle under the frame-callback lock so a stale callback from the
+        # abandoned handle only ever observes old / None / fully-swapped-new — never a
+        # half-configured handle or a torn read-buffer resize. Deadlock-safe: nothing
+        # called below acquires this lock, and _on_frame_callback makes no self._sdk.call
+        # while holding it.
+        with self._raw_frame_callback_lock:
+            # Forget the wedged handle entirely — do not Close() it (that call could
+            # hang too). Setting it None first makes any stale frame callback bail out.
+            self._camera = None
+            self._raw_camera_stream_started = False
+            self._trigger_sent = False
+            self._last_trigger_timestamp = 0
+            self._strobe_dirty = False
+            self._last_seq = None  # fresh handle restarts the SDK frame sequence
+
+            (self._camera, self._capabilities) = ToupcamCamera._open(index=0)
+            # Base config from stored self._pixel_format / self._binning / self._config
+            # (auto-exposure off, frame/pixel format, resolution, fan, temperature, gain).
+            self._configure_camera()
+
+            # Restore trigger/acquisition mode (stream not started yet, so this won't
+            # re-issue exposure — we do that below).
+            if acq_mode is not None:
+                self._set_acquisition_mode_imp(acq_mode)
+
+            # Restore ROI while the stream is stopped (matches the normal set-then-stream
+            # ordering). Skipped if the acquisition used the full frame.
+            if roi is not None:
+                try:
+                    self._camera.put_Roi(*roi)
+                except toupcam.HRESULTException:
+                    self._log.exception("Could not restore ROI on reopen; continuing with full frame.")
+
+            self._exposure_time = exposure_ms
+            self._start_raw_camera_stream()
+            self._update_internal_settings()
 
     def start_streaming(self):
         self._log.info("start streaming requested")
@@ -572,6 +750,14 @@ class ToupcamCamera(AbstractCamera):
                 self._update_internal_settings()
 
     def stop_streaming(self):
+        # If the camera is wedged, its native handle is stuck and Stop() could block on
+        # the same driver lock — skip it so acquisition teardown (and the finalize that
+        # follows) is never held up. The app must be restarted to recover the camera
+        # anyway, so leaving the (dead) stream "running" is moot.
+        if self._sdk.is_wedged:
+            self._log.warning("Camera wedged; skipping stop_streaming() Stop() to avoid blocking teardown.")
+            self._raw_camera_stream_started = False
+            return
         self._camera.Stop()
         self._raw_camera_stream_started = False
 
@@ -579,6 +765,11 @@ class ToupcamCamera(AbstractCamera):
         return self._raw_camera_stream_started
 
     def set_exposure_time(self, exposure_time_ms: float):
+        # Watchdogged: _update_internal_settings issues native SDK calls (strobe
+        # recalc, put_ExpoTime) that must not be able to hang the acquisition forever.
+        self._sdk.call("set_exposure_time", lambda: self._set_exposure_time_impl(exposure_time_ms))
+
+    def _set_exposure_time_impl(self, exposure_time_ms: float):
         # Since we have to set the on-camera exposure time differently depending on the trigger mode
         # and the calculated strobe delay, it is tricky to get the exposure time from the
         # camera.  To get around this, we store it.
@@ -623,6 +814,11 @@ class ToupcamCamera(AbstractCamera):
         return 20 * math.log10(toupcam_gain / 100)
 
     def set_analog_gain(self, analog_gain):
+        # Watchdogged: get_ExpoAGainRange / get_Option / put_ExpoAGain are native SDK
+        # calls. This is the exact path that wedged and froze a timelapse mid-frame.
+        self._sdk.call("set_analog_gain", lambda: self._set_analog_gain_impl(analog_gain))
+
+    def _set_analog_gain_impl(self, analog_gain):
         gain_range = self.get_gain_range()
         self._log.info(f"Requested {analog_gain=} with gain range {gain_range} in gain mode {self._get_gain_mode()}")
 
@@ -883,7 +1079,10 @@ class ToupcamCamera(AbstractCamera):
             self._hw_trigger_fn(illumination_time)
         elif self.get_acquisition_mode() == CameraAcquisitionMode.SOFTWARE_TRIGGER:
             self._log.debug("Sending software trigger..")
-            self._camera.Trigger(1)
+            # Watchdogged: a wedged Trigger() would hang before the worker's
+            # frame-wait timeout could ever fire (that only guards the wait AFTER
+            # the trigger returns), so bound this native call itself.
+            self._sdk.call("Trigger", lambda: self._camera.Trigger(1))
 
         self._last_trigger_timestamp = time.time()
         self._trigger_sent = True
@@ -923,6 +1122,10 @@ class ToupcamCamera(AbstractCamera):
         roi_offset_y = control.utils.truncate_to_interval(offset_y, 2)
         roi_width = control.utils.truncate_to_interval(width, 2)
         roi_height = control.utils.truncate_to_interval(height, 2)
+
+        # Track for reopen() recovery (get_region_of_interest reads the handle, which
+        # is unusable once wedged).
+        self._roi = (roi_offset_x, roi_offset_y, roi_width, roi_height)
 
         if (roi_offset_x, roi_offset_y, roi_width, roi_height) == self.get_region_of_interest():
             self._log.debug(f"set_region_of_interest: already {(roi_offset_x, roi_offset_y, roi_width, roi_height)}, skipping")
@@ -1099,6 +1302,10 @@ class ToupcamCamera(AbstractCamera):
         # Re-set exposure time to force strobe to get set to the remote.
         if self._raw_camera_stream_started:
             self.set_exposure_time(self.get_exposure_time())
+
+        # Track for reopen() recovery (get_acquisition_mode reads the handle, which is
+        # unusable once wedged).
+        self._acquisition_mode = acquisition_mode
 
     def get_acquisition_mode(self) -> CameraAcquisitionMode:
         trigger_option_value = self._camera.get_Option(toupcam.TOUPCAM_OPTION_TRIGGER)
