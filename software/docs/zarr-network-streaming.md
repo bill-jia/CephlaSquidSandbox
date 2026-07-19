@@ -244,9 +244,21 @@ The split is enforced at the upload-pipeline boundary: `UploadTask` carries
 an explicit `deletable_local_paths: Set[str]` whitelist;
 `UploadResult.deletable_uploaded_paths` is the strict subset of verified
 uploads that the caller is allowed to delete. The live pipeline's
-`_maybe_batched_delete` and the backfill's `delete_verified_locals` both
-iterate only that subset. There is no code path through which a metadata
-file can be deleted while uploads are in flight.
+`_delete_verified_result_files` and the backfill's `delete_verified_locals`
+both iterate only that subset. There is no code path through which a
+metadata file can be deleted while uploads are in flight.
+
+**Deletion is per verified task, during the acquisition.** As soon as one
+FOV visit's `UploadResult` arrives with its shards verified, those files are
+reclaimed — deletion never waits for the rest of the timepoint. (It used to
+be batched per timepoint gated on every barrier succeeding, which held a
+whole timepoint's disk hostage to its slowest or failed task and to the
+expected-barrier tally — local usage ballooned exactly when streaming was
+supposed to bound it.) The per-timepoint tally now only triggers the
+empty-`c/<t>/` directory pruning and a one-line reclaim summary once all of
+a timepoint's barriers have reported. Consequence during failures: the local
+tree can hold *partial* timepoints (only unverified files remain); the
+manifest + backfill script reconcile exactly what is missing remotely.
 
 Shared metadata is still **uploaded** on every barrier, so the remote tree
 stays continuously readable as a valid OME-NGFF — but the local copies
@@ -514,9 +526,15 @@ Three related fixes keep the runner honest at end of run:
 - **No throttling.** The user chose "continue and accumulate locally" for
   network outages. If uploads fall behind for hours, local disk usage will
   trend back upward and a partial timepoint may force the run to stop.
-- **Delete is per-timepoint, not per-FOV.** A single FOV upload failure
-  defers deletion of the whole timepoint's local data until the failure
-  resolves.
+- **Overflow is bounded, not impossible.** Verified shards are deleted per
+  task as the run progresses, so steady-state local usage is the upload
+  backlog plus the in-flight timepoint. But nothing throttles the
+  acquisition: if the writer sustainably outruns the share
+  (~55–60 MB/s effective on 1 GbE with verify-readback), the backlog — and
+  local usage — grows for the whole run. The mid-run health check warns
+  (log + Slack) on backlog growth, upload failures, and low local disk
+  (< 2 estimated timepoints of headroom), but by design it never pauses or
+  aborts the acquisition.
 - **Aborts / end-of-run drain.** When an acquisition ends, the background
   drainer keeps uploading and only gives up after a **stall window**
   (`UPLOAD_DRAINER_STALL_WINDOW_S`, default 120 s) of *no forward progress* —

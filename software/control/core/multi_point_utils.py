@@ -128,6 +128,11 @@ class AcquisitionParameters:
     zarr_upload_enabled: bool = False
     zarr_upload_remote_root: str = ""
     zarr_upload_delete_after_verify: bool = True
+    # Pre-run estimate of the acquisition's total on-disk size (bytes), from
+    # MultiPointController.get_estimated_acquisition_disk_storage(). The
+    # worker's mid-run upload health check divides by Nt to warn when local
+    # free space drops below a couple of timepoints' headroom. 0 = unknown.
+    estimated_total_disk_bytes: int = 0
 
 
 @dataclass

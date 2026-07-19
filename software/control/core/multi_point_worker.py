@@ -437,7 +437,8 @@ class _BackgroundUploadDrainer:
                 )
             else:
                 self._consecutive_failed_tasks = 0
-            self._maybe_batched_delete(tp)
+            self._delete_verified_result_files(result)
+            self._maybe_prune_timepoint(tp)
         return len(results)
 
     def _drain_runner_barrier_results(self) -> None:
@@ -488,9 +489,24 @@ class _BackgroundUploadDrainer:
                     error=None,
                 )
             )
-            self._maybe_batched_delete(br.time_point)
+            self._maybe_prune_timepoint(br.time_point)
 
-    def _maybe_batched_delete(self, time_point: int) -> None:
+    def _delete_verified_result_files(self, result) -> None:
+        """Reclaim a verified task's shards immediately (mirrors the
+        MultiPointWorker-side method; see its docstring)."""
+        if self._target is None or not self._target.delete_after_verify:
+            return
+        for local_path in result.deletable_uploaded_paths:
+            try:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+            except OSError as e:
+                self._failed_deletions += 1
+                self._log.warning(
+                    f"Failed to delete {local_path} after verified upload: {e}"
+                )
+
+    def _maybe_prune_timepoint(self, time_point: int) -> None:
         if time_point in self._deletion_done:
             return
         if self._target is None or not self._target.delete_after_verify:
@@ -501,26 +517,14 @@ class _BackgroundUploadDrainer:
         results = self._results_by_tp.get(time_point, [])
         if len(results) < expected:
             return
-        if any(not r.success for r in results):
-            return
-        deleted = 0
-        for result in results:
-            for local_path in result.deletable_uploaded_paths:
-                try:
-                    if os.path.isfile(local_path):
-                        os.remove(local_path)
-                        deleted += 1
-                except OSError as e:
-                    self._failed_deletions += 1
-                    self._log.warning(
-                        f"Failed to delete {local_path} after verified upload: {e}"
-                    )
         self._prune_empty_shard_dirs(time_point)
         self._deletion_done.add(time_point)
+        n_files = sum(len(r.deletable_uploaded_paths) for r in results)
+        failures = sum(1 for r in results if not r.success)
         self._log.info(
             f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-            f"Reclaimed local disk: deleted {deleted} files "
-            f"for verified timepoint t={time_point}"
+            f"Timepoint t={time_point}: {n_files} verified shard file(s) reclaimed"
+            + (f"; {failures} task(s) failed (their files kept)" if failures else "")
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
@@ -985,8 +989,9 @@ class _BackgroundUploadDrainer:
                     )
                     if undeleted:
                         self._log.warning(
-                            f"[{tag}] delete-after-verify never completed for "
-                            f"timepoint(s) {undeleted}; their local shards were kept."
+                            f"[{tag}] timepoint(s) {undeleted} did not fully verify; "
+                            f"verified shards were reclaimed as they landed, but the "
+                            f"unverified files (and empty-dir pruning) were left."
                         )
             except Exception:
                 pass
@@ -1497,6 +1502,11 @@ class MultiPointWorker:
         self._upload_failed_deletions = 0
         self._upload_health_last_check = 0.0
         self._upload_health_last_warn = 0.0
+        # Per-timepoint size estimate for the low-disk warning (0 = unknown).
+        self._upload_est_tp_bytes = (
+            getattr(acquisition_parameters, "estimated_total_disk_bytes", 0)
+            / max(1, self.Nt)
+        )
         if (
             use_zarr_v3
             and getattr(acquisition_parameters, "zarr_upload_enabled", False)
@@ -1533,7 +1543,7 @@ class MultiPointWorker:
             # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
             # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
             # run has len(array_keys) raw plates, and postprocessing adds one per
-            # derived output. Seeding to bare FOV count made _maybe_batched_delete
+            # derived output. Seeding to bare FOV count made the per-timepoint tally
             # fire after only 1/N barriers for ragged/postprocess runs (deletion
             # would then never reclaim later shards). Count keys per FOV per region.
             barriers_per_tp = 0
@@ -2807,7 +2817,8 @@ class MultiPointWorker:
                     f"Upload task {result.task_id} for t={tp} fov={result.fov} "
                     f"failed: {result.error}"
                 )
-            self._maybe_batched_delete(tp)
+            self._delete_verified_result_files(result)
+            self._maybe_prune_timepoint(tp)
         self._maybe_warn_upload_health()
 
     # Mid-run upload supervision (previously the heartbeat had no consumer
@@ -2846,6 +2857,25 @@ class MultiPointWorker:
             )
         if self._upload_failed_tasks:
             problems.append(f"{len(self._upload_failed_tasks)} upload task(s) failed so far")
+        # Low-disk early warning: streaming is supposed to keep local usage
+        # bounded, so shrinking headroom means uploads/deletion are falling
+        # behind the writer. Threshold = 2 timepoints of estimated data (or
+        # 20 GB when no estimate is available).
+        try:
+            free = utils.get_available_disk_space(self.base_path)
+        except Exception:
+            free = None
+        if free is not None:
+            floor = (
+                2.0 * self._upload_est_tp_bytes
+                if self._upload_est_tp_bytes > 0
+                else 20 * 1024 ** 3
+            )
+            if free < floor:
+                problems.append(
+                    f"local free disk is low ({free / 1e9:.1f} GB) while streaming — "
+                    f"uploads are not reclaiming space fast enough"
+                )
         if not problems:
             return
         if now - self._upload_health_last_warn < self._UPLOAD_HEALTH_WARN_INTERVAL_S:
@@ -2859,15 +2889,40 @@ class MultiPointWorker:
             except Exception:
                 pass
 
-    def _maybe_batched_delete(self, time_point: int) -> None:
-        """If every FOV in ``time_point`` has uploaded successfully, delete
-        the local shard files for that timepoint in one batch.
+    def _delete_verified_result_files(self, result: UploadResult) -> None:
+        """Reclaim a verified task's shards IMMEDIATELY (per FOV visit).
 
-        We require *all* expected FOVs to be present (so a partial timepoint
-        with one failure does not silently drop the remainder), *and* every
-        result to be ``success=True``. A single failure defers deletion for
-        that timepoint until either a retry succeeds or the user intervenes.
+        Every path in ``deletable_uploaded_paths`` is sha256-verified on the
+        remote, so deleting it is safe regardless of what the rest of the
+        timepoint is doing. The old per-timepoint batch held a whole
+        timepoint's disk hostage to its slowest/failed task (and to the
+        expected-barrier tally), letting local usage balloon exactly when
+        streaming was supposed to bound it.
         """
+        if self._upload_target is None or not self._upload_target.delete_after_verify:
+            return
+        deleted = 0
+        for local_path in result.deletable_uploaded_paths:
+            try:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+                    deleted += 1
+            except OSError as e:
+                self._upload_failed_deletions += 1
+                self._log.warning(
+                    f"Failed to delete {local_path} after verified upload: {e}"
+                )
+        if deleted:
+            self._log.debug(
+                f"Reclaimed {deleted} verified shard file(s) "
+                f"(t={result.time_point} fov={result.fov})"
+            )
+
+    def _maybe_prune_timepoint(self, time_point: int) -> None:
+        """Bookkeeping once every expected barrier of a timepoint reported:
+        prune the now-empty ``c/<t>/`` dirs and log one reclaim summary.
+        Files were already deleted per verified result; pruning only removes
+        empty directories, so task failures don't block it."""
         if time_point in self._upload_deletion_done:
             return
         if self._upload_target is None or not self._upload_target.delete_after_verify:
@@ -2878,30 +2933,13 @@ class MultiPointWorker:
         results = self._upload_results_by_tp.get(time_point, [])
         if len(results) < expected:
             return
-        if any(not r.success for r in results):
-            return
-        # All bundles for this timepoint are verified on the remote. Delete
-        # only the per-timepoint shard files that the upload worker tagged
-        # as deletable — never the shared metadata (zarr.json / frame_times),
-        # which the live writer is still using.
-        deleted = 0
-        for result in results:
-            for local_path in result.deletable_uploaded_paths:
-                try:
-                    if os.path.isfile(local_path):
-                        os.remove(local_path)
-                        deleted += 1
-                except OSError as e:
-                    self._upload_failed_deletions += 1
-                    self._log.warning(
-                        f"Failed to delete {local_path} after verified upload: {e}"
-                    )
-        # Best-effort prune of the now-empty `c/<t>/...` shard subtrees so
-        # the local directory listing stays tidy.
         self._prune_empty_shard_dirs(time_point)
         self._upload_deletion_done.add(time_point)
+        n_files = sum(len(r.deletable_uploaded_paths) for r in results)
+        failures = sum(1 for r in results if not r.success)
         self._log.info(
-            f"Reclaimed local disk: deleted {deleted} files for verified timepoint t={time_point}"
+            f"Timepoint t={time_point}: {n_files} verified shard file(s) reclaimed"
+            + (f"; {failures} task(s) failed (their files kept)" if failures else "")
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
@@ -3017,7 +3055,7 @@ class MultiPointWorker:
                     error=None,
                 )
             )
-            self._maybe_batched_delete(br.time_point)
+            self._maybe_prune_timepoint(br.time_point)
 
     def _emit_postprocess_display(self, pr: "PostprocessResult") -> None:
         """Push each derived output preview to the live image display.
