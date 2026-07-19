@@ -114,6 +114,9 @@ class AcquisitionParameters:
     laser_af_refresh_every_n_fovs: int = 10
     laser_af_consistency_threshold_um: float = 5.0
     laser_af_check_last_fov_per_region: bool = True
+    # Diagnostic before/after AF comparison at every table FOV (see
+    # _def.LASER_AF_TABLE_PATH_AUDIT). Corrects Z at audited FOVs.
+    laser_af_table_path_audit: bool = False
 
     # Live ZARR_V3 streaming upload to a network drive. When ``zarr_upload_enabled``
     # is True and ``file_saving_option == ZARR_V3``, the acquisition is mirrored

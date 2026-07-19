@@ -299,7 +299,20 @@ Three independent focus aids are available (combine as needed):
 recorded to `autofocus_log.csv` at the dataset root, with columns
 `position_index, t_index, x, y, z_expected, z_actual, af_status`. `z_expected` is the
 target Z before AF; `z_actual` is the Z after correction (or, on `af_status=failed`, the
-Z the acquisition fell back to). Use it to audit focus drift and AF reliability over a run.
+Z the acquisition fell back to). `af_status` values: `ok` (live measurement), `stale`
+(laser-AF read failed, fell back to the stale anchor + table offset), `table` (fast-mode
+table Z, no live read), `audit` (table FOV corrected by the opt-in table-path audit),
+`map` (contrast path: interpolated focus-map move, runs at every FOV), `failed` (no Z
+set), `skipped` (AF enabled but not run at this FOV). Use it to audit focus drift and AF
+reliability over a run.
+
+**Table-path audit (diagnostic).** The laser-AF settings dialog has a "Table-path audit"
+checkbox for validation runs: at every table FOV it measures the laser-AF displacement
+before and after a full corrective AF and appends both to `table_path_audit.csv` next to
+`autofocus_log.csv`. `displacement_before_um` is the fast-mode table path's true focus
+error at the moment the FOV would have been imaged (drift plus any Z-approach backlash
+offset). It corrects Z at audited FOVs and costs ~300 ms per FOV — leave it off for
+production runs.
 
 ### Step 9 — Saving and output options
 

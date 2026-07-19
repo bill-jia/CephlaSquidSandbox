@@ -1229,11 +1229,10 @@ class MultiPointWorker:
         # Count of camera reopen recoveries performed this run (bounded by
         # MAX_CAMERA_REINIT_ATTEMPTS). See _recover_wedged_camera.
         self._camera_reinit_attempts = 0
-        # Outcome of the last perform_autofocus() call, recorded to autofocus_log.csv:
-        # "ok" (live measurement), "stale" (live read failed -> stale-anchor+table
-        # fallback), "table" (no live read this FOV; used the z-map), "failed" (no Z
-        # set), "skipped" (AF enabled but not performed this FOV). Distinguishing these
-        # is what surfaces focus-camera trouble that a bare "ok"/"failed" hid.
+        # Outcome of the last perform_autofocus() call, recorded to
+        # autofocus_log.csv. Full status vocabulary: see the comment above
+        # _AUTOFOCUS_LOG_HEADER. Distinguishing these is what surfaces
+        # focus-camera trouble that a bare "ok"/"failed" hid.
         self._last_af_status = "skipped"
         self.num_fovs = 0
         self.total_scans = 0
@@ -1328,6 +1327,7 @@ class MultiPointWorker:
         self._laser_af_refresh_every_n_fovs = max(1, int(acquisition_parameters.laser_af_refresh_every_n_fovs))
         self._laser_af_consistency_threshold_um = float(acquisition_parameters.laser_af_consistency_threshold_um)
         self._laser_af_check_last_fov_per_region = bool(acquisition_parameters.laser_af_check_last_fov_per_region)
+        self._laser_af_table_path_audit = bool(acquisition_parameters.laser_af_table_path_audit)
         self._fov_z_map: dict[tuple[str, int], float] = {}
         self._fov_z_delta_map: dict[tuple[str, int], float] = {}
         self._region_anchor_z_current: dict[str, float] = {}
@@ -2495,6 +2495,17 @@ class MultiPointWorker:
             self._timepoint_fov_count = 0
             self._laser_af_successes = 0
             self._laser_af_failures = 0
+            # Force a region entry (anchor refresh) at the first FOV of every
+            # timepoint. Without this, a run whose first region equals the
+            # previous timepoint's last region — always true single-region —
+            # keeps its anchor across timepoints indefinitely.
+            self._last_region_id = None
+            # Restart the contrast-AF cadence phase each timepoint (mirrors the
+            # laser path's forced re-anchor above). A counter carried across
+            # timepoints phase-locks whenever the per-timepoint FOV total is a
+            # multiple of NUMBER_OF_FOVS_PER_AF, leaving the same FOVs
+            # un-autofocused for the entire timelapse.
+            self.af_fov_count = 0
             self.microcontroller.enable_joystick(False)
 
             self._log.info("multipoint acquisition - time point " + str(self.time_point + 1))
@@ -2692,20 +2703,24 @@ class MultiPointWorker:
         else:
             self._log.debug(f"moving to coordinate {coordinate_mm}")
 
-        # Pick the Z source. On subsequent timepoints with AF enabled, prefer
-        # the focused Z cached from the previous timepoint over the
-        # coordinate's nominal Z. The X/Y move below must still run — only
-        # the Z source changes here.
-        if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
-            if (region_id, fov) in self._z_pos_proposal:
-                last_z_mm = self._z_pos_proposal[(region_id, fov)]
-                self.move_to_z_level(last_z_mm, blocking=False)
-                self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
-            else:
-                self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
+        # Pick the Z source. With AF enabled, prefer the per-FOV focused-Z
+        # proposal (seeded by the pre-acquisition scan, so valid at t=0 too,
+        # and re-seated after every successful refresh) over the coordinate's
+        # nominal Z. The X/Y move below must still run — only the Z source
+        # changes here.
+        if (self.do_reflection_af or self.do_autofocus) and (region_id, fov) in self._z_pos_proposal:
+            last_z_mm = self._z_pos_proposal[(region_id, fov)]
+            self.move_to_z_level(last_z_mm, blocking=False)
+            self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
         elif len(coordinate_mm) == 3:
+            if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
+                self._log.warning(
+                    f"No last z position found for region {region_id}, fov {fov}; using nominal z"
+                )
             z_mm = coordinate_mm[2]
             self.move_to_z_level(z_mm, blocking=False)
+        elif (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
+            self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
 
         # Blocking-longer-axis move. Shorter axis fires non-blocking; the
         # longer axis blocks until motion is complete. Stabilization sleep
@@ -4040,14 +4055,15 @@ class MultiPointWorker:
             if self.abort_requested_fn():
                 self.handle_acquisition_abort(current_path)
 
-            # update FOV counter
-            self.af_fov_count = self.af_fov_count + 1
-
             if z_level < self.NZ - 1:
                 self.move_z_for_stack()
 
         if self.NZ > 1:
             self.move_z_back_after_stack()
+
+        # Contrast-AF cadence counter: one increment per FOV visit, never per
+        # z-slice (inside the z loop the cadence period becomes NZ-dependent).
+        self.af_fov_count += 1
 
         # Increment FOV counter for Slack notification stats
         self._timepoint_fov_count += 1
@@ -4193,21 +4209,32 @@ class MultiPointWorker:
         if not self.do_reflection_af:
             # Contrast-based AF. Runs for any z-stacking mode: AF establishes the
             # focal/reference plane and acquire_at_position/prepare_z_stack then
-            # position the stack around it (bottom/center/top). Cadence-gated by
-            # NUMBER_OF_FOVS_PER_AF.
-            if (
-                (self.do_autofocus)
-                and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
-            ):
-                configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_channel_by_name(
-                    self.objectiveStore.current_objective, configuration_name_AF
+            # position the stack around it (bottom/center/top). The full sweep is
+            # cadence-gated by NUMBER_OF_FOVS_PER_AF; a focus map replaces the
+            # sweep with one interpolated Z move, cheap enough to run at every
+            # FOV so tilted samples track the map between cadence hits.
+            if self.do_autofocus:
+                use_map = (
+                    self.autofocusController.use_focus_map
+                    and len(self.autofocusController.focus_map_coords) >= 3
                 )
-                self._select_config(config_AF)
-                if (
-                    self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
-                ) or self.autofocusController.use_focus_map:
+                if use_map:
                     self.autofocusController.autofocus()
+                    self.autofocusController.wait_till_autofocus_has_completed()
+                    # The map short-circuit is a bare move_z_to; give it the
+                    # same settle every other pre-capture Z move gets (with
+                    # NZ==1 no later stack move sleeps before the trigger).
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+                    self._last_af_status = "map"
+                elif self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0:
+                    configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
+                    config_AF = self.liveController.get_channel_by_name(
+                        self.objectiveStore.current_objective, configuration_name_AF
+                    )
+                    self._select_config(config_AF)
+                    # focus_map_override guards the degenerate case of a map
+                    # toggle left on with <3 points — force the real sweep.
+                    self.autofocusController.autofocus(focus_map_override=True)
                     self.autofocusController.wait_till_autofocus_has_completed()
                     self._last_af_status = "ok"
         else:
@@ -4226,7 +4253,13 @@ class MultiPointWorker:
                 self._region_refresh_count_this_entry = 0
                 self._fovs_since_refresh[region_id] = 0
 
-            counter_due = self._fovs_since_refresh.get(region_id, 0) >= self._laser_af_refresh_every_n_fovs
+            # The counter holds completed table FOVs since the last refresh, so
+            # the Nth FOV after a refresh sees N-1 — comparing against N would
+            # give a period of N+1 and, at N=1 (Legacy mode), alternate
+            # refresh/table instead of refreshing at every FOV.
+            counter_due = (
+                self._fovs_since_refresh.get(region_id, 0) >= self._laser_af_refresh_every_n_fovs - 1
+            )
             unseeded = (region_id, fov) not in self._fov_z_map
             is_refresh = new_region_entry or counter_due or unseeded
 
@@ -4244,51 +4277,53 @@ class MultiPointWorker:
                     self._last_region_id = region_id
                     return False
 
-                # Mid-region consistency check: if this is the 2nd+ refresh in
-                # the current region entry and we had table data for this FOV
-                # coming in, compare the fresh measurement to the table's
-                # prediction.
-                if (
-                    self._region_refresh_count_this_entry >= 1
-                    and prior_anchor_z is not None
-                    and prior_anchor_fov is not None
-                    and prior_fov_z is not None
-                    and (region_id, prior_anchor_fov) in self._fov_z_map
-                ):
-                    predicted_z = prior_anchor_z + (
-                        prior_fov_z - self._fov_z_map[(region_id, prior_anchor_fov)]
-                    )
-                    measured_z = self._region_anchor_z_current[region_id]
-                    diff_um = abs(predicted_z - measured_z) * 1000.0
-                    if diff_um > self._laser_af_consistency_threshold_um:
-                        self._log.warning(
-                            f"Laser-AF consistency: table predicted z={predicted_z:.4f} mm, "
-                            f"measured {measured_z:.4f} mm (diff={diff_um:.1f} µm) "
-                            f"at region={region_id} fov={fov}"
+                # Mid-region consistency check: if this is the 2nd+ live
+                # refresh in the current region entry and we had table data for
+                # this FOV coming in, compare the fresh measurement to the
+                # table's prediction. A "stale" return took no measurement —
+                # the anchor is unchanged, so comparing it to the prediction
+                # would only report the FOV's own shape offset. Stale returns
+                # also don't count as refreshes for the end-of-region check.
+                if self._last_af_status == "ok":
+                    if (
+                        self._region_refresh_count_this_entry >= 1
+                        and prior_anchor_z is not None
+                        and prior_anchor_fov is not None
+                        and prior_fov_z is not None
+                        and (region_id, prior_anchor_fov) in self._fov_z_map
+                    ):
+                        predicted_z = prior_anchor_z + (
+                            prior_fov_z - self._fov_z_map[(region_id, prior_anchor_fov)]
                         )
-                    else:
-                        self._log.debug(
-                            f"Laser-AF consistency OK: diff={diff_um:.1f} µm at region={region_id} fov={fov}"
-                        )
+                        measured_z = self._region_anchor_z_current[region_id]
+                        diff_um = abs(predicted_z - measured_z) * 1000.0
+                        if diff_um > self._laser_af_consistency_threshold_um:
+                            self._log.warning(
+                                f"Laser-AF consistency: table predicted z={predicted_z:.4f} mm, "
+                                f"measured {measured_z:.4f} mm (diff={diff_um:.1f} µm) "
+                                f"at region={region_id} fov={fov}"
+                            )
+                        else:
+                            self._log.debug(
+                                f"Laser-AF consistency OK: diff={diff_um:.1f} µm at region={region_id} fov={fov}"
+                            )
 
-                self._region_refresh_count_this_entry += 1
+                    self._region_refresh_count_this_entry += 1
             else:
-                # Already taken care of in initial move to pos
-                # with self._timing.get_timer("af:table_move"):
-                #     anchor_fov = self._region_anchor_fov[region_id]
-                #     delta = self._fov_z_map[(region_id, fov)] - self._fov_z_map[(region_id, anchor_fov)]
-                #     target_z = self._region_anchor_z_current[region_id] + delta
-                #     self.stage.move_z_to(target_z)
-                #     self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+                # This FOV's table Z was already applied by move_to_coordinate's
+                # proposal pre-move; no Z move needed here.
                 self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
                 # Table path: no live focus-camera measurement this FOV.
                 self._last_af_status = "table"
 
-                # TEMPORARY audit: measure laser-AF displacement at every
-                # non-anchor FOV without correcting, to gauge how accurate the
-                # table + anchor estimate remains vs a live measurement.
-                # Remove once the approach is validated.
-                # self._check_table_path_displacement(region_id, fov)
+                # Diagnostic audit (opt-in via the laser-AF settings dialog):
+                # before/after displacement around a full laser-AF correction at
+                # every table FOV, appended to table_path_audit.csv. Note it
+                # CORRECTS Z at audited FOVs (~300 ms each) — validation runs
+                # only, e.g. quantifying the table path's backlash-flank offset.
+                if self._laser_af_table_path_audit:
+                    if self._check_table_path_displacement(region_id, fov):
+                        self._last_af_status = "audit"
 
             self._last_region_id = region_id
 
@@ -4302,12 +4337,15 @@ class MultiPointWorker:
                 self._laser_af_check_last_fov_per_region
                 and is_last_fov_in_region
                 and self._region_refresh_count_this_entry == 1
+                # The audit just corrected this FOV, so the check would always
+                # measure ~0; table_path_audit.csv already holds the true error.
+                and self._last_af_status != "audit"
             ):
                 self._check_last_fov_displacement(region_id, fov)
         return True
 
-    # TEMPORARY: header for the per-FOV table-path audit CSV. Columns cover
-    # the before/after state around a full laser-AF correction so we can
+    # Header for the per-FOV table-path audit CSV (opt-in diagnostic). Columns
+    # cover the before/after state around a full laser-AF correction so we can
     # directly compare the table+anchor estimate to a live focus measurement.
     _TABLE_PATH_AUDIT_HEADER = [
         "timestamp",
@@ -4325,8 +4363,8 @@ class MultiPointWorker:
     ]
 
     def _check_table_path_displacement(self, region_id, fov):
-        """TEMPORARY: compare the table+anchor Z estimate against a full AF
-        correction at the same FOV.
+        """Opt-in diagnostic: compare the table+anchor Z estimate against a
+        full AF correction at the same FOV.
 
         Sequence at each non-anchor FOV:
           1. Measure displacement + cross-correlation at the table-predicted Z.
@@ -4335,11 +4373,16 @@ class MultiPointWorker:
           4. Append the before/after pair to
              `{experiment_path}/table_path_audit.csv` for offline analysis.
 
-        Remove once the approach is validated.
+        Enabled by the "table-path audit" checkbox in the laser-AF settings
+        dialog. `displacement_before_um` is the table path's true focus error
+        (drift + backlash flank) at the moment the FOV would have been imaged.
+
+        Returns True only when the corrective move_to_target succeeded (the
+        caller records af_status "audit" for corrected FOVs, "table" otherwise).
         """
         controller = self.laser_auto_focus_controller
         if controller is None:
-            return
+            return False
 
         # 1. Pre-correction audit — current stage is at the table-predicted Z.
         z_before = self.stage.get_pos().z_mm
@@ -4347,9 +4390,10 @@ class MultiPointWorker:
 
         # 2. Full laser-AF correction. Errors are caught so the audit
         #    continues even if the measurement path misfires on one FOV.
+        corrected = False
         try:
             with self._timing.get_timer("af:table_path_audit_full_af"):
-                controller.move_to_target(0)
+                corrected = bool(controller.move_to_target(0))
         except Exception:
             self._log.exception(
                 f"Table-path audit: move_to_target raised at region={region_id} fov={fov}"
@@ -4361,6 +4405,7 @@ class MultiPointWorker:
 
         # 4. Append row.
         self._append_table_path_audit_row(region_id, fov, z_before, before, z_after, after)
+        return corrected
 
     def _audit_laser_af_state(self, region_id, fov, phase):
         """Return {displacement_um, correlation, cc_ok} for the laser-AF
@@ -4467,9 +4512,16 @@ class MultiPointWorker:
         try:
             measured_ok = self.laser_auto_focus_controller.move_to_target(0)
         except Exception as e:
-            file_ID = f"{region_id}_focus_camera.bmp"
-            saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
-            iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
+            # Best-effort debug image — the per-timepoint folder may not exist
+            # (ZARR_V3 mode), and a raise here would skip the status/counter
+            # bookkeeping below.
+            try:
+                file_ID = f"{region_id}_focus_camera.bmp"
+                saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
+                utils.ensure_directory_exists(os.path.dirname(saving_path))
+                iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
+            except Exception:
+                self._log.exception("Failed to save laser-AF failure debug image")
             self._log.error(
                 f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed at region={region_id} fov={fov} !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
                 exc_info=e,
@@ -4495,6 +4547,11 @@ class MultiPointWorker:
 
         # Refresh failed (exception caught above or move_to_target returned False).
         self._laser_af_failures += 1
+        # Saturate the counter so the next FOV re-attempts a live refresh
+        # instead of riding stale data for a full cadence interval (a
+        # region-entry failure would otherwise leave the counter at 0/1).
+        # Applies to both failure branches below.
+        self._fovs_since_refresh[region_id] = self._laser_af_refresh_every_n_fovs
 
         # If we have a prior anchor and this FOV is in the table, silently apply
         # the table offset relative to the stale anchor and continue. Better than
@@ -4504,7 +4561,6 @@ class MultiPointWorker:
             target_z = self._region_anchor_z_current[region_id] + delta
             self.stage.move_z_to(target_z)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
-            self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
             self._log.warning(f"Laser-AF refresh failed at region={region_id} fov={fov}; using stale anchor + table offset")
             # Live read failed; Z came from the stale anchor + table, not a measurement.
             self._last_af_status = "stale"
@@ -4519,6 +4575,8 @@ class MultiPointWorker:
     # the pre-AF target Z; z_actual is the Z after correction (or after a failed
     # AF). af_status is one of: "ok" (live measurement), "stale" (live read failed,
     # fell back to stale anchor + table offset), "table" (no live read this FOV),
+    # "audit" (table FOV that got a full corrective AF via the table-path audit),
+    # "map" (contrast path: interpolated focus-map move, no sweep),
     # "failed" (no Z set), "skipped" (AF enabled but not performed this FOV).
     _AUTOFOCUS_LOG_HEADER = [
         "position_index",
@@ -4574,6 +4632,13 @@ class MultiPointWorker:
                 self._log.warning(f"Failed to save laser-AF characterization image: {e}")
 
         pos_after = self.stage.get_pos()
+        # Contrast AF has no _recompute_region_proposals equivalent, so seed the
+        # next timepoint's proposal with the FOCUSED z here — the pre-AF cache
+        # above would freeze every FOV at its t=0 arrival z ("prefer the focused
+        # Z from the previous timepoint" is the proposal's contract). The laser
+        # branch re-seats its own proposals on refresh success.
+        if not self.do_reflection_af and self.Nt > 1 and self._last_af_status in ("ok", "map"):
+            self._z_pos_proposal[(region_id, fov)] = pos_after.z_mm
         self._record_autofocus_event(
             position_index=fov,
             x_mm=pos_after.x_mm,

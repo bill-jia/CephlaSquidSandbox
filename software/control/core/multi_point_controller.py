@@ -550,6 +550,7 @@ class MultiPointController:
         self.laser_af_refresh_every_n_fovs = control._def.LASER_AF_REFRESH_EVERY_N_FOVS
         self.laser_af_consistency_threshold_um = control._def.LASER_AF_CONSISTENCY_THRESHOLD_UM
         self.laser_af_check_last_fov_per_region = control._def.LASER_AF_CHECK_LAST_FOV_PER_REGION
+        self.laser_af_table_path_audit = control._def.LASER_AF_TABLE_PATH_AUDIT
         # Override laser-AF fast-mode defaults with whatever the user last
         # configured via the settings dialog. Load is widget-agnostic so the
         # values carry regardless of which multipoint tab is in use.
@@ -787,6 +788,12 @@ class MultiPointController:
         self.laser_af_check_last_fov_per_region = bool(flag)
         self._save_laser_af_settings_to_cache()
 
+    def set_laser_af_table_path_audit(self, flag: bool):
+        """Enable/disable the diagnostic before/after AF audit at table FOVs.
+        Corrects Z at audited FOVs (~300 ms each) — validation runs only."""
+        self.laser_af_table_path_audit = bool(flag)
+        self._save_laser_af_settings_to_cache()
+
     # Dedicated cache for laser-AF fast-mode settings. Lives outside the
     # wellplate-widget-specific multipoint_widget_config.yaml so that changes
     # made via the dialog from *any* multipoint widget (Flexible, Wellplate,
@@ -801,6 +808,7 @@ class MultiPointController:
                 "laser_af_refresh_every_n_fovs": self.laser_af_refresh_every_n_fovs,
                 "laser_af_consistency_threshold_um": self.laser_af_consistency_threshold_um,
                 "laser_af_check_last_fov_per_region": self.laser_af_check_last_fov_per_region,
+                "laser_af_table_path_audit": self.laser_af_table_path_audit,
             }
             with open(self._LASER_AF_SETTINGS_CACHE_PATH, "w") as f:
                 yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
@@ -832,6 +840,8 @@ class MultiPointController:
                 pass
         if "laser_af_check_last_fov_per_region" in data:
             self.laser_af_check_last_fov_per_region = bool(data["laser_af_check_last_fov_per_region"])
+        if "laser_af_table_path_audit" in data:
+            self.laser_af_table_path_audit = bool(data["laser_af_table_path_audit"])
 
     def set_manual_focus_map_flag(self, flag):
         self.use_manual_focus_map = flag
@@ -1908,6 +1918,7 @@ class MultiPointController:
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
             laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
+            laser_af_table_path_audit=self.laser_af_table_path_audit,
             zarr_upload_enabled=self.zarr_upload_enabled,
             zarr_upload_remote_root=self.zarr_upload_remote_root,
             zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,

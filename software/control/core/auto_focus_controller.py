@@ -38,9 +38,10 @@ class AutoFocusController:
         self._image_to_display_fn = image_to_display_fn
         self.nl5: Optional[NL5] = nl5
 
-        # Start with "Reasonable" defaults.
+        # Start with "Reasonable" defaults. deltaZ is stored in mm
+        # (set_deltaZ takes µm) — keep the constructor default in mm too.
         self.N: int = 10
-        self.deltaZ: float = 1.524
+        self.deltaZ: float = 0.001524
         self.crop_width = control._def.AF.CROP_WIDTH
         self.crop_height = control._def.AF.CROP_HEIGHT
         self.autofocus_in_progress = False
