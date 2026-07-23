@@ -49,14 +49,20 @@ def test_decode_hdr16_underfilled_zero_pads():
     np.testing.assert_array_equal(out, expected)
 
 
-def test_decode_cms12_synthetic_pair():
-    """Two 12-bit pixels packed in three bytes (MSB first). Third byte is bits 11-4 of pixel 1."""
-    p0, p1 = 0xABC, 0x123
+def gvsp_pack_pair(p0: int, p1: int) -> bytes:
+    """GigE Vision Mono12Packed: middle byte holds p1's low nibble in its high
+    half and p0's low nibble in its low half (verified against Aries 6506 wire
+    data — the other nibble order inflates noise 1.5x, see decode_tucsen_cms12)."""
     b0 = (p0 >> 4) & 0xFF
-    b1 = ((p0 & 0xF) << 4) | (p1 & 0xF)
+    b1 = ((p1 & 0xF) << 4) | (p0 & 0xF)
     b2 = (p1 >> 4) & 0xFF
-    raw = bytes([b0, b1, b2])
-    out = decode_tucsen_cms12(raw, 1, 2)
+    return bytes([b0, b1, b2])
+
+
+def test_decode_cms12_synthetic_pair():
+    """Two 12-bit pixels packed in three bytes. Third byte is bits 11-4 of pixel 1."""
+    p0, p1 = 0xABC, 0x123
+    out = decode_tucsen_cms12(gvsp_pack_pair(p0, p1), 1, 2)
     assert out.shape == (1, 2)
     assert int(out[0, 0]) == p0
     assert int(out[0, 1]) == p1
@@ -75,31 +81,31 @@ def test_decode_cms12_underfilled_zero_pads():
 
 def test_decode_cms12_small_frame():
     h, w = 2, 2
-    n = 4
-    raw = bytearray((n * 3 + 1) // 2)
-    # four pixels: two pairs, 6 bytes
-    pairs = [(0x100, 0x200), (0x300, 0x400)]
-    i = 0
-    for p0, p1 in pairs:
-        raw[i] = (p0 >> 4) & 0xFF
-        raw[i + 1] = ((p0 & 0xF) << 4) | (p1 & 0xF)
-        raw[i + 2] = (p1 >> 4) & 0xFF
-        i += 3
-    out = decode_tucsen_cms12(bytes(raw), h, w)
-    assert int(out[0, 0]) == 0x100
-    assert int(out[0, 1]) == 0x200
-    assert int(out[1, 0]) == 0x300
-    assert int(out[1, 1]) == 0x400
+    # four pixels: two pairs, 6 bytes — low nibbles differ per pixel so a
+    # nibble-order regression cannot decode to the same values
+    raw = gvsp_pack_pair(0x101, 0x202) + gvsp_pack_pair(0x303, 0x404)
+    out = decode_tucsen_cms12(raw, h, w)
+    assert int(out[0, 0]) == 0x101
+    assert int(out[0, 1]) == 0x202
+    assert int(out[1, 0]) == 0x303
+    assert int(out[1, 1]) == 0x404
+
+
+def test_decode_cms12_odd_pixel_count():
+    """Odd H*W: the trailing lone pixel occupies two bytes, low nibble in the
+    second byte's low half."""
+    h, w = 1, 3
+    p0, p1, p2 = 0xABC, 0x123, 0xDEF
+    tail = bytes([(p2 >> 4) & 0xFF, p2 & 0xF])
+    out = decode_tucsen_cms12(gvsp_pack_pair(p0, p1) + tail, h, w)
+    assert [int(v) for v in out.ravel()] == [p0, p1, p2]
 
 
 def test_decode_hs11_matches_cms12():
     """HS (high-speed) frames decode identically to CMS12: 12-bit packed values, no shift."""
     h, w = 1, 2
     p0, p1 = 0x5AB, 0x123  # arbitrary 12-bit values
-    b0 = (p0 >> 4) & 0xFF
-    b1 = ((p0 & 0xF) << 4) | (p1 & 0xF)
-    b2 = (p1 >> 4) & 0xFF
-    raw = bytes([b0, b1, b2])
+    raw = gvsp_pack_pair(p0, p1)
     out = decode_tucsen_hs11(raw, h, w)
     assert int(out[0, 0]) == p0
     assert int(out[0, 1]) == p1
@@ -114,18 +120,10 @@ def test_decode_tucsen_raw_bytes_dispatch():
 
 
 def test_pack_roundtrip_cms12_hs11():
-    """Pack 12-bit pixels in CMS12 layout and decode via hs11 -> identity (no shift)."""
+    """Pack 12-bit pixels in Mono12Packed layout and decode via hs11 -> identity (no shift)."""
     h, w = 2, 2
     pixels = np.array([[100, 200], [300, 400]], dtype=np.uint16)  # 12-bit values
-    raw = bytearray((h * w * 3 + 1) // 2)
     flat = pixels.ravel()
-    i = 0
-    for j in range(0, len(flat), 2):
-        p0 = int(flat[j])
-        p1 = int(flat[j + 1])
-        raw[i] = (p0 >> 4) & 0xFF
-        raw[i + 1] = ((p0 & 0xF) << 4) | (p1 & 0xF)
-        raw[i + 2] = (p1 >> 4) & 0xFF
-        i += 3
-    out_hs = decode_tucsen_hs11(bytes(raw), h, w)
+    raw = b"".join(gvsp_pack_pair(int(flat[j]), int(flat[j + 1])) for j in range(0, len(flat), 2))
+    out_hs = decode_tucsen_hs11(raw, h, w)
     np.testing.assert_array_equal(out_hs, pixels)

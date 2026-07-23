@@ -218,7 +218,15 @@ def decode_tucsen_hdr16(raw: bytes, height: int, width: int) -> np.ndarray:
     return np.frombuffer(raw[:expected], dtype=np.uint16).reshape(height, width)
 
 def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
-    """Vectorized decoding of 12-bit pixels packed into 3 bytes."""
+    """Vectorized decoding of 12-bit pixels packed into 3 bytes (GigE Vision
+    Mono12Packed): b0 = p0 bits 11..4, b1 = (p1 low nibble << 4) | p0 low
+    nibble, b2 = p1 bits 11..4.
+
+    Layout verified against Aries 6506 wire data (2026-07-22 noise test):
+    swapping the middle-byte nibbles preserves pair sums, so images look
+    normal, but per-pixel noise inflates ~1.5x with a -0.5 within-pair
+    correlation — the signature that exposed the original swapped decode.
+    """
     n = height * width
     expected = (n * 3 + 1) // 2
     if len(raw) < expected:
@@ -241,8 +249,8 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
     out = np.empty((pairs, 2), dtype=np.uint16)
 
     # Perform the bitwise operations on all pixels at once
-    out[:, 0] = (b0 << 4) | (b1 >> 4)
-    out[:, 1] = (b2 << 4) | (b1 & 0x0F)
+    out[:, 0] = (b0 << 4) | (b1 & 0x0F)
+    out[:, 1] = (b2 << 4) | (b1 >> 4)
 
     # Flatten the array back to 1D
     out_flat = out.ravel()
@@ -252,7 +260,7 @@ def decode_tucsen_cms12(raw: bytes, height: int, width: int) -> np.ndarray:
         out_final = np.empty(n, dtype=np.uint16)
         out_final[:n-1] = out_flat
         i = pairs * 3
-        out_final[-1] = int.from_bytes(raw[i : i + 2], "little") & 0xFFF
+        out_final[-1] = (raw[i] << 4) | (raw[i + 1] & 0x0F)
         return out_final.reshape(height, width)
 
     return out_flat.reshape(height, width)
