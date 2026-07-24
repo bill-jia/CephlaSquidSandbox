@@ -1,9 +1,14 @@
 """Unit tests for Tucsen fast-acquisition raw byte unpacking."""
 
+import logging
+from types import SimpleNamespace
+
 import numpy as np
+import pytest
 
 from control.core.fast_acquisition_writer import FastAcquisitionWriter
 from control.camera_tucsen import (
+    TucsenCamera,
     camera_mode_name_to_packing,
     decode_tucsen_cms12,
     decode_tucsen_hdr16,
@@ -127,3 +132,97 @@ def test_pack_roundtrip_cms12_hs11():
     raw = b"".join(gvsp_pack_pair(int(flat[j]), int(flat[j + 1])) for j in range(0, len(flat), 2))
     out_hs = decode_tucsen_hs11(raw, h, w)
     np.testing.assert_array_equal(out_hs, pixels)
+
+
+# ---------------------------------------------------------------------------
+# Max acquisition frame rate (exposure-limited ceiling)
+# ---------------------------------------------------------------------------
+
+
+class _StubGenicamCamera:
+    """Stand-in exercising TucsenCamera's max-frame-rate arithmetic without a device.
+
+    Provides only what get_max_acquisition_frame_rate / _read_rate_and_readout touch; the
+    real methods are bound onto it so the tested code is the shipping code.
+    """
+
+    _read_rate_and_readout = TucsenCamera._read_rate_and_readout
+    get_max_acquisition_frame_rate = TucsenCamera.get_max_acquisition_frame_rate
+    _update_readout_period = TucsenCamera._update_readout_period
+
+    def __init__(self, max_rate_hz, live_exposure_ms, is_genicam=True, exposure_readable=True):
+        self._max_rate_hz = max_rate_hz
+        self._live_exposure_ms = live_exposure_ms
+        self._exposure_readable = exposure_readable
+        self._model_properties = SimpleNamespace(is_genicam=is_genicam)
+        self._max_acquisition_rate_hz = max_rate_hz
+        self._readout_period_ms = 0.0
+        self._log = logging.getLogger("stub_tucsen")
+
+    def _get_genicam_parameter(self, name):
+        if name == "AcquisitionMaxFrameRate":
+            return {"value": self._max_rate_hz}
+        if name == "ExposureTime":
+            if not self._exposure_readable:
+                raise RuntimeError("node unreadable")
+            return {"value": self._live_exposure_ms * 1000.0}  # SDK reports microseconds
+        raise KeyError(name)
+
+
+# Bill's rig data point: 562 Hz reported at ~0.53 ms exposure => readout ~1.2494 ms.
+_LIVE_RATE_HZ = 562.0
+_LIVE_EXPOSURE_MS = 0.53
+_READOUT_MS = 1000.0 / _LIVE_RATE_HZ - _LIVE_EXPOSURE_MS
+
+
+def test_max_frame_rate_without_exposure_is_the_raw_node_value():
+    """No exposure argument -> the camera's own reading, at its current live exposure."""
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, _LIVE_EXPOSURE_MS)
+    assert cam.get_max_acquisition_frame_rate() == pytest.approx(_LIVE_RATE_HZ)
+
+
+def test_max_frame_rate_at_live_exposure_round_trips():
+    """Evaluating at the exposure the camera is already using reproduces the node value."""
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, _LIVE_EXPOSURE_MS)
+    assert cam.get_max_acquisition_frame_rate(_LIVE_EXPOSURE_MS) == pytest.approx(_LIVE_RATE_HZ)
+
+
+def test_max_frame_rate_uses_fast_acquisition_exposure_not_live():
+    """A short fast-acquisition exposure raises the ceiling even while live sits at 0.53 ms."""
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, _LIVE_EXPOSURE_MS)
+    fast_exposure_ms = 0.05
+    expected = 1000.0 / (fast_exposure_ms + _READOUT_MS)
+    assert cam.get_max_acquisition_frame_rate(fast_exposure_ms) == pytest.approx(expected)
+    # ...and a longer fast exposure lowers it, monotonically.
+    assert cam.get_max_acquisition_frame_rate(5.0) < cam.get_max_acquisition_frame_rate(1.0)
+
+
+def test_max_frame_rate_falls_back_when_exposure_unreadable():
+    """Never back-calculate from the stale exposure cache: report the raw node value instead."""
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, _LIVE_EXPOSURE_MS, exposure_readable=False)
+    assert cam.get_max_acquisition_frame_rate(0.05) == pytest.approx(_LIVE_RATE_HZ)
+
+
+def test_max_frame_rate_falls_back_when_readout_non_positive():
+    """Model violation (exposure >= frame period) must not produce an impossible ceiling."""
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, live_exposure_ms=1000.0 / _LIVE_RATE_HZ + 1.0)
+    assert cam.get_max_acquisition_frame_rate(0.05) == pytest.approx(_LIVE_RATE_HZ)
+
+
+def test_max_frame_rate_non_genicam_ignores_exposure():
+    cam = _StubGenicamCamera(120.0, _LIVE_EXPOSURE_MS, is_genicam=False)
+    assert cam.get_max_acquisition_frame_rate(0.05) == pytest.approx(120.0)
+
+
+def test_update_readout_period_caches_readout_and_clamp():
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, _LIVE_EXPOSURE_MS)
+    cam._update_readout_period()
+    assert cam._readout_period_ms == pytest.approx(_READOUT_MS)
+    assert cam._max_acquisition_rate_hz == pytest.approx(_LIVE_RATE_HZ)
+
+
+def test_update_readout_period_unsets_on_bad_model():
+    cam = _StubGenicamCamera(_LIVE_RATE_HZ, live_exposure_ms=1000.0 / _LIVE_RATE_HZ + 1.0)
+    cam._readout_period_ms = 9.9
+    cam._update_readout_period()
+    assert cam._readout_period_ms == 0.0

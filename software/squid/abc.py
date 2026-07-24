@@ -987,10 +987,14 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         return False
 
-    def get_max_acquisition_frame_rate(self) -> Optional[float]:
+    def get_max_acquisition_frame_rate(self, exposure_time_ms: Optional[float] = None) -> Optional[float]:
         """
         Camera-reported maximum acquisition frame rate (Hz) for the current
         ROI / binning / camera mode, or None if this camera cannot report one.
+
+        On sensors whose maximum is exposure-limited, the default is the ceiling at the
+        camera's current exposure; pass exposure_time_ms to get the ceiling at that
+        exposure instead (fast acquisition drives its own exposure, not the live one).
         """
         return None
 

@@ -63,15 +63,27 @@ Modes map to `CameraReadoutMode`: `ROLLING` ↔ `"Rolling"`, `ROLLING_WITH_GLOBA
 
 ## Max frame rate readout
 
-The "max N Hz" label beside the frame-rate spinbox shows the camera's reported
+The "max N Hz" label beside the frame-rate spinbox comes from the camera's reported
 `AcquisitionMaxFrameRate` — the **same GenICam node used in the streaming log messages**, read
-fresh so the label always matches the camera's current state. On the Aries this is
-`≈ 1/(exposure + readout)` (manual §3.13), so it reflects the current exposure / ROI / mode.
-The label turns red when the requested frame rate exceeds it.
+fresh so it always reflects the current ROI / binning / camera mode. The label turns red when
+the requested frame rate exceeds it.
 
-(The separate exposure-independent readout time used for the exposure-window overlay is still
-derived in `camera_tucsen.py: _update_readout_period` / `get_readout_time_ms`, by reading
-`AcquisitionMaxFrameRate` and `ExposureTime` fresh together and subtracting.)
+On the Aries that node is **exposure-limited**: `≈ 1/(exposure + readout)` (manual §3.13). Read
+as-is it would answer "at whatever exposure the live view happens to be using" — which is the
+wrong question here, because fast acquisition drives the camera at the **Exposure Time set in
+this panel**, not the live one. So the label is evaluated at the panel's exposure:
+`get_max_acquisition_frame_rate(exposure_time_ms=...)` backs the exposure-independent readout
+out of the live pair (`readout = 1/AcquisitionMaxFrameRate − live exposure`, both read fresh
+and back to back by `_read_rate_and_readout`) and re-applies it at the requested exposure. It
+updates as you change the exposure spinbox, and falls back to the raw node value if the readout
+can't be determined (exposure node unreadable, or a non-positive result).
+
+Reading exposure **fresh** rather than from `self._exposure_time_ms` is load-bearing: a mode/ROI
+change resets the camera's exposure while that cache still holds the old value, and
+over-subtracting there is what produced the impossible ~4000 Hz ceiling in an earlier revision.
+
+The same `_read_rate_and_readout` back-calc feeds `_update_readout_period` / `get_readout_time_ms`,
+which supplies the readout skew for the exposure-window overlay.
 
 ## Interactive zoom / pan
 

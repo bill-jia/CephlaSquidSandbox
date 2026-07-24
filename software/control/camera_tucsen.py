@@ -1679,21 +1679,32 @@ class TucsenCamera(AbstractCamera):
         else:
             return self._trigger_attr.nFrameRate
 
-    def get_max_acquisition_frame_rate(self) -> Optional[float]:
+    def get_max_acquisition_frame_rate(self, exposure_time_ms: Optional[float] = None) -> Optional[float]:
         """The camera's reported max acquisition frame rate (Hz) — the SAME AcquisitionMaxFrameRate
         GenICam node used in the streaming log messages, read fresh so the value always matches
         the camera's current state (it reflects the current exposure / ROI / mode). Non-genicam
-        models return their cached/default value."""
+        models return their cached/default value.
+
+        Because that node is exposure-limited (≈1/(exposure + readout), Aries manual §3.13), the
+        no-argument form answers "at the exposure the camera is set to RIGHT NOW". Pass
+        exposure_time_ms to get the ceiling that would apply at THAT exposure instead: the
+        exposure-independent readout is backed out of the live (rate, exposure) pair and
+        re-applied. Fast acquisition drives the camera at its own exposure setting rather than
+        the live one, so its readout passes that value here. Falls back to the raw node value
+        when the readout can't be determined."""
         if not self._model_properties.is_genicam:
             return self._max_acquisition_rate_hz
         try:
             # Read-only for the label; do NOT write self._max_acquisition_rate_hz (that cache
             # is the internal frame-rate clamp, maintained by _update_readout_period /
             # start_fast_acquisition) so a UI poll can't perturb the clamp value.
-            return self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
+            rate_hz, readout_ms = self._read_rate_and_readout(with_readout=exposure_time_ms is not None)
         except Exception as e:
             self._log.debug(f"Could not read AcquisitionMaxFrameRate: {e}")
             return self._max_acquisition_rate_hz
+        if exposure_time_ms is None or exposure_time_ms <= 0.0 or readout_ms is None:
+            return rate_hz
+        return 1000.0 / (exposure_time_ms + readout_ms)
 
     def get_exposure_limits(self) -> Tuple[float, float]:
         if self._model_properties.is_genicam:
@@ -1994,38 +2005,42 @@ class TucsenCamera(AbstractCamera):
             self._byte_decoding_fn = self._build_byte_decoding_fn(packing)
             self.update_config_crop()
 
-    def _update_readout_period(self):
-        """Isolate the exposure-INDEPENDENT sensor readout period from the camera's
-        AcquisitionMaxFrameRate node. Per the Aries manual (§3.13), the max frame rate is
-        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure. This feeds
-        get_readout_time_ms() for the exposure-window / strobe-timing visualization (the UI
-        max-frame-rate label reads AcquisitionMaxFrameRate directly, not this).
+    def _read_rate_and_readout(self, with_readout: bool = True) -> Tuple[float, Optional[float]]:
+        """Read AcquisitionMaxFrameRate and, when with_readout, ExposureTime — FRESH from the
+        nodes, back to back so the two correspond — and back out the exposure-INDEPENDENT
+        sensor readout period. Per the Aries manual (§3.13) the max frame rate is
+        1/(exposure + readout), so readout = 1/AcquisitionMaxFrameRate - exposure.
 
-        Both AcquisitionMaxFrameRate and ExposureTime are read FRESH from the nodes here,
-        back to back, so they correspond. Using the cached self._exposure_time_ms instead
-        was the bug behind the ~4000 Hz readouts: a mode/ROI change resets the camera's
-        exposure while the cache still held the old (larger) value, so 1/AMFR - stale_exp
-        over-subtracted and inflated the ceiling. Reading exposure fresh removes that skew;
-        because readout is exposure-independent, the cached result stays correct afterward."""
+        Returns (max_frame_rate_hz, readout_ms); readout_ms is None when it could not be
+        determined (exposure unreadable, or a non-positive result that violates the model).
+
+        Reading exposure FRESH rather than using the cached self._exposure_time_ms is
+        load-bearing: it was the bug behind the ~4000 Hz readouts, because a mode/ROI change
+        resets the camera's exposure while the cache still holds the old (larger) value, so
+        1/AMFR - stale_exp over-subtracts and inflates the ceiling. A failed exposure read
+        must therefore report None, never fall back to that cache. Raises if the frame-rate
+        node itself can't be read."""
         v = self._get_genicam_parameter("AcquisitionMaxFrameRate")["value"]
-        self._max_acquisition_rate_hz = v
-        if not v or v <= 0.0:
-            self._readout_period_ms = 0.0
-            return
+        if not with_readout or not v or v <= 0.0:
+            return v, None
         try:
             e_ms = self._get_genicam_parameter("ExposureTime")["value"] / 1000.0  # us -> ms
         except Exception as e:
-            # If exposure can't be read fresh, do NOT fall back to the (possibly stale) cache —
-            # that stale value is exactly what inflated the ceiling before. Leave the readout
-            # unset so the UI uses the raw camera max until the next successful update.
             self._log.debug(f"Could not read ExposureTime for readout back-calc: {e}")
-            self._readout_period_ms = 0.0
-            return
+            return v, None
         readout_ms = 1000.0 / v - e_ms
-        # readout must be a positive fraction of the frame period; if the model is violated
-        # (readout <= 0), leave it unset so get_max_acquisition_frame_rate falls back to the
-        # raw node value rather than reporting an impossible ceiling.
-        self._readout_period_ms = readout_ms if readout_ms > 0.0 else 0.0
+        return v, (readout_ms if readout_ms > 0.0 else None)
+
+    def _update_readout_period(self):
+        """Refresh the cached exposure-independent readout period (and the internal frame-rate
+        clamp) from the camera. Feeds get_readout_time_ms() for the exposure-window /
+        strobe-timing visualization. Because readout is exposure-independent, the cached
+        result stays correct until the ROI / binning / camera mode changes."""
+        v, readout_ms = self._read_rate_and_readout()
+        self._max_acquisition_rate_hz = v
+        # Leave the readout unset when it can't be determined, so get_readout_time_ms falls
+        # back to the geometric estimate rather than reporting an impossible value.
+        self._readout_period_ms = readout_ms if readout_ms else 0.0
 
     def get_readout_time_ms(self) -> float:
         """Exposure-independent sensor readout time (rolling-shutter row-0-to-last-row skew)

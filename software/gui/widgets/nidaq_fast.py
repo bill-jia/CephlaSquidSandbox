@@ -2351,11 +2351,9 @@ class FastAcquisitionWidget(QWidget):
         self._finalize_timer.timeout.connect(self._poll_finalize)
         self._finalize_timer.setInterval(300)
 
-        # Poll the camera's cached max frame rate so the label tracks ROI /
-        # binning / camera-mode changes made anywhere in the GUI (camera
-        # settings tab, observation-state loads, ...). The camera refreshes
-        # its cache on every such change, so this poll reads an attribute —
-        # no SDK traffic.
+        # Poll the camera's max frame rate so the label tracks ROI / binning / camera-mode /
+        # shutter changes made anywhere in the GUI (camera settings tab, observation-state
+        # loads, ...). Each poll is a couple of GenICam reads, skipped while acquiring.
         self._max_frame_rate_timer = QTimer(self)
         self._max_frame_rate_timer.timeout.connect(self._refresh_max_frame_rate)
         self._max_frame_rate_timer.start(500)
@@ -2429,8 +2427,9 @@ class FastAcquisitionWidget(QWidget):
         self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
         self.max_frame_rate_label = QLabel("")
         self.max_frame_rate_label.setToolTip(
-            "Readout-limited maximum frame rate for the current ROI, binning and camera mode. "
-            "This is the fixed sensor ceiling (independent of exposure time)."
+            "Camera-reported maximum frame rate for the current ROI, binning and camera mode, "
+            "evaluated at the fast-acquisition Exposure Time set here (not the live exposure). "
+            "The sensor limit is ~1 / (exposure + readout), so it moves with this exposure."
         )
         frame_rate_cell = QHBoxLayout()
         frame_rate_cell.setSpacing(4)
@@ -2443,6 +2442,8 @@ class FastAcquisitionWidget(QWidget):
         self.exposure_time_spinbox.setRange(0.1, 10000.0)
         self.exposure_time_spinbox.setValue(20.0)
         self.exposure_time_spinbox.setDecimals(2)
+        # The reported ceiling is 1/(exposure + readout), so it tracks this spinbox.
+        self.exposure_time_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
         acq_layout.addWidget(self.exposure_time_spinbox, 0, 3)
 
         self._update_max_exposure_time()
@@ -2678,6 +2679,10 @@ class FastAcquisitionWidget(QWidget):
         read fresh so it matches the camera's current state. Turns red when the requested
         frame rate exceeds it. Cameras that cannot report a maximum show nothing.
 
+        That maximum is exposure-limited, and fast acquisition drives the camera at THIS
+        panel's exposure setting rather than the live one — so the ceiling is evaluated at the
+        exposure spinbox's value, not at whatever the live view happens to be using.
+
         Also polled here (on the same 500 ms timer): pick up a shutter-mode change made in the
         live Camera Settings block and refresh the exposure overlay, since that mode is no
         longer set from this panel.
@@ -2687,7 +2692,9 @@ class FastAcquisitionWidget(QWidget):
         if self._is_acquiring:
             return
         try:
-            max_rate_hz = self.camera.get_max_acquisition_frame_rate()
+            max_rate_hz = self.camera.get_max_acquisition_frame_rate(
+                exposure_time_ms=self.exposure_time_spinbox.value()
+            )
         except Exception as e:
             self._log.debug(f"Failed to read max acquisition frame rate: {e}")
             max_rate_hz = None
