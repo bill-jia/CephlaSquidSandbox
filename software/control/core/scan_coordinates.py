@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import math
 import re
-from typing import Callable, List, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -9,6 +9,87 @@ import control._def
 from control.core.objective_store import ObjectiveStore
 from squid.abc import AbstractStage, AbstractCamera
 import squid.logging
+
+
+# A region id is not just a label: it is used verbatim as
+#   * a directory name in the zarr tree (``zarr/{region_id}/fov_N.ome.zarr``),
+#   * the leading token of every saved image filename (``{region_id}_{fov}_{z}.tiff``),
+#   * the ``region`` column of coordinates.csv and the per-region sidecar CSVs,
+#   * the key of every per-region dict (scan order, per-point channels, laser-AF refs).
+# So a user-supplied name has to be a unique, filesystem-safe path component or the
+# acquisition would merge two regions into one or write outside the experiment folder.
+REGION_NAME_MAX_LENGTH = 48
+_REGION_NAME_ILLEGAL_CHARS = '<>:"/\\|?*'
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def normalize_region_name(name) -> str:
+    """Canonical form of a user-typed region name (surrounding whitespace dropped)."""
+    return str(name).strip()
+
+
+def validate_region_name(name, existing_names: Iterable[str] = ()) -> Optional[str]:
+    """Return why ``name`` is unusable as a region id, or ``None`` if it is fine.
+
+    ``existing_names`` are the *other* regions in the same acquisition. Uniqueness is
+    checked case-insensitively: names differing only in case are distinct dict keys but
+    collide as directory names on Windows (and as well ids, which are upper-cased before
+    the HCS plate path is built), which would silently overwrite one region's data.
+    """
+    candidate = normalize_region_name(name)
+    if not candidate:
+        return "Region name cannot be empty."
+    if len(candidate) > REGION_NAME_MAX_LENGTH:
+        return f"Region name is too long (max {REGION_NAME_MAX_LENGTH} characters)."
+    bad = sorted({c for c in candidate if c in _REGION_NAME_ILLEGAL_CHARS})
+    if bad:
+        return (
+            f"Region name cannot contain {' '.join(bad)} — it is used as a folder name "
+            "and image filename prefix."
+        )
+    if any(ord(c) < 32 for c in candidate):
+        return "Region name cannot contain control characters."
+    if candidate.endswith("."):
+        # Windows silently strips trailing dots from path components.
+        return "Region name cannot end with '.'."
+    if candidate.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        return f"'{candidate}' is a reserved device name on Windows."
+    folded = candidate.casefold()
+    for other in existing_names:
+        if normalize_region_name(other).casefold() == folded:
+            return f"Region name '{candidate}' is already used by another region."
+    return None
+
+
+def validate_region_names(names: Iterable[str]) -> Optional[str]:
+    """Validate a whole set of region names; returns the first problem, or ``None``."""
+    accepted: List[str] = []
+    for name in names:
+        error = validate_region_name(name, accepted)
+        if error:
+            return error
+        accepted.append(normalize_region_name(name))
+    return None
+
+
+def _rekey_preserving_order(mapping: dict, old_key, new_key) -> None:
+    """Replace ``old_key`` with ``new_key`` without moving the entry to the end.
+
+    Dict insertion order is the scan order for the per-region dicts, so a plain
+    ``d[new] = d.pop(old)`` would quietly re-order the acquisition.
+    """
+    if old_key not in mapping:
+        return
+    items = [((new_key if k == old_key else k), v) for k, v in mapping.items()]
+    mapping.clear()
+    mapping.update(items)
 
 
 @dataclass
@@ -458,13 +539,46 @@ class ScanCoordinates:
             # self._log.info(f"Removed Region: {well_id}")
             self._update_callback(RemovedScanCoordinateRegion(fov_centers=removed_fov_centers))
 
+    def _region_maps(self) -> Tuple[dict, ...]:
+        """Every dict keyed by region id. Anything that adds one must list it here."""
+        return (
+            self.region_centers,
+            self.region_shapes,
+            self.region_fov_coordinates,
+            self.region_laser_af_references,
+            self.region_fov_rows,
+            self.region_generation_params,
+        )
+
+    def rename_region(self, old_id, new_id) -> bool:
+        """Rename a region, keeping its slot in the scan order.
+
+        Every per-region map is rekeyed in place. Missing one is not cosmetic:
+        a stale ``region_generation_params`` entry makes ``regenerate_for_fov``
+        (run at acquisition start) re-create the region under its old name, so the
+        run would scan the same coordinates twice under two different names.
+
+        Returns False if ``old_id`` is unknown; raises ValueError if ``new_id`` is taken.
+        """
+        old_id = str(old_id)
+        new_id = str(new_id)
+        if old_id == new_id:
+            return True
+        if old_id not in self.region_centers:
+            self._log.warning(f"Cannot rename unknown region '{old_id}'")
+            return False
+        if new_id in self.region_centers:
+            raise ValueError(f"Region '{new_id}' already exists.")
+
+        for mapping in self._region_maps():
+            _rekey_preserving_order(mapping, old_id, new_id)
+
+        self._log.info(f"Renamed region '{old_id}' -> '{new_id}'")
+        return True
+
     def clear_regions(self):
-        self.region_centers.clear()
-        self.region_shapes.clear()
-        self.region_fov_rows.clear()
-        self.region_fov_coordinates.clear()
-        self.region_laser_af_references.clear()
-        self.region_generation_params.clear()
+        for mapping in self._region_maps():
+            mapping.clear()
         self._update_callback(ClearedScanCoordinates())
         self._log.debug("Cleared All Regions")
 

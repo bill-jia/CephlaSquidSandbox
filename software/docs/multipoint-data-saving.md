@@ -246,6 +246,12 @@ Layout differs by save mode:
 
 Additionally, `coordinates.csv` records the stage position for each FOV at the experiment root. Non-ZARR modes also write a per-timepoint copy alongside the images.
 
+### Region Names
+
+`region_id` is a well id (`A1`) for wellplate scans, and on the Flexible Multipoint tab an auto-assigned `R{n}` that the user may rename to anything meaningful (see [the user guide](user_guides/multipoint.md#naming-regions)). It is not just a label — it is a path component (`zarr/{region_id}/`, `plate.ome.zarr/{row}/{col}/`) and the image filename prefix, so it must be a unique, filesystem-safe string. `control.core.scan_coordinates.validate_region_name` defines the rules; the GUI enforces them on every edit/import, and `MultiPointController.validate_acquisition_settings` re-checks the whole set at acquisition start so headless and SiLA entry points are covered too.
+
+Renaming goes through `ScanCoordinates.rename_region`, which rekeys **every** per-region map in place. Order matters: dict insertion order is the scan order, and a stale `region_generation_params` key would make the acquisition-start re-tile (`regenerate_for_fov`) resurrect the region under its old name and scan it twice.
+
 ### Zarr-Embedded Timestamps
 
 For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zarr array inside each FOV group (shape `(T, C, Z)`, dtype `float64`, Unix seconds). This makes the zarr store fully self-describing — downstream consumers can read timestamps with the same stack of tools that reads the image data. The root-level `acquisition_times.csv` covers the same ground in human-readable form.

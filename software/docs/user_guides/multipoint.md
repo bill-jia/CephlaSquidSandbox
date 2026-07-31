@@ -369,13 +369,39 @@ Click‑to‑Move), then manage the list with these buttons:
 
 | Button / action | Effect |
 |---|---|
-| **Add** (or the `;` key, or Ctrl+A) | Add the current stage X/Y/Z as a new position (region `R1`, `R2`, …). Duplicate X/Y positions are rejected. |
+| **Add** (or the `;` key, or Ctrl+A) | Add the current stage X/Y/Z as a new position (region `R0`, `R1`, …). Duplicate X/Y positions are rejected. |
 | **Remove** | Remove the position currently selected in the **Location List** dropdown. |
 | **Next** | Advance the selection to the next position and move the stage there. |
 | **Clear** | Remove all positions. |
-| **Location List** (dropdown) | Lists every saved position as `x … mm  y … mm  z … µm`; selecting one moves the stage there. |
+| **Location List** (dropdown) | Lists every saved position as `<region name> \| x … mm  y … mm  z … µm`; selecting one moves the stage there. |
 | **Update Z** | Overwrite the selected position's Z with the current stage Z. |
 | **Update Ref** | Re‑capture the laser‑AF reference (focus target) for the selected position. Only shown on rigs with the laser‑focus camera; see [Per‑region laser autofocus references](#per-region-laser-autofocus-references). |
+
+### Naming regions
+
+Auto‑assigned names (`R0`, `R1`, …) can be replaced with anything meaningful — `liver
+section`, `tumor_1`, `day3 rep2`. Open **Edit** and type a new value in the **Region
+Name** column (or set the `ID` column of an imported CSV).
+
+The name you choose is what appears everywhere downstream:
+
+- the `region` column of `coordinates.csv`;
+- the `positions` list in `acquisition.yaml`;
+- `region_observation_states.csv` and `region_laser_af_references.csv`;
+- the image filename prefix, `<region>_<fov>_<z>.tiff`;
+- the zarr folder for the region, `zarr/<region>/fov_<n>.ome.zarr`.
+
+Because a name is a folder name and a dict key, not just a label, it must be a safe,
+unique path component. A rename is rejected (with an explanation, leaving the previous
+name in place) when it is empty, longer than 48 characters, contains `< > : " / \ | ? *`
+or a control character, ends with `.`, is a Windows reserved device name (`CON`, `NUL`,
+`COM1`, …), or matches another region's name ignoring case — `sample` and `Sample` would
+be the same folder on Windows. Renames are also refused while an acquisition is running,
+since the worker took its region names when the run started. Names loaded from a CSV or
+YAML that fail these rules are replaced with a fresh `R{n}` and a warning in the log.
+
+An accepted rename carries the region's per‑point channel selection, laser‑AF reference,
+and focus‑map points with it, and leaves the scan order unchanged.
 
 ### Import / export / edit
 
@@ -389,10 +415,11 @@ Click‑to‑Move), then manage the list with these buttons:
   reference, a companion `<name>.laser_af.json` sidecar is written alongside the CSV
   holding the full references (including the cross‑correlation crop image) so the export
   round‑trips exactly. Keep the sidecar next to the CSV to re‑import references.
-- **Edit** — open the position list as an editable table (columns x, y, z, ID, and a
-  read‑only **AF Ref**); edit a cell to move/rename that position, click a row to select
-  it. The **AF Ref** column shows each region's stored laser‑AF spot position, or `—`
-  when none is set.
+- **Edit** — open the position list as an editable table (columns x, y, z, **Region
+  Name**, and a read‑only **AF Ref**); edit x/y/z to move that position or the name to
+  rename it (see [Naming regions](#naming-regions)), click a row to select it. The **AF
+  Ref** column shows each region's stored laser‑AF spot position, or `—` when none is
+  set.
 
 ### Per‑position tile grid
 

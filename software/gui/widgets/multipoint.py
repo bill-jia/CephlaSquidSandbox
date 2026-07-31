@@ -11,6 +11,7 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
+from control.core.scan_coordinates import normalize_region_name, validate_region_name
 from control.models import LaserAFReference
 
 
@@ -2674,8 +2675,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.setAcceptDrops(True)
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.acquisition_start_time = None
-        self.last_used_locations = None
-        self.last_used_location_ids = None
         self.stage = stage
         self.microscope = microscope
         self._enable_laser_autofocus = bool(
@@ -2690,7 +2689,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.performance_mode = False
         self.base_path_is_set = False
         self.location_list = np.empty((0, 3), dtype=float)
-        self.location_ids = np.empty((0,), dtype="<U20")
+        # dtype=object, not a fixed-width unicode dtype: a "<U20" array silently
+        # truncates a longer user-typed region name on assignment, which would
+        # de-synchronise the table from the scanCoordinates keys.
+        self.location_ids = np.empty((0,), dtype=object)
         self.use_overlap = USE_OVERLAP_FOR_FLEXIBLE
         self.add_components()
         self.setup_layout()
@@ -2726,8 +2728,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.btn_next = QPushButton("Next")
         self.btn_clear = QPushButton("Clear")
 
-        self.btn_load_last_executed = QPushButton("Prev Used Locations")
-
         self.btn_export_locations = QPushButton("Export Location List")
         self.btn_import_locations = QPushButton("Import Location List")
         self.btn_show_table_location_list = QPushButton("Edit")  # Open / Edit
@@ -2736,8 +2736,15 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # the per-region laser-AF focus target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
         self.table_location_list.setColumnCount(5)
-        header_labels = ["x", "y", "z", "ID", "AF Ref"]
+        header_labels = ["x", "y", "z", "Region Name", "AF Ref"]
         self.table_location_list.setHorizontalHeaderLabels(header_labels)
+        self.table_location_list.setWindowTitle("Location List")
+        self.table_location_list.setToolTip(
+            "Edit x/y/z to move a position, or the Region Name to rename it.\n"
+            "Region names are written to coordinates.csv, acquisition.yaml and the\n"
+            "per-region sidecars, and are used as the image filename prefix and\n"
+            "zarr folder name — so they must be unique and filesystem-safe."
+        )
         self.btn_update_z = QPushButton("Update Z")
         # Re-capture the laser-AF reference for the currently selected region.
         # Hidden when the rig has no focus camera.
@@ -3236,7 +3243,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.btn_previous.clicked.connect(self.previous)
         self.btn_next.clicked.connect(self.next)
         self.btn_clear.clicked.connect(self.clear)
-        self.btn_load_last_executed.clicked.connect(self.load_last_used_locations)
         self.btn_export_locations.clicked.connect(self.export_location_list)
         self.btn_import_locations.clicked.connect(self.import_location_list)
 
@@ -3359,14 +3365,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def update_z(self):
         z_mm = self.stage.get_pos().z_mm
         index = self.dropdown_location_list.currentIndex()
+        region_id = str(self.location_ids[index])
         self.location_list[index, 2] = z_mm
-        self.scanCoordinates.region_centers[self.location_ids[index]][2] = z_mm
-        self.scanCoordinates.region_fov_coordinates[self.location_ids[index]] = [
-            (coord[0], coord[1], z_mm)
-            for coord in self.scanCoordinates.region_fov_coordinates[self.location_ids[index]]
+        self.scanCoordinates.region_centers[region_id][2] = z_mm
+        self.scanCoordinates.region_fov_coordinates[region_id] = [
+            (coord[0], coord[1], z_mm) for coord in self.scanCoordinates.region_fov_coordinates[region_id]
         ]
-        location_str = f"x:{round(self.location_list[index,0],3)} mm  y:{round(self.location_list[index,1],3)} mm  z:{round(z_mm * 1000.0,3)} μm"
-        self.dropdown_location_list.setItemText(index, location_str)
+        # Keep the stored generation params in step, or the acquisition-start re-tile
+        # (regenerate_for_fov) would rebuild the region at the Z it was added with.
+        params = self.scanCoordinates.region_generation_params.get(region_id)
+        if params is not None and "center_z" in params:
+            params["center_z"] = z_mm
+        self._refresh_location_label(index)
 
     def update_Nz(self):
         z_min = self.entry_minZ.value()
@@ -3705,45 +3715,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # This must eventually propagate through and call out acquisition_finished.
             self.multipointController.request_abort_acquisition()
 
-    def load_last_used_locations(self):
-        if self.last_used_locations is None or len(self.last_used_locations) == 0:
-            return
-        self.clear_only_location_list()
+    @staticmethod
+    def _location_label(name, x, y, z):
+        """Text for a row of the Location List dropdown.
 
-        for row, row_ind in zip(self.last_used_locations, self.last_used_location_ids):
-            x = row[0]
-            y = row[1]
-            z = row[2]
-            name = row_ind[0]
-            if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
-                location_str = (
-                    "x:" + str(round(x, 3)) + "mm  y:" + str(round(y, 3)) + "mm  z:" + str(round(1000 * z, 1)) + "μm"
-                )
-                self.dropdown_location_list.addItem(location_str)
-                self.location_list = np.vstack((self.location_list, [[x, y, z]]))
-                self.location_ids = np.append(self.location_ids, name)
-                self.table_location_list.insertRow(self.table_location_list.rowCount())
-                self.table_location_list.setItem(
-                    self.table_location_list.rowCount() - 1, 0, QTableWidgetItem(str(round(x, 3)))
-                )
-                self.table_location_list.setItem(
-                    self.table_location_list.rowCount() - 1, 1, QTableWidgetItem(str(round(y, 3)))
-                )
-                self.table_location_list.setItem(
-                    self.table_location_list.rowCount() - 1, 2, QTableWidgetItem(str(round(z * 1000, 1)))
-                )
-                self.table_location_list.setItem(self.table_location_list.rowCount() - 1, 3, QTableWidgetItem(name))
-                self.table_location_list.setItem(
-                    self.table_location_list.rowCount() - 1,
-                    4,
-                    self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name)),
-                )
-                index = self.dropdown_location_list.count() - 1
-                self.dropdown_location_list.setCurrentIndex(index)
-                print(self.location_list)
-            else:
-                print("Duplicate values not added based on x and y.")
-                # to-do: update z coordinate
+        Leads with the region name so a rename is visible without opening the table
+        (the dropdown is the only always-visible view of the position list).
+        """
+        return f"{name}  |  x:{round(x, 3)} mm  y:{round(y, 3)} mm  z:{round(z * 1000, 1)} μm"
+
+    def _refresh_location_label(self, row):
+        """Re-render the dropdown entry for ``row`` from location_list/location_ids."""
+        x, y, z = self.location_list[row]
+        self.dropdown_location_list.setItemText(row, self._location_label(self.location_ids[row], x, y, z))
 
     def _next_region_id(self):
         """Return the smallest unused 'R{n}' region id.
@@ -3828,8 +3812,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.location_ids = np.append(self.location_ids, region_id)
 
             # Update both UI elements at the same time
-            location_str = f"x:{round(x,3)} mm  y:{round(y,3)} mm  z:{round(z*1000,1)} μm"
-            self.dropdown_location_list.addItem(location_str)
+            self.dropdown_location_list.addItem(self._location_label(region_id, x, y, z))
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
             self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
@@ -3882,8 +3865,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         index = self.dropdown_location_list.currentIndex()
         if index >= 0:
             # Remove region ID and associated data
-            region_id = self.location_ids[index]
-            print(f"Removing region: {region_id}")
+            region_id = str(self.location_ids[index])
+            self._log.info(f"Removing region: {region_id}")
 
             # Block signals to prevent unintended UI updates
             self.table_location_list.blockSignals(True)
@@ -3897,40 +3880,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.dropdown_location_list.removeItem(index)
             self.table_location_list.removeRow(index)
 
-            # Remove scanCoordinates dictionaries and remove region overlay
-            self.scanCoordinates.region_centers.pop(region_id, None)
-            self.scanCoordinates.region_laser_af_references.pop(region_id, None)
-            self.navigationViewer.deregister_fovs_from_image(
-                self.scanCoordinates.region_fov_coordinates.pop(region_id, [])
-            )
-
-            """
-            # Reindex remaining regions and update UI
-            for i in range(index, len(self.location_ids)):
-                old_id = self.location_ids[i]
-                new_id = f"R{i}"
-                self.location_ids[i] = new_id
-
-                # Update dictionaries
-                self.scanCoordinates.region_centers[new_id] = self.scanCoordinates.region_centers.pop(old_id, None)
-                self.scanCoordinates.region_fov_coordinates[new_id] = self.scanCoordinates.region_fov_coordinates.pop(
-                    old_id, []
-                )
-
-                # Update UI with new ID and coordinates
-                x, y, z = self.location_list[i]
-                location_str = f"x:{round(x, 3)} mm  y:{round(y, 3)} mm  z:{round(z * 1000, 1)} μm"
-                self.dropdown_location_list.setItemText(i, location_str)
-                self.table_location_list.setItem(i, 3, QTableWidgetItem(new_id))
-            """
+            # Drop every per-region map through ScanCoordinates (which also
+            # deregisters the overlay tiles). Popping only some of them left the
+            # region's generation params behind, and the acquisition-start re-tile
+            # (regenerate_for_fov) would then resurrect the region we just deleted.
+            self.scanCoordinates.remove_region(region_id)
 
             # Clear overlay if no locations remain
             if len(self.location_list) == 0:
                 self.navigationViewer.clear_overlay()
 
-            print(f"Remaining location IDs: {self.location_ids}")
-            for region_id, fov_coords in self.scanCoordinates.region_fov_coordinates.items():
-                self.navigationViewer.register_fovs_to_image(fov_coords)
+            self._log.debug(f"Remaining location IDs: {list(self.location_ids)}")
 
             # Re-enable signals
             self.table_location_list.blockSignals(False)
@@ -3970,7 +3930,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
-        self.location_ids = np.empty((0,), dtype="<U20")
+        self.location_ids = np.empty((0,), dtype=object)
         self.scanCoordinates.clear_regions()
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
@@ -3983,7 +3943,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def clear_only_location_list(self):
         self.location_list = np.empty((0, 3), dtype=float)
-        self.location_ids = np.empty((0,), dtype="<U20")
+        self.location_ids = np.empty((0,), dtype=object)
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
 
@@ -4001,13 +3961,79 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def cell_was_clicked(self, row, column):
         self.dropdown_location_list.setCurrentIndex(row)
 
+    def _set_name_cell(self, row, name):
+        """Write the Region Name cell without re-entering ``cell_was_changed``."""
+        self.table_location_list.blockSignals(True)
+        self.table_location_list.setItem(row, 3, QTableWidgetItem(str(name)))
+        self.table_location_list.blockSignals(False)
+
+    def _rename_region_from_cell(self, row, old_id):
+        """Apply (or reject) a user edit of the Region Name cell.
+
+        The name is the key of every per-region structure — scan order, per-point
+        channel/cycle map, laser-AF reference, tile-regeneration params — and is used
+        verbatim as a folder name and image filename prefix. A duplicate or unsafe
+        name would therefore merge two rows into one scanned region or write outside
+        the experiment folder, so anything that doesn't validate is bounced back to
+        the previous name with an explanation instead of being silently accepted.
+        """
+        new_id = normalize_region_name(self.table_location_list.item(row, 3).text())
+        if new_id == old_id:
+            self._set_name_cell(row, old_id)  # normalize a whitespace-only edit
+            return
+
+        if self.multipointController.acquisition_in_progress():
+            # The running worker took a snapshot of the region names at start, so a
+            # rename now would only desync the GUI from the folders being written.
+            QMessageBox.warning(
+                self, "Acquisition In Progress", "Regions cannot be renamed while an acquisition is running."
+            )
+            self._set_name_cell(row, old_id)
+            return
+
+        others = [str(rid) for i, rid in enumerate(self.location_ids) if i != row]
+        error = validate_region_name(new_id, others)
+        if error is None and old_id not in self.scanCoordinates.region_centers:
+            # e.g. the template widget, whose table ids don't key real regions.
+            error = f"'{old_id}' is not a registered scan region and cannot be renamed."
+        if error is None:
+            try:
+                if not self.scanCoordinates.rename_region(old_id, new_id):
+                    error = f"Could not rename region '{old_id}'."
+            except ValueError as e:
+                error = str(e)
+        if error:
+            QMessageBox.warning(self, "Invalid Region Name", error)
+            self._set_name_cell(row, old_id)
+            return
+
+        self.location_ids[row] = new_id
+        # The per-point channel/cycle map is keyed by region name; carry the entry over
+        # (in place, so region order is untouched) or the renamed region would quietly
+        # fall back to the global channel list while the stale key described a region
+        # that no longer exists.
+        if self._region_obs_state_map is not None:
+            self._region_obs_state_map = {
+                (new_id if k == old_id else k): v for k, v in self._region_obs_state_map.items()
+            }
+        # Focus points are tagged with their region id too, and a "By Region" surface
+        # fit refuses to run when those tags don't match the scan regions.
+        if self.focusMapWidget is not None:
+            self.focusMapWidget.rename_region(old_id, new_id)
+        self._set_name_cell(row, new_id)
+        self._refresh_location_label(row)
+
     def cell_was_changed(self, row, column):
         # The "AF Ref" column is a read-only indicator; ignore changes to it.
         if column >= 4:
             return
 
         # Get region ID
-        region_id = self.location_ids[row]
+        region_id = str(self.location_ids[row])
+
+        if column == 3:  # Region name; renaming must not move the stage.
+            self._rename_region_from_cell(row, region_id)
+            return
 
         # Clear all FOVs for this region
         if region_id in self.scanCoordinates.region_fov_coordinates.keys():
@@ -4043,28 +4069,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.entry_deltaY.value(),
                 )
 
-        elif column == 2:  # Z coordinate changed
+        else:  # Z coordinate changed
             z = float(val_edit) / 1000
             self.location_list[row, 2] = z
             self.scanCoordinates.region_centers[region_id][2] = z
-        else:  # ID changed
-            new_id = val_edit
-            self.location_ids[row] = new_id
-            # Update dictionary keys
-            if region_id in self.scanCoordinates.region_centers:
-                self.scanCoordinates.region_centers[new_id] = self.scanCoordinates.region_centers.pop(region_id)
-            if region_id in self.scanCoordinates.region_fov_coordinates:
-                self.scanCoordinates.region_fov_coordinates[new_id] = self.scanCoordinates.region_fov_coordinates.pop(
-                    region_id
-                )
-            if region_id in self.scanCoordinates.region_laser_af_references:
-                self.scanCoordinates.region_laser_af_references[new_id] = (
-                    self.scanCoordinates.region_laser_af_references.pop(region_id)
-                )
+            # Keep the stored generation params in step, or the acquisition-start
+            # re-tile (regenerate_for_fov) would rebuild the region at the old Z.
+            params = self.scanCoordinates.region_generation_params.get(region_id)
+            if params is not None and "center_z" in params:
+                params["center_z"] = z
 
         # Update UI
-        location_str = f"x:{round(self.location_list[row,0],3)} mm  y:{round(self.location_list[row,1],3)} mm  z:{round(1000*self.location_list[row,2],3)} μm"
-        self.dropdown_location_list.setItemText(row, location_str)
+        self._refresh_location_label(row)
         self.go_to(row)
 
     def keyPressEvent(self, event):
@@ -4078,16 +4094,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.dropdown_location_list.blockSignals(True)
 
         self.location_list[index, 2] = z_mm
-        location_str = (
-            "x:"
-            + str(round(self.location_list[index, 0], 3))
-            + "mm  y:"
-            + str(round(self.location_list[index, 1], 3))
-            + "mm  z:"
-            + str(round(1000 * z_mm, 1))
-            + "μm"
-        )
-        self.dropdown_location_list.setItemText(index, location_str)
+        self._refresh_location_label(index)
         if self.table_location_list.rowCount() > index:
             self.table_location_list.setItem(index, 2, QTableWidgetItem(str(round(1000 * z_mm, 1))))
 
@@ -4186,23 +4193,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 x = row["x (mm)"]
                 y = row["y (mm)"]
                 z = row["z (mm)"]
-                region_id = row["ID"]
-                # CSVs without an ID column give every row "None"; duplicate or
-                # missing ids would collapse into one scanCoordinates entry. Fall
-                # back to a fresh unique id in those cases.
-                if region_id in ("None", "nan", "") or region_id in self.location_ids:
-                    region_id = self._next_region_id()
+                region_id = normalize_region_name(row["ID"])
+                # CSVs without an ID column give every row "None"; duplicate, missing
+                # or filesystem-unsafe ids would collapse into one scanCoordinates
+                # entry (or break the output paths). Fall back to a fresh unique id.
+                if region_id in ("None", "nan") or validate_region_name(region_id, self.location_ids) is not None:
+                    replacement = self._next_region_id()
+                    if region_id not in ("None", "nan", ""):
+                        self._log.warning(f"Imported region name '{region_id}' is unusable; using '{replacement}'")
+                    region_id = replacement
                 if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
-                    location_str = (
-                        "x:"
-                        + str(round(x, 3))
-                        + "mm  y:"
-                        + str(round(y, 3))
-                        + "mm  z:"
-                        + str(round(1000.0 * z, 3))
-                        + "μm"
-                    )
-                    self.dropdown_location_list.addItem(location_str)
+                    self.dropdown_location_list.addItem(self._location_label(region_id, x, y, z))
                     index = self.dropdown_location_list.count() - 1
                     self.dropdown_location_list.setCurrentIndex(index)
                     self.location_list = np.vstack((self.location_list, [[x, y, z]]))
@@ -4285,10 +4286,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if not self.is_current_acquisition_widget:
             return  # Skip if this wasn't the widget that started acquisition
 
-        if not self.acquisition_in_place:
-            self.last_used_locations = self.location_list.copy()
-            self.last_used_location_ids = self.location_ids.copy()
-        else:
+        if self.acquisition_in_place:
             self.clear_only_location_list()
             self.acquisition_in_place = False
 
@@ -4446,7 +4444,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.clear_only_location_list()
 
         for pos in positions:
-            name = pos.get("name") or self._next_region_id()
+            # A name from the file still has to be a unique, filesystem-safe region id.
+            name = normalize_region_name(pos.get("name") or "")
+            if validate_region_name(name, self.location_ids) is not None:
+                replacement = self._next_region_id()
+                if name:
+                    self._log.warning(f"Position name '{name}' is unusable as a region id; using '{replacement}'")
+                name = replacement
             center = pos.get("center_mm", [0, 0, 0])
 
             if len(center) >= 3:
@@ -4470,8 +4474,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.location_ids = np.append(self.location_ids, name)
 
             # Update UI - dropdown
-            location_str = f"x:{round(x, 3)} mm  y:{round(y, 3)} mm  z:{round(z * 1000, 1)} um"
-            self.dropdown_location_list.addItem(location_str)
+            self.dropdown_location_list.addItem(self._location_label(name, x, y, z))
 
             # Update UI - table
             row = self.table_location_list.rowCount()
@@ -8175,19 +8178,24 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
         for _, row in template_df.iterrows():
             x = ref_x + row["x_offset_mm"]
             y = ref_y + row["y_offset_mm"]
+            point_id = self._next_region_id()
 
             self.location_list = np.vstack((self.location_list, [[x, y, ref_z]]))
-            self.location_ids = np.append(self.location_ids, self._next_region_id())
+            self.location_ids = np.append(self.location_ids, point_id)
 
-            location_str = f"x:{round(x,3)} mm  y:{round(y,3)} mm  z:{round(ref_z*1000,1)} μm"
-            self.dropdown_location_list.addItem(location_str)
+            self.dropdown_location_list.addItem(self._location_label(point_id, x, y, ref_z))
 
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
             self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
             self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(ref_z * 1000, 1))))
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(str(self.region_id)))
+            # One template *region* covers every template point, so a row's name does
+            # not key a region of its own — show the region it belongs to and make the
+            # cell read-only, since renaming a single row here has no coherent meaning.
+            name_item = QTableWidgetItem(str(self.region_id))
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.table_location_list.setItem(row, 3, name_item)
             # Template regions don't capture per-region laser-AF references; keep
             # the AF Ref column populated so it reads "—" rather than blank.
             self.table_location_list.setItem(row, 4, self._af_ref_item(None))

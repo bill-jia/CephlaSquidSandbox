@@ -46,7 +46,7 @@ from control import utils
 import control._def
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
-from control.core.scan_coordinates import ScanCoordinates
+from control.core.scan_coordinates import ScanCoordinates, validate_region_names
 from control.core.laser_auto_focus_controller import LaserAutofocusController
 from control.core.live_controller import LiveController
 from control.microscope import Microscope
@@ -2032,6 +2032,15 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        # Region names (user-editable on the Flexible tab) become folder names, image
+        # filename prefixes and the "region" column of every sidecar. Catch anything
+        # unsafe here rather than mid-run, and cover the headless/SiLA entry points
+        # that never go through the GUI's own validation.
+        name_error = validate_region_names(getattr(self.scanCoordinates, "region_centers", {}).keys())
+        if name_error:
+            self._log.error(f"Cannot start acquisition — invalid region name: {name_error}")
+            return False
+
         if self.do_reflection_af:
             # Acceptable when a global reference is set (regions without their own
             # reference fall back to it) OR every region carries a per-region

@@ -301,6 +301,21 @@ class FocusMapWidget(QFrame):
             self.focus_points[index] = (region_id, x, y, new_z)
             self.update_point_list()
 
+    def rename_region(self, old_region_id, new_region_id):
+        """Follow a region rename so already-placed focus points stay attached to it.
+
+        Focus points are tagged with the region id they belong to, and ``fit_surface``
+        refuses to fit "By Region" unless those tags exactly match the scan regions —
+        so without this a rename would strand every point of that region.
+        """
+        renamed = False
+        for index, (region_id, x, y, z) in enumerate(self.focus_points):
+            if region_id == old_region_id:
+                self.focus_points[index] = (new_region_id, x, y, z)
+                renamed = True
+        if renamed:
+            self.update_point_list()
+
     def get_region_points_dict(self):
         points_dict = {}
         for region_id, x, y, z in self.focus_points:

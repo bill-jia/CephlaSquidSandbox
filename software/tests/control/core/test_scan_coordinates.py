@@ -13,6 +13,8 @@ from control.core.scan_coordinates import (
     AddScanCoordinateRegion,
     RemovedScanCoordinateRegion,
     ClearedScanCoordinates,
+    validate_region_name,
+    validate_region_names,
 )
 from control.microscope import Microscope
 
@@ -426,3 +428,114 @@ def test_apply_snake_continuity_skips_regions_without_rows():
     # closest corner of A1 is top-right (101.5, 10.0).
     a1 = sc.region_fov_coordinates["A1"]
     assert a1[0] == (101.5, 10.0)
+
+
+# --------------------------------------------------------------------------------------
+# Region names (user-editable on the Flexible Multipoint tab)
+# --------------------------------------------------------------------------------------
+
+
+def test_validate_region_name_accepts_ordinary_names():
+    for name in ("R0", "A1", "manual0", "tumor_1", "Sample A", "day-3.rep2"):
+        assert validate_region_name(name) is None, name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        "a/b",           # path separator would escape the experiment folder
+        "a\b",
+        "left:right",
+        "star*",
+        "quote\"d",
+        "pipe|d",
+        "q?",
+        "trailing.",     # Windows strips trailing dots
+        "NUL",           # reserved device name
+        "com1.tiff",
+        "x" * 49,        # over REGION_NAME_MAX_LENGTH
+    ],
+)
+def test_validate_region_name_rejects_unsafe_names(name):
+    assert validate_region_name(name) is not None, name
+
+
+def test_validate_region_name_uniqueness_is_case_insensitive():
+    """'sample' and 'Sample' are distinct dict keys but the same folder on Windows,
+    and the same well id once upper-cased for the HCS plate path."""
+    assert validate_region_name("sample2", ["sample1"]) is None
+    assert validate_region_name("sample1", ["sample1"]) is not None
+    assert validate_region_name("SAMPLE1", ["sample1"]) is not None
+    # Leading/trailing whitespace is normalized away before comparing.
+    assert validate_region_name("  sample1 ", ["sample1"]) is not None
+
+
+def test_validate_region_names_reports_first_problem():
+    assert validate_region_names(["R0", "R1"]) is None
+    assert validate_region_names(["R0", "R0"]) is not None
+    assert validate_region_names(["R0", "bad/name"]) is not None
+
+
+def test_rename_region_rekeys_every_map_and_keeps_scan_order():
+    sc = _make_scan_coordinates()
+    sc.add_flexible_region("R0", 10.0, 10.0, 0.5, 2, 2, overlap_percent=0)
+    sc.add_flexible_region("R1", 20.0, 20.0, 0.5, 2, 2, overlap_percent=0)
+    sc.add_flexible_region("R2", 30.0, 30.0, 0.5, 2, 2, overlap_percent=0)
+    sc.set_region_laser_af_reference("R1", "ref-for-R1")
+
+    coords_before = list(sc.region_fov_coordinates["R1"])
+    assert sc.rename_region("R1", "middle sample") is True
+
+    # Renamed in every per-region map, with nothing left under the old key.
+    for mapping in sc._region_maps():
+        assert "R1" not in mapping
+    assert sc.region_fov_coordinates["middle sample"] == coords_before
+    assert sc.region_generation_params["middle sample"]["kind"] == "flexible"
+    assert sc.get_region_laser_af_reference("middle sample") == "ref-for-R1"
+
+    # Dict order is the scan order: the region must keep its slot, not move to the end.
+    assert list(sc.region_centers.keys()) == ["R0", "middle sample", "R2"]
+    assert list(sc.region_fov_coordinates.keys()) == ["R0", "middle sample", "R2"]
+
+
+def test_rename_region_rejects_collision_and_unknown():
+    sc = _make_scan_coordinates()
+    sc.add_flexible_region("R0", 10.0, 10.0, 0.5, 1, 1)
+    sc.add_flexible_region("R1", 20.0, 20.0, 0.5, 1, 1)
+
+    with pytest.raises(ValueError):
+        sc.rename_region("R0", "R1")
+    assert list(sc.region_centers.keys()) == ["R0", "R1"], "collision must not mutate state"
+
+    assert sc.rename_region("nope", "whatever") is False
+    assert sc.rename_region("R0", "R0") is True
+
+
+def test_renamed_region_is_not_resurrected_by_acquisition_start_retile():
+    """regenerate_for_fov replays region_generation_params. If a rename left that map
+    keyed by the old name, the acquisition would scan the same coordinates twice —
+    once as the renamed region and once as the resurrected original."""
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.add_flexible_region("R0", 10.0, 10.0, 0.5, 2, 1, overlap_percent=0)
+
+    sc.rename_region("R0", "liver")
+    sc.regenerate_for_fov(0.5, 0.5)
+
+    assert list(sc.region_centers.keys()) == ["liver"]
+    assert list(sc.region_fov_coordinates.keys()) == ["liver"]
+
+
+def test_removed_region_is_not_resurrected_by_acquisition_start_retile():
+    """Same hazard from the other direction: remove_region must drop the generation
+    params too, or the deleted position comes back when the run re-tiles."""
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.add_flexible_region("R0", 10.0, 10.0, 0.5, 2, 1, overlap_percent=0)
+    sc.add_flexible_region("R1", 20.0, 20.0, 0.5, 2, 1, overlap_percent=0)
+
+    sc.remove_region("R0")
+    sc.regenerate_for_fov(0.5, 0.5)
+
+    assert list(sc.region_centers.keys()) == ["R1"]
+    assert list(sc.region_fov_coordinates.keys()) == ["R1"]
