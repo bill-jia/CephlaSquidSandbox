@@ -8,9 +8,12 @@ runs in a dedicated subprocess (never blocking acquisition), is memory-bounded b
 the same backpressure accountant as saving, and the outputs are written as normal
 plates, uploaded like any other data, and pushed to the live display.
 
-The first built-in routine is **`phase2d`** — z-defocus 2D quantitative phase
-reconstruction (waveorder), outputting the phase image plus the center raw
-brightfield slice.
+Two routines are built in:
+
+- **`phase2d`** — z-defocus 2D quantitative phase (waveorder), from one
+  brightfield defocus z-stack.
+- **`dpc2d`** — 2D differential phase contrast (Tian & Waller 2015), from four
+  half-circle (or half-annulus) brightfield captures at a single plane.
 
 ## What a routine sees and returns
 
@@ -141,6 +144,60 @@ pip install --no-deps --ignore-requires-python -e C:\Code\waveorder
 Pre-flight validation imports `waveorder.api.phase` and gives this exact message
 if it fails.
 
+## Built-in: `dpc2d`
+
+Reconstructs quantitative phase from **four half-illumination brightfield
+captures** using the weak-object transfer function (WOTF) / Tikhonov solver of
+Tian & Waller, *Opt. Express* **23**(9), 11394 (2015) — the same math as the
+offline `qpm-analysis` reference engine (`example/tian2015/dpc_algorithm.py`
+driven by `dpc_tian2015_run.py`), including that runner's `VariableNADPCSolver`
+extension that decouples the illumination NA from the objective NA. Only numpy +
+scipy are needed; nothing extra to install.
+
+**Set-up.** Four steps — LED-matrix `top_half` / `bottom_half` / `left_half` /
+`right_half` (or the half-annulus modes `half_ann_t/b/l/r`) — **under one cycle
+group**, with the routine assigned to the *group*. One frame each, and
+**'Full z-stack' off**: dpc2d reconstructs a single plane. (If a step is left on
+full-z it contributes only its focus plane and logs a warning — the other planes
+are acquired and thrown away.)
+
+Outputs:
+- `phase` — float32 `(Y, X)` quantitative phase in radians. Optical path length
+  in nm is `phase × λ_nm / 2π`.
+- `absorption` — float32 `(Y, X)`, free from the same inversion (off by default).
+- `brightfield` — the mean of the four raw halves ≈ the full-disk brightfield
+  image, in the input dtype (on by default).
+
+Params (pixel size comes from the acquisition, never set here):
+
+| Param | Meaning |
+|---|---|
+| `state_top` / `state_bottom` / `state_left` / `state_right` | Which member state lit which half. Blank = infer from the state name's tag (`top`/`bot`/`left`/`right`, `th`/`bh`/`lh`/`rh`, `half_ann_t` …); pre-flight fails with an actionable message if that is ambiguous. |
+| `wavelength_nm` | Illumination wavelength (defaults to the states' wavelength). |
+| `na_detection` | Objective NA (defaults to the current objective). |
+| `na_illumination` | **Outer** NA of the lit half — the LED matrix DPC NA, *not* the objective NA. Equal to `na_detection` gives σ = 1. |
+| `na_illumination_inner` | 0 = full half-disk. For a half-**annulus** capture, the ring's inner NA; it must stay below `na_detection` or the capture is pure darkfield (rejected). |
+| `regularization_absorption` / `regularization_phase` | Tikhonov weights (reference defaults 1e-1 / 1e-2). Lower phase reg = sharper and noisier. Both must be > 0 — they are what keeps the per-frequency 2×2 inversion well-posed. |
+| `output_absorption` / `output_brightfield` | Whether to emit those extra plates. |
+| `single_precision` | complex64 instead of the reference's complex128: halves the cached filter-bank memory and the per-FOV FFT cost. Off by default so results stay bit-comparable with the offline reference run. |
+
+Selecting the routine in the editor pre-populates all of these — roles bound to
+the group's member steps, wavelength and illumination NA read off the states'
+LED-matrix preset, detection NA from the objective — and opens the params dialog
+for review.
+
+**Precomputation.** Everything FOV-invariant — the pupils, the four half-plane
+sources, the WOTFs `Hu`/`Hp`, and the Tikhonov normal equations — is built once
+(warmup, or the first FOV) and cached keyed on the geometry. It is cached
+*already inverted*: substituting `AHy` into the Cramer solution collapses the
+whole inversion into one weighted sum of the four measured spectra, so the cache
+holds four per-direction filters instead of the WOTFs plus the Gramian, and each
+FOV costs only four forward FFTs, a weighted sum, and one inverse FFT. Only one
+bank stays resident (each array is ~278 MB in complex128 at full frame), so a
+geometry change evicts the previous one. `tests/control/postprocessing/
+test_dpc2d.py` checks the collapsed form against a verbatim transcription of the
+reference solver.
+
 ## Live display
 
 As each output is computed it is pushed to the live image display, labelled with
@@ -163,9 +220,10 @@ saved but not displayed (a debug line notes the skip).
 | Routine contract + context | `control/postprocessing/base.py` |
 | Registry (builtin / custom script) | `control/postprocessing/registry.py` |
 | `phase2d` routine | `control/postprocessing/routines/phase2d.py` |
+| `dpc2d` routine | `control/postprocessing/routines/dpc2d.py` |
 | Spec model + plan accounting | `control/models/acquisition_cycle.py` (`PostprocessSpec`, `PostprocessGroupPlan`) |
 | Output declaration, manifest, validation | `control/core/multi_point_controller.py` |
 | `PostprocessJob` (accumulate/compute/write/barrier) | `control/core/job_processing.py` |
 | Worker routing, runner, display, upload tally | `control/core/multi_point_worker.py` |
-| Editor Postprocess column + params dialogs | `gui/widgets/multipoint.py` (`Phase2DParamsDialog`, `ScriptParamsDialog`) |
+| Editor Postprocess column + params dialogs | `gui/widgets/multipoint.py` (`Phase2DParamsDialog`, `DPC2DParamsDialog`, `ScriptParamsDialog`) |
 | Tests | `tests/control/postprocessing/`, `tests/control/models/test_acquisition_cycle.py`, `tests/control/core/test_cycle_zarr_layout.py` |

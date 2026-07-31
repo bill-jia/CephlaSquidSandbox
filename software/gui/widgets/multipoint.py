@@ -719,6 +719,164 @@ class Phase2DParamsDialog(QDialog):
         }
 
 
+class DPC2DParamsDialog(QDialog):
+    """Edit 2D differential-phase-contrast (Tian & Waller 2015) parameters.
+
+    The four half-illumination roles are bound to the group's member states
+    here; a role left on "(match by name)" is inferred at run time from the
+    state name's top/bottom/left/right tag. Pixel size comes from the
+    acquisition; wavelength defaults to the input states' illumination
+    wavelength and detection NA to the current objective NA.
+    """
+
+    _AUTO = "(match by name)"
+
+    def __init__(
+        self,
+        params,
+        input_states=None,
+        objective_na=None,
+        default_wavelength_nm=None,
+        default_illumination_na=(None, None),
+        parent=None,
+    ):
+        super().__init__(parent)
+        from control.postprocessing.routines.dpc2d import DEFAULT_PARAMS, ROLES, resolve_roles
+
+        self.setWindowTitle("DPC 2D Parameters")
+        # The routine's numeric optics defaults are the fallback for a params-less
+        # invocation; in the dialog the live objective / preset values should win
+        # whenever the user hasn't already set one, so blank them out first.
+        p = {
+            **DEFAULT_PARAMS,
+            "wavelength_nm": None,
+            "na_detection": None,
+            "na_illumination": None,
+            "na_illumination_inner": None,
+            **(params or {}),
+        }
+        default_outer_na, default_inner_na = default_illumination_na
+        states = [s for s in (input_states or []) if s]
+        form = QFormLayout(self)
+
+        info = QLabel(
+            "Reconstructs quantitative phase from four half-circle (or half-annulus) "
+            "brightfield captures. Assign this on the GROUP holding the four steps — one "
+            "frame each, 'Full z-stack' off. Pixel size comes from the acquisition."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        # Pure tag-based guess, used to pre-select the role combos.
+        guessed = {}
+        if len(states) == 4:
+            try:
+                guessed = resolve_roles(states, {})
+            except ValueError:
+                guessed = {}
+
+        self.role_combos = {}
+        for role in ROLES:
+            combo = QComboBox()
+            combo.addItem(self._AUTO, None)
+            for name in states:
+                combo.addItem(name, name)
+            chosen = p.get(f"state_{role}") or None
+            if chosen and states and chosen not in states:
+                chosen = None  # a stale name from another group
+            chosen = chosen or guessed.get(role)
+            if chosen:
+                if combo.findData(chosen) < 0:
+                    combo.addItem(chosen, chosen)
+                combo.setCurrentIndex(combo.findData(chosen))
+            self.role_combos[role] = combo
+            form.addRow(f"{role.capitalize()} half state", combo)
+
+        self.spin_wavelength = QDoubleSpinBox()
+        self.spin_wavelength.setRange(200.0, 2000.0)
+        self.spin_wavelength.setDecimals(0)
+        self.spin_wavelength.setValue(float(p["wavelength_nm"] or default_wavelength_nm or 530))
+        form.addRow("Illumination wavelength (nm)", self.spin_wavelength)
+
+        self.spin_na_det = QDoubleSpinBox()
+        self.spin_na_det.setRange(0.01, 1.6)
+        self.spin_na_det.setSingleStep(0.05)
+        self.spin_na_det.setDecimals(3)
+        self.spin_na_det.setValue(float(p["na_detection"] or objective_na or 0.4))
+        form.addRow("Detection (objective) NA", self.spin_na_det)
+
+        self.spin_na_ill = QDoubleSpinBox()
+        self.spin_na_ill.setRange(0.01, 1.6)
+        self.spin_na_ill.setSingleStep(0.05)
+        self.spin_na_ill.setDecimals(3)
+        self.spin_na_ill.setValue(float(p["na_illumination"] or default_outer_na or objective_na or 0.4))
+        self.spin_na_ill.setToolTip("Outer NA of the lit half — the LED matrix DPC NA, not the objective NA")
+        form.addRow("Illumination NA (outer)", self.spin_na_ill)
+
+        self.spin_na_inner = QDoubleSpinBox()
+        self.spin_na_inner.setRange(0.0, 1.6)
+        self.spin_na_inner.setSingleStep(0.05)
+        self.spin_na_inner.setDecimals(3)
+        # Explicit None check, not `or`: a deliberately-saved 0 (full half-disk)
+        # must not fall back to the preset's ring NA.
+        inner = p["na_illumination_inner"]
+        self.spin_na_inner.setValue(float((default_inner_na if inner is None else inner) or 0.0))
+        self.spin_na_inner.setToolTip(
+            "0 = full half-disk. For half-ANNULUS captures set the ring's inner NA; it must stay "
+            "below the objective NA or the capture is pure darkfield."
+        )
+        form.addRow("Illumination NA (inner, 0 = disk)", self.spin_na_inner)
+
+        self.spin_reg_u = QDoubleSpinBox()
+        self.spin_reg_u.setRange(1e-6, 1.0)
+        self.spin_reg_u.setDecimals(6)
+        self.spin_reg_u.setSingleStep(1e-2)
+        self.spin_reg_u.setValue(float(p["regularization_absorption"]))
+        form.addRow("Regularization (absorption)", self.spin_reg_u)
+
+        self.spin_reg_p = QDoubleSpinBox()
+        self.spin_reg_p.setRange(1e-6, 1.0)
+        self.spin_reg_p.setDecimals(6)
+        self.spin_reg_p.setSingleStep(1e-3)
+        self.spin_reg_p.setValue(float(p["regularization_phase"]))
+        self.spin_reg_p.setToolTip("Lower = sharper, noisier phase; higher = smoother, lower contrast")
+        form.addRow("Regularization (phase)", self.spin_reg_p)
+
+        self.chk_absorption = QCheckBox("Also save the absorption image")
+        self.chk_absorption.setChecked(bool(p["output_absorption"]))
+        form.addRow(self.chk_absorption)
+
+        self.chk_brightfield = QCheckBox("Also save the brightfield image (mean of the four halves)")
+        self.chk_brightfield.setChecked(bool(p["output_brightfield"]))
+        form.addRow(self.chk_brightfield)
+
+        self.chk_single = QCheckBox("Single precision (half the memory and compute)")
+        self.chk_single.setChecked(bool(p["single_precision"]))
+        form.addRow(self.chk_single)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def get_params(self) -> dict:
+        params = {f"state_{role}": combo.currentData() for role, combo in self.role_combos.items()}
+        params.update(
+            {
+                "wavelength_nm": int(self.spin_wavelength.value()),
+                "na_detection": float(self.spin_na_det.value()),
+                "na_illumination": float(self.spin_na_ill.value()),
+                "na_illumination_inner": float(self.spin_na_inner.value()),
+                "regularization_absorption": float(self.spin_reg_u.value()),
+                "regularization_phase": float(self.spin_reg_p.value()),
+                "output_absorption": self.chk_absorption.isChecked(),
+                "output_brightfield": self.chk_brightfield.isChecked(),
+                "single_precision": self.chk_single.isChecked(),
+            }
+        )
+        return params
+
+
 class ScriptParamsDialog(QDialog):
     """Generic JSON key/value editor for a custom-script routine's params."""
 
@@ -949,20 +1107,60 @@ class CycleEditorDialog(QDialog):
         btn.setEnabled(True)
         self._edit_pp_params(item, combo, btn)
 
+    # Routines with a purpose-built params dialog, i.e. the ones whose defaults
+    # can be pre-populated. Everything else falls back to the generic JSON
+    # editor, whose keys are routine-defined.
+    _PP_ROUTINES_WITH_DIALOG = ("phase2d", "dpc2d")
+
+    def _make_pp_params_dialog(self, routine, item, params):
+        """Params editor for a routine, seeded from the live acquisition context:
+        the item's member observation states, the objective NA, and the first
+        state's illumination wavelength."""
+        states = self._input_states_for(item)
+        wl = None
+        try:
+            _color, wl = self._preset_display_meta(states[0]) if states else (None, None)
+        except Exception:
+            pass
+        if routine == "phase2d":
+            return Phase2DParamsDialog(
+                params, objective_na=self._current_objective_na(), default_wavelength_nm=wl, parent=self
+            )
+        if routine == "dpc2d":
+            return DPC2DParamsDialog(
+                params,
+                input_states=states,
+                objective_na=self._current_objective_na(),
+                default_wavelength_nm=wl,
+                default_illumination_na=self._dpc_illumination_na(states[0]) if states else (None, None),
+                parent=self,
+            )
+        return ScriptParamsDialog(params, parent=self)
+
+    def _dpc_illumination_na(self, state):
+        """(outer_na, inner_na) of the LED-matrix half lighting this preset — the
+        shared half-circle DPC NA, or the ring NAs of a half annulus. Seeds the
+        dpc2d dialog so the reconstruction NA matches what was actually lit.
+        (None, None) when the preset has no LED-matrix half."""
+        try:
+            preset = self.repo.load_observation_preset(state)
+        except Exception:
+            return None, None
+        for ist in getattr(preset, "illuminator_states", []) or []:
+            if not getattr(ist, "on", False):
+                continue
+            mode = getattr(ist, "led_matrix_mode", None)
+            if mode in ("top_half", "bottom_half", "left_half", "right_half"):
+                return getattr(ist, "led_matrix_dpc_na", None), 0.0
+            if mode in ("half_ann_t", "half_ann_b", "half_ann_l", "half_ann_r"):
+                return getattr(ist, "led_matrix_outer_na", None), getattr(ist, "led_matrix_inner_na", None)
+        return None, None
+
     def _default_params_for(self, routine, item):
         """Resolved default params for a freshly-selected routine (empty for a
         script — its keys are routine-defined)."""
-        if routine == "phase2d":
-            state = self._first_input_state_for(item)
-            wl = None
-            try:
-                _color, wl = self._preset_display_meta(state) if state else (None, None)
-            except Exception:
-                pass
-            dlg = Phase2DParamsDialog(
-                {}, objective_na=self._current_objective_na(), default_wavelength_nm=wl, parent=self
-            )
-            return dlg.get_params()
+        if routine in self._PP_ROUTINES_WITH_DIALOG:
+            return self._make_pp_params_dialog(routine, item, {}).get_params()
         return {}
 
     def _edit_pp_params(self, item, combo, btn):
@@ -970,37 +1168,24 @@ class CycleEditorDialog(QDialog):
         routine = spec.get("routine")
         if routine is None:
             return
-        if routine == "phase2d":
-            state = self._first_input_state_for(item)
-            _color, wl = (None, None)
-            try:
-                _color, wl = self._preset_display_meta(state) if state else (None, None)
-            except Exception:
-                pass
-            dlg = Phase2DParamsDialog(
-                spec.get("params", {}),
-                objective_na=self._current_objective_na(),
-                default_wavelength_nm=wl,
-                parent=self,
-            )
-        else:
-            dlg = ScriptParamsDialog(spec.get("params", {}), parent=self)
+        dlg = self._make_pp_params_dialog(routine, item, spec.get("params", {}))
         if dlg.exec_() == QDialog.Accepted:
             spec["params"] = dlg.get_params()
             item.setData(0, self._PP_ROLE, spec)
 
-    def _first_input_state_for(self, item):
-        """Best-effort first observation-state name feeding this item/group (for
-        param defaults). For a group, the first member step's state."""
+    def _input_states_for(self, item):
+        """Observation-state names feeding this item/group, in order (best
+        effort). For a group, every member step's state — which is what a
+        multi-input routine like dpc2d needs to bind its roles."""
         kind = item.data(0, self._TYPE_ROLE)
-        if kind == "group":
-            for j in range(item.childCount()):
-                combo = self.tree.itemWidget(item.child(j), 0)
-                if combo is not None and hasattr(combo, "currentText"):
-                    return combo.currentText()
-            return None
-        combo = self.tree.itemWidget(item, 0)
-        return combo.currentText() if (combo is not None and hasattr(combo, "currentText")) else None
+        items = [item.child(j) for j in range(item.childCount())] if kind == "group" else [item]
+        names = []
+        for it in items:
+            combo = self.tree.itemWidget(it, 0)
+            name = combo.currentText() if (combo is not None and hasattr(combo, "currentText")) else None
+            if name and name not in names:
+                names.append(name)
+        return names
 
     def _preset_display_meta(self, state):
         """(color, wavelength_nm) for an observation-state preset, best-effort."""

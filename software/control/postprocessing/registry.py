@@ -14,6 +14,7 @@ import os
 from typing import Dict, List, Tuple, Type
 
 from control.postprocessing.base import PostprocessRoutine
+from control.postprocessing.routines.dpc2d import DPC2DRoutine
 from control.postprocessing.routines.phase2d import Phase2DRoutine
 
 # The PostprocessSpec.routine value marking a user script.
@@ -21,6 +22,7 @@ SCRIPT_ROUTINE = "script"
 
 BUILTIN_ROUTINES: Dict[str, Type[PostprocessRoutine]] = {
     Phase2DRoutine.name: Phase2DRoutine,
+    DPC2DRoutine.name: DPC2DRoutine,
 }
 
 

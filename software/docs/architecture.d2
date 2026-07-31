@@ -642,7 +642,7 @@ writers: "Data Output" {
       Optional online postprocessing (Advanced cycles).
       Accumulates a step/group's frames per FOV in a
       dedicated runner, runs a routine (built-in phase2d
-      or a custom script), and writes the outputs as
+      / dpc2d, or a custom script), and writes the outputs as
       their own {label}_{output} plates via inline
       SaveZarrJob / TIFF — raw inputs are NOT saved.
       TF cache persists across FOVs. ZARR_V3 +
