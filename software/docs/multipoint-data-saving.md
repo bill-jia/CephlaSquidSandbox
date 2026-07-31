@@ -252,6 +252,8 @@ Additionally, `coordinates.csv` records the stage position for each FOV at the e
 
 Renaming goes through `ScanCoordinates.rename_region`, which rekeys **every** per-region map in place. Order matters: dict insertion order is the scan order, and a stale `region_generation_params` key would make the acquisition-start re-tile (`regenerate_for_fov`) resurrect the region under its old name and scan it twice.
 
+Note that `ScanCoordinates` is *derived* state for flexible scans, not durable state: it is cleared and rebuilt wholesale by `FlexibleMultiPointWidget.update_fov_positions` (on any tile-geometry change) and by `MainWindow.onTabChanged`. Anything per-region that the user authored must therefore be owned by the widget and re-applied after each rebuild — that is what `_region_laser_af_references` / `_restore_region_references` do for the per-region laser-AF targets. Adding a new per-region user-authored value means giving it the same treatment.
+
 ### Zarr-Embedded Timestamps
 
 For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zarr array inside each FOV group (shape `(T, C, Z)`, dtype `float64`, Unix seconds). This makes the zarr store fully self-describing — downstream consumers can read timestamps with the same stack of tools that reads the image data. The root-level `acquisition_times.csv` covers the same ground in human-readable form.

@@ -462,6 +462,11 @@ missing. A `region_laser_af_references.csv` summary is written into the experime
 for reproducibility, and references export/import with the location list (see
 [Import / export / edit](#import--export--edit)).
 
+References stay attached to their position for as long as the position exists: they follow
+a rename, and they survive the region rebuilds triggered by switching acquisition tabs or
+changing **Nx** / **Ny** / **FOV Overlap** / the objective. They are discarded only when
+you **Remove** or **Clear** the position, or replace the list with an import.
+
 This per‑region reference plumbing is shared with the wellplate code path, but only the
 Flexible tab captures references today.
 

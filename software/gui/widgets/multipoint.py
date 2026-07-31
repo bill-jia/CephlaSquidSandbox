@@ -2693,6 +2693,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # truncates a longer user-typed region name on assignment, which would
         # de-synchronise the table from the scanCoordinates keys.
         self.location_ids = np.empty((0,), dtype=object)
+        # Durable {region_id: LaserAFReference} store. scanCoordinates is rebuilt
+        # from scratch on every tile change (and wholesale cleared on tab switch),
+        # which drops the references it holds; the widget owns the position list, so
+        # it owns the references too and re-applies them after each rebuild.
+        self._region_laser_af_references = {}
         self.use_overlap = USE_OVERLAP_FOR_FLEXIBLE
         self.add_components()
         self.setup_layout()
@@ -3479,7 +3484,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.scanCoordinates.clear_regions()
 
         for i, (x, y, z) in enumerate(self.location_list):
-            region_id = self.location_ids[i]
+            region_id = str(self.location_ids[i])
             if self.use_overlap:
                 self.scanCoordinates.add_flexible_region(
                     region_id,
@@ -3501,6 +3506,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.entry_deltaX.value(),
                     self.entry_deltaY.value(),
                 )
+
+        # The rebuild above went through clear_regions, which drops scanCoordinates'
+        # per-region laser-AF targets. Put them back.
+        self._restore_region_references()
 
         _refresh_size_estimate(self)
 
@@ -3637,6 +3646,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 self.add_location()
                 self.acquisition_in_place = True
 
+            # Make sure scanCoordinates is carrying the per-region laser-AF targets the
+            # user captured: the worker reads them from there, and so does the
+            # "every region has a reference" pre-flight check.
+            self._restore_region_references()
+
             if self.checkbox_set_z_range.isChecked():
                 # Set Z-range (convert from μm to mm)
                 minZ = self.entry_minZ.value() / 1000
@@ -3763,6 +3777,29 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.setItem(row, 4, self._af_ref_item(reference))
         self.table_location_list.blockSignals(False)
 
+    def _store_region_reference(self, region_id, reference):
+        """Record a per-region laser-AF target in both the widget and scanCoordinates."""
+        if reference is None:
+            self._region_laser_af_references.pop(region_id, None)
+        else:
+            self._region_laser_af_references[region_id] = reference
+        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+
+    def _restore_region_references(self):
+        """Re-apply the widget's references to scanCoordinates after a region rebuild.
+
+        ``update_fov_positions`` (and ``MainWindow.onTabChanged`` before it) clears
+        every region, taking scanCoordinates' copy of the laser-AF targets with it.
+        Without this, merely switching acquisition tabs silently dropped every
+        reference captured with "Update Ref" and the run fell back to the global one.
+        Also prunes references for positions that no longer exist.
+        """
+        live_ids = set(str(rid) for rid in self.location_ids)
+        for region_id in [rid for rid in self._region_laser_af_references if rid not in live_ids]:
+            del self._region_laser_af_references[region_id]
+        for region_id, reference in self._region_laser_af_references.items():
+            self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+
     def _capture_region_reference(self, region_id, warn_on_failure=True):
         """Capture and store the current laser-AF reference for ``region_id``.
 
@@ -3779,7 +3816,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     "Is the laser autofocus initialized?"
                 )
             return False
-        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+        self._store_region_reference(region_id, reference)
         self._set_af_ref_cell_for_region(region_id, reference)
         return True
 
@@ -3885,6 +3922,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # region's generation params behind, and the acquisition-start re-tile
             # (regenerate_for_fov) would then resurrect the region we just deleted.
             self.scanCoordinates.remove_region(region_id)
+            self._region_laser_af_references.pop(region_id, None)
 
             # Clear overlay if no locations remain
             if len(self.location_list) == 0:
@@ -3931,6 +3969,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
+        self._region_laser_af_references.clear()
         self.scanCoordinates.clear_regions()
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
@@ -3944,6 +3983,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def clear_only_location_list(self):
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
+        self._region_laser_af_references.clear()
         self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
 
@@ -4016,6 +4056,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self._region_obs_state_map = {
                 (new_id if k == old_id else k): v for k, v in self._region_obs_state_map.items()
             }
+        # rename_region moved scanCoordinates' copy of the laser-AF target; the widget
+        # holds the durable one, so it has to follow or the next rebuild would restore
+        # the reference under the old name and leave the renamed region without one.
+        if old_id in self._region_laser_af_references:
+            self._region_laser_af_references[new_id] = self._region_laser_af_references.pop(old_id)
         # Focus points are tagged with their region id too, and a "By Region" surface
         # fit refuses to run when those tags don't match the scan regions.
         if self.focusMapWidget is not None:
@@ -4141,7 +4186,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def export_location_list(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Export Location List", "", "CSV Files (*.csv);;All Files (*)")
         if file_path:
-            refs = self.scanCoordinates.region_laser_af_references
+            # Export from the widget's durable store, not scanCoordinates: the latter
+            # is empty whenever the regions have been cleared but not yet rebuilt.
+            refs = self._region_laser_af_references
             location_list_df = pd.DataFrame(self.location_list, columns=["x (mm)", "y (mm)", "z (mm)"])
             location_list_df["ID"] = self.location_ids
             # Human-readable spot position per region; blank when no reference.
@@ -4184,6 +4231,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Full per-region references (incl. crops) ride in a sidecar next to
             # the CSV; the x_reference column is the human-readable fallback.
             sidecar_refs = self._load_laser_af_sidecar(file_path)
+            # clear_only_location_list drops the widget's references; scanCoordinates
+            # keeps its own copy until the regions below replace them.
             self.clear_only_location_list()
             self.scanCoordinates.region_laser_af_references.clear()
 
@@ -4247,7 +4296,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     # exported id even when region_id was reassigned above.
                     reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
                     if reference is not None:
-                        self.scanCoordinates.set_region_laser_af_reference(region_id, reference)
+                        self._store_region_reference(region_id, reference)
                     self.table_location_list.setItem(
                         self.table_location_list.rowCount() - 1, 4, self._af_ref_item(reference)
                     )
@@ -4484,7 +4533,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
             self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
             self.table_location_list.setItem(
-                row, 4, self._af_ref_item(self.scanCoordinates.get_region_laser_af_reference(name))
+                row, 4, self._af_ref_item(self._region_laser_af_references.get(name))
             )
 
             # Add to scan coordinates
