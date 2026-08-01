@@ -673,3 +673,68 @@ class TestSaveZarrJob:
     def test_clear_writers_idempotent(self):
         SaveZarrJob.clear_writers()
         SaveZarrJob.clear_writers()
+
+
+class TestPartialZSliceCommit:
+    """A barrier must never commit a z-slice that is still missing channels.
+
+    Frame jobs are dispatched from the camera callback thread, so a barrier can
+    run between two channels of the same (t, z). Committing the slice there and
+    again when the late channel lands wrote the whole shard twice, and since
+    TensorStore omits chunks equal to the fill value the second write erased the
+    first channel — silently replacing captured frames with zeros.
+    """
+
+    def test_barrier_between_channels_keeps_both(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            try:
+                ch0 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+                ch1 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+
+                writer.write_frame(ch0, t=0, c=0, z=0)
+                # Barrier lands before the second channel's job is dispatched.
+                writer.wait_for_pending()
+                writer.write_frame(ch1, t=0, c=1, z=0)
+                writer.wait_for_pending()
+
+                data = writer._level_datasets[0][0, :, 0, :, :].read().result()
+                np.testing.assert_array_equal(data[0], ch0)
+                np.testing.assert_array_equal(data[1], ch1)
+            finally:
+                writer.finalize()
+
+    def test_incomplete_slice_not_staged_until_complete(self):
+        """An incomplete slice stages only once its last channel lands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            try:
+                plane = np.full((64, 64), 7, dtype=np.uint16)
+                writer.write_frame(plane, t=0, c=0, z=0)
+                writer.wait_for_pending()
+                assert writer.drain_unstaged_shard_paths() == []
+
+                writer.write_frame(plane, t=0, c=1, z=0)
+                writer.wait_for_pending()
+                assert writer.drain_unstaged_shard_paths() != []
+            finally:
+                writer.finalize()
+
+    def test_finalize_keeps_partial_slice(self):
+        """A FOV that ends mid-slice still keeps the channel it captured."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            ch0 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+            writer.write_frame(ch0, t=0, c=0, z=0)
+            data = None
+            try:
+                writer.wait_for_pending()
+                writer.finalize()
+                data = writer._level_datasets[0][0, :, 0, :, :].read().result()
+            finally:
+                if data is not None:
+                    np.testing.assert_array_equal(data[0], ch0)
+                    assert not data[1].any()

@@ -57,11 +57,15 @@ write data in shapes that are not safe to copy incrementally.
 ```
 multi_point_worker (main proc)
     │  after acquire_at_position(t, region, fov) returns:
-    │
+    │    _wait_for_dispatched_frames()    ← SaveZarrJobs are queued from the
+    │                                       camera callback thread, so drain it
+    │                                       first or a frame lands behind the
+    │                                       barrier (see "Ordering" below)
     ▼  dispatch FlushAndStageUploadJob(t, region, fov, output_path)
 JobRunner subprocess (one FIFO queue per job class)
     │  the barrier runs after every preceding SaveZarrJob for the same (t, fov):
-    │    writer.wait_for_pending()        ← drains TensorStore futures
+    │    writer.wait_for_pending()        ← drains TensorStore futures; commits
+    │                                       only *complete* z-slices
     │    paths = writer.drain_unstaged_shard_paths()  ← ALL shards written
     │                                                    since the last barrier
     │    upload_queue.put(UploadTask(...))
@@ -173,6 +177,34 @@ clears only the timepoints whose shards are fully on disk (an unflushed ``t``
 stays pending for the next barrier — a written timepoint is never dropped).
 Keying on the scan ``time_point`` instead would stage one shard per visit and
 silently skip the rest.
+
+### Ordering: a shard cell is committed exactly once
+
+A per-z shard holds **all channels** of one ``(t, z)``, and `_commit_z` writes
+the whole shard in one pass. That makes the write cheap, but it also means a
+*second* commit of the same cell rewrites the file — and because TensorStore
+omits chunks equal to the fill value, any channel absent from that second commit
+is **erased**, not preserved. So each cell must be committed exactly once, with
+every channel present.
+
+Two rules enforce that:
+
+1. **The writer never commits a partial slice mid-run.** `_flush_pending_z()`
+   skips z-slices still missing channels; they stay buffered and commit as soon
+   as the last channel lands, staging at the next barrier. Only `finalize()`
+   passes ``final=True``, and a partial commit there is written
+   channel-by-channel so it cannot erase anything already stored.
+2. **The worker drains the camera callbacks before dispatching the barrier.**
+   `SaveZarrJob`s are dispatched from the image callback thread, and
+   `_ready_for_next_trigger` is set at callback *entry* — before that dispatch.
+   So `acquire_at_position()` can return with a frame's job not yet queued, and
+   the barrier would otherwise overtake it in the FIFO queue.
+
+Violating these produced a real data loss: with a 2-channel FOV the barrier
+landed between the two channels, committed the slice with channel 0 only, and
+the late channel 1 rewrote the same shard one timepoint later — erasing every
+channel-0 frame it touched (~15% of them) while channel 1 and single-channel
+plates stayed clean.
 
 In the manifest, each record carries:
 - ``"deletable": true|false`` — whether the file was eligible for local

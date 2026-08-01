@@ -735,19 +735,30 @@ class ZarrWriter:
         Assembles the buffered channels into one ``(C, Y, X)`` array per level
         (cascading ``cv2.pyrDown`` per channel) and issues a single write per
         level, so each shard file is created with one pass — no read-modify-write.
-        Any channel that never arrived (e.g. an aborted FOV) stays at fill value.
+
+        A *complete* slice takes that whole-shard fast path. An incomplete slice
+        (only reachable from ``finalize()``) is written channel-by-channel
+        instead: a whole-shard write stores the fill value for the absent
+        channels, and because TensorStore drops chunks equal to the fill value
+        that would **erase** any channel already committed for this cell rather
+        than leave it untouched.
         """
         planes = self._pending_z.pop((t, z), None)
         if not planes:
             return
         config = self._config
         C = config.c_size
+        complete = len(planes) == C
 
         y0, x0 = self._level_shapes[0]
         arr0 = np.zeros((C, y0, x0), dtype=config.dtype)
         for ch, img in planes.items():
             arr0[ch] = img
-        self._pending_futures.append(self._level_datasets[0][t, :, z, :, :].write(arr0))
+        if complete:
+            self._pending_futures.append(self._level_datasets[0][t, :, z, :, :].write(arr0))
+        else:
+            for ch in planes:
+                self._pending_futures.append(self._level_datasets[0][t, ch, z, :, :].write(arr0[ch]))
 
         if len(self._level_datasets) > 1:
             try:
@@ -755,11 +766,11 @@ class ZarrWriter:
             except ImportError:
                 log.warning("cv2 not available, skipping pyramid generation for this z-slice")
             else:
-                current = [arr0[ch] for ch in range(C)]  # per-channel (y, x)
+                current = {ch: arr0[ch] for ch in planes}  # per-channel (y, x)
                 for level in range(1, len(self._level_datasets)):
                     expected_y, expected_x = self._level_shapes[level]
                     arrl = np.zeros((C, expected_y, expected_x), dtype=config.dtype)
-                    for ch in range(C):
+                    for ch in current:
                         d = cv2.pyrDown(current[ch])
                         if d.shape != (expected_y, expected_x):
                             d = cv2.resize(d, (expected_x, expected_y), interpolation=cv2.INTER_AREA)
@@ -767,18 +778,34 @@ class ZarrWriter:
                             d = d.astype(config.dtype)
                         arrl[ch] = d
                         current[ch] = d
-                    self._pending_futures.append(self._level_datasets[level][t, :, z, :, :].write(arrl))
+                    if complete:
+                        self._pending_futures.append(self._level_datasets[level][t, :, z, :, :].write(arrl))
+                    else:
+                        for ch in current:
+                            self._pending_futures.append(
+                                self._level_datasets[level][t, ch, z, :, :].write(arrl[ch])
+                            )
 
         self._unstaged_shards.add((t, z))
 
-    def _flush_pending_z(self) -> None:
-        """Commit any still-buffered z-slices (incomplete ones included).
+    def _flush_pending_z(self, final: bool = False) -> None:
+        """Commit buffered z-slices.
 
-        A no-op on a clean FOV (every z completes during the stream). Only an
-        aborted/short FOV leaves partial z-slices, which are written with their
-        received channels so no captured frame is silently dropped.
+        Barriers pass ``final=False``, which commits only slices whose channels
+        have *all* arrived. Committing a partial slice mid-acquisition is
+        destructive: the remaining channels land later and commit the same cell
+        a second time, and that write erases the channels stored by the first.
+        Frame jobs are dispatched from the camera callback thread, so a slice
+        can legitimately still be incomplete when a barrier runs; leaving it
+        buffered costs nothing — it commits as soon as its last channel lands,
+        and the next barrier stages it.
+
+        ``final=True`` (finalize) commits whatever is left, so a short or
+        aborted FOV keeps the frames it did capture.
         """
         for t, z in list(self._pending_z.keys()):
+            if not final and len(self._pending_z[(t, z)]) < self._config.c_size:
+                continue
             self._commit_z(t, z)
 
     def _drain_completed_futures(self) -> int:
@@ -826,8 +853,9 @@ class ZarrWriter:
     def wait_for_pending(self, timeout_s: Optional[float] = None) -> int:
         """Block until all pending writes complete; re-raise the first error.
 
-        Flushes any buffered z-slices first so every captured frame is committed
-        before the barrier/finalize awaits the futures.
+        Commits any *complete* buffered z-slice first so it is on disk before
+        the barrier awaits the futures. Slices still missing channels stay
+        buffered — see :meth:`_flush_pending_z`.
         """
         self._flush_pending_z()
         if not self._pending_futures:
@@ -857,6 +885,9 @@ class ZarrWriter:
             return
 
         log.info("Finalizing Zarr v3 dataset...")
+        # No more frames are coming, so commit partial slices too — this is the
+        # only place they may be written.
+        self._flush_pending_z(final=True)
         self.wait_for_pending()
         self._set_squid_flag("acquisition_complete", True)
         self._finalized = True

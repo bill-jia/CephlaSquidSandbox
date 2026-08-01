@@ -1779,6 +1779,23 @@ class MultiPointWorker:
         self._ready_for_next_trigger.set()
         self._image_callback_idle.set()
 
+    def _wait_for_dispatched_frames(self, region_id, fov):
+        """Block until every in-flight image callback has dispatched its jobs.
+
+        Mid-acquisition counterpart to :meth:`_wait_for_outstanding_callback_images`,
+        which force-sets the flags afterwards — correct at end of acquisition,
+        but here it would mask a frame that is genuinely still outstanding.
+        Timing out is not destructive: the writer holds an incomplete z-slice
+        until its last channel lands, so the only cost is that this FOV's
+        shards stage at a later barrier.
+        """
+        if not self._image_callback_idle.wait(self._frame_wait_timeout_s()):
+            self._log.warning(
+                f"Timed out waiting for image callbacks to dispatch before the upload "
+                f"barrier at region={region_id} fov={fov}; this FOV's shards will stage "
+                f"at a later barrier."
+            )
+
     def _finish_jobs(self, timeout_s=10):
         # Drain and summarize all currently available job results before waiting for completion
         self._summarize_runner_outputs(drain_all=True)
@@ -3249,6 +3266,12 @@ class MultiPointWorker:
                     and self._save_zarr_runner is not None
                     and self._zarr_writer_info is not None
                 ):
+                    # SaveZarrJobs are dispatched from the camera callback
+                    # thread, which acquire_at_position() does not wait on, so
+                    # this FOV's frames may not be queued yet even though it has
+                    # returned. The barrier only stages what precedes it in the
+                    # FIFO queue, so drain the callbacks before queueing it.
+                    self._wait_for_dispatched_frames(region_id, fov)
                     try:
                         # Dense -> one array per FOV (array_key=None); ragged ->
                         # one single-channel plate per imaged state, so flush each.

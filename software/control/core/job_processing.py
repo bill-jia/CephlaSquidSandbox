@@ -981,14 +981,21 @@ class BarrierResult:
 class FlushAndStageUploadJob:
     """Barrier job: flush one ``(t, fov)``'s zarr writes, then stage upload.
 
-    Runs in the ``JobRunner`` subprocess. Because the JobRunner pulls jobs
-    FIFO from a single queue, by the time this job runs every preceding
-    ``SaveZarrJob`` for ``(t, fov)`` has already been processed. We then call
-    ``writer.wait_for_pending()`` on the per-FOV ``ZarrWriter`` so all
-    outstanding TensorStore futures resolve, collect the resulting shard
-    paths via :meth:`ZarrWriter.drain_unstaged_shard_paths`, build local→remote
-    pairs, and push one :class:`UploadTask` onto the ``UploadWorker``'s input
-    queue. Network I/O happens in the upload worker, not here.
+    Runs in the ``JobRunner`` subprocess. The JobRunner pulls jobs FIFO from a
+    single queue, so every ``SaveZarrJob`` *already queued* for ``(t, fov)`` has
+    been processed by the time this job runs. Note that jobs are queued from the
+    camera callback thread, so the worker waits for those callbacks to drain
+    before dispatching this barrier — otherwise a frame can still be in flight
+    and land behind it. We then call ``writer.wait_for_pending()`` on the
+    per-FOV ``ZarrWriter`` so all outstanding TensorStore futures resolve,
+    collect the resulting shard paths via
+    :meth:`ZarrWriter.drain_unstaged_shard_paths`, build local→remote pairs, and
+    push one :class:`UploadTask` onto the ``UploadWorker``'s input queue.
+    Network I/O happens in the upload worker, not here.
+
+    A z-slice that is still missing channels is deliberately *not* committed by
+    that flush; it stages at a later barrier once complete. See
+    :meth:`ZarrWriter._flush_pending_z`.
 
     NOTE: this class does NOT inherit from :class:`Job` because the parent
     requires a real ``CaptureInfo``/``JobImage`` per-frame. The
