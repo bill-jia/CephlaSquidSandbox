@@ -90,7 +90,19 @@ Postprocessed events are excluded from the dense/ragged decision and the raw
 | Layout | ZARR_V3 | OME-TIFF | INDIVIDUAL_IMAGES |
 |---|---|---|---|
 | **Dense** | one multichannel plate; frames fold into `T` (`T = Nt × frames/state`) | one `TZCYX` stack, `T` expanded | per-frame files |
-| **Ragged** | one **single-channel plate per state** (`{state}.ome.zarr`), each with its own `T` | one stack per state | per-frame files |
+| **Ragged** | one **single-channel plate per (state, z-mode)**, each with its own `T` | one stack per state | per-frame files |
+
+The ragged zarr store name depends on the xy layout — HCS puts each namespace at
+plate level, flexible regions insert an extra directory:
+
+| | Dense | Ragged |
+|---|---|---|
+| HCS | `plate.ome.zarr/{row}/{col}/{fov}/` | `{state}.ome.zarr/{row}/{col}/{fov}/` |
+| Non-HCS | `zarr/{region}/fov_{n}.ome.zarr/` | `zarr/{state}/{region}/fov_{n}.ome.zarr/` |
+
+Each ragged store is a complete, independent OME-NGFF image (and, in HCS mode, a
+complete plate with its own `ome.plate` / `ome.well` metadata). See
+[zarr-v3-format.md](zarr-v3-format.md#store-inventory).
 
 Each captured frame is **self-describing** (`CaptureInfo.array_key`,
 `save_t_index`, `save_c_index`, `save_t_size`, `save_c_size`, `save_z_size`,

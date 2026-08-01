@@ -182,8 +182,30 @@ def enumerate_levels(fov_group: Path) -> List[Path]:
     return out
 
 
+def shard_files_for_timepoint(level_dir: Path, time_point: int) -> List[Path]:
+    """Every shard file belonging to ``time_point`` at this pyramid level.
+
+    With zarr-v3 ``default`` chunk-key encoding the shard path *is* its grid
+    coordinate, and the leading component is the ``t`` grid index — so the whole
+    ``c/<t>/`` subtree belongs to exactly that timepoint (guaranteed by
+    :func:`check_fov_layout`, which requires an outer chunk covering exactly one
+    timepoint). Walking it is layout-agnostic: it picks up the single
+    ``c/<t>/0/0/0/0`` of the legacy per-FOV shard, the ``c/<t>/0/<z>/0/0`` fan of
+    the default per-z layout, and anything else with the same ``t``-first
+    ordering — instead of hardcoding one shape and silently missing the rest.
+    """
+    tp_dir = level_dir / "c" / str(time_point)
+    if not tp_dir.is_dir():
+        return []
+    out: List[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(tp_dir):
+        for name in filenames:
+            out.append(Path(dirpath) / name)
+    return sorted(out)
+
+
 def enumerate_timepoints_for_level(level_dir: Path) -> List[int]:
-    """Timepoint indices for which a shard file exists at this level."""
+    """Timepoint indices for which at least one shard file exists at this level."""
     c_dir = level_dir / "c"
     if not c_dir.is_dir():
         return []
@@ -195,25 +217,30 @@ def enumerate_timepoints_for_level(level_dir: Path) -> List[int]:
             tp = int(entry.name)
         except ValueError:
             continue
-        # Expect one shard file at c/<t>/0/0/0/0.
-        shard_file = entry / "0" / "0" / "0" / "0"
-        if shard_file.is_file():
+        if shard_files_for_timepoint(level_dir, tp):
             tps.append(tp)
     return tps
 
 
 def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
     """Validate that ``fov_group``'s on-disk layout matches the assumptions
-    in :func:`enumerate_timepoints_for_level` and :func:`build_tasks_for_fov`.
+    in :func:`shard_files_for_timepoint` and :func:`build_tasks_for_fov`.
 
-    Specifically: the level-0 array must be a 5D ``(T, C, Z, Y, X)`` zarr
-    with an outer chunk grid of ``(1, C, Z, Y, X)`` — i.e. every chunk
-    file under ``c/<t>/0/0/0/0`` must contain **all and only** the data
-    for timepoint ``t``. This is what the current Squid writer produces;
-    older writers (pre-commit ``5d6b34b2``) supported conditional layouts
-    (FAST = no sharding, BALANCED = per-z-level sharding, 6D wellplate
-    arrays) whose files live at different paths and can NOT be safely
-    enumerated or deleted by this script.
+    The one invariant this script needs is **a shard never spans two
+    timepoints**: it batches uploads per ``(t, fov)`` and deletes a bundle's
+    local files once that bundle verifies, so a file shared between timepoints
+    would be deleted while still being written. With zarr-v3 ``default``
+    chunk-key encoding the shard path is its grid coordinate with ``t`` first,
+    so the invariant reduces to a 5D ``(T, C, Z, Y, X)`` array whose outer chunk
+    has ``chunk_shape[0] == 1``.
+
+    That admits every 5D layout the writer has produced — the default per-z
+    shard ``(1, C, 1, Y, X)`` at ``c/<t>/0/<z>/0/0``, the legacy per-FOV shard
+    ``(1, C, Z, Y, X)`` at ``c/<t>/0/0/0/0``, and the pre-``5d6b34b2``
+    unsharded ``(1, 1, 1, Y, X)`` at ``c/<t>/<c>/<z>/0/0`` — because the files
+    are enumerated by walking ``c/<t>/`` rather than by guessing a path shape.
+    It still rejects the old 6D wellplate arrays, whose leading grid axis is the
+    FOV rather than the timepoint.
 
     Returns ``(ok, reason)``. When ``ok=False``, ``reason`` is a short
     human-readable description; the caller should refuse to run.
@@ -242,23 +269,29 @@ def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
     if len(chunk_shape) != 5:
         return False, f"unexpected outer chunk_shape length: {chunk_shape}"
 
-    # The outer chunk must cover exactly one timepoint and all of C, Z, Y, X.
-    # This is what makes `c/<t>/0/0/0/0` a complete per-timepoint shard.
-    if chunk_shape[0] != 1 or list(chunk_shape[1:]) != list(shape[1:]):
+    # The outer chunk must cover exactly one timepoint, so that the whole
+    # `c/<t>/` subtree is exclusive to timepoint `t` and can be uploaded and
+    # deleted as one bundle. How the shard is subdivided below `t` does not
+    # matter — the files are walked, not constructed.
+    if chunk_shape[0] != 1:
         return False, (
-            f"unexpected outer chunk_shape {chunk_shape} for shape {shape}; "
-            f"this script assumes sharded layout with chunk_shape=(1, C, Z, Y, X) "
-            f"so files at c/<t>/0/0/0/0 are per-timepoint shards. The dataset's "
-            f"chunk grid suggests an older writer (FAST/NONE compression or "
-            f"per-z-level sharding) — its data lives at different paths and "
-            f"this script can NOT safely upload or delete it."
+            f"outer chunk_shape {chunk_shape} spans {chunk_shape[0]} timepoints "
+            f"(shape {shape}); this script batches uploads and local deletion "
+            f"per timepoint, which is only safe when a shard belongs to exactly "
+            f"one timepoint."
         )
 
     cke = data.get("chunk_key_encoding", {}) or {}
     if cke.get("name") != "default":
         return False, f"unexpected chunk_key_encoding.name: {cke.get('name')!r}"
 
-    return True, "5D, sharded (1, C, Z, Y, X), default chunk-key encoding"
+    if list(chunk_shape[1:]) == list(shape[1:]):
+        kind = "one shard per FOV-timepoint"
+    elif chunk_shape[1] == shape[1] and chunk_shape[2] == 1:
+        kind = "one shard per z-slice"
+    else:
+        kind = f"outer chunk {tuple(chunk_shape)}"
+    return True, f"5D, t-exclusive shards ({kind}), default chunk-key encoding"
 
 
 def fov_acquisition_complete(fov_group: Path) -> bool:
@@ -465,11 +498,10 @@ def build_tasks_for_fov(
         files: List[Tuple[str, str]] = []
         deletable: set = set()
         for level in level_dirs:
-            shard = level / "c" / str(tp) / "0" / "0" / "0" / "0"
-            if shard.is_file():
+            for shard in shard_files_for_timepoint(level, tp):
                 local = str(shard)
                 files.append((local, local_to_remote_path(local, target.local_base, target.remote_root)))
-                # Per-timepoint shards are exclusive to this (t, fov); safe
+                # Every file under c/<t>/ is exclusive to this (t, fov); safe
                 # to delete after sha256 verify.
                 deletable.add(local)
         if not files:
@@ -527,6 +559,29 @@ def build_metadata_task(
 # ---------------------------------------------------------------------------
 # Local deletion
 # ---------------------------------------------------------------------------
+
+
+def _drop_already_submitted(task: UploadTask, submitted_files: Set[str]) -> Optional[UploadTask]:
+    """Strip files already submitted this run; return None if nothing is left.
+
+    Records what survives, so each local file is uploaded at most once per
+    follow session even though a timepoint may be visited by several rescans as
+    its per-z shards land.
+    """
+    fresh = [(local, remote) for local, remote in task.files if local not in submitted_files]
+    if not fresh:
+        return None
+    for local, _remote in fresh:
+        submitted_files.add(local)
+    return UploadTask(
+        task_id=task.task_id,
+        time_point=task.time_point,
+        region_id=task.region_id,
+        fov=task.fov,
+        files=fresh,
+        deletable_local_paths={p for p in task.deletable_local_paths if any(p == l for l, _ in fresh)},
+        stable_read_paths={p for p in task.stable_read_paths if any(p == l for l, _ in fresh)},
+    )
 
 
 def delete_verified_locals(
@@ -945,9 +1000,13 @@ def run_backfill_follow(
         f"max_idle={max_idle_s if max_idle_s > 0 else 'forever'}s"
     )
 
-    # In-memory deduplication: which (region, fov, tp) we've already
-    # submitted; which (region, fov, tp) skips we've already logged.
-    submitted_shards: Set[Tuple[str, int, int]] = set()
+    # In-memory deduplication, at **file** granularity rather than per
+    # (region, fov, tp). A timepoint is no longer one shard file: the default
+    # per-z layout writes one per z-slice, and a rescan can catch a timepoint
+    # part-written. Deduping by timepoint would mark it done on the first sight
+    # and strand every shard that landed afterwards. Files already uploaded and
+    # locally deleted simply never reappear in a rescan.
+    submitted_files: Set[str] = set()
     skip_log_state: Set[Tuple[str, int, int]] = set()
     pending_task_ids: Set[str] = set()
     completed_results = 0
@@ -1063,11 +1122,10 @@ def run_backfill_follow(
                     in_progress=in_progress,
                     skip_log_state=skip_log_state,
                 ):
-                    key = (task.region_id, task.fov, task.time_point)
-                    if key in submitted_shards:
+                    task = _drop_already_submitted(task, submitted_files)
+                    if task is None:
                         continue
                     worker.submit(task)
-                    submitted_shards.add(key)
                     pending_task_ids.add(task.task_id)
                     submitted_now += 1
             if submitted_now:
@@ -1150,11 +1208,10 @@ def run_backfill_follow(
                             in_progress=False,
                             skip_log_state=skip_log_state,
                         ):
-                            key = (task.region_id, task.fov, task.time_point)
-                            if key in submitted_shards:
+                            task = _drop_already_submitted(task, submitted_files)
+                            if task is None:
                                 continue
                             worker.submit(task)
-                            submitted_shards.add(key)
                             pending_task_ids.add(task.task_id)
                             final_count += 1
                         # Metadata is rewritten by finalize; re-submit one

@@ -364,24 +364,32 @@ the Wellplate tab (Steps 5–10 above). The difference is how you specify *where
 
 ### Building a position list
 
+The **Positions** table sits directly in the tab and is the position list: one row per
+position, in scan order, with the columns `x (mm)`, `y (mm)`, `z (μm)`, **Region Name**
+and a read‑only **AF Ref**. **Click a row to select it and drive the stage there**;
+double‑click any cell to edit it.
+
 Drive the stage to a spot of interest (using the stage jog buttons, the plate map, or
-Click‑to‑Move), then manage the list with these buttons:
+Click‑to‑Move), then manage the list with the buttons around the table:
 
 | Button / action | Effect |
 |---|---|
 | **Add** (or the `;` key, or Ctrl+A) | Add the current stage X/Y/Z as a new position (region `R0`, `R1`, …). Duplicate X/Y positions are rejected. |
-| **Remove** | Remove the position currently selected in the **Location List** dropdown. |
-| **Next** | Advance the selection to the next position and move the stage there. |
+| **Remove** | Remove the selected position. |
 | **Clear** | Remove all positions. |
-| **Location List** (dropdown) | Lists every saved position as `<region name> \| x … mm  y … mm  z … µm`; selecting one moves the stage there. |
+| **Next** | Select the next position (wrapping at the end) and move the stage there. |
 | **Update Z** | Overwrite the selected position's Z with the current stage Z. |
 | **Update Ref** | Re‑capture the laser‑AF reference (focus target) for the selected position. Only shown on rigs with the laser‑focus camera; see [Per‑region laser autofocus references](#per-region-laser-autofocus-references). |
+| Editing a cell | `x` / `y` / `z` move that position (and the stage follows); **Region Name** renames it — see [Naming regions](#naming-regions). |
+
+The whole block is disabled while an acquisition is running: the worker takes its copy of
+the position list when the run starts, so edits made mid‑run would not reach the data.
 
 ### Naming regions
 
 Auto‑assigned names (`R0`, `R1`, …) can be replaced with anything meaningful — `liver
-section`, `tumor_1`, `day3 rep2`. Open **Edit** and type a new value in the **Region
-Name** column (or set the `ID` column of an imported CSV).
+section`, `tumor_1`, `day3 rep2`. Double‑click the **Region Name** cell in the Positions
+table and type (or set the `ID` column of an imported CSV).
 
 The name you choose is what appears everywhere downstream:
 
@@ -403,23 +411,20 @@ YAML that fail these rules are replaced with a fresh `R{n}` and a warning in the
 An accepted rename carries the region's per‑point channel selection, laser‑AF reference,
 and focus‑map points with it, and leaves the scan order unchanged.
 
-### Import / export / edit
+### Import / export
 
-- **Import Location List** — load positions from a CSV with columns `x (mm)`,
+- **Import** — load positions from a CSV with columns `x (mm)`,
   `y (mm)`, `z (mm)`, and optional `ID`. This replaces the current list. If the CSV has a
   `laser_af_x_reference` column and/or a `<name>.laser_af.json` sidecar file next to it,
   the per‑region laser‑AF references are restored too (see
   [Per‑region laser autofocus references](#per-region-laser-autofocus-references)).
-- **Export Location List** — save the current positions to a CSV (`x (mm)`, `y (mm)`,
+- **Export** — save the current positions to a CSV (`x (mm)`, `y (mm)`,
   `z (mm)`, `ID`, plus a `laser_af_x_reference` column). When any position has a laser‑AF
   reference, a companion `<name>.laser_af.json` sidecar is written alongside the CSV
   holding the full references (including the cross‑correlation crop image) so the export
   round‑trips exactly. Keep the sidecar next to the CSV to re‑import references.
-- **Edit** — open the position list as an editable table (columns x, y, z, **Region
-  Name**, and a read‑only **AF Ref**); edit x/y/z to move that position or the name to
-  rename it (see [Naming regions](#naming-regions)), click a row to select it. The **AF
-  Ref** column shows each region's stored laser‑AF spot position, or `—` when none is
-  set.
+The **AF Ref** column of the Positions table shows each region's stored laser‑AF spot
+position, or `—` when none is set.
 
 ### Per‑position tile grid
 
@@ -449,10 +454,10 @@ How to use it:
    *Focus Camera / Laser AF Setup* tool to find the spot and calibrate).
 2. Drive to a position, get it in focus, and click **Add**. The current laser‑AF reference
    is captured and attached to that position — its spot position appears in the **AF Ref**
-   column of the **Edit** table.
+   column of the Positions table.
 3. Repeat for each position, focusing each one before adding it.
-4. To re‑capture a position's reference later, select it in the **Location List** and click
-   **Update Ref** (focus first). **Update Z** changes only the stored Z, not the reference.
+4. To re‑capture a position's reference later, select its row in the Positions table and
+   click **Update Ref** (focus first). **Update Z** changes only the stored Z, not the reference.
 
 During acquisition the worker loads each region's own reference before focusing in that
 region, independent of scan order. Positions **without** a captured reference fall back to
@@ -460,7 +465,7 @@ the global reference. Acquisition can therefore start when *either* a global ref
 set *or* every position has its own — otherwise the start check reports that a reference is
 missing. A `region_laser_af_references.csv` summary is written into the experiment folder
 for reproducibility, and references export/import with the location list (see
-[Import / export / edit](#import--export--edit)).
+[Import / export](#import--export)).
 
 References stay attached to their position for as long as the position exists: they follow
 a rename, and they survive the region rebuilds triggered by switching acquisition tabs or

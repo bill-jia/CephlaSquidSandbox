@@ -32,12 +32,88 @@ File count per FOV ≈ `T × Z × (num_pyramid_levels + 1)` (per-z, default) or
 `T × (num_pyramid_levels + 1)` (legacy). Each shard is written once and never
 reopened.
 
+### Shard file paths
+
+With zarr-v3 `default` chunk-key encoding, a shard file's path *is* its grid
+coordinate: `{level}/c/{t}/{c_grid}/{z_grid}/{y_grid}/{x_grid}`. Because the
+shard spans all channels and the full `Y`,`X`, only `t` and `z` vary:
+
+| Layout | Shard grid | Shard file |
+|---|---|---|
+| per-z (default, `ZARR_SHARD_PER_Z=True`) | `(1, C, 1, Y, X)` | `c/{t}/0/{z}/0/0` — **one per z** |
+| legacy (`ZARR_SHARD_PER_Z=False`) | `(1, C, Z, Y, X)` | `c/{t}/0/0/0/0` — one per timepoint |
+
+Any external tool that enumerates shards by path must handle the `{z}` axis —
+see [Known gaps](#known-gaps-and-limitations).
+
+## Store inventory
+
+A single acquisition can produce **more than one** zarr store. Which stores
+appear depends on the xy layout (HCS vs flexible) and on whether the run uses
+[acquisition cycles](acquisition-cycles.md) with a ragged frame plan or
+[online postprocessing](online-postprocessing.md).
+
+Whether a run uses the HCS or the non-HCS column below is decided by
+`FLEXIBLE_MULTIPOINT_AS_HCS` (default `True` ⇒ HCS for every layout); the
+row is decided by the cycle plan.
+
+| Store kind | When | HCS path | Non-HCS path (opt-out) | Array shape |
+|---|---|---|---|---|
+| **Dense** (one multichannel array per FOV) | Plain channel selection, or a cycle plan where every imaged state has the same frame count *and* one z-mode | `plate.ome.zarr/{row}/{col}/{fov}/` | `zarr/{region}/fov_{n}.ome.zarr/` | `(Nt × frames_per_state, C, NZ, Y, X)` |
+| **Ragged** (one single-channel array per *(state, z-mode)*) | Cycle plan with unequal per-state frame counts, or mixed `acquire_z_stack` | `{state}.ome.zarr/{row}/{col}/{fov}/` | `zarr/{state}/{region}/fov_{n}.ome.zarr/` | `(Nt × that_state's_count, 1, NZ, Y, X)` |
+| **Ragged, reference-z only** | A cycle step with **Full z-stack** unchecked | `{state}_refz.ome.zarr/...` | `zarr/{state}_refz/{region}/...` | `(Nt × count, 1, **1**, Y, X)` |
+| **Derived** (postprocess output) | A step/group with a Postprocess routine assigned | `{label}_{output}.ome.zarr/...` | `zarr/{label}_{output}/{region}/...` | `(Nt, 1, z_size, Y, X)` |
+
+The path-building rules live in `control/utils.py`
+(`build_hcs_zarr_fov_path` / `build_per_fov_zarr_path`); the `array_key` that
+selects a namespace is `None` for dense, `array_key_for(state, acquire_z_stack)`
+for ragged (`control/models/acquisition_cycle.py`), and `{label}_{output}` for
+derived plates (`PostprocessJob._write_output`).
+
+Key consequences:
+
+- **Every store is structurally identical below the FOV group** — same
+  `(T, C, Z, Y, X)` arrays, same pyramid, same `frame_times`, same OME-NGFF
+  metadata. Only the extents and the channel list differ.
+- **In HCS mode each namespace is a full, independent OME-NGFF plate**, with its
+  own `ome.plate` root and `ome.well` groups (written once per plate by
+  `SaveZarrJob._write_hcs_metadata_if_needed`). A ragged 3-state run with one
+  DPC output produces four sibling `*.ome.zarr` plates in the experiment dir.
+- **A ragged/derived store's `C` axis is always 1**, and its `omero.channels`
+  has exactly that one entry (the state name, or `{label}_{output}`). The
+  channel axis carries no information in ragged mode — the *store name* does.
+- **Raw frames consumed by a postprocess routine are never written.** Only the
+  routine's declared outputs land on disk.
+- **Per-region channel subsets** (Per-Point Channels) are handled by each frame
+  self-describing its array, so two regions in the same run can legitimately have
+  different `C` and different channel names in the *same* dense plate hierarchy.
+
+### Channel and sequence semantics
+
+Where a frame lands is computed by `frame_coord()`:
+
+| | Dense | Ragged |
+|---|---|---|
+| Store | one per FOV | one per *(state, z-mode)* per FOV |
+| `c` index | position of the state in the region's channel order | always 0 |
+| `t` index | `t_scan × frames_per_state + state_frame_index` | `t_scan × that_state's_count + state_frame_index` |
+| `T` size | `Nt × frames_per_state` | `Nt × that_state's_count` |
+
+So a per-position cycle's repeats are **folded into `T`**, with the scan-level
+timelapse blocking on top of it — timepoint `t_scan` owns the contiguous `T`
+range `[t_scan × count, (t_scan+1) × count)`. The original acquisition order is
+recoverable from `acquisition_times.csv` (`cycle_event_index`,
+`state_frame_index`) and `cycles_manifest.yaml`.
+
 ## Output layouts
 
-### HCS (wellplate)
+### HCS (plate) — the default for every layout
 
-When the xy layout resolves to well IDs (`A1`, `B12`, …), Squid writes the
-OME-NGFF HCS plate hierarchy:
+Squid writes the OME-NGFF HCS plate hierarchy when the xy layout resolves to
+well IDs (`A1`, `B12`, …) **and** — since `FLEXIBLE_MULTIPOINT_AS_HCS = True` —
+for Flexible Multipoint scans, whose arbitrary regions are mapped onto synthetic
+plate cells with their names preserved as `_squid` annotations (see
+[flexible-to-hcs-conversion.md](flexible-to-hcs-conversion.md)).
 
 ```
 {experiment}/
@@ -57,9 +133,10 @@ OME-NGFF HCS plate hierarchy:
         └── ...
 ```
 
-### Non-HCS (flexible / large-area)
+### Non-HCS (opt-out)
 
-For non-well xy layouts (custom regions, single-area tile scans, etc.):
+Only written when `FLEXIBLE_MULTIPOINT_AS_HCS = False`, or by acquisitions
+recorded before that setting existed:
 
 ```
 {experiment}/
@@ -73,7 +150,31 @@ For non-well xy layouts (custom regions, single-area tile scans, etc.):
 ```
 
 Each FOV is its own OME-NGFF image group. Both layouts share the same per-FOV
-structure below the FOV group.
+structure below the FOV group. There is **no plate/well grouping metadata** in
+the non-HCS layout — the directory names are the only index, so plate-aware
+readers see unrelated images. `tools/flexible_to_hcs_zarr.py` converts such a
+tree into a real HCS plate by mapping each region to a well; see
+[flexible-to-hcs-conversion.md](flexible-to-hcs-conversion.md).
+
+### Ragged / derived namespaces
+
+A ragged cycle run or a postprocess output inserts one namespace level:
+
+```
+{experiment}/
+├── BF.ome.zarr/           # HCS: sibling plates, one per (state, z-mode) or output
+├── BF_refz.ome.zarr/
+├── dpc_phase.ome.zarr/
+└── zarr/                  # non-HCS: one subtree per namespace
+    ├── BF/{region}/fov_0.ome.zarr/
+    ├── BF_refz/{region}/fov_0.ome.zarr/
+    └── dpc_phase/{region}/fov_0.ome.zarr/
+```
+
+Note the asymmetry: in HCS mode the namespace replaces `plate` in the store
+name at the *same depth*; in non-HCS mode it is an *extra* directory level
+between `zarr/` and `{region}/`. Tools that walk these trees by path must
+account for both — see [Known gaps](#known-gaps-and-limitations).
 
 ## Array structure
 
@@ -167,12 +268,26 @@ At each FOV group's `zarr.json` (schema v0.5):
   `coordinates.csv` is kept for human inspection but is no longer the source of
   truth for positions.
 
-### `_squid` pointer
+### `_squid` block
 
-`_squid.manifest_path` is a relative path from the FOV group back to the
-experiment-root `acquisition.yaml`, which holds full provenance (objective,
-wellplate format, channel presets, instrument manifest, etc.). The zarr
-intentionally does not duplicate the manifest.
+A custom `_squid` key sits beside `ome` in the group attributes. The NGFF 0.5
+schemas do not restrict `additionalProperties`, so this validates cleanly and
+readers that don't know about it ignore it.
+
+On a **FOV group**:
+
+| Key | Meaning |
+|---|---|
+| `manifest_path` | Relative path back to the experiment-root `acquisition.yaml`, which holds full provenance (objective, wellplate format, channel presets, instrument manifest). The zarr intentionally does not duplicate the manifest. |
+| `acquisition_complete` | Flipped to `true` by `ZarrWriter.finalize()`. |
+| `region` | Originating region/well id. |
+| `fov_index` | Index of this field within its region. |
+| `well`, `stage_position_um` | Only for a synthetic plate (flexible regions mapped to wells): the assigned well and the FOV's stage origin, so the image is self-describing without a plate-root lookup. |
+
+On a **synthetic plate root**: `source_layout`, `region_layout`, and `regions` —
+the region ↔ well table that binds each well back to its user-given name. On a
+**synthetic well group**: `region` and `field_count`. Neither is written for a
+real wellplate scan, where the well id already *is* the region name.
 
 ## Per-frame timestamps
 
@@ -210,11 +325,17 @@ Acquisition-level completion is marked by a single `.done` file at
 
 For HCS acquisitions, two extra group-level `zarr.json` files are written:
 
-- `plate.ome.zarr/zarr.json` — OME-NGFF `ome.plate` (rows, columns, wells).
-- `plate.ome.zarr/{row}/{col}/zarr.json` — OME-NGFF `ome.well` (fields list).
+- `{plate}.ome.zarr/zarr.json` — OME-NGFF `ome.plate` (rows, columns, wells).
+- `{plate}.ome.zarr/{row}/{col}/zarr.json` — OME-NGFF `ome.well` (fields list).
 
-Both are written once per acquisition when the first writer for that
-plate / well initializes (see `SaveZarrJob._write_hcs_metadata_if_needed`).
+Both are written once **per plate** when the first writer for that plate / well
+initializes (see `SaveZarrJob._write_hcs_metadata_if_needed`). Ragged and
+derived namespaces each get their own pair, with `plate.name` set to the
+`array_key` (`BF`, `BF_refz`, `dpc_phase`, …) rather than the literal `"plate"`.
+Rows/columns/wells are identical across the plates of one run — they come from
+the same `region_fov_counts` map — so the plates are aligned well-for-well.
+
+The non-HCS layout writes no equivalent grouping metadata.
 
 ## Pipelined writes
 
@@ -232,6 +353,50 @@ effective pipeline depth. `finalize()` waits for all outstanding futures.
 
 Chunk/shard shape and pyramid depth are fixed by the implementation; they are
 not user-configurable.
+
+## Known gaps and limitations
+
+Audited 2026-07-31. These are **current behaviours to be aware of**, not
+aspirations — each is a place where a consumer of the output can be surprised.
+
+1. ~~**`_squid.manifest_path` is wrong for non-HCS ragged/derived stores.**~~
+   **Fixed.** `get_manifest_path()` now takes the `array_key`, so the pointer
+   accounts for the extra directory level a ragged/derived non-HCS store sits
+   at. Datasets written before the fix have `../../../acquisition.yaml` in those
+   stores, which resolves to `{experiment}/zarr/` — read `acquisition.yaml` from
+   the experiment root directly for those.
+2. ~~**`scripts/zarr_backfill_upload.py` does not support the default per-z
+   shard layout.**~~ **Fixed.** It now enumerates a timepoint's shards by
+   walking `c/{t}/` instead of constructing `c/{t}/0/0/0/0`, and its guard only
+   requires that a shard not span two timepoints (5D array, `chunk_shape[0] ==
+   1`). That covers per-z, legacy per-FOV, and unsharded layouts alike;
+   `--follow` also dedupes per file so a part-written timepoint isn't stranded.
+3. **The post-finalize upload metadata resync only covers dense stores.**
+   `MultiPointWorker._collect_metadata_paths_for_fov()` resolves the group path
+   with `array_key=None`, so for ragged/derived plates the *final* `zarr.json`
+   (the one carrying `acquisition_complete: true`) and the last `frame_times`
+   chunk are never re-pushed. Those files were uploaded by the per-FOV barriers
+   during the run, so the remote data is complete, but the remote copy's
+   `_squid.acquisition_complete` stays `false`. Anything keying on that flag
+   (including the backfill script's `--follow` exit condition) will not see the
+   run as finished.
+4. **The NDViewer's offline discovery only finds the dense store.**
+   `discover_zarr_v3_fovs()` looks for `plate.ome.zarr` and
+   `zarr/{region}/fov_*.ome.zarr`. Ragged plates (`{state}.ome.zarr`) and the
+   extra non-HCS namespace level are not enumerated, so a ragged run opened from
+   disk shows only its dense store (nothing at all if the run is entirely
+   ragged). Flexible runs are no longer affected for the dense case — they now
+   land in `plate.ome.zarr`, which is the first thing it checks. Live push-mode
+   viewing during acquisition is unaffected.
+5. **The stitcher cannot consume ZARR_V3 output.** `control/stitcher.py` reads
+   per-timepoint TIFF/BMP folders plus per-timepoint `coordinates.csv`; it has
+   no zarr reader. Its own `.ome.zarr` output is a *different* format
+   (zarr v2 via `ome-zarr`/`aicsimageio`, OME-NGFF 0.4-era), written to
+   `{input}/{t}_stitched/` and `*_complete_acquisition.ome.zarr`. Stitching a
+   ZARR_V3 acquisition requires exporting to TIFF first.
+6. **Local shard-directory pruning after verified upload skips ragged stores**
+   (`_prune_empty_shard_dirs` also resolves with `array_key=None`). Cosmetic —
+   empty `c/{t}/…` directories are left behind; no data is affected.
 
 ## Reading the output
 
@@ -261,10 +426,27 @@ arr = grp["0"]
 plane = arr[0, 0, 0, :, :]
 ```
 
+Substitute the store name for a ragged or derived namespace — e.g.
+`exp/BF_refz.ome.zarr/A/1/0/0`, or `exp/zarr/dpc_phase/R0/fov_0.ome.zarr/0`.
+Because ragged stores are single-channel, index them as `[t, 0, z, :, :]`.
+
 ### napari / OMERO / BiaFlows
 
 Any OME-NGFF v0.5 HCS-plate reader works with the output directory. Pyramid
-levels make scrolling at plate scale practical.
+levels make scrolling at plate scale practical. A ragged run is *n* separate
+plates — open each one; they are not merged into a single multi-channel view.
+
+## Other zarr writers in this codebase
+
+These produce zarr, but **not** this format. Don't confuse them with acquisition
+output.
+
+| Producer | Format | Layout |
+|---|---|---|
+| `FastAcquisitionWriter` (fast NIDAQ capture, `file_format="zarr"`) | **zarr v2**, blosc-lz4, no OME metadata | `{run}/frames.zarr` with flat `frames (N, Y, X)`, `frame_ids (N,)`, `timestamps (N,)` datasets; chunks `(100, Y, X)`. Context lives in sibling `metadata.json` + `acquisition_metadata.yaml` + `frames/frame_metadata.jsonl`, not in the store. |
+| `control/stitcher.py` | **zarr v2** OME-NGFF (via `ome-zarr` / `aicsimageio`) | `{input}/{t}_stitched/{region}_{name}.ome.zarr`, then a merged `*_complete_acquisition.ome.zarr` (plain or HCS). Input is TIFF acquisitions only. |
+| `tools/script_create_zarr_from_acquisition.py` | zarr v2 via `ome-zarr` | Legacy one-off converter driven by the old `configurations.xml`; superseded by the repackage tool below. |
+| `control/core/io_simulation.py` | none (no files written) | Simulated-write benchmarking path; accounts bytes and throttles only. |
 
 ## Repackaging legacy INDIVIDUAL_IMAGES acquisitions
 
@@ -272,6 +454,9 @@ levels make scrolling at plate scale practical.
 `INDIVIDUAL_IMAGES` acquisition (per-frame TIFFs under per-timepoint folders)
 into this exact layout, including per-FOV pyramids and translation metadata.
 Missing frames are zero-filled by default and logged to `missing_frames.csv`.
+It writes the **dense** layout only (one multichannel array per FOV) with the
+current default per-z shard granularity, and does not populate omero channel
+colors / wavelengths.
 
 ```bash
 python software/tools/repackage_tiffs_to_zarr.py \
@@ -286,6 +471,15 @@ See the script `--help` for the full flag set (`--on-missing`,
 
 ## Related documentation
 
+- [Multipoint Data Saving](multipoint-data-saving.md) — the job pipeline that
+  feeds this writer, and the other save formats.
+- [Acquisition Cycles](acquisition-cycles.md) — where the dense/ragged decision
+  and the `_refz` namespaces come from.
+- [Online Postprocessing](online-postprocessing.md) — the derived plates.
+- [Streaming OME-Zarr to a Network Drive](zarr-network-streaming.md) — live
+  upload, deletion safety, and the backfill script.
+- [Flexible → HCS conversion](flexible-to-hcs-conversion.md) — turning a
+  flexible-region acquisition into an OME-NGFF plate.
 - [NDViewer Tab](ndviewer-tab.md) — live viewing during acquisition.
 - [Downsampled Plate View](downsampled-plate-view.md) — overview tile images
   for wellplate scans (independent of the zarr output).

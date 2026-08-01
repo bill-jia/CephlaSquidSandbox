@@ -1017,6 +1017,43 @@ class MultiPointWorker:
                     for fov_idx, coord in enumerate(coords)
                 }
 
+            # Flexible (non-wellplate) regions -> synthetic plate wells, so the
+            # output is a real OME-NGFF HCS plate instead of a bare collection of
+            # images. Resolved HERE and only here: the region set and their FOV
+            # counts are frozen by this point, whereas ScanCoordinates is rebuilt
+            # wholesale on any earlier re-tile or rename. Region names are not
+            # lost — they are written as _squid annotations on the plate root,
+            # each well, and each FOV group.
+            from control.core.hcs_region_mapping import resolve_plate_mapping
+
+            try:
+                plate_mapping = resolve_plate_mapping(
+                    list(region_fov_counts.keys()),
+                    is_wellplate=is_hcs,
+                    flexible_as_hcs=FLEXIBLE_MULTIPOINT_AS_HCS,
+                    layout=FLEXIBLE_MULTIPOINT_HCS_LAYOUT,
+                )
+            except ValueError as e:
+                self._log.error(
+                    "Could not map flexible regions onto a plate (%s); "
+                    "falling back to the flat zarr/{region}/ layout",
+                    e,
+                )
+                plate_mapping = None
+
+            region_well_ids: Dict[str, str] = {}
+            region_layout: Optional[str] = None
+            if plate_mapping is not None:
+                is_hcs = plate_mapping.is_hcs
+                region_well_ids = plate_mapping.region_well_ids
+                region_layout = plate_mapping.layout
+                if region_well_ids:
+                    self._log.info(
+                        "Flexible multipoint -> HCS plate (%s layout): %s",
+                        region_layout,
+                        ", ".join(f"{r}->{w}" for r, w in region_well_ids.items()),
+                    )
+
             # Channel axis for the dense layout = the global plan's imaged states
             # (stimulus-only states produce no frame, so they're excluded). For
             # ragged runs each frame self-describes its single-channel array via
@@ -1046,6 +1083,8 @@ class MultiPointWorker:
                 channel_names=channel_names,
                 channel_colors=channel_colors,
                 channel_wavelengths=channel_wavelengths,
+                region_well_ids=region_well_ids,
+                region_layout=region_layout,
             )
             mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
@@ -1186,69 +1225,22 @@ class MultiPointWorker:
     def _is_well_based_acquisition(self) -> bool:
         """Check if regions represent a valid well-based acquisition.
 
-        Returns True if:
-        - All region names are valid well IDs (A1, B2, etc.)
-        - All regions have the same FOV grid pattern (same distinct X and Y counts)
+        True when every region name is a valid well ID *and* every region has
+        the same FOV grid shape. Delegates to
+        :func:`control.core.hcs_region_mapping.is_wellplate_acquisition` so this
+        and the zarr layout decision (and the GUI's live-view path builder)
+        can never disagree.
         """
-        if not self.scan_region_names:
+        from control.core.hcs_region_mapping import is_wellplate_acquisition
+
+        result = is_wellplate_acquisition("Load Coordinates", self.scan_region_fov_coords_mm)
+        if not result:
             self._log.debug(
-                "_is_well_based_acquisition: no scan_region_names defined; treating as non well-based acquisition"
-            )
-            return False
-
-        # Check all region names are valid well IDs using parse_well_id
-        for region_id in self.scan_region_names:
-            if not region_id:
-                self._log.debug(
-                    "_is_well_based_acquisition: encountered empty region_id in scan_region_names; "
-                    "treating as invalid well-based acquisition"
-                )
-                return False
-            try:
-                parse_well_id(region_id)
-            except ValueError as exc:
-                self._log.debug(
-                    "_is_well_based_acquisition: region_id '%s' is not a valid well ID: %s; "
-                    "treating as invalid well-based acquisition",
-                    region_id,
-                    exc,
-                )
-                return False
-
-        # Check all wells have same grid size
-        grid_sizes = set()
-        for region_id, coords in self.scan_region_fov_coords_mm.items():
-            if not coords:
-                self._log.debug(
-                    "_is_well_based_acquisition: region '%s' has no FOV coordinates; skipping in grid-size check",
-                    region_id,
-                )
-                continue
-            x_positions = set(round(c[0], 4) for c in coords)  # Round to avoid float precision issues
-            y_positions = set(round(c[1], 4) for c in coords)
-            grid_sizes.add((len(x_positions), len(y_positions)))
-
-        # All wells should have the same grid pattern
-        if not grid_sizes:
-            self._log.debug(
-                "_is_well_based_acquisition: no valid FOV coordinates found for any region; "
-                "treating as non well-based acquisition"
-            )
-            return False
-
-        if len(grid_sizes) > 1:
-            self._log.debug(
-                "_is_well_based_acquisition: inconsistent FOV grid sizes detected across wells: %s; "
+                "_is_well_based_acquisition: regions %s are not uniform-grid well IDs; "
                 "treating as non well-based acquisition",
-                grid_sizes,
+                list(self.scan_region_fov_coords_mm.keys()),
             )
-            return False
-
-        self._log.debug(
-            "_is_well_based_acquisition: valid well-based acquisition detected with grid size %s",
-            next(iter(grid_sizes)),
-        )
-        return True
+        return result
 
     def _channel_step_count(self) -> int:
         return len(self.observation_state_names)
@@ -2059,6 +2051,13 @@ class MultiPointWorker:
 
         Kept as a method so the background drainer can call it after the
         JobRunner subprocess (and its in-memory writer instances) is gone.
+
+        KNOWN GAP: resolves the group path with ``array_key=None``, so only the
+        dense store is resynced. A ragged/derived run's final ``zarr.json``
+        (carrying ``acquisition_complete=true``) and last ``frame_times`` chunk
+        are not re-pushed — the shard data is complete on the remote (the
+        per-FOV barriers do iterate every ``array_key``), but the remote
+        completion flag stays false. See docs/zarr-network-streaming.md.
         """
         if self._zarr_writer_info is None:
             return []

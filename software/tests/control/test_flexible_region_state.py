@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 import pytest
-from qtpy.QtWidgets import QComboBox, QTableWidget, QTableWidgetItem
+from qtpy.QtWidgets import QAbstractItemView, QTableWidget, QTableWidgetItem
 
 from control.core.multi_point_utils import ScanPositionInformation
 from control.core.scan_coordinates import ScanCoordinates
@@ -23,11 +23,16 @@ from gui.widgets.multipoint import FlexibleMultiPointWidget
 class _RegionHarness:
     """Just enough of FlexibleMultiPointWidget to drive its per-region bookkeeping."""
 
-    _location_label = staticmethod(FlexibleMultiPointWidget._location_label)
-    _refresh_location_label = FlexibleMultiPointWidget._refresh_location_label
+    _position_cells = staticmethod(FlexibleMultiPointWidget._position_cells)
+    _refresh_position_cells = FlexibleMultiPointWidget._refresh_position_cells
+    _selected_row = FlexibleMultiPointWidget._selected_row
+    _select_row = FlexibleMultiPointWidget._select_row
     _set_name_cell = FlexibleMultiPointWidget._set_name_cell
     _rename_region_from_cell = FlexibleMultiPointWidget._rename_region_from_cell
     cell_was_changed = FlexibleMultiPointWidget.cell_was_changed
+    cell_was_clicked = FlexibleMultiPointWidget.cell_was_clicked
+    go_to = FlexibleMultiPointWidget.go_to
+    next = FlexibleMultiPointWidget.next
     _store_region_reference = FlexibleMultiPointWidget._store_region_reference
     _restore_region_references = FlexibleMultiPointWidget._restore_region_references
     update_fov_positions = FlexibleMultiPointWidget.update_fov_positions
@@ -43,6 +48,7 @@ class _RegionHarness:
         self.focusMapWidget = MagicMock()
         self.multipointController = MagicMock()
         self.multipointController.acquisition_in_progress.return_value = False
+        self.stage = MagicMock()
 
         # update_fov_positions reads these; the tile geometry itself is not under test.
         self.use_overlap = True
@@ -50,13 +56,11 @@ class _RegionHarness:
         self.entry_NY = SimpleNamespace(value=lambda: 2)
         self.entry_overlap = SimpleNamespace(value=lambda: 0)
 
-        self.dropdown_location_list = QComboBox()
         self.table_location_list = QTableWidget(len(names), 5)
+        self.table_location_list.setSelectionBehavior(QAbstractItemView.SelectRows)
         for row, (name, (x, y, z)) in enumerate(zip(names, coords)):
-            self.dropdown_location_list.addItem(self._location_label(name, x, y, z))
-            self.table_location_list.setItem(row, 0, QTableWidgetItem(str(x)))
-            self.table_location_list.setItem(row, 1, QTableWidgetItem(str(y)))
-            self.table_location_list.setItem(row, 2, QTableWidgetItem(str(z * 1000)))
+            for col, item in enumerate(self._position_cells(x, y, z)):
+                self.table_location_list.setItem(row, col, item)
             self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
 
     def type_name(self, row, text):
@@ -90,17 +94,41 @@ def harness(qtbot):
 
     h = _RegionHarness(sc, names, coords)
     qtbot.addWidget(h.table_location_list)
-    qtbot.addWidget(h.dropdown_location_list)
     return h
 
 
-def test_rename_updates_ids_scan_coordinates_and_label(harness):
+def test_rename_updates_ids_scan_coordinates_and_cell(harness):
     harness.type_name(1, "liver section")
 
     assert list(harness.location_ids) == ["R0", "liver section", "R2"]
     assert list(harness.scanCoordinates.region_centers.keys()) == ["R0", "liver section", "R2"]
     assert harness.name_cell(1) == "liver section"
-    assert harness.dropdown_location_list.itemText(1).startswith("liver section")
+
+
+def test_clicking_a_row_selects_it_and_moves_the_stage(harness):
+    """The table is the selection model now that it lives in the tab, so a click has
+    to do what picking from the old dropdown did."""
+    harness.cell_was_clicked(2, 0)
+
+    assert harness._selected_row() == 2
+    harness.stage.move_x_to.assert_called_once_with(30.0)
+    harness.stage.move_y_to.assert_called_once_with(30.0)
+
+
+def test_next_wraps_around_the_selection(harness):
+    harness._select_row(2)
+    harness.next()
+
+    assert harness._selected_row() == 0
+    harness.stage.move_x_to.assert_called_once_with(10.0)
+
+
+def test_actions_are_no_ops_without_a_selection(harness):
+    """currentRow() is -1 until something is selected; the old dropdown could never
+    report that, and an unguarded -1 index silently addressed the *last* position."""
+    assert harness._selected_row() == -1
+    harness.go_to(-1)
+    harness.stage.move_x_to.assert_not_called()
 
 
 def test_rename_longer_than_twenty_chars_is_not_truncated(harness):

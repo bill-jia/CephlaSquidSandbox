@@ -15,7 +15,11 @@ Reads per-timepoint TIFF folders of the form::
 and writes a sibling ``plate.ome.zarr`` (HCS) or ``zarr/`` (non-HCS) tree
 matching what a fresh ZARR_V3 acquisition would produce:
 
-* One 5D ``(T, C, Z, Y, X)`` zarr per FOV with shard ``(1, C, Z, Y, X)``.
+* One 5D ``(T, C, Z, Y, X)`` zarr per FOV, with the ``ZarrWriter`` default
+  shard granularity (one shard per z-slice, ``(1, C, 1, Y, X)``).
+  Dense layout only — the ragged/derived ``array_key`` namespaces an
+  acquisition-cycle run can produce are not reconstructed, and omero channel
+  colors / wavelengths are left unset.
 * Streaming multiscale pyramid (via ``ZarrWriter``).
 * OME-NGFF multiscales + omero + ``_squid.manifest_path`` metadata.
 * HCS plate + well metadata when the layout is HCS.

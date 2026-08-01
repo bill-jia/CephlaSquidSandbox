@@ -673,6 +673,25 @@ writers: "Data Output" {
         its own T size; manifest joins them.
       Streaming multiscale pyramid.
       frame_times zarr array for timestamps.
+      HCS plate hierarchy for wellplate scans AND
+      (via hcs_map) flexible scans.
+    |
+  }
+
+  hcs_map: "HCS Region Mapping" {
+    class: model
+    tooltip: |md
+      control/core/hcs_region_mapping.py
+      Single source of the plate-layout decision.
+      Maps arbitrary flexible region names onto
+      synthetic NGFF plate cells (row/col must be
+      ^[A-Za-z0-9]+$, so names can't be wells).
+      Region names survive as _squid annotations on
+      the plate root / well / FOV groups.
+      Used by MultiPointWorker (where data lands),
+      the NDViewer path builder (live view), and
+      mirrored in tools/flexible_to_hcs_zarr.py for
+      offline conversion of older datasets.
     |
   }
 
@@ -697,6 +716,8 @@ writers: "Data Output" {
   }
 
   mp_worker -> zarr_writer: "SaveZarrJob"
+  mp_worker -> hcs_map: "region -> well\n(resolved at acq start)"
+  hcs_map -> zarr_writer: "plate layout + region annotations"
   mp_worker -> ome_tiff: "SaveOMETiffJob"
   mp_worker -> postprocess: "PostprocessJob\n(postprocessed frames)"
   postprocess -> zarr_writer: "derived output plates"

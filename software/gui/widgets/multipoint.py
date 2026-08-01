@@ -2910,32 +2910,52 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.lineEdit_experimentID.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lineEdit_experimentID.setFixedWidth(96)
 
-        self.dropdown_location_list = QComboBox()
-        self.dropdown_location_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.label_position_count = QLabel("no positions")
+        self.label_position_count.setStyleSheet("color: gray;")
+
         self.btn_add = QPushButton("Add")
+        self.btn_add.setToolTip("Add the current stage position (also ';' or Ctrl+A)")
         self.btn_remove = QPushButton("Remove")
-        self.btn_previous = QPushButton("Previous")
+        self.btn_remove.setToolTip("Remove the selected position")
         self.btn_next = QPushButton("Next")
+        self.btn_next.setToolTip("Select the next position and move the stage there")
         self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setToolTip("Remove every position")
 
-        self.btn_export_locations = QPushButton("Export Location List")
-        self.btn_import_locations = QPushButton("Import Location List")
-        self.btn_show_table_location_list = QPushButton("Edit")  # Open / Edit
+        self.btn_export_locations = QPushButton("Export")
+        self.btn_export_locations.setToolTip("Save the position list (and laser-AF references) to a CSV")
+        self.btn_import_locations = QPushButton("Import")
+        self.btn_import_locations.setToolTip("Replace the position list from a CSV")
 
-        # editable points table. The "AF Ref" column is a read-only indicator of
-        # the per-region laser-AF focus target (the spot x_reference, or "—").
+        # Editable points table, embedded directly in the tab. Row order is scan order.
+        # The "AF Ref" column is a read-only indicator of the per-region laser-AF focus
+        # target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
         self.table_location_list.setColumnCount(5)
-        header_labels = ["x", "y", "z", "Region Name", "AF Ref"]
-        self.table_location_list.setHorizontalHeaderLabels(header_labels)
-        self.table_location_list.setWindowTitle("Location List")
+        self.table_location_list.setHorizontalHeaderLabels(["x (mm)", "y (mm)", "z (μm)", "Region Name", "AF Ref"])
         self.table_location_list.setToolTip(
-            "Edit x/y/z to move a position, or the Region Name to rename it.\n"
-            "Region names are written to coordinates.csv, acquisition.yaml and the\n"
-            "per-region sidecars, and are used as the image filename prefix and\n"
-            "zarr folder name — so they must be unique and filesystem-safe."
+            "Click a row to move there. Edit x/y/z to move a position, or the Region\n"
+            "Name to rename it. Region names are written to coordinates.csv,\n"
+            "acquisition.yaml and the per-region sidecars, and are used as the image\n"
+            "filename prefix and zarr folder name — so they must be unique and\n"
+            "filesystem-safe."
         )
+        self.table_location_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_location_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table_location_list.setAlternatingRowColors(True)
+        self.table_location_list.verticalHeader().setDefaultSectionSize(22)
+        header = self.table_location_list.horizontalHeader()
+        for col in (0, 1, 2, 4):  # numbers stay narrow...
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)  # ...the name takes the slack
+        # ~5 rows visible, then scroll. The tab panel is clamped to its sizeHint by
+        # MainWindow.resizeCurrentTab, so an unbounded table would push the rest of the
+        # acquisition controls down by however tall QTableWidget felt like being.
+        self.table_location_list.setMinimumHeight(120)
+        self.table_location_list.setMaximumHeight(170)
+
         self.btn_update_z = QPushButton("Update Z")
+        self.btn_update_z.setToolTip("Overwrite the selected position's Z with the current stage Z")
         # Re-capture the laser-AF reference for the currently selected region.
         # Hidden when the rig has no focus camera.
         self.btn_update_ref = QPushButton("Update Ref")
@@ -3186,25 +3206,30 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.grid_line0.addWidget(QLabel("ID"))
         self.grid_line0.addWidget(self.lineEdit_experimentID)
 
-        self.grid_location_list_line1 = QGridLayout()
-        temp3 = QHBoxLayout()
-        temp3.addWidget(QLabel("Location List"))
-        temp3.addWidget(self.dropdown_location_list)
-        self.grid_location_list_line1.addLayout(temp3, 0, 0, 1, 4)  # Span the left columns
-        self.grid_location_list_line1.addWidget(self.btn_update_ref, 0, 4, 1, 2)
-        self.grid_location_list_line1.addWidget(self.btn_update_z, 0, 6, 1, 2)  # Align with other buttons
+        # Positions block: a titled header carrying the list-editing buttons, the
+        # position table itself, then a row of actions that operate on the selected
+        # row / the list as a whole. The table used to be a separate pop-up window
+        # behind an unlabelled "Edit" button, which made region naming undiscoverable.
+        self.positions_header_layout = QHBoxLayout()
+        self.positions_header_layout.addWidget(QLabel("<b>Positions</b>"))
+        self.positions_header_layout.addWidget(self.label_position_count)
+        self.positions_header_layout.addStretch(1)
+        self.positions_header_layout.addWidget(self.btn_add)
+        self.positions_header_layout.addWidget(self.btn_remove)
+        self.positions_header_layout.addWidget(self.btn_clear)
 
-        self.grid_location_list_line2 = QGridLayout()
-        # Make all buttons span 2 columns for consistent width
-        self.grid_location_list_line2.addWidget(self.btn_add, 1, 0, 1, 2)
-        self.grid_location_list_line2.addWidget(self.btn_remove, 1, 2, 1, 2)
-        self.grid_location_list_line2.addWidget(self.btn_next, 1, 4, 1, 2)
-        self.grid_location_list_line2.addWidget(self.btn_clear, 1, 6, 1, 2)
+        self.positions_actions_layout = QHBoxLayout()
+        self.positions_actions_layout.addWidget(self.btn_next)
+        self.positions_actions_layout.addWidget(self.btn_update_z)
+        self.positions_actions_layout.addWidget(self.btn_update_ref)
+        self.positions_actions_layout.addStretch(1)
+        self.positions_actions_layout.addWidget(self.btn_import_locations)
+        self.positions_actions_layout.addWidget(self.btn_export_locations)
 
-        self.grid_location_list_line3 = QGridLayout()
-        self.grid_location_list_line3.addWidget(self.btn_import_locations, 2, 0, 1, 3)
-        self.grid_location_list_line3.addWidget(self.btn_export_locations, 2, 3, 1, 3)
-        self.grid_location_list_line3.addWidget(self.btn_show_table_location_list, 2, 6, 1, 2)
+        self.grid_location_list = QVBoxLayout()
+        self.grid_location_list.addLayout(self.positions_header_layout)
+        self.grid_location_list.addWidget(self.table_location_list)
+        self.grid_location_list.addLayout(self.positions_actions_layout)
 
         # Create spacer items
         EDGE_SPACING = 4  # Adjust this value as needed
@@ -3341,19 +3366,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # Columns 0-3: Combined stretch factor = 4
         # Columns 4-7: Combined stretch factor = 4
         for i in range(4):
-            self.grid_location_list_line1.setColumnStretch(i, 1)
-            self.grid_location_list_line2.setColumnStretch(i, 1)
-            self.grid_location_list_line3.setColumnStretch(i, 1)
             self.grid_acquisition.setColumnStretch(i, 1)
-
-            self.grid_location_list_line1.setColumnStretch(i + 4, 1)
-            self.grid_location_list_line2.setColumnStretch(i + 4, 1)
-            self.grid_location_list_line3.setColumnStretch(i + 4, 1)
             self.grid_acquisition.setColumnStretch(i + 4, 1)
 
-        self.grid_location_list_line1.setRowStretch(0, 0)  # Location list row
-        self.grid_location_list_line2.setRowStretch(1, 0)  # Button row
-        self.grid_location_list_line3.setRowStretch(2, 0)  # Import/Export buttons
         self.grid_acquisition.setRowStretch(0, 0)  # Nx/Ny and overlap row
         self.grid_acquisition.setRowStretch(1, 0)  # dz/Nz and dt/Nt row
         self.grid_acquisition.setRowStretch(2, 0)  # Z-range row
@@ -3430,18 +3445,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
-        self.btn_previous.clicked.connect(self.previous)
         self.btn_next.clicked.connect(self.next)
         self.btn_clear.clicked.connect(self.clear)
         self.btn_export_locations.clicked.connect(self.export_location_list)
         self.btn_import_locations.clicked.connect(self.import_location_list)
 
+        # Clicking a row selects that position and drives the stage there. Wired to
+        # cellClicked (not the selection signal) so programmatic selection — after an
+        # add, a removal, an import — never moves the stage behind the user's back.
         self.table_location_list.cellClicked.connect(self.cell_was_clicked)
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
-        self.btn_show_table_location_list.clicked.connect(self.table_location_list.show)
         self.btn_update_z.clicked.connect(self.update_z)
         self.btn_update_ref.clicked.connect(self.update_reference)
-        self.dropdown_location_list.currentIndexChanged.connect(self.go_to)
 
         self.shortcut = QShortcut(QKeySequence(";"), self)
         self.shortcut.activated.connect(self.btn_add.click)
@@ -3454,9 +3469,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def setup_layout(self):
         self.grid = QVBoxLayout()
         self.grid.addLayout(self.grid_line0)
-        self.grid.addLayout(self.grid_location_list_line1)
-        self.grid.addLayout(self.grid_location_list_line2)
-        self.grid.addLayout(self.grid_location_list_line3)
+        self.grid.addLayout(self.grid_location_list)
         self.grid.addLayout(self.grid_acquisition)
         self.grid.addLayout(self.row_progress_layout)
         self.setLayout(self.grid)
@@ -3553,8 +3566,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
 
     def update_z(self):
+        index = self._selected_row()
+        if index < 0:
+            return
         z_mm = self.stage.get_pos().z_mm
-        index = self.dropdown_location_list.currentIndex()
         region_id = str(self.location_ids[index])
         self.location_list[index, 2] = z_mm
         self.scanCoordinates.region_centers[region_id][2] = z_mm
@@ -3566,7 +3581,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         params = self.scanCoordinates.region_generation_params.get(region_id)
         if params is not None and "center_z" in params:
             params["center_z"] = z_mm
-        self._refresh_location_label(index)
+        self._refresh_position_cells(index)
 
     def update_Nz(self):
         z_min = self.entry_minZ.value()
@@ -3914,19 +3929,44 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # This must eventually propagate through and call out acquisition_finished.
             self.multipointController.request_abort_acquisition()
 
-    @staticmethod
-    def _location_label(name, x, y, z):
-        """Text for a row of the Location List dropdown.
+    def _selected_row(self):
+        """Row of the position the user has selected, or -1 when there is none.
 
-        Leads with the region name so a rename is visible without opening the table
-        (the dropdown is the only always-visible view of the position list).
+        The table is the selection model: everything that acts on "the current
+        position" (Remove, Next, Update Z, Update Ref) reads it from here.
         """
-        return f"{name}  |  x:{round(x, 3)} mm  y:{round(y, 3)} mm  z:{round(z * 1000, 1)} μm"
+        row = self.table_location_list.currentRow()
+        return row if 0 <= row < len(self.location_ids) else -1
 
-    def _refresh_location_label(self, row):
-        """Re-render the dropdown entry for ``row`` from location_list/location_ids."""
+    def _select_row(self, row):
+        """Select ``row`` without moving the stage (cellClicked is the only mover)."""
+        if 0 <= row < self.table_location_list.rowCount():
+            self.table_location_list.blockSignals(True)
+            self.table_location_list.selectRow(row)
+            self.table_location_list.blockSignals(False)
+
+    @staticmethod
+    def _position_cells(x, y, z):
+        """The x / y / z cells for one position row (z displayed in μm)."""
+        return [
+            QTableWidgetItem(str(round(x, 3))),
+            QTableWidgetItem(str(round(y, 3))),
+            QTableWidgetItem(str(round(z * 1000, 1))),
+        ]
+
+    def _refresh_position_cells(self, row):
+        """Re-render the x/y/z cells for ``row`` from location_list."""
+        if not 0 <= row < self.table_location_list.rowCount():
+            return
         x, y, z = self.location_list[row]
-        self.dropdown_location_list.setItemText(row, self._location_label(self.location_ids[row], x, y, z))
+        self.table_location_list.blockSignals(True)
+        for col, item in enumerate(self._position_cells(x, y, z)):
+            self.table_location_list.setItem(row, col, item)
+        self.table_location_list.blockSignals(False)
+
+    def _update_position_count(self):
+        n = len(self.location_ids)
+        self.label_position_count.setText("no positions" if n == 0 else f"({n})")
 
     def _next_region_id(self):
         """Return the smallest unused 'R{n}' region id.
@@ -4007,8 +4047,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def update_reference(self):
         """Re-capture the laser-AF reference for the currently selected region."""
-        index = self.dropdown_location_list.currentIndex()
-        if index < 0 or index >= len(self.location_ids):
+        index = self._selected_row()
+        if index < 0:
             return
         if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
             error_dialog("Enable Reflection (Laser) AF before capturing a per-region reference.")
@@ -4027,19 +4067,15 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if not np.any(np.all(self.location_list[:, :2] == [round(x, 3), round(y, 3)], axis=1)):
             # Block signals to prevent triggering cell_was_changed
             self.table_location_list.blockSignals(True)
-            self.dropdown_location_list.blockSignals(True)
 
             # Store actual values in location_list
             self.location_list = np.vstack((self.location_list, [[x, y, z]]))
             self.location_ids = np.append(self.location_ids, region_id)
 
-            # Update both UI elements at the same time
-            self.dropdown_location_list.addItem(self._location_label(region_id, x, y, z))
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
-            self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
-            self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
+            for col, item in enumerate(self._position_cells(x, y, z)):
+                self.table_location_list.setItem(row, col, item)
             self.table_location_list.setItem(row, 3, QTableWidgetItem(region_id))
             self.table_location_list.setItem(row, 4, self._af_ref_item(None))
 
@@ -4066,101 +4102,79 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.entry_deltaY.value(),
                 )
 
-            # Set the current index to the newly added location
-            self.dropdown_location_list.setCurrentIndex(len(self.location_ids) - 1)
+            # Select the newly added position (without driving the stage there —
+            # it is already the current position).
             self.table_location_list.selectRow(row)
 
             # Re-enable signals
             self.table_location_list.blockSignals(False)
-            self.dropdown_location_list.blockSignals(False)
-            print(f"Added Region: {region_id} - x={x}, y={y}, z={z}")
+            self._log.info(f"Added region {region_id}: x={x}, y={y}, z={z}")
             # Snapshot this region's laser-AF focus target at add time (when AF is
             # enabled/initialized), so each region corrects to its own reference.
             self._capture_region_reference(region_id)
             self._region_obs_state_map = None
             self._update_per_point_button_text()
+            self._update_position_count()
             _refresh_size_estimate(self)
         else:
-            print("Invalid Region: Duplicate Location")
+            self._log.warning("Invalid region: a position with these x/y coordinates already exists")
 
     def remove_location(self):
-        index = self.dropdown_location_list.currentIndex()
-        if index >= 0:
-            # Remove region ID and associated data
-            region_id = str(self.location_ids[index])
-            self._log.info(f"Removing region: {region_id}")
+        index = self._selected_row()
+        if index < 0:
+            return
+        # Remove region ID and associated data
+        region_id = str(self.location_ids[index])
+        self._log.info(f"Removing region: {region_id}")
 
-            # Block signals to prevent unintended UI updates
-            self.table_location_list.blockSignals(True)
-            self.dropdown_location_list.blockSignals(True)
+        # Block signals to prevent unintended UI updates
+        self.table_location_list.blockSignals(True)
 
-            # Remove from data structures
-            self.location_list = np.delete(self.location_list, index, axis=0)
-            self.location_ids = np.delete(self.location_ids, index)
+        # Remove from data structures
+        self.location_list = np.delete(self.location_list, index, axis=0)
+        self.location_ids = np.delete(self.location_ids, index)
+        self.table_location_list.removeRow(index)
 
-            # Remove from both UI elements
-            self.dropdown_location_list.removeItem(index)
-            self.table_location_list.removeRow(index)
+        # Drop every per-region map through ScanCoordinates (which also
+        # deregisters the overlay tiles). Popping only some of them left the
+        # region's generation params behind, and the acquisition-start re-tile
+        # (regenerate_for_fov) would then resurrect the region we just deleted.
+        self.scanCoordinates.remove_region(region_id)
+        self._region_laser_af_references.pop(region_id, None)
 
-            # Drop every per-region map through ScanCoordinates (which also
-            # deregisters the overlay tiles). Popping only some of them left the
-            # region's generation params behind, and the acquisition-start re-tile
-            # (regenerate_for_fov) would then resurrect the region we just deleted.
-            self.scanCoordinates.remove_region(region_id)
-            self._region_laser_af_references.pop(region_id, None)
+        # Clear overlay if no locations remain
+        if len(self.location_list) == 0:
+            self.navigationViewer.clear_overlay()
 
-            # Clear overlay if no locations remain
-            if len(self.location_list) == 0:
-                self.navigationViewer.clear_overlay()
+        self._log.debug(f"Remaining location IDs: {list(self.location_ids)}")
 
-            self._log.debug(f"Remaining location IDs: {list(self.location_ids)}")
-
-            # Re-enable signals
-            self.table_location_list.blockSignals(False)
-            self.dropdown_location_list.blockSignals(False)
-            self._region_obs_state_map = None
-            self._update_per_point_button_text()
-            _refresh_size_estimate(self)
+        # Re-enable signals
+        self.table_location_list.blockSignals(False)
+        # Keep a neighbouring row selected so the action buttons stay meaningful.
+        self._select_row(min(index, len(self.location_ids) - 1))
+        self._region_obs_state_map = None
+        self._update_per_point_button_text()
+        self._update_position_count()
+        _refresh_size_estimate(self)
 
     def next(self):
-        index = self.dropdown_location_list.currentIndex()
-        # max_index = self.dropdown_location_list.count() - 1
-        # index = min(index + 1, max_index)
-        num_regions = self.dropdown_location_list.count()
-        if num_regions <= 0:
+        """Select the next position (wrapping) and move the stage there."""
+        count = len(self.location_ids)
+        if count <= 0:
             self._log.error("Cannot move to next location, because there are no locations in the list")
             return
-
-        index = (index + 1) % num_regions
-        self.dropdown_location_list.setCurrentIndex(index)
-        x = self.location_list[index, 0]
-        y = self.location_list[index, 1]
-        z = self.location_list[index, 2]
-        self.stage.move_x_to(x)
-        self.stage.move_y_to(y)
-        self.stage.move_z_to(z)
-
-    def previous(self):
-        index = self.dropdown_location_list.currentIndex()
-        index = max(index - 1, 0)
-        self.dropdown_location_list.setCurrentIndex(index)
-        x = self.location_list[index, 0]
-        y = self.location_list[index, 1]
-        z = self.location_list[index, 2]
-        self.stage.move_x_to(x)
-        self.stage.move_y_to(y)
-        self.stage.move_z_to(z)
+        self.go_to((self._selected_row() + 1) % count)
 
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
         self._region_laser_af_references.clear()
         self.scanCoordinates.clear_regions()
-        self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
         self.navigationViewer.clear_overlay()
         self._region_obs_state_map = None
         self._update_per_point_button_text()
+        self._update_position_count()
         _refresh_size_estimate(self)
 
         self._log.info("Cleared all locations and overlays.")
@@ -4169,22 +4183,21 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
         self._region_laser_af_references.clear()
-        self.dropdown_location_list.clear()
         self.table_location_list.setRowCount(0)
+        self._update_position_count()
 
     def go_to(self, index):
-        if index != -1:
-            if index < len(self.location_list):  # to avoid giving errors when adding new points
-                x = self.location_list[index, 0]
-                y = self.location_list[index, 1]
-                z = self.location_list[index, 2]
-                self.stage.move_x_to(x)
-                self.stage.move_y_to(y)
-                self.stage.move_z_to(z)
-                self.table_location_list.selectRow(index)
+        """Select position ``index`` and drive the stage to it."""
+        if not 0 <= index < len(self.location_list):
+            return
+        x, y, z = self.location_list[index]
+        self.stage.move_x_to(x)
+        self.stage.move_y_to(y)
+        self.stage.move_z_to(z)
+        self._select_row(index)
 
     def cell_was_clicked(self, row, column):
-        self.dropdown_location_list.setCurrentIndex(row)
+        self.go_to(row)
 
     def _set_name_cell(self, row, name):
         """Write the Region Name cell without re-entering ``cell_was_changed``."""
@@ -4251,7 +4264,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if self.focusMapWidget is not None:
             self.focusMapWidget.rename_region(old_id, new_id)
         self._set_name_cell(row, new_id)
-        self._refresh_location_label(row)
 
     def cell_was_changed(self, row, column):
         # The "AF Ref" column is a read-only indicator; ignore changes to it.
@@ -4309,8 +4321,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             if params is not None and "center_z" in params:
                 params["center_z"] = z
 
-        # Update UI
-        self._refresh_location_label(row)
+        # Re-render the row so the displayed value matches what was actually stored,
+        # then drive the stage to the edited position.
+        self._refresh_position_cells(row)
         self.go_to(row)
 
     def keyPressEvent(self, event):
@@ -4318,18 +4331,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.add_location()
         else:
             super().keyPressEvent(event)
-
-    def update_location_z_level(self, index, z_mm):
-        self.table_location_list.blockSignals(True)
-        self.dropdown_location_list.blockSignals(True)
-
-        self.location_list[index, 2] = z_mm
-        self._refresh_location_label(index)
-        if self.table_location_list.rowCount() > index:
-            self.table_location_list.setItem(index, 2, QTableWidgetItem(str(round(1000 * z_mm, 1))))
-
-        self.table_location_list.blockSignals(False)
-        self.dropdown_location_list.blockSignals(False)
 
     @staticmethod
     def _laser_af_sidecar_path(csv_path):
@@ -4422,8 +4423,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.scanCoordinates.region_laser_af_references.clear()
 
             self.table_location_list.blockSignals(True)
-            self.dropdown_location_list.blockSignals(True)
-            for index, row in location_list_df_relevant.iterrows():
+            for _, row in location_list_df_relevant.iterrows():
                 x = row["x (mm)"]
                 y = row["y (mm)"]
                 z = row["z (mm)"]
@@ -4437,24 +4437,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                         self._log.warning(f"Imported region name '{region_id}' is unusable; using '{replacement}'")
                     region_id = replacement
                 if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
-                    self.dropdown_location_list.addItem(self._location_label(region_id, x, y, z))
-                    index = self.dropdown_location_list.count() - 1
-                    self.dropdown_location_list.setCurrentIndex(index)
                     self.location_list = np.vstack((self.location_list, [[x, y, z]]))
                     self.location_ids = np.append(self.location_ids, region_id)
-                    self.table_location_list.insertRow(self.table_location_list.rowCount())
-                    self.table_location_list.setItem(
-                        self.table_location_list.rowCount() - 1, 0, QTableWidgetItem(str(round(x, 3)))
-                    )
-                    self.table_location_list.setItem(
-                        self.table_location_list.rowCount() - 1, 1, QTableWidgetItem(str(round(y, 3)))
-                    )
-                    self.table_location_list.setItem(
-                        self.table_location_list.rowCount() - 1, 2, QTableWidgetItem(str(round(1000 * z, 1)))
-                    )
-                    self.table_location_list.setItem(
-                        self.table_location_list.rowCount() - 1, 3, QTableWidgetItem(region_id)
-                    )
+                    table_row = self.table_location_list.rowCount()
+                    self.table_location_list.insertRow(table_row)
+                    for col, item in enumerate(self._position_cells(x, y, z)):
+                        self.table_location_list.setItem(table_row, col, item)
+                    self.table_location_list.setItem(table_row, 3, QTableWidgetItem(region_id))
                     if self.use_overlap:
                         self.scanCoordinates.add_flexible_region(
                             region_id,
@@ -4482,13 +4471,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
                     if reference is not None:
                         self._store_region_reference(region_id, reference)
-                    self.table_location_list.setItem(
-                        self.table_location_list.rowCount() - 1, 4, self._af_ref_item(reference)
-                    )
+                    self.table_location_list.setItem(table_row, 4, self._af_ref_item(reference))
                 else:
                     self._log.warning("Duplicate values not added based on x and y.")
             self.table_location_list.blockSignals(False)
-            self.dropdown_location_list.blockSignals(False)
+            self._select_row(0)
+            self._update_position_count()
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
@@ -4558,6 +4546,21 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.checkbox_withReflectionAutofocus.setEnabled(enabled)
         self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
+        # The worker snapshots the position list at start, so editing it mid-run would
+        # only desync the GUI from the data being written. Now that the table is always
+        # on screen, lock the whole positions block rather than leaving it inviting.
+        self.table_location_list.setEnabled(enabled)
+        for btn in (
+            self.btn_add,
+            self.btn_remove,
+            self.btn_clear,
+            self.btn_next,
+            self.btn_update_z,
+            self.btn_update_ref,
+            self.btn_import_locations,
+            self.btn_export_locations,
+        ):
+            btn.setEnabled(enabled)
 
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
@@ -4707,15 +4710,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.location_list = np.vstack((self.location_list, [[x, y, z]]))
             self.location_ids = np.append(self.location_ids, name)
 
-            # Update UI - dropdown
-            self.dropdown_location_list.addItem(self._location_label(name, x, y, z))
-
             # Update UI - table
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
-            self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
-            self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(z * 1000, 1))))
+            for col, item in enumerate(self._position_cells(x, y, z)):
+                self.table_location_list.setItem(row, col, item)
             self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
             self.table_location_list.setItem(
                 row, 4, self._af_ref_item(self._region_laser_af_references.get(name))
@@ -4743,6 +4742,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.entry_deltaX.value(),
                     self.entry_deltaY.value(),
                 )
+
+        self._select_row(0)
+        self._update_position_count()
 
 
 class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
@@ -8332,36 +8334,27 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
         self.dropdown_template = QComboBox()
         self.dropdown_template.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        temp = QHBoxLayout()
-        temp.addWidget(QLabel("Template     "))
-        temp.addWidget(self.dropdown_template)
-        self.grid_template = QGridLayout()
-        self.grid_template.addLayout(temp, 0, 0, 1, 6)
-        self.grid_template.addWidget(self.btn_load_template, 0, 6, 1, 2)
+        self.grid_template = QHBoxLayout()
+        self.grid_template.addWidget(QLabel("Template"))
+        self.grid_template.addWidget(self.dropdown_template, 1)
+        self.grid_template.addWidget(self.btn_load_template)
 
-        self.grid_add_next_clear = QGridLayout()
-        self.grid_add_next_clear.addWidget(self.btn_add_from_template, 0, 0, 1, 4)
-        self.grid_add_next_clear.addWidget(self.btn_next, 0, 4, 1, 2)
-        self.grid_add_next_clear.addWidget(self.btn_clear, 0, 6, 1, 2)
-
-        for i in range(4):
-            self.grid_template.setColumnStretch(i, 1)
-            self.grid_template.setColumnStretch(i + 4, 1)
-            self.grid_add_next_clear.setColumnStretch(i, 1)
-            self.grid_add_next_clear.setColumnStretch(i + 4, 1)
+        # Positions come from a template, one region per Add — the plain Add / Remove
+        # and the CSV import/export don't apply here.
+        self.positions_header_layout.insertWidget(2, self.btn_add_from_template)
+        self.btn_add.setVisible(False)
+        self.btn_remove.setVisible(False)
+        self.btn_import_locations.setVisible(False)
+        self.btn_export_locations.setVisible(False)
 
     def setup_layout(self):
         self.grid = QVBoxLayout()
         self.grid.addLayout(self.grid_line0)
         self.grid.addLayout(self.grid_template)
-        self.grid.addLayout(self.grid_location_list_line1)
-        self.grid.addLayout(self.grid_add_next_clear)
-        self.grid.addLayout(self.grid_location_list_line3)
+        self.grid.addLayout(self.grid_location_list)
         self.grid.addLayout(self.grid_acquisition)
         self.grid.addLayout(self.row_progress_layout)
         self.setLayout(self.grid)
-
-        self.grid_location_list_line3.setEnabled(False)
 
     def setup_connections(self):
         super().setup_connections()
@@ -8407,7 +8400,6 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             return
 
         self.table_location_list.blockSignals(True)
-        self.dropdown_location_list.blockSignals(True)
 
         for _, row in template_df.iterrows():
             x = ref_x + row["x_offset_mm"]
@@ -8417,13 +8409,10 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
             self.location_list = np.vstack((self.location_list, [[x, y, ref_z]]))
             self.location_ids = np.append(self.location_ids, point_id)
 
-            self.dropdown_location_list.addItem(self._location_label(point_id, x, y, ref_z))
-
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            self.table_location_list.setItem(row, 0, QTableWidgetItem(str(round(x, 3))))
-            self.table_location_list.setItem(row, 1, QTableWidgetItem(str(round(y, 3))))
-            self.table_location_list.setItem(row, 2, QTableWidgetItem(str(round(ref_z * 1000, 1))))
+            for col, item in enumerate(self._position_cells(x, y, ref_z)):
+                self.table_location_list.setItem(row, col, item)
             # One template *region* covers every template point, so a row's name does
             # not key a region of its own — show the region it belongs to and make the
             # cell read-only, since renaming a single row here has no coherent meaning.
@@ -8440,7 +8429,7 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
         self._log.info(f"Added {len(template_df)} locations from template '{template_name}'")
 
         self.table_location_list.blockSignals(False)
-        self.dropdown_location_list.blockSignals(False)
+        self._update_position_count()
 
     def clear(self):
         super().clear()

@@ -168,7 +168,7 @@ devices:
       serial_number: null
     config:
       distance: 50
-      default_na: 0.8
+      default_na: 0.65
       turn_on_delay: 0.03
       default_color: [1, 1, 1]
       r_factor: 1.0

@@ -9,7 +9,7 @@ import time
 import json
 from datetime import datetime, timezone
 from contextlib import contextmanager
-from typing import ClassVar, Dict, Generic, List, Optional, Set, Tuple, TypeVar, Union
+from typing import Any, ClassVar, Dict, Generic, List, Optional, Set, Tuple, TypeVar, Union
 from uuid import uuid4
 
 from dataclasses import dataclass, field
@@ -524,9 +524,19 @@ class SaveOMETiffJob(Job):
 class ZarrWriterInfo:
     """Info for Zarr v3 saving, injected by JobRunner.
 
-    Output is always 5D per FOV under OME-NGFF:
-    - HCS mode:     {base_path}/plate.ome.zarr/{row}/{col}/{fov}/0
-    - Non-HCS:      {base_path}/zarr/{region_id}/fov_{n}.ome.zarr/0
+    Output is always 5D per FOV under OME-NGFF. The ``array_key`` namespace
+    (None for the dense layout; a ``(state, z-mode)`` key for a ragged cycle
+    plate; ``{label}_{output}`` for a postprocess-derived plate) selects the
+    store:
+
+    - HCS, dense:    {base_path}/plate.ome.zarr/{row}/{col}/{fov}/0
+    - HCS, keyed:    {base_path}/{array_key}.ome.zarr/{row}/{col}/{fov}/0
+    - Non-HCS, dense:{base_path}/zarr/{region_id}/fov_{n}.ome.zarr/0
+    - Non-HCS, keyed:{base_path}/zarr/{array_key}/{region_id}/fov_{n}.ome.zarr/0
+
+    Note the asymmetry: an HCS namespace replaces ``plate`` at the same depth,
+    while a non-HCS namespace adds a directory level. Anything deriving a path
+    depth (e.g. :meth:`get_manifest_path`) must pass ``array_key`` through.
 
     Attributes:
         base_path: Experiment directory where ``acquisition.yaml`` lives.
@@ -545,6 +555,13 @@ class ZarrWriterInfo:
         channel_names: Channel names for the omero metadata block.
         channel_colors: Hex colors per channel (e.g. ``"#FF0000"``).
         channel_wavelengths: Emission wavelengths in nm (None for brightfield).
+        region_well_ids: ``region_id`` -> plate well id (``"A1"``) for flexible
+            scans mapped onto a synthetic plate. Empty for wellplate scans,
+            whose ``region_id`` *is* the well id. See
+            :mod:`control.core.hcs_region_mapping`.
+        region_layout: The synthetic plate shape used ("grid"/"row"/"column"),
+            recorded in the plate's ``_squid`` annotations. None when the
+            regions are real wells.
     """
 
     base_path: str
@@ -560,6 +577,16 @@ class ZarrWriterInfo:
     channel_names: List[str] = field(default_factory=list)
     channel_colors: List[str] = field(default_factory=list)
     channel_wavelengths: List[Optional[int]] = field(default_factory=list)
+    region_well_ids: Dict[str, str] = field(default_factory=dict)
+    region_layout: Optional[str] = None
+
+    def well_id_for(self, region_id: str) -> str:
+        """Plate well id for a region.
+
+        Identity for wellplate scans (the region id already *is* ``A1``), and a
+        lookup into the synthetic map for flexible scans.
+        """
+        return self.region_well_ids.get(str(region_id), str(region_id))
 
     def get_output_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
         """Resolution-0 array path for a given ``(region_id, fov)``.
@@ -572,7 +599,7 @@ class ZarrWriterInfo:
     def get_group_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
         """FOV group directory (parent of the resolution levels)."""
         if self.is_hcs:
-            return utils.build_hcs_zarr_fov_path(self.base_path, region_id, fov, array_key)
+            return utils.build_hcs_zarr_fov_path(self.base_path, self.well_id_for(region_id), fov, array_key)
         return utils.build_per_fov_zarr_path(self.base_path, region_id, fov, array_key)
 
     def get_fov_count(self, region_id: str) -> int:
@@ -585,9 +612,9 @@ class ZarrWriterInfo:
         plate = "plate.ome.zarr" if array_key is None else f"{array_key}.ome.zarr"
         return os.path.join(self.base_path, plate)
 
-    def get_well_path(self, well_id: str, array_key: Optional[str] = None) -> str:
-        """Path to a well directory (HCS mode only)."""
-        row_letter, col_num = utils.parse_well_id(well_id)
+    def get_well_path(self, region_id: str, array_key: Optional[str] = None) -> str:
+        """Path to a region's well directory (HCS mode only)."""
+        row_letter, col_num = utils.parse_well_id(self.well_id_for(region_id))
         return os.path.join(self.get_plate_path(array_key), row_letter, col_num)
 
     def get_hcs_structure(self) -> Tuple[List[str], List[int], List[Tuple[str, int]]]:
@@ -595,24 +622,58 @@ class ZarrWriterInfo:
         rows_set = set()
         cols_set = set()
         wells = []
-        for well_id in self.region_fov_counts.keys():
-            row_letter, col_num = utils.parse_well_id(well_id)
+        for region_id in self.region_fov_counts.keys():
+            row_letter, col_num = utils.parse_well_id(self.well_id_for(region_id))
             rows_set.add(row_letter)
             cols_set.add(int(col_num))
             wells.append((row_letter, int(col_num)))
         return sorted(rows_set), sorted(cols_set), wells
+
+    def get_region_annotations(self) -> List[Dict[str, Any]]:
+        """``_squid.regions`` for the plate root: the region <-> well table.
+
+        Empty for a real wellplate scan (the well id *is* the region name, so
+        there is nothing to record). For a flexible scan mapped onto a synthetic
+        plate this is the only place the user's region names are bound to their
+        wells, so it must be written at plate-metadata time.
+        """
+        if not self.region_well_ids:
+            return []
+        rows, cols, _wells = self.get_hcs_structure()
+        out: List[Dict[str, Any]] = []
+        for region_id in self.region_fov_counts.keys():
+            row_letter, col_num = utils.parse_well_id(self.well_id_for(region_id))
+            entry: Dict[str, Any] = {
+                "name": str(region_id),
+                "path": f"{row_letter}/{col_num}",
+                "row": row_letter,
+                "column": col_num,
+                "rowIndex": rows.index(row_letter),
+                "columnIndex": cols.index(int(col_num)),
+                "field_count": int(self.region_fov_counts[region_id]),
+            }
+            if self.region_layout:
+                entry["layout"] = self.region_layout
+            out.append(entry)
+        return out
 
     def get_fov_translation_um(self, region_id: str, fov: int) -> Tuple[float, float]:
         """Stage position (y_um, x_um) for the FOV; (0, 0) if unknown."""
         region_map = self.fov_translations_um.get(str(region_id), {})
         return region_map.get(int(fov), (0.0, 0.0))
 
-    def get_manifest_path(self, region_id: str, fov: int) -> str:
+    def get_manifest_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
         """Relative path from the FOV group to the experiment's acquisition.yaml.
 
         Used for ``_squid.manifest_path`` inside the FOV's zarr.json.
+
+        ``array_key`` must be passed through: a non-HCS ragged/derived store
+        (``zarr/{array_key}/{region}/fov_n.ome.zarr``) sits one directory level
+        deeper than the dense one, so computing the depth without it produces a
+        pointer that resolves to ``{base_path}/zarr`` instead of the experiment
+        root. (HCS namespaces sit at the same depth either way.)
         """
-        group_dir = self.get_group_path(region_id, fov)
+        group_dir = self.get_group_path(region_id, fov, array_key)
         manifest_abs = os.path.join(self.base_path, "acquisition.yaml")
         try:
             rel = os.path.relpath(manifest_abs, group_dir)
@@ -720,7 +781,19 @@ class SaveZarrJob(Job):
         if plate_path not in self._hcs_plate_written:
             rows, cols, wells = info.get_hcs_structure()
             plate_name = "plate" if array_key is None else str(array_key)
-            write_plate_metadata(plate_path, rows, cols, wells, plate_name=plate_name)
+            # For a flexible scan mapped onto a synthetic plate, the region <->
+            # well table is the only record of the user's region names.
+            regions = info.get_region_annotations()
+            squid_attrs = None
+            if regions:
+                squid_attrs = {
+                    "source_layout": "flexible_multipoint_non_hcs",
+                    "region_layout": info.region_layout,
+                    "regions": regions,
+                }
+            write_plate_metadata(
+                plate_path, rows, cols, wells, plate_name=plate_name, squid_attributes=squid_attrs
+            )
             self._hcs_plate_written.add(plate_path)
             self._log.info(f"Wrote HCS plate metadata ({plate_name}): {len(wells)} wells")
 
@@ -730,7 +803,10 @@ class SaveZarrJob(Job):
             # Get FOV count for this well
             fov_count = info.get_fov_count(region_id)
             fields = list(range(fov_count))
-            write_well_metadata(well_path, fields)
+            squid_well_attrs = None
+            if info.region_well_ids:
+                squid_well_attrs = {"region": str(region_id), "field_count": fov_count}
+            write_well_metadata(well_path, fields, squid_attributes=squid_well_attrs)
             self._hcs_wells_written.add(well_path)
             self._log.debug(f"Wrote HCS well metadata for {region_id}: {fov_count} fields")
 
@@ -831,13 +907,21 @@ class SaveZarrJob(Job):
                 image.shape[1],
             )
             translation_um = zwi.get_fov_translation_um(region_id, fov)
-            manifest_path = zwi.get_manifest_path(region_id, fov)
+            manifest_path = zwi.get_manifest_path(region_id, fov, ak)
             # Per-array channel metadata (ragged = single channel) falls back to global.
             channel_names = info.array_channel_names if info.array_channel_names is not None else zwi.channel_names
             channel_colors = info.array_channel_colors if info.array_channel_colors is not None else zwi.channel_colors
             channel_wavelengths = (
                 info.array_channel_wavelengths if info.array_channel_wavelengths is not None else zwi.channel_wavelengths
             )
+
+            # A synthetic plate's well/field coordinates say nothing about which
+            # region a FOV came from, so record it on the FOV group too — that
+            # makes each image self-describing without a plate-root lookup.
+            squid_extras: Dict[str, Any] = {"region": region_id, "fov_index": int(fov)}
+            if zwi.region_well_ids:
+                squid_extras["well"] = zwi.well_id_for(region_id)
+                squid_extras["stage_position_um"] = {"y": translation_um[0], "x": translation_um[1]}
 
             config = ZarrAcquisitionConfig(
                 output_path=output_path,
@@ -853,6 +937,7 @@ class SaveZarrJob(Job):
                 translation_um=translation_um,
                 manifest_path=manifest_path,
                 shard_per_z=_def.ZARR_SHARD_PER_Z,
+                squid_extras=squid_extras,
             )
             try:
                 writer = ZarrWriter(config)

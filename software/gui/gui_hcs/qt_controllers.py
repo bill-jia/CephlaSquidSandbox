@@ -17,7 +17,6 @@ from control.core.scan_coordinates import (
 from control.NL5 import NL5
 
 os.environ["QT_API"] = "pyqt5"
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -518,36 +517,41 @@ class QtMultiPointController(MultiPointController, QObject):
         """Build the per-FOV OME-NGFF zarr group paths for display.
 
         Returns one path per FOV in scan order (flattened across regions).
+
+        The layout decision is delegated to ``hcs_region_mapping`` — the same
+        resolver ``MultiPointWorker`` uses to decide where it actually writes.
+        Recomputing it here from region-name shape (as this used to) drifts:
+        Squid's default flexible names ``R0``/``R1`` match a well-id pattern, so
+        the old heuristic pointed the live viewer at a plate hierarchy the
+        writer wasn't using.
         """
+        from control.core.hcs_region_mapping import is_wellplate_acquisition, resolve_plate_mapping
+
         base_path = os.path.join(parameters.base_path, parameters.experiment_ID)
         scan_info = parameters.scan_position_information
-        is_hcs = self._detect_hcs_mode(scan_info)
+        coords = scan_info.scan_region_fov_coords_mm
+
+        try:
+            mapping = resolve_plate_mapping(
+                list(coords.keys()),
+                is_wellplate=is_wellplate_acquisition(parameters.xy_mode, coords),
+                flexible_as_hcs=control._def.FLEXIBLE_MULTIPOINT_AS_HCS,
+                layout=control._def.FLEXIBLE_MULTIPOINT_HCS_LAYOUT,
+            )
+        except ValueError:
+            mapping = None
 
         fov_paths: List[str] = []
         for region_name in scan_info.scan_region_names:
-            num_fovs = len(scan_info.scan_region_fov_coords_mm.get(region_name, []))
+            num_fovs = len(coords.get(region_name, []))
             for fov in range(num_fovs):
-                if is_hcs:
-                    path = control.utils.build_hcs_zarr_fov_path(base_path, region_name, fov)
+                if mapping is not None and mapping.is_hcs:
+                    path = control.utils.build_hcs_zarr_fov_path(
+                        base_path, mapping.well_id_for(region_name), fov
+                    )
                 else:
                     path = control.utils.build_per_fov_zarr_path(base_path, region_name, fov)
                 fov_paths.append(path)
 
         return fov_paths
-
-    def _detect_hcs_mode(self, scan_info: ScanCoordinates) -> bool:
-        """Detect if this is an HCS (wellplate) acquisition.
-
-        Args:
-            scan_info: Scan coordinates with region names.
-
-        Returns:
-            True if all region names match well ID pattern (e.g., A1, B12).
-        """
-        well_pattern = re.compile(r"^[A-Z]+\d+$")
-
-        for region_name in scan_info.scan_region_names:
-            if not well_pattern.match(region_name):
-                return False
-        return len(scan_info.scan_region_names) > 0
 

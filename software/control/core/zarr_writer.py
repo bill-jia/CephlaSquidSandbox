@@ -93,6 +93,9 @@ class ZarrAcquisitionConfig:
     max_pyramid_levels: int = 5
     min_pyramid_dim_px: int = 128
     shard_per_z: bool = True
+    squid_extras: Dict[str, Any] = field(default_factory=dict)
+    """Extra keys merged into the FOV group's ``_squid`` block (e.g. the
+    originating region name and FOV index for a synthetic HCS plate)."""
 
     @property
     def t_size(self) -> int:
@@ -214,13 +217,20 @@ def write_plate_metadata(
     cols: List[int],
     wells: List[Tuple[str, int]],
     plate_name: str = "plate",
+    squid_attributes: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Write OME-NGFF HCS plate metadata at the plate root."""
+    """Write OME-NGFF HCS plate metadata at the plate root.
+
+    ``squid_attributes`` is written as a ``_squid`` block beside ``ome``. The
+    NGFF plate schema does not restrict additional properties, so this validates
+    cleanly; it is where a synthetic plate records which region each well came
+    from (see :mod:`control.core.hcs_region_mapping`).
+    """
     well_entries = [
         {"path": f"{row}/{col}", "rowIndex": rows.index(row), "columnIndex": cols.index(col)} for row, col in wells
     ]
 
-    plate_metadata = {
+    plate_metadata: Dict[str, Any] = {
         "ome": {
             "version": "0.5",
             "plate": {
@@ -232,12 +242,22 @@ def write_plate_metadata(
             },
         }
     }
+    if squid_attributes:
+        plate_metadata["_squid"] = dict(squid_attributes)
     _write_group_metadata(plate_path, plate_metadata, "plate")
 
 
-def write_well_metadata(well_path: str, fields: List[int]) -> None:
-    """Write OME-NGFF HCS well metadata."""
-    well_metadata = {
+def write_well_metadata(
+    well_path: str,
+    fields: List[int],
+    squid_attributes: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write OME-NGFF HCS well metadata.
+
+    ``squid_attributes`` carries the originating region name for a synthetic
+    plate, so a well is self-describing without consulting the plate root.
+    """
+    well_metadata: Dict[str, Any] = {
         "ome": {
             "version": "0.5",
             "well": {
@@ -246,6 +266,8 @@ def write_well_metadata(well_path: str, fields: List[int]) -> None:
             },
         }
     }
+    if squid_attributes:
+        well_metadata["_squid"] = dict(squid_attributes)
     _write_group_metadata(well_path, well_metadata, "well")
 
 
@@ -635,6 +657,7 @@ class ZarrWriter:
             "_squid": {
                 "manifest_path": config.manifest_path or "",
                 "acquisition_complete": False,
+                **dict(config.squid_extras),
             },
         }
 

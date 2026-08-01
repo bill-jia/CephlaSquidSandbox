@@ -145,7 +145,15 @@ authoritative:
    intermediate barrier upload of ``frame_times`` had been torn. It covers
    three tiers, all marked non-deletable:
    - **per-FOV** group + level ``zarr.json`` and ``frame_times``
-     (``_enqueue_post_finalize_metadata_resync``);
+     (``_enqueue_post_finalize_metadata_resync``). ⚠️ This tier resolves the
+     FOV group with ``array_key=None``, i.e. **only the dense store**. For a
+     ragged or postprocess-derived run, those stores' final ``zarr.json``
+     (the one flipping ``acquisition_complete = true``) and last
+     ``frame_times`` chunk are never re-pushed. The image data is still
+     complete on the remote — the per-FOV barriers uploaded it during the run,
+     and those *do* iterate every ``array_key`` — but the remote copy keeps
+     ``acquisition_complete: false``, which also blocks the backfill script's
+     ``--follow`` exit condition;
    - **plate/well group metadata** — every ``*.ome.zarr`` plate's root
      ``zarr.json`` and per-well ``<row>/<col>/zarr.json``
      (``_enqueue_plate_metadata_resync``). Without these the remote tree is a
@@ -249,7 +257,9 @@ python scripts/zarr_backfill_upload.py /path/to/experiment_dir \
 - `--in-progress` — safe to run alongside an active acquisition writer.
   Skips the highest-numbered timepoint per FOV (it may still be receiving
   writes) and the FOV `zarr.json` files (the writer rewrites them at
-  finalize).
+  finalize). This skip is what makes the per-z shard layout safe to upload
+  mid-run: a FOV's timepoints are written in order, so once `t+1` shards
+  exist, `t`'s full set of z-shards is on disk.
 - `--follow` — stay open after the initial pass and rescan the experiment
   every `--poll-interval` seconds (default 30 s). New timepoints are
   uploaded as they land. The script keeps treating the run as in-progress
@@ -290,19 +300,39 @@ in-flight `.part` files are auto-cleared on the next run's first retry.
 
 ### Layout compatibility
 
-The backfill script assumes the **current Squid writer's layout** (5D
-arrays of shape `(T, C, Z, Y, X)`, outer chunk grid `(1, C, Z, Y, X)`,
-zarr-v3 `default` chunk-key encoding, so each timepoint occupies exactly
-one shard file at `c/<t>/0/0/0/0`). Before this layout became the only
-mode (commit `5d6b34b2` "Enable zarr writing"), the writer supported
-conditional layouts that vary by compression mode:
+The backfill script needs exactly one invariant from the on-disk layout: **a
+shard never spans two timepoints.** It batches uploads per `(t, fov)` and
+deletes a bundle's local files once that bundle verifies, so a file shared
+between timepoints would be deleted while still being written.
 
-| Mode | Outer chunk grid | Shard file path |
-|---|---|---|
-| `BALANCED` / `BEST` (current default, sharded) | `(1, C, Z, Y, X)` | `c/<t>/0/0/0/0` ✓ |
-| `FAST` / `NONE` (no sharding) | `(1, 1, 1, Y, X)` | `c/<t>/<c>/<z>/0/0` ✗ |
-| Older `BALANCED` (per-z-level) | `(1, C, 1, Y, X)` | `c/<t>/0/<z>/0/0` ✗ |
-| Older 6D wellplate | `(1, 1, 1, 1, Y, X)` | `c/<fov>/<t>/<c>/<z>/0/0` ✗ |
+With zarr-v3 `default` chunk-key encoding the shard path *is* its grid
+coordinate with `t` first, so that invariant reduces to: a 5D `(T, C, Z, Y, X)`
+array whose outer chunk has `chunk_shape[0] == 1`. `check_fov_layout()` checks
+precisely that, and the files for a timepoint are found by **walking `c/<t>/`**
+rather than by constructing a path — so any subdivision below `t` works:
+
+| Writer mode | Outer chunk grid | Shard file path | Backfill |
+|---|---|---|---|
+| `ZARR_SHARD_PER_Z = True` (**current default**) | `(1, C, 1, Y, X)` | `c/<t>/0/<z>/0/0` (one per z) | ✓ |
+| `ZARR_SHARD_PER_Z = False` (legacy per-FOV) | `(1, C, Z, Y, X)` | `c/<t>/0/0/0/0` | ✓ |
+| Pre-`5d6b34b2` `FAST`/`NONE` (no sharding) | `(1, 1, 1, Y, X)` | `c/<t>/<c>/<z>/0/0` | ✓ |
+| Pre-`5d6b34b2` 6D wellplate | `(1, 1, 1, 1, Y, X)` | `c/<fov>/<t>/<c>/<z>/0/0` | ✗ — leading axis is the FOV, not `t` |
+
+Earlier versions of the script hardcoded `c/<t>/0/0/0/0` and demanded an outer
+chunk of `(1, C, Z, Y, X)`. Against the per-z default that meant an abort with a
+misleading "older writer" message for any `Z > 1` dataset (it failed safe —
+nothing was uploaded or deleted — but the script was unusable). If you are
+running an older copy of the script, that is the symptom.
+
+In `--follow` mode, submitted work is deduplicated **per file**, not per
+timepoint: a timepoint is no longer one shard, and a rescan can catch it
+part-written, so a per-timepoint marker would strand every shard that landed
+after the first sighting. Files already uploaded and locally deleted simply
+never reappear in a rescan.
+
+The **live** pipeline was never affected by any of this: it stages shard paths
+from `ZarrWriter.drain_unstaged_shard_paths()`, which tracks written
+`(t, z_grid)` cells directly and never guesses at paths.
 
 The script discovers FOV groups in three layouts: non-HCS
 `zarr/<region>/fov_*.ome.zarr`; HCS `<plate>.ome.zarr/<row>/<col>/<fov>` for
@@ -314,6 +344,13 @@ legacy single `plate.ome.zarr` is just the one-plate case); and a top-level
 plate stem so wells from different per-state plates don't collide. Plate-root
 and per-well group `zarr.json` are uploaded alongside the per-FOV metadata so
 the remote opens as a valid HCS plate.
+
+Not covered by that discovery: the **non-HCS ragged/derived** layout, which
+inserts a namespace level (`zarr/<array_key>/<region>/fov_*.ome.zarr`). The
+`zarr/` walk only globs `fov_*.ome.zarr` one level below `zarr/`, so a ragged or
+postprocessed flexible-region acquisition is invisible to the backfill script.
+See [zarr-v3-format.md](zarr-v3-format.md#store-inventory) for the full store
+inventory.
 
 To prevent silent data loss against older datasets, the script reads the
 level-0 `zarr.json` of every FOV before submitting any uploads and aborts

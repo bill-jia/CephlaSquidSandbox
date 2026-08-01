@@ -156,6 +156,27 @@ See [zarr-v3-format.md](zarr-v3-format.md) for full details on output structure,
 - Shard granularity: `ZARR_SHARD_PER_Z` (default True = one shard per z-slice, ~30× faster writeback; False = legacy one shard per FOV)
 - Layout: HCS (wellplate) or per-FOV (flexible). Both are OME-NGFF v0.5 5D.
 
+**One acquisition can produce several stores.** The store a frame lands in is
+chosen by its `CaptureInfo.array_key`:
+
+| `array_key` | Store | Produced by |
+|---|---|---|
+| `None` | dense — `plate.ome.zarr` / `zarr/{region}/` | plain channel selection, or a dense cycle plan |
+| `{state}` / `{state}_refz` | ragged — one single-channel store per (state, z-mode) | a ragged [acquisition cycle](acquisition-cycles.md) |
+| `{label}_{output}` | derived — one store per postprocess output | [online postprocessing](online-postprocessing.md) |
+
+Whether those stores use the HCS plate hierarchy or the flat `zarr/` tree is a
+separate axis: wellplate scans always use HCS, and flexible scans do too unless
+`FLEXIBLE_MULTIPOINT_AS_HCS` is turned off — their regions are mapped to
+synthetic wells with the names kept as `_squid` annotations
+([flexible-to-hcs-conversion.md](flexible-to-hcs-conversion.md)).
+
+`SaveZarrJob` keys its process-local writer dict on the resolved level-0 path,
+so each store gets its own `ZarrWriter`, its own HCS plate/well metadata, its
+own pyramid and its own `frame_times`. See
+[zarr-v3-format.md](zarr-v3-format.md#store-inventory) for exact paths, shapes,
+and the channel/sequence coordinate rules.
+
 **Writeback status in the GUI:** capture ending (`acquisition_finished`) is *not* the same as data being on disk. The per-FOV writers finalize in a background thread; the controller fires `data_writing_complete` once they finish, and the multipoint widgets keep the Start button disabled with the progress bar showing "Finalizing…" until then (with a safety timeout so it can never get stuck). Only after "✓ Data writing complete" is it safe to move/copy the dataset.
 
 ## Job Processing Subprocess
@@ -242,7 +263,7 @@ Every format writes a per-frame timing CSV with the same column schema:
 Layout differs by save mode:
 
 - **`INDIVIDUAL_IMAGES`, `MULTI_PAGE_TIFF`, `OME_TIFF`**: one CSV per timepoint at `{exp}/{timepoint}/frame_acquisition_times.csv`, alongside the image files.
-- **`ZARR_V3`**: a single consolidated CSV at `{exp}/acquisition_times.csv`. The `time_point` column distinguishes rows. Image data lives under `plate.ome.zarr/` (HCS) or `zarr/` (non-HCS), so the per-timepoint folder is otherwise empty and is *not created* unless downsampled views or laser-AF characterization need it.
+- **`ZARR_V3`**: a single consolidated CSV at `{exp}/acquisition_times.csv`. The `time_point` column distinguishes rows. Image data lives under `plate.ome.zarr/` (the default for both wellplate and flexible scans) or `zarr/` (when `FLEXIBLE_MULTIPOINT_AS_HCS = False`), so the per-timepoint folder is otherwise empty and is *not created* unless downsampled views or laser-AF characterization need it.
 
 Additionally, `coordinates.csv` records the stage position for each FOV at the experiment root. Non-ZARR modes also write a per-timepoint copy alongside the images.
 
@@ -263,7 +284,24 @@ For Zarr V3 format, per-frame timestamps are also written as a `frame_times` zar
 For continuous fast acquisition (not multipoint), a separate `FastAcquisitionWriter` (`control/core/fast_acquisition_writer.py`) uses a two-stage approach:
 
 1. **During capture**: raw bytes are streamed to `frames.raw` with per-frame metadata in `frame_metadata.jsonl` (minimal CPU overhead)
-2. **Post-capture**: raw data is converted to the final format (TIFF stack, Zarr, or HDF5)
+2. **Post-capture**: raw data is converted to the final format (TIFF stack, BigTIFF, Zarr, or HDF5)
+
+When writes are deferred until stop *and* the target is BigTIFF/Zarr/HDF5, the writer skips `frames.raw` entirely and decodes the RAM ring straight into the output file (direct-encode, ~1× disk I/O instead of ~3×).
+
+Its **Zarr output is a different format from the multipoint one** — zarr v2, no OME metadata, no pyramid, no sharding:
+
+```
+{run}/
+├── frames.zarr/
+│   ├── frames/        # (N, Y, X), chunks (100, Y, X), blosc-lz4 clevel 5
+│   ├── frame_ids/     # (N,) int64
+│   └── timestamps/    # (N,) float64
+├── frames/frame_metadata.jsonl
+├── metadata.json                 # frame counts/drops, DIO lines, camera settings, DAQ settings
+└── acquisition_metadata.yaml     # microscope/objective/illumination sidecar
+```
+
+The stream is a flat frame sequence — there is no T/C/Z structure and no channel metadata, because a fast-acquisition burst is one observation state by construction. All acquisition context lives in the two sidecars, not in the store.
 
 This path is separate from the job-based multipoint pipeline.
 

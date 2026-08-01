@@ -1200,6 +1200,23 @@ ZARR_COMPRESSION = ZarrCompression.BALANCED
 # for an instant rollback to the legacy layout.
 ZARR_SHARD_PER_Z = True
 
+# Flexible (non-wellplate) multipoint saves as an OME-NGFF HCS plate.
+#   True (default) -> each scan region is mapped to a synthetic plate well, so a
+#            flexible run writes {exp}/plate.ome.zarr/{row}/{col}/{field}/ and is
+#            readable by any plate-aware tool (napari-ome-zarr, OMERO, ...). The
+#            user's region names are not lost: they are written as _squid
+#            annotations on the plate root, each well, and each FOV group.
+#   False -> legacy flat layout {exp}/zarr/{region}/fov_{n}.ome.zarr, which
+#            carries no plate grouping metadata.
+# Wellplate scans (Select Wells / Load Coordinates) are unaffected either way —
+# they already use their real well ids. See docs/flexible-to-hcs-conversion.md;
+# tools/flexible_to_hcs_zarr.py converts existing flat datasets forward.
+FLEXIBLE_MULTIPOINT_AS_HCS = True
+
+# Plate shape used when mapping flexible regions to wells: "grid" (square-ish,
+# row-major), "row" (one row), or "column" (one column).
+FLEXIBLE_MULTIPOINT_HCS_LAYOUT = "grid"
+
 ##########################################################
 #### start of loading machine specific configurations ####
 ##########################################################
