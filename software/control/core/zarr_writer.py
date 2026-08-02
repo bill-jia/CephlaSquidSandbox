@@ -313,6 +313,15 @@ class ZarrWriter:
         self._level_shapes: List[Tuple[int, int]] = []  # (y, x) per level
         self._frame_times_dataset: Optional[Any] = None
         self._pending_futures: List[Any] = []
+        # Timestamp writes are tracked separately from image writes because
+        # they carry a different failure policy: losing a ``frame_times`` cell
+        # costs bookkeeping, losing an image plane costs data. Both used to
+        # share ``_pending_futures``, so a failed timestamp write re-raised out
+        # of ``wait_for_pending()`` exactly like a lost frame and — with
+        # ``abort_on_failed_jobs=True`` — aborted the whole acquisition. See
+        # ``record_frame_time``, which already caught the *synchronous* form of
+        # this and only warned; this keeps the async form consistent with that.
+        self._pending_time_futures: List[Any] = []
         # Buffered planes for z-slices not yet committed, keyed by (t, z) ->
         # {c: image}. In shard-per-z mode a z-slice's channels accumulate here
         # until all C arrive, then the whole (1, C, 1, Y, X) shard is written
@@ -425,17 +434,21 @@ class ZarrWriter:
     def metadata_paths(self) -> List[str]:
         """Shared metadata files — **uploaded every barrier, never deleted**.
 
-        These files are either:
-          - Written once at ``initialize()`` and again at ``finalize()`` (the
-            group-level and per-level ``zarr.json`` files), OR
-          - Rewritten in place on every frame (``frame_times/c/0/0/0`` holds
-            timestamps for *all* ``(t, c, z)`` slots; ``record_frame_time``
-            updates a single cell per call).
+        All of these are written once at ``initialize()`` and rewritten only at
+        ``finalize()`` (the group-level, per-level and ``frame_times``
+        ``zarr.json`` files), so reading them mid-run is safe.
 
-        Deleting any of these while the writer is still active would corrupt
-        the running acquisition. They are re-uploaded on every barrier so
-        the remote tree stays continuously readable, but the local copies
-        must remain in place until the writer has finalized.
+        Deliberately **excluded**: ``frame_times/c/0/0/0``, the one file
+        ``record_frame_time`` rewrites on every frame. Uploading it here made
+        the uploader hold a read handle on a file TensorStore was concurrently
+        replacing via ``<key>.__lock`` -> ``<key>`` rename; on Windows that
+        rename fails ``ERROR_ACCESS_DENIED`` against any handle opened without
+        ``FILE_SHARE_DELETE`` (which is every CPython ``open()``), and the
+        resulting write error aborted a 282-timepoint run at t=264. It is also
+        the least useful thing to re-send: it is rewritten on every frame, so
+        every intermediate copy is stale on arrival. The post-finalize resync
+        (``_BackgroundUploadDrainer._enqueue_post_finalize_metadata_resync``,
+        which runs on the abort path too) pushes the settled copy once.
 
         Files that do not yet exist are filtered out.
         """
@@ -443,7 +456,6 @@ class ZarrWriter:
         for level in range(len(self._level_shapes)):
             candidates.append(self._level_zarr_json_path(level))
         candidates.append(os.path.join(self._frame_times_path(), "zarr.json"))
-        candidates.append(self._frame_times_shard_path())
         return [p for p in candidates if os.path.exists(p)]
 
     # Spec construction -------------------------------------------------------
@@ -822,9 +834,27 @@ class ZarrWriter:
             else:
                 still_pending.append(f)
         self._pending_futures = still_pending
+        self._drain_completed_time_futures()
         if drained:
             log.debug(f"Drained {drained} completed writes, {len(still_pending)} still pending")
         return drained
+
+    def _drain_completed_time_futures(self) -> None:
+        """Reap finished timestamp writes, warning (never raising) on failure.
+
+        Keeps ``_pending_time_futures`` from growing across a long FOV visit
+        without letting a bookkeeping failure escape into the image path.
+        """
+        still_pending = []
+        for f in self._pending_time_futures:
+            if not f.done():
+                still_pending.append(f)
+                continue
+            try:
+                f.result()
+            except Exception as e:
+                log.warning(f"Frame timestamp write failed (data unaffected): {e}")
+        self._pending_time_futures = still_pending
 
     def record_frame_time(
         self,
@@ -850,7 +880,7 @@ class ZarrWriter:
         try:
             value = np.asarray([[[float(unix_time_s)]]], dtype=np.float64)
             fut = self._frame_times_dataset[t : t + 1, c : c + 1, z : z + 1].write(value)
-            self._pending_futures.append(fut)
+            self._pending_time_futures.append(fut)
         except Exception as e:
             log.warning(f"Failed to write frame timestamp at t={t} c={c} z={z}: {e}")
 
@@ -860,8 +890,14 @@ class ZarrWriter:
         Commits any *complete* buffered z-slice first so it is on disk before
         the barrier awaits the futures. Slices still missing channels stay
         buffered — see :meth:`_flush_pending_z`.
+
+        Only **image** write failures propagate. Timestamp writes are awaited
+        too (the caller needs them settled before uploading ``frame_times``)
+        but a failure there is logged and swallowed: it costs a bookkeeping
+        cell, not a frame, and must never abort an acquisition.
         """
         self._flush_pending_z()
+        self._wait_for_pending_time_futures()
         if not self._pending_futures:
             return 0
         count = len(self._pending_futures)
@@ -871,6 +907,25 @@ class ZarrWriter:
         self._pending_futures.clear()
         log.debug(f"Completed {count} pending writes")
         return count
+
+    def _wait_for_pending_time_futures(self) -> None:
+        """Await every outstanding timestamp write, warning on failure."""
+        if not self._pending_time_futures:
+            return
+        failures = 0
+        for f in self._pending_time_futures:
+            try:
+                f.result()
+            except Exception as e:
+                failures += 1
+                if failures == 1:
+                    log.warning(
+                        f"Frame timestamp write failed (image data unaffected, "
+                        f"acquisition continues): {e}"
+                    )
+        if failures > 1:
+            log.warning(f"{failures} frame timestamp writes failed in this batch")
+        self._pending_time_futures.clear()
 
     @property
     def pending_write_count(self) -> int:
@@ -912,6 +967,7 @@ class ZarrWriter:
         log.warning("Aborting Zarr writer...")
         try:
             self._pending_futures.clear()
+            self._pending_time_futures.clear()
             self._pending_z.clear()
             self._set_squid_flag("acquisition_complete", False)
             self._set_squid_flag("aborted", True)

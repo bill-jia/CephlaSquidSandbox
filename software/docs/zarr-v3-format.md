@@ -371,16 +371,29 @@ aspirations — each is a place where a consumer of the output can be surprised.
    requires that a shard not span two timepoints (5D array, `chunk_shape[0] ==
    1`). That covers per-z, legacy per-FOV, and unsharded layouts alike;
    `--follow` also dedupes per file so a part-written timepoint isn't stranded.
-3. **The post-finalize upload metadata resync only covers dense stores.**
-   `MultiPointWorker._collect_metadata_paths_for_fov()` resolves the group path
-   with `array_key=None`, so for ragged/derived plates the *final* `zarr.json`
-   (the one carrying `acquisition_complete: true`) and the last `frame_times`
-   chunk are never re-pushed. Those files were uploaded by the per-FOV barriers
-   during the run, so the remote data is complete, but the remote copy's
-   `_squid.acquisition_complete` stays `false`. Anything keying on that flag
-   (including the backfill script's `--follow` exit condition) will not see the
-   run as finished.
-4. **The NDViewer's offline discovery only finds the dense store.**
+3. ~~**`scripts/zarr_backfill_upload.py` cannot see non-HCS ragged/derived
+   plates.**~~ **Fixed.** `find_fov_groups()` globbed `fov_*.ome.zarr` exactly
+   one level below `zarr/`, so a keyed store — a ragged cycle plate or an
+   online-postprocessing derived output at
+   `zarr/{array_key}/{region}/fov_*.ome.zarr` — was silently skipped, and the
+   script still wrote the upload-complete marker. It now treats a `zarr/` child
+   holding fov groups directly as a region and any other child as an array-key
+   namespace to descend into, and `parse_fov_identity()` namespaces the id as
+   `{array_key}/{region}` so a derived FOV cannot collide with the raw one it
+   derives from.
+4. ~~**The post-finalize upload metadata resync only covers dense stores.**~~
+   **Fixed.** `_enqueue_post_finalize_metadata_resync()` now enumerates by
+   filesystem walk of the whole experiment dir — every `zarr.json` (per-FOV
+   group and level metadata, plate roots, per-well groups, across dense,
+   ragged, `*_refz` and derived plates) plus every `frame_times` chunk, batched
+   ~100 files per task — followed by a full sidecar mirror. It also waits for
+   the JobRunners to exit before running, so it is genuinely post-finalize
+   rather than racing a finalize minutes away. That ordering matters now that
+   the per-frame-rewritten `frame_times/c/0/0/0` was removed from the
+   per-barrier upload set (it triggered a Windows rename-vs-open abort — see
+   [zarr-network-streaming.md](zarr-network-streaming.md#concurrent-write-safety)),
+   making this resync its only uploader.
+5. **The NDViewer's offline discovery only finds the dense store.**
    `discover_zarr_v3_fovs()` looks for `plate.ome.zarr` and
    `zarr/{region}/fov_*.ome.zarr`. Ragged plates (`{state}.ome.zarr`) and the
    extra non-HCS namespace level are not enumerated, so a ragged run opened from
@@ -388,13 +401,13 @@ aspirations — each is a place where a consumer of the output can be surprised.
    ragged). Flexible runs are no longer affected for the dense case — they now
    land in `plate.ome.zarr`, which is the first thing it checks. Live push-mode
    viewing during acquisition is unaffected.
-5. **The stitcher cannot consume ZARR_V3 output.** `control/stitcher.py` reads
+6. **The stitcher cannot consume ZARR_V3 output.** `control/stitcher.py` reads
    per-timepoint TIFF/BMP folders plus per-timepoint `coordinates.csv`; it has
    no zarr reader. Its own `.ome.zarr` output is a *different* format
    (zarr v2 via `ome-zarr`/`aicsimageio`, OME-NGFF 0.4-era), written to
    `{input}/{t}_stitched/` and `*_complete_acquisition.ome.zarr`. Stitching a
    ZARR_V3 acquisition requires exporting to TIFF first.
-6. **Local shard-directory pruning after verified upload skips ragged stores**
+7. **Local shard-directory pruning after verified upload skips ragged stores**
    (`_prune_empty_shard_dirs` also resolves with `array_key=None`). Cosmetic —
    empty `c/{t}/…` directories are left behind; no data is affected.
 

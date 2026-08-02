@@ -167,19 +167,43 @@ cache coherency, not a guaranteed fresh fetch from the server.
 ## Concurrent-write safety
 
 The metadata files are uploaded on every barrier *while the writer is still
-active*. Two of them can be racing the writer at the moment we read:
+active*, so a read can race the writer.
 
-- **`frame_times/c/0/0/0`** — every ``record_frame_time`` call from the
-  JobRunner rewrites this single chunk (read-modify-write of the whole
-  ``(T, C, Z)`` chunk to update one cell). Hit rate is on the order of one
-  rewrite per frame; the upload read takes 10–100 ms; overlap probability
-  during a typical run is ~10%.
-- **Per-FOV `zarr.json`** — static between ``initialize()`` and
-  ``finalize()``, but ``finalize()`` rewrites it with
-  ``_squid.acquisition_complete = True``. The last live barrier may race
-  this rewrite.
+**`frame_times/c/0/0/0` is therefore excluded from the per-barrier set.**
+Every ``record_frame_time`` call rewrites that single chunk (read-modify-write
+of the whole ``(T, C, Z)`` chunk to update one cell), so it was the one
+metadata file being rewritten on the order of once per frame. Uploading it
+every barrier was both useless — every copy is stale before it lands — and
+actively dangerous on Windows:
 
-A torn read could put garbage timestamps or a broken JSON document on the
+> TensorStore's file kvstore commits a write as ``<key>.__lock`` followed by a
+> rename onto ``<key>``. On Windows that rename fails with
+> ``ERROR_ACCESS_DENIED`` if *any* process holds the destination open without
+> ``FILE_SHARE_DELETE`` — which is every CPython ``open()``, including the
+> uploader's. The failure surfaced as a `PERMISSION_DENIED` job error and,
+> because `abort_on_failed_jobs=True`, aborted a 282-timepoint acquisition at
+> t=264 (2026-08-01). On POSIX the same rename succeeds silently, so this
+> hazard is Windows-only.
+
+The chunk is now uploaded exactly once, by the post-finalize resync below.
+Consequence to be aware of: **while a run is in progress the remote
+``frame_times`` array reads as fill value**, because its ``zarr.json`` is
+uploaded but no chunk is. Timestamps appear on the remote when the run
+finalizes. Local ``frame_times`` is unaffected and complete throughout.
+
+A second, independent guard covers the same class of failure from the writer
+side: ``ZarrWriter`` tracks timestamp futures in ``_pending_time_futures``,
+separate from image ``_pending_futures``. ``wait_for_pending()`` awaits both
+but only re-raises for images — a failed timestamp write is logged and the
+acquisition continues. (``record_frame_time`` already caught the *synchronous*
+form of this and only warned; sharing one future list meant the async form
+aborted the run instead.)
+
+The remaining per-barrier metadata (group, per-level and ``frame_times``
+``zarr.json``) is static between ``initialize()`` and ``finalize()`` — but
+``finalize()`` rewrites the group ``zarr.json`` with
+``_squid.acquisition_complete = True``, so the last live barrier can still
+race that one rewrite. A torn read could put a broken JSON document on the
 remote until the next barrier corrects it. Two safeguards keep the remote
 authoritative:
 
@@ -269,7 +293,7 @@ class is ever deleted locally** — even when `--delete-after-verify` is set:
 | Class | Files | Lifecycle | Deletable after verify? |
 |---|---|---|---|
 | Per-timepoint shards | `<level>/c/<t>/0/0/0/0` | Written once during `(t, fov)` acquisition, never touched again | **Yes** |
-| Shared metadata | group `zarr.json`, per-level `zarr.json`, `frame_times/zarr.json`, `frame_times/c/0/0/0` | Group + level `zarr.json` rewritten at finalize; `frame_times/c/0/0/0` rewritten by every `record_frame_time` call (one cell per call) | **No** |
+| Shared metadata | group `zarr.json`, per-level `zarr.json`, `frame_times/zarr.json` (per barrier); `frame_times/c/0/0/0` (post-finalize resync only) | Group + level `zarr.json` rewritten at finalize; `frame_times/c/0/0/0` rewritten by every `record_frame_time` call (one cell per call), which is why it is not uploaded per barrier | **No** |
 
 The split is enforced at the upload-pipeline boundary: `UploadTask` carries
 an explicit `deletable_local_paths: Set[str]` whitelist;

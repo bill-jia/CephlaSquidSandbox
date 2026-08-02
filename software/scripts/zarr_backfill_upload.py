@@ -12,7 +12,9 @@ be used to:
 
 Layout discovery matches what ``ZarrWriterInfo`` produces:
   - HCS:     ``{exp}/plate.ome.zarr/{row}/{col}/{fov}/{level}/c/{t}/...``
+             (``{key}.ome.zarr/...`` for a ragged/derived store)
   - non-HCS: ``{exp}/zarr/{region}/fov_{n}.ome.zarr/{level}/c/{t}/...``
+             (``{exp}/zarr/{key}/{region}/fov_{n}.ome.zarr/...`` likewise)
 
 For each FOV the script enumerates ``c/<t>/0/0/0/0`` shard files across all
 pyramid levels, then groups them into per-``(t, fov)`` tasks (matching how
@@ -98,11 +100,26 @@ def _ome_attrs(zarr_json: Path) -> dict:
         return {}
 
 
+def _fov_dirs_in(parent: Path) -> List[Path]:
+    """``fov_*.ome.zarr`` groups sitting directly inside ``parent``."""
+    return [
+        d for d in sorted(parent.glob("fov_*.ome.zarr"))
+        if (d / "zarr.json").is_file()
+    ]
+
+
 def find_fov_groups(experiment_dir: Path) -> List[Path]:
     """Return absolute paths of every FOV group directory in ``experiment_dir``.
 
     Detects three layouts:
-      - non-HCS: ``zarr/<region>/fov_*.ome.zarr``
+      - non-HCS: ``zarr/<region>/fov_*.ome.zarr`` for the dense store, and
+                 ``zarr/<array_key>/<region>/fov_*.ome.zarr`` one level deeper
+                 for every keyed store — a ragged acquisition-cycle plate or an
+                 online-postprocessing derived output (``{label}_{output}``).
+                 Both come from :func:`control.utils.build_per_fov_zarr_path`,
+                 which inserts ``array_key`` between ``zarr`` and the region.
+                 Scanning only the dense depth silently skipped whole derived
+                 plates while still reporting success.
       - HCS:     ``<plate>.ome.zarr/<row>/<col>/<fov>`` — **any** top-level
                  ``*.ome.zarr`` whose root zarr.json carries an ``ome.plate``
                  attribute. A ragged acquisition-cycle run writes one plate
@@ -116,12 +133,21 @@ def find_fov_groups(experiment_dir: Path) -> List[Path]:
 
     non_hcs_root = experiment_dir / "zarr"
     if non_hcs_root.is_dir():
-        for region_dir in sorted(non_hcs_root.iterdir()):
-            if not region_dir.is_dir():
+        for child in sorted(non_hcs_root.iterdir()):
+            if not child.is_dir():
                 continue
-            for fov_dir in sorted(region_dir.glob("fov_*.ome.zarr")):
-                if (fov_dir / "zarr.json").is_file():
-                    fov_groups.append(fov_dir)
+            # A dense region dir holds fov groups directly; a keyed namespace
+            # holds region dirs that hold them. The two never mix within one
+            # directory, so "no fov groups here" is an unambiguous signal to
+            # descend. A run may still have both kinds side by side under
+            # ``zarr/``, which this handles per-child.
+            direct = _fov_dirs_in(child)
+            if direct:
+                fov_groups.extend(direct)
+                continue
+            for region_dir in sorted(child.iterdir()):
+                if region_dir.is_dir():
+                    fov_groups.extend(_fov_dirs_in(region_dir))
 
     for plate_root in sorted(experiment_dir.glob("*.ome.zarr")):
         if not plate_root.is_dir():
@@ -148,10 +174,14 @@ def parse_fov_identity(fov_group: Path, experiment_dir: Path) -> Tuple[str, int]
     """Recover ``(region_id, fov_index)`` from a FOV group path."""
     rel = fov_group.relative_to(experiment_dir).as_posix()
     parts = rel.split("/")
-    if parts[0] == "zarr":
-        # zarr/<region>/fov_<n>.ome.zarr
-        region_id = parts[1]
-        stem = parts[2].split(".")[0]  # fov_<n>
+    if parts[0] == "zarr" and len(parts) >= 3:
+        # zarr/<region>/fov_<n>.ome.zarr, or the keyed form
+        # zarr/<array_key>/<region>/fov_<n>.ome.zarr. Join everything between
+        # ``zarr`` and the fov dir so a derived FOV keeps an id distinct from
+        # its raw counterpart — same namespacing the HCS branch below applies
+        # to per-state plates.
+        region_id = "/".join(parts[1:-1])
+        stem = parts[-1].split(".")[0]  # fov_<n>
         try:
             fov_idx = int(stem.split("_", 1)[1])
         except (IndexError, ValueError):

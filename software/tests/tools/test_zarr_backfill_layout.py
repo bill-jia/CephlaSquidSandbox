@@ -69,6 +69,15 @@ def _flexible_tree(root: Path, *, shard_per_z: bool, nz=NZ):
     return group
 
 
+def _keyed_tree(root: Path, key: str, *, shard_per_z: bool = True, nz=NZ):
+    """A keyed non-HCS store: ``zarr/<key>/<region>/fov_0.ome.zarr``, the shape
+    ``build_per_fov_zarr_path`` produces for a ragged cycle plate or an
+    online-postprocessing derived output."""
+    group = root / "zarr" / key / "R0" / "fov_0.ome.zarr"
+    _write_fov(group, shard_per_z=shard_per_z, nz=nz)
+    return group
+
+
 # ---------------------------------------------------------------------------
 # The layout guard
 # ---------------------------------------------------------------------------
@@ -198,6 +207,64 @@ def test_single_z_stack_still_works(tmp_path):
     ok, _reason = bf.check_fov_layout(group)
     assert ok
     assert len(bf.shard_files_for_timepoint(group / "0", 0)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Discovery across dense and keyed non-HCS stores
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_finds_dense_store(tmp_path):
+    group = _flexible_tree(tmp_path, shard_per_z=True)
+    assert bf.find_fov_groups(tmp_path) == [group]
+    assert bf.parse_fov_identity(group, tmp_path) == ("R0", 0)
+
+
+def test_discovery_finds_keyed_derived_plate(tmp_path):
+    """Regression: a postprocessing-derived output lives one level deeper than
+    the dense store. Scanning only the dense depth found nothing here and the
+    script still reported success, silently never uploading the plate."""
+    (tmp_path / "acquisition.yaml").write_text("x: 1\n", encoding="utf-8")
+    derived = _keyed_tree(tmp_path, "DPC_phase")
+
+    assert bf.find_fov_groups(tmp_path) == [derived]
+    # Namespaced so it cannot collide with the raw R0/fov_0 it derives from.
+    assert bf.parse_fov_identity(derived, tmp_path) == ("DPC_phase/R0", 0)
+
+
+def test_discovery_finds_dense_and_keyed_side_by_side(tmp_path):
+    """The real shape of an online-postprocessing run: raw regions and derived
+    plates share one ``zarr/`` root at different depths."""
+    dense = _flexible_tree(tmp_path, shard_per_z=True)
+    derived = _keyed_tree(tmp_path, "DPC_phase")
+
+    found = bf.find_fov_groups(tmp_path)
+    assert sorted(found) == sorted([dense, derived])
+
+    ids = {bf.parse_fov_identity(g, tmp_path) for g in found}
+    assert ids == {("R0", 0), ("DPC_phase/R0", 0)}
+
+
+def test_keyed_derived_plate_shards_are_enumerated(tmp_path):
+    """Discovery is only half of it — the derived plate's shards have to reach
+    real tasks with correctly-mapped remote paths."""
+    (tmp_path / "acquisition.yaml").write_text("x: 1\n", encoding="utf-8")
+    derived = _keyed_tree(tmp_path, "DPC_phase")
+    target = bf.UploadTarget(
+        enabled=True, remote_root=str(tmp_path / "remote"),
+        local_base=str(tmp_path), delete_after_verify=True,
+    )
+    tasks = bf.build_tasks_for_fov(derived, tmp_path, target, in_progress=False)
+
+    assert [t.time_point for t in tasks] == [0, 1]
+    for task in tasks:
+        assert task.region_id == "DPC_phase/R0" and task.fov == 0
+        assert len(task.files) == NZ
+        for local, remote in task.files:
+            assert os.path.isfile(local)
+            # The key stays in the remote path, so the mirror matches on-disk.
+            assert remote.startswith(str(tmp_path / "remote"))
+            assert os.path.join("zarr", "DPC_phase", "R0") in remote
 
 
 # ---------------------------------------------------------------------------
