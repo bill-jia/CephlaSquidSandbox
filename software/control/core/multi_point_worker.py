@@ -208,6 +208,32 @@ def active_upload_drainer_summary() -> List[dict]:
         return out
 
 
+def format_upload_failure(result, limit: int = 5) -> str:
+    """One log line describing *which* files failed in an UploadResult, and why.
+
+    ``UploadResult.error`` is only an aggregate ("5 file(s) failed"), and the
+    per-file error strings live in the UploadWorker subprocess whose logger
+    output does not reach any log file. Dropping ``failed_paths`` on the floor
+    therefore made upload failures undiagnosable after the fact — a real run
+    lost 10 tasks and the logs could not say whether it was a transient SMB
+    OSError, a torn stable-read, or a sha256 mismatch. Capped so a task that
+    fails wholesale cannot flood the log.
+    """
+    failed = list(getattr(result, "failed_paths", None) or [])
+    if not failed:
+        return str(getattr(result, "error", "") or "unknown error")
+    shown = []
+    for entry in failed[:limit]:
+        # Entries are (local_path, error); tolerate a bare path.
+        if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+            shown.append(f"{os.path.basename(str(entry[0]))}: {entry[1]}")
+        else:
+            shown.append(os.path.basename(str(entry)))
+    more = len(failed) - len(shown)
+    tail = f" (+{more} more)" if more > 0 else ""
+    return f"{getattr(result, 'error', '') or 'failed'} -> " + "; ".join(shown) + tail
+
+
 def _worker_experiment_path(worker: "UploadWorker") -> str:
     """Best-effort experiment dir for a worker (manifest lives at its root)."""
     try:
@@ -433,7 +459,7 @@ class _BackgroundUploadDrainer:
                 self._consecutive_failed_tasks += 1
                 self._log.warning(
                     f"Upload task {result.task_id} for t={tp} fov={result.fov} "
-                    f"failed: {result.error}"
+                    f"failed: {format_upload_failure(result)}"
                 )
             else:
                 self._consecutive_failed_tasks = 0
@@ -2824,7 +2850,7 @@ class MultiPointWorker:
                 self._upload_failed_tasks.append(result)
                 self._log.warning(
                     f"Upload task {result.task_id} for t={tp} fov={result.fov} "
-                    f"failed: {result.error}"
+                    f"failed: {format_upload_failure(result)}"
                 )
             self._delete_verified_result_files(result)
             self._maybe_prune_timepoint(tp)
