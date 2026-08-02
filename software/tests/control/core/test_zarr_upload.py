@@ -16,6 +16,7 @@ from control.core.zarr_upload import (
     UploadTarget,
     UploadTask,
     UploadWorker,
+    collect_sidecar_files,
     drain_output_queue_nonblocking,
     local_to_remote_path,
     read_manifest,
@@ -226,6 +227,129 @@ def test_remote_root_reachable(tmp_path):
     assert remote_root_reachable(str(tmp_path), timeout_s=2.0)
     assert not remote_root_reachable(str(tmp_path / "nope"), timeout_s=2.0)
     assert not remote_root_reachable("", timeout_s=2.0)
+
+
+def test_tasks_submitted_counter_tracks_both_producer_paths(tmp_path):
+    """submit() and the raw shared-Value path (used by JobRunner barriers)
+    must both count; outstanding accounting is (submitted - results)."""
+    local_base, files = _make_local_files(tmp_path, 4)
+    remote_root = str(tmp_path / "remote")
+    os.makedirs(remote_root, exist_ok=True)
+    target = UploadTarget(
+        enabled=True, remote_root=remote_root, local_base=local_base, delete_after_verify=False
+    )
+    worker = UploadWorker(target=target, manifest_path=str(tmp_path / "m.jsonl"))
+    worker.start()
+    try:
+        assert worker.tasks_submitted == 0
+        # Producer path 1: local submit().
+        worker.submit(_task("t0", files[:2], local_base, remote_root, deletable=False))
+        assert worker.tasks_submitted == 1
+        # Producer path 2: external producer holding only the shared Value +
+        # queue (what FlushAndStageUploadJob does in the JobRunner subprocess).
+        UploadWorker.count_submitted(worker.tasks_submitted_value)
+        worker.input_queue.put(_task("t1", files[2:], local_base, remote_root, deletable=False))
+        assert worker.tasks_submitted == 2
+        results = _drain(worker, 2)
+        assert len(results) == 2
+        assert worker.tasks_submitted - len(results) == 0
+    finally:
+        _stop(worker)
+
+
+def test_heartbeat_not_stamped_by_failing_uploads(tmp_path):
+    """A failure grind must look idle to the watchdog: only byte movement and
+    verified completions stamp the heartbeat."""
+    remote_root = str(tmp_path / "remote")
+    os.makedirs(remote_root, exist_ok=True)
+    target = UploadTarget(
+        enabled=True, remote_root=remote_root, local_base=str(tmp_path), delete_after_verify=False
+    )
+    worker = UploadWorker(
+        target=target, manifest_path=str(tmp_path / "m.jsonl"), max_attempts=1
+    )
+    worker.start()
+    try:
+        deadline = time.time() + 10.0
+        while worker.heartbeat == 0.0 and time.time() < deadline:
+            time.sleep(0.02)
+        hb0 = worker.heartbeat
+        assert hb0 > 0.0  # startup stamp
+        bogus = str(tmp_path / "missing.bin")
+        task = UploadTask(
+            task_id="fail",
+            time_point=0,
+            region_id="A1",
+            fov=0,
+            files=[(bogus, os.path.join(remote_root, "missing.bin"))],
+        )
+        worker.submit(task)
+        results = _drain(worker, 1)
+        assert len(results) == 1 and not results[0].success
+        assert worker.heartbeat == hb0, "failed upload must not refresh the heartbeat"
+    finally:
+        _stop(worker)
+
+
+def test_same_destination_from_two_tasks_is_safe(tmp_path):
+    """Shared metadata recurs in every barrier task; two lanes writing the
+    same remote path must not corrupt it (unique .part names + per-path
+    serialization)."""
+    local_base, files = _make_local_files(tmp_path, 1, size=2 * COPY_CHUNK_BYTES)
+    remote_root = str(tmp_path / "remote")
+    os.makedirs(remote_root, exist_ok=True)
+    target = UploadTarget(
+        enabled=True, remote_root=remote_root, local_base=local_base, delete_after_verify=False
+    )
+    worker = UploadWorker(
+        target=target, manifest_path=str(tmp_path / "m.jsonl"), pipelined=True, threads=4
+    )
+    worker.start()
+    try:
+        for i in range(4):
+            worker.submit(_task(f"t{i}", files, local_base, remote_root, deletable=False))
+        results = _drain(worker, 4)
+        assert len(results) == 4
+        assert all(r.success for r in results)
+        remote = local_to_remote_path(files[0], local_base, remote_root)
+        with open(files[0], "rb") as a, open(remote, "rb") as b:
+            assert a.read() == b.read()
+        # No temp files left behind anywhere on the remote.
+        leftovers = [
+            n for n in os.listdir(os.path.dirname(remote)) if ".part" in n
+        ]
+        assert leftovers == []
+    finally:
+        _stop(worker)
+
+
+def test_collect_sidecar_files_prunes_zarr_and_pipeline_outputs(tmp_path):
+    """Sidecar sweep must take everything EXCEPT zarr plate subtrees (covered
+    by live streaming + metadata resync) and the pipeline's own root files."""
+    exp = tmp_path / "exp"
+    # HCS plate + non-HCS tree: both pruned wholesale.
+    (exp / "plate.ome.zarr" / "A" / "1").mkdir(parents=True)
+    (exp / "plate.ome.zarr" / "zarr.json").write_text("{}")
+    (exp / "zarr" / "R0" / "fov_0.ome.zarr" / "0").mkdir(parents=True)
+    (exp / "zarr" / "R0" / "fov_0.ome.zarr" / "zarr.json").write_text("{}")
+    # Sidecars: root files + a per-timepoint folder + a stray non-plate file
+    # inside the zarr/ container dir.
+    (exp / "acquisition.yaml").write_text("a: 1")
+    (exp / "000").mkdir()
+    (exp / "000" / "well_A1.png").write_bytes(b"x")
+    (exp / "zarr" / "R0" / "notes.txt").write_text("hi")
+    # Pipeline outputs at the root: skipped there, kept elsewhere.
+    (exp / "upload_manifest.jsonl").write_text("")
+    (exp / "000" / "upload_manifest.jsonl").write_text("not-root-so-kept")
+
+    got = collect_sidecar_files(str(exp), frozenset({"upload_manifest.jsonl"}))
+    rel = {os.path.relpath(p, str(exp)).replace(os.sep, "/") for p in got}
+    assert rel == {
+        "acquisition.yaml",
+        "000/well_A1.png",
+        "000/upload_manifest.jsonl",
+        "zarr/R0/notes.txt",
+    }
 
 
 def test_force_stop_terminates_worker(tmp_path):

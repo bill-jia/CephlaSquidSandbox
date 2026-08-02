@@ -116,16 +116,23 @@ class AcquisitionParameters:
     laser_af_check_last_fov_per_region: bool = True
 
     # Live ZARR_V3 streaming upload to a network drive. When ``zarr_upload_enabled``
-    # is True and ``file_saving_option == ZARR_V3``, each timepoint's shard
-    # files are pushed to ``zarr_upload_remote_root`` (UNC ``\\server\share\dir``
-    # on Windows or ``//server/share/dir`` POSIX) by a dedicated UploadWorker.
-    # When ``zarr_upload_delete_after_verify`` is True, local shard files are
+    # is True and ``file_saving_option == ZARR_V3``, the acquisition is mirrored
+    # to ``<zarr_upload_remote_root>/<experiment_ID>/`` (the configured path is
+    # the PARENT folder; UNC ``\\server\share\dir`` on Windows or
+    # ``//server/share/dir`` POSIX) by a dedicated UploadWorker — shards stream
+    # per timepoint, metadata and every sidecar follow at end of run. When
+    # ``zarr_upload_delete_after_verify`` is True, local shard files are
     # deleted in batches at the end of each timepoint once every shard in that
     # timepoint has been sha256-verified on the remote. See
     # ``control.core.zarr_upload`` for details.
     zarr_upload_enabled: bool = False
     zarr_upload_remote_root: str = ""
     zarr_upload_delete_after_verify: bool = True
+    # Pre-run estimate of the acquisition's total on-disk size (bytes), from
+    # MultiPointController.get_estimated_acquisition_disk_storage(). The
+    # worker's mid-run upload health check divides by Nt to warn when local
+    # free space drops below a couple of timepoints' headroom. 0 = unknown.
+    estimated_total_disk_bytes: int = 0
 
 
 @dataclass

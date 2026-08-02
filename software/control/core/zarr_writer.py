@@ -406,13 +406,17 @@ class ZarrWriter:
         for t, z_grid in sorted(self._unstaged_shards):
             cell_paths = [self._level_shard_path(level, t, z_grid) for level in range(len(self._level_shapes))]
             present = [p for p in cell_paths if os.path.exists(p)]
-            # Only consider a cell staged once *all* its level shards are on
-            # disk; otherwise leave it pending so a later barrier re-checks
-            # (guards against a shard TensorStore hasn't flushed yet — never
-            # drop a written cell). An all-fill-value (e.g. all-zero) frame
-            # writes no chunk, so a cell whose shards never appear simply stays
-            # pending and is harmless.
-            if present and len(present) == len(cell_paths):
+            level0_present = bool(cell_paths) and os.path.exists(cell_paths[0])
+            # Callers run ``wait_for_pending()`` first, so every write for
+            # this cell has been committed: a level file that is absent NOW is
+            # permanently absent (TensorStore elides all-fill-value shards —
+            # e.g. a pyramid level that downsampled to exactly zero). Stage
+            # whatever exists; demanding ALL levels stranded the cell (and its
+            # real level-0 data) in the pending set forever. Only a cell with
+            # no level-0 file stays pending: either its write lands before a
+            # later barrier, or the frame itself was all-fill (no file will
+            # ever exist — harmless to keep pending).
+            if present and level0_present:
                 paths.extend(present)
                 staged.add((t, z_grid))
         self._unstaged_shards -= staged
@@ -889,6 +893,15 @@ class ZarrWriter:
         # only place they may be written.
         self._flush_pending_z(final=True)
         self.wait_for_pending()
+        if self._unstaged_shards:
+            # Upload staging never picked these cells up (their level-0 shard
+            # never appeared — all-fill frames, or writes that never landed).
+            # Purely informational for the streaming pipeline; the local
+            # dataset itself is complete.
+            log.info(
+                f"{len(self._unstaged_shards)} shard cell(s) were never staged "
+                f"for upload (no level-0 file): {sorted(self._unstaged_shards)[:10]}"
+            )
         self._set_squid_flag("acquisition_complete", True)
         self._finalized = True
         self._cleanup_event_loop()

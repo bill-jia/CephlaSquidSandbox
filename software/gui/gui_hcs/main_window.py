@@ -2504,6 +2504,28 @@ class HighContentScreeningGui(QMainWindow):
         """
         self.log.info("Restarting application with --skip-init...")
 
+        # Restart also force-terminates background streaming uploads (the new
+        # process cannot resume them) — same warning as app exit.
+        try:
+            from control.core.multi_point_worker import active_upload_drainer_summary
+
+            pending = active_upload_drainer_summary()
+        except Exception:
+            pending = []
+        if pending:
+            total = sum(int(d.get("outstanding", 0)) for d in pending)
+            reply = QMessageBox.question(
+                self,
+                "Uploads Still Running",
+                f"{len(pending)} acquisition(s) are still uploading to the network "
+                f"({total} task(s) outstanding). Restarting now ABANDONS these "
+                f"uploads (recover later with the backfill script).\n\nRestart anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
+
         # Build new args list, preserving original arguments but adding --skip-init
         args = [sys.executable] + sys.argv
         if "--skip-init" not in args:
@@ -2991,6 +3013,40 @@ class HighContentScreeningGui(QMainWindow):
         self._cleanup_common(for_restart=True)
 
     def closeEvent(self, event):
+        # Background streaming uploads do not survive app exit: closing
+        # force-terminates their workers and the backlog must be recovered
+        # with the backfill script. Surface that BEFORE the generic exit
+        # confirmation so data is never abandoned silently.
+        try:
+            from control.core.multi_point_worker import active_upload_drainer_summary
+
+            pending = active_upload_drainer_summary()
+        except Exception:
+            pending = []
+        if pending:
+            total = sum(int(d.get("outstanding", 0)) for d in pending)
+            paths = "\n".join(
+                f"  • {d.get('experiment_path')} "
+                + ("(acquisition in progress)"
+                   if d.get("acquisition_in_progress")
+                   else f"({d.get('outstanding', '?')} task(s))")
+                for d in pending
+            )
+            reply = QMessageBox.question(
+                self,
+                "Uploads Still Running",
+                f"{len(pending)} acquisition(s) are still uploading to the network "
+                f"({total} task(s) outstanding):\n\n{paths}\n\n"
+                f"Exiting now ABANDONS these uploads (an UPLOAD_INCOMPLETE.txt "
+                f"record is left next to each dataset; finish later with the "
+                f"backfill script).\n\nExit anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+
         # Show confirmation dialog
         reply = QMessageBox.question(
             self,

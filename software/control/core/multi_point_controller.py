@@ -1911,7 +1911,16 @@ class MultiPointController:
             zarr_upload_enabled=self.zarr_upload_enabled,
             zarr_upload_remote_root=self.zarr_upload_remote_root,
             zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,
+            estimated_total_disk_bytes=self._estimated_disk_bytes_or_zero(),
         )
+
+    def _estimated_disk_bytes_or_zero(self) -> int:
+        """Best-effort total-size estimate for the run (0 if not computable)."""
+        try:
+            return int(self.get_estimated_acquisition_disk_storage())
+        except Exception:
+            self._log.debug("Could not estimate acquisition disk size", exc_info=True)
+            return 0
 
     def _on_acquisition_completed(self):
         self._log.debug("MultiPointController._on_acquisition_completed called")
