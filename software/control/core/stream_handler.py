@@ -7,6 +7,7 @@ import cv2
 
 from control import utils
 import control._def
+from control.core.downsampled_views import downsample_to_max_dim
 from squid.abc import CameraFrame, AbstractCamera
 
 
@@ -32,6 +33,7 @@ class StreamHandler:
         handler_functions: StreamHandlerFunctions,
         display_resolution_scaling=1,
         camera: Optional[AbstractCamera] = None,
+        display_max_dim: Optional[int] = None,
     ):
         self.fps_display = 1
         self.fps_save = 1
@@ -41,6 +43,10 @@ class StreamHandler:
         self.timestamp_last_track = 0
         self.camera = camera
         self.display_resolution_scaling = display_resolution_scaling
+        # When set, displayed frames are resized down to fit this largest dimension.
+        # Note this is a true resize, unlike display_resolution_scaling, which is a
+        # center crop and so reduces field of view rather than pixel count.
+        self.display_max_dim = display_max_dim
 
         self.save_image_flag = False
         self.send_image_to_display_flag = True
@@ -76,6 +82,9 @@ class StreamHandler:
         self.display_resolution_scaling = display_resolution_scaling / 100
         print(self.display_resolution_scaling)
 
+    def set_display_max_dim(self, display_max_dim: Optional[int]):
+        self.display_max_dim = display_max_dim
+
     def set_functions(self, functions: StreamHandlerFunctions):
         if not functions:
             functions = NoOpStreamHandlerFunctions
@@ -106,13 +115,14 @@ class StreamHandler:
         time_now = time.time()
         if self.send_image_to_display_flag:
             if time_now - self.timestamp_last_display >= 1 / self.fps_display:
-                self._fns.image_to_display(
-                    utils.crop_image(
-                        image,
-                        round(image.shape[1] * self.display_resolution_scaling),
-                        round(image.shape[0] * self.display_resolution_scaling),
-                    )
+                display_image = utils.crop_image(
+                    image,
+                    round(image.shape[1] * self.display_resolution_scaling),
+                    round(image.shape[0] * self.display_resolution_scaling),
                 )
+                if self.display_max_dim:
+                    display_image = downsample_to_max_dim(display_image, self.display_max_dim)
+                self._fns.image_to_display(display_image)
                 self.timestamp_last_display = time_now
 
         # send image to write

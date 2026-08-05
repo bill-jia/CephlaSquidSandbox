@@ -133,6 +133,8 @@ class HighContentScreeningGui(QMainWindow):
         microscope: control.microscope.Microscope,
         is_simulation=False,
         live_only_mode=False,
+        touch_console=False,
+        touch_console_screen=None,
         skip_init=False,
         skip_homing=False,
         *args,
@@ -198,6 +200,13 @@ class HighContentScreeningGui(QMainWindow):
             )
 
         self.live_only_mode = live_only_mode or LIVE_ONLY_MODE
+        self.touch_console_enabled = touch_console or TOUCH_CONSOLE_ENABLED
+        self.touch_console_screen = (
+            touch_console_screen if touch_console_screen is not None else TOUCH_CONSOLE_SCREEN
+        )
+        self.touchConsole = None
+        self.touchConsoleStreamHandler: Optional[core.QtStreamHandler] = None
+        self.imageDisplayWindow_touch: Optional[core.ImageDisplayWindow] = None
         self.is_live_scan_grid_on = False
         self.live_scan_grid_was_on = None
         self.performance_mode = False
@@ -289,6 +298,10 @@ class HighContentScreeningGui(QMainWindow):
 
         # Initialize Slack notifier
         self._setup_slack_notifier()
+
+        # The bench console needs every widget it delegates to, so it is built last.
+        if self.touch_console_enabled:
+            self.setup_touch_console()
 
         # Skip cached position restoration on restart (hardware position hasn't changed),
         # except Z when using Xeryon (Z was retracted during cleanup).
@@ -394,6 +407,20 @@ class HighContentScreeningGui(QMainWindow):
 
     def load_objects(self, is_simulation):
         self.streamHandler = core.QtStreamHandler(accept_new_frame_fn=lambda: self.liveController.is_live, camera=self.camera)
+        if self.touch_console_enabled:
+            # The console gets its own handler so its frame rate and decimation
+            # are independent of the main display's. Frames are resized (not
+            # cropped) down to TOUCH_CONSOLE_MAX_DIM, which costs ~1.6 ms for a
+            # 2400x2400 MONO16 frame and keeps the panel cheap to render.
+            self.touchConsoleStreamHandler = core.QtStreamHandler(
+                accept_new_frame_fn=lambda: self.liveController.is_live,
+                camera=self.camera,
+                display_max_dim=TOUCH_CONSOLE_MAX_DIM,
+            )
+            self.touchConsoleStreamHandler.set_display_fps(TOUCH_CONSOLE_FPS)
+            self.imageDisplayWindow_touch = core.ImageDisplayWindow(
+                self.liveController, self.contrastManager, show_LUT=False, autoLevels=True
+            )
         self.autofocusController = QtAutoFocusController(
             self.camera, self.stage, self.liveController, self.microcontroller, self.nl5
         )
@@ -490,6 +517,8 @@ class HighContentScreeningGui(QMainWindow):
             raise ValueError(f"Invalid trigger mode: {DEFAULT_TRIGGER_MODE}")
         # Set up live acquisition to pull frames from background thread
         self.camera.add_frame_callback(self.streamHandler.get_frame_callback())
+        if self.touchConsoleStreamHandler is not None:
+            self.camera.add_frame_callback(self.touchConsoleStreamHandler.get_frame_callback())
         self.camera.enable_callbacks(enabled=True)
 
         if self.camera_focus:
@@ -1477,6 +1506,62 @@ class HighContentScreeningGui(QMainWindow):
         self.movement_update_timer.setInterval(100)
         self.movement_update_timer.timeout.connect(self.movement_updater.do_update)
         self.movement_update_timer.start()
+
+    def setup_touch_console(self):
+        """Build and show the bench touch console on its own screen.
+
+        The console is a second window in this process because the hardware is
+        single-owner: camera drivers open exclusively, the microcontroller
+        serial port is exclusive per-process, and the NIDAQ holds one DO task
+        for every line it touches. See docs/touch-console.md.
+        """
+        from gui.gui_hcs.touch_console import TouchConsoleWindow
+
+        self.touchConsole = TouchConsoleWindow(self, self.imageDisplayWindow_touch)
+
+        # Camera frame callbacks arrive on driver threads, so the hop onto the
+        # GUI thread must be explicit — Qt's AutoConnection degrades to
+        # DirectConnection for non-QThread senders. Same discipline as
+        # QtMultiPointController's _new_image_work_request.
+        self.touchConsoleStreamHandler.image_to_display.connect(
+            self.imageDisplayWindow_touch.display_image, Qt.QueuedConnection
+        )
+        self.autofocusController.image_to_display.connect(
+            self.imageDisplayWindow_touch.display_image, Qt.QueuedConnection
+        )
+        self.multipointController.image_to_display.connect(
+            self.imageDisplayWindow_touch.display_image, Qt.QueuedConnection
+        )
+        self.imageDisplayWindow_touch.image_click_coordinates.connect(self.move_from_click_image)
+
+        # Lock the panel's hardware controls out while an acquisition owns the scope.
+        self.multipointController.signal_acquisition_start.connect(
+            lambda *_: self.touchConsole.set_acquisition_running(True)
+        )
+        self.multipointController.acquisition_finished.connect(
+            lambda *_: self.touchConsole.set_acquisition_running(False)
+        )
+        self.multipointController.signal_acquisition_progress.connect(
+            self.touchConsole.on_acquisition_progress
+        )
+
+        self.touchConsole.show_on_screen(self.touch_console_screen)
+
+    def changeEvent(self, event):
+        """Pause the main window's full-resolution display while it is minimized.
+
+        With the console open the process would otherwise push every displayed
+        frame through two pyqtgraph ImageItems. When the operator is at the
+        bench the main window is not being looked at, so its display is the one
+        that can be dropped.
+        """
+        if event.type() == QEvent.WindowStateChange and self.touchConsole is not None:
+            if self.isMinimized():
+                self.streamHandler.disable_display()
+                self.log.debug("Main window minimized; pausing its live display")
+            else:
+                self.streamHandler.enable_display()
+        super().changeEvent(event)
 
     def makeNapariConnections(self):
         """Initialize all Napari connections in one place"""
@@ -3003,6 +3088,13 @@ class HighContentScreeningGui(QMainWindow):
         if reply == QMessageBox.No:
             event.ignore()
             return
+
+        # Close the bench console before teardown. It refuses close events by
+        # default so a stray touch cannot dismiss it, and it must never reach
+        # Microscope.close() itself.
+        if self.touchConsole is not None:
+            self.touchConsole.prepare_for_shutdown()
+            self.touchConsole.close()
 
         self._cleanup_common(for_restart=False)
 

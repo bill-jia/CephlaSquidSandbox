@@ -122,10 +122,26 @@ gui: "GUI Layer (PyQt5)" {
     stats: "StatsDisplayWidget"
   }
 
+  touch_console: "TouchConsoleWindow\n(QMainWindow, 2nd screen)" {
+    class: gui
+    tooltip: |md
+      Bench touch panel for eyepiece-less scopes (--touch-console).
+      Second window in the SAME process — hardware is single-owner.
+      Owns its own QtStreamHandler (15 fps, resized to 1024 px)
+      and its own ImageDisplayWindow.
+      Delegates every state-bearing action to the main window's
+      widgets, so the two UIs cannot diverge.
+      See docs/touch-console.md.
+    |
+  }
+
   main_window -> live_widgets
   main_window -> hardware_widgets
   main_window -> acquisition_widgets
   main_window -> viewers
+  main_window -> touch_console: "owns (optional)"
+  touch_console -> live_widgets: "drives"
+  touch_console -> hardware_widgets: "drives"
 }
 
 # ============================================================================
@@ -216,6 +232,13 @@ controllers: "Core Controllers" {
       Frame routing hub.
       Camera → on_new_frame() → display callback + save callback.
       Rate-limits display and save independently.
+
+      Two independent instances exist when the bench touch console
+      is enabled; camera.add_frame_callback() fans out to both.
+
+      display_resolution_scaling is a CENTER CROP (reduces field of
+      view). display_max_dim is a true resize (reduces pixel count)
+      via downsampled_views.downsample_to_max_dim.
     |
   }
 

@@ -153,6 +153,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulation", help="Run the GUI with simulated hardware.", action="store_true")
     parser.add_argument("--live-only", help="Run the GUI only the live viewer.", action="store_true")
+    parser.add_argument(
+        "--touch-console",
+        nargs="?",
+        type=int,
+        const=-1,
+        default=None,
+        metavar="SCREEN",
+        help="Show the bench touch console on the given screen index (default: the configured "
+             "TOUCH_CONSOLE_SCREEN). Falls back to a normal window if that screen is absent.",
+    )
     parser.add_argument("--verbose", help="Turn on verbose logging (DEBUG level)", action="store_true")
     parser.add_argument(
         "--start-server", help="Auto-start the MCP control server for programmatic control", action="store_true"
@@ -249,10 +259,17 @@ if __name__ == "__main__":
     )
 
     _splash_message(splash, "Starting interface…")
+    # --touch-console with no value means "use the configured screen index".
+    touch_console_screen = None
+    if args.touch_console is not None:
+        touch_console_screen = None if args.touch_console < 0 else args.touch_console
+
     win = gui.HighContentScreeningGui(
         microscope=microscope,
         is_simulation=args.simulation,
         live_only_mode=args.live_only,
+        touch_console=args.touch_console is not None,
+        touch_console_screen=touch_console_screen,
         skip_init=args.skip_init,
         skip_homing=args.skip_homing,
     )

@@ -61,7 +61,7 @@ class QtStreamHandler(QObject):
     packet_image_to_write = Signal(np.ndarray, int, float)
     signal_new_frame_received = Signal()
 
-    def __init__(self, display_resolution_scaling=1, accept_new_frame_fn: Callable[[], bool] = lambda: True, camera: Optional[AbstractCamera] = None):
+    def __init__(self, display_resolution_scaling=1, accept_new_frame_fn: Callable[[], bool] = lambda: True, camera: Optional[AbstractCamera] = None, display_max_dim: Optional[int] = None):
         super().__init__()
 
         functions = StreamHandlerFunctions(
@@ -71,7 +71,10 @@ class QtStreamHandler(QObject):
             accept_new_frame=accept_new_frame_fn,
         )
         self._handler = StreamHandler(
-            handler_functions=functions, display_resolution_scaling=display_resolution_scaling, camera=camera
+            handler_functions=functions,
+            display_resolution_scaling=display_resolution_scaling,
+            camera=camera,
+            display_max_dim=display_max_dim,
         )
 
     def get_frame_callback(self) -> Callable[[CameraFrame], None]:
@@ -91,6 +94,15 @@ class QtStreamHandler(QObject):
 
     def set_display_resolution_scaling(self, display_resolution_scaling):
         self._handler.set_display_resolution_scaling(display_resolution_scaling)
+
+    def set_display_max_dim(self, display_max_dim):
+        self._handler.set_display_max_dim(display_max_dim)
+
+    def enable_display(self):
+        self._handler.enable_display()
+
+    def disable_display(self):
+        self._handler.disable_display()
 
 
 class ImageSaver(QObject):

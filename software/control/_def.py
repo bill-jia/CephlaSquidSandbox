@@ -888,6 +888,24 @@ USE_NAPARI_WELL_SELECTION = False
 USE_NAPARI_FOR_LIVE_CONTROL = False
 LIVE_ONLY_MODE = False
 
+# Bench touch console: a second, finger-driven window shown fullscreen on a
+# touchscreen next to the microscope, for scopes with no eyepiece and no room
+# for a keyboard/mouse. It runs in the same process as the main GUI (hardware
+# is single-owner) and drives the existing control widgets. See
+# docs/touch-console.md.
+TOUCH_CONSOLE_ENABLED = False
+# Index into QGuiApplication.screens(). If the index does not exist, the
+# console falls back to a normal window on the primary screen.
+TOUCH_CONSOLE_SCREEN = 1
+# Display rate and decimation for the console's own stream handler. These are
+# independent of the main window's so the panel stays responsive without
+# forcing the main display to degrade.
+TOUCH_CONSOLE_FPS = 15
+TOUCH_CONSOLE_MAX_DIM = 1024
+# TOUCH_CONSOLE_SNAP_DIR and TOUCH_CONSOLE_PRESET_DIR are derived from
+# DEFAULT_SAVING_PATH near the bottom of this file, after that path has been
+# normalized against the user's home directory.
+
 # NDViewer integration
 ENABLE_NDVIEWER = False
 MOSAIC_VIEW_TARGET_PIXEL_SIZE_UM = 2
@@ -1313,6 +1331,10 @@ DEFAULT_TRIGGER_MODE = TriggerMode.convert_to_var(DEFAULT_TRIGGER_MODE)
 # saving path
 if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))):
     DEFAULT_SAVING_PATH = str(Path.home() / DEFAULT_SAVING_PATH.strip("/").strip("\\"))
+
+# Touch console paths, derived once DEFAULT_SAVING_PATH is final.
+TOUCH_CONSOLE_SNAP_DIR = os.path.join(DEFAULT_SAVING_PATH, "bench_snaps")
+TOUCH_CONSOLE_PRESET_DIR = os.path.join(DEFAULT_SAVING_PATH, "bench_presets")
 
 #
 # NOTE: Legacy INI-based overrides for Views / GENERAL / SIMULATION sections

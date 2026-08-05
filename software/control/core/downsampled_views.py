@@ -108,6 +108,42 @@ def _pyrdown_chain(tile: np.ndarray, target_width: int, target_height: int) -> n
     return result
 
 
+def downsample_to_max_dim(tile: np.ndarray, max_dim: int) -> np.ndarray:
+    """Shrink a tile so its largest spatial dimension is at most ``max_dim``.
+
+    Aspect ratio is preserved and the dtype is retained. Returns the input
+    unchanged when it already fits, so callers can apply this unconditionally.
+
+    Unlike :func:`downsample_tile` this is sized by pixel count rather than by
+    physical pixel size, which is what a fixed-size display panel needs. It also
+    does no per-call logging, since it runs on every displayed frame.
+
+    Args:
+        tile: Image tile (2D, or 3D for RGB)
+        max_dim: Maximum allowed width or height in pixels
+
+    Returns:
+        Downsampled tile, or the original if it already fits
+    """
+    if max_dim is None or max_dim < 1:
+        return tile
+
+    height, width = tile.shape[0], tile.shape[1]
+    largest = max(height, width)
+    if largest <= max_dim:
+        return tile
+
+    scale = max_dim / largest
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+
+    downsampled = _pyrdown_chain(tile, new_width, new_height)
+    if downsampled.dtype != tile.dtype:
+        downsampled = downsampled.astype(tile.dtype)
+
+    return downsampled
+
+
 def downsample_tile(
     tile: np.ndarray,
     source_pixel_size_um: float,
