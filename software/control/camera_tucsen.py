@@ -804,25 +804,15 @@ class TucsenCamera(AbstractCamera):
         # triggered frames only come out through the DataCallBack.
         use_sdk_callback = self._uses_sdk_buffer_callback(trigger_mode)
 
-        # SDK-callback cleanup is deferred from stop_streaming to here, so
+        # SDK-callback cleanup is deferred from stop_streaming, so
         # pause_streaming cycles that stay within callback mode (e.g., the
         # stop/start sandwich inside set_camera_mode during multipoint) avoid
-        # the full close+reopen. Only reopen when we're actually transitioning
-        # OUT of callback mode into a mode where the stale C callback pointer
-        # would fire on frames we didn't expect to come through that path.
-        if self._trigger_cb_obj is not None and not use_sdk_callback:
-            self._log.info(
-                "Tucsen: resetting SDK state before entering non-callback mode"
-            )
-            # Drain any in-flight decoded work before the reopen.
-            self._stop_decode_thread()
-            if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
-                self._log.warning(
-                    "TUCAM_Buf_Release failed during callback→non-callback transition"
-                )
-            self._m_frame = None
-            self._uninstall_trigger_buffer_callback()
-            self._reopen_camera_to_reset_sdk_state()
+        # the full close+reopen. Normally _set_acquisition_mode_imp already
+        # paid this when the mode left callback territory; this is the safety
+        # net for any path that reaches a non-callback Cap_Start with the
+        # stale C callback pointer still registered.
+        if not use_sdk_callback:
+            self._teardown_trigger_callback_mode()
 
         if self._m_frame is None:
             self._allocate_buffer()
@@ -1022,6 +1012,30 @@ class TucsenCamera(AbstractCamera):
         self._trigger_cb_obj = None
         self._trigger_cb_fn = None
         self._trigger_cb_user = None
+
+    def _teardown_trigger_callback_mode(self) -> None:
+        """Leave SDK-callback (triggered) frame delivery: drain the decoder,
+        release the SDK buffer, drop the callback refs, and close+reopen the
+        device to invalidate the SDK's stored C callback pointer (there is no
+        unregister API). No-op when no trigger callback is installed.
+
+        Costs several seconds (device close + Api_Uninit + reopen), so callers
+        should invoke it while nothing user-facing is waiting on the camera —
+        _set_acquisition_mode_imp pays it at acquisition teardown precisely so
+        the next "Start Live" doesn't stall with the sample already illuminated.
+        """
+        if self._trigger_cb_obj is None:
+            return
+        self._log.info("Tucsen: resetting SDK state before entering non-callback mode")
+        # Drain any in-flight decoded work before the reopen.
+        self._stop_decode_thread()
+        if TUCAM_Buf_Release(self._camera) != TUCAMRET.TUCAMRET_SUCCESS:
+            self._log.warning(
+                "TUCAM_Buf_Release failed during callback→non-callback transition"
+            )
+        self._m_frame = None
+        self._uninstall_trigger_buffer_callback()
+        self._reopen_camera_to_reset_sdk_state()
 
     def _reopen_camera_to_reset_sdk_state(self) -> None:
         """Vendor SDK workaround: close and reopen the camera to reset internal
@@ -1369,14 +1383,21 @@ class TucsenCamera(AbstractCamera):
 
         # The SDK has no unregister for TUCAM_Buf_DataCallBack; close+reopen is
         # the only way to clear the stale C pointer and reset SDK internals.
-        # _reopen_camera_to_reset_sdk_state now preserves acquisition mode, but
-        # fast acq explicitly runs in HARDWARE_TRIGGER and expects to hand back
-        # CONTINUOUS for live view. Go through set_acquisition_mode so the
-        # hardware trigger-mode register and the Python cache are written
-        # together — direct _acquisition_mode assignment would desync the two.
-        self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
+        # One reopen also invalidates any leftover live trigger callback, so
+        # drop those refs here too — otherwise a later transition out of
+        # callback mode would schedule a second, redundant reopen. The reopen
+        # must precede set_acquisition_mode(CONTINUOUS): with the callback refs
+        # still set, that call would itself tear down callback mode and reopen,
+        # doubling the multi-second reset.
+        self._stop_decode_thread()
+        self._uninstall_trigger_buffer_callback()
         self._region_of_interest = self._roi_before_fast_acq
         self._reopen_camera_to_reset_sdk_state()
+        # Fast acq explicitly runs in HARDWARE_TRIGGER and hands back CONTINUOUS
+        # for live view. Go through set_acquisition_mode so the hardware
+        # trigger-mode register and the Python cache are written together —
+        # direct _acquisition_mode assignment would desync the two.
+        self.set_acquisition_mode(CameraAcquisitionMode.CONTINUOUS)
         self._roi_before_fast_acq = None
 
         self._log.info(f"Fast acquisition frame grabbing stopped, {self.frames_polled} frames polled")
@@ -2384,6 +2405,20 @@ class TucsenCamera(AbstractCamera):
             self._acquisition_mode = acquisition_mode
             self._update_internal_settings()
             self.set_exposure_time(self._exposure_time_ms)
+
+        # Leaving SDK-callback (triggered) delivery requires the close/reopen
+        # SDK reset. Pay it NOW, while the camera is idle — typically during
+        # acquisition teardown when the pre-run trigger mode is restored —
+        # instead of lazily inside the next start_streaming, where it made
+        # "Start Live" sit ~6 s with the sample illuminated and no frames.
+        # When streaming, the pause_streaming exit above already routed
+        # through start_streaming, which performs the same reset.
+        if not self._is_streaming.is_set():
+            trigger_mode = (
+                self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+            )
+            if not self._uses_sdk_buffer_callback(trigger_mode):
+                self._teardown_trigger_callback_mode()
 
     def get_acquisition_mode(self, force_update=False) -> CameraAcquisitionMode:
         # When we're virtualizing software trigger on top of the hardware trigger

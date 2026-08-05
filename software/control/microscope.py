@@ -1214,7 +1214,6 @@ class Microscope:
 
     def start_live(self) -> None:
         """Start live view streaming from the camera."""
-        self.camera.start_streaming()
         self.live_controller.start_live()
 
     def stop_live(self) -> None:

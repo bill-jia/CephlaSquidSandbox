@@ -77,8 +77,15 @@ class LiveController:
 
     def start_live(self):
         self.is_live = True
-        # Open the streaming gate and turn on illumination BEFORE camera
-        # so the first frame is correctly illuminated.
+        # Start the camera BEFORE opening the streaming gate / illumination:
+        # start_streaming can stall for seconds (e.g. the Tucsen SDK reset when
+        # leaving a triggered acquisition), and the sample must not sit
+        # illuminated while no frames can be served. In triggered modes the
+        # first exposure only happens once the trigger timer fires, well after
+        # the illumination below is asserted; in CONTINUOUS the first frame or
+        # two may be dark, which the free-running stream immediately replaces.
+        self.camera.start_streaming()
+
         if self.control_illumination and self.obs_controller:
             config = self.obs_controller.current_observation_state
             waveform_driven = bool(config is not None and getattr(config, "is_waveform_driven", False))
@@ -100,8 +107,6 @@ class LiveController:
                 self.obs_controller.turn_on_illumination()
             ic = self.microscope.illumination_controller
             ic.set_streaming_active(True)
-
-        self.camera.start_streaming()
 
         if self.trigger_mode == TriggerMode.SOFTWARE or (
             self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
