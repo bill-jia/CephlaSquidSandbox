@@ -2412,8 +2412,11 @@ class TucsenCamera(AbstractCamera):
         # instead of lazily inside the next start_streaming, where it made
         # "Start Live" sit ~6 s with the sample illuminated and no frames.
         # When streaming, the pause_streaming exit above already routed
-        # through start_streaming, which performs the same reset.
-        if not self._is_streaming.is_set():
+        # through start_streaming, which performs the same reset. During fast
+        # acquisition _is_streaming is False but the SDK capture IS active —
+        # never close the device out from under it; the fast-acq stop path
+        # does its own reopen.
+        if not self._is_streaming.is_set() and not self._fast_acquisition_capture_active:
             trigger_mode = (
                 self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
             )
