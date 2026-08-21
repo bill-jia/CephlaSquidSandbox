@@ -40,6 +40,13 @@ state name). For ZARR_V3 this is `{label}_{output}.ome.zarr` with `T = Nt`,
 FOV visit per scan timepoint**, regardless of how many input frames were pooled.
 The raw input frames of a postprocessed item are never written.
 
+When two selected cycles each carry an unlabelled group over the same input
+states (e.g. the same DPC group copied into two cycles), both would derive the
+same label. The second one is disambiguated to `{state}_{group_id}` (e.g.
+`DPC_circ_bot_pp1`) so each group keeps its own plate. Explicit labels are never
+rewritten: two groups sharing an explicit label is a configuration error and is
+reported by `validate_acquisition_settings` before the run starts.
+
 `cycles_manifest.yaml` records each group's routine spec, member input states, and
 declared outputs; `acquisition_times.csv` gets a `postprocess/{group}` row per raw
 input frame (ground-truth timing) plus rows for each written output.

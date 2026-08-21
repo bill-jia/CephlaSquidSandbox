@@ -616,17 +616,30 @@ def _build_postprocess_groups(events: List[ResolvedEvent]) -> Dict[str, Postproc
         specs.setdefault(gid, ev.postprocess)
         per_group_states.setdefault(gid, {}).setdefault(ev.observation_state, []).append(ev.acquire_z_stack)
     groups: Dict[str, PostprocessGroupPlan] = {}
+    used_labels: Dict[str, str] = {}  # label -> gid that claimed it
     for gid, states in per_group_states.items():
         spec = specs[gid]
         input_states = {
             name: InputStateSpec(state=name, acquire_z_stack=z_modes[0], frames_per_visit=len(z_modes))
             for name, z_modes in states.items()
         }
+        # An unlabelled group falls back to its first input state. Two cycles in one
+        # chain running the same routine over the same states (e.g. the same DPC group
+        # copied into two cycles) would then derive the same label and fight over one
+        # output plate, so suffix the group id to keep the derived plates distinct.
+        # An *explicit* label is left alone: a genuine collision there is the user's to
+        # resolve, and _attach_postprocess_outputs reports it.
+        label = spec.label
+        if not label:
+            label = next(iter(input_states))
+            if label in used_labels:
+                label = f"{label}_{gid}"
+        used_labels.setdefault(label, gid)
         groups[gid] = PostprocessGroupPlan(
             group_key=gid,
             spec=spec,
             input_states=input_states,
-            label=spec.label or next(iter(input_states)),
+            label=label,
         )
     return groups
 

@@ -585,6 +585,10 @@ class MultiPointController:
         # state) is used unchanged — so the old path stays an instant rollback.
         self.selected_cycle_names = []
         self.region_cycle_map = None
+        # Last cycle-resolution failure (postprocess collision, unknown routine, ...),
+        # or None. Set by set_selected_cycles so the GUI can surface it instead of
+        # letting a selection change raise.
+        self.plan_error = None
         self._frames_per_position = 1
         self.scanCoordinates = scan_coordinates
         self._log.debug(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}, format: {self.scanCoordinates.format}")
@@ -911,6 +915,7 @@ class MultiPointController:
         self.selected_configurations = []
         self.selected_observation_state_names = []
         self.selected_cycle_names = []
+        self.plan_error = None  # cycle-only failure; the flat path can't hit it
         for name in selected_configurations_name:
             if name in preset_set:
                 self.selected_observation_state_names.append(name)
@@ -936,7 +941,20 @@ class MultiPointController:
                 self._log.warning("Cycle '%s' not found, skipping", name)
         from control.models.acquisition_cycle import all_states_in_order
 
-        plan = self._resolve_plan(self.selected_cycle_names, None)
+        try:
+            plan = self._resolve_plan(self.selected_cycle_names, None)
+        except ValueError as e:
+            # A misconfigured chain (unknown routine, colliding postprocess output
+            # plates) must not escape here: this runs on every GUI selection change,
+            # where an exception would tear down the app mid-session. Record the
+            # problem, leave the derived counts empty, and let
+            # validate_acquisition_settings block the run with the same message.
+            self._log.error("Cannot resolve selected cycles: %s", e)
+            self.plan_error = str(e)
+            self.selected_observation_state_names = []
+            self._frames_per_position = 0
+            return
+        self.plan_error = None
         # Metadata/disk/image-count helpers read this; keep stimulus states in the
         # record. The zarr C axis (imaged-only) is taken from the plan separately.
         self.selected_observation_state_names = all_states_in_order(plan.events)

@@ -1783,6 +1783,12 @@ def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hi
     return f"{count_str} · {approx}{_human_bytes(disk_bytes)}"
 
 
+_SIZE_ESTIMATE_TOOLTIP = (
+    "Estimated image count and on-disk size for the current settings.\n"
+    "ZARR_V3 sizes are approximate (compression is data-dependent)."
+)
+
+
 def _refresh_size_estimate(widget) -> None:
     """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
 
@@ -1795,6 +1801,15 @@ def _refresh_size_estimate(widget) -> None:
     if label is None:
         return
     widget._push_channel_selection_to_controller()
+    plan_error = getattr(widget.multipointController, "plan_error", None)
+    if plan_error:
+        # The selection is unrunnable (e.g. two postprocess groups fighting over one
+        # output plate). Say so here rather than showing a bogus "0 images" estimate;
+        # the full message is in the log and blocks Start Acquisition.
+        label.setText("Cycle configuration error — see log")
+        label.setToolTip(str(plan_error))
+        return
+    label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     has_selection = bool(_get_checked_names(widget.list_configurations))
     skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
     hint = (
@@ -1838,10 +1853,7 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
     estimate_label = QLabel("")
-    estimate_label.setToolTip(
-        "Estimated image count and on-disk size for the current settings.\n"
-        "ZARR_V3 sizes are approximate (compression is data-dependent)."
-    )
+    estimate_label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     estimate_label.setStyleSheet("color: gray;")
 
     row = QHBoxLayout()
