@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from control.core.laser_auto_focus_controller import LaserAutofocusController
+from control.core.laser_auto_focus_controller import LASER_AF_TRIGGER_ATTEMPTS, LaserAutofocusController
 
 IMAGE_H, IMAGE_W = 256, 1536
 SPOT_X0 = 768.0
@@ -33,7 +33,12 @@ class FakeFocusCamera:
     """Minimal focus-camera stand-in with software-trigger semantics and a
     'latest frame' cache: reads without a new trigger return the same stale
     frame (mirroring DefaultCamera's fast path), so the controller's frame-id
-    freshness check is exercised."""
+    freshness check is exercised.
+
+    ``drop_next_triggers`` lets a test simulate the Daheng camera dropping a
+    software trigger: that many subsequent ``send_trigger`` calls are
+    acknowledged (bumping ``trigger_count``) but never produce a new frame.
+    """
 
     def __init__(self, render_fn):
         self._render = render_fn
@@ -42,13 +47,17 @@ class FakeFocusCamera:
         self._latest = None
         self._callbacks_enabled = True
         self.trigger_count = 0
+        self.drop_next_triggers = 0
 
     def get_frame_id(self):
         return self._frame_id
 
     def send_trigger(self, exposure_time=None):
-        self._pending_trigger = True
         self.trigger_count += 1
+        if self.drop_next_triggers > 0:
+            self.drop_next_triggers -= 1
+            return
+        self._pending_trigger = True
 
     def read_camera_frame(self):
         if self._pending_trigger:
@@ -68,6 +77,9 @@ class FakeFocusCamera:
 
     def get_exposure_time(self):
         return 0.2
+
+    def get_strobe_time(self):
+        return 0.1
 
 
 def render_spot(stage, true_um_per_px, x0=SPOT_X0, amplitude=220.0):
@@ -139,6 +151,35 @@ def test_centroid_uses_distinct_frames_and_restores_callbacks():
     assert camera.get_frame_id() == controller.laser_af_properties.laser_af_averaging_n
     # Callback state must be restored (used to be left disabled forever).
     assert camera.get_callbacks_enabled() is True
+
+
+def test_get_new_frame_retriggers_on_dropped_trigger():
+    # The camera acks the first trigger but never produces a frame for it
+    # (the ~0.3% dropped-software-trigger case) — get_new_frame must re-send
+    # the trigger rather than burning the full timeout.
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    camera.drop_next_triggers = 1
+    controller = make_controller(camera, stage)
+
+    frame = controller.get_new_frame()
+
+    assert frame is not None
+    assert camera.trigger_count == 2
+
+
+def test_get_new_frame_gives_up_after_max_attempts():
+    # Every trigger is dropped: get_new_frame must give up after exactly
+    # LASER_AF_TRIGGER_ATTEMPTS tries instead of hanging or retrying forever.
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    camera.drop_next_triggers = LASER_AF_TRIGGER_ATTEMPTS
+    controller = make_controller(camera, stage)
+
+    frame = controller.get_new_frame()
+
+    assert frame is None
+    assert camera.trigger_count == LASER_AF_TRIGGER_ATTEMPTS
 
 
 def test_move_to_target_converges_with_accurate_scale():

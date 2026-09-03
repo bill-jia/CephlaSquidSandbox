@@ -20,9 +20,15 @@ from control.models import LaserAFConfig, LaserAFReference
 from squid.abc import AbstractCamera, AbstractStage
 import squid.logging
 
-# Waiting longer than this for a frame newer than the last-seen frame id means
-# the focus camera is not delivering (not streaming / trigger lost).
+# Waiting longer than this in total for a frame newer than the last-seen frame
+# id means the focus camera is not delivering (not streaming / hard fault).
+# This is an overall cap across all of get_new_frame's re-trigger attempts.
 FRESH_FRAME_TIMEOUT_S = 1.0
+# The Daheng focus camera occasionally drops a software trigger (~0.3% of
+# triggers in wellplate runs) and never produces a frame for it. get_new_frame
+# re-sends the trigger rather than waiting out the full FRESH_FRAME_TIMEOUT_S,
+# up to this many total attempts.
+LASER_AF_TRIGGER_ATTEMPTS = 3
 # Closed-loop correction bound for move_to_target. With an accurate
 # pixel_to_um one iteration converges; a moderate scale error (< 2x) converges
 # geometrically; a diverging correction aborts long before this bound.
@@ -769,31 +775,49 @@ class LaserAutofocusController(QObject):
         ``read_frame``/``read_camera_frame`` may serve a cached frame captured
         *before* the trigger (or before a preceding z move) if one arrived
         recently — DefaultCamera keeps a stale-frame fast path whose window
-        includes a full-sensor strobe estimate (~22 ms). Frame ids are compared
-        so a stale frame is never accepted; without this, "averaging" reads the
-        same frame repeatedly and post-move measurements can see pre-move data.
+        includes a strobe estimate. Frame ids are compared so a stale frame is
+        never accepted; without this, "averaging" reads the same frame
+        repeatedly and post-move measurements can see pre-move data.
+
+        The focus camera occasionally drops a software trigger and never
+        produces a frame for it. Rather than wait out the full
+        FRESH_FRAME_TIMEOUT_S for a frame that will never arrive, each attempt
+        only waits a window sized from the camera's own frame time before
+        re-sending the trigger, up to LASER_AF_TRIGGER_ATTEMPTS total.
 
         IMPORTANT: This assumes that the autofocus laser is already on!
         Returns None on timeout.
         """
         with self._time("af:get_new_frame"):
             last_frame_id = self.camera.get_frame_id()
-            with self._time("af:send_trigger"):
-                self.camera.send_trigger(self.camera.get_exposure_time())
-            with self._time("af:read_frame"):
-                deadline = time.time() + FRESH_FRAME_TIMEOUT_S
-                while time.time() < deadline:
-                    camera_frame = self.camera.read_camera_frame()
-                    if camera_frame is not None and camera_frame.frame_id != last_frame_id:
-                        return camera_frame.frame
-                    if camera_frame is None and not self.camera.get_is_streaming():
-                        self._log.error("Focus camera is not streaming; cannot acquire a laser AF frame")
-                        return None
-                    time.sleep(0.001)
-                self._log.warning(
-                    f"Timed out ({FRESH_FRAME_TIMEOUT_S:.1f} s) waiting for a fresh focus-camera frame"
-                )
-                return None
+            per_attempt_s = max(
+                3 * (self.camera.get_exposure_time() + self.camera.get_strobe_time()) / 1000.0, 0.05
+            )
+            start_time = time.time()
+            overall_deadline = start_time + FRESH_FRAME_TIMEOUT_S
+            for attempt in range(1, LASER_AF_TRIGGER_ATTEMPTS + 1):
+                with self._time("af:send_trigger"):
+                    self.camera.send_trigger(self.camera.get_exposure_time())
+                with self._time("af:read_frame"):
+                    attempt_deadline = min(time.time() + per_attempt_s, overall_deadline)
+                    while time.time() < attempt_deadline:
+                        camera_frame = self.camera.read_camera_frame()
+                        if camera_frame is not None and camera_frame.frame_id != last_frame_id:
+                            if attempt > 1:
+                                self._log.warning(
+                                    f"Focus camera dropped a trigger; frame arrived on attempt "
+                                    f"{attempt}/{LASER_AF_TRIGGER_ATTEMPTS}"
+                                )
+                            return camera_frame.frame
+                        if camera_frame is None and not self.camera.get_is_streaming():
+                            self._log.error("Focus camera is not streaming; cannot acquire a laser AF frame")
+                            return None
+                        time.sleep(0.001)
+            self._log.warning(
+                f"Focus camera dropped {LASER_AF_TRIGGER_ATTEMPTS} consecutive triggers; gave up after "
+                f"{time.time() - start_time:.2f} s waiting for a fresh frame"
+            )
+            return None
 
     def _spot_search_range(self) -> Optional[Tuple[float, float]]:
         """Column window the spot must lie in to be usable, or None for full-width.
