@@ -1023,3 +1023,93 @@ class NDViewerTab(QWidget):
         self._dataset_path = None
 
 
+
+
+class SegmentedSwitch(QWidget):
+    """Two-position switch that shows where the hardware *is*, not what a click does.
+
+    A pair of mutually exclusive checkable buttons; the lit segment is the current
+    state and the dim one is where a click sends it.  Clicking the dim segment emits
+    ``state_requested`` and leaves the display alone: the owner is expected to move
+    the hardware and then call :meth:`set_state`, so the switch never claims a
+    position the hardware has not reached.  Clicking the lit segment does nothing.
+
+    :meth:`set_state` is silent, so a panel can follow hardware that moved on its
+    own (an observation state, another panel) without re-commanding it.
+    """
+
+    # Emitted only for a user click on the inactive segment.  True = second label.
+    state_requested = Signal(bool)
+
+    _STYLE = """
+        QPushButton {
+            border: 1px solid #9a9a9a;
+            padding: 3px 6px;
+            background-color: #eaeaea;
+            color: #5a5a5a;
+        }
+        QPushButton:hover:!checked { background-color: #dcdcdc; }
+        QPushButton:checked {
+            background-color: #3574b5;
+            border-color: #25578a;
+            color: white;
+            font-weight: bold;
+        }
+        QPushButton:disabled { color: #9a9a9a; }
+        QPushButton:checked:disabled { background-color: #8fadcc; border-color: #7e97b0; }
+        QPushButton#segLeft  { border-top-left-radius: 3px;  border-bottom-left-radius: 3px; }
+        QPushButton#segRight { border-top-right-radius: 3px; border-bottom-right-radius: 3px; margin-left: -1px; }
+    """
+
+    def __init__(self, off_label: str, on_label: str, parent=None):
+        super().__init__(parent)
+        self._state = False
+
+        self.btn_off = QPushButton(off_label)
+        self.btn_off.setObjectName("segLeft")
+        self.btn_on = QPushButton(on_label)
+        self.btn_on.setObjectName("segRight")
+
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        for index, button in enumerate((self.btn_off, self.btn_on)):
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            self._group.addButton(button, index)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.btn_off, 1)
+        layout.addWidget(self.btn_on, 1)
+
+        self.setStyleSheet(self._STYLE)
+        self.btn_off.setChecked(True)
+
+        self.btn_off.clicked.connect(lambda: self._on_segment_clicked(False))
+        self.btn_on.clicked.connect(lambda: self._on_segment_clicked(True))
+
+    def _on_segment_clicked(self, requested: bool) -> None:
+        if requested == self._state:
+            # Clicking the segment we are already on is a no-op, but the exclusive
+            # group has no "uncheck" to undo, so the display is already correct.
+            return
+        # Keep showing the real position until the caller confirms the move.
+        self._show(self._state)
+        self.state_requested.emit(requested)
+
+    def _show(self, state: bool) -> None:
+        for button, checked in ((self.btn_off, not state), (self.btn_on, state)):
+            blocked = button.blockSignals(True)
+            try:
+                button.setChecked(checked)
+            finally:
+                button.blockSignals(blocked)
+
+    def state(self) -> bool:
+        return self._state
+
+    def set_state(self, state: bool) -> None:
+        """Show ``state`` without emitting anything or touching hardware."""
+        self._state = bool(state)
+        self._show(self._state)

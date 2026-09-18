@@ -35,6 +35,7 @@ from tests.control.test_xlight_driver import FakeSerialDevice
 pytest.importorskip("qtpy")
 from qtpy.QtWidgets import QApplication
 
+from gui.widgets.common import SegmentedSwitch
 from gui.widgets.hardware_panels import SpinningDiskConfocalWidget
 
 
@@ -266,20 +267,22 @@ def test_emission_dropdown_follows_an_applied_state(panel):
     assert panel.dropdown_emission_filter.currentData() == 5
 
 
-def test_confocal_button_follows_an_applied_state(panel):
+def test_confocal_switch_follows_an_applied_state(panel):
     state = _state()
     state.confocal_mode = True
 
     panel.sync_from_observation_state(state)
 
     assert panel.disk_position_state == 1
-    assert panel.btn_toggle_widefield.text() == "Switch to Widefield"
+    assert panel.switch_confocal.state() is True
+    assert panel.switch_confocal.btn_on.isChecked() is True
 
     state.confocal_mode = False
     panel.sync_from_observation_state(state)
 
     assert panel.disk_position_state == 0
-    assert panel.btn_toggle_widefield.text() == "Switch to Confocal"
+    assert panel.switch_confocal.state() is False
+    assert panel.switch_confocal.btn_off.isChecked() is True
 
 
 def test_dichroic_and_slider_follow_an_applied_state(panel):
@@ -373,3 +376,56 @@ def test_an_unreadable_mechanism_is_probed_only_once(qt_app):
         assert xlight.iris_reads == 1
     finally:
         widget.deleteLater()
+
+
+# ── The widefield/confocal switch ─────────────────────────────────────────────
+
+
+def test_switch_only_asks_and_does_not_claim_the_move(qt_app):
+    """A click requests the move; the lit segment stays on the real position.
+
+    The disk takes a moment to move and the move can fail, so the switch must not
+    advertise a light path the unit is not in yet.  The panel lights the new
+    segment from ``_on_disk_position_toggled``, once the driver has answered.
+    """
+    switch = SegmentedSwitch("Widefield", "Confocal")
+    try:
+        spy = Spy(switch.state_requested)
+
+        switch.btn_on.click()
+
+        assert spy.calls == [(True,)]
+        assert switch.state() is False
+        assert switch.btn_off.isChecked() is True
+
+        switch.set_state(True)
+        assert switch.btn_on.isChecked() is True
+        # Setting the state is silent: it follows hardware, it does not command it.
+        assert spy.calls == [(True,)]
+    finally:
+        switch.deleteLater()
+
+
+def test_clicking_the_lit_segment_asks_for_nothing(qt_app):
+    switch = SegmentedSwitch("Widefield", "Confocal")
+    try:
+        spy = Spy(switch.state_requested)
+
+        switch.btn_off.click()
+
+        assert spy.calls == []
+        assert switch.btn_off.isChecked() is True
+    finally:
+        switch.deleteLater()
+
+
+def test_panel_lights_the_new_segment_once_the_disk_has_moved(panel):
+    panel._on_disk_position_toggled(1)
+
+    assert panel.disk_position_state == 1
+    assert panel.switch_confocal.state() is True
+    assert panel.switch_confocal.btn_on.isChecked() is True
+
+    panel._on_disk_position_toggled(0)
+
+    assert panel.switch_confocal.btn_off.isChecked() is True

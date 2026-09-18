@@ -1,4 +1,5 @@
 from ._bootstrap import *
+from .common import SegmentedSwitch
 from squid.config import CameraReadoutMode
 
 # Live-view cap for the laser AF camera. The focus exposure is sub-millisecond,
@@ -501,7 +502,7 @@ class SpinningDiskConfocalWidget(QWidget):
         if self.xlight.has_dichroic_filter_slider:
             self.filter_slider.valueChanged.connect(self.set_filter_slider)
 
-        self.btn_toggle_widefield.clicked.connect(self.toggle_disk_position)
+        self.switch_confocal.state_requested.connect(self.request_disk_position)
         self.btn_toggle_motor.clicked.connect(self.toggle_motor)
 
         if self.xlight.has_illumination_iris_diaphragm:
@@ -558,14 +559,17 @@ class SpinningDiskConfocalWidget(QWidget):
         layout.addWidget(header, row, 0, 1, 2)
         row += 1
 
-        # --- disk motor + widefield/confocal toggle, side by side --------------
-        self.btn_toggle_widefield = QPushButton("Switch to Confocal")
+        # --- disk motor + widefield/confocal switch, side by side --------------
+        # The switch reads out the light path the unit is actually in; the disk
+        # position is not otherwise visible from the GUI, and a button labelled
+        # with the *next* action left the current one to be inferred.
+        self.switch_confocal = SegmentedSwitch("Widefield", "Confocal")
         self.btn_toggle_motor = QPushButton("Disk Motor On")
         self.btn_toggle_motor.setCheckable(True)
         button_row = QHBoxLayout()
         button_row.setSpacing(4)
         button_row.addWidget(self.btn_toggle_motor, 1)
-        button_row.addWidget(self.btn_toggle_widefield, 1)
+        button_row.addWidget(self.switch_confocal, 1)
         layout.addLayout(button_row, row, 0, 1, 2)
         row += 1
 
@@ -632,7 +636,7 @@ class SpinningDiskConfocalWidget(QWidget):
             self.dropdown_emission_filter.setEnabled(enable)
         if self.dropdown_dichroic:
             self.dropdown_dichroic.setEnabled(enable)
-        self.btn_toggle_widefield.setEnabled(enable)
+        self.switch_confocal.setEnabled(enable)
         self.btn_toggle_motor.setEnabled(enable)
         self.slider_illumination_iris.setEnabled(enable)
         self.spinbox_illumination_iris.setEnabled(enable)
@@ -647,9 +651,10 @@ class SpinningDiskConfocalWidget(QWidget):
         self.slider_emission_iris.blockSignals(block)
         self.spinbox_emission_iris.blockSignals(block)
 
-    def toggle_disk_position(self):
+    def request_disk_position(self, confocal: bool):
+        """Move the disk to the segment the user clicked."""
         self.enable_all_buttons(False)
-        target_position = 0 if self.disk_position_state == 1 else 1
+        target_position = 1 if confocal else 0
 
         def on_finished(success, error_msg):
             QMetaObject.invokeMethod(
@@ -661,10 +666,7 @@ class SpinningDiskConfocalWidget(QWidget):
     @Slot(int)
     def _on_disk_position_toggled(self, position):
         self.disk_position_state = position
-        if position == 1:
-            self.btn_toggle_widefield.setText("Switch to Widefield")
-        else:
-            self.btn_toggle_widefield.setText("Switch to Confocal")
+        self.switch_confocal.set_state(position == 1)
         self.enable_all_buttons(True)
         self.signal_toggle_confocal_widefield.emit(self.disk_position_state)
 
@@ -711,14 +713,14 @@ class SpinningDiskConfocalWidget(QWidget):
             self.dropdown_emission_filter.blockSignals(blocked)
 
     def set_confocal_mode_display(self, confocal: bool) -> None:
-        """Refresh the widefield/confocal button to match an externally applied state.
+        """Refresh the widefield/confocal switch to match an externally applied state.
 
         Used when an observation state moves the disk: updates
-        ``disk_position_state`` and the button label without touching hardware
-        and without re-emitting ``signal_toggle_confocal_widefield``.
+        ``disk_position_state`` and the switch without touching hardware and
+        without re-emitting ``signal_toggle_confocal_widefield``.
         """
         self.disk_position_state = 1 if confocal else 0
-        self.btn_toggle_widefield.setText("Switch to Widefield" if confocal else "Switch to Confocal")
+        self.switch_confocal.set_state(confocal)
 
     def set_dichroic(self, index):
         """Emit the chosen dichroic wheel position.
