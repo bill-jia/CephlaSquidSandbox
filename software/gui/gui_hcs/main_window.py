@@ -517,15 +517,18 @@ class HighContentScreeningGui(QMainWindow):
 
     def load_widgets(self, is_simulation=False):
         # Initialize all GUI widgets
-        if ENABLE_SPINNING_DISK_CONFOCAL:
-            # TODO: For user compatibility, when ENABLE_SPINNING_DISK_CONFOCAL is True, we use XLight/Cicero on default.
-            # This needs to be changed when we figure out better machine configuration structure.
-            if USE_DRAGONFLY:
-                self.spinningDiskConfocalWidget = widgets.DragonflyConfocalWidget(self.dragonfly)
-            else:
-                self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(
-                    self.xlight, config_repo=self.microscope.config_repo
-                )
+        # Branch on the hardware that was actually built, not on a _def flag:
+        # `from control._def import *` above binds a COPY at import time, and the
+        # machine config is applied later (main_hcs imports the GUI before
+        # Microscope.build_from_global_config runs), so the flag reads stale False
+        # here and the panel would silently never be created. The addon is None
+        # unless its device entry is enabled, so presence is the same signal.
+        if self.dragonfly is not None:
+            self.spinningDiskConfocalWidget = widgets.DragonflyConfocalWidget(self.dragonfly)
+        elif self.xlight is not None:
+            self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(
+                self.xlight, config_repo=self.microscope.config_repo
+            )
         if ENABLE_NL5:
             import control.NL5Widget as NL5Widget
 
@@ -1087,7 +1090,7 @@ class HighContentScreeningGui(QMainWindow):
             stage_layout.addWidget(self.piezoWidget)
         # Spinning-disk confocal controls live with the stage controls; they are
         # laid out narrow-and-tall so they fit this 1/3-width column.
-        if ENABLE_SPINNING_DISK_CONFOCAL and self.spinningDiskConfocalWidget is not None:
+        if self.spinningDiskConfocalWidget is not None:
             stage_layout.addWidget(self.spinningDiskConfocalWidget)
         stage_layout.addStretch(1)
         self.stageControlsWidget.setLayout(stage_layout)
@@ -1422,7 +1425,7 @@ class HighContentScreeningGui(QMainWindow):
                     self.piezoWidget.update_displacement_um_display
                 )
 
-        if ENABLE_SPINNING_DISK_CONFOCAL:
+        if self.spinningDiskConfocalWidget is not None:
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
                 self.microscope.obs_controller.toggle_confocal_widefield
             )

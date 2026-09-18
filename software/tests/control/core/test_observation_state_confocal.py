@@ -17,7 +17,6 @@ from typing import Optional
 import pytest
 import yaml
 
-import control.core.observation_state_controller as osc_mod
 from control.core.config.repository import ConfigRepository
 from control.core.observation_state_controller import ObservationStateController
 from control.core.observation_state_service import (
@@ -222,10 +221,18 @@ def _state(name="live", confocal=False, emission=None) -> ObservationState:
 
 
 @pytest.fixture
-def confocal_enabled(monkeypatch):
-    """Pretend the build has a spinning-disk confocal (X-Light, not Dragonfly)."""
-    monkeypatch.setattr(osc_mod, "ENABLE_SPINNING_DISK_CONFOCAL", True, raising=False)
-    monkeypatch.setattr(osc_mod, "USE_DRAGONFLY", False, raising=False)
+def confocal_enabled():
+    """A build with a spinning-disk confocal is signalled by the addon existing.
+
+    This deliberately patches no ``_def`` flag. It used to set
+    ``ENABLE_SPINNING_DISK_CONFOCAL`` True on the controller module, which made
+    these tests pass while production was broken: the real value is a stale
+    ``False`` copied by ``from control._def import *`` before the machine config
+    is applied, so every confocal branch was skipped on a live rig. The code now
+    branches on ``addons.xlight`` / ``addons.dragonfly`` instead, and the fakes
+    supply those.
+    """
+    return None
 
 
 def _repo_with_profile(tmp_path: Path) -> ConfigRepository:

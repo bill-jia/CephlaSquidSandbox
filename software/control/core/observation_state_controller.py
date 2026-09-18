@@ -376,15 +376,18 @@ class ObservationStateController:
         confocal = bool(confocal)
         if confocal == self._confocal_mode:
             return
-        if ENABLE_SPINNING_DISK_CONFOCAL:
-            addons = getattr(self.microscope, "addons", None)
-            dragonfly = getattr(addons, "dragonfly", None)
-            xlight = getattr(addons, "xlight", None)
+        # Presence of the addon, not a _def flag: `from control._def import *`
+        # binds a copy at import time and the machine config is applied after
+        # these modules are imported, so the flag reads stale False here.
+        addons = getattr(self.microscope, "addons", None)
+        dragonfly = getattr(addons, "dragonfly", None)
+        xlight = getattr(addons, "xlight", None)
+        if dragonfly is not None or xlight is not None:
             try:
                 with self._time("obs:confocal:set_disk_position"):
-                    if USE_DRAGONFLY and dragonfly is not None:
+                    if dragonfly is not None:
                         dragonfly.set_modality("CONFOCAL" if confocal else "BF")
-                    elif xlight is not None:
+                    else:
                         # XLight: 1 for confocal, 0 for widefield
                         xlight.set_disk_position(1 if confocal else 0)
             except Exception as e:
@@ -509,7 +512,9 @@ class ObservationStateController:
             return
         emission_filter_position = self._current_state.emission_filter_positions.get("default")
 
-        if ENABLE_SPINNING_DISK_CONFOCAL and self.microscope.addons.xlight and not USE_DRAGONFLY:
+        # Branch on the built hardware; the _def flags are stale copies here
+        # (see toggle_confocal_widefield).
+        if self.microscope.addons.xlight is not None and self.microscope.addons.dragonfly is None:
             try:
                 if emission_filter_position is not None:
                     with self._time("obs:op:xlight_set_emission_filter"):
@@ -530,7 +535,7 @@ class ObservationStateController:
                             xlight.set_emission_iris(int(hw_settings.emission_iris))
                 except (OSError, ValueError) as e:
                     self._log.warning("Not setting iris values: %s", e)
-        elif ENABLE_SPINNING_DISK_CONFOCAL and USE_DRAGONFLY and self.microscope.addons.dragonfly:
+        elif self.microscope.addons.dragonfly is not None:
             try:
                 with self._time("obs:op:dragonfly_set_emission_filter"):
                     self.microscope.addons.dragonfly.set_emission_filter(
