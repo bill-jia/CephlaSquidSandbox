@@ -70,6 +70,8 @@ from control.models.io_endpoint_config import (
 from control.models.machine_config import (
     ConfocalDeviceSettings,
     ConfocalEmissionWheel,
+    LaserAFCalibrationSettings,
+    LaserAFDeviceSettings,
     DeviceIOLine,
     DeviceChannel,
     DeviceConnection,
@@ -96,6 +98,9 @@ __all__ = [
     # Confocal
     "ConfocalDeviceSettings",
     "ConfocalEmissionWheel",
+    # Laser autofocus (machine-level)
+    "LaserAFCalibrationSettings",
+    "LaserAFDeviceSettings",
     # Camera (legacy)
     "CameraHardwareInfo",
     "CameraPropertyBindings",

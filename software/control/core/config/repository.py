@@ -50,7 +50,7 @@ from control.models import (
     MachineConfig,
     build_default_machine_config,
 )
-from control.models.machine_config import ConfocalDeviceSettings
+from control.models.machine_config import ConfocalDeviceSettings, LaserAFDeviceSettings
 from control.models.hardware_bindings import (
     FilterWheelReference,
     HardwareBindingsConfig,
@@ -569,6 +569,13 @@ class ConfigRepository:
         Returns None when no confocal unit is enabled.
         """
         return self.get_machine_config().get_confocal_settings()
+
+    def get_laser_af_settings(self) -> LaserAFDeviceSettings:
+        """Machine-level laser AF settings (``devices.laser_af.config``).
+
+        Model defaults when the device or the key is absent.
+        """
+        return self.get_machine_config().get_laser_af_settings()
 
     def get_camera_mappings(self) -> Optional[CameraMappingsConfig]:
         """Load camera mappings configuration (cached)."""

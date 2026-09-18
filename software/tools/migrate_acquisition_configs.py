@@ -358,7 +358,6 @@
 #         "x_reference": data.get("x_reference"),
 #         "has_reference": data.get("has_reference", False),
 #         "calibration_timestamp": data.get("calibration_timestamp", ""),
-#         "pixel_to_um_calibration_distance": data.get("pixel_to_um_calibration_distance", 6.0),
 #         "laser_af_range": data.get("laser_af_range", 100.0),
 #         "laser_af_averaging_n": data.get("laser_af_averaging_n", 3),
 #         "spot_detection_mode": data.get("spot_detection_mode", "dual_right"),

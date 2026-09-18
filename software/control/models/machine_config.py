@@ -47,10 +47,13 @@ Lumencor SPECTRA, individual IO-routed lasers, LED matrices) under a single
 """
 
 import logging
+import math
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
+
+from control._def import SpotDetectionMode
 
 from control.models.io_endpoint_config import (
     IOControllerType,
@@ -269,6 +272,103 @@ class ConfocalDeviceSettings(BaseModel):
             "positions": dict(self.emission_filter_wheel.positions),
         }
         return FilterWheelDefinition.model_validate(apply_single_filter_wheel_defaults([raw])[0])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Laser autofocus settings (devices.laser_af.config)
+# ═════════════════════════════════════════════════════════════════════════════
+
+LASER_AF_DEVICE_NAME = "laser_af"
+
+
+class LaserAFCalibrationSettings(BaseModel):
+    """Policy for the pixel-to-um calibration sweep, from
+    ``devices.laser_af.config.calibration``.
+
+    The AF laser goes out through the objective, reflects off the sample
+    interface and comes back through it, so the spot's lateral travel per um of
+    defocus scales with the objective: halve the magnification and the spot
+    moves roughly half as far per um. A fixed sweep tuned at one objective is
+    therefore too short at a lower one — which is exactly how calibration failed
+    at 10x with a 6 um sweep tuned for 20x. ``effective_distance_um`` rescales
+    the sweep by ``reference_magnification / magnification`` so every objective
+    sees the same spot travel, and hence the same margin over ``min_total_px``.
+    """
+
+    distance_um: float = Field(
+        6.0,
+        gt=0,
+        description="Calibration sweep span (um) at reference_magnification; scaled for other objectives",
+    )
+    reference_magnification: float = Field(
+        20.0, gt=0, description="Objective magnification distance_um was tuned for"
+    )
+    max_distance_um: float = Field(
+        30.0,
+        gt=0,
+        description=(
+            "Upper clamp on the scaled sweep (um). Keeps a very low-magnification objective from "
+            "commanding an absurd z excursion that leaves the spot's linear region."
+        ),
+    )
+    positions: int = Field(5, ge=3, description="Number of z samples across the sweep")
+    min_total_px: float = Field(
+        5.0, gt=0, description="Minimum total spot travel (px) over the sweep for the fit to be accepted"
+    )
+    min_r2: float = Field(0.90, ge=0.0, le=1.0, description="Minimum R² of the linear x(z) fit")
+    simulation_px: float = Field(
+        0.5,
+        gt=0,
+        description=(
+            "Total spot travel (px) below which the image is assumed static (simulated camera); "
+            "the canned simulation scale is used instead of failing."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+    def effective_distance_um(self, magnification: Optional[float]) -> float:
+        """Sweep span to use for an objective of ``magnification``.
+
+        Falls back to the unscaled ``distance_um`` when the magnification is
+        unknown or not positive (no objective store, objective missing from
+        objectives.csv, malformed CSV row), and clamps the result to
+        ``max_distance_um``.
+        """
+        if magnification is None:
+            return self.distance_um
+        try:
+            magnification = float(magnification)
+        except (TypeError, ValueError):
+            return self.distance_um
+        if not math.isfinite(magnification) or magnification <= 0:
+            return self.distance_um
+        scaled = self.distance_um * self.reference_magnification / magnification
+        return min(scaled, self.max_distance_um)
+
+
+class LaserAFDeviceSettings(BaseModel):
+    """Typed view of ``devices.laser_af.config``.
+
+    Machine-level laser AF policy. Per-objective measurements (pixel_to_um, the
+    reference spot, the ROI) stay in the per-objective ``LaserAFConfig`` files;
+    everything here is a property of the instrument, not of one calibration.
+    """
+
+    spot_detection_mode: SpotDetectionMode = Field(
+        SpotDetectionMode.DUAL_RIGHT,
+        description="Default spot detection mode for objectives with no saved laser AF config",
+    )
+    calibration: LaserAFCalibrationSettings = Field(default_factory=LaserAFCalibrationSettings)
+
+    model_config = {"extra": "forbid"}
+
+    @classmethod
+    def from_device_entry(cls, entry: Optional["DeviceEntry"]) -> "LaserAFDeviceSettings":
+        """Build settings from the ``laser_af`` ``DeviceEntry`` (defaults when None)."""
+        if entry is None:
+            return cls()
+        return cls.model_validate(entry.config or {})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -597,6 +697,10 @@ class MachineConfig(BaseModel):
         if found is None:
             return None
         return ConfocalDeviceSettings.from_device_entry(found[1])
+
+    def get_laser_af_settings(self) -> LaserAFDeviceSettings:
+        """Typed ``devices.laser_af.config`` settings (model defaults when absent)."""
+        return LaserAFDeviceSettings.from_device_entry(self.devices.get(LASER_AF_DEVICE_NAME))
 
 
 def build_default_machine_config() -> MachineConfig:

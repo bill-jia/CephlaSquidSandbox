@@ -17,6 +17,7 @@ from control.core.objective_store import ObjectiveStore
 from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 from control.models import LaserAFConfig, LaserAFReference
+from control.models.machine_config import LaserAFCalibrationSettings, LaserAFDeviceSettings
 from squid.abc import AbstractCamera, AbstractStage
 import squid.logging
 
@@ -33,14 +34,13 @@ LASER_AF_TRIGGER_ATTEMPTS = 3
 # pixel_to_um one iteration converges; a moderate scale error (< 2x) converges
 # geometrically; a diverging correction aborts long before this bound.
 MOVE_TO_TARGET_MAX_ITERATIONS = 5
-# Calibration sweep: sample count over pixel_to_um_calibration_distance, and
-# acceptance gates on the linear fit.
-CALIBRATION_POSITIONS = 5
-CALIBRATION_MIN_R2 = 0.90
-CALIBRATION_MIN_TOTAL_PX = 5.0
-# Total spot motion below this over the whole sweep means a static (simulated)
-# camera image; fall back to the legacy canned scale instead of failing.
-CALIBRATION_SIMULATION_PX = 0.5
+# The calibration sweep (span, sample count, acceptance gates, and the
+# simulated-camera escape hatch) is machine policy, not a per-objective
+# measurement: it lives in devices.laser_af.config.calibration in the machine
+# config, read here as LaserAFCalibrationSettings.
+# Canned pixel_to_um used when the focus camera serves a static image
+# (simulation): no spot motion at all means there is nothing to fit.
+SIMULATION_PIXEL_TO_UM = 0.4
 # Failed-detection frames kept under <log dir>/laser_af_debug for post-mortem.
 DEBUG_IMAGE_KEEP = 20
 
@@ -74,7 +74,12 @@ class LaserAutofocusController(QObject):
 
         self.is_initialized = False
 
-        self.laser_af_properties = LaserAFConfig()
+        # Machine-level laser AF policy (devices.laser_af.config). Read once:
+        # the machine config does not change while the app runs.
+        self._machine_settings: LaserAFDeviceSettings = self._resolve_machine_settings()
+        # A fresh (uncalibrated) per-objective config inherits the machine's
+        # spot detection mode; a saved per-objective config overrides it on load.
+        self.laser_af_properties = LaserAFConfig(spot_detection_mode=self._machine_settings.spot_detection_mode)
         self.reference_crop = None
 
         self.spot_spacing_pixels = None  # spacing between the spots from the two interfaces (unit: pixel)
@@ -88,6 +93,59 @@ class LaserAutofocusController(QObject):
 
         # Load configurations if available
         self.load_cached_configuration()
+
+    def _resolve_machine_settings(self) -> LaserAFDeviceSettings:
+        """Read ``devices.laser_af.config``, falling back to model defaults.
+
+        Never raises: a controller built against a stub/absent ConfigRepository
+        (tests, headless tools) still gets a fully usable settings object.
+        """
+        try:
+            settings = self._config_repo.get_laser_af_settings()
+        except Exception:
+            self._log.debug("Could not read devices.laser_af.config; using laser AF defaults", exc_info=True)
+            return LaserAFDeviceSettings()
+        if not isinstance(settings, LaserAFDeviceSettings):
+            self._log.debug("devices.laser_af.config unavailable; using laser AF defaults")
+            return LaserAFDeviceSettings()
+        return settings
+
+    @property
+    def calibration_settings(self) -> LaserAFCalibrationSettings:
+        """Calibration sweep policy from ``devices.laser_af.config.calibration``."""
+        return self._machine_settings.calibration
+
+    def current_magnification(self) -> Optional[float]:
+        """Magnification of the current objective, or None if it can't be determined."""
+        if self.objectiveStore is None:
+            return None
+        try:
+            info = self.objectiveStore.get_current_objective_info()
+            magnification = info["magnification"]
+        except Exception:
+            self._log.debug("Could not read the current objective's magnification", exc_info=True)
+            return None
+        try:
+            return float(magnification)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _magnification_text(magnification: Optional[float]) -> str:
+        """Human-readable magnification for logs ('10x', or a plain note)."""
+        if magnification is None or not math.isfinite(magnification) or magnification <= 0:
+            return "magnification unknown"
+        return f"{magnification:g}x"
+
+    def calibration_sweep_um(self) -> float:
+        """Total z span the calibration sweep will cover for the current objective.
+
+        The spot's lateral travel per um of defocus scales with the objective,
+        so the sweep is scaled by ``reference_magnification / magnification``
+        (clamped at ``max_distance_um``) to give every objective the same
+        margin over the acceptance floor.
+        """
+        return self.calibration_settings.effective_distance_um(self.current_magnification())
 
     def _time(self, name: str):
         """Context manager that records elapsed time under ``name`` when a
@@ -269,17 +327,19 @@ class LaserAutofocusController(QObject):
     def _calibrate_pixel_to_um(self) -> bool:
         """Calibrate the µm-of-Z-per-pixel scale of the spot's motion.
 
-        Steps through CALIBRATION_POSITIONS z offsets spanning
-        ``pixel_to_um_calibration_distance``, measures the spot at each, and
-        least-squares fits x(z). The sweep descends once to the lowest offset
+        Steps through ``calibration.positions`` z offsets spanning
+        :meth:`calibration_sweep_um` — the configured sweep scaled by the
+        current objective's magnification, since a lower-magnification
+        objective moves the spot less per µm of defocus — measures the spot at
+        each, and least-squares fits x(z). The sweep descends once to the lowest offset
         (that downward move is backlash-compensated by the stage) and then only
         steps upward, so every sample is approached from the same direction —
         the old two-point (-d/2 then +d) scheme reversed direction mid-sweep,
         which let backlash/settling compress the measured span and inflate the
         scale several-fold. The fit is accepted only if the spot moved enough
-        to measure (CALIBRATION_MIN_TOTAL_PX) and the fit is actually linear
-        (CALIBRATION_MIN_R2), so a bad sweep fails loudly instead of writing a
-        garbage scale that later wrecks every move_to_target.
+        to measure (``calibration.min_total_px``) and the fit is actually linear
+        (``calibration.min_r2``), so a bad sweep fails loudly instead of writing
+        a garbage scale that later wrecks every move_to_target.
 
         Returns:
             bool: True if calibration successful, False otherwise
@@ -290,8 +350,21 @@ class LaserAutofocusController(QObject):
             self._log.exception("Failed to turn on AF laser before pixel to um calibration, cannot continue!")
             return False
 
-        span_um = self.laser_af_properties.pixel_to_um_calibration_distance
-        offsets_um = np.linspace(-span_um / 2, span_um / 2, CALIBRATION_POSITIONS)
+        calibration = self.calibration_settings
+        magnification = self.current_magnification()
+        objective_name = self.objectiveStore.current_objective if self.objectiveStore else None
+        span_um = calibration.effective_distance_um(magnification)
+        n_positions = calibration.positions
+        unclamped_um = calibration.distance_um * calibration.reference_magnification / magnification if (
+            magnification and math.isfinite(magnification) and magnification > 0
+        ) else calibration.distance_um
+        clamp_note = f", clamped from {unclamped_um:.1f} µm" if unclamped_um > span_um + 1e-9 else ""
+        self._log.info(
+            f"Laser AF calibration sweep: {span_um:.1f} µm over {n_positions} positions on "
+            f"{objective_name or 'unknown objective'} ({self._magnification_text(magnification)}) — scaled from "
+            f"{calibration.distance_um:.1f} µm at {calibration.reference_magnification:g}x{clamp_note}"
+        )
+        offsets_um = np.linspace(-span_um / 2, span_um / 2, n_positions)
 
         measured_offsets_um: List[float] = []
         measured_xs: List[float] = []
@@ -320,7 +393,7 @@ class LaserAutofocusController(QObject):
 
         if len(measured_xs) < 3:
             self._log.error(
-                f"Calibration failed: spot detected at only {len(measured_xs)}/{CALIBRATION_POSITIONS} z positions"
+                f"Calibration failed: spot detected at only {len(measured_xs)}/{n_positions} z positions"
             )
             return False
 
@@ -331,17 +404,14 @@ class LaserAutofocusController(QObject):
         r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
         total_px = abs(slope_px_per_um) * (measured_offsets_um[-1] - measured_offsets_um[0])
 
-        if total_px < CALIBRATION_SIMULATION_PX:
+        if total_px < calibration.simulation_px:
             # A static image (simulated camera) produces no spot motion at all.
-            pixel_to_um = 0.4  # Simulation value
+            pixel_to_um = SIMULATION_PIXEL_TO_UM
             self._log.warning("Using simulation value for pixel_to_um conversion")
-        elif total_px < CALIBRATION_MIN_TOTAL_PX:
-            self._log.error(
-                f"Calibration failed: spot moved only {total_px:.1f} px over {span_um:.1f} µm — too little "
-                f"signal to fit a scale. Increase the calibration distance."
-            )
+        elif total_px < calibration.min_total_px:
+            self._log.error(self._calibration_signal_failure_message(total_px, span_um, magnification, objective_name))
             return False
-        elif r_squared < CALIBRATION_MIN_R2:
+        elif r_squared < calibration.min_r2:
             self._log.error(
                 f"Calibration failed: spot position vs z is not linear (R²={r_squared:.3f} over "
                 f"{len(measured_xs)} points, spot moved {total_px:.1f} px). Suspect stage backlash, an "
@@ -369,6 +439,32 @@ class LaserAutofocusController(QObject):
             )
 
         return True
+
+    def _calibration_signal_failure_message(
+        self,
+        total_px: float,
+        span_um: float,
+        magnification: Optional[float],
+        objective_name: Optional[str],
+    ) -> str:
+        """Explain a too-little-signal calibration failure in the operator's terms.
+
+        The sweep is no longer a per-objective knob, so the message names the
+        objective it was computed for and points at the machine config key that
+        actually controls it.
+        """
+        calibration = self.calibration_settings
+        objective = objective_name or "unknown objective"
+        return (
+            f"Calibration failed on {objective} ({self._magnification_text(magnification)}): the spot moved "
+            f"{total_px:.1f} px over the "
+            f"{span_um:.1f} µm sweep, below the {calibration.min_total_px:.1f} px minimum needed to fit a "
+            f"scale. The sweep is set in the machine config under devices.laser_af.config.calibration: "
+            f"distance_um={calibration.distance_um:.1f} µm at reference_magnification="
+            f"{calibration.reference_magnification:g}x, scaled by reference_magnification/magnification and "
+            f"clamped to max_distance_um={calibration.max_distance_um:.1f} µm. Raise distance_um (or "
+            f"max_distance_um if the sweep is clamped) so the spot travels further, or lower min_total_px."
+        )
 
     def _settle_after_move(self) -> None:
         """Wait out mechanical settling after a z move before measuring."""

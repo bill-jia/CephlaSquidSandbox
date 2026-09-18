@@ -104,9 +104,20 @@ class LaserAutofocusSettingWidget(QWidget):
 
         # Add non-threshold property spinboxes
         self._add_spinbox(non_threshold_layout, "Spot Crop Size (pixels):", "spot_crop_size", 1, 500, 0)
-        self._add_spinbox(
-            non_threshold_layout, "Calibration Distance (μm):", "pixel_to_um_calibration_distance", 0.1, 20.0, 2
+        # The calibration sweep is machine policy scaled by objective
+        # magnification (devices.laser_af.config.calibration), not a
+        # per-objective knob — show what will be used, read-only.
+        sweep_layout = QHBoxLayout()
+        sweep_layout.addWidget(QLabel("Calibration Sweep (μm):"))
+        self.calibration_sweep_label = QLabel()
+        self.calibration_sweep_label.setToolTip(
+            "Set in the machine config under devices.laser_af.config.calibration. "
+            "Scaled by reference_magnification / current magnification."
         )
+        sweep_layout.addWidget(self.calibration_sweep_label)
+        sweep_layout.addStretch()
+        non_threshold_layout.addLayout(sweep_layout)
+        self._update_calibration_sweep_label()
         non_threshold_group.setLayout(non_threshold_layout)
 
         # Settings group
@@ -324,6 +335,7 @@ class LaserAutofocusSettingWidget(QWidget):
             self.spot_mode_combo.setCurrentIndex(index)
 
         self.update_threshold_button.setEnabled(self.laserAutofocusController.is_initialized)
+        self._update_calibration_sweep_label()
         self.update_calibration_label()
 
     def apply_and_initialize(self):
@@ -334,7 +346,6 @@ class LaserAutofocusSettingWidget(QWidget):
             "displacement_success_window_um": self.spinboxes["displacement_success_window_um"].value(),
             "spot_crop_size": int(self.spinboxes["spot_crop_size"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
-            "pixel_to_um_calibration_distance": self.spinboxes["pixel_to_um_calibration_distance"].value(),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
             "spot_detection_mode": self.spot_mode_combo.currentData(),
             "y_window": int(self.spinboxes["y_window"].value()),
@@ -362,6 +373,13 @@ class LaserAutofocusSettingWidget(QWidget):
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
         }
         self.laserAutofocusController.update_threshold_properties(updates)
+
+    def _update_calibration_sweep_label(self):
+        """Show the sweep the current objective will actually be calibrated over."""
+        sweep_um = self.laserAutofocusController.calibration_sweep_um()
+        magnification = self.laserAutofocusController.current_magnification()
+        mag_text = f"{magnification:g}x" if magnification else "magnification unknown"
+        self.calibration_sweep_label.setText(f"{sweep_um:.1f}  ({mag_text}, from machine config)")
 
     def update_calibration_label(self):
         # Show calibration result

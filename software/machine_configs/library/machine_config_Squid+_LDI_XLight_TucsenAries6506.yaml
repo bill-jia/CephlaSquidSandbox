@@ -157,6 +157,27 @@ devices:
         display_name: "laser_af_gate_mcu"
     config:
       spot_detection_mode: dual_left
+      # Calibration sweep policy. The AF laser goes out and back through the
+      # objective, so the spot's lateral travel per um of defocus scales with
+      # magnification: distance_um is what works at reference_magnification and
+      # is rescaled by reference_magnification / current magnification, clamped
+      # at max_distance_um.  With distance_um 9.0 the sweep is 9 um at 20x,
+      # 18 um at 10x, 4.5 um at 40x, and 30 um (clamped) at 4x.
+      #
+      # 10x measured 0.55 px/um on 2026-09-17, so 18 um gives ~9.9 px against
+      # the 5.0 px floor.  A 6.0 base would leave 10x at ~6.6 px, which fits but
+      # with little headroom.  The sweep only affects the calibration
+      # measurement itself, not routine focusing, so a longer span buys a
+      # better-conditioned fit; set distance_um back to 6.0 to restore exactly
+      # the 20x sweep used before this was configurable.
+      calibration:
+        distance_um: 9.0
+        reference_magnification: 20
+        max_distance_um: 30.0
+        positions: 5
+        min_total_px: 5.0
+        min_r2: 0.90
+        simulation_px: 0.5
 
   piezo:
     driver: objective_piezo
@@ -213,7 +234,7 @@ devices:
       emission_filter_wheel:
         name: "XLight emission wheel"
         positions:
-          1: "Position 1"
+          1: "Quad"
           2: "Position 2"
           3: "Position 3"
           4: "Position 4"

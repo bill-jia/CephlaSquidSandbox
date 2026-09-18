@@ -33,3 +33,5 @@ def test_library_config_loads_and_io_is_consistent(path: Path):
     assert not mc.model_extra, f"unknown top-level keys: {sorted(mc.model_extra)}"
     # A confocal entry must parse into typed settings (rejects unknown keys).
     mc.get_confocal_settings()
+    # Same for the laser AF entry: devices.laser_af.config is read, not decoration.
+    mc.get_laser_af_settings()

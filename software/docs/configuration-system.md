@@ -392,7 +392,9 @@ pixel_to_um: 1.0
 x_reference: null
 has_reference: false
 calibration_timestamp: ""
-pixel_to_um_calibration_distance: 6.0
+# NOTE: the calibration sweep distance is NOT here. It is machine policy scaled
+# by objective magnification: devices.laser_af.config.calibration in the machine
+# config (see docs/laser-autofocus.md).
 
 # Detection parameters
 laser_af_range: 100.0
