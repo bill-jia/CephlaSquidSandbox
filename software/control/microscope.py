@@ -43,7 +43,7 @@ import squid.filter_wheel_controller.utils
 import squid.logging
 import squid.stage.cephla
 import squid.stage.utils
-from control.nidaq import AbstractNIDAQ, NIDAQ, build_nidaq_config_from_io
+from control.nidaq import AbstractNIDAQ, NIDAQ, SimulatedNIDAQ, build_nidaq_config_from_io
 
 
 def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
@@ -109,8 +109,11 @@ class MicroscopeAddons:
             return d if d and d.enabled else None
 
         def _sim(name: str) -> bool:
+            # The global flag must win even when the device entry exists: a
+            # rig config leaves `simulate` unset (False), and returning that
+            # alone made a simulated=True build open the real serial devices.
             d = mc.get_device(name)
-            return d.simulate if d else simulated
+            return _should_simulate(simulated, bool(d.simulate) if d else False)
 
         # ── Spinning disk confocal ────────────────────────────────────────
         xlight = None
@@ -213,7 +216,12 @@ class MicroscopeAddons:
                 delay = led_entry.config.get("turn_on_delay", 0.03)
                 na = led_entry.config.get("default_na", 0.8)
                 default_color = tuple(led_entry.config.get("default_color", [1, 1, 1]))
-                sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(
+                led_cls = (
+                    serial_peripherals.SciMicroscopyLEDArray_Simulation
+                    if _sim("led_matrix")
+                    else serial_peripherals.SciMicroscopyLEDArray
+                )
+                sci_microscopy_led_array = led_cls(
                     SN=sn,
                     array_distance=dist,
                     turn_on_delay=delay,
@@ -224,16 +232,28 @@ class MicroscopeAddons:
         # ── NI-DAQ ────────────────────────────────────────────────────────
         io_config = mc.collect_io_endpoints()
         # log.info(f"io_config: {io_config}")
+        # A simulated build still gets a DAQ object, built from the same IO
+        # endpoints. Without one the NIDAQ controller never registers, so every
+        # nidaq-routed endpoint (main_camera.trigger, frame_readout, the
+        # illumination shutters) stays unbound and simulation loses hardware
+        # trigger mode entirely. Only `enabled: false` means "no DAQ at all".
         nidaq = None
         nidaq_entry = _dev("nidaq")
-        if nidaq_entry and not _sim("nidaq"):
+        if nidaq_entry:
             device_name = nidaq_entry.config.get("device_name", "Dev1")
             nidaq_config = build_nidaq_config_from_io(
                 device_name=device_name,
                 base_config=nidaq_entry.config,
                 io_config=io_config,
             )
-            nidaq = NIDAQ(**nidaq_config)
+            nidaq_simulated = _should_simulate(simulated, _sim("nidaq"))
+            cls_ = SimulatedNIDAQ if nidaq_simulated else NIDAQ
+            log.info(
+                f"Building {'simulated ' if nidaq_simulated else ''}NI-DAQ "
+                f"'{device_name}' (ao={nidaq_config.get('ao_channels')}, "
+                f"do={nidaq_config.get('do_lines')}, di={nidaq_config.get('di_lines')})"
+            )
+            nidaq = cls_(**nidaq_config)
 
         # ── Hybrid serial+IO light sources ────────────────────────────────
         serial_devices: Dict[str, object] = {}

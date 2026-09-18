@@ -355,6 +355,47 @@ Main camera SW trigger routing: hardware_line via nidaq port0/line6 (machine con
 and the same description is printed in the "Timed out waiting … for a frame"
 error, so a misrouted line is legible rather than inferred.
 
+### Simulation (`--simulation`, `devices.<name>.simulate`)
+
+Two switches decide whether a device opens real hardware, and **either one is
+enough to simulate it** (`control.microscope._should_simulate`):
+
+| Switch | Scope |
+|--------|-------|
+| `--simulation` on the command line | every device |
+| `devices.<name>.simulate: true` | that device only |
+
+Per-device flags are what make mixed setups work — e.g. `main_camera.simulate:
+true` with a real `nidaq` drives the DAQ's trigger line for an external
+frame-grabbing application while Squid synthesizes its own frames. Never gate a
+device on the global flag alone.
+
+`enabled: false` is a different statement: the device does not exist on this rig
+and nothing is built for it, simulated or otherwise.
+
+**The NI-DAQ is simulated, not skipped.** An enabled `devices.nidaq` always
+produces an object — `SimulatedNIDAQ` when simulating, `NIDAQ` otherwise — built
+from the same IO endpoints either way, and logged at startup:
+
+```
+Building simulated NI-DAQ 'Dev1' (ao=['ao0'], do=[2, 6], di=[7])
+```
+
+That object is what registers the NIDAQ controller in the `IORegistry`, so with
+it every nidaq-routed endpoint binds in simulation: `main_camera.trigger` (so
+Hardware trigger mode and `software_trigger_routing: hardware_line` both work
+against the simulated camera), `main_camera.frame_readout`, and the illumination
+shutter/intensity lines. `SimulatedNIDAQ` records live AO/DO state and returns
+from `send_edge_pulse` immediately — no pulse-width sleep, and no readout-line
+diagnostic, since there is no DI line to sample.
+
+Waveform-driven and stimulus-only observation states also run in simulation
+(`SimulatedNIDAQ` arms, fires on `start_trigger`, and completes after the
+waveform's own duration). **Fast acquisition does not**: it is a DAQ-clocked
+pulse train the camera answers with frames, and a simulated DAQ emits no pulses,
+so the Fast Acquisition tab is left out when the DAQ is simulated and the reason
+is logged. With a real DAQ it stays available, simulated camera or not.
+
 ### hardware_bindings.yaml (Optional)
 
 Maps cameras to their associated filter wheels using **source-qualified references**. This file is only needed for multi-camera systems where each camera uses a different emission filter wheel. The same schema may be embedded as `hardware_bindings` on `machine_config.yaml` and overrides this file when present.

@@ -50,10 +50,10 @@ from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
-from control.microscope import Microscope, _should_simulate
+from control.microscope import Microscope
 from control.models import ObservationState
 from control.models.gui_state import GuiState
-from control.nidaq import AbstractNIDAQ
+from control.nidaq import AbstractNIDAQ, SimulatedNIDAQ
 from squid.abc import AbstractCamera, AbstractStage
 import control._def
 import control.lighting
@@ -639,12 +639,25 @@ class HighContentScreeningGui(QMainWindow):
             and bool(getattr(mc.software.acquisition, "fast_acquisition", False))
         )
 
+        # Branch on the DAQ that was actually built, for the same reason the
+        # confocal panel does above: SIMULATE_NIDAQ here is the stale import-time
+        # copy, so a per-device `devices.nidaq.simulate: true` would read False.
+        nidaq_simulated = isinstance(self.nidaq, SimulatedNIDAQ)
+
         if nidaq_enabled:
-            nidaq_simulated = _should_simulate(is_simulation, SIMULATE_NIDAQ)
             self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=nidaq_simulated)
 
-        # Fast acquisition widget
-        if fast_acq_enabled:
+        # Fast acquisition widget.  Fast acquisition is a DAQ-clocked pulse train
+        # that the camera answers with frames; a SimulatedNIDAQ emits no pulses
+        # and the simulated camera never sees one, so every run would sit there
+        # until the frame timeout.  Per-device flags decide, not the global one:
+        # "simulated camera, real DAQ" (external frame grabbing) keeps the tab.
+        if fast_acq_enabled and nidaq_simulated:
+            self.log.info(
+                "Fast Acquisition tab disabled: the NI-DAQ is simulated, so no "
+                "trigger pulses reach the camera and an acquisition could not complete."
+            )
+        elif fast_acq_enabled:
             self.fastAcquisitionWidget = widgets.FastAcquisitionWidget(
                 self.microscope,
                 ni_daq_widget=self.niDAQWidget if nidaq_enabled else None,
