@@ -447,6 +447,64 @@ def _build_serial_device(
     )
 
 
+def _build_serial_light_source(
+    dev_entry: IlluminationDeviceEntry,
+    simulated: bool,
+) -> Optional["LightSource"]:
+    """Instantiate the serial ``LightSource`` driver for an illumination entry.
+
+    Addressing (serial number / port) comes from ``dev_entry.connection`` and
+    driver options from ``dev_entry.config``.
+
+    Returns ``None`` when ``simulated`` is True and the driver has no
+    simulation variant in this repo, so the caller can skip the device.
+    """
+    driver = dev_entry.driver
+    cfg = dev_entry.config or {}
+    sn = dev_entry.connection.serial_number if dev_entry.connection else None
+    port = dev_entry.connection.port if dev_entry.connection else None
+
+    if driver == "ldi":
+        mode_kwargs = {
+            "intensity_mode": str(cfg.get("intensity_mode", "PC")),
+            "shutter_mode": str(cfg.get("shutter_mode", "PC")),
+        }
+        if simulated:
+            return serial_peripherals.LDI_Simulation(SN=sn, **mode_kwargs)
+        if not sn:
+            raise ValueError(
+                f"Illumination device '{dev_entry.id}' (driver='ldi') needs "
+                f"connection.serial_number: the LDI is only addressable by its "
+                f"USB serial number"
+            )
+        return serial_peripherals.LDI(SN=sn, **mode_kwargs)
+
+    if driver == "coolled_pe400":
+        import control.serial_peripherals_coolled as _coolled_module
+
+        if simulated:
+            return _coolled_module.CoolLEDpE400_Simulation(SN=sn, port=port)
+        return _coolled_module.CoolLEDpE400(SN=sn, port=port)
+
+    if driver == "celesta":
+        # No CELESTA simulation class exists in control/celesta.py.
+        return None if simulated else control.celesta.CELESTA()
+
+    if driver == "andor_laser":
+        # No AndorLaser simulation class exists in control/illumination_andor.py.
+        if simulated:
+            return None
+        return control.illumination_andor.AndorLaser(
+            control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
+        )
+
+    if driver == "versalase":
+        # No VersaLase simulation class exists in control/serial_peripherals.py.
+        return None if simulated else serial_peripherals.VersaLase()
+
+    raise ValueError(f"Unknown serial illumination driver '{driver}'")
+
+
 def _build_led_matrix_device(
     dev_entry: IlluminationDeviceEntry,
     micro: Optional[Microcontroller],
@@ -533,24 +591,18 @@ def _build_illumination_controller(
                     devices.append(
                         _build_led_matrix_device(dev_entry, micro, sci_array, default_color=_lm_color)
                     )
-                elif driver == "coolled_pe400" and not simulated:
-                    import control.serial_peripherals_coolled as _coolled_module
-                    sn = dev_entry.connection.serial_number if dev_entry.connection else None
-                    port = dev_entry.connection.port if dev_entry.connection else None
-                    coolled_ls = _coolled_module.CoolLEDpE400(SN=sn, port=port)
-                    devices.append(_build_serial_device(dev_entry, coolled_ls, io_registry))
-                elif driver == "ldi" and not simulated:
-                    devices.append(_build_serial_device(dev_entry, serial_peripherals.LDI(), io_registry))
-                elif driver == "celesta" and not simulated:
-                    devices.append(_build_serial_device(dev_entry, control.celesta.CELESTA(), io_registry))
-                elif driver == "andor_laser" and not simulated:
-                    andor = control.illumination_andor.AndorLaser(
-                        control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
-                    )
-                    devices.append(_build_serial_device(dev_entry, andor, io_registry))
-                elif driver == "versalase" and not simulated:
-                    versalase = serial_peripherals.VersaLase()
-                    devices.append(_build_serial_device(dev_entry, versalase, io_registry))
+                elif driver in ("coolled_pe400", "ldi", "celesta", "andor_laser", "versalase"):
+                    light_source = _build_serial_light_source(dev_entry, simulated)
+                    if light_source is None:
+                        # Simulated launch of a driver with no simulation class.
+                        squid.logging.get_logger("illumination").info(
+                            f"Skipping illumination device '{dev_entry.id}' "
+                            f"(driver='{driver}', simulated={simulated})"
+                        )
+                    else:
+                        devices.append(
+                            _build_serial_device(dev_entry, light_source, io_registry)
+                        )
                 else:
                     squid.logging.get_logger("illumination").info(
                         f"Skipping illumination device '{dev_entry.id}' "
@@ -558,7 +610,8 @@ def _build_illumination_controller(
                     )
             except Exception as exc:
                 squid.logging.get_logger("illumination").warning(
-                    f"Failed to build illumination device '{dev_entry.id}': {exc}"
+                    f"Failed to build illumination device '{dev_entry.id}' "
+                    f"(driver='{driver}'): {type(exc).__name__}: {exc}"
                 )
 
         if devices:
@@ -626,7 +679,19 @@ def _build_illumination_controller(
         return IlluminationController(devices_legacy)
 
     if _legacy_driver == "ldi" and not simulated:
-        ldi = serial_peripherals.LDI()
+        _ldi_cfg = (illum_entry.config or {}) if illum_entry else {}
+        _ldi_sn = illum_entry.connection.serial_number if (illum_entry and illum_entry.connection) else None
+        if not _ldi_sn:
+            raise ValueError(
+                "Legacy illumination device 'illumination' (driver='ldi') needs "
+                "connection.serial_number: the LDI is only addressable by its "
+                "USB serial number"
+            )
+        ldi = serial_peripherals.LDI(
+            SN=_ldi_sn,
+            intensity_mode=str(_ldi_cfg.get("intensity_mode", "PC")),
+            shutter_mode=str(_ldi_cfg.get("shutter_mode", "PC")),
+        )
         ldi.initialize()
         ch_map = {str(wl): key for wl, key in ldi.channel_mappings.items()} if hasattr(ldi, "channel_mappings") else {}
         return IlluminationController([

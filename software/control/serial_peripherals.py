@@ -867,14 +867,51 @@ class Dragonfly_Simulation:
         self.log.info("Dragonfly simulation closed")
 
 
+def _ldi_intensity_control_mode(mode: str) -> IntensityControlMode:
+    """Map an LDI config string ("PC" / "EXT") onto an IntensityControlMode."""
+    normalized = str(mode).strip().upper()
+    if normalized == "PC":
+        return IntensityControlMode.Software
+    if normalized == "EXT":
+        return IntensityControlMode.SquidControllerDAC
+    raise ValueError(f"Invalid LDI intensity_mode {mode!r}: expected 'PC' (software) or 'EXT' (external DAC).")
+
+
+def _ldi_shutter_control_mode(mode: str) -> ShutterControlMode:
+    """Map an LDI config string ("PC" / "EXT") onto a ShutterControlMode."""
+    normalized = str(mode).strip().upper()
+    if normalized == "PC":
+        return ShutterControlMode.Software
+    if normalized == "EXT":
+        return ShutterControlMode.TTL
+    raise ValueError(f"Invalid LDI shutter_mode {mode!r}: expected 'PC' (software) or 'EXT' (TTL).")
+
+
+def _found_serial_numbers() -> str:
+    """Describe the serial numbers of the currently attached serial ports, for error messages."""
+    try:
+        found = [f"{p.device} (SN={p.serial_number})" for p in list_ports.comports()]
+    except Exception:
+        return "<could not enumerate serial ports>"
+    return ", ".join(found) if found else "<none>"
+
+
 class LDI(LightSource):
     """Wrapper for communicating with LDI over serial"""
 
-    def __init__(self, SN="00000001"):
+    def __init__(self, SN: str, intensity_mode: str = "PC", shutter_mode: str = "PC"):
         """
-        Provide serial number
+        Args:
+            SN: USB serial number of the LDI.
+            intensity_mode: "PC" for software (serial ``set:``) control of laser power, "EXT" to
+                take the power setpoint from the external analog input.
+            shutter_mode: "PC" for software (serial ``shutter:``) control of the shutters, "EXT" to
+                gate the shutters from the external TTL input.
         """
         self.log = squid.logging.get_logger(self.__class__.__name__)
+        self.SN = SN
+        self.intensity_mode = _ldi_intensity_control_mode(intensity_mode)
+        self.shutter_mode = _ldi_shutter_control_mode(shutter_mode)
         self.serial_connection = SerialDevice(
             SN=SN,
             baudrate=9600,
@@ -886,14 +923,11 @@ class LDI(LightSource):
             dsrdtr=False,
         )
         self.serial_connection.open_ser()
-        if LDI_INTENSITY_MODE == "PC":
-            self.intensity_mode = IntensityControlMode.Software
-        elif LDI_INTENSITY_MODE == "EXT":
-            self.intensity_mode = IntensityControlMode.SquidControllerDAC
-        if LDI_SHUTTER_MODE == "PC":
-            self.shutter_mode = ShutterControlMode.Software
-        elif LDI_SHUTTER_MODE == "EXT":
-            self.shutter_mode = ShutterControlMode.TTL
+        if self.serial_connection.serial is None:
+            raise SerialDeviceError(
+                f"No serial port with serial number '{SN}' was found for the Lumencor LDI. "
+                f"Ports found: {_found_serial_numbers()}"
+            )
 
         self.channel_mappings = {
             405: 405,
@@ -913,6 +947,10 @@ class LDI(LightSource):
 
     def initialize(self):
         self.serial_connection.write_and_check("run!\r", "ok")
+        # The LDI remembers the control mode it was last left in. If it comes up in EXT mode it
+        # silently ignores every serial set:/shutter: command, so push both modes on every startup.
+        self.set_intensity_control_mode(self.intensity_mode)
+        self.set_shutter_control_mode(self.shutter_mode)
 
     def set_shutter_control_mode(self, mode):
         if mode == ShutterControlMode.TTL:
@@ -946,9 +984,9 @@ class LDI(LightSource):
             pairs = response.replace("SET:", "").split(",")
             intensities = {}
             for pair in pairs:
-                channel, value = pair.split("=")
-                intensities[int(channel)] = int(value)
-            return intensities[channel]
+                pair_channel, value = pair.split("=")
+                intensities[int(pair_channel)] = int(value)
+            return intensities[int(channel)]
         except:
             return None
 
@@ -983,15 +1021,14 @@ class LDI(LightSource):
 
 
 class LDI_Simulation(LightSource):
-    """Wrapper for communicating with LDI over serial"""
+    """Simulated stand-in for the LDI serial driver"""
 
-    def __init__(self, SN="00000001"):
-        """
-        Provide serial number
-        """
+    def __init__(self, SN: Optional[str] = None, intensity_mode: str = "PC", shutter_mode: str = "PC"):
+        """Mirrors LDI.__init__; the serial number is accepted but unused."""
         self.log = squid.logging.get_logger(self.__class__.__name__)
-        self.intensity_mode = IntensityControlMode.Software
-        self.shutter_mode = ShutterControlMode.Software
+        self.SN = SN
+        self.intensity_mode = _ldi_intensity_control_mode(intensity_mode)
+        self.shutter_mode = _ldi_shutter_control_mode(shutter_mode)
 
         self.channel_mappings = {
             405: 405,
