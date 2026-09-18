@@ -59,11 +59,15 @@ def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
         True if the component should be simulated, False otherwise.
 
     Behavior:
-        - Per-component SIMULATE_* is always respected.
-        - When --simulation is used, apply_simulation_mode_defaults(True) sets any
-          SIMULATE_* not specified in config to True, so unset components are simulated.
+        - Per-component SIMULATE_* is always respected, so one component can be
+          simulated against otherwise-real hardware.
+        - ``global_simulated`` forces simulation for every component. Honouring it
+          here matters for callers that construct a Microscope directly, such as
+          tests: ``apply_simulation_mode_defaults`` only runs on the --simulation
+          launch path, so without this a ``simulated=True`` build would open real
+          serial ports and cameras on a live rig.
     """
-    return bool(component_override)
+    return bool(component_override) or bool(global_simulated)
 
 
 class MicroscopeAddons:
