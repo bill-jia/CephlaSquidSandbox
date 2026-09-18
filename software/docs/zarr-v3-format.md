@@ -301,17 +301,22 @@ A single human-friendly `acquisition_times.csv` is written at the experiment
 root (`{experiment}/acquisition_times.csv`) consolidating per-frame timestamps
 across every timepoint, region, FOV, channel, and z. Each row carries a
 `time_point` column so all data live in one file rather than scattered across
-per-timepoint folders. (Other save modes — `INDIVIDUAL_IMAGES`,
-`MULTI_PAGE_TIFF`, `OME_TIFF` — keep their per-timepoint
-`{experiment}/{timepoint}/frame_acquisition_times.csv` since their image data
-is also organised per timepoint.)
+per-timepoint folders. `OME_TIFF` shares this file for the same reason. (The
+per-frame TIFF modes — `INDIVIDUAL_IMAGES`, `MULTI_PAGE_TIFF` — keep their
+per-timepoint `{experiment}/{timepoint}/frame_acquisition_times.csv` since
+their image data is also organised per timepoint.)
+
+The measured stage positions are consolidated the same way, into
+`{experiment}/acquired_positions.csv` — see
+[multipoint-data-saving.md](multipoint-data-saving.md#per-frame-metadata).
 
 ### No empty per-timepoint folders
 
 Because ZARR_V3 streams image data to its own per-FOV trees and consolidates
 the per-frame CSV at the root, the per-timepoint folder
 (`{experiment}/{timepoint:04d}/`) is **not created** for pure ZARR_V3
-acquisitions. The folder is only created when something else needs it:
+acquisitions (the same holds for `OME_TIFF`). The folder is only created when
+something else needs it:
 
 - Downsampled views are enabled (`SAVE_DOWNSAMPLED_WELL_IMAGES` or
   `DISPLAY_PLATE_VIEW`) — `plate_<r>um.tiff` lands per timepoint.

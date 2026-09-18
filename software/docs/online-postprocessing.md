@@ -33,12 +33,32 @@ arrays keyed by name.
 
 ## Where the outputs go
 
-Each declared output becomes its own single-channel plate keyed
+Each declared output becomes its own single-channel array keyed
 `{label}_{output}` (label = the routine's `label` param, or the first input
-state name). For ZARR_V3 this is `{label}_{output}.ome.zarr` with `T = Nt`,
-`C = 1`, `Z = z_size`, and the declared dtype. **One output-set is produced per
-FOV visit per scan timepoint**, regardless of how many input frames were pooled.
-The raw input frames of a postprocessed item are never written.
+state name), with `T = Nt`, `C = 1`, `Z = z_size` and the declared dtype —
+never the acquisition's own `NZ`, so a routine that collapses an 11-plane
+z-stack to one phase image writes a single-z output. **One output-set is
+produced per FOV visit per scan timepoint**, regardless of how many input
+frames were pooled. The raw input frames of a postprocessed item are never
+written. Where that array lands depends on the saving mode:
+
+| Saving mode | Derived output location |
+|---|---|
+| `ZARR_V3` | `{exp}/{label}_{output}.ome.zarr` — a derived OME-NGFF plate alongside the raw ones, written by an inline `SaveZarrJob` (and flushed/staged by an inline upload barrier when uploads are on) |
+| `OME_TIFF` | `{exp}/ome_tiff/{region}__{label}_{output}.ome.tiff` — a keyed per-region multi-series file (series *i* = FOV *i*, axes TZCYX), written by an inline `SaveOMETiffJob` |
+| `INDIVIDUAL_IMAGES` | `{exp}/{timepoint}/{region}_{fov}_{label}_{output}[_zNNN].tiff` — loose float-safe TIFFs in the timepoint folder |
+
+For `OME_TIFF` the derived file is always distinct from every raw one: the raw
+frames of a postprocessed step are not saved, so no raw `array_key` can equal an
+`out_key`, and a dense raw run has no `array_key` at all (its file is the bare
+`{region}.ome.tiff`). The only way to collide is to name a *saved* state
+literally `{label}_{output}` — the same user-namespace collision the ZARR_V3
+derived plates already have.
+
+All FOV series of the keyed file are pre-allocated from `fovs_per_region` on the
+region's first derived frame, so if a postprocess step runs at only some FOVs the
+untouched series stay zero-filled (and carry no `Plane` metadata) — the same
+behaviour as an aborted raw run.
 
 When two selected cycles each carry an unlabelled group over the same input
 states (e.g. the same DPC group copied into two cycles), both would derive the
@@ -53,9 +73,17 @@ input frame (ground-truth timing) plus rows for each written output.
 
 ## Supported save formats
 
-Postprocessing supports **ZARR_V3** and **INDIVIDUAL_IMAGES** only. OME-TIFF and
-multi-page TIFF are rejected pre-flight (their global-dims / shared-append writers
-don't compose with a second writer process). `skip saving` is also rejected.
+Postprocessing supports **ZARR_V3**, **OME_TIFF** and **INDIVIDUAL_IMAGES**.
+Multi-page TIFF is rejected pre-flight: its shared-append writer cannot take a
+second writer process. `skip saving` is also rejected.
+
+`PostprocessJob` runs in its own `JobRunner` subprocess, separate from the one
+running the raw save jobs. For OME-TIFF that is safe because the two processes
+write disjoint files (keyed vs. unkeyed region files), preserving the
+one-process-per-file invariant the memmap writer relies on. `JobRunner.run()`
+calls `SaveOMETiffJob.finalize_all_writers()` on its way out regardless of which
+job classes it served, so the postprocess runner finalises its own derived
+region files (plane metadata, positions, timestamps) even on abort.
 
 ## The routine contract
 
@@ -215,7 +243,7 @@ saved but not displayed (a debug line notes the skip).
 
 ## Limitations (v1)
 
-- ZARR_V3 / INDIVIDUAL_IMAGES only.
+- ZARR_V3 / OME_TIFF / INDIVIDUAL_IMAGES only (no multi-page TIFF).
 - Postprocessed states are excluded from the downsampled well mosaics / plate view
   (a warning is logged when downsampled views are enabled).
 - Derived outputs are not fed into the downsampled/plate-view pipeline.

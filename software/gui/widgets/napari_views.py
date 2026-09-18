@@ -672,7 +672,7 @@ class AlignmentWidget(QWidget):
             self.btn_align.setText("Confirm Offset")
 
             self.signal_move_to_position.emit(ref_x, ref_y)
-            self._load_reference_image(info["image_path"])
+            self._load_reference_image(info["image_path"], info["image_series"])
             self._log.info(f"Alignment started: ref_pos=({ref_x:.4f}, {ref_y:.4f})")
 
         except Exception as e:
@@ -717,7 +717,8 @@ class AlignmentWidget(QWidget):
         """
         Load acquisition info from a past acquisition folder.
 
-        Returns dict with: coordinates, first_region, center_fov_index, center_fov_position, image_path
+        Returns dict with: coordinates, first_region, center_fov_index, center_fov_position,
+        image_path, image_series
         """
         folder = Path(folder_path)
 
@@ -734,7 +735,7 @@ class AlignmentWidget(QWidget):
         center_fov = region_coords.iloc[center_idx]
         center_fov_position = (float(center_fov["x (mm)"]), float(center_fov["y (mm)"]))
 
-        image_path = self._find_reference_image(folder, first_region, center_idx)
+        image_path, image_series = self._find_reference_image(folder, first_region, center_idx)
 
         self._log.info(
             f"Loaded acquisition info: region={first_region}, "
@@ -748,6 +749,7 @@ class AlignmentWidget(QWidget):
             "center_fov_index": center_idx,
             "center_fov_position": center_fov_position,
             "image_path": str(image_path),
+            "image_series": image_series,
         }
 
     def _find_center_fov(self, region_coords: "pd.DataFrame") -> int:
@@ -759,15 +761,38 @@ class AlignmentWidget(QWidget):
         distances_sq = (x - center_x) ** 2 + (y - center_y) ** 2
         return int(distances_sq.argmin())
 
-    def _find_reference_image(self, folder: Path, region: str, fov_idx: int) -> Path:
-        """Find reference image in OME-TIFF or traditional timepoint folders."""
+    def _find_reference_image(self, folder: Path, region: str, fov_idx: int) -> Tuple[Path, Optional[int]]:
+        """Find a reference image for (region, FOV) and the series to read from it.
+
+        OME-TIFF acquisitions store one multi-series file per region
+        (``ome_tiff/{region}.ome.tiff``, or ``{region}__{array_key}.ome.tiff`` for
+        ragged cycles), where series index == FOV index. Traditional timepoint
+        folders hold one file per plane, so no series index applies.
+        """
         # Try OME-TIFF folder first
+        import tifffile
+
         ome_tiff_folder = folder / "ome_tiff"
-        if ome_tiff_folder.exists():
-            ome_images = list(ome_tiff_folder.glob(f"{region}_{fov_idx}.ome.tiff"))
-            if ome_images:
-                self._log.info(f"Found OME-TIFF image: {ome_images[0]}")
-                return ome_images[0]
+        if ome_tiff_folder.is_dir():
+            region_files = sorted(
+                f
+                for f in ome_tiff_folder.iterdir()
+                if f.is_file() and not f.name.startswith(".") and f.name.lower().endswith((".ome.tif", ".ome.tiff"))
+            )
+            for path in region_files:
+                try:
+                    with tifffile.TiffFile(str(path)) as tif:
+                        series = tif.series
+                        # Region ids are user-editable and may contain underscores,
+                        # so trust the OME image name ("{region}:{fov}"), not the filename.
+                        name = getattr(series[0], "name", "") if series else ""
+                        if not name or name.rsplit(":", 1)[0] != region or fov_idx >= len(series):
+                            continue
+                except Exception as e:
+                    self._log.debug(f"Skipping {path}: {e}")
+                    continue
+                self._log.info(f"Found OME-TIFF image: {path} (series {fov_idx})")
+                return path, fov_idx
 
         # Try traditional timepoint folders
         timepoint_folders = sorted(
@@ -780,7 +805,7 @@ class AlignmentWidget(QWidget):
                 images = sorted(last_timepoint.glob(f"{region}_{fov_idx}_0_*.{ext}"))
                 if images:
                     self._log.info(f"Found traditional format image: {images[0]}")
-                    return images[0]
+                    return images[0], None
 
         raise FileNotFoundError(
             f"No images found for region={region}, FOV={fov_idx} in {folder}. "
@@ -791,12 +816,19 @@ class AlignmentWidget(QWidget):
     # Napari Layer Management
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _load_reference_image(self, image_path: str):
-        """Load reference image and add to napari viewer."""
+    def _load_reference_image(self, image_path: str, series_index: Optional[int] = None):
+        """Load reference image and add to napari viewer.
+
+        ``series_index`` selects one FOV out of a multi-series OME-TIFF region file.
+        """
         import tifffile
 
-        if image_path.endswith((".tiff", ".tif", ".ome.tiff", ".ome.tif")):
-            ref_image = tifffile.imread(image_path)
+        if image_path.endswith((".tiff", ".tif")):
+            if series_index is None:
+                ref_image = tifffile.imread(image_path)
+            else:
+                # Only the first plane of that FOV is needed for alignment.
+                ref_image = tifffile.imread(image_path, series=series_index, key=0)
             # Reduce multi-dimensional images (T, C, Z, Y, X) to 2D
             while ref_image.ndim > 2:
                 ref_image = ref_image[0]

@@ -913,6 +913,103 @@ class NDViewerTab(QWidget):
         except Exception:
             self._log.exception("Failed to end zarr acquisition in NDViewer")
 
+    # -------------------------------------------------------------------------
+    # OME-TIFF Push-based API for live acquisition
+    # -------------------------------------------------------------------------
+
+    def start_ome_tiff_acquisition(
+        self,
+        fov_files: List[str],
+        fov_series: List[int],
+        channels: List[str],
+        num_z: int,
+        num_t: int,
+        fov_labels: List[str],
+        height: int,
+        width: int,
+    ) -> bool:
+        """Configure viewer for OME-TIFF live acquisition.
+
+        Args:
+            fov_files: Region OME-TIFF path per flat FOV (regions repeat)
+            fov_series: Series index within that file per flat FOV
+            channels: List of channel names
+            num_z: Number of z-levels
+            num_t: Number of timepoints
+            fov_labels: List of FOV labels (e.g., ["A1:0", "A1:1"])
+            height: Image height in pixels
+            width: Image width in pixels
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self._ensure_viewer_ready("OME-TIFF acquisition"):
+            return False
+
+        try:
+            if not hasattr(self._viewer, "start_ome_tiff_acquisition"):
+                self._log.warning(
+                    "ndviewer_light doesn't support the OME-TIFF push API. "
+                    "Live viewing not available for OME-TIFF format. "
+                    "Update ndviewer_light submodule to enable this feature."
+                )
+                self._show_placeholder(
+                    "NDViewer: OME-TIFF live view requires ndviewer_light with OME-TIFF push support.\n"
+                    "Update the ndviewer_light submodule."
+                )
+                return False
+
+            self._viewer.start_ome_tiff_acquisition(
+                fov_files, fov_series, channels, num_z, num_t, fov_labels, height, width
+            )
+            self._viewer.setVisible(True)
+            self._placeholder.setVisible(False)
+            self._log.info(
+                f"NDViewer configured for OME-TIFF acquisition: {len(channels)} channels, "
+                f"{num_z} z-levels, {len(fov_labels)} FOVs"
+            )
+            return True
+        except Exception as e:
+            self._log.exception("Failed to start OME-TIFF acquisition in NDViewer")
+            error_msg = str(e) if str(e) else type(e).__name__
+            self._show_placeholder(f"NDViewer: failed to start OME-TIFF acquisition:\n{error_msg}")
+            return False
+
+    def notify_ome_tiff_frame(self, t: int, fov_idx: int, z: int, channel: str) -> None:
+        """Notify viewer that an OME-TIFF plane was written.
+
+        Called on main thread via Qt signal from worker thread.
+
+        Args:
+            t: Timepoint index
+            fov_idx: Flat FOV index
+            z: Z-level index
+            channel: Channel name
+        """
+        if self._viewer is None:
+            return
+        try:
+            if hasattr(self._viewer, "notify_ome_tiff_frame"):
+                self._viewer.notify_ome_tiff_frame(t, fov_idx, z, channel)
+        except Exception:
+            self._log.exception(
+                f"Failed to notify OME-TIFF frame: t={t}, fov={fov_idx}, z={z}, channel={channel}"
+            )
+
+    def end_ome_tiff_acquisition(self) -> None:
+        """Mark OME-TIFF acquisition as ended.
+
+        The viewer remains usable for navigating the acquired data.
+        """
+        if self._viewer is None:
+            return
+        try:
+            if hasattr(self._viewer, "end_ome_tiff_acquisition"):
+                self._viewer.end_ome_tiff_acquisition()
+                self._log.debug("NDViewer OME-TIFF acquisition ended")
+        except Exception:
+            self._log.exception("Failed to end OME-TIFF acquisition in NDViewer")
+
     def close(self) -> None:
         """Clean up viewer resources."""
         if self._viewer is not None:

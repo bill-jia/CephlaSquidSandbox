@@ -296,6 +296,149 @@ def test_postprocess_job_accumulate_compute_write():
         SaveZarrJob.clear_writers()
 
 
+def _make_ome_pp_job(exp_dir, acq_info, group_key, label, expected_frames, output_specs,
+                     input_state_specs, ctx_meta, state, region_id, fov, t_scan, z_index, image):
+    """A PostprocessJob whose frames belong to an OME_TIFF acquisition.
+
+    OME_TIFF has no per-timepoint folder, so ``save_directory`` IS the
+    experiment root — which is exactly why the derived outputs must not be
+    written as loose TIFFs next to it.
+    """
+    cap = CaptureInfo(
+        position=squid.abc.Pos(x_mm=float(fov) + 0.5, y_mm=float(fov) * 2.0, z_mm=0.0, theta_rad=None),
+        z_index=z_index,
+        capture_time=time.time(),
+        observation_state=_obs(state),
+        save_directory=str(exp_dir),
+        file_id=f"{region_id}_{fov}_{t_scan}",
+        region_id=region_id,
+        fov=fov,
+        configuration_idx=0,
+        time_point=t_scan,
+        file_saving_option=FileSavingOption.OME_TIFF,
+        acquisition_root=str(exp_dir),
+        postprocess_group=group_key,
+    )
+    job = PostprocessJob(
+        capture_info=cap,
+        capture_image=JobImage(image_array=image),
+        group_key=group_key,
+        label=label,
+        spec_dict={"routine": "stub_mean", "script_path": None, "params": {}},
+        expected_frames=expected_frames,
+        output_specs=output_specs,
+        input_state_specs=input_state_specs,
+        ctx_meta=ctx_meta,
+    )
+    job.acquisition_info = acq_info
+    return job
+
+
+def test_postprocess_ome_tiff_outputs_land_in_a_keyed_region_file():
+    """OME_TIFF derived outputs go to ``ome_tiff/{region}__{out_key}.ome.tiff``.
+
+    Two FOVs x two timepoints of a 3-plane input collapse to a single-z float32
+    output, so the derived file's Z (1) must come from the output spec, NOT from
+    the acquisition's ``total_z_levels`` (3).
+    """
+    import xml.etree.ElementTree as ET
+
+    import tifffile
+
+    from control.core.job_processing import AcquisitionInfo, SaveOMETiffJob
+
+    OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+    NZ, NT, N_FOV = 3, 2, 2
+    REGION = "R"
+    registry.BUILTIN_ROUTINES["stub_mean"] = _StubRoutine
+    SaveOMETiffJob._region_files.clear()
+    SaveOMETiffJob._active_region_path = None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            exp_dir = os.path.join(tmp, "experiment")
+            os.makedirs(exp_dir, exist_ok=True)
+            acq_info = AcquisitionInfo(
+                total_time_points=NT,
+                total_z_levels=NZ,
+                total_channels=1,
+                channel_names=["BF"],
+                experiment_path=exp_dir,
+                fovs_per_region={REGION: N_FOV},
+            )
+            output_specs = [{"name": "mean", "z_size": 1, "dtype": "float32",
+                             "channel_color": "#FFFFFF", "wavelength_nm": None}]
+            input_state_specs = {"BF": {"acquire_z_stack": True, "frames_per_visit": 1}}
+            ctx_meta = {"pixel_size_um": 0.325, "dz_um": 1.0, "nz": NZ, "nt": NT, "state_meta": {}}
+
+            def _expected(t, fov):
+                # mean over z of (1000*t + 100*fov + 10*z) == 1000*t + 100*fov + 10
+                return 1000.0 * t + 100.0 * fov + 10.0
+
+            for t in range(NT):
+                for fov in range(N_FOV):
+                    for z in range(NZ):
+                        job = _make_ome_pp_job(
+                            exp_dir, acq_info, "pp0", "bf", NZ, output_specs, input_state_specs,
+                            ctx_meta, state="BF", region_id=REGION, fov=fov, t_scan=t, z_index=z,
+                            image=np.full((16, 16), 1000 * t + 100 * fov + 10 * z, np.uint16),
+                        )
+                        result = job.run()
+                    assert isinstance(result, PostprocessResult)
+                    assert result.outputs_written == 1
+
+            # The JobRunner exit hook (runs in the postprocess runner too).
+            assert SaveOMETiffJob.finalize_all_writers()
+
+            ome_dir = os.path.join(exp_dir, "ome_tiff")
+            assert sorted(p for p in os.listdir(ome_dir)) == ["R__bf_mean.ome.tiff"]
+            # Nothing loose at the experiment root (OME_TIFF's save_directory).
+            at_root = sorted(p for p in os.listdir(exp_dir) if not p.endswith(".lock"))
+            assert at_root == ["acquisition_times.csv", "ome_tiff"]
+
+            output_path = os.path.join(ome_dir, "R__bf_mean.ome.tiff")
+            with tifffile.TiffFile(output_path) as tif:
+                assert len(tif.series) == N_FOV
+                for fov in range(N_FOV):
+                    series = tif.series[fov]
+                    assert series.name == f"{REGION}:{fov}"
+                    data = series.asarray().reshape(NT, 1, 1, 16, 16)
+                    assert data.dtype == np.float32
+                    for t in range(NT):
+                        np.testing.assert_allclose(data[t, 0, 0], _expected(t, fov))
+                root = ET.fromstring(tif.ome_metadata)
+
+            images = root.findall("ome:Image", OME_NS)
+            assert [im.get("Name") for im in images] == [f"{REGION}:0", f"{REGION}:1"]
+            for fov, image_elem in enumerate(images):
+                pixels = image_elem.find("ome:Pixels", OME_NS)
+                assert (pixels.get("SizeT"), pixels.get("SizeZ"), pixels.get("SizeC")) == ("2", "1", "1")
+                assert pixels.get("Type") == "float"
+                assert [ch.get("Name") for ch in pixels.findall("ome:Channel", OME_NS)] == ["bf_mean"]
+                planes = pixels.findall("ome:Plane", OME_NS)
+                assert len(planes) == NT
+                assert {int(p.get("TheT")) for p in planes} == {0, 1}
+                assert all(float(p.get("PositionX")) == pytest.approx(float(fov) + 0.5) for p in planes)
+                assert all(float(p.get("PositionY")) == pytest.approx(float(fov) * 2.0) for p in planes)
+
+            # One timing row per written output plane, naming the region file.
+            import csv
+
+            with open(os.path.join(exp_dir, "acquisition_times.csv"), newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            derived = [r for r in rows if r["channel"] == "bf_mean"]
+            assert len(derived) == NT * N_FOV
+            assert {r["filename"] for r in derived} == {"ome_tiff/R__bf_mean.ome.tiff"}
+            # The (unsaved) raw input frames still get their own ground-truth rows.
+            assert len([r for r in rows if r["filename"] == "postprocess/pp0"]) == NT * N_FOV * NZ
+    finally:
+        registry.BUILTIN_ROUTINES.pop("stub_mean", None)
+        PostprocessJob.clear_accumulators()
+        for region_file in SaveOMETiffJob._region_files.values():
+            region_file.close_memmap()
+        SaveOMETiffJob._region_files.clear()
+        SaveOMETiffJob._active_region_path = None
+
+
 def test_warmup_job_populates_shared_routine_cache():
     """PostprocessWarmupJob runs the routine's warmup and shares its cache (keyed
     by routine identity) with the per-FOV PostprocessJob in the same process."""

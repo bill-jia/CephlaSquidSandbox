@@ -1322,6 +1322,14 @@ class HighContentScreeningGui(QMainWindow):
             self.multipointController.ndviewer_start_zarr_acquisition.connect(self.ndviewerTab.start_zarr_acquisition)
             self.multipointController.ndviewer_notify_zarr_frame.connect(self.ndviewerTab.notify_zarr_frame)
             self.multipointController.ndviewer_end_zarr_acquisition.connect(self.ndviewerTab.end_zarr_acquisition)
+            # OME-TIFF mode signals (one multi-series file per region)
+            self.multipointController.ndviewer_start_ome_tiff_acquisition.connect(
+                self.ndviewerTab.start_ome_tiff_acquisition
+            )
+            self.multipointController.ndviewer_notify_ome_tiff_frame.connect(self.ndviewerTab.notify_ome_tiff_frame)
+            self.multipointController.ndviewer_end_ome_tiff_acquisition.connect(
+                self.ndviewerTab.end_ome_tiff_acquisition
+            )
 
         self.recordTabWidget.currentChanged.connect(self.onTabChanged)
         if not self.live_only_mode:

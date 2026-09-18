@@ -186,9 +186,10 @@ class MultiPointControllerFunctions:
     # Optional Slack notification callbacks (allows main thread to capture screenshot and maintain ordering)
     signal_slack_timepoint_notification: Callable[["TimepointStats"], None] = lambda *a, **kw: None
     signal_slack_acquisition_finished: Callable[["AcquisitionStats"], None] = lambda *a, **kw: None
-    # Zarr frame written callback - called when subprocess completes writing a frame
+    # Frame-written callback - called when the save subprocess reports a frame is
+    # on disk (ZARR_V3 and OME_TIFF, i.e. every mode that writes out-of-process).
     # Args: (fov, time_point, z_index, channel_name, region_idx)
-    signal_zarr_frame_written: Callable[[int, int, int, str, int], None] = lambda *a, **kw: None
+    signal_frame_written: Callable[[int, int, int, str, int], None] = lambda *a, **kw: None
     # Fires at the start of each timepoint (arg: time_point index). Used by napari
     # views to flush per-timepoint state so peak RAM tracks a single timepoint
     # rather than accumulating across the run.

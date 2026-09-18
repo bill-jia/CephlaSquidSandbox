@@ -25,7 +25,7 @@ from control.core.job_processing import (
     CaptureInfo,
     JobImage,
     SaveZarrJob,
-    ZarrWriteResult,
+    FrameWriteResult,
     ZarrWriterInfo,
 )
 from control.models.observation_state import CameraSettings, IlluminatorState, ObservationState
@@ -640,7 +640,7 @@ class TestSaveZarrJob:
                     job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=img))
                     job.zarr_writer_info = info
                     result = job.run()
-                    assert isinstance(result, ZarrWriteResult)
+                    assert isinstance(result, FrameWriteResult)
                 SaveZarrJob.finalize_all_writers()
 
                 out = info.get_output_path("A1", 0)
