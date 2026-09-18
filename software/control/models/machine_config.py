@@ -48,7 +48,7 @@ Lumencor SPECTRA, individual IO-routed lasers, LED matrices) under a single
 
 import logging
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -59,7 +59,12 @@ from control.models.io_endpoint_config import (
     IOEndpointConfig,
     IOSignalType,
 )
-from control.models.filter_wheel_config import FilterWheelRegistryConfig
+from control.models.filter_wheel_config import (
+    FilterWheelDefinition,
+    FilterWheelRegistryConfig,
+    FilterWheelType,
+    apply_single_filter_wheel_defaults,
+)
 from control.models.hardware_bindings import HardwareBindingsConfig
 
 logger = logging.getLogger(__name__)
@@ -196,6 +201,74 @@ class DeviceEntry(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Confocal unit settings (devices.xlight.config / devices.dragonfly.config)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Device names that carry a spinning-disk confocal unit, in lookup order.
+CONFOCAL_DEVICE_NAMES: Tuple[str, ...] = ("xlight", "dragonfly")
+
+# Slot count used when the confocal device declares no emission wheel
+# (8 = X-Light V3, 5 = Cicero).
+DEFAULT_EMISSION_FILTER_POSITIONS = 8
+
+
+class ConfocalEmissionWheel(BaseModel):
+    """The emission filter wheel built into a confocal unit.
+
+    Declared under ``devices.<confocal>.config.emission_filter_wheel``; the
+    number of slots the driver accepts is ``len(positions)``.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, description="User-friendly wheel name")
+    positions: Dict[int, str] = Field(default_factory=dict, description="Slot number -> filter name")
+
+    model_config = {"extra": "forbid"}
+
+
+class ConfocalDeviceSettings(BaseModel):
+    """Typed view of ``devices.xlight.config`` / ``devices.dragonfly.config``.
+
+    Everything the confocal unit needs lives on its own device entry: there is
+    no separate confocal config file.
+    """
+
+    sleep_time_for_wheel: float = Field(0.25, description="Seconds to wait after a wheel move")
+    validate_wheel_pos: bool = Field(False, description="Read back the wheel position after each move")
+    illumination_iris_default: float = Field(100.0, description="Default illumination iris (0-100)")
+    emission_iris_default: float = Field(100.0, description="Default emission iris (0-100)")
+    emission_filter_wheel: ConfocalEmissionWheel = Field(default_factory=ConfocalEmissionWheel)
+
+    model_config = {"extra": "forbid"}
+
+    @classmethod
+    def from_device_entry(cls, entry: Optional["DeviceEntry"]) -> "ConfocalDeviceSettings":
+        """Build settings from a confocal ``DeviceEntry`` (defaults when None)."""
+        if entry is None:
+            return cls()
+        return cls.model_validate(entry.config or {})
+
+    @property
+    def emission_filter_positions(self) -> int:
+        """Number of emission wheel slots the driver will accept."""
+        return len(self.emission_filter_wheel.positions) or DEFAULT_EMISSION_FILTER_POSITIONS
+
+    def build_emission_wheel_definition(self) -> Optional[FilterWheelDefinition]:
+        """Return the declared emission wheel as a ``FilterWheelDefinition``.
+
+        Returns None when the device declares no positions.
+        """
+        if not self.emission_filter_wheel.positions:
+            return None
+        raw = {
+            "name": self.emission_filter_wheel.name,
+            "id": 1,
+            "type": FilterWheelType.EMISSION.value,
+            "positions": dict(self.emission_filter_wheel.positions),
+        }
+        return FilterWheelDefinition.model_validate(apply_single_filter_wheel_defaults([raw])[0])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -506,6 +579,24 @@ class MachineConfig(BaseModel):
             k: v for k, v in self.devices.items()
             if v.enabled and v.role == role
         }
+
+    def get_confocal_device(self) -> Optional[Tuple[str, DeviceEntry]]:
+        """Get the enabled spinning-disk confocal device as ``(name, entry)``.
+
+        Returns None when no confocal unit is enabled.
+        """
+        for name in CONFOCAL_DEVICE_NAMES:
+            entry = self.devices.get(name)
+            if entry is not None and entry.enabled:
+                return name, entry
+        return None
+
+    def get_confocal_settings(self) -> Optional[ConfocalDeviceSettings]:
+        """Typed settings for the enabled confocal device, or None."""
+        found = self.get_confocal_device()
+        if found is None:
+            return None
+        return ConfocalDeviceSettings.from_device_entry(found[1])
 
 
 def build_default_machine_config() -> MachineConfig:

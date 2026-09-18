@@ -500,7 +500,9 @@ class SpinningDiskConfocalWidget(QWidget):
         self.dropdown_emission_filter = None
         if self.xlight.has_emission_filters_wheel:
             self.dropdown_emission_filter = QComboBox(self)
-            self.dropdown_emission_filter.addItems([str(i + 1) for i in range(XLIGHT_EMISSION_FILTER_POSITIONS)])
+            self.dropdown_emission_filter.addItems(
+                [str(i + 1) for i in range(self.xlight.emission_filter_positions)]
+            )
 
         self.dropdown_dichroic = None
         if self.xlight.has_dichroic_filters_wheel:

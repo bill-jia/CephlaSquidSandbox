@@ -126,12 +126,8 @@ if ill_config:
     channel = ill_config.get_channel_by_name("Fluorescence 488 nm Ex")
     source_code = ill_config.get_source_code(channel)
 
-# Confocal config (None if no confocal)
-confocal_config = config_repo.get_confocal_config()
-
-# Check for confocal presence
-if config_repo.has_confocal():
-    ...
+# Confocal settings from devices.xlight / devices.dragonfly (None if no confocal)
+confocal_settings = config_repo.get_confocal_settings()
 
 # Camera mappings (legacy)
 camera_config = config_repo.get_camera_mappings()
@@ -149,12 +145,11 @@ if filter_wheel_registry:
     filter_name = filter_wheel_registry.get_filter_name("Emission Filter Wheel", position=2)
 
 # Convenience methods for UI dropdowns
-camera_names = config_repo.get_camera_names()      # Returns [] if no registry
-wheel_names = config_repo.get_filter_wheel_names() # Returns [] if no registry
+camera_names = config_repo.get_camera_names()          # Returns [] if no registry
+wheel_names = config_repo.get_all_filter_wheel_names() # Standalone + confocal wheels
 
 # Save machine configs (updates cache)
 config_repo.save_illumination_config(ill_config)
-config_repo.save_confocal_config(confocal_config)
 config_repo.save_camera_mappings(camera_config)
 config_repo.save_camera_registry(camera_registry)
 config_repo.save_filter_wheel_registry(filter_wheel_registry)
@@ -449,19 +444,22 @@ laser_af.set_reference_image(new_reference)
 laser_af.set_reference_image(None)
 ```
 
-### ConfocalConfig
+### ConfocalDeviceSettings
+
+Typed view of `devices.xlight.config` / `devices.dragonfly.config`.
 
 ```python
-from control.models import ConfocalConfig
+from control.models import ConfocalDeviceSettings
 
-config = config_repo.get_confocal_config()
-if config:
-    # Get filter name
-    filter_name = config.get_filter_name(wheel_id=1, slot=2)
+settings = config_repo.get_confocal_settings()   # None if no confocal device
+if settings:
+    slot_count = settings.emission_filter_positions   # len(positions), else 8
+    wheel = settings.build_emission_wheel_definition()  # FilterWheelDefinition | None
+    iris = settings.illumination_iris_default
 
-    # Check if property is available
-    if config.has_property("illumination_iris"):
-        ...
+# Or straight from a device entry
+name, entry = config_repo.get_machine_config().get_confocal_device()
+settings = ConfocalDeviceSettings.from_device_entry(entry)
 ```
 
 ### CameraMappingsConfig (Legacy)
@@ -618,27 +616,22 @@ Located in `control/default_config_generator.py`:
 ```python
 from control.default_config_generator import (
     ensure_default_configs,
-    generate_default_configs,
+    generate_default_observation_state,
     has_legacy_configs_to_migrate,
 )
 
-# Ensure profile has defaults (called automatically by load_profile)
-generated = ensure_default_configs(
-    config_repo,
-    profile="my_profile",
-    objectives=["20x", "40x"]
-)
+# Ensure profile has defaults (called automatically by load_profile).
+# Confocal iris defaults are read from the confocal device entry.
+generated = ensure_default_configs(config_repo, profile="my_profile")
 
 # Check for legacy configs that need migration
 if has_legacy_configs_to_migrate("my_profile", base_path=Path("software/")):
     print("Run migration script first")
 
-# Generate configs programmatically
-general, objectives = generate_default_configs(
+# Generate an observation state programmatically
+general = generate_default_observation_state(
     illumination_config,
-    confocal_config,
-    objectives=["20x", "40x"],
-    camera_id="1"
+    confocal_settings=config_repo.get_confocal_settings(),
 )
 ```
 
@@ -729,9 +722,9 @@ Many methods return `None` if config doesn't exist:
 
 ```python
 # Safe access pattern
-confocal = config_repo.get_confocal_config()
+confocal = config_repo.get_confocal_settings()
 if confocal is not None:
-    # System has confocal
+    # System has a confocal device enabled
     ...
 
 # Safe channel access

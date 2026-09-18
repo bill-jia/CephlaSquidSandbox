@@ -193,12 +193,29 @@ devices:
       serial_number: "A9KI1SXRA"
     config:
       sleep_time_for_wheel: 0.25
-      # ---- Not yet read by control code (see docs/pending plan) ----
-      # Legacy ini keys carried over so nothing is lost:
-      validate_wheel_pos: false          # xlight_validate_wheel_pos
-      emission_filter_positions: 8       # XLIGHT_EMISSION_FILTER_POSITIONS (8 = V3, 5 = Cicero)
-      illumination_iris_default: 80      # XLIGHT_ILLUMINATION_IRIS_DEFAULT
-      emission_iris_default: 100         # XLIGHT_EMISSION_IRIS_DEFAULT
+      validate_wheel_pos: false          # read the wheel back after each move
+      # Seeds ObservationState.confocal_hardware_settings the first time an
+      # iris is edited in the GUI.
+      illumination_iris_default: 80
+      emission_iris_default: 100
+      # The unit's built-in emission wheel.  len(positions) is the slot count
+      # the driver accepts (8 = X-Light V3, 5 = Cicero), and these names fill
+      # the observation-state editor's filter-position picker.  The per-state
+      # "default" position is what ObservationStateController.apply_optical_path
+      # sends to xlight.set_emission_filter().  (The legacy ini's
+      # xlight_emission_filter_mapping was dead code -- positions came from
+      # per-channel filter_position in general.yaml, all = 1.)
+      emission_filter_wheel:
+        name: "XLight emission wheel"
+        positions:
+          1: "Position 1"
+          2: "Position 2"
+          3: "Position 3"
+          4: "Position 4"
+          5: "Position 5"
+          6: "Position 6"
+          7: "Position 7"
+          8: "Position 8"
 
 illumination_channels_file: illumination_channel_config.yaml
 
@@ -254,41 +271,6 @@ illumination_devices:
       unified: true
       unified_channel_name: "LED matrix"
     channels: {}
-
-# ============================================================
-# FILTER WHEELS
-# The X-Light's built-in 8-position emission wheel.  Declared in the
-# standalone registry because the observation-state editor's
-# filter-position picker only reads this registry; the per-state
-# "default" position is what ObservationStateController.apply_optical_path
-# sends to xlight.set_emission_filter().  (The legacy ini's
-# xlight_emission_filter_mapping was dead code -- positions came from
-# per-channel filter_position in general.yaml, all = 1.)
-# ============================================================
-
-filter_wheel_registry:
-  version: 1.0
-  filter_wheels:
-    - name: "XLight emission wheel"
-      id: 1
-      type: emission
-      positions:
-        1: "Position 1"
-        2: "Position 2"
-        3: "Position 3"
-        4: "Position 4"
-        5: "Position 5"
-        6: "Position 6"
-        7: "Position 7"
-        8: "Position 8"
-
-# Confocal model.  NOT read from here yet: ConfigRepository only loads
-# machine_configs/confocal_config.yaml (a global file shared by every
-# library config).  Until the embedded form is supported (see plan), copy
-# this block to machine_configs/confocal_config.yaml on the X-Light rig.
-confocal:
-  version: 1
-  model: xlight_v3
 
 software:
   is_hcs: true

@@ -480,7 +480,6 @@ class ObservationStateController:
                         self.microscope.addons.xlight.set_emission_filter(
                             emission_filter_position,
                             extraction=False,
-                            validate=XLIGHT_VALIDATE_WHEEL_POS,
                         )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)

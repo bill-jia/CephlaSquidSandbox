@@ -27,7 +27,7 @@ from control.lighting import (
     ShutterControlMode,
 )
 from control.microcontroller import Microcontroller
-from control.models.machine_config import MachineConfig, DeviceEntry, IlluminationDeviceEntry
+from control.models.machine_config import ConfocalDeviceSettings, MachineConfig, DeviceEntry, IlluminationDeviceEntry
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
 from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController, LightSource
@@ -112,12 +112,15 @@ class MicroscopeAddons:
         xlight = None
         xlight_entry = _dev("xlight")
         if xlight_entry:
-            if not _sim("xlight"):
-                sn = xlight_entry.connection.serial_number if xlight_entry.connection else ""
-                sleep_time = xlight_entry.config.get("sleep_time_for_wheel", 0.25)
-                xlight = serial_peripherals.XLight(sn, sleep_time)
-            else:
-                xlight = serial_peripherals.XLight_Simulation()
+            settings = ConfocalDeviceSettings.from_device_entry(xlight_entry)
+            sn = xlight_entry.connection.serial_number if xlight_entry.connection else ""
+            cls_ = serial_peripherals.XLight_Simulation if _sim("xlight") else serial_peripherals.XLight
+            xlight = cls_(
+                sn,
+                sleep_time_for_wheel=settings.sleep_time_for_wheel,
+                validate_wheel_pos=settings.validate_wheel_pos,
+                emission_filter_positions=settings.emission_filter_positions,
+            )
 
         dragonfly = None
         dragonfly_entry = _dev("dragonfly")

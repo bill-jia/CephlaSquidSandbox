@@ -39,7 +39,6 @@ from control.models import (
     AcquisitionOutputConfig,
     CameraMappingsConfig,
     CameraRegistryConfig,
-    ConfocalConfig,
     FilterWheelDefinition,
     FilterWheelRegistryConfig,
     FilterWheelType,
@@ -51,6 +50,7 @@ from control.models import (
     MachineConfig,
     build_default_machine_config,
 )
+from control.models.machine_config import ConfocalDeviceSettings
 from control.models.hardware_bindings import (
     FilterWheelReference,
     HardwareBindingsConfig,
@@ -79,7 +79,6 @@ class ConfigRepository:
         software/
         ├── machine_configs/
         │   ├── illumination_channel_config.yaml
-        │   ├── confocal_config.yaml (optional)
         │   ├── camera_mappings.yaml (legacy)
         │   ├── cameras.yaml (v1.1 - camera registry)
         │   └── filter_wheels.yaml (v1.1 - filter wheel registry)
@@ -305,10 +304,8 @@ class ConfigRepository:
         # Ensure default configs exist (lazy import to avoid circular dependency)
         try:
             from control.default_config_generator import ensure_default_configs
-            import control._def
 
-            include_confocal = getattr(control._def, "ENABLE_SPINNING_DISK_CONFOCAL", False)
-            if ensure_default_configs(self, profile, include_confocal=include_confocal):
+            if ensure_default_configs(self, profile):
                 logger.info(f"Generated default configs for profile '{profile}'")
         except ImportError as e:
             # Expected if running without full dependencies or in test environment
@@ -566,17 +563,12 @@ class ConfigRepository:
             self._machine_cache[cache_key] = loaded
         return self._machine_cache[cache_key]
 
-    def get_confocal_config(self) -> Optional[ConfocalConfig]:
-        """
-        Load confocal configuration (cached).
+    def get_confocal_settings(self) -> Optional[ConfocalDeviceSettings]:
+        """Settings of the enabled confocal device (``devices.xlight`` / ``devices.dragonfly``).
 
-        Returns None if confocal_config.yaml doesn't exist (system has no confocal).
+        Returns None when no confocal unit is enabled.
         """
-        cache_key = "confocal"
-        if cache_key not in self._machine_cache:
-            path = self.machine_configs_path / "confocal_config.yaml"
-            self._machine_cache[cache_key] = self._load_yaml(path, ConfocalConfig)
-        return self._machine_cache[cache_key]
+        return self.get_machine_config().get_confocal_settings()
 
     def get_camera_mappings(self) -> Optional[CameraMappingsConfig]:
         """Load camera mappings configuration (cached)."""
@@ -586,21 +578,11 @@ class ConfigRepository:
             self._machine_cache[cache_key] = self._load_yaml(path, CameraMappingsConfig)
         return self._machine_cache[cache_key]
 
-    def has_confocal(self) -> bool:
-        """Check if system has confocal hardware."""
-        return self.get_confocal_config() is not None
-
     def save_illumination_config(self, config: IlluminationChannelConfig) -> None:
         """Save illumination channel configuration and update cache."""
         path = self.machine_configs_path / "illumination_channel_config.yaml"
         self._save_yaml(path, config)
         self._machine_cache["illumination"] = config
-
-    def save_confocal_config(self, config: ConfocalConfig) -> None:
-        """Save confocal configuration and update cache."""
-        path = self.machine_configs_path / "confocal_config.yaml"
-        self._save_yaml(path, config)
-        self._machine_cache["confocal"] = config
 
     def save_camera_mappings(self, config: CameraMappingsConfig) -> None:
         """Save camera mappings configuration and update cache."""
@@ -663,12 +645,6 @@ class ConfigRepository:
             return registry.get_camera_names()
         return []
 
-    def get_filter_wheel_names(self) -> List[str]:
-        """Get list of available filter wheel names from registry."""
-        registry = self.get_filter_wheel_registry()
-        if registry:
-            return registry.get_wheel_names()
-        return []
 
     # ───────────────────────────────────────────────────────────────────────────
     # v1.1 Hardware Bindings and Filter Wheel Aggregation
@@ -705,7 +681,7 @@ class ConfigRepository:
 
         Returns a dict mapping source name to list of wheels:
         - "standalone": wheels from embedded ``machine_config.filter_wheel_registry`` or ``filter_wheels.yaml``
-        - "confocal": wheels from confocal_config.yaml
+        - "confocal": the emission wheel declared by the confocal device entry
 
         Each source has its own ID namespace (no global conflicts).
         """
@@ -716,12 +692,21 @@ class ConfigRepository:
         if registry and registry.filter_wheels:
             result[FILTER_WHEEL_SOURCE_STANDALONE] = list(registry.filter_wheels)
 
-        # Confocal wheels from confocal_config.yaml
-        confocal = self.get_confocal_config()
-        if confocal and confocal.filter_wheels:
-            result[FILTER_WHEEL_SOURCE_CONFOCAL] = list(confocal.filter_wheels)
+        # Confocal wheel from devices.xlight / devices.dragonfly
+        confocal = self.get_confocal_settings()
+        if confocal is not None:
+            wheel = confocal.build_emission_wheel_definition()
+            if wheel is not None:
+                result[FILTER_WHEEL_SOURCE_CONFOCAL] = [wheel]
 
         return result
+
+    def get_all_filter_wheel_names(self) -> List[str]:
+        """Names of every filter wheel, standalone and confocal, in source order."""
+        names: List[str] = []
+        for wheels in self.get_all_filter_wheels().values():
+            names.extend(w.name for w in wheels if w.name is not None)
+        return names
 
     def get_emission_wheels(self) -> Dict[str, List[FilterWheelDefinition]]:
         """
@@ -775,8 +760,8 @@ class ConfigRepository:
         )
         logger.warning(
             f"Filter wheel reference not found: {ref}. {available_info}. "
-            f"Check that hardware_bindings.yaml references match your "
-            f"filter_wheels.yaml or confocal.yaml."
+            f"Check that hardware_bindings references match your standalone "
+            f"filter wheel registry or the confocal device's emission_filter_wheel."
         )
         return None
 
@@ -914,9 +899,9 @@ class ConfigRepository:
 
         if location == "confocal_hw":
             if state.confocal_hardware_settings is None:
-                from control.default_config_generator import build_confocal_settings_from_config
+                from control.default_config_generator import build_confocal_settings
 
-                state.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
+                state.confocal_hardware_settings = build_confocal_settings(self.get_confocal_settings())
             setattr(state.confocal_hardware_settings, field, value)
         elif location == "camera":
             if state.camera_settings is None:

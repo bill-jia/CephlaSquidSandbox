@@ -152,8 +152,27 @@ class SerialDeviceError(RuntimeError):
     pass
 
 
+def _validate_emission_filter_position(position, slot_count: int) -> None:
+    """Raise ValueError unless ``position`` is a slot the wheel actually has."""
+    valid_positions = [str(i + 1) for i in range(slot_count)]
+    if str(position) not in valid_positions:
+        raise ValueError(f"Invalid emission filter position {position}, must be 1-{slot_count}")
+
+
 class XLight_Simulation:
-    def __init__(self):
+    def __init__(
+        self,
+        SN=None,
+        sleep_time_for_wheel=0.25,
+        validate_wheel_pos=False,
+        emission_filter_positions=8,
+        disable_emission_filter_wheel=False,
+    ):
+        self.sleep_time_for_wheel = sleep_time_for_wheel
+        self.validate_wheel_pos = validate_wheel_pos
+        self.emission_filter_positions = emission_filter_positions
+        self.disable_emission_filter_wheel = disable_emission_filter_wheel
+
         self.has_spinning_disk_motor = True
         self.has_spinning_disk_slider = True
         self.has_dichroic_filters_wheel = True
@@ -172,7 +191,10 @@ class XLight_Simulation:
         self.emission_iris = 0
         self.slider_position = 0
 
-    def set_emission_filter(self, position, extraction=False, validate=False):
+    def set_emission_filter(self, position, extraction=False, validate=None):
+        if self.disable_emission_filter_wheel:
+            return -1
+        _validate_emission_filter_position(position, self.emission_filter_positions)
         self.emission_wheel_pos = position
         return position
 
@@ -241,7 +263,14 @@ class XLight:
     Supports V1, V2, V3, and Cicero with automatic protocol detection.
     """
 
-    def __init__(self, SN, sleep_time_for_wheel=0.25, disable_emission_filter_wheel=False):
+    def __init__(
+        self,
+        SN,
+        sleep_time_for_wheel=0.25,
+        validate_wheel_pos=False,
+        emission_filter_positions=8,
+        disable_emission_filter_wheel=False,
+    ):
         self.log = squid.logging.get_logger(self.__class__.__name__)
 
         self.has_spinning_disk_motor = False
@@ -254,6 +283,8 @@ class XLight:
         self.has_dichroic_filter_slider = False
         self.has_ttl_control = False
         self.sleep_time_for_wheel = sleep_time_for_wheel
+        self.validate_wheel_pos = validate_wheel_pos
+        self.emission_filter_positions = emission_filter_positions
         self.disable_emission_filter_wheel = disable_emission_filter_wheel
         self.slider_position = 0
         self.illumination_iris = 0
@@ -335,15 +366,13 @@ class XLight:
             )
         )
 
-    def set_emission_filter(self, position, extraction=False, validate=True):
+    def set_emission_filter(self, position, extraction=False, validate=None):
         if self.disable_emission_filter_wheel:
             self.log.info("Emission filter wheel disabled, skipping set_emission_filter")
             return -1
-        valid_positions = [str(i + 1) for i in range(XLIGHT_EMISSION_FILTER_POSITIONS)]
-        if str(position) not in valid_positions:
-            raise ValueError(
-                f"Invalid emission filter position {position}, must be 1-{XLIGHT_EMISSION_FILTER_POSITIONS}"
-            )
+        _validate_emission_filter_position(position, self.emission_filter_positions)
+        if validate is None:
+            validate = self.validate_wheel_pos
         position_to_write = str(position)
         position_to_read = str(position)
         if extraction:

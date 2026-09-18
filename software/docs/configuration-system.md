@@ -15,7 +15,6 @@ software/
 │   ├── cameras.yaml                      # Optional: camera registry
 │   ├── filter_wheels.yaml                # Optional: standalone filter wheels (ignored if embedded registry is non-empty)
 │   ├── hardware_bindings.yaml            # Optional: camera→wheel mappings (ignored if embedded in machine_config.yaml)
-│   ├── confocal_config.yaml              # Optional: confocal settings + wheels
 │   └── intensity_calibrations/           # Optional: power calibration CSVs
 │
 └── user_profiles/                      # User preferences (per profile)
@@ -213,43 +212,61 @@ filter_wheels:
 - **Emission filter wheels** (most common, 0-1 per system): Referenced by acquisition channels via `filter_wheel` and `filter_position` fields in user profile configs
 - **Excitation filter wheels** (rare): Referenced by illumination channels via `excitation_filter_wheel` and `excitation_filter_position` fields in machine config
 
-### confocal_config.yaml (Optional)
+### Confocal settings (`devices.xlight` / `devices.dragonfly`)
 
-Only create this file if the system has a confocal unit. Its presence indicates that confocal settings should be included in acquisition configs. Filter wheels built into the confocal unit are defined here (not in `filter_wheels.yaml`).
+Everything a spinning-disk confocal unit needs lives under its own device entry
+in `machine_config.yaml` — there is no separate confocal config file. The
+presence of an **enabled** `xlight` or `dragonfly` device is what marks the
+system as confocal.
 
-> **Note**: Filter wheels in this file are referenced with the `confocal` source prefix in `hardware_bindings.yaml` (e.g., `confocal.1`), while wheels in `filter_wheels.yaml` use the `standalone` source prefix.
+> **Note**: The wheel declared here is referenced with the `confocal` source
+> prefix in `hardware_bindings` (e.g., `confocal.1`), while wheels in
+> `filter_wheels.yaml` / `filter_wheel_registry` use the `standalone` prefix.
 
 ```yaml
-version: 1
-
-# Filter wheels built into the confocal unit
-filter_wheels:
-  - name: "Emission Wheel"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
-      2: "BP 525/50"
-      3: "BP 600/50"
-      4: "BP 700/75"
-      5: "LP 650"
-
-# Properties available for configuration
-public_properties:
-  - emission_filter_wheel_position
-
-objective_specific_properties:
-  - illumination_iris
-  - emission_iris
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    connection:
+      serial_number: "A9KI1SXRA"
+    config:
+      sleep_time_for_wheel: 0.25       # seconds to wait after a wheel move
+      validate_wheel_pos: false        # read the wheel back after each move
+      illumination_iris_default: 80    # seeds confocal_hardware_settings
+      emission_iris_default: 100
+      emission_filter_wheel:
+        name: "XLight emission wheel"  # optional; defaults to "Emission Wheel"
+        positions:
+          1: "Empty"
+          2: "BP 525/50"
+          3: "BP 600/50"
+          4: "BP 700/75"
+          5: "LP 650"
 ```
 
-**Fields:**
+**Fields (`ConfocalDeviceSettings`):**
 
-| Field | Description |
-|-------|-------------|
-| `filter_wheels` | List of filter wheel definitions (same format as `filter_wheels.yaml`) |
-| `public_properties` | Properties available in `general.yaml` |
-| `objective_specific_properties` | Properties only in objective-specific files |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sleep_time_for_wheel` | `0.25` | Seconds the driver waits after a wheel move |
+| `validate_wheel_pos` | `false` | Default for `XLight.set_emission_filter(validate=...)`: read the position back after each move |
+| `illumination_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.illumination_iris` |
+| `emission_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.emission_iris` |
+| `emission_filter_wheel.name` | `"Emission Wheel"` | Name shown in filter wheel dropdowns |
+| `emission_filter_wheel.positions` | `{}` | Slot number → filter name; `len(positions)` is the slot count the driver accepts (8 = X-Light V3, 5 = Cicero). Omitted → the driver falls back to 8 slots and no wheel is published to the UI. |
+
+Unknown keys in this block are rejected, so typos surface at startup.
+
+**How it is consumed:**
+- `MicroscopeAddons.build_from_global_config` passes `sleep_time_for_wheel`,
+  `validate_wheel_pos` and the slot count into `XLight` / `XLight_Simulation`.
+- `ConfigRepository.get_all_filter_wheels()` publishes the declared wheel under
+  the `"confocal"` source, so `hardware_bindings` refs like `confocal.1` and the
+  observation-state editor's filter-position picker both resolve it without a
+  duplicate `filter_wheel_registry` entry.
+- The iris defaults seed `confocal_hardware_settings` the first time an iris is
+  edited, and when default configs are generated for a new profile.
 
 ### hardware_bindings.yaml (Optional)
 
@@ -260,8 +277,8 @@ Maps cameras to their associated filter wheels using **source-qualified referenc
 **Source-Qualified References:**
 
 Filter wheels can come from two sources:
-- **`standalone`**: Defined in `filter_wheels.yaml`
-- **`confocal`**: Defined in `confocal_config.yaml`
+- **`standalone`**: Defined in `filter_wheels.yaml` (or the embedded `filter_wheel_registry`)
+- **`confocal`**: Derived from the confocal device entry's `config.emission_filter_wheel`
 
 References use the format `source.identifier` where identifier can be an ID or name:
 - `confocal.1` - confocal wheel with ID 1
@@ -463,9 +480,9 @@ This file captures the exact settings used, including:
    - Re-run calibration if laser power changes
    - Store calibration CSVs in `machine_configs/intensity_calibrations/`
 
-3. **Confocal config presence matters**
-   - Create `confocal_config.yaml` only if confocal exists
-   - File presence enables confocal settings in acquisition configs
+3. **Confocal presence matters**
+   - Enable `devices.xlight` (or `devices.dragonfly`) only if a confocal unit exists
+   - An enabled confocal device is what enables confocal settings in acquisition configs
 
 ---
 

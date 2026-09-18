@@ -7,22 +7,19 @@ Tests default configuration generation functions.
 import pytest
 
 from control.default_config_generator import (
-    ALL_IRIS_DEFAULTS,
     DEFAULT_EXPOSURE_TIME_MS,
     DEFAULT_GAIN_MODE,
     DEFAULT_ILLUMINATION_INTENSITY,
-    build_confocal_settings_from_config,
-    create_general_observation_state,
-    create_objective_override,
-    generate_default_configs,
-    generate_general_config,
+    DEFAULT_LED_ILLUMINATION_INTENSITY,
+    build_confocal_settings,
+    generate_default_observation_state,
     get_display_color_for_channel,
 )
 from control.models import (
     IlluminationChannel,
     IlluminationChannelConfig,
 )
-from control.models.confocal_config import ConfocalConfig
+from control.models.machine_config import ConfocalDeviceSettings, DeviceEntry
 from control.models.illumination_config import (
     DEFAULT_LED_COLOR,
     DEFAULT_WAVELENGTH_COLORS,
@@ -55,35 +52,7 @@ class TestDefaultConfigGenerator:
         color = get_display_color_for_channel(channel)
         assert color == DEFAULT_LED_COLOR
 
-    def test_create_general_observation_state(self):
-        ill_channel = IlluminationChannel(
-            name="Fluorescence 488nm",
-            type=IlluminationType.EPI_ILLUMINATION,
-            wavelength_nm=488,
-            controller_port="D1",
-            source_code=11,
-        )
-        state = create_general_observation_state(ill_channel, include_confocal=False)
-        assert state.name == "Fluorescence 488nm"
-        assert state.camera_settings.exposure_time_ms == DEFAULT_EXPOSURE_TIME_MS
-        assert state.camera_settings.gain_mode == DEFAULT_GAIN_MODE
-        assert len(state.illuminator_states) == 1
-        assert state.illuminator_states[0].intensity == DEFAULT_ILLUMINATION_INTENSITY
-
-    def test_create_objective_override_with_confocal(self):
-        ill_channel = IlluminationChannel(
-            name="Fluorescence 488nm",
-            type=IlluminationType.EPI_ILLUMINATION,
-            wavelength_nm=488,
-            controller_port="D1",
-            source_code=11,
-        )
-        override = create_objective_override(ill_channel, include_confocal=True)
-        assert override.confocal_hardware_settings is not None
-        assert override.confocal_hardware_settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert override.confocal_hardware_settings.emission_iris == ALL_IRIS_DEFAULTS["emission_iris"]
-
-    def test_generate_general_config(self):
+    def test_generate_default_observation_state(self):
         illumination_config = IlluminationChannelConfig(
             version=1,
             channels=[
@@ -102,10 +71,20 @@ class TestDefaultConfigGenerator:
                 ),
             ],
         )
-        general_config = generate_general_config(illumination_config)
-        assert len(general_config.observation_states) == 2
+        state = generate_default_observation_state(illumination_config)
 
-    def test_generate_default_configs(self):
+        assert state.camera_settings.exposure_time_ms == DEFAULT_EXPOSURE_TIME_MS
+        assert state.camera_settings.gain_mode == DEFAULT_GAIN_MODE
+        assert len(state.illuminator_states) == 2
+        assert state.illuminator_states[0].on is True
+        assert state.illuminator_states[0].intensity == DEFAULT_ILLUMINATION_INTENSITY
+        assert state.illuminator_states[1].on is False
+        assert state.illuminator_states[1].intensity == DEFAULT_LED_ILLUMINATION_INTENSITY
+        # No confocal device: no confocal block at all
+        assert state.confocal_hardware_settings is None
+
+    def test_generate_default_observation_state_with_confocal(self):
+        """Iris defaults come from the confocal device entry, not a hard-coded 100."""
         illumination_config = IlluminationChannelConfig(
             version=1,
             channels=[
@@ -118,107 +97,41 @@ class TestDefaultConfigGenerator:
                 ),
             ],
         )
-        general, objectives = generate_default_configs(
+        state = generate_default_observation_state(
             illumination_config,
-            objectives=["10x", "20x"],
+            confocal_settings=ConfocalDeviceSettings(
+                illumination_iris_default=80,
+                emission_iris_default=60,
+            ),
         )
-        assert len(general.observation_states) == 1
-        assert "10x" in objectives
-        assert "20x" in objectives
 
-    def test_generate_default_configs_with_confocal(self):
-        illumination_config = IlluminationChannelConfig(
-            version=1,
-            channels=[
-                IlluminationChannel(
-                    name="Channel A",
-                    type=IlluminationType.EPI_ILLUMINATION,
-                    wavelength_nm=488,
-                    controller_port="D1",
-                    source_code=11,
-                ),
-            ],
-        )
-        general, objectives = generate_default_configs(
-            illumination_config,
-            include_confocal=True,
-            objectives=["20x"],
-        )
-        assert general.observation_states[0].confocal_hardware_settings is None
-        assert objectives["20x"].overrides[0].confocal_hardware_settings is not None
+        assert state.confocal_hardware_settings is not None
+        assert state.confocal_hardware_settings.illumination_iris == 80.0
+        assert state.confocal_hardware_settings.emission_iris == 60.0
 
 
-class TestBuildConfocalSettingsFromConfig:
-    """Tests for build_confocal_settings_from_config()."""
+class TestBuildConfocalSettings:
+    """Tests for build_confocal_settings()."""
 
-    def test_no_config_returns_all_iris_defaults(self):
-        settings = build_confocal_settings_from_config(None)
-        assert settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert settings.emission_iris == ALL_IRIS_DEFAULTS["emission_iris"]
-
-    def test_model_xlight_v3_returns_both_iris(self):
-        config = ConfocalConfig(model="xlight_v3")
-        settings = build_confocal_settings_from_config(config)
+    def test_no_settings_returns_model_defaults(self):
+        settings = build_confocal_settings(None)
         assert settings.illumination_iris == 100.0
         assert settings.emission_iris == 100.0
 
-    def test_model_cicero_returns_empty_settings(self):
-        config = ConfocalConfig(model="cicero")
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris is None
-        assert settings.emission_iris is None
-
-    def test_model_xlight_v2_returns_empty_settings(self):
-        config = ConfocalConfig(model="xlight_v2")
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris is None
-        assert settings.emission_iris is None
-
-    def test_unknown_model_falls_back_to_string_list(self):
-        config = ConfocalConfig(
-            model="unknown_model",
-            objective_specific_properties=["illumination_iris"],
+    def test_device_defaults_are_used(self):
+        device_settings = ConfocalDeviceSettings(
+            illumination_iris_default=80,
+            emission_iris_default=60,
         )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert settings.emission_iris is None
+        settings = build_confocal_settings(device_settings)
+        assert settings.illumination_iris == 80.0
+        assert settings.emission_iris == 60.0
 
-    def test_config_with_both_iris_properties(self):
-        config = ConfocalConfig(
-            objective_specific_properties=["illumination_iris", "emission_iris"],
+    def test_settings_from_device_entry(self):
+        entry = DeviceEntry(
+            driver="xlight",
+            config={"illumination_iris_default": 80, "emission_iris_default": 45},
         )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert settings.emission_iris == ALL_IRIS_DEFAULTS["emission_iris"]
-
-    def test_config_with_only_illumination_iris(self):
-        config = ConfocalConfig(
-            objective_specific_properties=["illumination_iris"],
-        )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert settings.emission_iris is None
-
-    def test_config_with_only_emission_iris(self):
-        config = ConfocalConfig(
-            objective_specific_properties=["emission_iris"],
-        )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris is None
-        assert settings.emission_iris == ALL_IRIS_DEFAULTS["emission_iris"]
-
-    def test_config_with_empty_properties_no_iris(self):
-        config = ConfocalConfig(
-            objective_specific_properties=[],
-        )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris is None
-        assert settings.emission_iris is None
-
-    def test_config_ignores_non_iris_properties(self):
-        config = ConfocalConfig(
-            objective_specific_properties=["emission_filter_wheel_position", "illumination_iris"],
-        )
-        settings = build_confocal_settings_from_config(config)
-        assert settings.illumination_iris == ALL_IRIS_DEFAULTS["illumination_iris"]
-        assert settings.emission_iris is None
+        settings = build_confocal_settings(ConfocalDeviceSettings.from_device_entry(entry))
+        assert settings.illumination_iris == 80.0
+        assert settings.emission_iris == 45.0
