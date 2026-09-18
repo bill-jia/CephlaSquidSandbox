@@ -47,16 +47,31 @@ class CameraSettings(BaseModel):
 
 
 class ConfocalSettings(BaseModel):
-    """Confocal iris aperture settings.
+    """Confocal unit settings that belong to an observation state.
 
-    Note: Filter wheel selection is handled via hardware_bindings.yaml, not here.
-    The camera's bound filter wheel (confocal or standalone) is resolved at runtime.
+    The irises, the dichroic wheel and the dichroic filter slider are all part of
+    the light path, so a saved state has to carry them or loading it leaves the
+    optics wherever the last state left them.
+
+    Every field is ``None`` by default and ``None`` means *leave the hardware
+    alone*.  Presets saved before a field existed simply do not carry it, and
+    loading one must not invent a position and drive the mechanism to it — that
+    would move a dichroic or a 5-second slider on every old preset load.
+
+    Note: emission filter *wheel* selection lives on
+    ``ObservationState.emission_filter_positions``, not here.
     """
 
     illumination_iris: Optional[float] = Field(
         None, ge=0, le=100, description="Illumination iris aperture percentage (0-100)"
     )
     emission_iris: Optional[float] = Field(None, ge=0, le=100, description="Emission iris aperture percentage (0-100)")
+    dichroic_position: Optional[int] = Field(
+        None, ge=1, le=5, description="Dichroic wheel position (1-5); None leaves the wheel where it is"
+    )
+    filter_slider_position: Optional[int] = Field(
+        None, ge=0, le=3, description="Dichroic filter slider position (0-3); None leaves the slider where it is"
+    )
 
     model_config = {"extra": "forbid"}
 

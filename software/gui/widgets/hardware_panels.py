@@ -468,10 +468,13 @@ class SpinningDiskConfocalWidget(QWidget):
     signal_toggle_confocal_widefield = Signal(bool)
     signal_illumination_iris_changed = Signal(float)
     signal_emission_iris_changed = Signal(float)
-    # Emitted with the integer emission wheel slot chosen in this panel.  The
-    # move itself is performed by the observation state controller so the wheel
-    # position is recorded on (and saved with) the live observation state.
+    # Emitted with the position chosen in this panel.  The move itself is
+    # performed by the observation state controller so the choice is recorded on
+    # (and saved with) the live observation state rather than being a
+    # driver-only side effect the state never learns about.
     signal_emission_filter_changed = Signal(int)
+    signal_dichroic_changed = Signal(int)
+    signal_filter_slider_changed = Signal(int)
 
     def __init__(self, xlight, config_repo=None):
         super(SpinningDiskConfocalWidget, self).__init__()
@@ -479,34 +482,29 @@ class SpinningDiskConfocalWidget(QWidget):
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.xlight = xlight
         self.config_repo = config_repo
+        self.disk_position_state = 0
+        # Mechanisms this panel has already tried (and failed) to read directly.
+        self._probed = set()
 
         self.init_ui()
 
+        # Seed every control from what the unit is actually doing, *before* the
+        # change signals are connected. A control that starts on a made-up value
+        # (an iris slider at 0 on a unit whose iris is at 100) both lies to the
+        # user and becomes the value the next interaction pushes to hardware.
+        self.sync_from_observation_state(None)
+
         if self.xlight.has_emission_filters_wheel:
-            self.select_emission_filter_slot(self.xlight.get_emission_filter())
             self.dropdown_emission_filter.currentIndexChanged.connect(self.set_emission_filter)
         if self.xlight.has_dichroic_filters_wheel:
-            self.dropdown_dichroic.setCurrentText(str(self.xlight.get_dichroic()))
             self.dropdown_dichroic.currentIndexChanged.connect(self.set_dichroic)
         if self.xlight.has_dichroic_filter_slider:
-            self.filter_slider.setValue(self.xlight.get_filter_slider())
-
-        self.disk_position_state = self.xlight.get_disk_position()
-
-        self.signal_toggle_confocal_widefield.emit(self.disk_position_state)  # signal initial state
-
-        if self.disk_position_state == 1:
-            self.btn_toggle_widefield.setText("Switch to Widefield")
+            self.filter_slider.valueChanged.connect(self.set_filter_slider)
 
         self.btn_toggle_widefield.clicked.connect(self.toggle_disk_position)
         self.btn_toggle_motor.clicked.connect(self.toggle_motor)
 
-        if self.xlight.has_dichroic_filter_slider:
-            self.filter_slider.valueChanged.connect(self.set_filter_slider)
-
         if self.xlight.has_illumination_iris_diaphragm:
-            # Slider values are set from acquisition config via update_iris_from_config()
-            # after signal connections are established in gui.gui_hcs
             self.slider_illumination_iris.sliderReleased.connect(lambda: self.update_illumination_iris(True))
             # Update spinbox + apply on click-to-position (not during drag)
             self.slider_illumination_iris.valueChanged.connect(self._on_illumination_iris_value_changed)
@@ -535,8 +533,8 @@ class SpinningDiskConfocalWidget(QWidget):
         """Label-left rows so the panel stays narrow without wasting vertical space.
 
         Every control is constructed unconditionally (``enable_all_buttons`` and
-        ``update_iris_from_config`` touch them all); only the *placement* is gated
-        on the unit's reported capabilities.
+        ``sync_from_observation_state`` touch them all); only the *placement* is
+        gated on the unit's reported capabilities.
         """
         layout = QGridLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -723,41 +721,150 @@ class SpinningDiskConfocalWidget(QWidget):
         self.btn_toggle_widefield.setText("Switch to Widefield" if confocal else "Switch to Confocal")
 
     def set_dichroic(self, index):
+        """Emit the chosen dichroic wheel position.
+
+        Like the emission wheel, the move is performed by the observation state
+        controller so the position becomes part of the live state.
+        """
+        if self.dropdown_dichroic is None:
+            return
+        try:
+            position = int(self.dropdown_dichroic.currentText())
+        except (TypeError, ValueError):
+            return
         self.enable_all_buttons(False)
-        selected_pos = self.dropdown_dichroic.currentText()
-        self.xlight.set_dichroic(selected_pos)
-        self.enable_all_buttons(True)
+        try:
+            self.signal_dichroic_changed.emit(position)
+        finally:
+            self.enable_all_buttons(True)
 
     def _set_iris_ui(self, slider, spinbox, value):
         """Set an iris slider+spinbox pair to the given value."""
         slider.setValue(value)
         spinbox.setValue(value)
 
-    def update_iris_from_config(self, configuration):
-        """Update iris UI controls from a channel's confocal_hardware_settings."""
-        hw_settings = getattr(configuration, "confocal_hardware_settings", None)
-        self.block_iris_control_signals(True)
+    def _hardware_value(self, cache_attr, getter):
+        """Last-known hardware value for one mechanism, or None if unknown.
+
+        The driver caches every position it has driven (and seeds those caches
+        from the unit at construction), so the cache is both free and truthful;
+        the blocking serial read is only needed when it says "unknown".
+
+        That fallback read is attempted at most once per mechanism: this method
+        runs on every channel switch, including the ones a running acquisition
+        makes, and a mechanism the unit will not report must not put a blocking
+        serial round-trip on the UI thread over and over while frames are being
+        taken.
+        """
+        value = getattr(self.xlight, cache_attr, None)
+        if value is not None:
+            return value
+        if cache_attr in self._probed:
+            return None
+        self._probed.add(cache_attr)
         try:
-            for has_iris, iris_val, slider, spinbox in (
+            return getter()
+        except Exception:
+            self._log.warning("Could not read the X-Light %s", cache_attr, exc_info=True)
+            return None
+
+    def _block_change_signals(self, block: bool):
+        """Block every control whose change signal drives hardware or the state."""
+        self.block_iris_control_signals(block)
+        if self.dropdown_dichroic is not None:
+            self.dropdown_dichroic.blockSignals(block)
+        if self.dropdown_emission_filter is not None:
+            self.dropdown_emission_filter.blockSignals(block)
+        self.filter_slider.blockSignals(block)
+
+    def sync_from_observation_state(self, state=None):
+        """Show what the light path is doing, without touching it.
+
+        The single refresh entry point for this panel: called at construction and
+        whenever an observation state is applied from somewhere else (a preset,
+        the menu, a channel switch), so the panel follows the state instead of
+        keeping whatever the user last dialled in by hand.
+
+        Per control the displayed value is: the value carried by ``state`` if it
+        has one, else the driver's last-known hardware value. It is never a
+        widget default — a control falling back to its minimum is how an iris
+        physically at 100 came to read 0, and that displayed 0 is what the next
+        user interaction would have pushed to the hardware.
+
+        Purely a display update: every change signal is blocked for the duration,
+        so a refresh can never drive a 2 s iris write, a 5 s slider move, or a
+        write-back onto the state being displayed.
+        """
+        hw_settings = getattr(state, "confocal_hardware_settings", None)
+
+        def from_state(field):
+            return getattr(hw_settings, field, None) if hw_settings is not None else None
+
+        self._block_change_signals(True)
+        try:
+            for capable, state_value, cache_attr, getter, slider, spinbox in (
                 (
                     self.xlight.has_illumination_iris_diaphragm,
-                    getattr(hw_settings, "illumination_iris", None) if hw_settings else None,
+                    from_state("illumination_iris"),
+                    "illumination_iris",
+                    self.xlight.get_illumination_iris,
                     self.slider_illumination_iris,
                     self.spinbox_illumination_iris,
                 ),
                 (
                     self.xlight.has_emission_iris_diaphragm,
-                    getattr(hw_settings, "emission_iris", None) if hw_settings else None,
+                    from_state("emission_iris"),
+                    "emission_iris",
+                    self.xlight.get_emission_iris,
                     self.slider_emission_iris,
                     self.spinbox_emission_iris,
                 ),
             ):
-                if not has_iris:
+                if not capable:
                     continue
-                value = int(iris_val) if iris_val is not None else slider.minimum()
-                self._set_iris_ui(slider, spinbox, value)
+                value = state_value if state_value is not None else self._hardware_value(cache_attr, getter)
+                if value is not None:
+                    self._set_iris_ui(slider, spinbox, int(value))
+
+            if self.xlight.has_dichroic_filter_slider:
+                value = from_state("filter_slider_position")
+                if value is None:
+                    value = self._hardware_value("slider_position", self.xlight.get_filter_slider)
+                if value is not None:
+                    self.filter_slider.setValue(int(value))
+
+            if self.xlight.has_dichroic_filters_wheel and self.dropdown_dichroic is not None:
+                value = from_state("dichroic_position")
+                if value is None:
+                    value = self._hardware_value("dichroic_wheel_pos", self.xlight.get_dichroic)
+                if value is not None:
+                    self.dropdown_dichroic.setCurrentText(str(int(value)))
+
+            if self.xlight.has_emission_filters_wheel:
+                slot = getattr(state, "emission_filter_positions", None) or {}
+                slot = slot.get("default") if isinstance(slot, dict) else None
+                if slot is None:
+                    slot = self._hardware_value("emission_wheel_pos", self.xlight.get_emission_filter)
+                if slot is not None:
+                    self.select_emission_filter_slot(slot)
+
+            if state is not None:
+                confocal = bool(getattr(state, "confocal_mode", False))
+            else:
+                disk = self._hardware_value("spinning_disk_pos", self.xlight.get_disk_position)
+                confocal = bool(disk) if disk is not None else bool(self.disk_position_state)
+            self.set_confocal_mode_display(confocal)
+
+            if self.xlight.has_spinning_disk_motor:
+                # Not part of an ObservationState: the disk either spins for the
+                # whole session or it does not, so it only ever follows hardware.
+                running = self._hardware_value("disk_motor_state", self.xlight.get_disk_motor_state)
+                if running is not None:
+                    # setChecked emits `toggled`, never `clicked`, and `clicked`
+                    # is what drives the motor — so this cannot start the disk.
+                    self.btn_toggle_motor.setChecked(bool(running))
         finally:
-            self.block_iris_control_signals(False)
+            self._block_change_signals(False)
 
     def _on_illumination_iris_value_changed(self, value):
         """Handle illumination iris slider valueChanged — sync spinbox, apply on click-to-position."""
@@ -803,14 +910,25 @@ class SpinningDiskConfocalWidget(QWidget):
             self.signal_emission_iris_changed,
         )
 
+    def _apply_filter_slider_position(self, position):
+        """Hand the chosen slider position to whoever owns the observation state.
+
+        Runs on the worker thread started by ``set_filter_slider``: the slider is
+        a 5 s move and must not block the UI. ``signal_filter_slider_changed`` is
+        therefore connected with ``Qt.DirectConnection`` (see
+        ``HighContentScreeningGui.make_connections``) so the receiving controller
+        runs here rather than being queued back onto the UI thread.
+        """
+        self.signal_filter_slider_changed.emit(int(position))
+
     def set_filter_slider(self, index):
         self.enable_all_buttons(False)
-        position = str(self.filter_slider.value())
+        position = int(self.filter_slider.value())
 
         def on_finished(success, error_msg):
             QMetaObject.invokeMethod(self, "enable_all_buttons", Qt.QueuedConnection, Q_ARG(bool, True))
 
-        utils.threaded_operation_helper(self.xlight.set_filter_slider, on_finished, position=position)
+        utils.threaded_operation_helper(self._apply_filter_slider_position, on_finished, position=position)
 
     def get_confocal_mode(self) -> bool:
         """Get current confocal mode state.
@@ -2264,14 +2382,17 @@ class LiveControlWidget(QFrame):
             self.is_switching_mode = False
 
     def _persist_iris_config(self, setting_name, new_value):
+        """Record an iris aperture on the observation state.
+
+        Goes through the controller, which writes both the repository's cached
+        state (flushed to general.yaml) and the live state a preset is saved
+        from. Calling ``config_repo.update_channel_setting`` directly from here
+        used to pass the channel *name* as the setting, so every iris the user
+        dialled in was silently discarded ("unknown setting") and came back as 0
+        on the next start.
+        """
         if self.currentConfiguration:
-            ok = self.liveController.microscope.config_repo.update_channel_setting(
-                self.currentConfiguration.name,
-                setting_name,
-                new_value,
-            )
-            if not ok:
-                logger.warning("Failed to persist %s value %.1f", setting_name, new_value)
+            self.liveController.obs_controller.persist_iris_config(setting_name, new_value)
 
     def update_config_illumination_iris(self, new_value):
         self._persist_iris_config("IlluminationIris", new_value)

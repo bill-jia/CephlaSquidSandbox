@@ -183,18 +183,25 @@ class XLight_Simulation:
         self.has_dichroic_filter_slider = True
         self.has_ttl_control = True
 
+        # The simulated unit *is* the hardware, so its state is known from the
+        # start; on the real driver these are None until a move or a read-back.
         self.emission_wheel_pos = 1
         self.dichroic_wheel_pos = 1
         self.disk_motor_state = False
         self.spinning_disk_pos = 0
-        self.illumination_iris = 0
-        self.emission_iris = 0
+        # A real unit powers up with both irises wide open, and the GUI is
+        # expected to show what the hardware is actually doing.
+        self.illumination_iris = 100
+        self.emission_iris = 100
         self.slider_position = 0
 
     def set_emission_filter(self, position, extraction=False, validate=None):
         if self.disable_emission_filter_wheel:
             return -1
         _validate_emission_filter_position(position, self.emission_filter_positions)
+        position = int(position)
+        if not extraction and self.emission_wheel_pos == position:
+            return self.emission_wheel_pos
         self.emission_wheel_pos = position
         return position
 
@@ -202,6 +209,11 @@ class XLight_Simulation:
         return self.emission_wheel_pos
 
     def set_dichroic(self, position, extraction=False):
+        if str(position) not in ["1", "2", "3", "4", "5"]:
+            raise ValueError("Invalid dichroic wheel position!")
+        position = int(position)
+        if not extraction and self.dichroic_wheel_pos == position:
+            return self.dichroic_wheel_pos
         self.dichroic_wheel_pos = position
         return position
 
@@ -224,27 +236,30 @@ class XLight_Simulation:
 
     def set_illumination_iris(self, value):
         # value: 0 - 100
+        if self.illumination_iris == value:
+            return self.illumination_iris
         self.illumination_iris = value
-        print("illumination_iris", self.illumination_iris)
         return self.illumination_iris
 
     def get_illumination_iris(self):
-        self.illumination_iris = 100
         return self.illumination_iris
 
     def set_emission_iris(self, value):
         # value: 0 - 100
+        if self.emission_iris == value:
+            return self.emission_iris
         self.emission_iris = value
-        print("emission_iris", self.emission_iris)
         return self.emission_iris
 
     def get_emission_iris(self):
-        self.emission_iris = 100
         return self.emission_iris
 
     def set_filter_slider(self, position):
         if str(position) not in ["0", "1", "2", "3"]:
             raise ValueError("Invalid slider position!")
+        position = int(position)
+        if self.slider_position == position:
+            return self.slider_position
         self.slider_position = position
         return self.slider_position
 
@@ -290,9 +305,16 @@ class XLight:
         self.validate_wheel_pos = validate_wheel_pos
         self.emission_filter_positions = emission_filter_positions
         self.disable_emission_filter_wheel = disable_emission_filter_wheel
-        self.slider_position = 0
-        self.illumination_iris = 0
-        self.emission_iris = 0
+        # Last position this driver is known to have put the hardware in, used to
+        # skip redundant (and slow) serial writes. None means "unknown": nothing
+        # has been written or read back yet, so the next request always writes.
+        self.emission_wheel_pos = None
+        self.dichroic_wheel_pos = None
+        self.slider_position = None
+        self.illumination_iris = None
+        self.emission_iris = None
+        self.spinning_disk_pos = None
+        self.disk_motor_state = None
 
         # Auto-detect protocol: try V3 (115200) first, then V1/V2 (9600)
         self.protocol_version = self._connect_and_detect(SN)
@@ -308,7 +330,39 @@ class XLight:
             # V3/Cicero: use idc command for config
             self.parse_idc_response(self.serial_connection.write_and_read("idc\r"))
 
+        self.seed_caches_from_hardware()
         self.print_config()
+
+    def seed_caches_from_hardware(self) -> None:
+        """Ask the unit where every mechanism actually is, once, at startup.
+
+        The write-skipping in the setters below is only safe if the cache is
+        truthful.  Starting from a guessed value (0, say) on a unit whose iris is
+        physically wide open makes the first "close the iris to 0" request look
+        redundant, so it is silently dropped: the hardware stays open while the
+        software believes it closed, and the GUI shows 0 for an iris at 100.
+
+        Each read is guarded by the capability flag the unit reported and is
+        individually best-effort: a unit that will not answer leaves that cache
+        at None ("unknown"), which makes the next write happen rather than
+        breaking startup.
+        """
+        for capable, name, reader in (
+            (self.has_emission_filters_wheel and not self.disable_emission_filter_wheel,
+             "emission filter wheel", self.get_emission_filter),
+            (self.has_dichroic_filters_wheel, "dichroic wheel", self.get_dichroic),
+            (self.has_dichroic_filter_slider, "dichroic filter slider", self.get_filter_slider),
+            (self.has_illumination_iris_diaphragm, "illumination iris", self.get_illumination_iris),
+            (self.has_emission_iris_diaphragm, "emission iris", self.get_emission_iris),
+            (self.has_spinning_disk_slider, "spinning disk position", self.get_disk_position),
+            (self.has_spinning_disk_motor, "spinning disk motor", self.get_disk_motor_state),
+        ):
+            if not capable:
+                continue
+            try:
+                reader()
+            except Exception as e:
+                self.log.warning(f"Could not read the X-Light {name} at startup ({e}); it stays unknown")
 
     def _open_serial(self, SN, baudrate):
         """Open serial connection with specified baud rate."""
@@ -375,6 +429,15 @@ class XLight:
             self.log.info("Emission filter wheel disabled, skipping set_emission_filter")
             return -1
         _validate_emission_filter_position(position, self.emission_filter_positions)
+        position = int(position)
+        # A wheel move costs sleep_time_for_wheel (0.25 s by default) and a
+        # multi-channel acquisition asks for the same slot on every channel
+        # switch (one quad-band filter for the whole run is the common case).
+        # emission_wheel_pos is the slot this driver last put the wheel in, so a
+        # request for it is already satisfied. An extraction move writes a
+        # different command, so it is never skipped.
+        if not extraction and self.emission_wheel_pos == position:
+            return self.emission_wheel_pos
         if validate is None:
             validate = self.validate_wheel_pos
         position_to_write = str(position)
@@ -382,6 +445,10 @@ class XLight:
         if extraction:
             position_to_write += "m"
 
+        # The wheel's position is unknown while the move is in flight: a write
+        # that raises must not leave a cached slot behind for the next call to
+        # skip, it must make the next call retry.
+        self.emission_wheel_pos = None
         if validate:
             current_pos = self.serial_connection.write_and_check(
                 "B" + position_to_write + "\r", "B" + position_to_read, read_delay=self.sleep_time_for_wheel
@@ -402,11 +469,21 @@ class XLight:
     def set_dichroic(self, position, extraction=False):
         if str(position) not in ["1", "2", "3", "4", "5"]:
             raise ValueError("Invalid dichroic wheel position!")
+        position = int(position)
+        # Same dedup as set_emission_filter: a dichroic move sleeps
+        # sleep_time_for_wheel, and consecutive observation states usually name
+        # the same dichroic. An extraction move writes a different command, so it
+        # is never skipped.
+        if not extraction and self.dichroic_wheel_pos == position:
+            return self.dichroic_wheel_pos
         position_to_write = str(position)
         position_to_read = str(position)
         if extraction:
             position_to_write += "m"
 
+        # Unknown while the move is in flight, so a write that raises makes the
+        # next call retry instead of being skipped as already-satisfied.
+        self.dichroic_wheel_pos = None
         current_pos = self.serial_connection.write_and_check(
             "C" + position_to_write + "\r", "C" + position_to_read, read_delay=self.sleep_time_for_wheel
         )
@@ -438,10 +515,13 @@ class XLight:
 
     def set_illumination_iris(self, value):
         # value: 0 - 100
-        if value == self.illumination_iris:
+        # Same dedup as set_emission_filter: the iris round-trip sleeps 2 s, and
+        # consecutive observation states usually carry the same aperture.
+        if self.illumination_iris == value:
             return self.illumination_iris
-        self.illumination_iris = value
+        self.illumination_iris = None
         self.serial_connection.write_and_read("J" + str(int(10 * value)) + "\r", read_delay=2)
+        self.illumination_iris = value
         return self.illumination_iris
 
     def get_illumination_iris(self):
@@ -451,10 +531,11 @@ class XLight:
 
     def set_emission_iris(self, value):
         # value: 0 - 100
-        if value == self.emission_iris:
+        if self.emission_iris == value:
             return self.emission_iris
-        self.emission_iris = value
+        self.emission_iris = None
         self.serial_connection.write_and_read("V" + str(int(10 * value)) + "\r", read_delay=2)
+        self.emission_iris = value
         return self.emission_iris
 
     def get_emission_iris(self):
@@ -465,10 +546,19 @@ class XLight:
     def set_filter_slider(self, position):
         if str(position) not in ["0", "1", "2", "3"]:
             raise ValueError("Invalid slider position!")
-        self.slider_position = position
+        position = int(position)
+        # The slider round-trip sleeps 5 s — by far the most expensive move on
+        # the unit — and consecutive observation states almost always name the
+        # same slider position, so writing it again is 5 s of dead time per
+        # channel switch.
+        if self.slider_position == position:
+            return self.slider_position
         position_to_write = str(position)
         position_to_read = str(position)
+        # Unknown while the move is in flight (see set_dichroic).
+        self.slider_position = None
         self.serial_connection.write_and_check("P" + position_to_write + "\r", "P" + position_to_read, read_delay=5)
+        self.slider_position = position
         return self.slider_position
 
     def get_filter_slider(self):

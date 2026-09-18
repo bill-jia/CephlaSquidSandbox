@@ -5,10 +5,13 @@ Covers the X-Light side of an ObservationState's optical path:
 * collecting the emission wheel position from the confocal unit when the rig has
   no standalone wheel (and doing so from the driver's cache, not the serial port),
 * recording a user-driven wheel move onto the live state,
-* and the confocal_mode flag surviving collect -> save -> load -> apply, with the
-  apply actually moving the spinning disk.
+* the confocal_mode flag surviving collect -> save -> load -> apply, with the
+  apply actually moving the spinning disk,
+* and the driver skipping optical-path writes the hardware is already making.
 
-Everything here runs against fakes; no hardware object is ever constructed.
+Everything here runs against fakes: either a stand-in X-Light, or the real
+driver over a faked serial port. No COM port is opened and no hardware object is
+ever constructed.
 """
 
 from pathlib import Path
@@ -17,6 +20,7 @@ from typing import Optional
 import pytest
 import yaml
 
+import control.serial_peripherals as sp
 from control.core.config.repository import ConfigRepository
 from control.core.observation_state_controller import ObservationStateController
 from control.core.observation_state_service import (
@@ -29,6 +33,7 @@ from control.models.observation_state import (
     IlluminatorState,
     ObservationState,
 )
+from tests.control.test_xlight_driver import make_xlight
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
@@ -43,13 +48,24 @@ class FakeXLight:
         self.has_emission_filters_wheel = True
         self.has_illumination_iris_diaphragm = True
         self.has_emission_iris_diaphragm = True
+        self.has_dichroic_filters_wheel = True
+        self.has_dichroic_filter_slider = True
+        self.has_spinning_disk_motor = True
+        self.has_spinning_disk_slider = True
         self.disable_emission_filter_wheel = False
         self.spinning_disk_pos = 0
         self.illumination_iris = 100
         self.emission_iris = 100
+        # None == "unknown", exactly like the real driver before it has driven or
+        # read back a mechanism, so the first write is never skipped.
+        self.dichroic_wheel_pos = None
+        self.slider_position = None
+        self.disk_motor_state = False
         self.get_emission_filter_calls = 0
         self.set_emission_filter_calls = []
         self.disk_position_calls = []
+        self.set_dichroic_calls = []
+        self.set_filter_slider_calls = []
 
     def get_emission_filter(self):
         self.get_emission_filter_calls += 1
@@ -77,6 +93,28 @@ class FakeXLight:
 
     def set_emission_iris(self, value):
         self.emission_iris = value
+
+    # The dedup lives in the real driver, so the fake mirrors it: a request for
+    # the position the mechanism is already in records nothing.
+    def set_dichroic(self, position, extraction=False):
+        if not extraction and self.dichroic_wheel_pos == int(position):
+            return self.dichroic_wheel_pos
+        self.set_dichroic_calls.append(int(position))
+        self.dichroic_wheel_pos = int(position)
+        return self.dichroic_wheel_pos
+
+    def get_dichroic(self):
+        return self.dichroic_wheel_pos
+
+    def set_filter_slider(self, position):
+        if self.slider_position == int(position):
+            return self.slider_position
+        self.set_filter_slider_calls.append(int(position))
+        self.slider_position = int(position)
+        return self.slider_position
+
+    def get_filter_slider(self):
+        return self.slider_position
 
 
 class FakeStandaloneWheel:
@@ -189,9 +227,14 @@ class FakeConfigRepo:
 
     def __init__(self, saved: Optional[ObservationState] = None):
         self.saved = saved
+        self.channel_settings = []
 
     def get_observation_state(self):
         return self.saved
+
+    def update_channel_setting(self, setting, value, profile=None):
+        self.channel_settings.append((setting, value))
+        return True
 
 
 class FakeMicroscope:
@@ -497,3 +540,289 @@ def test_widefield_preset_moves_the_disk_back(tmp_path, confocal_enabled):
 
     assert ctl.is_confocal_mode() is False
     assert xlight.disk_position_calls == [0]
+
+
+# ── Redundant optical-path writes ─────────────────────────────────────────────
+#
+# These run the *real* X-Light driver over a fake serial port (no COM port is
+# opened) because the skip lives in the driver, not in the controller: the
+# confocal panel writes through the same setters, so the cache cannot go stale.
+
+
+def _optical_state(slot, illumination_iris=None, emission_iris=None) -> ObservationState:
+    state = _state(emission={"default": slot})
+    state.confocal_hardware_settings = ConfocalSettings(
+        illumination_iris=illumination_iris, emission_iris=emission_iris
+    )
+    return state
+
+
+def test_repeated_apply_writes_the_optical_path_once(monkeypatch):
+    """Every channel switch applies the optical path; only changes reach serial."""
+    xlight, fake = make_xlight(monkeypatch)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _optical_state(3, illumination_iris=80.0, emission_iris=60.0)
+
+    ctl.apply_optical_path()
+    ctl.apply_optical_path()
+    ctl.apply_optical_path()
+
+    assert fake.commands == ["B3\r", "J800\r", "V600\r"]
+
+
+def test_apply_writes_again_when_the_state_changes(monkeypatch):
+    xlight, fake = make_xlight(monkeypatch)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _optical_state(3, illumination_iris=80.0, emission_iris=60.0)
+    ctl.apply_optical_path()
+    fake.commands.clear()
+
+    ctl.current_observation_state = _optical_state(4, illumination_iris=80.0, emission_iris=20.0)
+    ctl.apply_optical_path()
+
+    assert fake.commands == ["B4\r", "V200\r"]
+
+
+def test_failed_wheel_write_is_retried_on_the_next_apply(monkeypatch, caplog):
+    """A jammed wheel must not be remembered as 'already there'."""
+    xlight, fake = make_xlight(monkeypatch)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _optical_state(3)
+
+    fail = {"on": True}
+    record = xlight.serial_connection.write
+
+    def maybe_boom(command):
+        if fail["on"]:
+            raise sp.SerialDeviceError("no response")
+        record(command)
+
+    monkeypatch.setattr(xlight.serial_connection, "write", maybe_boom)
+    with caplog.at_level("WARNING"):
+        ctl.apply_optical_path()  # swallowed, logged
+    assert any("emission filter position" in rec.getMessage() for rec in caplog.records)
+    assert fake.commands == []
+
+    fail["on"] = False
+    ctl.apply_optical_path()
+    assert fake.commands == ["B3\r"]
+    assert xlight.emission_wheel_pos == 3
+
+
+def test_apply_overrides_a_panel_driven_wheel_move(monkeypatch):
+    """The confocal panel drives the driver too, so the state still wins."""
+    xlight, fake = make_xlight(monkeypatch)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _optical_state(3, illumination_iris=80.0)
+    ctl.apply_optical_path()
+    fake.commands.clear()
+
+    # The user picks another filter and closes the iris in the spinning-disk panel.
+    ctl.set_emission_filter_position(5)
+    xlight.set_illumination_iris(30)
+    assert fake.commands == ["B5\r", "J300\r"]
+
+    # Re-applying the state puts the hardware back where the state says.
+    ctl.current_observation_state = _optical_state(3, illumination_iris=80.0)
+    ctl.apply_optical_path()
+
+    assert fake.commands == ["B5\r", "J300\r", "B3\r", "J800\r"]
+    assert xlight.emission_wheel_pos == 3
+    assert xlight.illumination_iris == 80
+
+
+# ── Dichroic wheel & filter slider ────────────────────────────────────────────
+#
+# Both are part of the light path, so an observation state carries them. Both
+# are slow (the slider is 5 s), so a state that does not change them must cost
+# nothing, and a state that never recorded them must not move them at all.
+
+
+def _confocal_state(**hw) -> ObservationState:
+    state = _state()
+    state.confocal_hardware_settings = ConfocalSettings(**hw)
+    return state
+
+
+def test_apply_optical_path_drives_dichroic_and_slider_once():
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _confocal_state(dichroic_position=3, filter_slider_position=2)
+
+    ctl.apply_optical_path()
+
+    assert xlight.set_dichroic_calls == [3]
+    assert xlight.set_filter_slider_calls == [2]
+    assert xlight.dichroic_wheel_pos == 3
+    assert xlight.slider_position == 2
+
+
+def test_reapplying_the_same_state_issues_no_further_writes():
+    """The parsimony requirement: an unchanged slider is 5 s of dead time."""
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _confocal_state(dichroic_position=3, filter_slider_position=2)
+
+    ctl.apply_optical_path()
+    xlight.set_dichroic_calls.clear()
+    xlight.set_filter_slider_calls.clear()
+
+    ctl.apply_optical_path()
+    ctl.apply_optical_path()
+
+    assert xlight.set_dichroic_calls == []
+    assert xlight.set_filter_slider_calls == []
+
+
+def test_state_without_dichroic_or_slider_touches_neither():
+    """Presets saved before these fields existed must leave the optics alone."""
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _confocal_state(illumination_iris=70.0, emission_iris=40.0)
+
+    ctl.apply_optical_path()
+
+    assert xlight.set_dichroic_calls == []
+    assert xlight.set_filter_slider_calls == []
+    assert xlight.dichroic_wheel_pos is None
+    assert xlight.slider_position is None
+
+
+def test_dichroic_and_slider_are_skipped_when_the_unit_lacks_them():
+    xlight = FakeXLight(emission_wheel_pos=1)
+    xlight.has_dichroic_filters_wheel = False
+    xlight.has_dichroic_filter_slider = False
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _confocal_state(dichroic_position=3, filter_slider_position=2)
+
+    ctl.apply_optical_path()
+
+    assert xlight.set_dichroic_calls == []
+    assert xlight.set_filter_slider_calls == []
+
+
+def test_set_dichroic_position_records_and_applies():
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _state()
+
+    ctl.set_dichroic_position(4)
+
+    assert ctl.current_observation_state.confocal_hardware_settings.dichroic_position == 4
+    assert xlight.set_dichroic_calls == [4]
+
+
+def test_set_filter_slider_position_records_and_applies():
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _state()
+
+    ctl.set_filter_slider_position(1)
+
+    assert ctl.current_observation_state.confocal_hardware_settings.filter_slider_position == 1
+    assert xlight.set_filter_slider_calls == [1]
+
+
+def test_recording_setters_swallow_hardware_errors(caplog):
+    class BadXLight(FakeXLight):
+        def set_dichroic(self, position, extraction=False):
+            raise OSError("wheel jammed")
+
+        def set_filter_slider(self, position):
+            raise OSError("slider jammed")
+
+    ctl = _make_controller(xlight=BadXLight(emission_wheel_pos=1))
+    ctl.current_observation_state = _state()
+
+    with caplog.at_level("WARNING"):
+        ctl.set_dichroic_position(2)
+        ctl.set_filter_slider_position(3)
+
+    # The user's choice is still recorded, so a retry / preset save keeps it.
+    hw = ctl.current_observation_state.confocal_hardware_settings
+    assert (hw.dichroic_position, hw.filter_slider_position) == (2, 3)
+    assert any("dichroic position" in rec.getMessage() for rec in caplog.records)
+    assert any("filter slider position" in rec.getMessage() for rec in caplog.records)
+
+
+def test_persist_iris_config_records_on_the_live_state():
+    """The panel's iris writes have to reach the state a preset is saved from."""
+    ctl = _make_controller(xlight=FakeXLight(emission_wheel_pos=1))
+    ctl.current_observation_state = _state()
+
+    ctl.persist_iris_config("IlluminationIris", 65.0)
+    ctl.persist_iris_config("EmissionIris", 35.0)
+
+    hw = ctl.current_observation_state.confocal_hardware_settings
+    assert (hw.illumination_iris, hw.emission_iris) == (65.0, 35.0)
+
+
+def test_dichroic_and_slider_round_trip_through_a_preset(tmp_path):
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    ctl.current_observation_state = _state()
+
+    ctl.set_dichroic_position(5)
+    ctl.set_filter_slider_position(3)
+    collected = ctl.current_observation_state
+    repo.save_observation_preset("optics_preset", collected)
+
+    loaded = repo.load_observation_preset("optics_preset")
+    assert loaded.confocal_hardware_settings.dichroic_position == 5
+    assert loaded.confocal_hardware_settings.filter_slider_position == 3
+
+    # Hardware moved elsewhere in the meantime; applying the preset brings it back.
+    xlight.dichroic_wheel_pos = 1
+    xlight.slider_position = 0
+    xlight.set_dichroic_calls.clear()
+    xlight.set_filter_slider_calls.clear()
+    ctl.apply_observation_state_preset(loaded)
+    assert xlight.set_dichroic_calls == [5]
+    assert xlight.set_filter_slider_calls == [3]
+
+
+def test_older_presets_without_the_new_keys_still_load(tmp_path):
+    """ConfocalSettings forbids extras, but the new keys are optional."""
+    repo = _repo_with_profile(tmp_path)
+    old = _state()
+    old.confocal_hardware_settings = ConfocalSettings(illumination_iris=70.0, emission_iris=40.0)
+    payload = old.model_dump(mode="json", exclude_none=True)
+    assert "dichroic_position" not in payload["confocal_hardware_settings"]
+    assert "filter_slider_position" not in payload["confocal_hardware_settings"]
+
+    path = tmp_path / "sw" / "user_profiles" / "p1" / "observation_presets" / "legacy.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    loaded = repo.load_observation_preset("legacy")
+    assert loaded is not None
+    assert loaded.confocal_hardware_settings.illumination_iris == 70.0
+    assert loaded.confocal_hardware_settings.dichroic_position is None
+    assert loaded.confocal_hardware_settings.filter_slider_position is None
+
+
+def test_real_driver_writes_dichroic_and_slider_once_across_channel_switches(monkeypatch):
+    """The 5 s slider and the dichroic reach serial once, not once per switch."""
+    xlight, fake = make_xlight(monkeypatch)
+    state = _optical_state(3, illumination_iris=80.0, emission_iris=60.0)
+    state.confocal_hardware_settings.dichroic_position = 2
+    state.confocal_hardware_settings.filter_slider_position = 1
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = state
+
+    ctl.apply_optical_path()
+    ctl.apply_optical_path()
+    ctl.apply_optical_path()
+
+    assert fake.commands == ["B3\r", "J800\r", "V600\r", "C2\r", "P1\r"]
+
+
+def test_real_driver_leaves_dichroic_and_slider_alone_when_unrecorded(monkeypatch):
+    xlight, fake = make_xlight(monkeypatch)
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _optical_state(3, illumination_iris=80.0, emission_iris=60.0)
+
+    ctl.apply_optical_path()
+
+    assert "C2\r" not in fake.commands
+    assert not [c for c in fake.commands if c.startswith("C") or c.startswith("P")]

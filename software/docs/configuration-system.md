@@ -268,6 +268,93 @@ Unknown keys in this block are rejected, so typos surface at startup.
 - The iris defaults seed `confocal_hardware_settings` the first time an iris is
   edited, and when default configs are generated for a new profile.
 
+**Redundant writes are skipped in the driver.**
+`ObservationStateController.apply_optical_path` writes the wheel slot and both
+irises on *every* observation-state apply, i.e. on every channel switch of a
+multi-channel acquisition. Each of those is slow on the wire —
+`sleep_time_for_wheel` per wheel move, a 2 s round trip per iris — and the usual
+rig runs one quad-band filter and one aperture for the whole run. `XLight`
+therefore caches what it last drove (`emission_wheel_pos`, `dichroic_wheel_pos`,
+`slider_position`, `illumination_iris`, `emission_iris`, plus `spinning_disk_pos`
+and `disk_motor_state`) and returns without touching serial when the request
+matches. The dichroic filter slider is the biggest win: its round trip is 5 s.
+The invariants:
+
+- The cache is the driver's, not the controller's, so the confocal panel (which
+  drives the same mechanisms) cannot make it stale.
+- It starts as `None` — "unknown" — so a mechanism the unit will not report
+  always writes, including a request for slot 1 or a fully closed iris.
+- `XLight.__init__` calls `seed_caches_from_hardware()`, which reads back every
+  mechanism the unit says it has (`rB`, `rC`, `rP`, `rJ`, `rV`, `rD`, `rN`).
+  This is what makes the skipping safe: a cache guessed as 0 on a unit whose
+  iris is physically at 100 makes "close the iris to 0" look redundant, so it is
+  silently dropped — the hardware stays open while the software believes it
+  closed. Each read is individually best-effort; one that fails logs a warning
+  and leaves that cache unknown rather than breaking startup.
+- It is cleared before the write and set only after the write returns, so a
+  command that raises leaves the position unknown and the next apply retries.
+- `validate_wheel_pos` is unchanged for the moves that do happen: a skipped move
+  reads nothing back because nothing moved. An `extraction=True` move is a
+  different command and is never skipped.
+- `XLight_Simulation` skips the same way; its cache starts at the simulated
+  unit's known state rather than `None`, because there it *is* the hardware.
+
+`Dragonfly` has no such cache: its `set_emission_filter` is port-keyed and its
+commands are ~0.1 s, so the confocal branch of `apply_optical_path` for a
+Dragonfly still writes every time.
+
+### Camera trigger routing (`devices.main_camera`)
+
+A camera declares the line that triggers it under `io.trigger`, and how a
+**software** trigger is delivered under `config.software_trigger_routing`:
+
+```yaml
+devices:
+  main_camera:
+    driver: tucsen
+    role: main
+    io:
+      trigger:                        # the line that actually fires the sensor.
+        controller: nidaq             # Used by Hardware trigger mode AND by
+        signal_type: digital          # Software trigger mode when
+        direction: output             # software_trigger_routing is hardware_line.
+        channel_id: "port0/line6"
+        display_name: "Main camera trigger"
+    config:
+      software_trigger_routing: hardware_line   # or: native
+```
+
+| Value | What `camera.send_trigger()` does |
+|-------|-----------------------------------|
+| `hardware_line` | The camera is programmed for hardware (Standard) trigger and every "software" trigger is a pulse on the `io.trigger` endpoint. Illumination stays software-controlled by the worker (LED steady-on across the exposure). |
+| `native` | The camera's own SDK software-trigger command (GenICam `TriggerSoftwarePulse` / `TUCCM_TRIGGER_SOFTWARE`). No IO endpoint is involved. |
+
+**Default** (resolved in one place,
+`control.models.machine_config.resolve_software_trigger_routing`):
+`hardware_line` when the camera declares an `io.trigger` endpoint, `native`
+otherwise. An explicit value always wins.
+
+**Validation.** `hardware_line` without an `io.trigger` endpoint is rejected when
+the machine config loads, and an unknown value is rejected by name. If the
+endpoint exists in the config but its controller is disabled or unavailable, the
+camera raises a `CameraError` the first time the acquisition mode is set —
+before a run starts — instead of timing out on a frame mid-acquisition.
+
+**Why it is explicit.** The Tucsen Aries' native software trigger does not
+reliably start exposures, so that rig must use `hardware_line`; the trigger line
+is then load-bearing for ordinary software-triggered acquisition, not just for
+Hardware trigger mode. Pointing `io.trigger` at a controller/channel that does
+not physically reach the camera produces no error anywhere — the triggers simply
+go nowhere — so the routing in effect and the endpoint it resolves to are logged
+at INFO during startup:
+
+```
+Main camera SW trigger routing: hardware_line via nidaq port0/line6 (machine config declares: nidaq port0/line6)
+```
+
+and the same description is printed in the "Timed out waiting … for a frame"
+error, so a misrouted line is legible rather than inferred.
+
 ### hardware_bindings.yaml (Optional)
 
 Maps cameras to their associated filter wheels using **source-qualified references**. This file is only needed for multi-camera systems where each camera uses a different emission filter wheel. The same schema may be embedded as `hardware_bindings` on `machine_config.yaml` and overrides this file when present.
