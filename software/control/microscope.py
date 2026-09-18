@@ -1104,8 +1104,8 @@ class Microscope:
             modality = "CONFOCAL" if confocal else "BF"
             self.addons.dragonfly.set_modality(modality)
         elif self.addons.xlight is not None:
-            # XLight: 1 for confocal, 0 for widefield
-            self.addons.xlight.set_disk_position(1 if confocal else 0)
+            # Starts the spinning disk on the way into confocal.
+            serial_peripherals.set_xlight_confocal_mode(self.addons.xlight, confocal)
         else:
             raise RuntimeError("No spinning disk hardware available")
 

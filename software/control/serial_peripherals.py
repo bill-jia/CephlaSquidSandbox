@@ -159,6 +159,33 @@ def _validate_emission_filter_position(position, slot_count: int) -> None:
         raise ValueError(f"Invalid emission filter position {position}, must be 1-{slot_count}")
 
 
+def set_xlight_confocal_mode(xlight, confocal: bool) -> None:
+    """Move the X-Light disk, spinning it up first on the way into confocal.
+
+    The motor (``N``) and the disk position (``D``) are independent commands, so
+    the disk can be driven into the light path while parked -- which images
+    through a static pinhole mask and is never what the operator meant.  Every
+    caller that puts the unit into confocal goes through here so that cannot
+    happen, whether the switch comes from the panel, from applying a saved
+    observation state, or from a headless script.
+
+    The motor is started *before* the disk moves, so it is at speed by the time
+    it is in the path, and it is deliberately left running on the way back out
+    to widefield: stopping it costs a spin-up on the next channel switch and a
+    spinning disk out of the light path harms nothing.
+
+    A motor that will not start is logged, not raised: the disk move is the
+    operation the caller asked for and it still happens.
+    """
+    if confocal and getattr(xlight, "has_spinning_disk_motor", False):
+        try:
+            if not xlight.get_disk_motor_state():
+                xlight.set_disk_motor_state(True)
+        except Exception:
+            log.warning("Could not start the X-Light spinning disk motor for confocal", exc_info=True)
+    xlight.set_disk_position(1 if confocal else 0)
+
+
 class XLight_Simulation:
     def __init__(
         self,

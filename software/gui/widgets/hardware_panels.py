@@ -1,5 +1,6 @@
 from ._bootstrap import *
 from .common import SegmentedSwitch
+import control.serial_peripherals as serial_peripherals
 from squid.config import CameraReadoutMode
 
 # Live-view cap for the laser AF camera. The focus exposure is sub-millisecond,
@@ -654,7 +655,12 @@ class SpinningDiskConfocalWidget(QWidget):
         self.spinbox_emission_iris.blockSignals(block)
 
     def request_disk_position(self, confocal: bool):
-        """Move the disk to the segment the user clicked."""
+        """Move the disk to the segment the user clicked.
+
+        Going into confocal spins the disk up first (see
+        ``set_xlight_confocal_mode``), so the motor switch is refreshed from the
+        driver when the move lands.
+        """
         self.enable_all_buttons(False)
         target_position = 1 if confocal else 0
 
@@ -667,7 +673,9 @@ class SpinningDiskConfocalWidget(QWidget):
                 Q_ARG(int, target_position),
             )
 
-        utils.threaded_operation_helper(self.xlight.set_disk_position, on_finished, position=target_position)
+        utils.threaded_operation_helper(
+            serial_peripherals.set_xlight_confocal_mode, on_finished, xlight=self.xlight, confocal=confocal
+        )
 
     @Slot(bool, int)
     def _on_disk_position_toggled(self, moved, position):
@@ -680,6 +688,10 @@ class SpinningDiskConfocalWidget(QWidget):
         if moved:
             self.disk_position_state = position
             self.switch_confocal.set_state(position == 1)
+            if self.xlight.has_spinning_disk_motor:
+                running = getattr(self.xlight, "disk_motor_state", None)
+                if running is not None:
+                    self.switch_motor.set_state(bool(running))
         self.enable_all_buttons(True)
         if moved:
             self.signal_toggle_confocal_widefield.emit(self.disk_position_state)

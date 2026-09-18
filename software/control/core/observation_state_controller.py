@@ -22,6 +22,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import squid.logging
+import control.serial_peripherals as serial_peripherals
 from control._def import *
 from control._sdk_watchdog import CameraTimeoutError
 from control.models.observation_state import (
@@ -410,8 +411,8 @@ class ObservationStateController:
                     if dragonfly is not None:
                         dragonfly.set_modality("CONFOCAL" if confocal else "BF")
                     else:
-                        # XLight: 1 for confocal, 0 for widefield
-                        xlight.set_disk_position(1 if confocal else 0)
+                        # Starts the spinning disk on the way into confocal.
+                        serial_peripherals.set_xlight_confocal_mode(xlight, confocal)
             except Exception as e:
                 self._log.warning(
                     "Could not move the spinning disk to %s: %s",

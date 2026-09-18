@@ -456,3 +456,78 @@ def test_a_failed_disk_move_is_not_shown_or_recorded(panel):
     assert panel.disk_position_state == 1
     assert panel.switch_confocal.btn_on.isChecked() is True
     assert spy.calls == [(True,)]
+
+
+# ── Entering confocal spins the disk up ───────────────────────────────────────
+
+
+def test_entering_confocal_starts_the_motor_first():
+    """A parked disk in the light path is a static pinhole mask, never intended."""
+    xlight = sp.XLight_Simulation()
+    order = []
+    xlight.set_disk_motor_state = lambda state: order.append(("motor", state))
+    xlight.set_disk_position = lambda position: order.append(("disk", position))
+
+    sp.set_xlight_confocal_mode(xlight, True)
+
+    assert order == [("motor", True), ("disk", 1)]
+
+
+def test_a_spinning_disk_is_not_restarted():
+    """N costs 2.5 s on the real unit, and a channel switch pays it every time."""
+    xlight = sp.XLight_Simulation()
+    xlight.set_disk_motor_state(True)
+    calls = []
+    xlight.set_disk_motor_state = lambda state: calls.append(state)
+
+    sp.set_xlight_confocal_mode(xlight, True)
+
+    assert calls == []
+    assert xlight.spinning_disk_pos == 1
+
+
+def test_leaving_confocal_leaves_the_disk_spinning():
+    """Stopping it would cost a spin-up on the next switch and buys nothing."""
+    xlight = sp.XLight_Simulation()
+    xlight.set_disk_motor_state(True)
+
+    sp.set_xlight_confocal_mode(xlight, False)
+
+    assert xlight.spinning_disk_pos == 0
+    assert xlight.disk_motor_state is True
+
+
+def test_a_motor_that_will_not_start_does_not_block_the_disk_move():
+    xlight = sp.XLight_Simulation()
+
+    def refuse(state):
+        raise OSError("motor did not answer")
+
+    xlight.set_disk_motor_state = refuse
+
+    sp.set_xlight_confocal_mode(xlight, True)
+
+    assert xlight.spinning_disk_pos == 1
+
+
+def test_a_unit_without_a_motor_just_moves_the_disk():
+    xlight = sp.XLight_Simulation()
+    xlight.has_spinning_disk_motor = False
+    calls = []
+    xlight.set_disk_motor_state = lambda state: calls.append(state)
+
+    sp.set_xlight_confocal_mode(xlight, True)
+
+    assert calls == []
+    assert xlight.spinning_disk_pos == 1
+
+
+def test_panel_motor_switch_follows_the_spin_up(panel):
+    """The panel started the motor on the user's behalf, so it must say so."""
+    assert panel.switch_motor.state() is False
+
+    panel.xlight.set_disk_motor_state(True)
+    panel._on_disk_position_toggled(True, 1)
+
+    assert panel.switch_motor.state() is True
+    assert panel.switch_motor.btn_on.isChecked() is True
