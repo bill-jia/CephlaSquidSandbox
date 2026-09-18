@@ -251,6 +251,10 @@ class XLight_Simulation:
     def get_filter_slider(self):
         return self.slider_position
 
+    def close(self):
+        """Mirror XLight.close(): the simulated disk motor stops, nothing to release."""
+        self.disk_motor_state = False
+
 
 # CrestOptics X-Light Port specs:
 # V1/V2: 9600 baud, V3/Cicero: 115200 baud
@@ -495,6 +499,16 @@ class XLight:
         current_pos = self.serial_connection.write_and_check("rN\r", "rN", read_delay=0.01)
         self.disk_motor_state = bool(int(current_pos[2]))
         return self.disk_motor_state
+
+    def close(self):
+        """Stop the spinning disk motor (best effort) and close the serial connection."""
+        if self.has_spinning_disk_motor:
+            try:
+                self.set_disk_motor_state(False)
+            except Exception as e:
+                self.log.warning(f"Error stopping X-Light spinning disk motor during close: {e}")
+        if self.serial_connection:
+            self.serial_connection.close()
 
 
 class Dragonfly:

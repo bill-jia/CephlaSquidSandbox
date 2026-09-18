@@ -23,6 +23,8 @@ class FakeSerialDevice:
     # Valid hex so XLight._connect_and_detect picks the V3 protocol.
     idc_response: str = "00000FFF"
 
+    closed: bool = False
+
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
         self.serial = object()
@@ -31,7 +33,8 @@ class FakeSerialDevice:
         pass
 
     def close(self):
-        pass
+        type(self).closed = True
+        type(self).calls.append(("close", None))
 
     def write(self, command):
         type(self).commands.append(command)
@@ -48,8 +51,12 @@ class FakeSerialDevice:
         return type(self).idc_response
 
 
-def make_xlight(monkeypatch, **kwargs):
-    fake = type("FakeSerialDeviceForTest", (FakeSerialDevice,), {"commands": [], "calls": []})
+def make_xlight(monkeypatch, idc_response=FakeSerialDevice.idc_response, **kwargs):
+    fake = type(
+        "FakeSerialDeviceForTest",
+        (FakeSerialDevice,),
+        {"commands": [], "calls": [], "closed": False, "idc_response": idc_response},
+    )
     monkeypatch.setattr(sp, "SerialDevice", fake)
     kwargs.setdefault("sleep_time_for_wheel", 0.0)
     xlight = sp.XLight("SN", **kwargs)
@@ -127,3 +134,39 @@ class TestValidateWheelPos:
         xlight, fake = make_xlight(monkeypatch, disable_emission_filter_wheel=True)
         assert xlight.set_emission_filter(3) == -1
         assert fake.commands == []
+
+
+class TestClose:
+    """close() parks the spinning disk motor (when present) and releases the port."""
+
+    def test_stops_motor_then_closes_port(self, monkeypatch):
+        xlight, fake = make_xlight(monkeypatch, idc_response="00000FFF")
+        assert xlight.has_spinning_disk_motor
+        xlight.close()
+        assert fake.calls == [("check", "N0\r"), ("close", None)]
+        assert fake.closed
+        assert xlight.disk_motor_state is False
+
+    def test_skips_motor_command_when_absent(self, monkeypatch):
+        xlight, fake = make_xlight(monkeypatch, idc_response="00000FFE")
+        assert not xlight.has_spinning_disk_motor
+        xlight.close()
+        assert fake.commands == []
+        assert fake.calls == [("close", None)]
+        assert fake.closed
+
+    def test_port_closes_even_if_motor_stop_fails(self, monkeypatch):
+        xlight, fake = make_xlight(monkeypatch, idc_response="00000FFF")
+
+        def boom(*args, **kwargs):
+            raise sp.SerialDeviceError("no response")
+
+        monkeypatch.setattr(xlight.serial_connection, "write_and_check", boom)
+        xlight.close()
+        assert fake.closed
+
+    def test_simulation_close_parks_motor(self):
+        xlight = sp.XLight_Simulation()
+        xlight.set_disk_motor_state(True)
+        xlight.close()
+        assert xlight.disk_motor_state is False

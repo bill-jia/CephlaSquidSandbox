@@ -1316,11 +1316,31 @@ class Microscope:
         except Exception as e:
             self._log.warning(f"Error stopping live view during close: {e}")
 
+        # Shut the light sources down before the microcontroller: the LED matrix
+        # illumination device talks to the MCU, and serial sources (LDI/CoolLED)
+        # otherwise stay lit with their ports open.
+        try:
+            self.illumination_controller.shut_down()
+        except Exception as e:
+            self._log.warning(f"Error shutting down illumination controller: {e}")
+
         if self.low_level_drivers.microcontroller:
             try:
                 self.low_level_drivers.microcontroller.close()
             except Exception as e:
                 self._log.warning(f"Error closing microcontroller: {e}")
+
+        if self.addons.xlight:
+            try:
+                self.addons.xlight.close()
+            except Exception as e:
+                self._log.warning(f"Error closing X-Light: {e}")
+
+        if self.addons.dragonfly:
+            try:
+                self.addons.dragonfly.close()
+            except Exception as e:
+                self._log.warning(f"Error closing Dragonfly: {e}")
 
         if self.addons.emission_filter_wheel:
             try:

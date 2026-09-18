@@ -1,9 +1,10 @@
 # LDI + X-Light V3 rig: port from the legacy fork
 
-Status (2026-09-17): config written; **gaps 1-5 implemented** on branch
+Status (2026-09-17): config written; **gaps 1-6 implemented** on branch
 `ldi-xlight-port` (tests: `tests/control/test_ldi_driver.py`,
 `tests/control/test_illumination_builder_ldi.py`,
-`tests/control/test_xlight_driver.py`); gaps 6-8 pending.
+`tests/control/test_xlight_driver.py`,
+`tests/control/test_illumination_controller_shutdown.py`); gap 7 is documentation only.
 Untested on the rig.
 
 Config: `machine_configs/library/machine_config_Squid+_LDI_XLight_TucsenAries6506.yaml`
@@ -25,7 +26,7 @@ Source: `C:\Users\jialab\Desktop\Squid_XLightV3\software\configuration_Squid+_Tu
 | Disk motor | GUI button only, never auto-started | identical |
 | Laser AF | MCU pin 15 gate, Daheng MER2-630-60U3M focus camera | `devices.laser_af.io.laser_gate = teensy pin:15`, `devices.focus_camera` daheng |
 | Camera | Tucsen ARIES-6506, MCU trigger, Software trigger default | same |
-| Shutdown | never shuts down LDI or X-Light | same gap (gap 6) |
+| Shutdown | never shuts down LDI or X-Light | fixed (gap 6) |
 
 ## Gaps that need code changes
 
@@ -73,7 +74,7 @@ in `devices.xlight.config` (same shape for `dragonfly`), typed by
 list, and the library YAML dropped its `confocal:` block and duplicate
 `filter_wheel_registry`.
 
-### 6. Shutdown leaves the LDI and disk untouched (recommended)
+### 6. Shutdown leaves the LDI and disk untouched (recommended) — DONE
 
 `Microscope.close()` closes MCU, filter wheel, focus camera, camera. It
 never calls `illumination_controller` shut_down (which would run
@@ -81,6 +82,12 @@ never calls `illumination_controller` shut_down (which would run
 and never touches `addons.xlight` (disk motor keeps spinning, port stays
 open). Add both; `XLight` needs a `close()` that stops the motor and closes
 the serial connection.
+
+DONE: `Microscope.close()` now calls `IlluminationController.shut_down()`
+(renamed from the dead `close()`; per-device try/except) before closing the
+MCU, then closes `addons.xlight` / `addons.dragonfly`.
+New `XLight.close()` sends `N0` when `has_spinning_disk_motor` and always
+closes the port; `XLight_Simulation.close()` mirrors it.
 
 ### 7. Hardware trigger semantics (document only)
 
@@ -91,10 +98,10 @@ before the trigger regardless of trigger mode, and live opens it at
 the whole window. Per-frame strobing needs `shutter_mode: EXT` plus a TTL
 line (MCU D-port or NI-DAQ) declared as `io.shutter` on each LDI channel.
 
-### 8. Library-wide config validation test (nice to have)
+### 8. Library-wide config validation test — DONE
 
-No test loads every file in `machine_configs/library/`. Add one that
-`MachineConfig.model_validate`s each and asserts `validate_io_lines() == []`.
+`tests/control/test_machine_config_library.py` loads every `machine_configs/library/*.yaml`,
+checks IO consistency and rejects unknown top-level keys. It caught a typo that had left the generic `machine_config.yaml` template unparseable.
 
 ## Suggested order
 
@@ -103,7 +110,7 @@ No test loads every file in `machine_configs/library/`. Add one that
    `set:470=…`, `shutter:470=True` for the 488 nm channel.
 2. Gap 3 (sim device) so the config can be exercised off-rig.
 3. Gaps 4 + 5 (embedded confocal + ctor args) — done.
-4. Gap 6 (shutdown).
+4. Gap 6 (shutdown) — done.
 5. Gap 8.
 
 Then on the rig: confirm the LDI USB serial number (the `"00000001"`
