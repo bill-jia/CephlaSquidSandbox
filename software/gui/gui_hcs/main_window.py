@@ -523,7 +523,9 @@ class HighContentScreeningGui(QMainWindow):
             if USE_DRAGONFLY:
                 self.spinningDiskConfocalWidget = widgets.DragonflyConfocalWidget(self.dragonfly)
             else:
-                self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(self.xlight)
+                self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(
+                    self.xlight, config_repo=self.microscope.config_repo
+                )
         if ENABLE_NL5:
             import control.NL5Widget as NL5Widget
 
@@ -1083,6 +1085,11 @@ class HighContentScreeningGui(QMainWindow):
         stage_layout.addWidget(self.navigationWidget)
         if self.piezoWidget:
             stage_layout.addWidget(self.piezoWidget)
+        # Spinning-disk confocal controls live with the stage controls; they are
+        # laid out narrow-and-tall so they fit this 1/3-width column.
+        if ENABLE_SPINNING_DISK_CONFOCAL and self.spinningDiskConfocalWidget is not None:
+            stage_layout.addWidget(self.spinningDiskConfocalWidget)
+        stage_layout.addStretch(1)
         self.stageControlsWidget.setLayout(stage_layout)
 
         # RAM monitor widget (always create, visibility controlled by setting)
@@ -1435,6 +1442,19 @@ class HighContentScreeningGui(QMainWindow):
             self.spinningDiskConfocalWidget.signal_emission_iris_changed.connect(
                 self.liveControlWidget.update_config_emission_iris
             )
+            # Emission wheel changes go through the observation state controller so
+            # they are recorded on (and saved with) the live observation state.
+            if hasattr(self.spinningDiskConfocalWidget, "signal_emission_filter_changed"):
+                obs_controller = getattr(self.microscope, "obs_controller", None)
+                if obs_controller is not None and hasattr(obs_controller, "set_emission_filter_position"):
+                    self.spinningDiskConfocalWidget.signal_emission_filter_changed.connect(
+                        obs_controller.set_emission_filter_position
+                    )
+                else:
+                    self.log.warning(
+                        "No observation state controller available: emission filter changes from the "
+                        "confocal panel will not be applied."
+                    )
             # Sync iris UI from the initial channel config (signal wasn't connected during __init__)
             if self.liveControlWidget.currentConfiguration:
                 self.spinningDiskConfocalWidget.update_iris_from_config(self.liveControlWidget.currentConfiguration)

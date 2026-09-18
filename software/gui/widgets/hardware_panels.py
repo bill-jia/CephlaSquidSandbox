@@ -450,17 +450,22 @@ class SpinningDiskConfocalWidget(QWidget):
     signal_toggle_confocal_widefield = Signal(bool)
     signal_illumination_iris_changed = Signal(float)
     signal_emission_iris_changed = Signal(float)
+    # Emitted with the integer emission wheel slot chosen in this panel.  The
+    # move itself is performed by the observation state controller so the wheel
+    # position is recorded on (and saved with) the live observation state.
+    signal_emission_filter_changed = Signal(int)
 
-    def __init__(self, xlight):
+    def __init__(self, xlight, config_repo=None):
         super(SpinningDiskConfocalWidget, self).__init__()
 
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self.xlight = xlight
+        self.config_repo = config_repo
 
         self.init_ui()
 
         if self.xlight.has_emission_filters_wheel:
-            self.dropdown_emission_filter.setCurrentText(str(self.xlight.get_emission_filter()))
+            self.select_emission_filter_slot(self.xlight.get_emission_filter())
             self.dropdown_emission_filter.currentIndexChanged.connect(self.set_emission_filter)
         if self.xlight.has_dichroic_filters_wheel:
             self.dropdown_dichroic.setCurrentText(str(self.xlight.get_dichroic()))
@@ -494,81 +499,116 @@ class SpinningDiskConfocalWidget(QWidget):
             self.slider_emission_iris.valueChanged.connect(self._on_emission_iris_value_changed)
             self.spinbox_emission_iris.editingFinished.connect(lambda: self.update_emission_iris(False))
 
+    def _emission_filter_names(self) -> Dict[int, str]:
+        """Slot -> filter name declared for the confocal emission wheel, if any."""
+        if self.config_repo is None:
+            return {}
+        try:
+            wheels = self.config_repo.get_all_filter_wheels().get("confocal") or []
+        except Exception:
+            self._log.warning("Could not read confocal filter wheel names from the machine config", exc_info=True)
+            return {}
+        for wheel in wheels:
+            if getattr(wheel, "positions", None):
+                return {int(slot): str(name) for slot, name in wheel.positions.items()}
+        return {}
+
     def init_ui(self):
+        """Label-left rows so the panel stays narrow without wasting vertical space.
 
-        # Only create widgets if hardware supports them
-        self.dropdown_emission_filter = None
-        if self.xlight.has_emission_filters_wheel:
-            self.dropdown_emission_filter = QComboBox(self)
-            self.dropdown_emission_filter.addItems(
-                [str(i + 1) for i in range(self.xlight.emission_filter_positions)]
-            )
+        Every control is constructed unconditionally (``enable_all_buttons`` and
+        ``update_iris_from_config`` touch them all); only the *placement* is gated
+        on the unit's reported capabilities.
+        """
+        layout = QGridLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(4)
+        layout.setColumnStretch(1, 1)
+        row = 0
 
+        def add_row(label_text, control):
+            """Place ``control`` (widget or layout) beside its label, return next row."""
+            nonlocal row
+            layout.addWidget(QLabel(label_text), row, 0)
+            if isinstance(control, QHBoxLayout):
+                layout.addLayout(control, row, 1)
+            else:
+                layout.addWidget(control, row, 1)
+            row += 1
+
+        header = QLabel("Spinning Disk Confocal")
+        header.setStyleSheet("font-weight: bold;")
+        layout.addWidget(header, row, 0, 1, 2)
+        row += 1
+
+        # --- disk motor + widefield/confocal toggle, side by side --------------
+        self.btn_toggle_widefield = QPushButton("Switch to Confocal")
+        self.btn_toggle_motor = QPushButton("Disk Motor On")
+        self.btn_toggle_motor.setCheckable(True)
+        button_row = QHBoxLayout()
+        button_row.setSpacing(4)
+        button_row.addWidget(self.btn_toggle_motor, 1)
+        button_row.addWidget(self.btn_toggle_widefield, 1)
+        layout.addLayout(button_row, row, 0, 1, 2)
+        row += 1
+
+        # --- dichroic filter slider -------------------------------------------
+        self.filter_slider = QSlider(Qt.Horizontal)
+        self.filter_slider.setRange(0, 3)
+        self.filter_slider.setTickPosition(QSlider.TicksBelow)
+        self.filter_slider.setTickInterval(1)
+        if self.xlight.has_dichroic_filter_slider:
+            add_row("Filter Slider", self.filter_slider)
+
+        # --- dichroic wheel ----------------------------------------------------
         self.dropdown_dichroic = None
         if self.xlight.has_dichroic_filters_wheel:
             self.dropdown_dichroic = QComboBox(self)
             self.dropdown_dichroic.addItems([str(i + 1) for i in range(5)])
+            self.dropdown_dichroic.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+            self.dropdown_dichroic.setMinimumContentsLength(6)
+            add_row("Dichroic", self.dropdown_dichroic)
 
-        illuminationIrisLayout = QHBoxLayout()
-        illuminationIrisLayout.addWidget(QLabel("Illumination Iris"))
+        # --- emission wheel ----------------------------------------------------
+        self.dropdown_emission_filter = None
+        if self.xlight.has_emission_filters_wheel:
+            self.dropdown_emission_filter = QComboBox(self)
+            names = self._emission_filter_names()
+            for i in range(self.xlight.emission_filter_positions):
+                slot = i + 1
+                name = names.get(slot)
+                self.dropdown_emission_filter.addItem(f"{slot}: {name}" if name else str(slot), slot)
+            self.dropdown_emission_filter.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+            self.dropdown_emission_filter.setMinimumContentsLength(8)
+            add_row("Emission", self.dropdown_emission_filter)
+
+        # --- irises -------------------------------------------------------------
         self.slider_illumination_iris = QSlider(Qt.Horizontal)
         self.slider_illumination_iris.setRange(0, 100)
         self.spinbox_illumination_iris = QSpinBox()
         self.spinbox_illumination_iris.setRange(0, 100)
         self.spinbox_illumination_iris.setKeyboardTracking(False)
-        illuminationIrisLayout.addWidget(self.slider_illumination_iris)
-        illuminationIrisLayout.addWidget(self.spinbox_illumination_iris)
+        self.spinbox_illumination_iris.setFixedWidth(52)
+        if self.xlight.has_illumination_iris_diaphragm:
+            illuminationIrisLayout = QHBoxLayout()
+            illuminationIrisLayout.setSpacing(4)
+            illuminationIrisLayout.addWidget(self.slider_illumination_iris, 1)
+            illuminationIrisLayout.addWidget(self.spinbox_illumination_iris)
+            add_row("Illum. Iris", illuminationIrisLayout)
 
-        emissionIrisLayout = QHBoxLayout()
-        emissionIrisLayout.addWidget(QLabel("Emission Iris"))
         self.slider_emission_iris = QSlider(Qt.Horizontal)
         self.slider_emission_iris.setRange(0, 100)
         self.spinbox_emission_iris = QSpinBox()
         self.spinbox_emission_iris.setRange(0, 100)
         self.spinbox_emission_iris.setKeyboardTracking(False)
-        emissionIrisLayout.addWidget(self.slider_emission_iris)
-        emissionIrisLayout.addWidget(self.spinbox_emission_iris)
-
-        filterSliderLayout = QHBoxLayout()
-        filterSliderLayout.addWidget(QLabel("Filter Slider"))
-        # self.filter_slider = QComboBox(self)
-        # self.filter_slider.addItems(["0", "1", "2", "3"])
-        self.filter_slider = QSlider(Qt.Horizontal)
-        self.filter_slider.setRange(0, 3)
-        self.filter_slider.setTickPosition(QSlider.TicksBelow)
-        self.filter_slider.setTickInterval(1)
-        filterSliderLayout.addWidget(self.filter_slider)
-
-        self.btn_toggle_widefield = QPushButton("Switch to Confocal")
-
-        self.btn_toggle_motor = QPushButton("Disk Motor On")
-        self.btn_toggle_motor.setCheckable(True)
-
-        layout = QGridLayout(self)
-
-        # row 1
-        if self.xlight.has_dichroic_filter_slider:
-            layout.addLayout(filterSliderLayout, 0, 0, 1, 2)
-        layout.addWidget(self.btn_toggle_motor, 0, 2)
-        layout.addWidget(self.btn_toggle_widefield, 0, 3)
-
-        # row 2
-        if self.xlight.has_dichroic_filters_wheel:
-            layout.addWidget(QLabel("Dichroic Filter Wheel"), 1, 0)
-            layout.addWidget(self.dropdown_dichroic, 1, 1)
-        if self.xlight.has_illumination_iris_diaphragm:
-            layout.addLayout(illuminationIrisLayout, 1, 2, 1, 2)
-
-        # row 3
-        if self.xlight.has_emission_filters_wheel:
-            layout.addWidget(QLabel("Emission Filter Wheel"), 2, 0)
-            layout.addWidget(self.dropdown_emission_filter, 2, 1)
+        self.spinbox_emission_iris.setFixedWidth(52)
         if self.xlight.has_emission_iris_diaphragm:
-            layout.addLayout(emissionIrisLayout, 2, 2, 1, 2)
-
-        layout.setColumnStretch(2, 1)
-        layout.setColumnStretch(3, 1)
-        self.setLayout(layout)
+            emissionIrisLayout = QHBoxLayout()
+            emissionIrisLayout.setSpacing(4)
+            emissionIrisLayout.addWidget(self.slider_emission_iris, 1)
+            emissionIrisLayout.addWidget(self.spinbox_emission_iris)
+            add_row("Emis. Iris", emissionIrisLayout)
 
     @Slot(bool)
     def enable_all_buttons(self, enable: bool):
@@ -622,10 +662,47 @@ class SpinningDiskConfocalWidget(QWidget):
         utils.threaded_operation_helper(self.xlight.set_disk_motor_state, on_finished, state=state)
 
     def set_emission_filter(self, index):
+        """Emit the chosen emission wheel slot.
+
+        The hardware move is done by the observation state controller (see
+        ``signal_emission_filter_changed``) so the position is recorded on the
+        live observation state instead of being a hardware-only side effect.
+        """
+        slot = self.dropdown_emission_filter.currentData()
+        if slot is None:
+            return
         self.enable_all_buttons(False)
-        selected_pos = self.dropdown_emission_filter.currentText()
-        self.xlight.set_emission_filter(selected_pos)
-        self.enable_all_buttons(True)
+        try:
+            self.signal_emission_filter_changed.emit(int(slot))
+        finally:
+            self.enable_all_buttons(True)
+
+    def select_emission_filter_slot(self, slot) -> None:
+        """Show ``slot`` in the emission wheel dropdown without moving hardware."""
+        if not self.dropdown_emission_filter:
+            return
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return
+        index = self.dropdown_emission_filter.findData(slot)
+        if index < 0:
+            return
+        blocked = self.dropdown_emission_filter.blockSignals(True)
+        try:
+            self.dropdown_emission_filter.setCurrentIndex(index)
+        finally:
+            self.dropdown_emission_filter.blockSignals(blocked)
+
+    def set_confocal_mode_display(self, confocal: bool) -> None:
+        """Refresh the widefield/confocal button to match an externally applied state.
+
+        Used when an observation state moves the disk: updates
+        ``disk_position_state`` and the button label without touching hardware
+        and without re-emitting ``signal_toggle_confocal_widefield``.
+        """
+        self.disk_position_state = 1 if confocal else 0
+        self.btn_toggle_widefield.setText("Switch to Widefield" if confocal else "Switch to Confocal")
 
     def set_dichroic(self, index):
         self.enable_all_buttons(False)
@@ -2462,110 +2539,119 @@ class NavigationWidget(QFrame):
         self.label_Zpos.setNum(pos.z_mm * 1000)
 
     def add_components(self):
-        x_label = QLabel("X :")
-        x_label.setFixedWidth(15)
-        self.label_Xpos = QLabel()
-        self.label_Xpos.setNum(0)
-        self.label_Xpos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        self.entry_dX = QDoubleSpinBox()
-        self.entry_dX.setMinimum(0)
-        self.entry_dX.setMaximum(25)
-        self.entry_dX.setSingleStep(0.2)
-        self.entry_dX.setValue(0)
-        self.entry_dX.setDecimals(3)
-        self.entry_dX.setSuffix(" mm")
-        self.entry_dX.setKeyboardTracking(False)
-        self.entry_dX.setFixedWidth(70)
-        self.btn_moveX_forward = QPushButton("Up")
-        self.btn_moveX_forward.setDefault(False)
-        self.btn_moveX_forward.setFixedWidth(55)
-        self.btn_moveX_backward = QPushButton("Down")
-        self.btn_moveX_backward.setDefault(False)
-        self.btn_moveX_backward.setFixedWidth(55)
+        # Compact two-row layout: a read-out row (X/Y/Z positions with units) and a
+        # jog row (per-axis step size + small arrow buttons).
+        STEP_WIDTH = 58
+        ARROW_WIDTH = 22
+
+        def _make_step_box(maximum, decimals=3, step=0.2):
+            box = QDoubleSpinBox()
+            box.setMinimum(0)
+            box.setMaximum(maximum)
+            box.setSingleStep(step)
+            box.setValue(0)
+            box.setDecimals(decimals)
+            box.setKeyboardTracking(False)
+            box.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            box.setFixedWidth(STEP_WIDTH)
+            return box
+
+        def _make_arrow(glyph, tooltip):
+            btn = QPushButton(glyph)
+            btn.setDefault(False)
+            btn.setAutoDefault(False)
+            btn.setToolTip(tooltip)
+            btn.setFixedWidth(ARROW_WIDTH)
+            return btn
+
+        def _make_readout():
+            label = QLabel()
+            label.setNum(0)
+            label.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            label.setMinimumWidth(46)
+            return label
+
+        # --- read-outs -------------------------------------------------------
+        x_label = QLabel("X")
+        x_label.setFixedWidth(10)
+        self.label_Xpos = _make_readout()
+        self.label_Xunit = QLabel("mm")
+
+        y_label = QLabel("Y")
+        y_label.setFixedWidth(10)
+        self.label_Ypos = _make_readout()
+        self.label_Yunit = QLabel("mm")
+
+        self.z_label = QLabel("Z")
+        self.z_label.setFixedWidth(10)
+        self.label_Zpos = _make_readout()
+        self.label_Zunit = QLabel("μm")
+
+        # --- jog controls ----------------------------------------------------
+        self.entry_dX = _make_step_box(25)
+        self.entry_dX.setToolTip("X step size (mm)")
+        self.btn_moveX_forward = _make_arrow("▲", "Move X forward by the step size")
+        self.btn_moveX_backward = _make_arrow("▼", "Move X backward by the step size")
+
+        self.entry_dY = _make_step_box(25)
+        self.entry_dY.setToolTip("Y step size (mm)")
+        self.btn_moveY_forward = _make_arrow("▲", "Move Y forward by the step size")
+        self.btn_moveY_backward = _make_arrow("▼", "Move Y backward by the step size")
+
+        self.entry_dZ = _make_step_box(1000)
+        self.entry_dZ.setToolTip("Z step size (μm)")
+        self.btn_moveZ_forward = _make_arrow("▲", "Move Z up by the step size")
+        self.btn_moveZ_backward = _make_arrow("▼", "Move Z down by the step size")
 
         self.checkbox_clickToMove = QCheckBox("Click to Move")
         self.checkbox_clickToMove.setChecked(False)
-        self.checkbox_clickToMove.setSizePolicy(QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed))
 
-        y_label = QLabel("Y :")
-        y_label.setFixedWidth(15)
-        self.label_Ypos = QLabel()
-        self.label_Ypos.setNum(0)
-        self.label_Ypos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        self.entry_dY = QDoubleSpinBox()
-        self.entry_dY.setMinimum(0)
-        self.entry_dY.setMaximum(25)
-        self.entry_dY.setSingleStep(0.2)
-        self.entry_dY.setValue(0)
-        self.entry_dY.setDecimals(3)
-        self.entry_dY.setSuffix(" mm")
+        # --- row 1: X / Y / Z read-outs --------------------------------------
+        readout_row = QHBoxLayout()
+        readout_row.setSpacing(3)
+        for axis_label, value_label, unit_label in (
+            (x_label, self.label_Xpos, self.label_Xunit),
+            (y_label, self.label_Ypos, self.label_Yunit),
+            (self.z_label, self.label_Zpos, self.label_Zunit),
+        ):
+            readout_row.addWidget(axis_label)
+            readout_row.addWidget(value_label, 1)
+            readout_row.addWidget(unit_label)
+            readout_row.addSpacing(4)
+        if not ENABLE_CLICK_TO_MOVE_BY_DEFAULT:
+            readout_row.addWidget(self.checkbox_clickToMove)
 
-        self.entry_dY.setKeyboardTracking(False)
-        self.entry_dY.setFixedWidth(70)
-        self.btn_moveY_forward = QPushButton("Up")
-        self.btn_moveY_forward.setDefault(False)
-        self.btn_moveY_forward.setFixedWidth(55)
-        self.btn_moveY_backward = QPushButton("Down")
-        self.btn_moveY_backward.setDefault(False)
-        self.btn_moveY_backward.setFixedWidth(55)
-
-        self.z_label = QLabel("Z :")
-        self.z_label.setFixedWidth(15)
-        self.label_Zpos = QLabel()
-        self.label_Zpos.setNum(0)
-        self.label_Zpos.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        self.entry_dZ = QDoubleSpinBox()
-        self.entry_dZ.setMinimum(0)
-        self.entry_dZ.setMaximum(1000)
-        self.entry_dZ.setSingleStep(0.2)
-        self.entry_dZ.setValue(0)
-        self.entry_dZ.setDecimals(3)
-        self.entry_dZ.setSuffix(" μm")
-        self.entry_dZ.setKeyboardTracking(False)
-        self.entry_dZ.setFixedWidth(70)
-        self.btn_moveZ_forward = QPushButton("Up")
-        self.btn_moveZ_forward.setDefault(False)
-        self.btn_moveZ_forward.setFixedWidth(55)
-        self.btn_moveZ_backward = QPushButton("Down")
-        self.btn_moveZ_backward.setDefault(False)
-        self.btn_moveZ_backward.setFixedWidth(55)
-
-        grid_line0 = QGridLayout()
-        grid_line0.setHorizontalSpacing(4)
-        grid_line0.setVerticalSpacing(2)
-        grid_line0.addWidget(x_label, 0, 0)
-        grid_line0.addWidget(self.label_Xpos, 0, 1)
-        grid_line0.addWidget(self.entry_dX, 0, 2)
-        grid_line0.addWidget(self.btn_moveX_forward, 0, 3)
-        grid_line0.addWidget(self.btn_moveX_backward, 0, 4)
-
-        grid_line0.addWidget(y_label, 1, 0)
-        grid_line0.addWidget(self.label_Ypos, 1, 1)
-        grid_line0.addWidget(self.entry_dY, 1, 2)
-        grid_line0.addWidget(self.btn_moveY_forward, 1, 3)
-        grid_line0.addWidget(self.btn_moveY_backward, 1, 4)
-
-        grid_line0.addWidget(self.z_label, 2, 0)
-        grid_line0.addWidget(self.label_Zpos, 2, 1)
-        grid_line0.addWidget(self.entry_dZ, 2, 2)
-        grid_line0.addWidget(self.btn_moveZ_forward, 2, 3)
-        grid_line0.addWidget(self.btn_moveZ_backward, 2, 4)
+        # --- row 2: per-axis step size + jog arrows ---------------------------
+        jog_row = QHBoxLayout()
+        jog_row.setSpacing(2)
+        for step_box, btn_forward, btn_backward in (
+            (self.entry_dX, self.btn_moveX_forward, self.btn_moveX_backward),
+            (self.entry_dY, self.btn_moveY_forward, self.btn_moveY_backward),
+            (self.entry_dZ, self.btn_moveZ_forward, self.btn_moveZ_backward),
+        ):
+            jog_row.addWidget(step_box)
+            jog_row.addWidget(btn_forward)
+            jog_row.addWidget(btn_backward)
+            # Spread the three jog groups so they sit under their read-outs.
+            jog_row.addStretch(1)
 
         # Hide Z controls in piezo-only mode (Z is controlled via piezo widget)
         if IS_PIEZO_ONLY:
             self.z_label.setVisible(False)
             self.label_Zpos.setVisible(False)
+            self.label_Zunit.setVisible(False)
             self.entry_dZ.setVisible(False)
             self.btn_moveZ_forward.setVisible(False)
             self.btn_moveZ_backward.setVisible(False)
 
         self.grid = QVBoxLayout()
-        self.grid.addLayout(grid_line0)
+        self.grid.setContentsMargins(6, 4, 6, 4)
+        self.grid.setSpacing(3)
+        self.grid.addLayout(readout_row)
+        self.grid.addLayout(jog_row)
         self.set_click_to_move(ENABLE_CLICK_TO_MOVE_BY_DEFAULT)
-        if not ENABLE_CLICK_TO_MOVE_BY_DEFAULT:
-            grid_line3 = QHBoxLayout()
-            grid_line3.addWidget(self.checkbox_clickToMove, 1)
-            self.grid.addLayout(grid_line3)
         self.setLayout(self.grid)
 
         self.entry_dX.valueChanged.connect(self.set_deltaX)
