@@ -13,7 +13,7 @@ is handled by ObservationStateController.
 from __future__ import annotations
 
 import threading
-from typing import Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 import squid.logging
 from squid.abc import CameraAcquisitionMode, AbstractCamera
@@ -21,6 +21,7 @@ from control._def import *
 
 if TYPE_CHECKING:
     from control.core.observation_state_controller import ObservationStateController
+    from control.models.observation_state import ObservationState
 
 
 class LiveController:
@@ -306,6 +307,43 @@ class LiveController:
 
     def get_trigger_mode(self):
         return self.trigger_mode
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Channel lookup
+    #
+    # "Channel" and "Observation State" are the same thing: the whole light
+    # path for one acquisition. The namespace is the saved preset set — what
+    # the Observation State save/load dropdown lists — falling back to the
+    # working state in general.yaml when a profile has saved none.
+    #
+    # The ``objective`` argument several callers still pass is vestigial:
+    # channels used to be listed per objective, and are not any more. It is
+    # accepted and ignored so those call sites keep reading naturally.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_observation_states(self) -> List["ObservationState"]:
+        """Every selectable Observation State."""
+        return self.microscope.config_repo.get_observation_states()
+
+    def get_observation_state_by_name(self, name: str) -> Optional["ObservationState"]:
+        """Resolve a channel name to an Observation State, or None."""
+        return self.microscope.config_repo.get_observation_state_by_name(name)
+
+    def get_channels(self, objective: Optional[str] = None) -> List["ObservationState"]:
+        """Alias of :meth:`get_observation_states` for channel-flavoured callers."""
+        return self.get_observation_states()
+
+    def get_channel_by_name(
+        self, objective: Optional[str], name: Optional[str] = None
+    ) -> Optional["ObservationState"]:
+        """Alias of :meth:`get_observation_state_by_name`.
+
+        Tolerates both the two-argument ``(objective, name)`` form used by the
+        older call sites and a single ``(name)``.
+        """
+        if name is None:
+            objective, name = None, objective
+        return self.get_observation_state_by_name(name)
 
     # ─────────────────────────────────────────────────────────────────────
     # Frame callback

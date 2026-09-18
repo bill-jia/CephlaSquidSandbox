@@ -338,6 +338,18 @@ class ObservationStateController:
         """Get the observation state from the current profile's general.yaml."""
         return self.config_repo.get_observation_state()
 
+    def get_observation_states(self) -> List[ObservationState]:
+        """Every selectable Observation State — the saved presets, else general.yaml."""
+        return self.config_repo.get_observation_states()
+
+    def get_observation_state_by_name(self, name: str) -> Optional[ObservationState]:
+        """Resolve a channel name to an Observation State, or None.
+
+        The namespace is the saved preset set, the same one the Observation
+        State save/load dropdown lists.
+        """
+        return self.config_repo.get_observation_state_by_name(name)
+
     def set_active_observation_state(self, state: Optional[ObservationState]) -> None:
         """Record the selected observation state without touching hardware."""
         self._current_state = state

@@ -1071,6 +1071,54 @@ class ConfigRepository:
             names.append(p.stem)
         return names
 
+    def get_observation_states(self, profile: Optional[str] = None) -> List[ObservationState]:
+        """Every selectable Observation State, in the order the GUI lists them.
+
+        The saved presets *are* the channel namespace — the same set the
+        Observation State save/load dropdown shows. A profile with no presets
+        saved yet falls back to the single working state in ``general.yaml`` so
+        callers always have something to select.
+        """
+        states: List[ObservationState] = []
+        for name in self.list_observation_presets(profile):
+            state = self.load_observation_preset(name, profile)
+            if state is not None:
+                states.append(state)
+        if states:
+            return states
+        general = self.get_observation_state(profile)
+        return [general] if general is not None else []
+
+    def get_observation_state_by_name(
+        self, name: str, profile: Optional[str] = None
+    ) -> Optional[ObservationState]:
+        """Resolve a channel name to an Observation State.
+
+        Looks the name up among the saved presets. When a profile has no presets
+        at all, the working state in ``general.yaml`` is the only state there is,
+        so it answers every name — with a warning, since the caller asked for a
+        channel this profile has not actually defined.
+
+        Returns None when presets exist but none carries this name.
+        """
+        preset_names = self.list_observation_presets(profile)
+        if preset_names:
+            if name in preset_names:
+                return self.load_observation_preset(name, profile)
+            return None
+
+        general = self.get_observation_state(profile)
+        if general is None:
+            return None
+        logger.warning(
+            "No Observation State presets saved; resolving channel %r to the working "
+            "state %r from general.yaml. Save a preset named %r to select it explicitly.",
+            name,
+            general.name,
+            name,
+        )
+        return general
+
     def save_observation_preset(self, name: str, state: ObservationState, profile: Optional[str] = None) -> Path:
         """
         Save an Observation State preset under ``user_profiles/{profile}/observation_presets/``.
