@@ -780,48 +780,63 @@ class Microscope:
         )
 
         # ── Camera trigger routing ────────────────────────────────────────
+        # The trigger functions are handed to the camera only when something
+        # actually drives the line. Passing an unconditional closure made
+        # "is there a hardware trigger?" always true, which is how a trigger
+        # endpoint pointing at a controller that never reaches the camera stayed
+        # invisible until a mid-acquisition frame timeout.
         cam_trigger_log = squid.logging.get_logger("camera hw functions")
         io_reg = addons.io_registry
         trigger_ep = io_reg.get("main_camera.trigger") if io_reg else None
+        nl5_drives_trigger = bool(addons.nl5 and control._def.NL5_USE_DOUT)
 
-        def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
-            if addons.nl5 and control._def.NL5_USE_DOUT:
-                addons.nl5.start_acquisition()
-            elif trigger_ep is not None:
-                illumination_time_us = int(1000.0 * illumination_time) if illumination_time else 0
-                cam_trigger_log.debug(
-                    f"Sending hw trigger via IO endpoint with illumination_time="
-                    f"{illumination_time_us if illumination_time else None} [us]"
-                )
-                trigger_ep.send_trigger(
-                    control_illumination=illumination_time is not None,
-                    illumination_on_time_us=illumination_time_us,
-                )
-            else:
-                illumination_time_us = 1000.0 * illumination_time if illumination_time else 0
-                cam_trigger_log.debug(
-                    f"Sending hw trigger (legacy) with illumination_time="
-                    f"{illumination_time_us if illumination_time else None} [us]"
-                )
-                low_level_devices.microcontroller.send_hardware_trigger(
-                    illumination_time is not None, illumination_time_us
-                )
-            return True
+        acquisition_camera_hw_trigger_fn = None
+        acquisition_camera_hw_strobe_delay_fn = None
 
-        def acquisition_camera_hw_strobe_delay_fn(strobe_delay_ms: float) -> bool:
-            strobe_delay_us = int(1000 * strobe_delay_ms)
-            cam_trigger_log.debug(f"Setting strobe delay to {strobe_delay_us} [us]")
-            if trigger_ep is not None:
+        if nl5_drives_trigger or trigger_ep is not None:
+
+            def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
+                if nl5_drives_trigger:
+                    addons.nl5.start_acquisition()
+                else:
+                    illumination_time_us = int(1000.0 * illumination_time) if illumination_time else 0
+                    cam_trigger_log.debug(
+                        f"Sending hw trigger via IO endpoint with illumination_time="
+                        f"{illumination_time_us if illumination_time else None} [us]"
+                    )
+                    trigger_ep.send_trigger(
+                        control_illumination=illumination_time is not None,
+                        illumination_on_time_us=illumination_time_us,
+                    )
+                return True
+
+        if trigger_ep is not None:
+
+            def acquisition_camera_hw_strobe_delay_fn(strobe_delay_ms: float) -> bool:
+                strobe_delay_us = int(1000 * strobe_delay_ms)
+                cam_trigger_log.debug(f"Setting strobe delay to {strobe_delay_us} [us]")
                 trigger_ep.set_strobe_delay(strobe_delay_us)
                 trigger_ep.wait()
-            else:
-                low_level_devices.microcontroller.set_strobe_delay_us(strobe_delay_us)
-                low_level_devices.microcontroller.wait_till_operation_is_completed()
-            return True
+                return True
+
+        camera_config = squid.config.get_camera_config()
+        if trigger_ep is not None:
+            endpoint_desc = (
+                f"{trigger_ep.controller_type.value.lower()} {trigger_ep.endpoint.channel_id}"
+            )
+        elif nl5_drives_trigger:
+            endpoint_desc = "nl5 start_acquisition"
+        else:
+            endpoint_desc = "no trigger endpoint"
+        cam_trigger_log.info(
+            f"Main camera SW trigger routing: "
+            f"{camera_config.software_trigger_routing.value} via {endpoint_desc} "
+            f"(machine config declares: {camera_config.trigger_endpoint_description or 'none'})"
+        )
 
         camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
         camera = squid.camera.utils.get_camera(
-            config=squid.config.get_camera_config(),
+            config=camera_config,
             simulated=camera_simulated,
             hw_trigger_fn=acquisition_camera_hw_trigger_fn,
             hw_set_strobe_delay_ms_fn=acquisition_camera_hw_strobe_delay_fn,
@@ -1144,16 +1159,16 @@ class Microscope:
             self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
             trigger_ep = self.addons.io_registry.get("main_camera.trigger") if self.addons.io_registry else None
+            if trigger_ep is None:
+                raise RuntimeError(
+                    "Hardware trigger mode needs a main_camera.trigger IO endpoint, but none "
+                    "is bound. Declare devices.main_camera.io.trigger on an enabled controller."
+                )
             illumination_time_us = int(self.camera.get_exposure_time() * 1000)
-            if trigger_ep is not None:
-                trigger_ep.send_trigger(
-                    control_illumination=True,
-                    illumination_on_time_us=illumination_time_us,
-                )
-            else:
-                self.low_level_drivers.microcontroller.send_hardware_trigger(
-                    control_illumination=True, illumination_on_time_us=illumination_time_us,
-                )
+            trigger_ep.send_trigger(
+                control_illumination=True,
+                illumination_on_time_us=illumination_time_us,
+            )
 
         try:
             # read a frame from camera

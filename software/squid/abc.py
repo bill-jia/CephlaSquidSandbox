@@ -883,6 +883,21 @@ class AbstractCamera(metaclass=abc.ABCMeta):
 
         return self._set_acquisition_mode_imp(acquisition_mode=acquisition_mode)
 
+    def describe_trigger_routing(self) -> str:
+        """One-line description of how a software trigger reaches this camera.
+
+        Diagnostic only.  A frame that never arrives is almost always a trigger
+        that never arrived, so error paths print this instead of leaving the
+        operator to guess which line was wired where.
+        """
+        routing = self._config.software_trigger_routing.value
+        endpoint = self._config.trigger_endpoint_description
+        if endpoint:
+            return f"{routing} via {endpoint}"
+        if routing == "hardware_line":
+            return f"{routing} (no io.trigger endpoint declared!)"
+        return routing
+
     @abc.abstractmethod
     def _set_acquisition_mode_imp(self, acquisition_mode: CameraAcquisitionMode):
         """

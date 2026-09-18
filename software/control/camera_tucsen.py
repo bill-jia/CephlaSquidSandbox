@@ -30,6 +30,7 @@ from squid.abc import (
     CameraError,
 )
 from squid.config import CameraConfig, CameraPixelFormat, CameraReadoutMode, TucsenCameraModel
+from control.models.machine_config import SoftwareTriggerRouting
 import squid.logging
 from control.TUCam import *
 import control.utils
@@ -546,7 +547,9 @@ class TucsenCamera(AbstractCamera):
         # masquerades as SOFTWARE_TRIGGER — send_trigger() fires an NI-DAQ / Teensy
         # pulse via _hw_trigger_fn. The GenICam software trigger path is unreliable
         # on Aries, so we reroute through the hardware trigger line that already
-        # works. See set_acquisition_mode / send_trigger.
+        # works. Driven by config.software_trigger_routing == hardware_line, not by
+        # whether a _hw_trigger_fn happens to exist. See set_acquisition_mode /
+        # send_trigger.
         self._virt_sw_trigger = False
         # Rolling-shutter timing. Populated by _calculate_strobe_delay; used by
         # set_exposure_time to compensate when the LED is pulsed by the microcontroller
@@ -2317,28 +2320,38 @@ class TucsenCamera(AbstractCamera):
 
     def _set_acquisition_mode_imp(self, acquisition_mode: CameraAcquisitionMode):
         self._log.debug(f"Setting acquisition mode to {acquisition_mode}")
-        # If the user wants software trigger but we have a hardware-trigger line wired
-        # up, masquerade: configure the camera for HARDWARE_TRIGGER and let send_trigger
-        # fire the DAQ pulse. The native Tucsen GenICam software-trigger command does
-        # not reliably fire exposures on the Aries, so we route through the hardware
-        # line that is already proven to work.
-
-        # Phase C1: when the rig has a hardware-trigger line wired up, route
-        # SOFTWARE_TRIGGER requests through it. Camera runs in TUCCM_TRIGGER_STANDARD
-        # (gated single-shot), and send_trigger fires the NI-DAQ / MCU pulse via
-        # _hw_trigger_fn(None) while illumination stays software-controlled by the
-        # worker (LED steady-on for the exposure window). Falls back to the native
-        # GenICam TriggerSoftwarePulse path for rigs without _hw_trigger_fn.
-
-        virtualize_sw_trigger = (
+        # How a SOFTWARE_TRIGGER request is delivered is an explicit per-camera
+        # config decision (devices.<camera>.config.software_trigger_routing), not
+        # an inference from whether a hw_trigger_fn happens to be present:
+        #
+        #   hardware_line -- masquerade: configure the camera for TUCCM_TRIGGER_STANDARD
+        #       (gated single-shot) and let send_trigger fire the NI-DAQ / MCU pulse via
+        #       _hw_trigger_fn(None), while illumination stays software-controlled by
+        #       the worker (LED steady-on for the exposure window). This is the correct
+        #       mode on the Aries, whose native GenICam software-trigger command does
+        #       not reliably fire exposures.
+        #   native -- the GenICam TriggerSoftwarePulse / TUCCM_TRIGGER_SOFTWARE path.
+        #
+        # A hardware_line rig with nothing behind the line must fail here, loudly, and
+        # not silently at the first frame timeout deep inside an acquisition.
+        routing = self._config.software_trigger_routing
+        if acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER:
+            if routing == SoftwareTriggerRouting.HARDWARE_LINE and not self._hw_trigger_fn:
+                raise CameraError(
+                    "software_trigger_routing is 'hardware_line' but no hardware trigger "
+                    "function is available. Check that the camera declares an io.trigger "
+                    "endpoint on a controller that is enabled and actually wired to the "
+                    f"camera (configured endpoint: {self._config.trigger_endpoint_description}), "
+                    "or set software_trigger_routing: native."
+                )
+        self._virt_sw_trigger = (
             acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER
-            and self._hw_trigger_fn is not None
+            and routing == SoftwareTriggerRouting.HARDWARE_LINE
         )
-        self._virt_sw_trigger = virtualize_sw_trigger
 
         self._log.info(
             f"Tucsen acquisition mode set to {acquisition_mode} "
-            f"(virtualize_sw_trigger={self._virt_sw_trigger})"
+            f"(software trigger routing: {self.describe_trigger_routing()})"
         )
         with self._pause_streaming():
             if (

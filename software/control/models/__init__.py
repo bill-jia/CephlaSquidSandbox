@@ -87,6 +87,8 @@ from control.models.machine_config import (
     WellplateCalibration,
     SoftwareConfig,
     MachineConfig,
+    SoftwareTriggerRouting,
+    resolve_software_trigger_routing,
     build_default_machine_config,
 )
 
@@ -161,5 +163,7 @@ __all__ = [
     "WellplateCalibration",
     "SoftwareConfig",
     "MachineConfig",
+    "SoftwareTriggerRouting",
+    "resolve_software_trigger_routing",
     "build_default_machine_config",
 ]

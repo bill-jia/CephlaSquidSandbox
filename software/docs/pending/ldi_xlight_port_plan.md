@@ -89,14 +89,43 @@ MCU, then closes `addons.xlight` / `addons.dragonfly`.
 New `XLight.close()` sends `N0` when `has_spinning_disk_motor` and always
 closes the port; `XLight_Simulation.close()` mirrors it.
 
-### 7. Hardware trigger semantics (document only)
+### 7. Trigger semantics — routing is now explicit
 
-`main_camera.trigger` on the Teensy sends `control_illumination=True`,
-which strobes MCU ports only. Multipoint opens the LDI serial shutter
-before the trigger regardless of trigger mode, and live opens it at
-`start_live`, so hardware trigger works but with the shutter held open for
-the whole window. Per-frame strobing needs `shutter_mode: EXT` plus a TTL
-line (MCU D-port or NI-DAQ) declared as `io.shutter` on each LDI channel.
+**`main_camera.io.trigger` is not "only for Hardware trigger mode".** On the
+Aries the native GenICam software trigger does not reliably start exposures, so
+a SOFTWARE_TRIGGER request is virtualized onto that same line: the camera runs in
+Standard (hardware) trigger mode and `send_trigger()` pulses the endpoint. If the
+line is declared on a controller/channel that does not physically reach the
+camera, nothing errors — the triggers go nowhere and the run dies later with
+`Timed out waiting … for a frame`. That is exactly how a Teensy `trigger:0`
+entry survived on this rig until it aborted mid-acquisition.
+
+That routing is now a declared, validated decision rather than an inference from
+"did anyone hand the camera a trigger function?":
+
+- `devices.<camera>.config.software_trigger_routing`: `hardware_line` (virtualize
+  onto `io.trigger`) or `native` (SDK software-trigger command). Default
+  `hardware_line` iff an `io.trigger` endpoint is declared — resolved once in
+  `control.models.machine_config.resolve_software_trigger_routing`.
+- `hardware_line` with no `io.trigger` is rejected at config load;
+  `hardware_line` with an endpoint that did not bind (controller disabled or
+  absent) raises a `CameraError` at acquisition-mode set, not at first trigger.
+- `Microscope.build_from_global_config` passes a `hw_trigger_fn` only when
+  something actually drives it (a bound `main_camera.trigger` endpoint, or NL5),
+  and logs the effective routing plus the resolved endpoint at INFO on startup.
+- Simulation is not an exception: an enabled `devices.nidaq` builds a
+  `SimulatedNIDAQ`, so `main_camera.trigger` binds and both Hardware trigger mode
+  and `hardware_line` software triggers keep working against the simulated
+  camera. See `docs/configuration-system.md`, "Simulation".
+- See `docs/configuration-system.md`, "Camera trigger routing".
+
+Illumination is unaffected by all this. `main_camera.trigger` sends
+`control_illumination=True` only on the true Hardware-trigger path, and that
+strobes MCU ports only. Multipoint opens the LDI serial shutter before the
+trigger regardless of trigger mode, and live opens it at `start_live`, so
+hardware trigger works but with the shutter held open for the whole window.
+Per-frame strobing needs `shutter_mode: EXT` plus a TTL line (MCU D-port or
+NI-DAQ) declared as `io.shutter` on each LDI channel.
 
 ### 8. Library-wide config validation test — DONE
 

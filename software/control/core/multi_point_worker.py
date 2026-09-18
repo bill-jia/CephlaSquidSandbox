@@ -1169,6 +1169,10 @@ class MultiPointWorker:
         self.callbacks: MultiPointControllerFunctions = callbacks
         self.abort_requested_fn: Callable[[], bool] = abort_requested_fn
         self.request_abort_fn: Callable[[], None] = request_abort_fn
+        # Set when an abort is requested because a triggered frame never arrived.
+        # The teardown path then knows the outstanding frame is never coming and
+        # must not burn another _frame_wait_timeout_s() waiting for it.
+        self._aborted_on_frame_timeout = False
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
 
@@ -2279,11 +2283,23 @@ class MultiPointWorker:
             self.callbacks.signal_acquisition_finished()
 
     def _wait_for_outstanding_callback_images(self):
-        # If there are outstanding frames, wait for them to come in.
-        self._log.info("Waiting for any outstanding frames.")
-        if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-            self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
+        # If there are outstanding frames, wait for them to come in.  Except when the
+        # abort was itself caused by a frame that never arrived: that frame is not
+        # late, it does not exist, and blocking another _frame_wait_timeout_s() on it
+        # only delays teardown.  The normal-completion path is untouched — the flag is
+        # only ever set by a frame-timeout abort.
+        if self._aborted_on_frame_timeout:
+            self._log.info(
+                "Skipping the outstanding-frame wait: the acquisition was aborted by a frame "
+                "timeout, so the triggered frame is never going to arrive."
+            )
+        else:
+            self._log.info("Waiting for any outstanding frames.")
+            if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
+                self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
 
+        # In-flight image callbacks are real work on frames that DID arrive, so this
+        # wait stands either way.
         if not self._image_callback_idle.wait(self._frame_wait_timeout_s()):
             self._log.warning("Timed out waiting for the last image to process!")
 
@@ -4841,6 +4857,24 @@ class MultiPointWorker:
     def _frame_wait_timeout_s(self):
         return (self.camera.get_total_frame_time() / 1e3) + 10
 
+    def _describe_camera_trigger_routing(self) -> str:
+        """How software triggers reach the camera, for frame-timeout diagnostics.
+
+        Optional on the camera: not every driver in the tree implements it, and a
+        diagnostic string must never be the thing that raises.
+        """
+        describe = getattr(self.camera, "describe_trigger_routing", None)
+        if describe is None:
+            return "unknown"
+        try:
+            return describe()
+        except Exception:
+            return "unknown"
+
+    def _note_frame_timeout_abort(self) -> None:
+        """Record that the abort we are about to request is a never-arriving frame."""
+        self._aborted_on_frame_timeout = True
+
     def acquire_camera_image(
         self,
         config,
@@ -4897,7 +4931,11 @@ class MultiPointWorker:
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-                self._log.error("Frame callback never set _have_last_triggered_image callback! Aborting acquisition.")
+                self._log.error(
+                    "Frame callback never set _have_last_triggered_image callback! Aborting acquisition. "
+                    f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                )
+                self._note_frame_timeout_abort()
                 self.request_abort_fn()
                 return
 
@@ -5037,7 +5075,13 @@ class MultiPointWorker:
                     # wrong.
                     non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
                     if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                        self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                        # A frame that never arrives is almost always a trigger that never
+                        # arrived, so name the route it was supposed to take.
+                        self._log.error(
+                            f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition. "
+                            f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                        )
+                        self._note_frame_timeout_abort()
                         self.request_abort_fn()
                         # Let this fall through so we still turn off illumination.  Let the caller actually break out
                         # of the acquisition.

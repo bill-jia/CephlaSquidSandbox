@@ -84,6 +84,71 @@ _SPECIAL_CONTROLLER_NAMES: Dict[str, IOControllerType] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Camera software-trigger routing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SoftwareTriggerRouting(str, Enum):
+    """How a SOFTWARE_TRIGGER request is actually delivered to a camera.
+
+    Declared per camera as ``devices.<camera>.config.software_trigger_routing``.
+
+    - ``hardware_line``: the camera is programmed for hardware (Standard) trigger
+      and every "software" trigger is a pulse on the camera's ``io.trigger``
+      endpoint.  Required on sensors whose native software-trigger command is
+      unreliable (Tucsen Aries), and the reason the trigger line must actually
+      reach the camera: if it is wired to a controller/channel that goes nowhere,
+      no exposure ever starts.
+    - ``native``: the camera's own SDK software-trigger command
+      (GenICam ``TriggerSoftwarePulse`` / ``TUCCM_TRIGGER_SOFTWARE``).  No IO
+      endpoint is involved.
+    """
+
+    HARDWARE_LINE = "hardware_line"
+    NATIVE = "native"
+
+
+def resolve_software_trigger_routing(
+    configured: Optional[Any], declares_trigger_endpoint: bool
+) -> SoftwareTriggerRouting:
+    """Resolve the effective software-trigger routing for one camera.
+
+    This is the single place the default is decided.  ``configured`` is the raw
+    ``config.software_trigger_routing`` value (``None`` when unset), and
+    ``declares_trigger_endpoint`` says whether the camera declares an
+    ``io.trigger`` line.
+
+    Default: ``hardware_line`` when a trigger endpoint is declared (the line
+    exists, so use it), otherwise ``native``.  An explicit value always wins,
+    but ``hardware_line`` without a trigger endpoint is a configuration error.
+    """
+    if configured is None:
+        return (
+            SoftwareTriggerRouting.HARDWARE_LINE
+            if declares_trigger_endpoint
+            else SoftwareTriggerRouting.NATIVE
+        )
+
+    if isinstance(configured, SoftwareTriggerRouting):
+        routing = configured
+    else:
+        try:
+            routing = SoftwareTriggerRouting(str(configured))
+        except ValueError:
+            raise ValueError(
+                f"Unknown software_trigger_routing {configured!r}; expected one of "
+                f"{[r.value for r in SoftwareTriggerRouting]}"
+            )
+
+    if routing is SoftwareTriggerRouting.HARDWARE_LINE and not declares_trigger_endpoint:
+        raise ValueError(
+            "software_trigger_routing: hardware_line requires the camera to declare "
+            "an io.trigger endpoint that physically reaches the camera"
+        )
+    return routing
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Device IO and channel models
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -597,6 +662,29 @@ class MachineConfig(BaseModel):
                     f"'{dev.controller}' which is not defined in devices"
                 )
         return self
+
+    @model_validator(mode="after")
+    def _validate_software_trigger_routing(self) -> "MachineConfig":
+        """Reject an unknown routing value, or ``hardware_line`` with no trigger line."""
+        for dev_name, dev in self.devices.items():
+            if "software_trigger_routing" not in dev.config:
+                continue
+            try:
+                resolve_software_trigger_routing(
+                    dev.config["software_trigger_routing"], "trigger" in dev.io
+                )
+            except ValueError as e:
+                raise ValueError(f"Device '{dev_name}': {e}")
+        return self
+
+    def get_software_trigger_routing(self, device_name: str) -> SoftwareTriggerRouting:
+        """Effective software-trigger routing for a camera device (see the resolver)."""
+        dev = self.devices.get(device_name)
+        if dev is None:
+            return SoftwareTriggerRouting.NATIVE
+        return resolve_software_trigger_routing(
+            dev.config.get("software_trigger_routing"), "trigger" in dev.io
+        )
 
     def validate_io_lines(self) -> List[str]:
         """Check for channel conflicts and missing controller references.
