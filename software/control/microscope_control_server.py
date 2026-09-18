@@ -505,42 +505,50 @@ class MicroscopeControlServer:
         return result
 
     @schema_method
-    def _cmd_set_channel(
+    def _cmd_set_observation_state(
         self,
-        channel_name: str = Field(
-            ..., description="Name of the channel to activate (e.g., 'BF LED matrix full', 'Fluorescence 488 nm Ex')"
+        observation_state: str = Field(
+            ...,
+            description=(
+                "Name of the Observation State (imaging channel) to apply, as listed by "
+                "get_observation_states. An Observation State is the whole light path: "
+                "illumination, exposure, gain, emission filter and confocal settings. "
+                "To change one light source's brightness instead, use set_illumination_intensity."
+            ),
         ),
     ) -> Dict[str, Any]:
-        """Set the current imaging channel/illumination mode."""
-        # TBD: change to use ObservationState
-        return None
-    #     """Set the current imaging channel/illumination mode."""
-    #     objective = self.microscope.objective_store.current_objective
-    #     channel_config = self.microscope.live_controller.get_channel_by_name(objective, channel_name)
-    #     if channel_config:
-    #         self.microscope.live_controller.set_microscope_mode(channel_config)
-    #         return {"channel": channel_name, "objective": objective}
-    #     else:
-    #         raise ValueError(f"Channel '{channel_name}' not found for objective '{objective}'")
+        """Apply a named Observation State (imaging channel) to the microscope."""
+        state = self.microscope.config_repo.get_observation_state_by_name(observation_state)
+        if state is None:
+            available = [s.name for s in self.microscope.config_repo.get_observation_states()]
+            raise ValueError(
+                f"No Observation State named '{observation_state}'. Available: {available}"
+            )
+        self.microscope.obs_controller.apply_full_observation_state(state)
+        self.microscope.obs_controller.set_active_observation_state(state)
+        return {"observation_state": state.name}
 
     @schema_method
-    def _cmd_get_channels(self) -> Dict[str, Any]:
-        """Get list of available imaging channels."""
-        channels = self.microscope.live_controller.get_observation_states()
-        return {"channels": [ch.name for ch in channels] if channels else []}
+    def _cmd_get_observation_states(self) -> Dict[str, Any]:
+        """List the available Observation States (imaging channels)."""
+        states = self.microscope.config_repo.get_observation_states()
+        return {"observation_states": [s.name for s in states] if states else []}
 
     @schema_method
     def _cmd_set_exposure(
         self,
         exposure_ms: float = Field(..., description="Exposure time in milliseconds", ge=0.1, le=10000),
-        channel: Optional[str] = Field(
-            None, description="Channel to set exposure for (applies to current if not specified)"
+        observation_state: Optional[str] = Field(
+            None,
+            description=(
+                "Observation State (imaging channel) to record the exposure on. "
+                "Omit to set the camera directly for whatever is currently applied."
+            ),
         ),
     ) -> Dict[str, Any]:
         """Set camera exposure time in milliseconds."""
-        if channel:
-            objective = self.microscope.objective_store.current_objective
-            self.microscope.set_exposure_time(channel, exposure_ms, objective)
+        if observation_state:
+            self.microscope.set_exposure_time(observation_state, exposure_ms)
         else:
             self.microscope.camera.set_exposure_time(exposure_ms)
         return {"exposure_ms": exposure_ms}
@@ -548,12 +556,19 @@ class MicroscopeControlServer:
     @schema_method
     def _cmd_set_illumination_intensity(
         self,
-        channel: str = Field(..., description="Channel name (e.g., 'Fluorescence 488 nm Ex')"),
+        illumination_channel: str = Field(
+            ...,
+            description=(
+                "Illumination channel: one light source line, e.g. 'Fluorescence 488 nm Ex'. "
+                "This is NOT an Observation State — to apply a whole light path use "
+                "set_observation_state."
+            ),
+        ),
         intensity: float = Field(..., description="Intensity value (0-100%)", ge=0, le=100),
     ) -> Dict[str, Any]:
-        """Set illumination/laser intensity for a specific channel (0-100%)."""
-        self.microscope.set_illumination_intensity(channel, intensity)
-        return {"channel": channel, "intensity": intensity}
+        """Set the intensity of one illumination channel (0-100%)."""
+        self.microscope.set_illumination_intensity(illumination_channel, intensity)
+        return {"illumination_channel": illumination_channel, "intensity": intensity}
 
     @schema_method
     def _cmd_get_objectives(self) -> Dict[str, Any]:
@@ -581,13 +596,13 @@ class MicroscopeControlServer:
     @schema_method
     def _cmd_turn_on_illumination(self) -> Dict[str, Any]:
         """Turn on the illumination for the current channel."""
-        self.microscope.live_controller.turn_on_illumination()
+        self.microscope.obs_controller.turn_on_illumination()
         return {"illumination": "on"}
 
     @schema_method
     def _cmd_turn_off_illumination(self) -> Dict[str, Any]:
         """Turn off all illumination."""
-        self.microscope.live_controller.turn_off_illumination()
+        self.microscope.obs_controller.turn_off_illumination()
         return {"illumination": "off"}
 
     @schema_method
@@ -676,9 +691,13 @@ class MicroscopeControlServer:
     def _cmd_run_acquisition(
         self,
         wells: str = Field(..., description="Well selection string (e.g., 'A1:B3' for range or 'A1,A2,B1' for list)"),
-        channels: List[str] = Field(
+        observation_states: List[str] = Field(
             ...,
-            description="List of channel names to acquire (e.g., ['Fluorescence 488 nm Ex', 'Fluorescence 561 nm Ex'])",
+            description=(
+                "Observation States (imaging channels) to acquire at each position, by name, "
+                "as listed by get_observation_states. These are whole light paths, not "
+                "illumination channel names."
+            ),
         ),
         nx: int = Field(2, description="Number of sites in X per well", ge=1, le=100),
         ny: int = Field(2, description="Number of sites in Y per well", ge=1, le=100),
@@ -724,13 +743,15 @@ class MicroscopeControlServer:
         if not well_coords:
             raise ValueError(f"Could not parse wells: {wells}")
 
-        # Validate channels exist
-        available_channels = self.microscope.live_controller.get_observation_states()
-        available_channel_names = [ch.name for ch in available_channels] if available_channels else []
+        # Validate the requested Observation States exist
+        available_states = self.microscope.live_controller.get_observation_states()
+        available_state_names = [s.name for s in available_states] if available_states else []
 
-        invalid_channels = [ch for ch in channels if ch not in available_channel_names]
-        if invalid_channels:
-            raise ValueError(f"Invalid channels: {invalid_channels}. Available: {available_channel_names}")
+        invalid = [name for name in observation_states if name not in available_state_names]
+        if invalid:
+            raise ValueError(
+                f"Invalid Observation States: {invalid}. Available: {available_state_names}"
+            )
 
         # Set up paths
         if not base_path:
@@ -771,8 +792,8 @@ class MicroscopeControlServer:
             self.multipoint_controller.set_NZ(1)  # No Z-stack for now
             self.multipoint_controller.set_Nt(1)  # Single timepoint
 
-            # Set the selected channels
-            self.multipoint_controller.set_selected_configurations(channels)
+            # Select the Observation States to acquire
+            self.multipoint_controller.set_selected_configurations(observation_states)
 
             # Set the base path and start new experiment
             self.multipoint_controller.set_base_path(base_path)
@@ -780,7 +801,7 @@ class MicroscopeControlServer:
 
             # Calculate total FOVs for status reporting
             total_fovs = sum(len(coords) for coords in self.scan_coordinates.region_fov_coordinates.values())
-            total_images = total_fovs * len(channels)
+            total_images = total_fovs * len(observation_states)
 
             # Run the acquisition (non-blocking - runs in worker thread)
             self.multipoint_controller.run_acquisition()
@@ -789,7 +810,7 @@ class MicroscopeControlServer:
                 "started": True,
                 "wells": wells,
                 "well_count": len(well_coords),
-                "channels": channels,
+                "observation_states": observation_states,
                 "sites_per_well": nx * ny,
                 "total_fovs": total_fovs,
                 "total_images": total_images,
@@ -1010,20 +1031,23 @@ class MicroscopeControlServer:
         except Exception as e:
             self._log.error(f"Failed to update GUI acquisition state: {e}")
 
-    def _validate_channels(self, channel_names: List[str], current_objective: str) -> List[str]:
-        """Validate that requested channels exist for the current objective.
+    def _validate_observation_states(self, names: List[str]) -> List[str]:
+        """Check that every requested Observation State exists.
 
-        Returns the list of available channel names.
-        Raises ValueError if any requested channels are invalid.
+        Observation States are objective-free — the acquisition YAML's
+        ``channel_names`` hold their names. Returns the available names.
+        Raises ValueError naming the ones that do not exist.
         """
-        available_channels = self.microscope.config_repo.get_observation_states()
-        available_channel_names = [ch.name for ch in available_channels] if available_channels else []
+        available = self.microscope.config_repo.get_observation_states()
+        available_names = [s.name for s in available] if available else []
 
-        invalid_channels = [ch for ch in channel_names if ch not in available_channel_names]
-        if invalid_channels:
-            raise ValueError(f"Invalid channels: {invalid_channels}. Available: {available_channel_names}")
+        invalid = [name for name in names if name not in available_names]
+        if invalid:
+            raise ValueError(
+                f"Invalid Observation States: {invalid}. Available: {available_names}"
+            )
 
-        return available_channel_names
+        return available_names
 
     def _get_z_from_center(self, center: list, default_z: float) -> float:
         """Extract Z coordinate from center array, using default if not present."""
@@ -1209,7 +1233,7 @@ class MicroscopeControlServer:
         self._update_gui_from_yaml(yaml_data, yaml_path)
 
         # Validate channels exist (raises ValueError if invalid)
-        self._validate_channels(yaml_data.channel_names, current_objective)
+        self._validate_observation_states(yaml_data.channel_names)
 
         # Set up paths - require explicit DEFAULT_SAVING_PATH configuration
         if not base_path:
