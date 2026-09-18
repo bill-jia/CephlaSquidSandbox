@@ -253,7 +253,7 @@ illumination_devices:
       "BF LED matrix left half":  { source_code: 1, type: transillumination }
       "BF LED matrix right half": { source_code: 2, type: transillumination }
       "BF LED matrix top half":   { source_code: 7, type: transillumination }
-      "BF LED matrix bottom half":{ source_code: 8, type: transillumination }
+      "BF LED matrix bottom half": { source_code: 8, type: transillumination }
 
 # Example: CoolLED pE-400 (serial intensity) with NI-DAQ TTL shutter
 # Uncomment and adjust to add a CoolLED alongside the squid_lasers above.
