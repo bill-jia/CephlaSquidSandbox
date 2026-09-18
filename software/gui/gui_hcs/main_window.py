@@ -1429,10 +1429,15 @@ class HighContentScreeningGui(QMainWindow):
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
                 self.microscope.obs_controller.toggle_confocal_widefield
             )
+            # Re-select the current channel so its confocal overrides take effect.
+            # No channel may be selected yet, so this must not dereference None.
+            def _reselect_current_channel():
+                current = self.liveControlWidget.currentConfiguration
+                if current is not None:
+                    self.liveControlWidget.select_new_microscope_mode_by_name(current.name)
+
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
-                lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-                    self.liveControlWidget.currentConfiguration.name
-                )
+                _reselect_current_channel
             )
             # Update iris UI when channel changes
             self.liveControlWidget.signal_live_configuration.connect(

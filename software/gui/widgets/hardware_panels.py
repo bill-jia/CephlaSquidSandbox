@@ -1957,6 +1957,12 @@ class LiveControlWidget(QFrame):
         self.fps_display = 10
         self.streamHandler.set_display_fps(self.fps_display)
 
+        # Assigned by select_new_microscope_mode_by_name, but read by other
+        # widgets (the confocal panel syncs its irises from it) before any mode
+        # has been selected — bind it up front so those reads see None instead
+        # of raising AttributeError.
+        self.currentConfiguration = None
+
         # channels = self.liveController.get_observation_states()
         # if not channels:
         #     self._log.error("No channels available - cannot initialize LiveControlWidget")
