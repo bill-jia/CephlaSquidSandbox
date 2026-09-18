@@ -359,6 +359,42 @@ class ObservationStateController:
     def sync_confocal_mode_from_hardware(self, confocal: bool) -> None:
         self.toggle_confocal_widefield(confocal)
 
+    def apply_confocal_mode(self, confocal: bool) -> None:
+        """Record the confocal/widefield mode *and* move the spinning disk.
+
+        ``toggle_confocal_widefield`` is the GUI's state-only entry point: the
+        confocal panel drives the disk itself and then tells the controller what
+        it did. Applying a saved observation state has no widget in the loop, so
+        the disk has to be driven here — otherwise ``state.confocal_mode`` would
+        be a software-only flag and a preset saved in confocal would come back
+        with the disk parked in widefield.
+
+        A disk move is several seconds, so hardware is only touched when the
+        requested mode differs from the mode the controller believes the
+        hardware is in.
+        """
+        confocal = bool(confocal)
+        if confocal == self._confocal_mode:
+            return
+        if ENABLE_SPINNING_DISK_CONFOCAL:
+            addons = getattr(self.microscope, "addons", None)
+            dragonfly = getattr(addons, "dragonfly", None)
+            xlight = getattr(addons, "xlight", None)
+            try:
+                with self._time("obs:confocal:set_disk_position"):
+                    if USE_DRAGONFLY and dragonfly is not None:
+                        dragonfly.set_modality("CONFOCAL" if confocal else "BF")
+                    elif xlight is not None:
+                        # XLight: 1 for confocal, 0 for widefield
+                        xlight.set_disk_position(1 if confocal else 0)
+            except Exception as e:
+                self._log.warning(
+                    "Could not move the spinning disk to %s: %s",
+                    "confocal" if confocal else "widefield",
+                    e,
+                )
+        self.toggle_confocal_widefield(confocal)
+
     # ─────────────────────────────────────────────────────────────────────
     # Illumination control (moved from LiveController)
     # ─────────────────────────────────────────────────────────────────────
@@ -522,6 +558,38 @@ class ObservationStateController:
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
 
+    def set_emission_filter_position(self, position: int) -> None:
+        """Record an emission filter move on the live state and apply it.
+
+        Called by the confocal panel when the user picks a filter, so the choice
+        becomes part of the observation state (and of any preset saved from it)
+        instead of being a driver-only side effect the state never learns about.
+
+        The X-Light is preferred when the rig has one (its wheel is the confocal
+        unit's own); otherwise the standalone wheel is used. Hardware errors are
+        logged, never raised — a stuck wheel must not break the GUI.
+        """
+        try:
+            slot = int(position)
+        except (TypeError, ValueError):
+            self._log.warning("Ignoring invalid emission filter position: %r", position)
+            return
+
+        if self._current_state is not None:
+            self._current_state.emission_filter_positions["default"] = slot
+
+        addons = getattr(self.microscope, "addons", None)
+        xlight = getattr(addons, "xlight", None)
+        wheel = getattr(addons, "emission_filter_wheel", None)
+        try:
+            if xlight is not None:
+                # validate/readback comes from the driver's own validate_wheel_pos
+                xlight.set_emission_filter(slot, extraction=False)
+            elif wheel is not None:
+                wheel.set_filter_wheel_position({1: slot})
+        except Exception as e:
+            self._log.warning("Not setting emission filter position: %s", e)
+
     # ─────────────────────────────────────────────────────────────────────
     # Full observation state apply (replaces LiveController.set_observation_state)
     # ─────────────────────────────────────────────────────────────────────
@@ -595,7 +663,7 @@ class ObservationStateController:
         ``camera_mode`` saved by a different camera class).
         """
         with self._time("obs:preset:toggle_confocal_widefield"):
-            self.toggle_confocal_widefield(state.confocal_mode)
+            self.apply_confocal_mode(state.confocal_mode)
 
         if state.enable_channel_auto_filter_switching is not None:
             self.enable_channel_auto_filter_switching = bool(state.enable_channel_auto_filter_switching)
@@ -656,10 +724,13 @@ class ObservationStateController:
         from control.core.observation_state_service import collect_emission_filter_positions
 
         wheel = None
+        xlight = None
         if self.microscope is not None:
-            wheel = getattr(self.microscope.addons, "emission_filter_wheel", None)
+            addons = getattr(self.microscope, "addons", None)
+            wheel = getattr(addons, "emission_filter_wheel", None)
+            xlight = getattr(addons, "xlight", None)
         try:
-            emission = collect_emission_filter_positions(wheel) if wheel else {}
+            emission = collect_emission_filter_positions(wheel, xlight=xlight)
         except Exception:
             emission = {}
         if not emission and self._current_state is not None:

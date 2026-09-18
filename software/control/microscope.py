@@ -1069,7 +1069,8 @@ class Microscope:
         else:
             raise RuntimeError("No spinning disk hardware available")
 
-        self.live_controller.toggle_confocal_widefield(confocal)
+        # State only: the disk was already moved above.
+        self.obs_controller.toggle_confocal_widefield(confocal)
 
     def is_confocal_mode(self) -> bool:
         """Check if currently in confocal mode.
