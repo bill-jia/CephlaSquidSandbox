@@ -503,7 +503,7 @@ class SpinningDiskConfocalWidget(QWidget):
             self.filter_slider.valueChanged.connect(self.set_filter_slider)
 
         self.switch_confocal.state_requested.connect(self.request_disk_position)
-        self.btn_toggle_motor.clicked.connect(self.toggle_motor)
+        self.switch_motor.state_requested.connect(self.request_motor_state)
 
         if self.xlight.has_illumination_iris_diaphragm:
             self.slider_illumination_iris.sliderReleased.connect(lambda: self.update_illumination_iris(True))
@@ -564,11 +564,13 @@ class SpinningDiskConfocalWidget(QWidget):
         # position is not otherwise visible from the GUI, and a button labelled
         # with the *next* action left the current one to be inferred.
         self.switch_confocal = SegmentedSwitch("Widefield", "Confocal")
-        self.btn_toggle_motor = QPushButton("Disk Motor On")
-        self.btn_toggle_motor.setCheckable(True)
+        # The motor is independent of the disk position in both the firmware and
+        # this software -- confocal can be selected with the disk parked -- so it
+        # gets its own switch rather than being implied by the mode.
+        self.switch_motor = SegmentedSwitch("Disk Off", "Disk On")
         button_row = QHBoxLayout()
         button_row.setSpacing(4)
-        button_row.addWidget(self.btn_toggle_motor, 1)
+        button_row.addWidget(self.switch_motor, 1)
         button_row.addWidget(self.switch_confocal, 1)
         layout.addLayout(button_row, row, 0, 1, 2)
         row += 1
@@ -637,7 +639,7 @@ class SpinningDiskConfocalWidget(QWidget):
         if self.dropdown_dichroic:
             self.dropdown_dichroic.setEnabled(enable)
         self.switch_confocal.setEnabled(enable)
-        self.btn_toggle_motor.setEnabled(enable)
+        self.switch_motor.setEnabled(enable)
         self.slider_illumination_iris.setEnabled(enable)
         self.spinbox_illumination_iris.setEnabled(enable)
         self.slider_emission_iris.setEnabled(enable)
@@ -658,26 +660,46 @@ class SpinningDiskConfocalWidget(QWidget):
 
         def on_finished(success, error_msg):
             QMetaObject.invokeMethod(
-                self, "_on_disk_position_toggled", Qt.QueuedConnection, Q_ARG(int, target_position)
+                self,
+                "_on_disk_position_toggled",
+                Qt.QueuedConnection,
+                Q_ARG(bool, bool(success)),
+                Q_ARG(int, target_position),
             )
 
         utils.threaded_operation_helper(self.xlight.set_disk_position, on_finished, position=target_position)
 
-    @Slot(int)
-    def _on_disk_position_toggled(self, position):
-        self.disk_position_state = position
-        self.switch_confocal.set_state(position == 1)
-        self.enable_all_buttons(True)
-        self.signal_toggle_confocal_widefield.emit(self.disk_position_state)
+    @Slot(bool, int)
+    def _on_disk_position_toggled(self, moved, position):
+        """Light the new segment only if the disk actually got there.
 
-    def toggle_motor(self):
+        A failed move leaves the switch (and ``disk_position_state``, and the
+        observation state controller) on the position the disk is still in,
+        rather than recording a light path the unit never entered.
+        """
+        if moved:
+            self.disk_position_state = position
+            self.switch_confocal.set_state(position == 1)
+        self.enable_all_buttons(True)
+        if moved:
+            self.signal_toggle_confocal_widefield.emit(self.disk_position_state)
+
+    def request_motor_state(self, run: bool):
+        """Start or stop the spinning disk, per the segment the user clicked."""
         self.enable_all_buttons(False)
-        state = self.btn_toggle_motor.isChecked()
 
         def on_finished(success, error_msg):
-            QMetaObject.invokeMethod(self, "enable_all_buttons", Qt.QueuedConnection, Q_ARG(bool, True))
+            QMetaObject.invokeMethod(
+                self, "_on_motor_state_changed", Qt.QueuedConnection, Q_ARG(bool, bool(success)), Q_ARG(bool, run)
+            )
 
-        utils.threaded_operation_helper(self.xlight.set_disk_motor_state, on_finished, state=state)
+        utils.threaded_operation_helper(self.xlight.set_disk_motor_state, on_finished, state=run)
+
+    @Slot(bool, bool)
+    def _on_motor_state_changed(self, changed, running):
+        if changed:
+            self.switch_motor.set_state(running)
+        self.enable_all_buttons(True)
 
     def set_emission_filter(self, index):
         """Emit the chosen emission wheel slot.
@@ -862,9 +884,8 @@ class SpinningDiskConfocalWidget(QWidget):
                 # whole session or it does not, so it only ever follows hardware.
                 running = self._hardware_value("disk_motor_state", self.xlight.get_disk_motor_state)
                 if running is not None:
-                    # setChecked emits `toggled`, never `clicked`, and `clicked`
-                    # is what drives the motor — so this cannot start the disk.
-                    self.btn_toggle_motor.setChecked(bool(running))
+                    # set_state is display-only, so this cannot start the disk.
+                    self.switch_motor.set_state(bool(running))
         finally:
             self._block_change_signals(False)
 

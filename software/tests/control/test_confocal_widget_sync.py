@@ -305,21 +305,22 @@ def test_dichroic_and_slider_keep_the_hardware_value_when_unrecorded(panel):
     assert panel.filter_slider.value() == 3
 
 
-def test_disk_motor_button_reflects_a_running_motor(qt_app):
+def test_disk_motor_switch_reflects_a_running_motor(qt_app):
     xlight = sp.XLight_Simulation()
     xlight.set_disk_motor_state(True)
 
     widget = SpinningDiskConfocalWidget(xlight)
     try:
-        assert widget.btn_toggle_motor.isChecked() is True
+        assert widget.switch_motor.btn_on.isChecked() is True
         # ...and the panel did not start (or stop) the motor to find out.
         assert xlight.disk_motor_state is True
     finally:
         widget.deleteLater()
 
 
-def test_disk_motor_button_is_unchecked_for_a_parked_disk(panel):
-    assert panel.btn_toggle_motor.isChecked() is False
+def test_disk_motor_switch_reads_off_for_a_parked_disk(panel):
+    assert panel.switch_motor.state() is False
+    assert panel.switch_motor.btn_off.isChecked() is True
 
 
 def test_user_dichroic_choice_is_emitted_not_written(panel):
@@ -420,12 +421,38 @@ def test_clicking_the_lit_segment_asks_for_nothing(qt_app):
 
 
 def test_panel_lights_the_new_segment_once_the_disk_has_moved(panel):
-    panel._on_disk_position_toggled(1)
+    panel._on_disk_position_toggled(True, 1)
 
     assert panel.disk_position_state == 1
     assert panel.switch_confocal.state() is True
     assert panel.switch_confocal.btn_on.isChecked() is True
 
-    panel._on_disk_position_toggled(0)
+    panel._on_disk_position_toggled(True, 0)
 
     assert panel.switch_confocal.btn_off.isChecked() is True
+
+
+def test_motor_switch_lights_the_new_segment_only_on_success(panel):
+    panel._on_motor_state_changed(True, True)
+    assert panel.switch_motor.state() is True
+
+    # A failed start leaves the switch on the state the disk is still in.
+    panel._on_motor_state_changed(False, False)
+    assert panel.switch_motor.state() is True
+
+
+def test_a_failed_disk_move_is_not_shown_or_recorded(panel):
+    """The switch and the observation state must not claim a move that failed."""
+    spy = Spy(panel.signal_toggle_confocal_widefield)
+
+    panel._on_disk_position_toggled(False, 1)
+
+    assert panel.disk_position_state == 0
+    assert panel.switch_confocal.btn_off.isChecked() is True
+    assert spy.calls == []
+
+    panel._on_disk_position_toggled(True, 1)
+
+    assert panel.disk_position_state == 1
+    assert panel.switch_confocal.btn_on.isChecked() is True
+    assert spy.calls == [(True,)]
