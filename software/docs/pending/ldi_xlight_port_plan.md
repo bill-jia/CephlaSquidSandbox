@@ -1,6 +1,9 @@
 # LDI + X-Light V3 rig: port from the legacy fork
 
-Status: **config written, code changes pending** (2026-09-17).
+Status (2026-09-17): config written; **gaps 1-3 implemented** on branch
+`ldi-xlight-port` (tests: `tests/control/test_ldi_driver.py`,
+`tests/control/test_illumination_builder_ldi.py`); gaps 4-8 pending.
+Untested on the rig.
 
 Config: `machine_configs/library/machine_config_Squid+_LDI_XLight_TucsenAries6506.yaml`
 Source: `C:\Users\jialab\Desktop\Squid_XLightV3\software\configuration_Squid+_Tucsen_LDI_XLight.ini`
@@ -27,39 +30,26 @@ Source: `C:\Users\jialab\Desktop\Squid_XLightV3\software\configuration_Squid+_Tu
 
 Ordered by "will not work at all" → "quality of life".
 
-### 1. LDI builder ignores the config entry (required)
+### 1. LDI builder ignores the config entry — DONE
 
-`microscope.py::_build_illumination_controller` does
-`serial_peripherals.LDI()` — no serial number, no modes. `LDI.__init__`
-hard-codes `SN="00000001"` and reads `control._def.LDI_INTENSITY_MODE` /
-`LDI_SHUTTER_MODE`, which `config_bridge.apply_machine_config` never sets.
+`LDI(SN, intensity_mode="PC", shutter_mode="PC")` /
+`LDI_Simulation(SN=None, ...)`; the `_def.LDI_*` globals are gone.
+`microscope.py::_build_serial_light_source` passes
+`connection.serial_number` and `config.intensity_mode/shutter_mode` from the
+`illumination_devices` entry (missing SN → `ValueError` naming the device).
+A serial number with no matching COM port raises `SerialDeviceError`
+listing the ports that were found.
 
-Change:
-- `LDI.__init__(self, SN, intensity_mode="PC", shutter_mode="PC")`; drop the
-  `_def.LDI_*` globals (no other reader).
-- Builder passes `dev_entry.connection.serial_number` and
-  `dev_entry.config.get("intensity_mode")` / `("shutter_mode")`.
-- Fail loudly when the SN is not found: `SerialDevice` currently leaves
-  `self.serial = None` and the first write raises `AttributeError`. Raise a
-  `SerialDeviceError` naming the SN instead.
+### 2. LDI never receives its mode commands — DONE
 
-### 2. LDI never receives its mode commands (required)
+`LDI.initialize()` now sends `run!` → `INT_MODE=PC|EXT` → `SH_MODE=PC|EXT`.
 
-`_build_serial_device` calls `light_source.initialize()` only, and
-`LDI.initialize()` sends just `run!`. The legacy
-`IlluminationController._configure_light_source` sent `INT_MODE=PC` and
-`SH_MODE=PC` after `run!`. If the LDI was last left in EXT mode, every
-serial `set:` / `shutter:` command is ignored and the lasers never fire.
+### 3. Simulation drops the LDI entirely — DONE
 
-Change: `LDI.initialize()` = `run!` → `set_intensity_control_mode(self.intensity_mode)`
-→ `set_shutter_control_mode(self.shutter_mode)`.
-
-### 3. Simulation drops the LDI entirely (recommended)
-
-`elif driver == "ldi" and not simulated:` skips the device, so a simulated
-launch of this config shows no laser channels. Build
-`LDI_Simulation()` when simulated (same for `celesta` / `versalase`;
-`coolled_pe400` has the same gap).
+Simulated launches build `LDI_Simulation` and `CoolLEDpE400_Simulation`
+through the same `_build_serial_device` path as the real drivers.
+`celesta`, `andor_laser`, `versalase` have no simulation class and are still
+skipped when simulated.
 
 ### 4. X-Light config keys are not bridged (recommended)
 
@@ -76,24 +66,35 @@ registry must read `_def` lazily (property or function) or the bridge runs
 too late. Better: pass `sleep_time_for_wheel` and `validate_wheel_pos` into
 `XLight.__init__` and stop reading `_def` in `apply_optical_path`.
 
-### 5. Confocal config is a global file, not per library config (recommended)
+### 5. Remove `confocal_config.yaml` and nest confocal settings under the device (recommended)
 
-`ConfigRepository.get_confocal_config()` always reads
-`machine_configs/confocal_config.yaml`, shared by every library entry. On a
-machine that hosts several library configs (this sandbox), creating that
-file would make the CoolLED rigs think they have a confocal.
+`ConfigRepository.get_confocal_config()` reads a global
+`machine_configs/confocal_config.yaml` that has never existed on any rig
+(only the `.example` does). Its only runtime effects are (a) seeding iris
+defaults through `ConfocalConfig.model` → `CONFOCAL_MODELS` →
+`_def.XLIGHT_*_IRIS_DEFAULT` when the GUI first edits an iris, and (b)
+contributing wheels under the `"confocal"` source of
+`get_all_filter_wheels()`, which only multi-camera `hardware_bindings`
+resolution reads. `save_confocal_config` has no callers, and the X-Light
+self-reports its wheels and irises through the `idc` capability bits, so
+`model` is redundant.
 
-Change: add `confocal: Optional[ConfocalConfig]` to `MachineConfig` and have
-`get_confocal_config()` prefer the embedded block, mirroring
-`filter_wheel_registry` / `hardware_bindings`. The new YAML already carries
-the block under `confocal:` (currently stored in `model_extra`, harmless).
-
-Related: the observation-state editor's filter-position picker
-(`gui/widgets/monitoring.py::_populate_filter_positions_for_combo`) reads
-only the standalone `filter_wheel_registry`, so the X-Light wheel is
-declared there rather than as a `confocal` wheel. Either teach the picker to
-merge `config_repo.get_all_filter_wheels()` or keep the standalone
-declaration and document it.
+Change (removal, not a new loader):
+- Delete `ConfocalConfig`, `confocal_models.py`, `get/has/save_confocal_config`,
+  `confocal_config.yaml.example`, the docs sections, and their tests.
+- Move everything into `devices.xlight.config` (same shape for `dragonfly`):
+  `sleep_time_for_wheel`, `validate_wheel_pos`, `illumination_iris_default`,
+  `emission_iris_default`, and `emission_filter_wheel: {positions: {1: …, 8: …}}`
+  (slot count = `len(positions)`, replacing `XLIGHT_EMISSION_FILTER_POSITIONS`).
+- Iris seeding reads the device config defaults, or better the hardware at
+  startup (`xlight.get_illumination_iris()` / `get_emission_iris()`), the way
+  `_sync_confocal_mode_from_hardware` already reads the disk position.
+- `get_all_filter_wheels()["confocal"]` is derived from the xlight/dragonfly
+  device entry, and the observation-state editor's filter-position picker
+  (`gui/widgets/monitoring.py::_populate_filter_positions_for_combo`) uses
+  `get_all_filter_wheels()` instead of only the standalone registry.
+- Then drop the `confocal:` block and the standalone `filter_wheel_registry`
+  entry from the new library YAML; both exist only to work around the above.
 
 ### 6. Shutdown leaves the LDI and disk untouched (recommended)
 
