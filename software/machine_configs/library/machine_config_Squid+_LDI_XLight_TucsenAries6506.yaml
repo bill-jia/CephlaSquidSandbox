@@ -27,6 +27,11 @@ devices:
 
   teensy:
     driver: teensy
+    connection:
+      # Legacy ini: controller_sn = "16821080".  Required on this rig: Windows
+      # labels every USB CDC device "Microsoft", so the LDI also matches the
+      # microcontroller port scan.
+      serial_number: "16821080"
     config:
       # Legacy ini: illumination_intensity_factor = 1.  Only affects DAC
       # ports, which nothing uses on this rig (lasers are serial-driven).
