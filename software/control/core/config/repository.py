@@ -920,24 +920,6 @@ class ConfigRepository:
 
         return True
 
-    def get_last_active_channel_name(self) -> Optional[str]:
-        """Read the channel name that was active when the app last shut down.
-
-        Sourced from ``gui_state.yaml`` (preferred) with a fallback to the
-        legacy ``last_active_channel.txt`` sidecar.
-        """
-        gui_state = self.get_gui_state()
-        if gui_state and gui_state.last_active_observation_state_name:
-            return gui_state.last_active_observation_state_name
-        try:
-            path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
-            if path.exists():
-                name = path.read_text().strip()
-                return name if name else None
-        except Exception:
-            pass
-        return None
-
     # ═══════════════════════════════════════════════════════════════════════════
     # GUI STATE (per-profile)
     # Transient UI selections (geometry, tabs, last objective/channel) that

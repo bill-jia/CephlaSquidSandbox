@@ -2099,21 +2099,6 @@ class LiveControlWidget(QFrame):
         # of raising AttributeError.
         self.currentConfiguration = None
 
-        # channels = self.liveController.get_observation_states()
-        # if not channels:
-        #     self._log.error("No channels available - cannot initialize LiveControlWidget")
-        #     self.currentConfiguration = None
-        # else:
-        #     # Restore the last active channel if available, otherwise use first
-        #     selected = channels[0]
-        #     last_name = self.liveController.microscope.config_repo.get_last_active_channel_name()
-        #     if last_name:
-        #         for s in channels:
-        #             if s.name == last_name:
-        #                 selected = s
-        #                 break
-        #     self.currentConfiguration = selected
-
         self.add_components(show_display_options, show_autolevel, autolevel, stretch, objectives_widget)
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
@@ -2121,13 +2106,6 @@ class LiveControlWidget(QFrame):
 
     def add_components(self, show_display_options, show_autolevel, autolevel, stretch, objectives_widget=None):
         sizePolicy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        # self.dropdown_modeSelection = QComboBox()
-        # for state in self.liveController.get_observation_states():
-        #     self.dropdown_modeSelection.addItems([state.name])
-        # if self.currentConfiguration:
-        #     self.dropdown_modeSelection.setCurrentText(self.currentConfiguration.name)
-        # self.dropdown_modeSelection.setSizePolicy(sizePolicy)
 
         self.btn_live = QPushButton("Start Live")
         self.btn_live.setCheckable(True)

@@ -4316,9 +4316,14 @@ class MultiPointWorker:
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_channel_by_name(
-                    self.objectiveStore.current_objective, configuration_name_AF
-                )
+                config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
+                if config_AF is None:
+                    available = [s.name for s in self.liveController.get_observation_states()]
+                    raise RuntimeError(
+                        f"Contrast autofocus channel {configuration_name_AF!r} "
+                        f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
+                        f"State, so autofocus cannot be configured. Available: {available}"
+                    )
                 self._select_config(config_AF)
                 if (
                     self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0

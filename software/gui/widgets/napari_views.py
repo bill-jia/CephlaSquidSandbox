@@ -897,6 +897,34 @@ class AlignmentWidget(QWidget):
             self._modified_live_view = False
 
 
+def _primary_illuminator(config):
+    """The illuminator entry the single live-intensity slider drives.
+
+    An ObservationState can carry several illuminators; this panel has one
+    slider, so it follows the first active entry, falling back to the first
+    declared one when nothing is switched on yet.
+    """
+    if config is None:
+        return None
+    active = config.active_illuminator_states
+    if active:
+        return active[0]
+    return config.illuminator_states[0] if config.illuminator_states else None
+
+
+def _illumination_intensity_of(config) -> float:
+    ist = _primary_illuminator(config)
+    return float(ist.intensity) if ist is not None else 0.0
+
+
+def _exposure_time_of(config) -> float:
+    return float(config.exposure_time) if config is not None else 1.0
+
+
+def _analog_gain_of(config) -> float:
+    return float(config.analog_gain) if config is not None else 0.0
+
+
 class NapariLiveWidget(QWidget):
     signal_coordinates_clicked = Signal(int, int, int, int)
     signal_newExposureTime = Signal(float)
@@ -924,7 +952,7 @@ class NapariLiveWidget(QWidget):
         self.stage = stage
         self.objectiveStore = objectiveStore
         self.wellSelectionWidget = wellSelectionWidget
-        chs = self.liveController.get_channels(self.objectiveStore.current_objective)
+        chs = self.liveController.get_observation_states()
         if self.liveController.obs_controller.current_observation_state is None and chs:
             self.liveController.obs_controller.set_active_observation_state(chs[0])
         self.live_configuration = self.liveController.obs_controller.current_observation_state or (chs[0] if chs else None)
@@ -1017,7 +1045,7 @@ class NapariLiveWidget(QWidget):
 
         # Microscope Configuration (only enabled channels)
         self.dropdown_modeSelection = QComboBox()
-        for config in self.liveController.get_channels(self.objectiveStore.current_objective):
+        for config in self.liveController.get_observation_states():
             self.dropdown_modeSelection.addItem(config.name)
         if self.live_configuration is not None:
             self.dropdown_modeSelection.setCurrentText(self.live_configuration.name)
@@ -1057,7 +1085,7 @@ class NapariLiveWidget(QWidget):
         # Exposure Time
         self.entry_exposureTime = QDoubleSpinBox()
         self.entry_exposureTime.setRange(*self.liveController.camera.get_exposure_limits())
-        self.entry_exposureTime.setValue(self.live_configuration.exposure_time)
+        self.entry_exposureTime.setValue(_exposure_time_of(self.live_configuration))
         self.entry_exposureTime.setSuffix(" ms")
         self.entry_exposureTime.valueChanged.connect(self.update_config_exposure_time)
 
@@ -1065,14 +1093,14 @@ class NapariLiveWidget(QWidget):
         self.entry_analogGain = QDoubleSpinBox()
         self.entry_analogGain.setRange(0, 24)
         self.entry_analogGain.setSingleStep(0.1)
-        self.entry_analogGain.setValue(self.live_configuration.analog_gain)
+        self.entry_analogGain.setValue(_analog_gain_of(self.live_configuration))
         # self.entry_analogGain.setSuffix('x')
         self.entry_analogGain.valueChanged.connect(self.update_config_analog_gain)
 
         # Illumination Intensity
         self.slider_illuminationIntensity = QSlider(Qt.Horizontal)
         self.slider_illuminationIntensity.setRange(0, 100)
-        self.slider_illuminationIntensity.setValue(int(self.live_configuration.illumination_intensity))
+        self.slider_illuminationIntensity.setValue(int(_illumination_intensity_of(self.live_configuration)))
         self.slider_illuminationIntensity.setTickPosition(QSlider.TicksBelow)
         self.slider_illuminationIntensity.setTickInterval(10)
         self.slider_illuminationIntensity.valueChanged.connect(self.update_config_illumination_intensity)
@@ -1267,7 +1295,7 @@ class NapariLiveWidget(QWidget):
 
     def select_new_microscope_mode_by_name(self, config_index):
         config_name = self.dropdown_modeSelection.itemText(config_index)
-        maybe_new_config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, config_name)
+        maybe_new_config = self.liveController.get_observation_state_by_name(config_name)
 
         if not maybe_new_config:
             self._log.error(f"User attempted to select config named '{config_name}' but it does not exist!")
@@ -1282,50 +1310,39 @@ class NapariLiveWidget(QWidget):
             self.live_configuration = config
             self.dropdown_modeSelection.setCurrentText(config.name if config else "Unknown")
             if self.live_configuration:
-                self.entry_exposureTime.setValue(self.live_configuration.exposure_time)
-                self.entry_analogGain.setValue(self.live_configuration.analog_gain)
-                self.slider_illuminationIntensity.setValue(int(self.live_configuration.illumination_intensity))
+                self.entry_exposureTime.setValue(_exposure_time_of(self.live_configuration))
+                self.entry_analogGain.setValue(_analog_gain_of(self.live_configuration))
+                self.slider_illuminationIntensity.setValue(
+                    int(_illumination_intensity_of(self.live_configuration))
+                )
         finally:
             self.is_switching_mode = False
 
     def update_config_exposure_time(self, new_value):
         if self.is_switching_mode:
             return
-        self.live_configuration.exposure_time = new_value
-        self.liveController.microscope.config_repo.update_channel_setting(
-            self.objectiveStore.current_objective,
-            self.live_configuration.name,
-            "ExposureTime",
-            new_value,
-            confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
-        )
+        # The controller owns the write: it updates the active ObservationState's
+        # camera_settings and pushes the value to the camera. ObservationState's
+        # exposure_time is a read-only property derived from those settings.
+        self.liveController.obs_controller.set_exposure_time(float(new_value))
         self.signal_newExposureTime.emit(new_value)
 
     def update_config_analog_gain(self, new_value):
         if self.is_switching_mode:
             return
-        self.live_configuration.analog_gain = new_value
-        self.liveController.microscope.config_repo.update_channel_setting(
-            self.objectiveStore.current_objective,
-            self.live_configuration.name,
-            "AnalogGain",
-            new_value,
-            confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
-        )
+        self.liveController.obs_controller.set_analog_gain(float(new_value))
         self.signal_newAnalogGain.emit(new_value)
 
     def update_config_illumination_intensity(self, new_value):
         if self.is_switching_mode:
             return
-        self.live_configuration.illumination_intensity = new_value
-        self.liveController.microscope.config_repo.update_channel_setting(
-            self.objectiveStore.current_objective,
-            self.live_configuration.name,
-            "IlluminationIntensity",
-            new_value,
-            confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
-        )
-        self.liveController.obs_controller.apply_illumination_parameters()
+        # One slider, possibly several illuminators: it drives the state's primary
+        # (first active) illuminator, which is the one this panel displays.
+        ist = _primary_illuminator(self.live_configuration)
+        if ist is None:
+            self._log.warning("No illuminator in the current observation state to set intensity on")
+            return
+        self.liveController.obs_controller.set_illumination_intensity(ist.illumination_channel, float(new_value))
 
     def update_resolution_scaling(self, value):
         self.streamHandler.set_display_resolution_scaling(value)
@@ -1336,7 +1353,7 @@ class NapariLiveWidget(QWidget):
         self.dropdown_modeSelection.blockSignals(True)
         self.dropdown_modeSelection.clear()
         first_config = None
-        for config in self.liveController.get_channels(self.objectiveStore.current_objective):
+        for config in self.liveController.get_observation_states():
             if not first_config:
                 first_config = config
             self.dropdown_modeSelection.addItem(config.name)

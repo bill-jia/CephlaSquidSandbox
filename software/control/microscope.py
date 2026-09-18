@@ -28,6 +28,7 @@ from control.lighting import (
 )
 from control.microcontroller import Microcontroller
 from control.models.machine_config import ConfocalDeviceSettings, MachineConfig, DeviceEntry, IlluminationDeviceEntry
+from control.models.observation_state import CameraSettings
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
 from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController, LightSource
@@ -1174,7 +1175,7 @@ class Microscope:
 
         # turn on illumination and send trigger
         if using_software_trigger:
-            self.live_controller.turn_on_illumination()
+            self.obs_controller.turn_on_illumination()
             self._wait_for_microcontroller()
             self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
@@ -1200,7 +1201,7 @@ class Microscope:
         finally:
             # always turn off illumination when using software trigger
             if using_software_trigger:
-                self.live_controller.turn_off_illumination()
+                self.obs_controller.turn_off_illumination()
 
     def home_xyz(self) -> None:
         """Home the X, Y, and Z axes based on configuration settings.
@@ -1419,27 +1420,59 @@ class Microscope:
         """
         self.objective_store.set_current_objective(objective)
 
-    def set_illumination_intensity(self, channel: str, intensity: float) -> None:
-        """Set the illumination intensity for a channel.
+    def set_illumination_intensity(self, illumination_channel: str, intensity: float) -> None:
+        """Set the intensity of one illumination channel.
+
+        An *illumination channel* is a single light source line, e.g.
+        "Fluorescence 488 nm Ex" — not an Observation State. Contrast with
+        :meth:`set_exposure_time`, whose subject is the whole light path.
 
         Args:
-            channel: Name of the channel.
-            intensity: Illumination intensity value.
-            objective: Objective name. If None, uses current objective.
+            illumination_channel: Name of the light source line.
+            intensity: Illumination intensity, 0-100 %.
         """
-        self.illumination_controller.set_channel_intensity(channel, intensity)
+        self.illumination_controller.set_channel_intensity(illumination_channel, intensity)
 
-    def set_exposure_time(self, channel: str, exposure_time: float, objective: Optional[str] = None) -> None:
-        """Set the exposure time for a channel.
+    def set_exposure_time(self, observation_state: str, exposure_time: float) -> None:
+        """Set the exposure time recorded for a named Observation State.
+
+        The write lands on the state's ``camera_settings.exposure_time_ms`` --
+        ``ObservationState.exposure_time`` is a read-only view of it. When the
+        name belongs to a saved preset the preset file is rewritten, so the new
+        exposure survives a reload. The camera itself is only touched when that
+        state is the one currently applied; changing a channel the scope is not
+        looking through must not move live hardware.
+
+        An *Observation State* is the whole light path for one acquisition, the
+        thing this codebase also calls a channel. Contrast with
+        :meth:`set_illumination_intensity`, whose subject is a single light
+        source line.
 
         Args:
-            channel: Name of the channel.
+            observation_state: Name of the Observation State.
             exposure_time: Exposure time in milliseconds.
-            objective: Objective name. If None, uses current objective.
+
+        Raises:
+            ValueError: If no Observation State carries this name.
         """
-        if objective is None:
-            objective = self.objective_store.current_objective
-        channel_config = self.live_controller.get_observation_state_by_name(channel)
-        if channel_config:
-            channel_config.exposure_time = exposure_time
-            self.live_controller.set_microscope_mode(channel_config)
+        exposure_time = float(exposure_time)
+        repo = self.config_repo
+        state = repo.get_observation_state_by_name(observation_state)
+        if state is None:
+            available = [s.name for s in repo.get_observation_states()]
+            raise ValueError(
+                f"No Observation State named {observation_state!r}. Available: {available}"
+            )
+
+        if state.camera_settings is None:
+            state.camera_settings = CameraSettings(exposure_time_ms=exposure_time, gain_mode=state.analog_gain)
+        else:
+            state.camera_settings.exposure_time_ms = exposure_time
+
+        if observation_state in repo.list_observation_presets():
+            repo.save_observation_preset(observation_state, state)
+
+        active = self.obs_controller.current_observation_state
+        if active is not None and active.name == state.name:
+            # Updates the live state object + general.yaml and pushes to the camera.
+            self.obs_controller.set_exposure_time(exposure_time)

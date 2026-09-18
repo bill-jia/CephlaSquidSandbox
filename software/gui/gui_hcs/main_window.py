@@ -1377,18 +1377,6 @@ class HighContentScreeningGui(QMainWindow):
                 self.wellplateMultiPointWidget.handle_objective_change
             )
 
-        # TBD: replace with ObservationState refreshing
-        # self.profileWidget.signal_profile_changed.connect(
-        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-        #         self.liveControlWidget.currentConfiguration.name
-        #     )
-        # )
-        # self.objectivesWidget.signal_objective_changed.connect(
-        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-        #         self.liveControlWidget.currentConfiguration.name
-        #     )
-        # )
-
         if self.microscope.addons.camera_focus:
             self.log.info(f"laser autofocus controller: {self.laserAutofocusController}, camera: {self.camera_focus}, setting up connections")
 
@@ -1452,10 +1440,9 @@ class HighContentScreeningGui(QMainWindow):
             )
             # Re-apply the current channel so its confocal overrides take effect.
             # Re-applies the state object we already hold rather than looking it
-            # up by name: select_new_microscope_mode_by_name calls
-            # obs_controller.get_observation_state_by_name, which does not exist,
-            # so routing through it raises AttributeError inside the Qt slot on
-            # every toggle. No channel may be selected yet, so guard for None.
+            # up by name, so an unsaved live state (one that is not in the preset
+            # namespace) still round-trips through a confocal toggle. No channel
+            # may be selected yet, so guard for None.
             def _reselect_current_channel():
                 current = self.liveControlWidget.currentConfiguration
                 if current is None:
@@ -2750,13 +2737,6 @@ class HighContentScreeningGui(QMainWindow):
 
         try:
             state.last_active_objective = self.objectiveStore.current_objective
-        except Exception:
-            pass
-
-        try:
-            obs = self.microscope.obs_controller.current_observation_state
-            if obs is not None and getattr(obs, "name", None):
-                state.last_active_observation_state_name = obs.name
         except Exception:
             pass
 

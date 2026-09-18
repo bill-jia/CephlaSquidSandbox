@@ -641,21 +641,27 @@ general = generate_default_observation_state(
 
 ### In Widgets (Qt)
 
-Use `LiveController.get_channels(objective)` for UI access:
+Use `LiveController.get_observation_states()` /
+`get_observation_state_by_name(name)` for UI access. "Channel" and "Observation
+State" name the same thing — the whole light path for one acquisition — and the
+namespace is the saved preset set, exactly what the Observation State save/load
+dropdown lists. Channels are no longer listed per objective, so these take no
+`objective` argument.
 
 ```python
 class MyWidget(QWidget):
-    def __init__(self, liveController, objectiveStore):
+    def __init__(self, liveController):
         self.liveController = liveController
-        self.objectiveStore = objectiveStore
 
     def update_channels(self):
-        # Gets merged channels for current objective with confocal mode applied
-        objective = self.objectiveStore.current_objective
-        channels = self.liveController.get_channels(objective)
+        for state in self.liveController.get_observation_states():
+            self.add_channel_button(state.name)
 
-        for channel in channels:
-            self.add_channel_button(channel.name, channel.display_color)
+    def select(self, name):
+        state = self.liveController.get_observation_state_by_name(name)
+        if state is None:
+            return  # not a defined Observation State
+        self.liveController.obs_controller.apply_full_observation_state(state)
 ```
 
 ### In Controllers

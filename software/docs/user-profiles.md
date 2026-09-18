@@ -104,7 +104,6 @@ The following transient UI state is persisted to
 | Field | Source widget |
 |---|---|
 | `last_active_objective` | `ObjectiveStore.current_objective` |
-| `last_active_observation_state_name` | `ObservationStateController.current_observation_state.name` |
 | `window_geometry_b64`, `window_state_b64` | `QMainWindow.saveGeometry / saveState` |
 | `record_tab_index` | `recordTabWidget.currentIndex()` |
 | `snap_saving_dir` | `LiveControlWidget.snap_saving_path` |
