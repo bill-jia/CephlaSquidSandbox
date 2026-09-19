@@ -63,6 +63,11 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # Bracket every XY move that enters a region with a retract to
+    # OBJECTIVE_RETRACTED_POS_MM (Z home, blocking) and a return to the target
+    # Z. Covers the first move of the run and the end-of-run return to the
+    # start position; never fires between FOVs inside a region's tile grid.
+    retract_z_between_regions: bool = True
     # On-disk format for saved images (INDIVIDUAL_IMAGES, MULTI_PAGE_TIFF, OME_TIFF, ZARR_V3).
     # Snapshotted at acquisition start so the worker doesn't depend on a mutable global.
     file_saving_option: FileSavingOption = FileSavingOption.INDIVIDUAL_IMAGES

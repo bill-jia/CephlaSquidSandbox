@@ -364,6 +364,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "widget_type": widget_type,
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
+            "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
         },
@@ -562,6 +563,7 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
         # Live ZARR_V3 upload settings (off by default; configured per-acquisition).
@@ -857,6 +859,15 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_retract_z_between_regions(self, retract_z_between_regions):
+        """Retract the objective to Z home for every XY move that enters a region.
+
+        Covers the first move of the run and the end-of-run return to the start
+        position, but not the steps across a region's own tile grid. Recorded in
+        acquisition.yaml via AcquisitionParameters.
+        """
+        self.retract_z_between_regions = bool(retract_z_between_regions)
 
     def set_file_saving_option(self, option):
         """Set the on-disk save format for the next acquisition.
@@ -1904,6 +1915,7 @@ class MultiPointController:
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving,
+            retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
             # Downsampled view generation parameters
@@ -2042,18 +2054,37 @@ class MultiPointController:
         if self.run_acquisition_current_fov:
             self.run_acquisition_current_fov = False
 
-        if self._start_position:
-            x_mm = self._start_position.x_mm
-            y_mm = self._start_position.y_mm
-            z_mm = self._start_position.z_mm
-            self._log.info(f"Moving back to start position: (x,y,z) [mm] = ({x_mm}, {y_mm}, {z_mm})")
-            self.stage.move_x_to(x_mm)
-            self.stage.move_y_to(y_mm)
-            self.stage.move_z_to(z_mm)
-            self._start_position = None
+        self._move_back_to_start_position()
 
         ending_pos = self.stage.get_pos()
         self.callbacks.signal_current_fov(ending_pos.x_mm, ending_pos.y_mm)
+
+    def _move_back_to_start_position(self) -> None:
+        """Return the stage to where the run started, if we recorded a start position.
+
+        With ``retract_z_between_regions`` on this travel gets the same bracket
+        the worker applies to inter-region moves: Z to
+        ``OBJECTIVE_RETRACTED_POS_MM`` (blocking) before XY, then Z down to the
+        recorded start Z.
+        """
+        if not self._start_position:
+            return
+        x_mm = self._start_position.x_mm
+        y_mm = self._start_position.y_mm
+        z_mm = self._start_position.z_mm
+        self._log.info(f"Moving back to start position: (x,y,z) [mm] = ({x_mm}, {y_mm}, {z_mm})")
+        if self.retract_z_between_regions:
+            # The objective clears the sample before the (often long) XY move
+            # back to where the run started.
+            self._log.debug(
+                f"Retracting z to {control._def.OBJECTIVE_RETRACTED_POS_MM} [mm] "
+                "before the XY move back to the start position"
+            )
+            self.stage.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM)
+        self.stage.move_x_to(x_mm)
+        self.stage.move_y_to(y_mm)
+        self.stage.move_z_to(z_mm)
+        self._start_position = None
 
     def request_abort_acquisition(self):
         self.abort_acqusition_requested = True
