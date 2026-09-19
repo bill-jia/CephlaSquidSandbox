@@ -2857,6 +2857,20 @@ def _row_col_to_well_id(row, col):
 
 class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
 
+    # Column layout of table_location_list. Every setItem()/item() call goes through
+    # these so the order can be changed in one place; the wide editable Region Name
+    # column is deliberately last.
+    _COL_X = 0
+    _COL_Y = 1
+    _COL_Z = 2
+    _COL_AF_REF = 3
+    _COL_NAME = 4
+    _COL_COUNT = 5
+
+    # An empty list is not an error: acquisition_in_place() silently acquires wherever
+    # the stage happens to be, so say so rather than just "no positions".
+    _NO_POSITIONS_HINT = "no positions — Start acquires the current field"
+
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
     signal_acquisition_channels = Signal(list)  # list channels
     signal_acquisition_shape = Signal(int, float)  # Nz, dz
@@ -2929,15 +2943,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.lineEdit_experimentID.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lineEdit_experimentID.setFixedWidth(96)
 
-        self.label_position_count = QLabel("no positions")
+        self.label_position_count = QLabel(self._NO_POSITIONS_HINT)
         self.label_position_count.setStyleSheet("color: gray;")
 
         self.btn_add = QPushButton("Add")
         self.btn_add.setToolTip("Add the current stage position (also ';' or Ctrl+A)")
         self.btn_remove = QPushButton("Remove")
         self.btn_remove.setToolTip("Remove the selected position")
-        self.btn_next = QPushButton("Next")
-        self.btn_next.setToolTip("Select the next position and move the stage there")
+        self.btn_prev = QPushButton("Prev Pos")
+        self.btn_prev.setToolTip("Move the stage to the previous position (wraps to the last)")
+        self.btn_next = QPushButton("Next Pos")
+        self.btn_next.setToolTip("Move the stage to the next position (wraps to the first)")
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.setToolTip("Remove every position")
 
@@ -2950,8 +2966,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # The "AF Ref" column is a read-only indicator of the per-region laser-AF focus
         # target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
-        self.table_location_list.setColumnCount(5)
-        self.table_location_list.setHorizontalHeaderLabels(["x (mm)", "y (mm)", "z (μm)", "Region Name", "AF Ref"])
+        self.table_location_list.setColumnCount(self._COL_COUNT)
+        labels = [None] * self._COL_COUNT
+        labels[self._COL_X] = "x (mm)"
+        labels[self._COL_Y] = "y (mm)"
+        labels[self._COL_Z] = "z (μm)"
+        labels[self._COL_AF_REF] = "AF Ref"
+        labels[self._COL_NAME] = "Region Name"
+        self.table_location_list.setHorizontalHeaderLabels(labels)
         self.table_location_list.setToolTip(
             "Click a row to move there. Edit x/y/z to move a position, or the Region\n"
             "Name to rename it. Region names are written to coordinates.csv,\n"
@@ -2964,23 +2986,20 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.setAlternatingRowColors(True)
         self.table_location_list.verticalHeader().setDefaultSectionSize(22)
         header = self.table_location_list.horizontalHeader()
-        for col in (0, 1, 2, 4):  # numbers stay narrow...
+        for col in (self._COL_X, self._COL_Y, self._COL_Z, self._COL_AF_REF):  # numbers stay narrow...
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)  # ...the name takes the slack
+        header.setSectionResizeMode(self._COL_NAME, QHeaderView.Stretch)  # ...name takes the slack
         # ~5 rows visible, then scroll. The tab panel is clamped to its sizeHint by
         # MainWindow.resizeCurrentTab, so an unbounded table would push the rest of the
         # acquisition controls down by however tall QTableWidget felt like being.
         self.table_location_list.setMinimumHeight(120)
         self.table_location_list.setMaximumHeight(170)
 
-        self.btn_update_z = QPushButton("Update Z")
+        self.btn_update_z = QPushButton("Set Z from Stage")
         self.btn_update_z.setToolTip("Overwrite the selected position's Z with the current stage Z")
-        # Re-capture the laser-AF reference for the currently selected region.
-        # Hidden when the rig has no focus camera.
-        self.btn_update_ref = QPushButton("Update Ref")
-        self.btn_update_ref.setToolTip(
-            "Capture the current laser-AF reference (focus target) for the selected region."
-        )
+        # Re-capture the laser-AF reference for the currently selected region. Hidden
+        # when the rig has no focus camera, greyed out while laser AF is switched off.
+        self.btn_update_ref = QPushButton("Recapture AF Ref")
         self.btn_update_ref.setVisible(self._enable_laser_autofocus)
 
         self.entry_deltaX = QDoubleSpinBox()
@@ -3236,14 +3255,16 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.positions_header_layout.addWidget(self.btn_add)
         self.positions_header_layout.addWidget(self.btn_remove)
         self.positions_header_layout.addWidget(self.btn_clear)
+        self.positions_header_layout.addWidget(self.btn_import_locations)
+        self.positions_header_layout.addWidget(self.btn_export_locations)
 
+        # The header edits the list as a whole; this row acts on the selected row.
         self.positions_actions_layout = QHBoxLayout()
+        self.positions_actions_layout.addWidget(self.btn_prev)
         self.positions_actions_layout.addWidget(self.btn_next)
         self.positions_actions_layout.addWidget(self.btn_update_z)
         self.positions_actions_layout.addWidget(self.btn_update_ref)
         self.positions_actions_layout.addStretch(1)
-        self.positions_actions_layout.addWidget(self.btn_import_locations)
-        self.positions_actions_layout.addWidget(self.btn_export_locations)
 
         self.grid_location_list = QVBoxLayout()
         self.grid_location_list.addLayout(self.positions_header_layout)
@@ -3464,6 +3485,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
+        self.btn_prev.clicked.connect(self.prev)
         self.btn_next.clicked.connect(self.next)
         self.btn_clear.clicked.connect(self.clear)
         self.btn_export_locations.clicked.connect(self.export_location_list)
@@ -3476,6 +3498,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
         self.btn_update_z.clicked.connect(self.update_z)
         self.btn_update_ref.clicked.connect(self.update_reference)
+        if self._enable_laser_autofocus:
+            # "Recapture AF Ref" means nothing with laser AF off, so it follows the
+            # Laser AF button instead of popping an error dialog when clicked.
+            self.checkbox_withReflectionAutofocus.toggled.connect(self._sync_af_ref_button)
+        self._sync_af_ref_button()
 
         self.shortcut = QShortcut(QKeySequence(";"), self)
         self.shortcut.activated.connect(self.btn_add.click)
@@ -3979,14 +4006,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.table_location_list.selectRow(row)
             self.table_location_list.blockSignals(False)
 
-    @staticmethod
-    def _position_cells(x, y, z):
-        """The x / y / z cells for one position row (z displayed in μm)."""
-        return [
-            QTableWidgetItem(str(round(x, 3))),
-            QTableWidgetItem(str(round(y, 3))),
-            QTableWidgetItem(str(round(z * 1000, 1))),
-        ]
+    @classmethod
+    def _position_cells(cls, x, y, z):
+        """The x / y / z cells for one position row, keyed by column (z shown in μm)."""
+        return {
+            cls._COL_X: QTableWidgetItem(str(round(x, 3))),
+            cls._COL_Y: QTableWidgetItem(str(round(y, 3))),
+            cls._COL_Z: QTableWidgetItem(str(round(z * 1000, 1))),
+        }
 
     def _refresh_position_cells(self, row):
         """Re-render the x/y/z cells for ``row`` from location_list."""
@@ -3994,13 +4021,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             return
         x, y, z = self.location_list[row]
         self.table_location_list.blockSignals(True)
-        for col, item in enumerate(self._position_cells(x, y, z)):
+        for col, item in self._position_cells(x, y, z).items():
             self.table_location_list.setItem(row, col, item)
         self.table_location_list.blockSignals(False)
 
     def _update_position_count(self):
         n = len(self.location_ids)
-        self.label_position_count.setText("no positions" if n == 0 else f"({n})")
+        self.label_position_count.setText(self._NO_POSITIONS_HINT if n == 0 else f"({n})")
 
     def _next_region_id(self):
         """Return the smallest unused 'R{n}' region id.
@@ -4033,7 +4060,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             return
         row = ids.index(region_id)
         self.table_location_list.blockSignals(True)
-        self.table_location_list.setItem(row, 4, self._af_ref_item(reference))
+        self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(reference))
         self.table_location_list.blockSignals(False)
 
     def _store_region_reference(self, region_id, reference):
@@ -4079,13 +4106,24 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self._set_af_ref_cell_for_region(region_id, reference)
         return True
 
+    def _laser_af_is_on(self):
+        """True when this panel would actually run laser AF (and so can capture a ref)."""
+        return bool(self._enable_laser_autofocus and self.checkbox_withReflectionAutofocus.isChecked())
+
+    def _sync_af_ref_button(self, *_):
+        """Grey out "Recapture AF Ref", with a reason, while laser AF is off."""
+        enabled = self._laser_af_is_on()
+        self.btn_update_ref.setEnabled(enabled)
+        self.btn_update_ref.setToolTip(
+            "Capture the current laser-AF reference (focus target) for the selected position."
+            if enabled
+            else "Turn Laser AF on to capture a per-position laser-AF reference."
+        )
+
     def update_reference(self):
         """Re-capture the laser-AF reference for the currently selected region."""
         index = self._selected_row()
         if index < 0:
-            return
-        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
-            error_dialog("Enable Reflection (Laser) AF before capturing a per-region reference.")
             return
         self._capture_region_reference(str(self.location_ids[index]))
 
@@ -4108,10 +4146,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, z)):
+            for col, item in self._position_cells(x, y, z).items():
                 self.table_location_list.setItem(row, col, item)
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(region_id))
-            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
+            self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(region_id))
+            self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(None))
 
             # Store actual values in region coordinates
             if self.use_overlap:
@@ -4197,7 +4235,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if count <= 0:
             self._log.error("Cannot move to next location, because there are no locations in the list")
             return
+        # _selected_row() is -1 with nothing selected, which lands on row 0.
         self.go_to((self._selected_row() + 1) % count)
+
+    def prev(self):
+        """Select the previous position (wrapping) and move the stage there."""
+        count = len(self.location_ids)
+        if count <= 0:
+            self._log.error("Cannot move to previous location, because there are no locations in the list")
+            return
+        row = self._selected_row()
+        # With nothing selected, "previous" means the end of the list.
+        self.go_to(count - 1 if row < 0 else (row - 1) % count)
 
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
@@ -4236,7 +4285,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
     def _set_name_cell(self, row, name):
         """Write the Region Name cell without re-entering ``cell_was_changed``."""
         self.table_location_list.blockSignals(True)
-        self.table_location_list.setItem(row, 3, QTableWidgetItem(str(name)))
+        self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(str(name)))
         self.table_location_list.blockSignals(False)
 
     def _rename_region_from_cell(self, row, old_id):
@@ -4249,7 +4298,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         the experiment folder, so anything that doesn't validate is bounced back to
         the previous name with an explanation instead of being silently accepted.
         """
-        new_id = normalize_region_name(self.table_location_list.item(row, 3).text())
+        new_id = normalize_region_name(self.table_location_list.item(row, self._COL_NAME).text())
         if new_id == old_id:
             self._set_name_cell(row, old_id)  # normalize a whitespace-only edit
             return
@@ -4301,13 +4350,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def cell_was_changed(self, row, column):
         # The "AF Ref" column is a read-only indicator; ignore changes to it.
-        if column >= 4:
+        if column == self._COL_AF_REF:
             return
 
         # Get region ID
         region_id = str(self.location_ids[row])
 
-        if column == 3:  # Region name; renaming must not move the stage.
+        if column == self._COL_NAME:  # Renaming must not move the stage.
             self._rename_region_from_cell(row, region_id)
             return
 
@@ -4318,7 +4367,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # Handle the changed value
         val_edit = self.table_location_list.item(row, column).text()
 
-        if column < 2:  # X or Y coordinate changed
+        if column in (self._COL_X, self._COL_Y):
+            # _COL_X / _COL_Y double as the x/y columns of location_list.
             self.location_list[row, column] = float(val_edit)
             x, y, z = self.location_list[row]
 
@@ -4475,9 +4525,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.location_ids = np.append(self.location_ids, region_id)
                     table_row = self.table_location_list.rowCount()
                     self.table_location_list.insertRow(table_row)
-                    for col, item in enumerate(self._position_cells(x, y, z)):
+                    for col, item in self._position_cells(x, y, z).items():
                         self.table_location_list.setItem(table_row, col, item)
-                    self.table_location_list.setItem(table_row, 3, QTableWidgetItem(region_id))
+                    self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
                     if self.use_overlap:
                         self.scanCoordinates.add_flexible_region(
                             region_id,
@@ -4505,7 +4555,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
                     if reference is not None:
                         self._store_region_reference(region_id, reference)
-                    self.table_location_list.setItem(table_row, 4, self._af_ref_item(reference))
+                    self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
                 else:
                     self._log.warning("Duplicate values not added based on x and y.")
             self.table_location_list.blockSignals(False)
@@ -4588,6 +4638,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.btn_add,
             self.btn_remove,
             self.btn_clear,
+            self.btn_prev,
             self.btn_next,
             self.btn_update_z,
             self.btn_update_ref,
@@ -4595,6 +4646,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.btn_export_locations,
         ):
             btn.setEnabled(enabled)
+        if enabled:
+            # ...but "Recapture AF Ref" only comes back if laser AF is actually on.
+            self._sync_af_ref_button()
 
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
@@ -4747,11 +4801,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Update UI - table
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, z)):
+            for col, item in self._position_cells(x, y, z).items():
                 self.table_location_list.setItem(row, col, item)
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
+            self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(name))
             self.table_location_list.setItem(
-                row, 4, self._af_ref_item(self._region_laser_af_references.get(name))
+                row, self._COL_AF_REF, self._af_ref_item(self._region_laser_af_references.get(name))
             )
 
             # Add to scan coordinates
@@ -8467,17 +8521,17 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
 
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, ref_z)):
+            for col, item in self._position_cells(x, y, ref_z).items():
                 self.table_location_list.setItem(row, col, item)
             # One template *region* covers every template point, so a row's name does
             # not key a region of its own — show the region it belongs to and make the
             # cell read-only, since renaming a single row here has no coherent meaning.
             name_item = QTableWidgetItem(str(self.region_id))
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
-            self.table_location_list.setItem(row, 3, name_item)
+            self.table_location_list.setItem(row, self._COL_NAME, name_item)
             # Template regions don't capture per-region laser-AF references; keep
             # the AF Ref column populated so it reads "—" rather than blank.
-            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
+            self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(None))
 
         self.scanCoordinates.add_template_region(
             ref_x, ref_y, ref_z, template_df["x_offset_mm"], template_df["y_offset_mm"], str(self.region_id)

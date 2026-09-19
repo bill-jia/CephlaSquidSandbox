@@ -23,6 +23,15 @@ from gui.widgets.multipoint import FlexibleMultiPointWidget
 class _RegionHarness:
     """Just enough of FlexibleMultiPointWidget to drive its per-region bookkeeping."""
 
+    # The table's column order is part of the widget's contract; take it from the
+    # widget rather than restating it, so a reorder can't silently desync the harness.
+    _COL_X = FlexibleMultiPointWidget._COL_X
+    _COL_Y = FlexibleMultiPointWidget._COL_Y
+    _COL_Z = FlexibleMultiPointWidget._COL_Z
+    _COL_AF_REF = FlexibleMultiPointWidget._COL_AF_REF
+    _COL_NAME = FlexibleMultiPointWidget._COL_NAME
+    _COL_COUNT = FlexibleMultiPointWidget._COL_COUNT
+
     _position_cells = staticmethod(FlexibleMultiPointWidget._position_cells)
     _refresh_position_cells = FlexibleMultiPointWidget._refresh_position_cells
     _selected_row = FlexibleMultiPointWidget._selected_row
@@ -33,6 +42,9 @@ class _RegionHarness:
     cell_was_clicked = FlexibleMultiPointWidget.cell_was_clicked
     go_to = FlexibleMultiPointWidget.go_to
     next = FlexibleMultiPointWidget.next
+    prev = FlexibleMultiPointWidget.prev
+    _af_ref_item = FlexibleMultiPointWidget._af_ref_item
+    _set_af_ref_cell_for_region = FlexibleMultiPointWidget._set_af_ref_cell_for_region
     _store_region_reference = FlexibleMultiPointWidget._store_region_reference
     _restore_region_references = FlexibleMultiPointWidget._restore_region_references
     update_fov_positions = FlexibleMultiPointWidget.update_fov_positions
@@ -56,22 +68,26 @@ class _RegionHarness:
         self.entry_NY = SimpleNamespace(value=lambda: 2)
         self.entry_overlap = SimpleNamespace(value=lambda: 0)
 
-        self.table_location_list = QTableWidget(len(names), 5)
+        self.table_location_list = QTableWidget(len(names), self._COL_COUNT)
         self.table_location_list.setSelectionBehavior(QAbstractItemView.SelectRows)
         for row, (name, (x, y, z)) in enumerate(zip(names, coords)):
-            for col, item in enumerate(self._position_cells(x, y, z)):
+            for col, item in self._position_cells(x, y, z).items():
                 self.table_location_list.setItem(row, col, item)
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
+            self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(name))
+            self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(None))
 
     def type_name(self, row, text):
         """Simulate the user editing the Region Name cell and pressing Enter."""
         self.table_location_list.blockSignals(True)
-        self.table_location_list.setItem(row, 3, QTableWidgetItem(text))
+        self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(text))
         self.table_location_list.blockSignals(False)
-        self.cell_was_changed(row, 3)
+        self.cell_was_changed(row, self._COL_NAME)
 
     def name_cell(self, row):
-        return self.table_location_list.item(row, 3).text()
+        return self.table_location_list.item(row, self._COL_NAME).text()
+
+    def af_ref_cell(self, row):
+        return self.table_location_list.item(row, self._COL_AF_REF).text()
 
     def isVisible(self):
         return True  # update_fov_positions bails out on a hidden widget
@@ -121,6 +137,34 @@ def test_next_wraps_around_the_selection(harness):
 
     assert harness._selected_row() == 0
     harness.stage.move_x_to.assert_called_once_with(10.0)
+
+
+def test_prev_wraps_around_the_selection(harness):
+    harness._select_row(0)
+    harness.prev()
+
+    assert harness._selected_row() == 2
+    harness.stage.move_x_to.assert_called_once_with(30.0)
+
+
+def test_prev_with_no_selection_goes_to_the_last_row(harness):
+    """Next starts at the top of an unselected list, so Prev starts at the bottom."""
+    assert harness._selected_row() == -1
+    harness.prev()
+
+    assert harness._selected_row() == 2
+    harness.stage.move_x_to.assert_called_once_with(30.0)
+
+
+def test_af_ref_cell_tracks_the_stored_reference(harness):
+    """The AF Ref column sits between z and the name; writing it by the wrong index
+    would overwrite a region's name with a focus-spot position."""
+    assert harness.af_ref_cell(1) == "—"
+
+    harness._set_af_ref_cell_for_region("R1", SimpleNamespace(x_reference=222.0))
+
+    assert harness.af_ref_cell(1) == "222.0"
+    assert harness.name_cell(1) == "R1", "the name column must be untouched"
 
 
 def test_actions_are_no_ops_without_a_selection(harness):

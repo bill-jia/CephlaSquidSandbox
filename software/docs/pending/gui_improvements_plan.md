@@ -14,19 +14,17 @@ layout change is applied to both.
   are segmented switches (`SegmentedSwitch`, `gui/widgets/common.py`) that
   show the current hardware state; entering confocal spins the disk up first
   (`set_xlight_confocal_mode`, `control/serial_peripherals.py`).
-
-## A. Positions block
-
-1. Table columns: `x | y | z | AF Ref | Region Name` — AF Ref moves to the
-   left of the name, so the wide editable column is last.
-2. Header row (right of **Positions**): `Add  Remove  Clear  Import  Export`.
-3. Action row under the table: `Prev Pos  Next Pos  Update Z  Update Ref`
-   (Prev Pos where Import was, Next Pos where Export was; Next Pos wraps
-   like today, Prev Pos wraps the other way).
-4. Renames: `Update Z` → `Set Z from Stage`; `Update Ref` → `Recapture AF Ref`;
-   grey out Recapture AF Ref unless Laser AF is on (today: error dialog).
-5. "no positions" hint → *"no positions — Start acquires the current field"*
-   (that is what `acquisition_in_place` silently does).
+- A. Positions block (`FlexibleMultiPointWidget`, the only widget with a
+  positions table): columns are `x | y | z | AF Ref | Region Name` with the
+  wide editable name column last and every index taken from the class
+  constants `_COL_X/_COL_Y/_COL_Z/_COL_AF_REF/_COL_NAME`; the header carries
+  `Add  Remove  Clear  Import  Export` and the row under the table carries
+  `Prev Pos  Next Pos  Set Z from Stage  Recapture AF Ref`. `Prev Pos` wraps
+  backwards (and starts at the last row with nothing selected). `Recapture AF
+  Ref` is greyed out, with a tooltip saying why, unless Laser AF is on — it
+  follows `LaserAutofocusButton.toggled`, and the old error dialog is gone.
+  The empty-list hint now reads *"no positions — Start acquires the current
+  field"*, which is what `acquisition_in_place` does.
 
 ## B. Parameter grid → four labelled groups
 
