@@ -1780,6 +1780,33 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
         combo.setCurrentIndex(index if index >= 0 else 0)
 
 
+def _make_retract_z_checkbox() -> "QCheckBox":
+    """The *Scan behaviour* checkbox that brackets XY travel with a Z retract.
+
+    Both multipoint tabs show it, and both start it checked because that is the
+    controller's default (``MultiPointController.retract_z_between_regions``). The
+    label is built from ``OBJECTIVE_RETRACTED_POS_MM`` so it cannot go stale.
+    """
+    height_um = int(control._def.OBJECTIVE_RETRACTED_POS_MM * 1000)
+    checkbox = QCheckBox(f"Retract Z to {height_um} \u00b5m for XY moves")
+    checkbox.setChecked(True)
+    checkbox.setToolTip(
+        "Before each XY move between regions (and when going to a position from this "
+        "table), raise Z to the retracted height, move, then lower Z back to the target."
+    )
+    return checkbox
+
+
+def _apply_retract_z_from_yaml(widget, yaml_data) -> None:
+    """Restore the retract-Z checkbox from a dropped ``acquisition.yaml``.
+
+    The key is optional: a file written before the flag existed leaves the checkbox
+    on whatever the user has set rather than silently turning the retract off.
+    """
+    if yaml_data.retract_z_between_regions is not None:
+        widget.checkbox_retractZBetweenRegions.setChecked(yaml_data.retract_z_between_regions)
+
+
 def _make_section(title: str) -> "tuple[QVBoxLayout, QVBoxLayout]":
     """A bold section header with an indented content column under it.
 
@@ -3249,6 +3276,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
         )
 
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
+        self.checkbox_moveStageOnClick = QCheckBox("Move stage on click")
+        self.checkbox_moveStageOnClick.setChecked(True)
+        self.checkbox_moveStageOnClick.setToolTip(
+            "Clicking a row drives the stage to that position. Uncheck to select rows without moving."
+        )
+
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
 
@@ -3333,6 +3368,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.positions_actions_layout.addWidget(self.btn_update_z)
         self.positions_actions_layout.addWidget(self.btn_update_ref)
         self.positions_actions_layout.addStretch(1)
+        self.positions_actions_layout.addWidget(self.checkbox_moveStageOnClick)
 
         self.grid_location_list = QVBoxLayout()
         self.grid_location_list.addLayout(self.positions_header_layout)
@@ -3438,6 +3474,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         scan_section, scan_content = _make_section("Scan behaviour")
         scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+        scan_content.addWidget(self.checkbox_retractZBetweenRegions)
 
         options_left = QVBoxLayout()
         options_left.addLayout(tiling_section)
@@ -3529,6 +3566,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.checkbox_showLiveDuringAcquisition.toggled.connect(
             self.multipointController.set_show_live_during_acquisition
         )
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.entry_NZ.valueChanged.connect(lambda *_: self._sync_z_stack_controls())
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
@@ -4021,6 +4059,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
             _push_save_format_to_controller(self)
+            # Same story for the retract flag: one controller, a checkbox per tab.
+            self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
@@ -4357,13 +4397,32 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if not 0 <= index < len(self.location_list):
             return
         x, y, z = self.location_list[index]
+        self._move_stage_to_position(x, y, z)
+        self._select_row(index)
+
+    def _move_stage_to_position(self, x, y, z):
+        """Drive the stage to a listed position, retracting Z first if asked to.
+
+        With *Retract Z ... for XY moves* on, the objective is raised to
+        ``OBJECTIVE_RETRACTED_POS_MM`` and the moves are serialised (Z up, XY, Z
+        down) so nothing travels across the sample at working height - the same
+        bracket the worker puts around inter-region moves. The retract height goes
+        to ``move_z_to`` as-is: no raw->canonical conversion and no
+        ``INVERTED_OBJECTIVE`` flip (see ``_retract_z_home_for_move``).
+        """
+        if self.checkbox_retractZBetweenRegions.isChecked():
+            self.stage.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM)
         self.stage.move_x_to(x)
         self.stage.move_y_to(y)
         self.stage.move_z_to(z)
-        self._select_row(index)
 
     def cell_was_clicked(self, row, column):
-        self.go_to(row)
+        # Prev/Next Pos always move - they are navigation. A click only selects
+        # unless the user asked for it to drive the stage too.
+        if self.checkbox_moveStageOnClick.isChecked():
+            self.go_to(row)
+        else:
+            self._select_row(row)
 
     def _set_name_cell(self, row, name):
         """Write the Region Name cell without re-entering ``cell_was_changed``."""
@@ -4731,6 +4790,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.btn_update_ref,
             self.btn_import_locations,
             self.btn_export_locations,
+            self.checkbox_moveStageOnClick,
         ):
             btn.setEnabled(enabled)
         if enabled:
@@ -4842,6 +4902,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
             # Saving (the dry-run entry of the save-format combo)
             _apply_save_format_from_yaml(self, yaml_data)
+
+            # Scan behaviour
+            _apply_retract_z_from_yaml(self, yaml_data)
 
             # Load positions if present
             if yaml_data.flexible_positions:
@@ -5232,6 +5295,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
         )
 
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
@@ -5504,6 +5569,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         scan_content.addWidget(self.checkbox_snakeScan)
         scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+        scan_content.addWidget(self.checkbox_retractZBetweenRegions)
 
         options_layout = QVBoxLayout()
         options_layout.addLayout(zstack_section)
@@ -5598,6 +5664,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_showLiveDuringAcquisition.toggled.connect(
             self.multipointController.set_show_live_during_acquisition
         )
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.list_configurations.itemChanged.connect(self._reset_per_point_channels_map)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
@@ -6831,6 +6898,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
             _push_save_format_to_controller(self)
+            # Same story for the retract flag: one controller, a checkbox per tab.
+            self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
@@ -7408,6 +7477,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
             # Saving (the dry-run entry of the save-format combo)
             _apply_save_format_from_yaml(self, yaml_data)
+
+            # Scan behaviour
+            _apply_retract_z_from_yaml(self, yaml_data)
 
             # XY mode - set to Select Wells for wellplate YAML
             if yaml_data.xy_mode in ["Current Position", "Select Wells", "Manual", "Load Coordinates"]:

@@ -8,13 +8,14 @@ they touch: the real ``QTableWidget``/``QComboBox`` they edit, a real
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pandas as pd
 import pytest
-from qtpy.QtWidgets import QAbstractItemView, QTableWidget, QTableWidgetItem
+from qtpy.QtWidgets import QAbstractItemView, QCheckBox, QTableWidget, QTableWidgetItem
 
+import control._def
 from control.core.multi_point_utils import ScanPositionInformation
 from control.core.scan_coordinates import ScanCoordinates
 from gui.widgets.multipoint import FlexibleMultiPointWidget
@@ -41,6 +42,7 @@ class _RegionHarness:
     cell_was_changed = FlexibleMultiPointWidget.cell_was_changed
     cell_was_clicked = FlexibleMultiPointWidget.cell_was_clicked
     go_to = FlexibleMultiPointWidget.go_to
+    _move_stage_to_position = FlexibleMultiPointWidget._move_stage_to_position
     next = FlexibleMultiPointWidget.next
     prev = FlexibleMultiPointWidget.prev
     _af_ref_item = FlexibleMultiPointWidget._af_ref_item
@@ -61,6 +63,12 @@ class _RegionHarness:
         self.multipointController = MagicMock()
         self.multipointController.acquisition_in_progress.return_value = False
         self.stage = MagicMock()
+
+        # The two stage-motion toggles, at their shipped defaults.
+        self.checkbox_moveStageOnClick = QCheckBox("Move stage on click")
+        self.checkbox_moveStageOnClick.setChecked(True)
+        self.checkbox_retractZBetweenRegions = QCheckBox("Retract Z for XY moves")
+        self.checkbox_retractZBetweenRegions.setChecked(True)
 
         # update_fov_positions reads these; the tile geometry itself is not under test.
         self.use_overlap = True
@@ -129,6 +137,42 @@ def test_clicking_a_row_selects_it_and_moves_the_stage(harness):
     assert harness._selected_row() == 2
     harness.stage.move_x_to.assert_called_once_with(30.0)
     harness.stage.move_y_to.assert_called_once_with(30.0)
+
+
+def test_clicking_a_row_with_move_on_click_off_only_selects(harness):
+    """"Move stage on click" off makes the table a selection list: the user can pick a
+    row to rename it, or to set its Z, without the objective going anywhere."""
+    harness.checkbox_moveStageOnClick.setChecked(False)
+
+    harness.cell_was_clicked(2, 0)
+
+    assert harness._selected_row() == 2
+    assert harness.stage.mock_calls == []
+
+
+def test_go_to_retracts_z_before_the_xy_move(harness):
+    """With the retract on, Z goes up *first* and blocking - an XY move issued
+    alongside a Z move would sweep the objective across the sample at working height."""
+    harness.go_to(1)
+
+    assert harness.stage.mock_calls == [
+        call.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM),
+        call.move_x_to(20.0),
+        call.move_y_to(20.0),
+        call.move_z_to(0.5),
+    ]
+
+
+def test_go_to_without_the_retract_moves_xy_then_z(harness):
+    harness.checkbox_retractZBetweenRegions.setChecked(False)
+
+    harness.go_to(1)
+
+    assert harness.stage.mock_calls == [
+        call.move_x_to(20.0),
+        call.move_y_to(20.0),
+        call.move_z_to(0.5),
+    ]
 
 
 def test_next_wraps_around_the_selection(harness):

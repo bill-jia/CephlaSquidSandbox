@@ -337,6 +337,17 @@ Z the acquisition fell back to). Use it to audit focus drift and AF reliability 
 - **Show live preview during acquisition** — when unchecked, skips per‑frame display
   updates and only redraws the last frame at the end, reducing per‑capture overhead.
   This is the one control that stays enabled while a run is in progress.
+- **Retract Z to 100 µm for XY moves** (on by default) — before each XY move *between
+  regions*, raise Z to the retracted height (100 µm, `OBJECTIVE_RETRACTED_POS_MM`),
+  make the XY move, then lower Z back to the target. This keeps the objective from
+  travelling across the sample at working height, at the cost of two extra Z moves
+  (plus settle) per region visit. It applies to the first move of a run, to the
+  pre‑move at the start of each timepoint, and to the return to the starting position
+  at the end — but **not** between FOVs inside one region's tile grid, which are short
+  hops at a constant Z. On the Flexible tab the same checkbox also brackets the move
+  made when you go to a position from the Positions table. Both multipoint tabs have
+  their own copy; the one you press **Start Acquisition** on wins, and the value is
+  recorded in `acquisition.yaml` as `acquisition.retract_z_between_regions`.
 
 > For ZARR_V3 compression and related tuning, see **Settings → Preferences**. For the
 > data layout produced by each format, see
@@ -373,6 +384,11 @@ The **Positions** table sits directly in the tab and is the position list: one r
 position, in scan order, with the columns `x (mm)`, `y (mm)`, `z (μm)`, **Region Name**
 and a read‑only **AF Ref**. **Click a row to select it and drive the stage there**;
 double‑click any cell to edit it.
+
+**Move stage on click** (right‑hand end of the button row under the table, on by
+default) is what makes a click move the stage. Uncheck it when you only want to pick
+rows — to rename a region, or read its coordinates — without the objective going
+anywhere. **Prev Pos** / **Next Pos** always move: they are navigation.
 
 Drive the stage to a spot of interest (using the stage jog buttons, the plate map, or
 Click‑to‑Move), then manage the list with the buttons around the table:

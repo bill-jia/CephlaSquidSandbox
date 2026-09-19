@@ -14,6 +14,9 @@ class AcquisitionYAMLData:
     widget_type: str  # "wellplate" or "flexible"
     xy_mode: str = "Select Wells"
     skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
+    # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
+    # None means the file predates the flag, and the GUI then leaves its checkbox alone.
+    retract_z_between_regions: Optional[bool] = None
 
     # Objective info
     objective_name: Optional[str] = None
@@ -113,6 +116,9 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         widget_type=widget_type,
         xy_mode=acq.get("xy_mode", "Select Wells"),
         skip_saving=bool(acq.get("skip_saving", False)),
+        retract_z_between_regions=(
+            None if acq.get("retract_z_between_regions") is None else bool(acq["retract_z_between_regions"])
+        ),
         # Objective info
         objective_name=obj.get("name"),
         objective_magnification=obj.get("magnification"),

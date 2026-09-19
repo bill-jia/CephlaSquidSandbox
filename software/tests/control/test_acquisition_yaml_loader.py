@@ -195,6 +195,23 @@ acquisition:
         assert result.laser_af is False
         assert result.overlap_percent == 10.0
 
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ("  retract_z_between_regions: true", True),
+            ("  retract_z_between_regions: false", False),
+            ("", None),  # written before the flag existed: the GUI keeps its checkbox
+        ],
+    )
+    def test_parse_retract_z_between_regions(self, tmp_path, line, expected):
+        """The retract flag round-trips, and its absence is distinguishable from false."""
+        yaml_file = tmp_path / "test_retract.yaml"
+        yaml_file.write_text(f"acquisition:\n  widget_type: flexible\n{line}\n")
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert result.retract_z_between_regions is expected
+
     def test_parse_empty_yaml_raises_error(self, tmp_path):
         """Test that empty YAML file raises ValueError."""
         yaml_file = tmp_path / "test_empty.yaml"

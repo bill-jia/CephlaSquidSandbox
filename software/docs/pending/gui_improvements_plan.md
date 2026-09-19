@@ -1,8 +1,8 @@
 # GUI improvements — work list (branch `gui-improvements`)
 
-Ordered as we intend to do them. Items are grouped so each group is one commit
-and one screenshot; the last group changes acquisition behaviour and is
-deliberately last.
+All of it has shipped; this is the record of what went in, in the order it went
+in. Items were grouped so each group was one commit and one screenshot, with the
+group that changes what the stage does left deliberately last.
 
 Both `FlexibleMultiPointWidget` and `WellplateMultiPointWidget`
 (`software/gui/widgets/multipoint.py`) share almost all of this code; every
@@ -55,56 +55,38 @@ layout change is applied to both.
     `Snap Images`) and `Start Acquisition` (stretch 2). `on_snap_images` now
     names the dataset `snap_<ID>` (or `snap`), not `snapped images<ID>`.
   - Tests: `software/tests/control/test_save_format_dry_run.py`.
-
-## D. Stage-motion behaviour (last — changes what the stage does)
-
-12. **Move stage on click** checkbox (default on = today's behaviour).
-    Today `cellClicked → go_to` always drives the stage; when off, clicking
-    only selects. `Prev Pos` / `Next Pos` always move — they are navigation.
-13. **Z home at 100 µm + retract for XY moves.**
-    - Home = `OBJECTIVE_RETRACTED_POS_MM = 0.1` (already 100 µm in `_def.py`;
-      reuse it, don't add a second constant).
-    - Checkbox *"Retract Z to home for XY moves"*, default **on**. Sequence
-      per move: Z → home (blocking), XY move, Z → target.
-    - Applies in two places:
-      a. GUI `go_to` (click, Prev/Next Pos).
-      b. Worker `move_to_coordinate` **between regions only**, not between
-         FOVs inside a region's tile grid. Today Z is issued non-blocking
-         alongside XY; the retract path must serialise Z-up before XY.
-    - Carried on `AcquisitionParameters` (like `skip_saving`) so it is
-      recorded in `acquisition.yaml`.
-    - Watch-outs: two extra Z moves per region visit (tens of ms each on the
-      TMC path, plus settle); the AF z-cache (`_z_pos_proposal`) is the
-      *target* Z, retract happens before it; `INVERTED_OBJECTIVE` flips
-      which way is "away from the sample"; piezo Z is untouched.
-
-## Decisions for D (2026-09-19)
-
-- The retract **does** apply to the first move of a run and to the
-  return-to-start move at the end.
-- 100 µm (`OBJECTIVE_RETRACTED_POS_MM`) **is** the right clearance for
-  inter-region travel on the current holder.
-
-## D13 non-GUI core — done
-
-The acquisition side of item 13 is in; only the checkbox is left.
-
-- `MultiPointController.set_retract_z_between_regions(bool)` is what the
-  checkbox calls (default **on**, mirrors `set_skip_saving`). It rides
-  `AcquisitionParameters.retract_z_between_regions` into the worker and lands
-  in `acquisition.yaml` under `acquisition:`.
-- `MultiPointWorker.move_to_coordinate` brackets a move when it *enters* a
-  region — `fov == 0`, or a region id different from the previous move, which
-  also covers the very first move of a run and the inter-timepoint pre-move.
-  Steps across a region's own tile grid are byte-for-byte unchanged.
-- The end-of-run return lives on the controller, not the worker:
-  `MultiPointController._move_back_to_start_position`.
-- `OBJECTIVE_RETRACTED_POS_MM` goes to `stage.move_z_to` as-is, like the
-  loading-position retract in `squid/stage/utils.py` — no raw→canonical
-  conversion (that is only for the raw-units `Z_HOME_SAFETY_POINT`) and no
-  `INVERTED_OBJECTIVE` sign flip. Piezo Z is untouched.
-- Tests: `software/tests/control/test_multipoint_z_retract.py`.
-- GUI `go_to` (item 13a) is still to do.
+- D. Stage-motion behaviour (items 12-13), two checkboxes:
+  - **Move stage on click** (Flexible only, default on), at the right end of the
+    `Prev Pos / Next Pos / Set Z from Stage / Recapture AF Ref` row. Off, a table
+    click only selects the row (`_select_row`); `Prev Pos` / `Next Pos` still move,
+    they are navigation. It locks with the rest of the positions block during a run.
+  - **Retract Z to 100 µm for XY moves** in *Scan behaviour* on **both** tabs,
+    default on (the controller default). The label is built from
+    `OBJECTIVE_RETRACTED_POS_MM` so it cannot go stale. `toggled` →
+    `set_retract_z_between_regions`, and each tab re-pushes its own value in
+    `toggle_acquisition` beside the save-format push, because one controller is
+    shared by two checkboxes.
+  - `FlexibleMultiPointWidget._move_stage_to_position` is the bracket for the
+    GUI's own moves (click, Prev/Next Pos): Z → `OBJECTIVE_RETRACTED_POS_MM`
+    (blocking), X, Y, then Z → target. Unchecked it is the old X, Y, Z sequence.
+    `on_snap_images` is untouched — a snap does not move XY.
+  - `acquisition.retract_z_between_regions` round-trips: optional in
+    `AcquisitionYAMLData` (absent → the checkbox is left alone), applied by
+    `_apply_retract_z_from_yaml` on both tabs' drop path.
+  - Decisions taken: the retract applies to the first move of a run and to the
+    return-to-start at the end; 100 µm is the right clearance for inter-region
+    travel on the current holder.
+  - Acquisition-side core (landed first): `MultiPointController.
+    set_retract_z_between_regions` rides `AcquisitionParameters` into the worker;
+    `MultiPointWorker.move_to_coordinate` brackets a move only when it *enters* a
+    region (`fov == 0` or a new region id), so steps across a region's own tile grid
+    are unchanged; the end-of-run return lives in
+    `MultiPointController._move_back_to_start_position`. The retract height goes to
+    `stage.move_z_to` as-is — no raw→canonical conversion, no `INVERTED_OBJECTIVE`
+    flip — and piezo Z is untouched.
+  - Tests: `software/tests/control/test_multipoint_z_retract.py`, plus the stage-motion
+    cases in `test_flexible_region_state.py` and the YAML field in
+    `test_acquisition_yaml_loader.py`.
 
 ## Screenshots without hardware
 
