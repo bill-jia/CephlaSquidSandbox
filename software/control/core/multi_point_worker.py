@@ -1396,6 +1396,14 @@ class MultiPointWorker:
         self._region_refresh_count_this_entry: int = 0
 
         self.skip_saving = acquisition_parameters.skip_saving
+        # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
+        # move that enters a region (and before the very first move of the
+        # run), then drive Z back to the target. Never fires between FOVs
+        # inside one region's tile grid.
+        self.retract_z_between_regions = acquisition_parameters.retract_z_between_regions
+        # Region of the previous move_to_coordinate, so a move into a different
+        # region can be told apart from a step across the current region's grid.
+        self._last_move_region_id: Optional[str] = None
         self.file_saving_option = acquisition_parameters.file_saving_option
         # Tracks whether the most recent run_single_time_point created a per-timepoint
         # folder (so we know whether to drop a per-timepoint .done marker into it).
@@ -2806,16 +2814,27 @@ class MultiPointWorker:
         # the focused Z cached from the previous timepoint over the
         # coordinate's nominal Z. The X/Y move below must still run — only
         # the Z source changes here.
+        z_target_mm = None
         if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
             if (region_id, fov) in self._z_pos_proposal:
-                last_z_mm = self._z_pos_proposal[(region_id, fov)]
-                self.move_to_z_level(last_z_mm, blocking=False)
-                self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
+                z_target_mm = self._z_pos_proposal[(region_id, fov)]
             else:
                 self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
         elif len(coordinate_mm) == 3:
-            z_mm = coordinate_mm[2]
-            self.move_to_z_level(z_mm, blocking=False)
+            z_target_mm = coordinate_mm[2]
+
+        retract = self._should_retract_z_for_move(region_id, fov)
+        if retract:
+            # The retract only brackets the XY move; the target Z is still
+            # whatever the AF cache / coordinate picked above. When neither
+            # names one, come back to the Z we are leaving from so the
+            # objective never stays parked at the retract height.
+            if z_target_mm is None:
+                z_target_mm = curr_pos.z_mm
+            self._retract_z_home_for_move(region_id, fov)
+        elif z_target_mm is not None:
+            self.move_to_z_level(z_target_mm, blocking=False)
+            self._log.debug(f"Moved to z position {z_target_mm} [mm]")
 
         # Blocking-longer-axis move. Shorter axis fires non-blocking; the
         # longer axis blocks until motion is complete. Stabilization sleep
@@ -2831,6 +2850,41 @@ class MultiPointWorker:
             self.stage.move_x_to(x_mm, blocking=False)
             self.stage.move_y_to(y_mm)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+
+        if retract:
+            self._log.debug(f"Lowering z to target {z_target_mm} [mm] after the retracted XY move")
+            self.move_to_z_level(z_target_mm)
+
+        self._last_move_region_id = region_id
+
+    def _should_retract_z_for_move(self, region_id, fov) -> bool:
+        """Does this move need the Z retract bracket?
+
+        Only moves that enter a region do: the first FOV of a region (``fov ==
+        0``, which is the first entry in the region's already-snaked coordinate
+        list), any move that lands in a different region than the last one,
+        and -- because ``_last_move_region_id`` starts as ``None`` -- the first
+        move of the run. Steps across a region's own Nx x Ny grid keep today's
+        behaviour.
+        """
+        if not self.retract_z_between_regions:
+            return False
+        return fov == 0 or region_id != self._last_move_region_id
+
+    def _retract_z_home_for_move(self, region_id, fov) -> None:
+        """Park the objective at the retract height, blocking, before an XY move.
+
+        Mirrors the loading-position retract in ``squid/stage/utils.py``:
+        ``OBJECTIVE_RETRACTED_POS_MM`` goes to ``move_z_to`` as-is -- no
+        raw->canonical conversion (that is only for ``Z_HOME_SAFETY_POINT``,
+        which is stored in raw units) and no ``INVERTED_OBJECTIVE`` sign flip,
+        since the stage config already owns the axis sign.
+        """
+        home_z_mm = control._def.OBJECTIVE_RETRACTED_POS_MM
+        self._log.debug(
+            f"Retracting z to {home_z_mm} [mm] before the XY move into region {region_id}, fov {fov}"
+        )
+        self.stage.move_z_to(home_z_mm)
 
     def _wait_for_move_settled(self, timeout_s: float = 30.0) -> None:
         """Join the in-flight stage motion issued by move_to_coordinate and

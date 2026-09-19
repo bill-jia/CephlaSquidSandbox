@@ -82,6 +82,27 @@ Time-lapse                   Scan behaviour
 - 100 µm (`OBJECTIVE_RETRACTED_POS_MM`) **is** the right clearance for
   inter-region travel on the current holder.
 
+## D13 non-GUI core — done
+
+The acquisition side of item 13 is in; only the checkbox is left.
+
+- `MultiPointController.set_retract_z_between_regions(bool)` is what the
+  checkbox calls (default **on**, mirrors `set_skip_saving`). It rides
+  `AcquisitionParameters.retract_z_between_regions` into the worker and lands
+  in `acquisition.yaml` under `acquisition:`.
+- `MultiPointWorker.move_to_coordinate` brackets a move when it *enters* a
+  region — `fov == 0`, or a region id different from the previous move, which
+  also covers the very first move of a run and the inter-timepoint pre-move.
+  Steps across a region's own tile grid are byte-for-byte unchanged.
+- The end-of-run return lives on the controller, not the worker:
+  `MultiPointController._move_back_to_start_position`.
+- `OBJECTIVE_RETRACTED_POS_MM` goes to `stage.move_z_to` as-is, like the
+  loading-position retract in `squid/stage/utils.py` — no raw→canonical
+  conversion (that is only for the raw-units `Z_HOME_SAFETY_POINT`) and no
+  `INVERTED_OBJECTIVE` sign flip. Piezo Z is untouched.
+- Tests: `software/tests/control/test_multipoint_z_retract.py`.
+- GUI `go_to` (item 13a) is still to do.
+
 ## Screenshots without hardware
 
 `python tools/screenshot_multipoint.py <out_dir>` (from `software/`, squid env)
