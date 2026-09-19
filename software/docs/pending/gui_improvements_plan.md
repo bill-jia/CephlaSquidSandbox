@@ -77,10 +77,17 @@ Time-lapse                   Scan behaviour
       *target* Z, retract happens before it; `INVERTED_OBJECTIVE` flips
       which way is "away from the sample"; piezo Z is untouched.
 
-## Open questions for D
+## Decisions for D (2026-09-19)
 
-- Should the retract also apply to the **first** move of a run (stage may
-  already be at a safe Z) and to the return-to-start move at the end?
-- 100 µm is the objective-retracted position for *loading*; confirm it is
-  also the right clearance for inter-region travel on the current sample
-  holder.
+- The retract **does** apply to the first move of a run and to the
+  return-to-start move at the end.
+- 100 µm (`OBJECTIVE_RETRACTED_POS_MM`) **is** the right clearance for
+  inter-region travel on the current holder.
+
+## Screenshots without hardware
+
+`python tools/screenshot_multipoint.py <out_dir>` (from `software/`, squid env)
+builds the whole GUI with every `SIMULATE_*` flag on and writes
+`flexible_multipoint.png` / `wellplate_multipoint.png`. Takes ~60 s; the
+`default` profile has no observation-state presets, so the channel list is
+empty.
