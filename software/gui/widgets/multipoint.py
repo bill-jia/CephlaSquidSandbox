@@ -1741,6 +1741,63 @@ _FILE_SAVING_FORMAT_TOOLTIPS = {
     "ZARR_V3": "OME-NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines.",
 }
 
+# Last entry of the save-format combo: "run the acquisition, write nothing". It is a
+# save *format* from the user's point of view, so it lives in the same dropdown rather
+# than in a separate checkbox (which was easy to leave ticked by accident).
+DRY_RUN_SAVE_FORMAT = "Don't save (dry run)"
+
+
+def _is_dry_run(combo: "QComboBox") -> bool:
+    """True when the save-format combo is on the dry-run entry."""
+    return combo.currentText() == DRY_RUN_SAVE_FORMAT
+
+
+def _push_save_format_to_controller(widget) -> None:
+    """Push the save-format combo's selection into the controller.
+
+    The dry-run entry is not a ``FileSavingOption``: it sets ``skip_saving`` and leaves
+    the last real format alone (nothing is written, so the format is moot). Any real
+    format clears ``skip_saving``.
+    """
+    dry_run = _is_dry_run(widget.combobox_fileSavingFormat)
+    widget.multipointController.set_skip_saving(dry_run)
+    if not dry_run:
+        widget.multipointController.set_file_saving_option(widget.combobox_fileSavingFormat.currentText())
+
+
+def _apply_save_format_from_yaml(widget, yaml_data) -> None:
+    """Restore the save-format combo from a dropped ``acquisition.yaml``.
+
+    Only the dry-run flag travels in the file (``acquisition.skip_saving``); the format
+    itself is not recorded, so a normal run just brings the combo back out of dry run.
+    """
+    combo = widget.combobox_fileSavingFormat
+    if yaml_data.skip_saving:
+        combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
+    elif _is_dry_run(combo):
+        current = getattr(widget.multipointController.file_saving_option, "name", "")
+        index = combo.findText(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+
+def _make_section(title: str) -> "tuple[QVBoxLayout, QVBoxLayout]":
+    """A bold section header with an indented content column under it.
+
+    Returns ``(section, content)``: add ``section`` to the parent layout, put the
+    group's widgets in ``content``. A bold QLabel rather than a QGroupBox — matching
+    the ``<b>Positions</b>`` header above the position table — so grouping the
+    acquisition options doesn't add another ring of frames to an already busy panel.
+    """
+    section = QVBoxLayout()
+    section.setContentsMargins(0, 0, 0, 0)
+    section.setSpacing(2)
+    section.addWidget(QLabel(f"<b>{title}</b>"))
+    content = QVBoxLayout()
+    content.setContentsMargins(12, 0, 0, 0)
+    content.setSpacing(2)
+    section.addLayout(content)
+    return section, content
+
 
 def _human_bytes(n: float) -> str:
     """Format a byte count as a short human-readable string (e.g. ``3.4 GB``)."""
@@ -1811,7 +1868,7 @@ def _refresh_size_estimate(widget) -> None:
         return
     label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     has_selection = bool(_get_checked_names(widget.list_configurations))
-    skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
+    skip_saving = _is_dry_run(widget.combobox_fileSavingFormat)
     hint = (
         "Select a cycle to estimate size"
         if getattr(widget, "_channel_mode", "simple") == "advanced"
@@ -1824,17 +1881,25 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     """Build a compact ``Save format: [combo] ........ [size estimate]`` row.
 
     The combo only mirrors local UI state; the caller wires its
-    ``currentTextChanged`` signal to ``MultiPointController.set_file_saving_option``
-    so the choice flows through ``AcquisitionParameters`` to the worker
-    (mirroring how ``Skip Saving`` is plumbed). Compression / chunking knobs
-    live in Settings > Preferences. The trailing label shows a live image-count /
-    disk-size estimate (the caller keeps it updated via ``_refresh_size_estimate``).
+    ``currentTextChanged`` signal to ``_push_save_format_to_controller`` so the choice
+    flows through ``AcquisitionParameters`` to the worker. Its last entry is
+    ``DRY_RUN_SAVE_FORMAT``, which sets ``skip_saving`` instead of a format.
+    Compression / chunking knobs live in Settings > Preferences. The trailing label
+    shows a live image-count / disk-size estimate (the caller keeps it updated via
+    ``_refresh_size_estimate``).
     """
     label = QLabel("Save format:")
     combo = QComboBox()
     for opt in FileSavingOption:
         combo.addItem(opt.name)
         combo.setItemData(combo.count() - 1, _FILE_SAVING_FORMAT_TOOLTIPS.get(opt.name, ""), Qt.ToolTipRole)
+    combo.addItem(DRY_RUN_SAVE_FORMAT)
+    combo.setItemData(
+        combo.count() - 1,
+        "Run the acquisition without writing any image files — for timing, "
+        "illumination and stage-path checks.",
+        Qt.ToolTipRole,
+    )
     if initial_option is None:
         initial_option = control._def.FILE_SAVING_OPTION
     try:
@@ -3124,8 +3189,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             "Advanced: pick acquisition cycles (per-position sequences of states)."
         )
 
-        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
-        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_per_point_channels = QPushButton("Per-Point Channels")
+        self.btn_edit_cycles = QPushButton("Edit Cycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
@@ -3156,9 +3221,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
-
-        self.checkbox_skipSaving = QCheckBox("Skip Saving")
-        self.checkbox_skipSaving.setChecked(False)
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
@@ -3223,7 +3285,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # self.btn_startAcquisition.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Add snap images button
-        self.btn_snap_images = QPushButton("Snap Images")
+        self.btn_snap_images = QPushButton("Acquire\nCurrent FOV")
+        self.btn_snap_images.setToolTip(
+            "Acquire the checked channels once, one plane, at the current stage position, "
+            "using the Save format above. Does not add a position."
+        )
         self.btn_snap_images.clicked.connect(self.on_snap_images)
         self.btn_snap_images.setCheckable(False)
         self.btn_snap_images.setChecked(False)
@@ -3241,7 +3307,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.grid_line0.addWidget(QLabel("Saving Path"))
         self.grid_line0.addWidget(self.lineEdit_savingDir)
         self.grid_line0.addWidget(self.btn_setSavingDir)
-        self.grid_line0.addWidget(QLabel("ID"))
+        self.grid_line0.addWidget(QLabel("Experiment ID"))
+        self.lineEdit_experimentID.setPlaceholderText("optional name, prefixed to the folder")
+        self.lineEdit_experimentID.setMinimumWidth(260)
         self.grid_line0.addWidget(self.lineEdit_experimentID)
 
         # Positions block: a titled header carrying the list-editing buttons, the
@@ -3271,149 +3339,152 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.grid_location_list.addWidget(self.table_location_list)
         self.grid_location_list.addLayout(self.positions_actions_layout)
 
-        # Create spacer items
-        EDGE_SPACING = 4  # Adjust this value as needed
-        edge_spacer = QSpacerItem(EDGE_SPACING, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        # ---- Acquisition options, as four labelled groups ------------------
+        # Left column says what the stage does at each position (tiling, Z, time),
+        # right column says how the run behaves (focus, saving, scan behaviour).
+        # Before this the same widgets sat in one unlabelled 8-column grid, so
+        # "Nz" and "Set Z-range" were half a panel apart.
 
-        # Create first row layouts
+        tiling_section, tiling_content = _make_section("Tiling per position")
+        tiling_row = QHBoxLayout()
+        tiling_row.addWidget(QLabel("Nx"))
+        tiling_row.addWidget(self.entry_NX)
+        tiling_row.addWidget(QLabel("Ny"))
+        tiling_row.addWidget(self.entry_NY)
         if self.use_overlap:
-            xy_half = QHBoxLayout()
-            xy_half.addWidget(QLabel("Nx"))
-            xy_half.addWidget(self.entry_NX)
-            xy_half.addStretch(1)
-            xy_half.addWidget(QLabel("Ny"))
-            xy_half.addWidget(self.entry_NY)
-            xy_half.addSpacerItem(edge_spacer)
-
-            overlap_half = QHBoxLayout()
-            overlap_half.addSpacerItem(edge_spacer)
-            overlap_half.addWidget(QLabel("FOV Overlap"), alignment=Qt.AlignRight)
-            overlap_half.addWidget(self.entry_overlap)
+            tiling_row.addWidget(QLabel("Overlap"))
+            tiling_row.addWidget(self.entry_overlap)
+            tiling_row.addWidget(self.checkbox_snakeScan)
+            tiling_row.addStretch(1)
+            tiling_content.addLayout(tiling_row)
         else:
-            # Create alternate first row layouts (dx, dy) instead of (overlap %)
-            x_half = QHBoxLayout()
-            x_half.addWidget(QLabel("dx"))
-            x_half.addWidget(self.entry_deltaX)
-            x_half.addStretch(1)
-            x_half.addWidget(QLabel("Nx"))
-            x_half.addWidget(self.entry_NX)
-            x_half.addSpacerItem(edge_spacer)
+            # Alternate geometry (use_overlap off): the tile pitch is given directly
+            # as dx/dy instead of being derived from the FOV and an overlap fraction.
+            tiling_row.addStretch(1)
+            tiling_content.addLayout(tiling_row)
+            pitch_row = QHBoxLayout()
+            pitch_row.addWidget(QLabel("dx"))
+            pitch_row.addWidget(self.entry_deltaX)
+            pitch_row.addWidget(QLabel("dy"))
+            pitch_row.addWidget(self.entry_deltaY)
+            pitch_row.addWidget(self.checkbox_snakeScan)
+            pitch_row.addStretch(1)
+            tiling_content.addLayout(pitch_row)
 
-            y_half = QHBoxLayout()
-            y_half.addSpacerItem(edge_spacer)
-            y_half.addWidget(QLabel("dy"))
-            y_half.addWidget(self.entry_deltaY)
-            y_half.addStretch(1)
-            y_half.addWidget(QLabel("Ny"))
-            y_half.addWidget(self.entry_NY)
-
-        # Create second row layouts
-        dz_half = QHBoxLayout()
-        dz_half.addWidget(QLabel("dz"))
-        dz_half.addWidget(self.entry_deltaZ)
-        dz_half.addStretch(1)
-        dz_half.addWidget(QLabel("Nz"))
-        dz_half.addWidget(self.entry_NZ)
-        dz_half.addSpacerItem(edge_spacer)
-
-        dt_half = QHBoxLayout()
-        dt_half.addSpacerItem(edge_spacer)
-        dt_half.addWidget(QLabel("dt"))
-        dt_half.addWidget(self.entry_dt)
-        dt_half.addStretch(1)
-        dt_half.addWidget(QLabel("Nt"))
-        dt_half.addWidget(self.entry_Nt)
-
-        self.grid_acquisition = QGridLayout()
-        # Add the layouts to grid_line1
-        if self.use_overlap:
-            self.grid_acquisition.addLayout(xy_half, 3, 0, 1, 4)
-            self.grid_acquisition.addLayout(overlap_half, 3, 4, 1, 4)
-        else:
-            self.grid_acquisition.addLayout(x_half, 3, 0, 1, 4)
-            self.grid_acquisition.addLayout(y_half, 3, 4, 1, 4)
-        self.grid_acquisition.addLayout(dz_half, 4, 0, 1, 4)
-        self.grid_acquisition.addLayout(dt_half, 4, 4, 1, 4)
-
-        self.z_min_layout = QHBoxLayout()
-        self.z_min_layout.addWidget(self.set_minZ_button)
-        self.z_min_layout.addWidget(QLabel("Z-min"), Qt.AlignRight)
-        self.z_min_layout.addWidget(self.entry_minZ)
-        self.z_min_layout.addSpacerItem(edge_spacer)
-
-        self.z_max_layout = QHBoxLayout()
-        self.z_max_layout.addSpacerItem(edge_spacer)
-        self.z_max_layout.addWidget(self.set_maxZ_button)
-        self.z_max_layout.addWidget(QLabel("Z-max"), Qt.AlignRight)
-        self.z_max_layout.addWidget(self.entry_maxZ)
-
-        self.grid_acquisition.addLayout(self.z_min_layout, 5, 0, 1, 4)  # hide this in toggle
-        self.grid_acquisition.addLayout(self.z_max_layout, 5, 4, 1, 4)  # hide this in toggle
-
-        grid_af = QVBoxLayout()
-        grid_af.addWidget(self.checkbox_withAutofocus)
-        # Laser AF has been promoted from a checkbox into a configuration button
-        # and lives in the right-hand button column (above Snap Images) instead.
-        # grid_af.addWidget(self.checkbox_genAFMap)  # we are not using auto-focus map for now
-        grid_af.addWidget(self.checkbox_useFocusMap)
+        zstack_section, zstack_content = _make_section("Z-stack")
+        zstack_row = QHBoxLayout()
+        zstack_row.addWidget(QLabel("Nz"))
+        zstack_row.addWidget(self.entry_NZ)
+        zstack_row.addWidget(QLabel("dz"))
+        zstack_row.addWidget(self.entry_deltaZ)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        self.label_z_stack_from = QLabel("From")
+        zstack_row.addWidget(self.label_z_stack_from)
+        zstack_row.addWidget(self.combobox_z_stack, 1)
+        zstack_row.addWidget(self.checkbox_set_z_range)
+        zstack_content.addLayout(zstack_row)
         if HAS_OBJECTIVE_PIEZO:
-            grid_af.addWidget(self.checkbox_usePiezo)
+            zstack_content.addWidget(self.checkbox_usePiezo)
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
-        grid_af.addWidget(self.checkbox_set_z_range)
-        # Z-stack reference plane: with autofocus on, the AF plane becomes the
-        # bottom / center / top slice per this selection (see acquire_at_position).
-        z_stack_mode_row = QHBoxLayout()
-        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
-        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
-        grid_af.addLayout(z_stack_mode_row)
-        grid_af.addWidget(self.checkbox_skipSaving)
-        grid_af.addLayout(self.fileSavingFormatRow)
-        grid_af.addLayout(self.zarrStreamingRow)
-        grid_af.addWidget(self.checkbox_snakeScan)
-        grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
-        grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
 
-        grid_config = QHBoxLayout()
-        grid_config.addWidget(self.combobox_channel_mode, 0, Qt.AlignTop)
-        grid_config.addWidget(self.list_configurations)
-        grid_config.addWidget(self.btn_per_point_channels)
-        grid_config.addWidget(self.btn_edit_cycles)
-        grid_config.addSpacerItem(edge_spacer)
+        # Shown only in "Set Z-range" mode (toggle_z_range_controls walks both layouts
+        # by index, so they must stay the same length).
+        self.z_min_layout = QHBoxLayout()
+        self.z_min_layout.addWidget(self.set_minZ_button)
+        self.z_min_layout.addWidget(QLabel("Z-min"))
+        self.z_min_layout.addWidget(self.entry_minZ)
+        self.z_min_layout.addStretch(1)
 
-        # Button column (bottom-right). Laser AF button sits above Snap Images
-        # and is stretched to match the other two buttons' heights.
+        self.z_max_layout = QHBoxLayout()
+        self.z_max_layout.addWidget(self.set_maxZ_button)
+        self.z_max_layout.addWidget(QLabel("Z-max"))
+        self.z_max_layout.addWidget(self.entry_maxZ)
+        self.z_max_layout.addStretch(1)
+
+        zstack_content.addLayout(self.z_min_layout)
+        zstack_content.addLayout(self.z_max_layout)
+
+        timelapse_section, timelapse_content = _make_section("Time-lapse")
+        timelapse_row = QHBoxLayout()
+        timelapse_row.addWidget(QLabel("Nt"))
+        timelapse_row.addWidget(self.entry_Nt)
+        timelapse_row.addWidget(QLabel("dt"))
+        timelapse_row.addWidget(self.entry_dt)
+        timelapse_row.addStretch(1)
+        timelapse_content.addLayout(timelapse_row)
+
+        focus_section, focus_content = _make_section("Focus")
+        focus_content.addWidget(self.checkbox_withAutofocus)
+        # Laser AF is a settings *button* (it opens a dialog), but it is a focus
+        # setting like the two checkboxes around it, so it sits here at normal
+        # control height rather than in the actions column.
+        if self._enable_laser_autofocus:
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            focus_content.addLayout(laser_af_row)
+        # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
+        focus_content.addWidget(self.checkbox_useFocusMap)
+
+        saving_section, saving_content = _make_section("Saving")
+        saving_content.addLayout(self.fileSavingFormatRow)
+        saving_content.addLayout(self.zarrStreamingRow)
+
+        scan_section, scan_content = _make_section("Scan behaviour")
+        scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+
+        options_left = QVBoxLayout()
+        options_left.addLayout(tiling_section)
+        options_left.addLayout(zstack_section)
+        options_left.addLayout(timelapse_section)
+        options_left.addStretch(1)
+
+        options_right = QVBoxLayout()
+        options_right.addLayout(focus_section)
+        options_right.addLayout(saving_section)
+        options_right.addLayout(scan_section)
+        options_right.addStretch(1)
+
+        options_columns = QHBoxLayout()
+        options_columns.addLayout(options_left, 1)
+        options_columns.addSpacing(12)
+        options_columns.addLayout(options_right, 1)
+
+        # ---- Channels + the actions column ---------------------------------
+        channels_header = QHBoxLayout()
+        channels_header.addWidget(QLabel("<b>Channels</b>"))
+        channels_header.addWidget(self.combobox_channel_mode)
+        channels_header.addStretch(1)
+        channels_header.addWidget(self.btn_per_point_channels)
+        channels_header.addWidget(self.btn_edit_cycles)
+
+        channels_column = QVBoxLayout()
+        channels_column.setSpacing(2)
+        channels_column.addLayout(channels_header)
+        channels_column.addWidget(self.list_configurations)
+
+        # Actions only: Start is the main verb, the single-FOV acquire is half its
+        # height so the two never get confused at a glance.
         button_layout = QVBoxLayout()
         for btn in (self.btn_snap_images, self.btn_startAcquisition):
             btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        if self._enable_laser_autofocus:
-            self.checkbox_withReflectionAutofocus.setSizePolicy(
-                QSizePolicy.Preferred, QSizePolicy.Expanding
-            )
-            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
         button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 1)
+        button_layout.addWidget(self.btn_startAcquisition, 2)
 
-        grid_acquisition = QHBoxLayout()
-        grid_acquisition.addSpacerItem(edge_spacer)
-        grid_acquisition.addLayout(grid_af)
-        grid_acquisition.addLayout(button_layout)
+        channels_row = QHBoxLayout()
+        channels_row.addLayout(channels_column, 1)
+        channels_row.addSpacing(4)
+        channels_row.addLayout(button_layout)
 
-        self.grid_acquisition.addLayout(grid_config, 6, 0, 3, 4)
-        self.grid_acquisition.addLayout(grid_acquisition, 6, 4, 3, 4)
-
-        # Columns 0-3: Combined stretch factor = 4
-        # Columns 4-7: Combined stretch factor = 4
-        for i in range(4):
-            self.grid_acquisition.setColumnStretch(i, 1)
-            self.grid_acquisition.setColumnStretch(i + 4, 1)
-
-        self.grid_acquisition.setRowStretch(0, 0)  # Nx/Ny and overlap row
-        self.grid_acquisition.setRowStretch(1, 0)  # dz/Nz and dt/Nt row
-        self.grid_acquisition.setRowStretch(2, 0)  # Z-range row
-        self.grid_acquisition.setRowStretch(3, 1)  # Configuration/AF row - allow this to stretch
-        self.grid_acquisition.setRowStretch(4, 0)  # Last row
+        self.grid_acquisition = QVBoxLayout()
+        self.grid_acquisition.addLayout(options_columns)
+        self.grid_acquisition.addLayout(channels_row)
 
         # Row : Progress Bar
         self.row_progress_layout = QHBoxLayout()
@@ -3448,8 +3519,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
-        self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
-        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
+        # The last combo entry is "don't save" rather than a format, so the push goes
+        # through a helper that splits it into set_skip_saving / set_file_saving_option.
+        self.combobox_fileSavingFormat.currentTextChanged.connect(lambda *_: _push_save_format_to_controller(self))
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
@@ -3457,6 +3529,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.checkbox_showLiveDuringAcquisition.toggled.connect(
             self.multipointController.set_show_live_during_acquisition
         )
+        self.entry_NZ.valueChanged.connect(lambda *_: self._sync_z_stack_controls())
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
@@ -3475,7 +3548,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.entry_NZ.valueChanged,
             self.entry_Nt.valueChanged,
             self.combobox_fileSavingFormat.currentTextChanged,
-            self.checkbox_skipSaving.toggled,
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
@@ -3509,6 +3581,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
         self.toggle_z_range_controls(False)
         self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
+        self._sync_z_stack_controls()
 
         _refresh_size_estimate(self)
 
@@ -3519,6 +3592,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.grid.addLayout(self.grid_acquisition)
         self.grid.addLayout(self.row_progress_layout)
         self.setLayout(self.grid)
+
+    def _sync_z_stack_controls(self):
+        """Nz == 1 is a single plane, so the stack's reference plane and the Z-range
+        entry have nothing to act on — grey them out. Dropping to Nz == 1 while the
+        Z-range is on also leaves that mode (which hides the Z-min/Z-max rows)."""
+        is_stack = self.entry_NZ.value() > 1
+        if not is_stack and self.checkbox_set_z_range.isChecked():
+            self.checkbox_set_z_range.setChecked(False)
+        self.label_z_stack_from.setEnabled(is_stack)
+        self.combobox_z_stack.setEnabled(is_stack)
+        self.checkbox_set_z_range.setEnabled(is_stack)
 
     def toggle_z_range_controls(self, state):
         is_visible = bool(state)
@@ -3788,9 +3872,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def _update_per_point_button_text(self):
         if self._region_obs_state_map is not None:
-            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+            self.btn_per_point_channels.setText("Per-Point Channels *")
         else:
-            self.btn_per_point_channels.setText("Per-Point\nChannels")
+            self.btn_per_point_channels.setText("Per-Point Channels")
 
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
@@ -3927,7 +4011,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
-            self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
@@ -3937,7 +4020,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # flexible and wellplate tabs each have their own combo/row bound
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
-            self.multipointController.set_file_saving_option(self.combobox_fileSavingFormat.currentText())
+            _push_save_format_to_controller(self)
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
@@ -3955,7 +4038,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if self.checkbox_skipSaving.isChecked():
+            if _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
@@ -4581,7 +4664,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.multipointController.set_z_range(z, z)
 
         # Start the acquisition process for the single FOV
-        self.multipointController.start_new_experiment("snapped images" + self.lineEdit_experimentID.text())
+        # start_new_experiment appends _<timestamp> and squashes spaces, so this lands as
+        # snap_<id>_<timestamp> (or snap_<timestamp> with no experiment ID). The old
+        # "snapped images" + id ran the two together with no separator.
+        experiment_id = self.lineEdit_experimentID.text().strip()
+        self.multipointController.start_new_experiment("snap_" + experiment_id if experiment_id else "snap")
         self.multipointController.run_acquisition(acquire_current_fov=True)
 
     def acquisition_is_finished(self):
@@ -4647,8 +4734,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         ):
             btn.setEnabled(enabled)
         if enabled:
-            # ...but "Recapture AF Ref" only comes back if laser AF is actually on.
+            # ...but "Recapture AF Ref" only comes back if laser AF is actually on, and
+            # the Z-stack controls only if there is more than one plane.
             self._sync_af_ref_button()
+            self._sync_z_stack_controls()
 
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
@@ -4751,6 +4840,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
 
+            # Saving (the dry-run entry of the save-format combo)
+            _apply_save_format_from_yaml(self, yaml_data)
+
             # Load positions if present
             if yaml_data.flexible_positions:
                 self._load_positions(yaml_data.flexible_positions)
@@ -4759,6 +4851,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Unblock all signals
             for widget in widgets_to_block:
                 widget.blockSignals(False)
+
+            # Nz was set with signals blocked, so re-apply the single-plane grey-out.
+            self._sync_z_stack_controls()
 
             # Update FOV positions to reflect new NX, NY, delta values
             self.update_fov_positions()
@@ -5061,8 +5156,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self._region_obs_state_map = None
         # Stable channel_name -> palette index, persists across dialog opens for color continuity.
         self._channel_color_index = {}
-        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
-        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_per_point_channels = QPushButton("Per-Point Channels")
+        self.btn_edit_cycles = QPushButton("Edit Cycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
@@ -5110,9 +5205,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
-        self.checkbox_skipSaving = QCheckBox("Skip Saving")
-        self.checkbox_skipSaving.setChecked(False)
-
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
@@ -5155,7 +5247,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.eta_timer = QTimer()
 
         # Add snap images button
-        self.btn_snap_images = QPushButton("Snap Images")
+        self.btn_snap_images = QPushButton("Acquire\nCurrent FOV")
+        self.btn_snap_images.setToolTip(
+            "Acquire the checked channels once, one plane, at the current stage position, "
+            "using the Save format above. Does not add a position."
+        )
         self.btn_snap_images.clicked.connect(self.on_snap_images)
         self.btn_snap_images.setCheckable(False)
         self.btn_snap_images.setChecked(False)
@@ -5222,6 +5318,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         # Experiment ID
         row_1_layout = QHBoxLayout()
         row_1_layout.addWidget(QLabel("Experiment ID"))
+        self.lineEdit_experimentID.setPlaceholderText("optional name, prefixed to the folder")
         row_1_layout.addWidget(self.lineEdit_experimentID)
         main_layout.addLayout(row_1_layout)
 
@@ -5353,54 +5450,75 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.z_controls_range_frame.setVisible(False)  # Initially hidden (shown when "Set Range" mode)
         grid.addWidget(self.z_controls_range_frame, 1, 0, 1, 3)  # Span full row (columns 0, 1, 2)
 
-        # Configuration list + Per-Point Channels button (shares the cell so the
-        # button reclaims vertical space that would otherwise sit empty next to
-        # the Z-stack frames above).
+        # Channel list under a header carrying the mode combo and the two
+        # channel-editing buttons, so the bare "Simple ▾" combo is labelled.
+        channels_header = QHBoxLayout()
+        channels_header.addWidget(QLabel("<b>Channels</b>"))
+        channels_header.addWidget(self.combobox_channel_mode)
+        channels_header.addStretch(1)
+        channels_header.addWidget(self.btn_per_point_channels)
+        channels_header.addWidget(self.btn_edit_cycles)
+
         config_cell = QVBoxLayout()
         config_cell.setContentsMargins(0, 0, 0, 0)
-        config_cell.addWidget(self.combobox_channel_mode)
+        config_cell.setSpacing(2)
+        config_cell.addLayout(channels_header)
         config_cell.addWidget(self.list_configurations)
-        config_cell.addWidget(self.btn_per_point_channels)
-        config_cell.addWidget(self.btn_edit_cycles)
         grid.addLayout(config_cell, 2, 0)
 
-        # Options and Start button
-        options_layout = QVBoxLayout()
-        options_layout.addWidget(self.checkbox_withAutofocus)
-        # Laser AF has been promoted from a checkbox into a configuration button
-        # and lives in the right-hand button column (above Snap Images) instead.
-        # options_layout.addWidget(self.checkbox_genAFMap)  # We are not using AF map now
-        options_layout.addWidget(self.checkbox_useFocusMap)
-        if HAS_OBJECTIVE_PIEZO:
-            options_layout.addWidget(self.checkbox_usePiezo)
-            if IS_PIEZO_ONLY:
-                self.checkbox_usePiezo.setChecked(True)
-                self.checkbox_usePiezo.setVisible(False)
+        # Options, as labelled groups. The XY / Z / Time rows above own the scan
+        # geometry; everything left here is about how the run behaves.
+        zstack_section, zstack_content = _make_section("Z-stack")
         # Z-stack reference plane: with autofocus on, the AF plane becomes the
         # bottom / center / top slice per this selection (see acquire_at_position).
         z_stack_mode_row = QHBoxLayout()
-        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
+        self.label_z_stack_from = QLabel("From")
+        z_stack_mode_row.addWidget(self.label_z_stack_from)
         z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
-        options_layout.addLayout(z_stack_mode_row)
-        options_layout.addWidget(self.checkbox_skipSaving)
-        options_layout.addLayout(self.fileSavingFormatRow)
-        options_layout.addLayout(self.zarrStreamingRow)
-        options_layout.addWidget(self.checkbox_snakeScan)
-        options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
-        options_layout.addWidget(self.checkbox_showLiveDuringAcquisition)
+        zstack_content.addLayout(z_stack_mode_row)
+        if HAS_OBJECTIVE_PIEZO:
+            zstack_content.addWidget(self.checkbox_usePiezo)
+            if IS_PIEZO_ONLY:
+                self.checkbox_usePiezo.setChecked(True)
+                self.checkbox_usePiezo.setVisible(False)
 
-        # Button column (bottom-right). Laser AF button sits above Snap Images
-        # and is stretched to match the other two buttons' heights.
+        focus_section, focus_content = _make_section("Focus")
+        focus_content.addWidget(self.checkbox_withAutofocus)
+        # Laser AF is a settings button (it opens a dialog) but it is a focus setting,
+        # so it sits here at normal control height, not in the actions column.
+        if self._enable_laser_autofocus:
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            focus_content.addLayout(laser_af_row)
+        # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
+        focus_content.addWidget(self.checkbox_useFocusMap)
+
+        saving_section, saving_content = _make_section("Saving")
+        saving_content.addLayout(self.fileSavingFormatRow)
+        saving_content.addLayout(self.zarrStreamingRow)
+
+        scan_section, scan_content = _make_section("Scan behaviour")
+        scan_content.addWidget(self.checkbox_snakeScan)
+        scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+
+        options_layout = QVBoxLayout()
+        options_layout.addLayout(zstack_section)
+        options_layout.addLayout(focus_section)
+        options_layout.addLayout(saving_section)
+        options_layout.addLayout(scan_section)
+        options_layout.addStretch(1)
+
+        # Actions only: Start is the main verb, the single-FOV acquire is half its
+        # height so the two never get confused at a glance.
         button_layout = QVBoxLayout()
         for btn in (self.btn_snap_images, self.btn_startAcquisition):
             btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        if self._enable_laser_autofocus:
-            self.checkbox_withReflectionAutofocus.setSizePolicy(
-                QSizePolicy.Preferred, QSizePolicy.Expanding
-            )
-            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
         button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 1)
+        button_layout.addWidget(self.btn_startAcquisition, 2)
 
         bottom_right = QHBoxLayout()
         bottom_right.addLayout(options_layout)
@@ -5469,8 +5587,10 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
-        self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
-        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
+        # The last combo entry is "don't save" rather than a format, so the push goes
+        # through a helper that splits it into set_skip_saving / set_file_saving_option.
+        self.combobox_fileSavingFormat.currentTextChanged.connect(lambda *_: _push_save_format_to_controller(self))
+        self.entry_NZ.valueChanged.connect(lambda *_: self._sync_z_stack_controls())
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
@@ -5492,7 +5612,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.entry_NZ.valueChanged,
             self.entry_Nt.valueChanged,
             self.combobox_fileSavingFormat.currentTextChanged,
-            self.checkbox_skipSaving.toggled,
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
@@ -5519,6 +5638,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         # Load cached acquisition settings
         self.load_multipoint_widget_config_from_cache()
 
+        self._sync_z_stack_controls()
         _refresh_size_estimate(self)
 
         # Connect settings saving to relevant value changes
@@ -5538,6 +5658,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_withAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
+
+    def _sync_z_stack_controls(self):
+        """Nz == 1 is a single plane, so the stack's reference-plane choice has nothing
+        to act on — grey it out. (The Z-range itself lives in the Z tab above.)"""
+        is_stack = self.entry_NZ.value() > 1
+        self.label_z_stack_from.setEnabled(is_stack)
+        self.combobox_z_stack.setEnabled(is_stack)
 
     def enable_manual_ROI(self):
         _manual_index = self.combobox_xy_mode.findText("Manual")
@@ -6692,7 +6819,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
-            self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
@@ -6704,7 +6830,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             # Re-push THIS tab's visible save-format + streaming state (the
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
-            self.multipointController.set_file_saving_option(self.combobox_fileSavingFormat.currentText())
+            _push_save_format_to_controller(self)
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
@@ -6720,7 +6846,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 return
 
-            if self.checkbox_skipSaving.isChecked():
+            if _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
@@ -6845,6 +6971,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 # In Current Position mode, coverage should be disabled (N/A)
                 self.entry_well_coverage.setEnabled(False)
 
+            # The blanket re-enable above also lit up the Z-stack reference-plane combo.
+            self._sync_z_stack_controls()
+
     def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
 
@@ -6879,7 +7008,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         z = self.stage.get_pos().z_mm
         self.multipointController.set_z_range(z, z)
         # Start the acquisition process for the single FOV
-        self.multipointController.start_new_experiment("snapped images" + self.lineEdit_experimentID.text())
+        # start_new_experiment appends _<timestamp> and squashes spaces, so this lands as
+        # snap_<id>_<timestamp> (or snap_<timestamp> with no experiment ID). The old
+        # "snapped images" + id ran the two together with no separator.
+        experiment_id = self.lineEdit_experimentID.text().strip()
+        self.multipointController.start_new_experiment("snap_" + experiment_id if experiment_id else "snap")
         self.multipointController.run_acquisition(acquire_current_fov=True)
 
     def set_deltaZ(self, value):
@@ -6969,9 +7102,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
     def _update_per_point_button_text(self):
         if self._region_obs_state_map is not None:
-            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+            self.btn_per_point_channels.setText("Per-Point Channels *")
         else:
-            self.btn_per_point_channels.setText("Per-Point\nChannels")
+            self.btn_per_point_channels.setText("Per-Point Channels")
 
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
@@ -7273,6 +7406,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
 
+            # Saving (the dry-run entry of the save-format combo)
+            _apply_save_format_from_yaml(self, yaml_data)
+
             # XY mode - set to Select Wells for wellplate YAML
             if yaml_data.xy_mode in ["Current Position", "Select Wells", "Manual", "Load Coordinates"]:
                 self.combobox_xy_mode.setCurrentText(yaml_data.xy_mode)
@@ -7292,6 +7428,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             # Enable/disable mode dropdowns based on checkbox states
             self.combobox_z_mode.setEnabled(self.checkbox_z.isChecked())
             self.combobox_xy_mode.setEnabled(self.checkbox_xy.isChecked())
+
+            # Nz was set with signals blocked, so re-apply the single-plane grey-out.
+            self._sync_z_stack_controls()
 
             # Update all UI components based on checkbox states and mode selections
             self.update_scan_control_ui()
@@ -7513,7 +7652,13 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         # Options layout
         options_layout = QVBoxLayout()
         if self._enable_laser_autofocus:
-            options_layout.addWidget(self.checkbox_withReflectionAutofocus)
+            # The button's text is only the state ("Off ▸"), so it needs its name beside it.
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            options_layout.addLayout(laser_af_row)
         if HAS_OBJECTIVE_PIEZO:
             options_layout.addWidget(self.checkbox_usePiezo)
             if IS_PIEZO_ONLY:

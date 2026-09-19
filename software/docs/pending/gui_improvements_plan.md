@@ -25,33 +25,36 @@ layout change is applied to both.
   follows `LaserAutofocusButton.toggled`, and the old error dialog is gone.
   The empty-list hint now reads *"no positions — Start acquires the current
   field"*, which is what `acquisition_in_place` does.
-
-## B. Parameter grid → four labelled groups
-
-```
-Tiling per position          Focus
-  Nx  Ny  Overlap  Snake       Contrast AF · Laser AF [Off ▸] · Use Focus Map
-Z-stack                      Saving
-  Nz  dz  From  Set range      Format ▾ (incl. "Don't save — dry run") · size estimate
-Time-lapse                   Scan behaviour
-  Nt  dt                       Keep illuminators on · Show live preview
-```
-
-6. Fold **Skip Saving** into the Save format dropdown as `Don't save (dry run)`.
-   Size label already knows how to say "no files written"; postprocessing's
-   start-time refusal becomes a greyed option.
-7. **Laser AF** becomes a normal-height setting row in the Focus group; the
-   big-button column keeps actions only.
-8. Grey out `Z-stack from` / `Set Z-range` when Nz = 1.
-9. `Simple ▾` combobox gets a header: `Channels · Simple ▾` above the list.
-10. `ID` → `Experiment ID` with placeholder text.
-
-## C. Actions column
-
-11. `Snap Images` → `Acquire Current FOV`, half the height of Start, tooltip
-    ("checked channels, one plane, at the current stage position, using the
-    Save format above"). Fix folder name: `snapped_images<ID>_…` →
-    `snap_<ID>_…` (`on_snap_images`, missing separator).
+- B + C. Option groups and the actions column (both multipoint widgets, items
+  6-11). The unlabelled 8-column parameter grid is gone; options now sit under
+  bold section headers built by `_make_section` — *Tiling per position*,
+  *Z-stack*, *Time-lapse* on the left, *Focus*, *Saving*, *Scan behaviour* on
+  the right (the Wellplate tab keeps its XY/Z/Time boxes on top and gets the
+  same groups below, with `Snake scan` in *Scan behaviour* since it has no
+  tiling group). Details:
+  - **Skip Saving is gone as a checkbox**: the save-format combo's last entry is
+    `DRY_RUN_SAVE_FORMAT` ("Don't save (dry run)"). `_push_save_format_to_controller`
+    splits the selection into `set_skip_saving` / `set_file_saving_option`
+    (the dry-run string is not a `FileSavingOption` and must never reach the
+    enum conversion); `_refresh_size_estimate` and the pre-start disk-space
+    check read the combo via `_is_dry_run`. `AcquisitionYAMLData.skip_saving`
+    is new, and `_apply_save_format_from_yaml` selects the dry-run entry when a
+    dropped `acquisition.yaml` has `skip_saving: true`.
+  - **Laser AF** is a `Laser AF [Off ▸]` row in the *Focus* group at normal
+    height. `LaserAutofocusButton` dropped the "Laser AF: " prefix from its own
+    text (the label beside it carries the name) — the fluidics widget got the
+    same label row.
+  - **Nz = 1** greys `From` and `Set Z-range` (`_sync_z_stack_controls`, also
+    re-applied after `setEnabled_all(True)`); dropping to one plane leaves
+    Set Z-range mode so its Z-min/Z-max rows hide.
+  - **Channels header**: `<b>Channels</b>  Simple ▾  …  Per-Point Channels
+    Edit Cycles` above a full-width list; both buttons are single-line now.
+  - `ID` → `Experiment ID` with the placeholder *optional name, prefixed to the
+    folder* on both tabs.
+  - **Actions column** holds only `Acquire Current FOV` (stretch 1, was
+    `Snap Images`) and `Start Acquisition` (stretch 2). `on_snap_images` now
+    names the dataset `snap_<ID>` (or `snap`), not `snapped images<ID>`.
+  - Tests: `software/tests/control/test_save_format_dry_run.py`.
 
 ## D. Stage-motion behaviour (last — changes what the stage does)
 

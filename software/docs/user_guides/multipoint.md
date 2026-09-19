@@ -208,8 +208,9 @@ Coords** button and a read‑only field showing the loaded file path. The CSV mu
 
 ### Step 5 — Choose channels (observation states)
 
-A **Simple / Advanced** dropdown next to the channel list controls what the checklist
-holds. It defaults to **Simple** every time you open the widget.
+A **Simple / Advanced** dropdown in the **Channels** header above the checklist
+controls what the checklist holds. It defaults to **Simple** every time you open the
+widget. The header also carries the **Per-Point Channels** and **Edit Cycles** buttons.
 
 - **Simple** (default) — the checklist lists single **observation‑state presets**
   (channels); each checked one is imaged **once** per position, like standard microscope
@@ -253,7 +254,8 @@ Two things keep the overlap correct across a mixed‑ROI acquisition:
 
 Check the **Z** mode box to acquire a focal stack. Set **dz** (step size, µm) and
 **Nz** (number of planes), and pick where the stack sits relative to the focal plane
-with the **Z‑stack from** dropdown:
+with the **From** dropdown in the **Z‑stack** group (greyed out while Nz = 1, which is
+a single plane):
 
 - **From Bottom (Z‑min)** — the focal plane is the first (bottom) slice; the stack is
   built upward (`+dz` per plane).
@@ -288,9 +290,9 @@ Check the **Time** mode box, then set:
 Three independent focus aids are available (combine as needed):
 
 - **Contrast AF** — software contrast‑based autofocus run during the acquisition.
-- **Laser AF** — the reflection/laser autofocus button (only present on rigs with the
-  laser‑focus camera). Its label shows the current mode: *Laser AF: Off*, *Every FOV*,
-  or *Fast (N=…)*. Click it to open the laser‑AF settings dialog.
+- **Laser AF** — the reflection/laser autofocus button in the **Focus** group (only
+  present on rigs with the laser‑focus camera). Its label shows the current mode: *Off*,
+  *Every FOV*, or *Fast (N=…)*. Click it to open the laser‑AF settings dialog.
 - **Use Focus Map** — fits a focus surface from a set of measured points (configured in
   the **Focus Map** tab) and follows it during the scan. When checked, the surface is
   fitted at Start; if the fit fails the acquisition will not begin.
@@ -314,6 +316,7 @@ Z the acquisition fell back to). Use it to audit focus drift and AF reliability 
   | **MULTI_PAGE_TIFF** | One multi‑page TIFF per FOV (pages = Z × channel × time). |
   | **OME_TIFF** | OME‑TIFF stacks (TZCYX) with embedded XML metadata; opens in ImageJ/FIJI. |
   | **ZARR_V3** | OME‑NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines. |
+  | **Don't save (dry run)** | Run the acquisition and write no image files — for timing, illumination and stage‑path checks. Also bypasses the disk‑space check. |
 
 - **Size estimate** — to the right of **Save format**, a live `N images · ~size` readout
   updates as you change settings (regions, Nz, Nt, channels/cycles, save format). It
@@ -321,12 +324,12 @@ Z the acquisition fell back to). Use it to audit focus drift and AF reliability 
   see [acquisition-cycles.md](../acquisition-cycles.md)) and the chosen format: TIFF
   formats are estimated uncompressed, while **ZARR_V3** is shown with a `≈` and reflects
   the selected compression preset plus pyramid overhead (the real size is data‑dependent
-  and usually smaller). It reads *Saving disabled* when **Skip Saving** is checked.
+  and usually smaller). It reads *Saving disabled* when the format is
+  **Don't save (dry run)**.
 - **Stream to network** (ZARR_V3 only) — appears when the format is ZARR_V3. Streams the
   zarr output to a mounted network share as the run proceeds, sha256‑verifies each
   timepoint on the remote, and optionally deletes local copies (**Delete after verify**)
   to reclaim disk space. See [zarr-network-streaming.md](zarr-network-streaming.md).
-- **Skip Saving** — acquire without writing files (also bypasses the disk‑space check).
 - **Snake scan** — alternate the tile direction each row (boustrophedon) to minimize
   stage travel. When off, every row starts from the same side.
 - **Keep illuminators on between captures** — leaves the light source on between frames
@@ -341,14 +344,16 @@ Z the acquisition fell back to). Use it to audit focus drift and AF reliability 
 
 ### Step 10 — Run it
 
-- **Snap Images** captures a single FOV at the current position using the checked
-  channels (no Z‑stack, no time‑lapse, no autofocus) — handy for a quick test shot.
+- **Acquire Current FOV** captures a single FOV at the current stage position using the
+  checked channels and the chosen **Save format** (no Z‑stack, no time‑lapse, no
+  autofocus) — handy for a quick test shot. It does not add a position; the dataset
+  folder is named `snap_<Experiment ID>_<timestamp>`.
 - **Start Acquisition** begins the full run. The button toggles to **Stop Acquisition**
   while running; click it again to abort. During the run, every other control is
   disabled and the **progress bar**, region counter, and **ETA** appear at the bottom.
 
 On Start the software validates the saving path, checks available disk space (unless
-*Skip Saving*) and RAM, and — if *Use Focus Map* is on — fits the focus surface. If any
+the save format is *Don't save*) and RAM, and — if *Use Focus Map* is on — fits the focus surface. If any
 check fails it shows a dialog and the run does not start.
 
 ---
@@ -526,7 +531,7 @@ channel configuration.
   starting.
 - **Acquisition won't start after a disk/RAM warning.** The run is blocked when there
   isn't enough disk space or memory; free space, reduce the run size, or (for disk only)
-  enable *Skip Saving* if you don't need the files.
+  choose the *Don't save (dry run)* save format if you don't need the files.
 - **"Failed to fit focus surface."** *Use Focus Map* is on but the surface fit failed —
   add/adjust focus points in the **Focus Map** tab, or uncheck *Use Focus Map*.
 - **Per‑Point Channels is greyed out / warns you.** It needs at least one checked

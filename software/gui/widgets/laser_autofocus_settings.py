@@ -215,14 +215,16 @@ class LaserAutofocusButton(QPushButton):
         self._refresh_label()
 
     def _refresh_label(self):
+        # The caller puts a "Laser AF" label beside the button, so the text is just
+        # the current state — repeating the name here read as "Laser AF Laser AF: Off".
         if not self._checked_state:
-            self.setText("Laser AF: Off ▸")  # ▸
+            self.setText("Off ▸")  # ▸
             return
         n = int(getattr(self._mpc, "laser_af_refresh_every_n_fovs", 10))
         if n <= 1:
-            self.setText("Laser AF: Every FOV ▸")
+            self.setText("Every FOV ▸")
         else:
-            self.setText(f"Laser AF: Fast (N={n}) ▸")
+            self.setText(f"Fast (N={n}) ▸")
 
     def _open_dialog(self):
         # Push the button's local enable state to the controller before showing

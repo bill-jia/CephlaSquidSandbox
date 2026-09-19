@@ -13,6 +13,7 @@ class AcquisitionYAMLData:
 
     widget_type: str  # "wellplate" or "flexible"
     xy_mode: str = "Select Wells"
+    skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
 
     # Objective info
     objective_name: Optional[str] = None
@@ -111,6 +112,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
     return AcquisitionYAMLData(
         widget_type=widget_type,
         xy_mode=acq.get("xy_mode", "Select Wells"),
+        skip_saving=bool(acq.get("skip_saving", False)),
         # Objective info
         objective_name=obj.get("name"),
         objective_magnification=obj.get("magnification"),
