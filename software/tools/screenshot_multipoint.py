@@ -24,6 +24,7 @@ Qt lays the widgets out.
 import argparse
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -117,6 +118,14 @@ def _grab(app, widget, path, width):
     print("saved", path)
 
 
+_T0 = time.monotonic()
+
+
+def _phase(msg: str) -> None:
+    """Flushed wall-clock trace so a slow run shows *where* it is slow."""
+    print(f"[shot +{time.monotonic() - _T0:7.1f}s] {msg}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("out_dir")
@@ -165,6 +174,7 @@ def main():
     app = QApplication(["Squid"])
     app.setStyle("Fusion")
 
+    _phase("importing microscope + gui modules")
     import control.microscope
     import gui.gui_hcs as gui
     import gui.widgets.multipoint as multipoint_widgets
@@ -174,9 +184,11 @@ def main():
     # run must not leave the user's real panel state behind.
     multipoint_widgets.WellplateMultiPointWidget.save_multipoint_widget_config_to_cache = lambda self, *a, **k: None
 
+    _phase("building simulated microscope")
     microscope = control.microscope.Microscope.build_from_global_config(
         True, skip_init=False, skip_homing=True, profile_name=args.profile
     )
+    _phase("constructing GUI")
     win = gui.HighContentScreeningGui(microscope=microscope, is_simulation=True, skip_homing=True)
     win.resize(1600, 1000)
     win.show()
@@ -221,14 +233,31 @@ def main():
     # nobody to click, and past it _cleanup_common caches the *simulated* stage
     # position to the file the real GUI restores the stage from at startup.
     # Hide the window and tear the simulated hardware down directly instead.
+    _phase("grabs done; hiding window")
     win.hide()
     app.processEvents()
+    _phase("microscope.close() starting")
     try:
         microscope.close()
     except Exception as e:
         print("microscope.close():", e)
     # Hard exit: the simulated GUI leaves worker threads/processes that would
     # otherwise keep the interpreter alive. Flush first or the prints are lost.
+    # The GUI spawns worker subprocesses (JobRunner, memory profiler) that
+    # inherit our stdout/stderr. os._exit() would orphan them, and anything
+    # capturing our output (conda run, an agent's shell) then blocks until the
+    # orphans notice the parent is gone -- minutes, on a 30 s script. Kill the
+    # whole tree first so the pipe closes with us.
+    import psutil
+
+    children = psutil.Process().children(recursive=True)
+    for child in children:
+        try:
+            child.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(children, timeout=5)
+    _phase(f"killed {len(children)} child process(es); os._exit(0)")
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
