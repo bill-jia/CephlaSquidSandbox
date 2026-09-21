@@ -336,10 +336,32 @@ group.
   correctly` in `tests/control/test_observation_state_and_metadata.py`; the
   pre-existing `test_config_repository_acquisition_cycle_io` cycle test, which
   had asserted the buggy sanitized-name behavior, was corrected to assert the
-  fixed behavior. Known follow-up (not fixed here, out of scope — touches
-  `job_processing.py`/`multi_point_worker.py`): saved TIFF/zarr filenames derive
-  their channel label from `observation_state.name`; a preset name with spaces
-  will now flow verbatim into on-disk image filenames where previously it never
-  could (every real preset name was space-free). Worth a follow-up sanitization
-  pass at the filename-building call sites if that turns out to matter in
-  practice.
+  fixed behavior.
+
+  Follow-up FIXED (spaces in filenames): the above left saved TIFF/zarr/OME-TIFF
+  filenames deriving their channel label straight from `observation_state.name`,
+  so a preset name with spaces would now flow verbatim into on-disk image
+  filenames where previously it never could. `job_processing.py` now runs every
+  label that becomes part of a **filename or directory name** through a new
+  `_filename_label()` helper (maps whitespace to `_`, strips path separators;
+  written locally rather than reusing `sanitize_preset_filename` because
+  `ObservationState.name` has no character restriction and that stricter
+  validator raises on e.g. `.`/`,`/`/`) — used at `SaveImageJob`'s TIFF-basename
+  disambiguation, and at `PostprocessJob`'s derived-output `array_key`/postprocess
+  TIFF filename/zarr-upload-barrier path (three call sites that all previously
+  used the same unsanitized `out_key`). A new `_FilenameLabelDeduper` (process-
+  local, mirroring the file's existing `_region_files`/`_well_accumulators`
+  ClassVar pattern) prevents two differently-named channels that sanitize to the
+  same label (e.g. "A B" and "A_B", both -> "A_B") from silently overwriting
+  each other's files. Metadata (zarr/OME channel names, the acquisition-times
+  CSV "channel" column, `record_frame_time`'s `channel_name`, the OME-TIFF
+  sidecar, `PostprocessJob`'s live-preview `display_images` keys) is
+  deliberately left unsanitized — those carry the display name. The
+  MULTI_PAGE_TIFF branch's channel label was checked and needs no change: its
+  filename is `{region}_{fov}_stack.tiff` (channel-free); the label only feeds
+  the JSON description and TIFF `PageName` tag, both metadata. New tests in
+  `tests/control/test_observation_state_and_metadata.py`:
+  `test_save_image_job_sanitizes_display_name_for_tiff_basename`,
+  `test_save_image_job_dedupes_names_colliding_after_sanitizing`,
+  `test_zarr_frame_time_and_channel_names_keep_display_name`,
+  `test_postprocess_derived_capture_info_sanitizes_array_key_only`.
