@@ -577,6 +577,10 @@ def test_set_well_coordinates_grid_tiles_each_well_as_nx_by_ny():
     The grid is the Flexible panel's lattice applied to a well centre, so the step is
     FOV * (1 - overlap) on each axis and the FOV count is exactly nx * ny — independent
     of the well size, which is what distinguishes it from the fraction-of-well method.
+
+    Unlike the Flexible panel's own lattice, the well-grid FOVs carry no baked-in Z: the
+    worker never moves Z per FOV in this path, so a refocus after selecting wells is not
+    silently overridden the next time a well is visited (F1).
     """
     adds = []
     sc = _make_wellplate_scan_coordinates([(0, 0), (0, 1)], fov_w_mm=1.0, fov_h_mm=1.0, update_callback=adds.append)
@@ -590,6 +594,7 @@ def test_set_well_coordinates_grid_tiles_each_well_as_nx_by_ny():
     for well_id, (cx, cy) in (("A1", (10.0, 10.0)), ("A2", (19.0, 10.0))):
         coords = sc.region_fov_coordinates[well_id]
         assert len(coords) == 6, "nx * ny FOVs"
+        assert all(len(c) == 2 for c in coords), "grid FOVs carry no baked-in Z"
         xs = sorted({round(c[0], 9) for c in coords})
         ys = sorted({round(c[1], 9) for c in coords})
         assert len(xs) == 2 and len(ys) == 3
@@ -597,11 +602,11 @@ def test_set_well_coordinates_grid_tiles_each_well_as_nx_by_ny():
         assert ys[1] - ys[0] == pytest.approx(0.9)
         assert sum(xs) / len(xs) == pytest.approx(cx), "grid centred on the well centre"
         assert sum(ys) / len(ys) == pytest.approx(cy)
-        assert all(c[2] == pytest.approx(1.25) for c in coords), "Z comes from the live stage"
-        assert sc.region_centers[well_id] == [cx, cy, 1.25]
+        assert sc.region_centers[well_id] == [cx, cy], "region center has no Z either"
         # Recorded as a grid, so acquisition-time re-tiling replays it as a grid.
         params = sc.region_generation_params[well_id]
         assert params["kind"] == "flexible"
+        assert params["center_z"] is None
         assert (params["Nx"], params["Ny"], params["overlap_percent"]) == (2, 3, 10)
         # Focus-map point generation asks for the region shape; it must not KeyError.
         assert sc.get_region_shape(well_id) == "Square"
@@ -614,22 +619,21 @@ def test_set_well_coordinates_grid_1x1_is_exactly_the_well_center():
 
     sc.set_well_coordinates_grid(1, 1, 10)
 
-    assert sc.region_fov_coordinates == {"A1": [(10.0, 10.0, 2.0)]}
+    assert sc.region_fov_coordinates == {"A1": [(10.0, 10.0)]}
 
 
-def test_set_well_coordinates_grid_drops_deselected_wells():
-    """Same incremental well iteration as the fraction method: deselecting removes."""
+def test_set_well_coordinates_grid_empty_selection_clears():
+    """An empty selection clears every region, since there is nothing left to iterate.
+
+    Deselecting one of several selected wells is no longer diffed here — the GUI's own
+    ``_tile_wells`` always calls ``clear_regions()`` before re-tiling (F11), so a stale
+    region from a deselected well is the caller's responsibility to have cleared, not
+    something ``set_well_coordinates_grid`` itself needs to detect.
+    """
     updates = []
     sc = _make_wellplate_scan_coordinates([(0, 0), (0, 1)], update_callback=updates.append)
     sc.set_well_coordinates_grid(2, 2, 0)
     assert list(sc.region_centers.keys()) == ["A1", "A2"]
-
-    sc.well_selector.cells = [(0, 0)]
-    sc.set_well_coordinates_grid(2, 2, 0)
-
-    assert list(sc.region_centers.keys()) == ["A1"]
-    assert "A2" not in sc.region_generation_params
-    assert any(isinstance(u, RemovedScanCoordinateRegion) for u in updates), "overlay told to un-draw A2"
 
     sc.well_selector.cells = []
     sc.set_well_coordinates_grid(2, 2, 0)
@@ -646,7 +650,7 @@ def test_set_well_coordinates_grid_on_glass_slide_follows_the_stage():
     sc.set_well_coordinates_grid(2, 2, 0)
 
     assert list(sc.region_centers.keys()) == ["current"]
-    assert sc.region_centers["current"] == [30.0, 31.0, 0.4]
+    assert sc.region_centers["current"] == [30.0, 31.0], "no Z baked in for the grid path"
     assert len(sc.region_fov_coordinates["current"]) == 4
 
 
@@ -687,11 +691,12 @@ def test_regenerate_for_fov_keeps_grid_wells_as_grids():
     for well_id, cx in (("A1", 10.0), ("A2", 19.0)):
         coords = sc.region_fov_coordinates[well_id]
         assert len(coords) == 6, "grid FOV count is fixed by nx * ny"
+        assert all(len(c) == 2 for c in coords), "grid FOVs still carry no baked-in Z after a regen"
         xs = sorted({round(c[0], 9) for c in coords})
         assert xs[1] - xs[0] == pytest.approx(0.5), "step follows the acquisition FOV"
         assert sum(xs) / len(xs) == pytest.approx(cx), "still centred on the well"
-        assert all(c[2] == pytest.approx(0.75) for c in coords), "region Z preserved"
         assert sc.region_generation_params[well_id]["kind"] == "flexible"
+        assert sc.region_generation_params[well_id]["center_z"] is None
     assert sc._fov_override_mm is None
 
 

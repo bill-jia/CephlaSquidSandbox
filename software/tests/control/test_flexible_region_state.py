@@ -25,7 +25,7 @@ from qtpy.QtWidgets import (
 import control._def
 from control.core.multi_point_utils import ScanPositionInformation
 from control.core.scan_coordinates import ScanCoordinates
-from gui.widgets.multipoint import FlexibleMultiPointWidget
+from gui.widgets.multipoint import FlexibleMultiPointWidget, _push_tiling_grid_to_controller
 
 
 class _RegionHarness:
@@ -481,16 +481,41 @@ def test_checked_zstack_pushes_the_spinbox_value(z_time):
     assert z_time.entry_NZ.isEnabled()
 
 
-def test_unchecking_zstack_leaves_set_z_range(z_time):
-    """Set Z-range with the group off would strand the Z-min/Z-max rows on screen."""
+def test_unchecking_zstack_greys_but_does_not_uncheck_set_z_range(z_time):
+    """Disabling the Z-stack group must only grey "Set Z-range", never uncheck it -
+    unchecking fires toggle_z_range_controls, which overwrites entry_minZ/entry_maxZ
+    with the current stage Z and collapses entry_NZ to 1 (F7)."""
     z_time.checkbox_zstack.setChecked(True)
     z_time.checkbox_set_z_range.setChecked(True)
 
     z_time.checkbox_zstack.setChecked(False)
     z_time._apply_zstack_enabled()
 
-    assert not z_time.checkbox_set_z_range.isChecked()
+    assert z_time.checkbox_set_z_range.isChecked()
     assert not z_time.checkbox_set_z_range.isEnabled()
+
+
+def test_disabling_and_reenabling_zstack_preserves_set_z_range_state(z_time):
+    """What the user typed stays on screen (the mixin's own docstring contract):
+    enabling the group, turning on Set Z-range, and typing a min/max survives a
+    disable/re-enable of the whole group untouched (F7)."""
+    z_time.checkbox_zstack.setChecked(True)
+    z_time.checkbox_set_z_range.setChecked(True)
+    z_time.entry_minZ.setValue(900.0)
+    z_time.entry_maxZ.setValue(1100.0)
+    z_time.entry_NZ.setValue(11)
+    z_time._apply_zstack_enabled()
+
+    z_time.checkbox_zstack.setChecked(False)
+    z_time._apply_zstack_enabled()
+
+    z_time.checkbox_zstack.setChecked(True)
+    z_time._apply_zstack_enabled()
+
+    assert z_time.checkbox_set_z_range.isChecked()
+    assert z_time.entry_minZ.value() == pytest.approx(900.0)
+    assert z_time.entry_maxZ.value() == pytest.approx(1100.0)
+    assert z_time.entry_NZ.value() == 11
 
 
 def test_set_z_range_keeps_nz_derived_when_the_group_is_on(z_time):
@@ -549,3 +574,24 @@ def test_compute_z_range_with_set_z_range_uses_the_entries(z_time):
 
     assert minZ == pytest.approx(0.900, abs=1e-9)
     assert maxZ == pytest.approx(1.100, abs=1e-9)
+
+
+def test_push_tiling_grid_to_controller_pushes_the_current_spinbox_values(qtbot):
+    """F10: FlexibleMultiPointWidget.toggle_acquisition must re-push NX/NY at Start, or
+    a Flexible run after a Wellplate one (which sets the shared controller to 1x1 for a
+    fraction-of-well run) records a stale nx: 1, ny: 1 in acquisition.yaml."""
+    entry_NX = QSpinBox()
+    entry_NX.setMaximum(50)
+    entry_NX.setValue(4)
+    entry_NY = QSpinBox()
+    entry_NY.setMaximum(50)
+    entry_NY.setValue(7)
+    qtbot.addWidget(entry_NX)
+    qtbot.addWidget(entry_NY)
+
+    widget = SimpleNamespace(entry_NX=entry_NX, entry_NY=entry_NY, multipointController=MagicMock())
+
+    _push_tiling_grid_to_controller(widget)
+
+    widget.multipointController.set_NX.assert_called_once_with(4)
+    widget.multipointController.set_NY.assert_called_once_with(7)

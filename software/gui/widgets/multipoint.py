@@ -1752,6 +1752,19 @@ def _is_dry_run(combo: "QComboBox") -> bool:
     return combo.currentText() == DRY_RUN_SAVE_FORMAT
 
 
+def _push_tiling_grid_to_controller(widget) -> None:
+    """Push the panel's Nx/Ny spinboxes into the shared controller.
+
+    NX/NY are metadata recorded in ``acquisition.yaml`` (the regions are already
+    tiled by the time a run starts); both ``entry_NX``/``entry_NY`` exist regardless
+    of the panel's tiling mode. One controller is shared by both multipoint tabs, so
+    without re-pushing at Start, a Flexible run after a Wellplate one (which sets NX/NY
+    to 1x1 for a fraction-of-well run) would record a stale ``nx: 1, ny: 1`` (F10).
+    """
+    widget.multipointController.set_NX(widget.entry_NX.value())
+    widget.multipointController.set_NY(widget.entry_NY.value())
+
+
 def _push_save_format_to_controller(widget) -> None:
     """Push the save-format combo's selection into the controller.
 
@@ -1805,6 +1818,25 @@ def _apply_retract_z_from_yaml(widget, yaml_data) -> None:
     """
     if yaml_data.retract_z_between_regions is not None:
         widget.checkbox_retractZBetweenRegions.setChecked(yaml_data.retract_z_between_regions)
+
+
+def _apply_tiling_method_from_yaml(widget, yaml_data) -> None:
+    """Restore the Wellplate tab's tiling-method radio from a dropped ``acquisition.yaml``.
+
+    ``tiling_method`` is optional: a file written before it existed (or a fraction-of-well
+    run, whose shared NX/NY spinboxes may hold stale grid values from an earlier Nx x Ny
+    session — F6) leaves the radio wherever it already is instead of guessing "grid" from
+    ``nx*ny > 1``. NX/NY are only pushed into the spinboxes when the method that ends up
+    selected — from the tag, or from what was already selected — is actually Nx x Ny.
+    """
+    if yaml_data.tiling_method == "grid":
+        widget.radio_tiling_grid.setChecked(True)
+    elif yaml_data.tiling_method == "fraction":
+        widget.radio_tiling_fraction.setChecked(True)
+
+    if widget.radio_tiling_grid.isChecked():
+        widget.entry_NX.setValue(yaml_data.nx)
+        widget.entry_NY.setValue(yaml_data.ny)
 
 
 def _make_section(title: str, header_extra=None) -> "tuple[QVBoxLayout, QVBoxLayout]":
@@ -1997,10 +2029,14 @@ class _ZTimeGroupMixin:
 
     def _apply_zstack_enabled(self) -> None:
         enabled = self._zstack_checkbox.isChecked()
-        # Leaving "Set Z-range" on with the group off would strand the Z-min/Z-max
-        # rows on screen, so drop out of that mode first — its toggle hides them.
-        if not enabled and self.checkbox_set_z_range.isChecked():
-            self.checkbox_set_z_range.setChecked(False)
+        # Disabling the group only greys its controls (including "Set Z-range" and the
+        # Z-min/Z-max rows, via _zstack_controls below) - it must not uncheck "Set
+        # Z-range" itself. That checkbox's own toggled signal drives
+        # toggle_z_range_controls, which overwrites entry_minZ/entry_maxZ with the
+        # current stage Z and collapses entry_NZ to 1; forcing it off here silently
+        # destroyed whatever Z-range the user had typed, contradicting this mixin's own
+        # "what the user typed stays on screen" contract (F7). Re-enabling the group
+        # leaves "Set Z-range" exactly as the user left it.
         for widget in self._zstack_controls:
             widget.setEnabled(enabled)
         if enabled and self.checkbox_set_z_range.isChecked():
@@ -4270,6 +4306,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("flexible")
+            _push_tiling_grid_to_controller(self)
             self._push_channel_selection_to_controller()
             # Re-push THIS tab's visible save-format + streaming state. The
             # flexible and wellplate tabs each have their own combo/row bound
@@ -6805,6 +6842,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             grid_tiling = self.radio_tiling_grid.isChecked()
             self.multipointController.set_NX(self.entry_NX.value() if grid_tiling else 1)
             self.multipointController.set_NY(self.entry_NY.value() if grid_tiling else 1)
+            self.multipointController.set_tiling_method("grid" if grid_tiling else "fraction")
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self._push_channel_selection_to_controller()
             # Re-push THIS tab's visible save-format + streaming state (the
@@ -7375,13 +7413,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 if index >= 0:
                     self.combobox_shape.setCurrentIndex(index)
 
-            # Tiling method: a file that names a real grid asks for Nx x Ny. A 1x1
-            # grid is what the writer emits for a fraction-of-well run too, so it
-            # says nothing and the current method is kept.
-            if yaml_data.nx * yaml_data.ny > 1:
-                self.radio_tiling_grid.setChecked(True)
-                self.entry_NX.setValue(yaml_data.nx)
-                self.entry_NY.setValue(yaml_data.ny)
+            # Tiling method (F6): see _apply_tiling_method_from_yaml.
+            _apply_tiling_method_from_yaml(self, yaml_data)
 
             # Channels
             if yaml_data.channel_names:

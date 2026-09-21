@@ -105,6 +105,32 @@ wellplate_scan:
 
         assert (result.nx, result.ny) == (2, 3)
         assert result.overlap_percent == 20.0
+        # No tiling_method tag: a legacy file predating F6, or one written by a fraction
+        # run whose shared NX/NY spinboxes happened to hold stale grid values. The drop
+        # handler must not infer "grid" from nx*ny alone here.
+        assert result.tiling_method is None
+
+    def test_parse_wellplate_yaml_tiling_method_round_trips(self, tmp_path):
+        """The writer's explicit tiling_method tag (F6) survives a round trip, distinct
+        from guessing the method from nx*ny."""
+        yaml_file = tmp_path / "wellplate_tiling_method.yaml"
+        yaml_file.write_text(
+            """
+acquisition:
+  widget_type: wellplate
+wellplate_scan:
+  scan_size_mm: 2.1
+  overlap_percent: 20.0
+  tiling_method: grid
+  nx: 2
+  ny: 3
+"""
+        )
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert result.tiling_method == "grid"
+        assert (result.nx, result.ny) == (2, 3)
 
     def test_parse_flexible_yaml(self, tmp_path):
         """Test parsing a flexible acquisition YAML file."""
@@ -512,6 +538,7 @@ class TestAcquisitionYAMLDataclass:
         assert data.ny == 1
         assert data.delta_x_mm == 0.9
         assert data.delta_y_mm == 0.9
+        assert data.tiling_method is None
 
     def test_required_widget_type(self):
         """Test that widget_type is required."""

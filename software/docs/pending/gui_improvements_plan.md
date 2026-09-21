@@ -262,3 +262,20 @@ group.
   so is `self.grid_acquisition` (now the body row itself), which `TemplateMultiPointWidget`
   still inserts between its template row and the progress row. The progress bar stays
   full-width at the bottom.
+- FIXED (1): The Nx x Ny grid path baked the stage Z into every FOV (3-tuples), so the
+  worker drove Z back to that stale value at every well; `add_flexible_region` now takes
+  `center_z=None` for "no Z on the FOVs" and the well-grid path passes it.
+- FIXED (6): The Wellplate drop handler guessed the tiling method from `nx*ny > 1`, so a
+  pre-branch fraction-of-well `acquisition.yaml` with a stale shared NX/NY flipped the
+  radio to Nx x Ny; `wellplate_scan.tiling_method` is now written and read explicitly, and
+  the drop handler only switches methods when the tag is present.
+- FIXED (7): Disabling the `[x] Z-stack` group force-unchecked `checkbox_set_z_range`,
+  whose own toggle overwrote the user's Z-min/Z-max entries and collapsed Nz to 1;
+  `_apply_zstack_enabled` now only greys the group and leaves `Set Z-range` untouched.
+- FIXED (10): `FlexibleMultiPointWidget.toggle_acquisition` never re-pushed NX/NY, so a
+  Flexible run after a Wellplate one recorded a stale `nx: 1, ny: 1`; it now calls the new
+  `_push_tiling_grid_to_controller` helper alongside its other per-tab pushes.
+- FIXED (11): `ScanCoordinates._tile_selected_wells` still carried the add/remove diffing
+  from before the GUI's `_tile_wells` started clearing and rebuilding on every re-tile;
+  the dead deselection branch is gone, keeping only the glass-slide fallback and the
+  empty-selection clear.

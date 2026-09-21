@@ -52,6 +52,11 @@ class AcquisitionYAMLData:
     ny: int = 1
     delta_x_mm: float = 0.9
     delta_y_mm: float = 0.9
+    # Wellplate tiling method ("fraction" or "grid"); only wellplate_scan ever writes
+    # this. None means the file predates the field (or is a flexible_scan file), and
+    # the drop handler then leaves the radio button alone instead of guessing from
+    # nx*ny, which a pre-existing fraction-of-well file may carry stale values for.
+    tiling_method: Optional[str] = None
 
     # Flexible-specific
     flexible_positions: Optional[List[Dict]] = None  # [{name, center_mm}, ...]
@@ -150,6 +155,8 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         ny=scan.get("ny", 1),
         delta_x_mm=scan.get("delta_x_mm", 0.9),
         delta_y_mm=scan.get("delta_y_mm", 0.9),
+        # Only wellplate_scan ever writes this (flexible has no tiling-method choice).
+        tiling_method=wellplate_scan.get("tiling_method"),
         # Flexible-specific
         flexible_positions=flexible_scan.get("positions"),
     )
