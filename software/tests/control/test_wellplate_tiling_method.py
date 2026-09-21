@@ -8,6 +8,7 @@ widget's own methods against a harness that carries exactly the controls they re
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -214,3 +215,56 @@ def test_tiling_method_and_grid_size_round_trip_through_the_cache(tiling, tmp_pa
     assert tiling.radio_tiling_grid.isChecked() == method_is_grid
     assert (tiling.entry_NX.value(), tiling.entry_NY.value()) == (4, 7)
     assert tiling.entry_overlap.value() == 12.5
+
+
+class _ZRangeHarness:
+    """Just enough of WellplateMultiPointWidget to drive ``_compute_z_range``.
+
+    Both panels mix in ``_ZTimeGroupMixin`` for this shared helper - see the
+    equivalent harness in test_flexible_region_state.py.
+    """
+
+    _compute_z_range = WellplateMultiPointWidget._compute_z_range
+
+    def __init__(self):
+        self.stage = MagicMock()
+        self.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=1.000)
+
+        self.checkbox_set_z_range = QCheckBox("Set Z-range")
+        self.entry_deltaZ = QDoubleSpinBox()
+        self.entry_deltaZ.setRange(-100000, 100000)
+        self.entry_minZ = QDoubleSpinBox()
+        self.entry_minZ.setRange(-100000, 100000)
+        self.entry_maxZ = QDoubleSpinBox()
+        self.entry_maxZ.setRange(-100000, 100000)
+
+
+@pytest.fixture
+def z_range(qtbot):
+    h = _ZRangeHarness()
+    qtbot.addWidget(h.checkbox_set_z_range)
+    return h
+
+
+def test_z_range_without_set_z_range_stays_in_millimeters(z_range):
+    """Regression: entry_deltaZ is in um (spinbox suffix), stage z is in mm - the
+    step must be converted before being added, or the span comes out ~1000x too
+    large (e.g. 1.000 -> 9.000 mm instead of 1.000 -> 1.008 mm)."""
+    z_range.checkbox_set_z_range.setChecked(False)
+    z_range.entry_deltaZ.setValue(2.0)  # um
+
+    minZ, maxZ = z_range._compute_z_range(effective_NZ=5)
+
+    assert minZ == pytest.approx(1.000, abs=1e-9)
+    assert maxZ == pytest.approx(1.008, abs=1e-9)
+
+
+def test_z_range_with_set_z_range_uses_the_entries(z_range):
+    z_range.checkbox_set_z_range.setChecked(True)
+    z_range.entry_minZ.setValue(900.0)  # um
+    z_range.entry_maxZ.setValue(1100.0)  # um
+
+    minZ, maxZ = z_range._compute_z_range(effective_NZ=5)
+
+    assert minZ == pytest.approx(0.900, abs=1e-9)
+    assert maxZ == pytest.approx(1.100, abs=1e-9)

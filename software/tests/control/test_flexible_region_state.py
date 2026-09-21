@@ -418,11 +418,14 @@ class _ZTimeHarness:
     _apply_timelapse_enabled = FlexibleMultiPointWidget._apply_timelapse_enabled
     _effective_NZ = FlexibleMultiPointWidget._effective_NZ
     _effective_Nt = FlexibleMultiPointWidget._effective_Nt
+    _compute_z_range = FlexibleMultiPointWidget._compute_z_range
     _zstack_checkbox = FlexibleMultiPointWidget._zstack_checkbox
     _timelapse_checkbox = FlexibleMultiPointWidget._timelapse_checkbox
 
     def __init__(self):
         self.multipointController = MagicMock()
+        self.stage = MagicMock()
+        self.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.0)
 
         self.checkbox_zstack = QCheckBox("Z-stack")
         self.checkbox_timelapse = QCheckBox("Time-lapse")
@@ -437,6 +440,11 @@ class _ZTimeHarness:
 
         self.entry_deltaZ = QDoubleSpinBox()
         self.entry_dt = QDoubleSpinBox()
+
+        self.entry_minZ = QDoubleSpinBox()
+        self.entry_minZ.setRange(-100000, 100000)
+        self.entry_maxZ = QDoubleSpinBox()
+        self.entry_maxZ.setRange(-100000, 100000)
 
         self._zstack_controls = [self.entry_NZ, self.entry_deltaZ, self.checkbox_set_z_range]
         self._timelapse_controls = [self.entry_Nt, self.entry_dt]
@@ -516,3 +524,28 @@ def test_checked_timelapse_pushes_the_spinbox_value(z_time):
     assert z_time._effective_Nt() == 7
     z_time.multipointController.set_Nt.assert_called_with(7)
     assert z_time.entry_dt.isEnabled()
+
+
+def test_compute_z_range_without_set_z_range_stays_in_millimeters(z_time):
+    """entry_deltaZ is in um; the span must be converted to mm before being added
+    to the stage's mm position, or it comes out ~1000x too large."""
+    z_time.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=1.000)
+    z_time.checkbox_set_z_range.setChecked(False)
+    z_time.entry_deltaZ.setValue(2.0)  # um
+
+    minZ, maxZ = z_time._compute_z_range(effective_NZ=5)
+
+    assert minZ == pytest.approx(1.000, abs=1e-9)
+    assert maxZ == pytest.approx(1.008, abs=1e-9)
+
+
+def test_compute_z_range_with_set_z_range_uses_the_entries(z_time):
+    z_time.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=1.000)
+    z_time.checkbox_set_z_range.setChecked(True)
+    z_time.entry_minZ.setValue(900.0)  # um
+    z_time.entry_maxZ.setValue(1100.0)  # um
+
+    minZ, maxZ = z_time._compute_z_range(effective_NZ=5)
+
+    assert minZ == pytest.approx(0.900, abs=1e-9)
+    assert maxZ == pytest.approx(1.100, abs=1e-9)

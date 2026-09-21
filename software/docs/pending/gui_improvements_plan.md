@@ -238,9 +238,12 @@ group.
   regions, whose bounding box is exact), so `_add_well_grid_region`'s hand-set shape was
   removed as redundant. See `test_scan_coordinates.py`'s
   `test_region_contains_coordinate_for_*` tests.
-- The wellplate tab's non-range Z span is `z + dz * (Nz - 1)` where `z` is in mm and
-  `dz` in µm (`entry_deltaZ` has a µm suffix); the Flexible tab divides `dz` by 1000
-  in the same expression. Check and fix in a separate commit if it really is wrong.
+- FIXED: The wellplate tab's non-range Z span was `z + dz * (Nz - 1)` where `z` is in
+  mm and `dz` in µm (`entry_deltaZ` has a µm suffix), giving a span ~1000x too large;
+  the Flexible tab already divided `dz` by 1000 in the same expression. Both
+  `toggle_acquisition` methods now share one `_ZTimeGroupMixin._compute_z_range`
+  helper so the two panels cannot diverge again. See
+  `test_wellplate_tiling_method.py` / `test_flexible_region_state.py`.
 - Channels box placement: **DONE.** The channel list was a full-width box under both
   columns; it is now the top of a right-hand *group* that mirrors the left box, built for
   both tabs by one helper, `_make_acquisition_body(widget, focus_section, saving_section,

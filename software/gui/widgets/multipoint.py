@@ -2026,6 +2026,22 @@ class _ZTimeGroupMixin:
         """Timepoints this run will actually acquire (1 with Time-lapse off)."""
         return self.entry_Nt.value() if self._timelapse_checkbox.isChecked() else 1
 
+    def _compute_z_range(self, effective_NZ: int) -> tuple[float, float]:
+        """Z-stack span (min_mm, max_mm) to hand to ``set_z_range``, shared by both panels.
+
+        With "Set Z-range" checked, the Z-min/Z-max entries (um) are used directly.
+        Otherwise the span starts at the current stage position and grows by
+        ``entry_deltaZ`` (um) per plane -- both are converted to mm before being
+        combined with the stage's mm position, so the two modes agree on units.
+        """
+        if self.checkbox_set_z_range.isChecked():
+            minZ = self.entry_minZ.value() / 1000  # um -> mm
+            maxZ = self.entry_maxZ.value() / 1000  # um -> mm
+            return minZ, maxZ
+        z = self.stage.get_pos().z_mm
+        dz = self.entry_deltaZ.value()  # um
+        return z, z + dz / 1000 * (effective_NZ - 1)
+
 
 def _human_bytes(n: float) -> str:
     """Format a byte count as a short human-readable string (e.g. ``3.4 GB``)."""
@@ -4228,15 +4244,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             effective_NZ = self._effective_NZ()
             effective_Nt = self._effective_Nt()
 
-            if self.checkbox_set_z_range.isChecked():
-                # Set Z-range (convert from μm to mm)
-                minZ = self.entry_minZ.value() / 1000
-                maxZ = self.entry_maxZ.value() / 1000
-                self.multipointController.set_z_range(minZ, maxZ)
-            else:
-                z = self.stage.get_pos().z_mm
-                dz = self.entry_deltaZ.value()
-                self.multipointController.set_z_range(z, z + dz / 1000 * (effective_NZ - 1))
+            minZ, maxZ = self._compute_z_range(effective_NZ)
+            self.multipointController.set_z_range(minZ, maxZ)
 
             if self.checkbox_useFocusMap.isChecked():
                 self.focusMapWidget.fit_surface()
@@ -6756,16 +6765,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             effective_NZ = self._effective_NZ()
             effective_Nt = self._effective_Nt()
 
-            if self.checkbox_set_z_range.isChecked():
-                # Set Z-range (convert from μm to mm)
-                minZ = self.entry_minZ.value() / 1000  # Convert from μm to mm
-                maxZ = self.entry_maxZ.value() / 1000  # Convert from μm to mm
-                self.multipointController.set_z_range(minZ, maxZ)
-                self._log.debug(f"Set z-range: ({minZ}, {maxZ})")
-            else:
-                z = self.stage.get_pos().z_mm
-                dz = self.entry_deltaZ.value()
-                self.multipointController.set_z_range(z, z + dz * (effective_NZ - 1))
+            minZ, maxZ = self._compute_z_range(effective_NZ)
+            self.multipointController.set_z_range(minZ, maxZ)
+            self._log.debug(f"Set z-range: ({minZ}, {maxZ})")
 
             if self.checkbox_useFocusMap.isChecked():
                 # Try to fit the surface
