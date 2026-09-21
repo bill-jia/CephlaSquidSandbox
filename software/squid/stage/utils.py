@@ -283,3 +283,75 @@ def move_to_scanning_position(
 def move_z_axis_to_safety_position(stage: AbstractStage):
     safety_z_raw_mm = int(_def.Z_HOME_SAFETY_POINT) / 1000.0
     stage.move_z_to(stage.get_config().Z_AXIS.raw_to_canonical(safety_z_raw_mm))
+
+
+# An XY move shorter than this is not worth bracketing with a Z retract: the
+# objective would just go up and back down for no lateral benefit (e.g. a
+# single-position time-lapse re-visiting the same FOV every timepoint, or a
+# table click on the row the stage is already sitting on).
+RETRACT_MIN_XY_TRAVEL_MM = 0.005  # 5 um
+
+
+def move_xy_with_z_retract(
+    stage: AbstractStage,
+    x_mm: float,
+    y_mm: float,
+    *,
+    retract: bool,
+    z_target_mm: Optional[float],
+    home_z_mm: float,
+    xy_move: Optional[Callable[[], None]] = None,
+    log=None,
+) -> None:
+    """The one "retract Z to clear the sample, move XY, restore Z" bracket.
+
+    - No real XY travel (< ``RETRACT_MIN_XY_TRAVEL_MM`` on both axes): the XY
+      leg is skipped entirely (nothing to move) and, if ``z_target_mm`` is
+      given, this is just a plain ``move_z_to`` -- retracting first would only
+      rack the objective up and back down for no reason.
+    - Real travel and ``retract``: Z to ``home_z_mm`` (blocking), then the XY
+      leg, then Z down to ``z_target_mm`` (blocking) -- or back to whatever Z
+      the stage was at before the retract, when the caller has no target of
+      its own.
+    - Real travel and not ``retract``: exactly the XY leg, then a ``move_z_to``
+      to ``z_target_mm`` if one was given. Callers with their own non-retract
+      Z/XY ordering (e.g. issuing a non-blocking Z move before the XY move)
+      should not route that path through this helper -- see
+      ``MultiPointWorker.move_to_coordinate``.
+
+    ``xy_move``, when given, performs the XY leg in the caller's own
+    axis-order/blocking/sleep style instead of the default blocking
+    ``move_x_to`` + ``move_y_to`` pair.
+    """
+    pos = stage.get_pos()
+    has_xy_travel = (
+        abs(pos.x_mm - x_mm) >= RETRACT_MIN_XY_TRAVEL_MM or abs(pos.y_mm - y_mm) >= RETRACT_MIN_XY_TRAVEL_MM
+    )
+
+    def _do_xy_move():
+        if xy_move is not None:
+            xy_move()
+        else:
+            stage.move_x_to(x_mm)
+            stage.move_y_to(y_mm)
+
+    if not has_xy_travel:
+        if z_target_mm is not None:
+            stage.move_z_to(z_target_mm)
+        return
+
+    if not retract:
+        _do_xy_move()
+        if z_target_mm is not None:
+            stage.move_z_to(z_target_mm)
+        return
+
+    current_z_mm = pos.z_mm
+    target_z_mm = z_target_mm if z_target_mm is not None else current_z_mm
+    if log is not None:
+        log.debug(f"Retracting z to {home_z_mm} [mm] before the XY move")
+    stage.move_z_to(home_z_mm)
+    _do_xy_move()
+    if log is not None:
+        log.debug(f"Lowering z to target {target_z_mm} [mm] after the retracted XY move")
+    stage.move_z_to(target_z_mm)

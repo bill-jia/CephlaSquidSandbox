@@ -40,6 +40,7 @@ class _RegionHarness:
     _COL_NAME = FlexibleMultiPointWidget._COL_NAME
     _COL_COUNT = FlexibleMultiPointWidget._COL_COUNT
 
+    _GO_TO_POSITION_TOLERANCE_MM = FlexibleMultiPointWidget._GO_TO_POSITION_TOLERANCE_MM
     _position_cells = staticmethod(FlexibleMultiPointWidget._position_cells)
     _refresh_position_cells = FlexibleMultiPointWidget._refresh_position_cells
     _selected_row = FlexibleMultiPointWidget._selected_row
@@ -70,6 +71,9 @@ class _RegionHarness:
         self.multipointController = MagicMock()
         self.multipointController.acquisition_in_progress.return_value = False
         self.stage = MagicMock()
+        # Far from every listed position so "already there" (go_to's F8 guard)
+        # never fires by accident; tests that care about it set this per-case.
+        self.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.0)
 
         # The two stage-motion toggles, at their shipped defaults.
         self.checkbox_moveStageOnClick = QCheckBox("Move stage on click")
@@ -159,10 +163,17 @@ def test_clicking_a_row_with_move_on_click_off_only_selects(harness):
 
 def test_go_to_retracts_z_before_the_xy_move(harness):
     """With the retract on, Z goes up *first* and blocking - an XY move issued
-    alongside a Z move would sweep the objective across the sample at working height."""
+    alongside a Z move would sweep the objective across the sample at working height.
+
+    ``get_pos`` is called twice: once by ``go_to``'s "already there" guard (F8),
+    once by ``move_xy_with_z_retract``'s XY-travel guard (F3) -- both read from
+    the same fixed (0, 0, 0) mock, well clear of every listed position.
+    """
     harness.go_to(1)
 
     assert harness.stage.mock_calls == [
+        call.get_pos(),
+        call.get_pos(),
         call.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM),
         call.move_x_to(20.0),
         call.move_y_to(20.0),
@@ -176,10 +187,36 @@ def test_go_to_without_the_retract_moves_xy_then_z(harness):
     harness.go_to(1)
 
     assert harness.stage.mock_calls == [
+        call.get_pos(),
+        call.get_pos(),
         call.move_x_to(20.0),
         call.move_y_to(20.0),
         call.move_z_to(0.5),
     ]
+
+
+def test_go_to_the_current_position_only_selects(harness):
+    """F8: clicking a row the stage is already sitting on (within 1 um on every
+    axis) must not move anything -- this alone fixes the double-click-to-rename
+    excursion, since the second click of a double-click re-targets the row it
+    already selected."""
+    harness.stage.get_pos.return_value = SimpleNamespace(x_mm=20.0, y_mm=20.0, z_mm=0.5)
+
+    harness.go_to(1)
+
+    assert harness.stage.mock_calls == [call.get_pos()]
+    assert harness._selected_row() == 1
+
+
+def test_go_to_same_xy_different_z_is_a_plain_z_move(harness):
+    """With the retract on, a click that only changes Z (XY already at the
+    target) must not retract or re-issue the no-op XY moves -- the F3 guard
+    inside ``move_xy_with_z_retract`` reduces it to a single Z move."""
+    harness.stage.get_pos.return_value = SimpleNamespace(x_mm=20.0, y_mm=20.0, z_mm=9.0)
+
+    harness.go_to(1)
+
+    assert harness.stage.mock_calls == [call.get_pos(), call.get_pos(), call.move_z_to(0.5)]
 
 
 def test_next_wraps_around_the_selection(harness):

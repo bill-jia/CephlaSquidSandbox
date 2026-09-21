@@ -272,3 +272,21 @@ group.
   so is `self.grid_acquisition` (now the body row itself), which `TemplateMultiPointWidget`
   still inserts between its template row and the progress row. The progress bar stays
   full-width at the bottom.
+- FIXED (retract-Z-for-XY-moves review, item 3): the retract bracket fired on
+  zero-travel moves (single-position time-lapse, repeated "Acquire Current FOV")
+  even though the stage never left the target XY; `move_xy_with_z_retract` now
+  guards on real XY travel (`RETRACT_MIN_XY_TRAVEL_MM`, 5 um).
+- FIXED (retract-Z-for-XY-moves review, item 5): the bracket existed as three
+  hand-rolled copies; consolidated into one `move_xy_with_z_retract` helper in
+  `squid/stage/utils.py`, used by `MultiPointWorker.move_to_coordinate`,
+  `MultiPointController._move_back_to_start_position` and the AF-map return hop,
+  the laser-AF seed scan, `AutoFocusController.gen_focus_map`, and
+  `FlexibleMultiPointWidget._move_stage_to_position`.
+- FIXED (retract-Z-for-XY-moves review, item 4): `MultiPointWithFluidicsWidget`
+  gained the same "Retract Z ... for XY moves" checkbox as the other tabs
+  (default on), and `microscope_control_server._configure_controller_from_yaml`
+  now forwards a YAML's explicit `retract_z_between_regions` to the controller.
+- FIXED (retract-Z-for-XY-moves review, item 8): a table click within 1 um of
+  the stage's current XYZ only selects the row (fixes the double-click-to-rename
+  excursion); a same-XY, different-Z click is a plain Z move via the same
+  travel guard.

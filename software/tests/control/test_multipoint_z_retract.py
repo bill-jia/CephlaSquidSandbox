@@ -214,6 +214,87 @@ def test_x_dominant_travel_keeps_its_axis_order_under_the_retract():
     ]
 
 
+def test_zero_xy_travel_with_retract_on_skips_the_home_retract():
+    """A single-position time-lapse re-visits the same FOV every timepoint: with
+    the old hand-rolled bracket, ``fov == 0`` alone triggered a full Z excursion
+    every time even though the stage never left. ``move_xy_with_z_retract``'s
+    XY-travel guard (F3) skips the home retract (and the no-op XY calls) and
+    reduces this to a single Z move."""
+    stage = RecordingStage(x_mm=10.0, y_mm=20.0, z_mm=3.0)
+    worker = _worker(stage, retract=True)
+
+    worker.move_to_coordinate(R0_FOV0, "R0", 0)
+
+    assert stage.calls == [("move_z_to", 3.0, True)]
+    assert ("move_z_to", HOME_Z_MM, True) not in stage.calls
+
+
+def test_acquire_current_fov_twice_in_a_row_never_retracts():
+    """"Acquire Current FOV" calls move_to_coordinate with fov == 0 every time;
+    back-to-back calls to the same coordinate must not retract on the second one
+    either."""
+    stage = RecordingStage(x_mm=10.0, y_mm=20.0, z_mm=3.0)
+    worker = _worker(stage, retract=True)
+
+    worker.move_to_coordinate(R0_FOV0, "R0", 0)
+    stage.calls.clear()
+    worker.move_to_coordinate(R0_FOV0, "R0", 0)
+
+    assert ("move_z_to", HOME_Z_MM, True) not in stage.calls
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (f) Laser-AF seed scan: brackets region entries only
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _seed_xy(coord):
+    return [("move_x_to", coord[0], True), ("move_y_to", coord[1], True)]
+
+
+def _seed_worker(stage, *, retract):
+    from control import utils as control_utils
+
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker.stage = stage
+    worker._log = MagicMock()
+    worker._alignment_widget = None
+    worker.retract_z_between_regions = retract
+    worker._sleep = lambda seconds: None
+    worker._timing = control_utils.TimingManager("test seed scan")
+    worker.abort_requested_fn = lambda: False
+    worker.laser_auto_focus_controller = MagicMock()
+    worker.laser_auto_focus_controller.move_to_target.return_value = True
+    worker._resolve_region_laser_af_reference = lambda region_id: None
+    worker._fov_z_map = {}
+    worker._fov_z_delta_map = {}
+    worker._z_pos_proposal = {}
+    worker._region_anchor_z_current = {}
+    return worker
+
+
+def test_seed_scan_brackets_region_entries_and_not_intra_region_fovs():
+    stage = RecordingStage(x_mm=0.0, y_mm=0.0, z_mm=2.0)
+    worker = _seed_worker(stage, retract=True)
+    worker.scan_region_fov_coords_mm = {
+        "R0": [R0_FOV0[:2], R0_FOV1[:2]],
+        "R1": [R1_FOV0[:2]],
+    }
+
+    worker._seed_fov_z_map()
+
+    assert stage.calls == (
+        # R0 fov 0: region entry -> bracketed. No Z target of its own is known
+        # (the seed scan lets laser AF set Z after arriving), so the bracket
+        # restores the Z it left from.
+        [("move_z_to", HOME_Z_MM, True)] + _seed_xy(R0_FOV0[:2]) + [("move_z_to", 2.0, True)]
+        # R0 fov 1: same region -> no bracket.
+        + _seed_xy(R0_FOV1[:2])
+        # R1 fov 0: new region -> bracketed again.
+        + [("move_z_to", HOME_Z_MM, True)] + _seed_xy(R1_FOV0[:2]) + [("move_z_to", 2.0, True)]
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # (d) End-of-run return to the start position (lives on the controller)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -267,6 +348,18 @@ def test_return_to_start_is_a_no_op_without_a_start_position():
     controller._move_back_to_start_position()
 
     assert stage.calls == []
+
+
+def test_return_to_start_with_zero_xy_travel_skips_the_home_retract():
+    """The stage is already at the start XY (only Z drifted, e.g. from AF) --
+    the same F3 guard applies here as in the worker."""
+    stage = RecordingStage(x_mm=1.0, y_mm=2.0, z_mm=5.0)
+    controller = _ControllerUnderTest(stage, retract=True)
+    controller._start_position = Pos(x_mm=1.0, y_mm=2.0, z_mm=3.0, theta_rad=None)
+
+    controller._move_back_to_start_position()
+
+    assert stage.calls == [("move_z_to", 3.0, True)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

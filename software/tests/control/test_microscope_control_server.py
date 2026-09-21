@@ -387,6 +387,9 @@ class TestHelperMethods:
         yaml_data.laser_af = False
         yaml_data.use_piezo = True
         yaml_data.channel_names = ["Channel1"]
+        # Not set by this YAML -- the controller's current retract setting must
+        # be left alone, not clobbered with a stray MagicMock truthy value.
+        yaml_data.retract_z_between_regions = None
 
         mock_server._configure_controller_from_yaml(yaml_data)
 
@@ -398,3 +401,23 @@ class TestHelperMethods:
         assert mock_server.multipoint_controller.do_reflection_af is False
         assert mock_server.multipoint_controller.use_piezo is True
         mock_server.multipoint_controller.set_selected_configurations.assert_called_with(["Channel1"])
+        mock_server.multipoint_controller.set_retract_z_between_regions.assert_not_called()
+
+    def test_configure_controller_from_yaml_forwards_retract_z_between_regions(self, mock_server):
+        """F4: a YAML with an explicit ``retract_z_between_regions`` must reach the
+        controller's setter -- this field used to be parsed by the YAML loader but
+        silently dropped here."""
+        yaml_data = MagicMock()
+        yaml_data.nz = 1
+        yaml_data.delta_z_um = 0.0
+        yaml_data.nt = 1
+        yaml_data.delta_t_s = 0.0
+        yaml_data.contrast_af = False
+        yaml_data.laser_af = False
+        yaml_data.use_piezo = False
+        yaml_data.channel_names = ["Channel1"]
+        yaml_data.retract_z_between_regions = False
+
+        mock_server._configure_controller_from_yaml(yaml_data)
+
+        mock_server.multipoint_controller.set_retract_z_between_regions.assert_called_once_with(False)
