@@ -414,10 +414,6 @@ class ScanCoordinates:
         """
         center_z = float(self.stage.get_pos().z_mm)
         self.add_flexible_region(region_id, center_x, center_y, center_z, nx, ny, overlap_percent)
-        if region_id in self.region_centers:
-            # A grid is rectangular; recording the shape keeps region_contains_coordinate
-            # (focus-map point generation) working the same as for the fraction method.
-            self.region_shapes[region_id] = "Square"
 
     def set_well_coordinates(self, scan_size_mm, overlap_percent, shape):
         """Tile each selected well with a scan area that is a fraction of the well."""
@@ -451,18 +447,18 @@ class ScanCoordinates:
                     else:
                         region_name = f"manual{i}"
                     center = np.mean(shape_coords, axis=0)
-                    self.region_centers[region_name] = [center[0], center[1]]
-                    self.region_shapes[region_name] = "Manual"
-                    self.region_fov_coordinates[region_name] = scan_coordinates
-                    self.region_generation_params[region_name] = {
-                        "kind": "manual",
-                        "shape_coords": np.asarray(shape_coords).tolist(),
-                        "overlap_percent": overlap_percent,
-                    }
-                    self._log.info(f"Added Manual Region: {region_name}")
-                    self._update_callback(
-                        AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
+                    self._register_region(
+                        region_name,
+                        center=[center[0], center[1]],
+                        fov_coordinates=scan_coordinates,
+                        shape="Manual",
+                        generation_params={
+                            "kind": "manual",
+                            "shape_coords": np.asarray(shape_coords).tolist(),
+                            "overlap_percent": overlap_percent,
+                        },
                     )
+                    self._log.info(f"Added Manual Region: {region_name}")
         else:
             self._log.info("No Manual ROI found")
 
@@ -478,6 +474,33 @@ class ScanCoordinates:
         pixel_size_factor = self.objectiveStore.get_pixel_size_factor()
         fov_w_mm_sensor, fov_h_mm_sensor = self.camera.get_fov_size_mm()
         return pixel_size_factor * fov_w_mm_sensor, pixel_size_factor * fov_h_mm_sensor
+
+    def _register_region(
+        self,
+        region_id,
+        center,
+        fov_coordinates,
+        shape,
+        fov_rows=None,
+        generation_params=None,
+    ):
+        """Single place every add_* method funnels its result through.
+
+        A region cannot exist without a recorded shape: ``region_contains_coordinate``
+        (via ``get_region_shape``) raises ``KeyError`` for any region missing from
+        ``region_shapes`` — hit in practice by focus-map point generation
+        (``core.py``) for regions created outside the wellplate fraction-of-well path.
+        ``fov_rows``/``generation_params`` are only set when the caller provides them,
+        since not every region kind has a row grid or is FOV-dependent.
+        """
+        self.region_centers[region_id] = center
+        self.region_shapes[region_id] = shape
+        self.region_fov_coordinates[region_id] = fov_coordinates
+        if fov_rows is not None:
+            self.region_fov_rows[region_id] = fov_rows
+        if generation_params is not None:
+            self.region_generation_params[region_id] = generation_params
+        self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(fov_coordinates)))
 
     def add_region(self, well_id, center_x, center_y, scan_size_mm, overlap_percent=10, shape="Square"):
         """add region based on user inputs"""
@@ -553,20 +576,22 @@ class ScanCoordinates:
                 scan_coordinates = [(center_x, center_y)]
 
         center_z = float(self.stage.get_pos().z_mm)
-        self.region_shapes[well_id] = shape
-        self.region_centers[well_id] = [float(center_x), float(center_y), center_z]
-        self.region_fov_rows[well_id] = rows
-        self.region_fov_coordinates[well_id] = scan_coordinates
-        self.region_generation_params[well_id] = {
-            "kind": "well",
-            "center_x": float(center_x),
-            "center_y": float(center_y),
-            "center_z": center_z,
-            "scan_size_mm": scan_size_mm,
-            "overlap_percent": overlap_percent,
-            "shape": shape,
-        }
-        self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
+        self._register_region(
+            well_id,
+            center=[float(center_x), float(center_y), center_z],
+            fov_coordinates=scan_coordinates,
+            shape=shape,
+            fov_rows=rows,
+            generation_params={
+                "kind": "well",
+                "center_x": float(center_x),
+                "center_y": float(center_y),
+                "center_z": center_z,
+                "scan_size_mm": scan_size_mm,
+                "overlap_percent": overlap_percent,
+                "shape": shape,
+            },
+        )
 
     def remove_region(self, well_id):
         if well_id in self.region_centers:
@@ -722,20 +747,24 @@ class ScanCoordinates:
         # Region coordinates are already centered since center_x, center_y is grid center
         if scan_coordinates:  # Only add region if there are valid coordinates
             # self._log.info(f"Added Flexible Region: {region_id}")
-            self.region_centers[region_id] = [center_x, center_y, center_z]
-            self.region_fov_rows[region_id] = rows
-            self.region_fov_coordinates[region_id] = scan_coordinates
-            self.region_generation_params[region_id] = {
-                "kind": "flexible",
-                "center_x": center_x,
-                "center_y": center_y,
-                "center_z": center_z,
-                "Nx": Nx,
-                "Ny": Ny,
-                "overlap_percent": overlap_percent,
-            }
-            self._update_callback(
-                AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
+            # Nx x Ny grid -> rectangular extent, so "Square" gives region_contains_coordinate
+            # the plain bounding-box test (its containment check reads bounds from
+            # region_fov_coordinates directly; only "Circle" needs anything more).
+            self._register_region(
+                region_id,
+                center=[center_x, center_y, center_z],
+                fov_coordinates=scan_coordinates,
+                shape="Square",
+                fov_rows=rows,
+                generation_params={
+                    "kind": "flexible",
+                    "center_x": center_x,
+                    "center_y": center_y,
+                    "center_z": center_z,
+                    "Nx": Nx,
+                    "Ny": Ny,
+                    "overlap_percent": overlap_percent,
+                },
             )
         else:
             self._log.info(f"Region Out of Bounds: {region_id}")
@@ -744,9 +773,14 @@ class ScanCoordinates:
         if not self.validate_coordinates(center_x, center_y):
             raise ValueError(f"FOV with center (x,y)={center_x},{center_y} is not valid, cannot add region.")
 
-        self.region_centers[region_id] = [center_x, center_y, center_z]
-        self.region_fov_coordinates[region_id] = [(center_x, center_y)]
-        self._update_callback(AddScanCoordinateRegion(fov_centers=[FovCenter(x_mm=center_x, y_mm=center_y)]))
+        # A single FOV is a 1x1 grid: "Square" keeps the bounding-box containment test
+        # (which is exact here since min==max==the one point) instead of raising.
+        self._register_region(
+            region_id,
+            center=[center_x, center_y, center_z],
+            fov_coordinates=[(center_x, center_y)],
+            shape="Square",
+        )
 
     def add_flexible_region_with_step_size(self, region_id, center_x, center_y, center_z, Nx, Ny, dx, dy):
         """Convert grid parameters NX, NY to FOV coordinates based on dx, dy"""
@@ -765,11 +799,12 @@ class ScanCoordinates:
 
         if scan_coordinates:  # Only add region if there are valid coordinates
             self._log.info(f"Added Flexible Region: {region_id}")
-            self.region_centers[region_id] = [center_x, center_y, center_z]
-            self.region_fov_rows[region_id] = rows
-            self.region_fov_coordinates[region_id] = scan_coordinates
-            self._update_callback(
-                AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates))
+            self._register_region(
+                region_id,
+                center=[center_x, center_y, center_z],
+                fov_coordinates=scan_coordinates,
+                shape="Square",
+                fov_rows=rows,
             )
         else:
             print(f"Region Out of Bounds: {region_id}")
@@ -876,9 +911,12 @@ class ScanCoordinates:
             y = float(y_mm + template_y_mm[i])
             if self.validate_coordinates(x, y):
                 scan_coordinates.append((x, y))
-        self.region_centers[region_id] = [x_mm, y_mm, z_mm]
-        self.region_fov_coordinates[region_id] = scan_coordinates
-        self._update_callback(AddScanCoordinateRegion(fov_centers=FovCenter.from_scan_coordinates(scan_coordinates)))
+        self._register_region(
+            region_id,
+            center=[x_mm, y_mm, z_mm],
+            fov_coordinates=scan_coordinates,
+            shape="Square",
+        )
 
     def region_contains_coordinate(self, region_id: str, x: float, y: float) -> bool:
         # TODO: check for manual region
