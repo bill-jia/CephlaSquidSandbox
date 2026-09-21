@@ -95,3 +95,92 @@ builds the whole GUI with every `SIMULATE_*` flag on and writes
 `flexible_multipoint.png` / `wellplate_multipoint.png`. Takes ~60 s; the
 `default` profile has no observation-state presets, so the channel list is
 empty.
+
+---
+
+# Round 2 (2026-09-21): uniform Positions / Tiling / Z-stack / Time-lapse block
+
+Goal: the left column of both multipoint panels is the *same* boxed block,
+built by one helper, so a user who knows one panel knows the other. The only
+permitted difference is Wellplate's extra tiling method ("fraction of well").
+The Channels box stays where it is for now; its placement is decided after
+screenshots.
+
+## Target layout (left column, one framed box; right column unchanged)
+
+```
+┌ Positions ─────────────────────────────────────────────────────┐
+│ Flexible:  the positions table + its header/action rows          │
+│ Wellplate: [x] XY   Mode ▾ (Current Position / Select Wells /    │
+│            Manual / Load Coordinates)   … Save / Load coordinates │
+├ Tiling per position ──────────────────────────────────────────── ┤
+│ Wellplate only:  Method  (•) Fraction of well   ( ) Nx × Ny       │
+│   fraction:      Shape ▾   Scan size [mm]   Coverage [%]          │
+│ Both:            Nx [ ]  Ny [ ]   Overlap [ %]                    │
+│                  (dx/dy variant when use_overlap is False)        │
+├ [x] Z-stack ──────────────────────────────────────────────────── ┤
+│   Nz [ ]  dz [ µm]  From ▾ (Bottom / Center / Top)  [ ] Set Z-range│
+│   Z-min … Z-max … rows (visible only with Set Z-range)            │
+│   [ ] Piezo Z-stack (HAS_OBJECTIVE_PIEZO)                         │
+├ [x] Time-lapse ───────────────────────────────────────────────── ┤
+│   Nt [ ]  dt [ s]                                                 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The box is a `QFrame` with `StyledPanel | Plain` and a 1-px `palette(mid)`
+border; section titles inside stay the bold-label style of `_make_section`,
+except that Z-stack and Time-lapse titles are *checkboxes* that enable the
+group.
+
+## Decisions
+
+- **Enable checkboxes (both panels).** `[x] Z-stack` / `[x] Time-lapse`
+  header checkboxes grey the group's controls when off (no hiding, no
+  placeholder labels, no store/restore of values) and push `set_NZ(1)` /
+  `set_Nt(1)` to the controller; when on, push the spinbox values. At start,
+  `toggle_acquisition` uses the effective values. Flexible's default is
+  unchecked (Nz/Nt start at 1); Wellplate keeps its cached state. Flexible's
+  `_sync_z_stack_controls` (grey From/Set Z-range at Nz==1) is subsumed: the
+  group is either on or off.
+- **One `From ▾` per panel** = the AF reference plane (`combobox_z_stack` →
+  `set_z_stacking_config`). Wellplate's `combobox_z_mode`
+  (`From Bottom | Set Range`) is deleted; its "Set Range" becomes the
+  `Set Z-range` checkbox exactly as in Flexible. Fix the YAML apply path that
+  mapped `z_stacking_config` into `combobox_z_mode`: `z_stacking_config` now
+  drives `combobox_z_stack`, and `Set Z-range` is derived from whether the
+  yaml carries an explicit z range (check what the loader provides).
+- **Wellplate XY block**: the `XY` checkbox + mode combobox stay (unchecked =
+  current position, as today); the Save/Load coordinates controls sit on the
+  same row(s). The coloured `xy_frame / z_frame / time_frame`,
+  `update_tab_styles`, `*_not_selected_label`, `hide_/show_z_controls`,
+  `store_/restore_z_parameters`, `store_/restore_time_parameters` are
+  removed. `save_multipoint_widget_config_to_cache` / the restore path change
+  keys: `z_mode` → `set_z_range: bool`; add `tiling_method`, `nx`, `ny`.
+- **Wellplate tiling methods**: `Fraction of well` (today's Shape / Scan size /
+  Coverage) and `Nx × Ny` (Flexible's grid centred on each well centre, or on
+  the stage position in Current Position mode). The method row and the rows
+  it governs are shown only in Select Wells / Current Position modes (Manual
+  and Load Coordinates define their own FOVs, as today). `Overlap` applies to
+  both methods.
+- **Snake scan** moves from Flexible's Tiling group to Scan behaviour, matching
+  Wellplate.
+- `dt`/`Nt` live in the Time-lapse group (with the checkbox), so the separate
+  `time_controls_frame` is gone.
+
+## Work split
+
+- **R2-core (worktree, no GUI):** `ScanCoordinates.set_well_coordinates_grid(nx, ny, overlap_percent)`
+  and `set_live_scan_coordinates_grid(x_mm, y_mm, nx, ny, overlap_percent)`
+  in `control/core/scan_coordinates.py`, mirroring `set_well_coordinates` /
+  `set_live_scan_coordinates` but tiling with `add_flexible_region` semantics
+  (same overlay/navigation-viewer behaviour, same region naming as the
+  fraction method so per-region maps keep working). Unit tests with the
+  existing ScanCoordinates test fixtures.
+- **R2-layout (main tree):** the shared block builder + both panels rebuilt
+  on it, Z/Time enable checkboxes, Wellplate `combobox_z_mode` → Set Z-range,
+  dead style/store machinery removed, cache keys, YAML fix, snake → Scan
+  behaviour. Leaves a `Method` selector in the Wellplate tiling group wired
+  to nothing but the fraction rows' visibility.
+- **R2-wire (main tree, after both):** wire `Nx × Ny` to the R2-core API in
+  `update_coordinates`, `update_well_coordinates`, `update_live_coordinates`,
+  the cache and the YAML path; screenshots of both panels with wells selected.
