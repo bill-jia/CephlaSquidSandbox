@@ -229,11 +229,15 @@ group.
 
 ## Follow-ups (found during R2-wire, deliberately not fixed here)
 
-- `ScanCoordinates.add_flexible_region` never populates `region_shapes`, so
+- FIXED: `ScanCoordinates.add_flexible_region` never populates `region_shapes`, so
   `region_contains_coordinate` raises `KeyError` for regions defined on the Flexible
   panel (bites focus-map point generation, `control/core/core.py:~1963`). The wellplate
   grid method dodges it only because `_add_well_grid_region` sets the shape by hand
-  afterwards.
+  afterwards. Every `add_*` region method now funnels through a shared
+  `_register_region` that always records a shape ("Square" for grid/template/single-FOV
+  regions, whose bounding box is exact), so `_add_well_grid_region`'s hand-set shape was
+  removed as redundant. See `test_scan_coordinates.py`'s
+  `test_region_contains_coordinate_for_*` tests.
 - The wellplate tab's non-range Z span is `z + dz * (Nz - 1)` where `z` is in mm and
   `dz` in µm (`entry_deltaZ` has a µm suffix); the Flexible tab divides `dz` by 1000
   in the same expression. Check and fix in a separate commit if it really is wrong.

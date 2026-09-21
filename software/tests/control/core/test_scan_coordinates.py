@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 import tests.control.gui_test_stubs as gts
@@ -707,3 +708,76 @@ def test_set_well_coordinates_fraction_path_is_unchanged_by_the_shared_iteration
     assert sc.region_centers == expected.region_centers
     assert sc.region_shapes == expected.region_shapes
     assert sc.region_generation_params == expected.region_generation_params
+
+
+# --------------------------------------------------------------------------------------
+# region_contains_coordinate / get_region_shape must work for every add_* method
+#
+# Regression coverage for a latent KeyError: get_region_shape did self.region_shapes[id],
+# but only add_region (and the well-grid path, by hand) ever wrote region_shapes. Every
+# add_* method now funnels through the shared _register_region, so every region has a
+# shape from the moment it exists.
+# --------------------------------------------------------------------------------------
+
+
+def test_region_contains_coordinate_for_flexible_region():
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.add_flexible_region("f", 30.0, 30.0, 0.5, 3, 3, overlap_percent=0)
+
+    assert sc.get_region_shape("f") == "Square"
+    assert sc.region_contains_coordinate("f", 30.0, 30.0) is True
+    assert sc.region_contains_coordinate("f", 0.0, 0.0) is False
+
+
+def test_region_contains_coordinate_for_single_fov_region():
+    sc = _make_scan_coordinates()
+    sc.add_single_fov_region("s", 6.0, 7.0, 3.0)
+
+    assert sc.get_region_shape("s") == "Square"
+    assert sc.region_contains_coordinate("s", 6.0, 7.0) is True
+    assert sc.region_contains_coordinate("s", 50.0, 50.0) is False
+
+
+def test_region_contains_coordinate_for_flexible_region_with_step_size():
+    sc = _make_scan_coordinates()
+    sc.add_flexible_region_with_step_size("fs", 20.0, 20.0, 1.0, 3, 3, 1.0, 1.0)
+
+    assert sc.get_region_shape("fs") == "Square"
+    assert sc.region_contains_coordinate("fs", 20.0, 20.0) is True
+    assert sc.region_contains_coordinate("fs", 50.0, 50.0) is False
+
+
+def test_region_contains_coordinate_for_template_region():
+    sc = _make_scan_coordinates()
+    sc.add_template_region(
+        15.0,
+        15.0,
+        0.0,
+        np.array([-1.0, 0.0, 1.0]),
+        np.array([-1.0, 0.0, 1.0]),
+        "t",
+    )
+
+    assert sc.get_region_shape("t") == "Square"
+    assert sc.region_contains_coordinate("t", 15.0, 15.0) is True
+    assert sc.region_contains_coordinate("t", 50.0, 50.0) is False
+
+
+def test_region_contains_coordinate_for_add_region():
+    """The pre-existing wellplate fraction-of-well path must keep working."""
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.add_region("w", 40.0, 40.0, 3.0, 10, "Square")
+
+    assert sc.get_region_shape("w") == "Square"
+    assert sc.region_contains_coordinate("w", 40.0, 40.0) is True
+    assert sc.region_contains_coordinate("w", 0.0, 0.0) is False
+
+
+def test_remove_region_drops_shape_entry():
+    sc = _make_scan_coordinates(fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.add_flexible_region("f", 30.0, 30.0, 0.5, 2, 2, overlap_percent=0)
+    assert "f" in sc.region_shapes
+
+    sc.remove_region("f")
+
+    assert "f" not in sc.region_shapes
