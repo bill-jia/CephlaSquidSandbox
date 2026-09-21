@@ -167,6 +167,12 @@ def main():
 
     import control.microscope
     import gui.gui_hcs as gui
+    import gui.widgets.multipoint as multipoint_widgets
+
+    # The panels persist their Z/Time/tiling state to
+    # software/cache/multipoint_widget_config.yaml on every toggle; a screenshot
+    # run must not leave the user's real panel state behind.
+    multipoint_widgets.WellplateMultiPointWidget.save_multipoint_widget_config_to_cache = lambda self, *a, **k: None
 
     microscope = control.microscope.Microscope.build_from_global_config(
         True, skip_init=False, skip_homing=True, profile_name=args.profile
@@ -211,7 +217,12 @@ def main():
         else:
             _grab(app, viewer, os.path.join(args.out_dir, "navigation_grid.png"), viewer.width())
 
-    win.close()
+    # Do NOT win.close(): closeEvent blocks on a modal "Confirm Exit" box with
+    # nobody to click, and past it _cleanup_common caches the *simulated* stage
+    # position to the file the real GUI restores the stage from at startup.
+    # Hide the window and tear the simulated hardware down directly instead.
+    win.hide()
+    app.processEvents()
     try:
         microscope.close()
     except Exception as e:
