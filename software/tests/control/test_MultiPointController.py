@@ -263,6 +263,15 @@ def select_some_configs(mpc: MultiPointController, objective: str):
     mpc.set_selected_configurations(selected_configurations_name=first_two_config_names)
 
 
+def set_default_z_range(mpc: MultiPointController):
+    """MultiPointController.run_acquisition() only fills in z_range when it is
+    None, but z_range is never initialized in __init__. The GUI always calls
+    set_z_range() right before starting a run (see gui/widgets/multipoint.py),
+    so a direct-API test has to do the same."""
+    z = mpc.stage.get_pos().z_mm
+    mpc.set_z_range(z, z)
+
+
 def test_multi_point_controller_basic_acquisition():
     control._def.MERGE_CHANNELS = False
     scope = control.microscope.Microscope.build_from_global_config(True)
@@ -271,6 +280,7 @@ def test_multi_point_controller_basic_acquisition():
 
     add_some_coordinates(mpc)
     select_some_configs(mpc, scope.objective_store.current_objective)
+    set_default_z_range(mpc)
 
     mpc.run_acquisition()
 
@@ -295,6 +305,7 @@ def test_multi_point_with_laser_af():
 
     add_some_coordinates(mpc)
     select_some_configs(mpc, scope.objective_store.current_objective)
+    set_default_z_range(mpc)
     mpc.set_reflection_af_flag(True)
     scope.addons.camera_focus.send_trigger()
     laser_af_ref_image = scope.addons.camera_focus.read_frame()
@@ -325,6 +336,7 @@ def test_multi_point_with_contrast_af():
 
     add_some_coordinates(mpc)
     select_some_configs(mpc, scope.objective_store.current_objective)
+    set_default_z_range(mpc)
     mpc.set_af_flag(True)
     mpc.run_acquisition()
 
