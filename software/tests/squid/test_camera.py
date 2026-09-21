@@ -34,6 +34,21 @@ def test_simulated_camera():
     assert frame_height == res_height
 
 
+def test_simulated_camera_getattr_private_names_raise_attribute_error():
+    sim_cam = squid.camera.utils.get_camera(squid.config.get_camera_config(), simulated=True)
+
+    # Private/dunder attribute lookups must behave like a normal object: no
+    # fabricated placeholder, so getattr(..., default) and hasattr work as expected.
+    assert getattr(sim_cam, "_nope", None) is None
+    assert hasattr(sim_cam, "_nope") is False
+
+    # Public unknown method names still get a callable placeholder (the
+    # SDK-shim behavior this class exists for).
+    placeholder = sim_cam.some_unimplemented_sdk_method
+    assert callable(placeholder)
+    assert placeholder() is None
+
+
 def test_new_roi_for_binning():
     old_binning = (2, 2)  # Base binning
     old_roi_full = (0, 0, 1500, 3000)
