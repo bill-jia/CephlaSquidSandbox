@@ -63,6 +63,10 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # Which wellplate tiling method NX/NY describe ("fraction" or "grid"); metadata only
+    # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
+    # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.
+    tiling_method: str = "fraction"
     # Bracket every XY move that enters a region with a retract to
     # OBJECTIVE_RETRACTED_POS_MM (Z home, blocking) and a return to the target
     # Z. Covers the first move of the run and the end-of-run return to the

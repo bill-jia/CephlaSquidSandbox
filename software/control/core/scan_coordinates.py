@@ -382,38 +382,34 @@ class ScanCoordinates:
     def _tile_selected_wells(self, tile_well, tile_live):
         """Shared well iteration for both wellplate tiling methods.
 
-        ``tile_well(well_id, x_mm, y_mm)`` defines one region per newly selected well;
+        ``tile_well(well_id, x_mm, y_mm)`` defines one region per selected well;
         ``tile_live(pos)`` handles the glass-slide case, where there are no wells and the
-        single region follows the stage. Regions for deselected wells are removed (which
-        fires the overlay's remove callback), and an empty selection clears everything.
+        single region follows the stage. The GUI's own caller (``_tile_wells`` in
+        ``multipoint.py``) always clears every region before calling in, so there is no
+        deselected-well diffing to do here — only an empty selection needs its own clear
+        (there is nothing to iterate to trigger one).
         """
-        new_region_centers = self.get_selected_wells()
-
         if self.format == "glass slide":
             tile_live(self.stage.get_pos())
+            return
 
-        elif bool(new_region_centers):
-            # Remove regions that are no longer selected
-            for well_id in list(self.region_centers.keys()):
-                if well_id not in new_region_centers.keys():
-                    self.remove_region(well_id)
-
-            # Add regions for selected wells
-            for well_id, (x, y) in new_region_centers.items():
-                if well_id not in self.region_centers:
-                    tile_well(well_id, x, y)
-        else:
+        new_region_centers = self.get_selected_wells()
+        if not new_region_centers:
             self.clear_regions()
+            return
+
+        for well_id, (x, y) in new_region_centers.items():
+            tile_well(well_id, x, y)
 
     def _add_well_grid_region(self, region_id, center_x, center_y, nx, ny, overlap_percent):
         """One Nx x Ny grid centred on a well centre, tiled like a flexible region.
 
-        Z comes from the live stage position, exactly as ``add_region`` does it: a
-        wellplate region's Z is "wherever the objective was when the region was defined",
-        not anything derived from the plate format.
+        Unlike ``add_region``'s "Z is wherever the objective was when the region was
+        defined" semantics, the grid's FOVs carry no baked-in Z (``center_z=None``):
+        the worker never moves Z per FOV for a 2-tuple coordinate, so a refocus after
+        selecting wells is not silently overridden the next time a well is visited.
         """
-        center_z = float(self.stage.get_pos().z_mm)
-        self.add_flexible_region(region_id, center_x, center_y, center_z, nx, ny, overlap_percent)
+        self.add_flexible_region(region_id, center_x, center_y, None, nx, ny, overlap_percent)
 
     def set_well_coordinates(self, scan_size_mm, overlap_percent, shape):
         """Tile each selected well with a scan area that is a fraction of the well."""
@@ -722,7 +718,14 @@ class ScanCoordinates:
         return self.region_laser_af_references.get(region_id)
 
     def add_flexible_region(self, region_id, center_x, center_y, center_z, Nx, Ny, overlap_percent=10):
-        """Convert grid parameters NX, NY to FOV coordinates based on overlap"""
+        """Convert grid parameters NX, NY to FOV coordinates based on overlap.
+
+        ``center_z=None`` means the FOVs carry no Z (2-tuples): the acquisition worker
+        (``multi_point_worker.py``, ``elif len(coordinate_mm) == 3``) then leaves Z alone
+        at every FOV, matching the fraction-of-well path (``add_region``) instead of
+        baking in the stage Z at selection time. Pass a real Z (as the Flexible panel's
+        positions table does) to get 3-tuple FOVs as before.
+        """
         fov_w_mm, fov_h_mm = self._fov_mm()
         overlap_frac = 1 - overlap_percent / 100
         step_x_mm = fov_w_mm * overlap_frac
@@ -732,14 +735,14 @@ class ScanCoordinates:
         grid_width_mm = (Nx - 1) * step_x_mm
         grid_height_mm = (Ny - 1) * step_y_mm
 
-        rows: List[List[Tuple[float, float, float]]] = []
+        rows: List[List[Tuple[float, ...]]] = []
         for i in range(Ny):
             row = []
             y = center_y - grid_height_mm / 2 + i * step_y_mm
             for j in range(Nx):
                 x = center_x - grid_width_mm / 2 + j * step_x_mm
                 if self.validate_coordinates(x, y):
-                    row.append((x, y, center_z))
+                    row.append((x, y) if center_z is None else (x, y, center_z))
             rows.append(row)
 
         scan_coordinates = self._flatten_fov_rows(rows)
@@ -750,9 +753,10 @@ class ScanCoordinates:
             # Nx x Ny grid -> rectangular extent, so "Square" gives region_contains_coordinate
             # the plain bounding-box test (its containment check reads bounds from
             # region_fov_coordinates directly; only "Circle" needs anything more).
+            center = [center_x, center_y] if center_z is None else [center_x, center_y, center_z]
             self._register_region(
                 region_id,
-                center=[center_x, center_y, center_z],
+                center=center,
                 fov_coordinates=scan_coordinates,
                 shape="Square",
                 fov_rows=rows,

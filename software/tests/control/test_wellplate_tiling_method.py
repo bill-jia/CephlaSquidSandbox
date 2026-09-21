@@ -23,7 +23,7 @@ from qtpy.QtWidgets import (
 )
 from unittest.mock import MagicMock
 
-from gui.widgets.multipoint import WellplateMultiPointWidget
+from gui.widgets.multipoint import WellplateMultiPointWidget, _apply_tiling_method_from_yaml
 
 
 class _TilingHarness:
@@ -215,6 +215,44 @@ def test_tiling_method_and_grid_size_round_trip_through_the_cache(tiling, tmp_pa
     assert tiling.radio_tiling_grid.isChecked() == method_is_grid
     assert (tiling.entry_NX.value(), tiling.entry_NY.value()) == (4, 7)
     assert tiling.entry_overlap.value() == 12.5
+
+
+def test_apply_tiling_method_from_yaml_with_an_explicit_tag_switches(tiling):
+    """A file written after F6 carries the tag, so the drop switches the radio and
+    fills NX/NY for a grid tag, or just switches the radio for a fraction tag."""
+    tiling.radio_tiling_fraction.setChecked(True)
+    tiling.entry_NX.setValue(1)
+    tiling.entry_NY.setValue(1)
+
+    _apply_tiling_method_from_yaml(tiling, SimpleNamespace(tiling_method="grid", nx=5, ny=6))
+
+    assert tiling.radio_tiling_grid.isChecked() is True
+    assert (tiling.entry_NX.value(), tiling.entry_NY.value()) == (5, 6)
+
+    _apply_tiling_method_from_yaml(tiling, SimpleNamespace(tiling_method="fraction", nx=5, ny=6))
+
+    assert tiling.radio_tiling_fraction.isChecked() is True
+
+
+def test_apply_tiling_method_from_yaml_legacy_file_leaves_the_radio_alone(tiling):
+    """A pre-F6 wellplate acquisition.yaml recorded the shared controller's NX/NY, which
+    only the Flexible tab's spinboxes ever set — so a fraction-of-well plate can carry
+    nx=3, ny=3 with no tiling_method tag. Guessing "grid" from nx*ny > 1 was the bug
+    (F6): with no tag, the radio must be left exactly where it was."""
+    tiling.radio_tiling_fraction.setChecked(True)
+    tiling.entry_NX.setValue(1)
+    tiling.entry_NY.setValue(1)
+
+    _apply_tiling_method_from_yaml(tiling, SimpleNamespace(tiling_method=None, nx=3, ny=3))
+
+    assert tiling.radio_tiling_fraction.isChecked() is True, "no tag: fraction stays selected"
+    assert (tiling.entry_NX.value(), tiling.entry_NY.value()) == (1, 1), "NX/NY untouched too"
+
+    # If grid was already selected before the drop, a tagless file still fills NX/NY -
+    # the fill follows whichever method ends up selected, tag or not.
+    tiling.radio_tiling_grid.setChecked(True)
+    _apply_tiling_method_from_yaml(tiling, SimpleNamespace(tiling_method=None, nx=3, ny=3))
+    assert (tiling.entry_NX.value(), tiling.entry_NY.value()) == (3, 3)
 
 
 class _ZRangeHarness:

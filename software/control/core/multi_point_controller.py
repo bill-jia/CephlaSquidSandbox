@@ -398,6 +398,7 @@ def _save_unified_multipoint_acquisition_yaml(
         yaml_dict["wellplate_scan"] = {
             "scan_size_mm": scan_size_mm,
             "overlap_percent": overlap_percent,
+            "tiling_method": params.tiling_method,
             "nx": params.NX,
             "ny": params.NY,
             "delta_x_mm": params.deltaX,
@@ -541,6 +542,11 @@ class MultiPointController:
         self.deltaX = control._def.Acquisition.DX  # Spacing between positions in X (mm)
         self.NY = 1  # Number of positions in Y direction
         self.deltaY = control._def.Acquisition.DY  # Spacing between positions in Y (mm)
+        # Which wellplate tiling method NX/NY describe: "fraction" (of the well) or
+        # "grid" (an explicit Nx x Ny lattice). Written into acquisition.yaml so a
+        # dropped file can tell a real grid from the 1x1 a fraction-of-well run also
+        # emits, instead of the drop handler guessing from nx*ny alone (F6).
+        self.tiling_method = "fraction"
         self.NZ = 1  # Number of Z positions (for Z-stacks)
         # TODO(imo): Switch all to consistent mm units
         self.deltaZ = control._def.Acquisition.DZ / 1000  # Z step size (mm, converted from um)
@@ -747,6 +753,9 @@ class MultiPointController:
 
     def set_NY(self, N):
         self.NY = N
+
+    def set_tiling_method(self, method: str):
+        self.tiling_method = method
 
     def set_NZ(self, N):
         self.NZ = N
@@ -1913,6 +1922,7 @@ class MultiPointController:
             deltaX=self.deltaX,
             NY=self.NY,
             deltaY=self.deltaY,
+            tiling_method=self.tiling_method,
             NZ=self.NZ,
             deltaZ=self.deltaZ,
             Nt=self.Nt,
