@@ -1035,9 +1035,34 @@ class ConfigRepository:
     # OBSERVATION STATE (objective-free presets)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def _read_yaml_display_name(self, path: Path) -> Optional[str]:
+        """Read the ``name:`` field out of a preset/cycle YAML file, cheaply.
+
+        Returns None if the file is missing, unparsable, or has no usable
+        ``name`` field so callers can fall back to the file stem.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.load(f, Loader=_YamlSafeLoader)
+        except (OSError, yaml.YAMLError):
+            return None
+        if isinstance(data, dict):
+            candidate = data.get("name")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
     def list_observation_presets(self, profile: Optional[str] = None) -> List[str]:
         """
-        List saved Observation State preset names (without ``.yaml``) for a profile.
+        List saved Observation State preset *display names* for a profile.
+
+        Each preset's on-disk filename is a sanitized stem (spaces become
+        underscores, see ``sanitize_preset_filename``), but the name the user
+        gave it — and the name lookups like ``get_observation_state_by_name``
+        must match — is preserved verbatim in the file's ``name:`` field. This
+        lists that field (falling back to the file stem for a file that has
+        none), so a preset saved as "BF LED matrix full" is listed and
+        resolved under that exact name, not "BF_LED_matrix_full".
 
         Args:
             profile: Profile name (defaults to current profile)
@@ -1050,7 +1075,7 @@ class ConfigRepository:
             return []
         names: List[str] = []
         for p in sorted(presets_dir.glob("*.yaml")):
-            names.append(p.stem)
+            names.append(self._read_yaml_display_name(p) or p.stem)
         return names
 
     def get_observation_states(self, profile: Optional[str] = None) -> List[ObservationState]:
@@ -1106,7 +1131,11 @@ class ConfigRepository:
         Save an Observation State preset under ``user_profiles/{profile}/observation_presets/``.
 
         Args:
-            name: Display name (sanitized to a file stem)
+            name: Display name. Only the *filename* is sanitized (spaces ->
+                underscores, see ``sanitize_preset_filename``); the name as
+                given is preserved verbatim in the saved state's ``name``
+                field so name-based lookups (e.g. the contrast-autofocus
+                channel) see exactly what the user typed.
             state: Objective-free Observation State
             profile: Profile name (defaults to current profile)
 
@@ -1118,8 +1147,9 @@ class ConfigRepository:
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
-        safe_name = sanitize_preset_filename(name)
-        state_to_save = state.model_copy(update={"name": safe_name})
+        sanitize_preset_filename(name)  # validate; raises on empty/disallowed characters
+        display_name = name.strip()
+        state_to_save = state.model_copy(update={"name": display_name})
         path = observation_preset_path(self, name, profile=profile)
         from control.core.observation_state_service import observation_state_to_yaml
 
@@ -1251,28 +1281,35 @@ class ConfigRepository:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def list_acquisition_cycles(self, profile: Optional[str] = None) -> List[str]:
-        """List saved acquisition-cycle names (without ``.yaml``) for a profile."""
+        """List saved acquisition-cycle *display names* for a profile.
+
+        Mirrors ``list_observation_presets``: the on-disk filename is a
+        sanitized stem, but the name the user gave the cycle (and the name
+        lookups must match) is preserved verbatim in the file's ``name:``
+        field. Falls back to the file stem for a file that has none.
+        """
         profile = profile or self._current_profile
         if profile is None:
             return []
         cycles_dir = self.user_profiles_path / profile / "cycles"
         if not cycles_dir.is_dir():
             return []
-        return [p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
+        return [self._read_yaml_display_name(p) or p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
 
     def save_acquisition_cycle(self, name: str, cycle: "AcquisitionCycle", profile: Optional[str] = None) -> Path:
         """Save an acquisition cycle under ``user_profiles/{profile}/cycles/``.
 
-        The cycle's ``name`` is normalized to the sanitized file stem so the
-        on-disk name and the in-file name always match.
+        Only the *filename* is sanitized (spaces -> underscores); the name as
+        given is preserved verbatim in the saved cycle's ``name`` field so
+        name-based lookups see exactly what the user typed.
         """
         from control.core.observation_state_service import acquisition_cycle_path, sanitize_preset_filename
 
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
-        safe_name = sanitize_preset_filename(name)
-        cycle_to_save = cycle.model_copy(update={"name": safe_name})
+        sanitize_preset_filename(name)  # validate; raises on empty/disallowed characters
+        cycle_to_save = cycle.model_copy(update={"name": name.strip()})
         path = acquisition_cycle_path(self, name, profile=profile)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

@@ -307,3 +307,39 @@ group.
   from before the GUI's `_tile_wells` started clearing and rebuilding on every re-tile;
   the dead deselection branch is gone, keeping only the glass-slide fallback and the
   empty-selection clear.
+- FIXED (preset display name lost to filename sanitization): `ConfigRepository.
+  save_observation_preset`/`save_acquisition_cycle` baked the sanitized *filename*
+  (spaces -> underscores, via `sanitize_preset_filename`) back into the saved
+  `state.name`/`cycle.name`, so any preset or cycle saved with a space in its name
+  permanently lost that space on first save. This broke name-based lookup for the
+  default contrast-AF channel (`MULTIPOINT_AUTOFOCUS_CHANNEL = "BF LED matrix
+  full"`), which raised `RuntimeError: ... is not a defined Observation State`
+  the moment contrast AF ran against a freshly-saved preset (see
+  `tests/control/test_MultiPointController.py::test_multi_point_with_contrast_af`).
+  `list_observation_presets`/`list_acquisition_cycles` also returned the sanitized
+  file stem, not the display name, so the GUI's save/load dropdown showed the
+  mangled name too. Fix: only the filename is sanitized now; `state.name`/
+  `cycle.name` keep the name exactly as given, and `list_observation_presets`/
+  `list_acquisition_cycles` read each file's own `name:` field (falling back to
+  the file stem when absent) instead of returning the stem directly. `load_*`
+  already read `name:` correctly and needed no change; `observation_preset_path`/
+  `acquisition_cycle_path` re-sanitize the given display name to reach the file,
+  which works because `stem == sanitize(name)` holds for every preset — old
+  (already-underscored, so trivially unaffected) and new alike. Read-only audit
+  of the rig's real profiles (`user_profiles/{Bill,default}/observation_presets/
+  *.yaml`, outside this worktree since `user_profiles/` is gitignored) confirmed
+  every existing preset already has `name:` equal to its underscored file stem —
+  i.e. every one was saved through the bug — so no data migration was needed;
+  they keep loading and listing unchanged under their existing (underscored)
+  names. New tests: `test_preset_display_name_with_spaces_survives_save_load_
+  round_trip` and `test_preexisting_underscored_preset_still_loads_and_lists_
+  correctly` in `tests/control/test_observation_state_and_metadata.py`; the
+  pre-existing `test_config_repository_acquisition_cycle_io` cycle test, which
+  had asserted the buggy sanitized-name behavior, was corrected to assert the
+  fixed behavior. Known follow-up (not fixed here, out of scope — touches
+  `job_processing.py`/`multi_point_worker.py`): saved TIFF/zarr filenames derive
+  their channel label from `observation_state.name`; a preset name with spaces
+  will now flow verbatim into on-disk image filenames where previously it never
+  could (every real preset name was space-free). Worth a follow-up sanitization
+  pass at the filename-building call sites if that turns out to matter in
+  practice.

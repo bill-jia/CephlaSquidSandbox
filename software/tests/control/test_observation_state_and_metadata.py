@@ -310,6 +310,96 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     assert loaded.name == "test_preset"
 
 
+def _repo_for_preset_io(tmp_path: Path) -> ConfigRepository:
+    base = tmp_path / "sw"
+    (base / "machine_configs").mkdir(parents=True)
+    (base / "user_profiles" / "p1" / "channel_configs").mkdir(parents=True)
+    (base / "user_profiles" / "p1" / "observation_presets").mkdir(parents=True)
+    (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
+        "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
+    )
+    state_for_general = ObservationState(
+        version=3,
+        name="TestLaser",
+        display_color="#FF0000",
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
+    )
+    (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
+        yaml.safe_dump(state_for_general.model_dump(mode="json", exclude_none=True)), encoding="utf-8"
+    )
+    repo = ConfigRepository(base_path=base)
+    repo.set_profile("p1")
+    return repo
+
+
+def test_preset_display_name_with_spaces_survives_save_load_round_trip(tmp_path: Path):
+    """A preset name with spaces (e.g. the default contrast-AF channel
+
+    'BF LED matrix full') must keep its exact display name after a
+    save/load round trip. Only the on-disk filename is sanitized; the name
+    the user typed is preserved verbatim in the saved state and in
+    ``list_observation_presets()``/name-based lookup, matching what the
+    Observation State save/load dropdown and MULTIPOINT_AUTOFOCUS_CHANNEL
+    depend on.
+    """
+    repo = _repo_for_preset_io(tmp_path)
+    state = _minimal_state(name="whatever", illumination_channel="BF LED matrix full", on=True)
+
+    path = repo.save_observation_preset("BF LED matrix full", state)
+
+    # Filename is sanitized (spaces -> underscores).
+    assert path.name == "BF_LED_matrix_full.yaml"
+
+    # The display name is preserved verbatim, not sanitized, in the saved file.
+    loaded = repo.load_observation_preset("BF LED matrix full")
+    assert loaded is not None
+    assert loaded.name == "BF LED matrix full"
+
+    # list_observation_presets() returns the display name, not the file stem.
+    assert repo.list_observation_presets() == ["BF LED matrix full"]
+
+    # Name-based lookup (what get_observation_state_by_name/perform_autofocus use)
+    # resolves the display name including its spaces.
+    resolved = repo.get_observation_state_by_name("BF LED matrix full")
+    assert resolved is not None
+    assert resolved.name == "BF LED matrix full"
+
+
+def test_preexisting_underscored_preset_still_loads_and_lists_correctly(tmp_path: Path):
+    """A preset saved by the old buggy code (name already underscored on disk)
+
+    must keep loading and listing unchanged -- this is a data-compatibility
+    guarantee, not a code shim.
+    """
+    repo = _repo_for_preset_io(tmp_path)
+    legacy_path = repo.user_profiles_path / "p1" / "observation_presets" / "BF_LED_matrix_full.yaml"
+    legacy_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 3,
+                "name": "BF_LED_matrix_full",
+                "illuminator_states": [
+                    {"illumination_channel": "BF LED matrix full", "intensity": 100.0, "on": True}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert repo.list_observation_presets() == ["BF_LED_matrix_full"]
+
+    loaded = repo.load_observation_preset("BF_LED_matrix_full")
+    assert loaded is not None
+    assert loaded.name == "BF_LED_matrix_full"
+
+    resolved = repo.get_observation_state_by_name("BF_LED_matrix_full")
+    assert resolved is not None
+    assert resolved.name == "BF_LED_matrix_full"
+
+
 def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, CycleStep, CycleWait
 
@@ -352,12 +442,14 @@ def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     )
     path = repo.save_acquisition_cycle("opto v1", cycle)
     assert path.exists()
-    # Sanitized name becomes the file stem and the in-file name.
-    assert repo.list_acquisition_cycles() == ["opto_v1"]
+    # The sanitized name becomes the file stem, but the display name (as the
+    # user typed it) is preserved verbatim in the file and in the listing.
+    assert path.stem == "opto_v1"
+    assert repo.list_acquisition_cycles() == ["opto v1"]
 
-    loaded = repo.load_acquisition_cycle("opto_v1")
+    loaded = repo.load_acquisition_cycle("opto v1")
     assert loaded is not None
-    assert loaded.name == "opto_v1"
+    assert loaded.name == "opto v1"
     assert loaded.repeat == 4
     assert isinstance(loaded.items[0], CycleGroup)
     assert loaded.items[0].repeat == 3
@@ -371,9 +463,9 @@ def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     assert isinstance(loaded.items[2], CycleStep)
     assert loaded.items[2].n_frames == 5
 
-    assert repo.delete_acquisition_cycle("opto_v1") is True
+    assert repo.delete_acquisition_cycle("opto v1") is True
     assert repo.list_acquisition_cycles() == []
-    assert repo.load_acquisition_cycle("opto_v1") is None
+    assert repo.load_acquisition_cycle("opto v1") is None
 
 
 def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):
