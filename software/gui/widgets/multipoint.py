@@ -3428,8 +3428,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.entry_minZ.setValue(self.stage.get_pos().z_mm * 1000)  # Set to current position
         self.entry_minZ.setSuffix(" μm")
         # self.entry_minZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.set_minZ_button = QPushButton("Set")
+        # Same Set | Go To | label | value row as the wellplate tab.
+        self.set_minZ_button = QPushButton("Set Z-min")
         self.set_minZ_button.clicked.connect(self.set_z_min)
+
+        self.goto_minZ_button = QPushButton("Go To")
+        self.goto_minZ_button.clicked.connect(self.goto_z_min)
+        self.goto_minZ_button.setFixedWidth(50)
 
         self.entry_maxZ = QDoubleSpinBox()
         self.entry_maxZ.setKeyboardTracking(False)
@@ -3439,8 +3444,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.entry_maxZ.setValue(self.stage.get_pos().z_mm * 1000)  # Set to current position
         self.entry_maxZ.setSuffix(" μm")
         # self.entry_maxZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.set_maxZ_button = QPushButton("Set")
+        self.set_maxZ_button = QPushButton("Set Z-max")
         self.set_maxZ_button.clicked.connect(self.set_z_max)
+
+        self.goto_maxZ_button = QPushButton("Go To")
+        self.goto_maxZ_button.clicked.connect(self.goto_z_max)
+        self.goto_maxZ_button.setFixedWidth(50)
 
         self.combobox_z_stack = QComboBox()
         self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
@@ -3561,12 +3570,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # by index, so they must stay the same length).
         self.z_min_layout = QHBoxLayout()
         self.z_min_layout.addWidget(self.set_minZ_button)
+        self.z_min_layout.addWidget(self.goto_minZ_button)
         self.z_min_layout.addWidget(QLabel("Z-min"))
         self.z_min_layout.addWidget(self.entry_minZ)
         self.z_min_layout.addStretch(1)
 
         self.z_max_layout = QHBoxLayout()
         self.z_max_layout.addWidget(self.set_maxZ_button)
+        self.z_max_layout.addWidget(self.goto_maxZ_button)
         self.z_max_layout.addWidget(QLabel("Z-max"))
         self.z_max_layout.addWidget(self.entry_maxZ)
         self.z_max_layout.addStretch(1)
@@ -3856,6 +3867,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
     def set_z_max(self):
         z_value = self.stage.get_pos().z_mm * 1000  # Convert to μm
         self.entry_maxZ.setValue(z_value)
+
+    def goto_z_min(self):
+        # Z-only move: the retract-Z-for-XY-moves setting does not apply, there is
+        # nothing to travel across.
+        self.stage.move_z_to(self.entry_minZ.value() / 1000)  # Convert from μm to mm
+
+    def goto_z_max(self):
+        self.stage.move_z_to(self.entry_maxZ.value() / 1000)  # Convert from μm to mm
 
     def update_z_min(self, z_pos_um):
         if z_pos_um < self.entry_minZ.value():
@@ -5539,13 +5558,18 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
 
         tiling_section, tiling_content = _make_section("Tiling per position")
 
-        # Two ways to say how much of each well to cover. "Nx × Ny" is the Flexible
-        # tab's grid; it is not wired to the scan generator yet (R2-wire), it only
-        # swaps which rows are on screen.
+        # Two ways to say how much of each well to cover: a scan area that is a
+        # fraction of the well, or the Flexible tab's explicit Nx x Ny grid centred
+        # on the well centre (on the stage position in Current Position mode).
         self.radio_tiling_fraction = QRadioButton("Fraction of well")
         self.radio_tiling_grid = QRadioButton("Nx × Ny")
         self.radio_tiling_fraction.setChecked(True)
-        self.radio_tiling_grid.setToolTip("Not wired to the scan generator yet — the fraction method still tiles.")
+        self.radio_tiling_fraction.setToolTip(
+            "Cover a scan area of the given size in each well, tiled to fill the shape."
+        )
+        self.radio_tiling_grid.setToolTip(
+            "Image an explicit Nx × Ny block of FOVs centred on each well centre, whatever the well size."
+        )
         self.tiling_method_group = QButtonGroup(self)
         self.tiling_method_group.addButton(self.radio_tiling_fraction)
         self.tiling_method_group.addButton(self.radio_tiling_grid)
@@ -5811,8 +5835,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.combobox_xy_mode.currentTextChanged.connect(self.on_xy_mode_changed)
         self.checkbox_z.toggled.connect(self.on_z_toggled)
         self.checkbox_time.toggled.connect(self.on_time_toggled)
-        # The tiling method only swaps which rows are on screen until R2-wire.
-        self.radio_tiling_fraction.toggled.connect(lambda *_: self.update_scan_control_ui())
+        # Only one radio of the exclusive pair is connected: switching method fires
+        # toggled on both, and the handler is a full re-tile.
+        self.radio_tiling_fraction.toggled.connect(lambda *_: self._on_tiling_method_changed())
+        self.entry_NX.valueChanged.connect(self.update_coordinates)
+        self.entry_NY.valueChanged.connect(self.update_coordinates)
 
         # Load cached acquisition settings
         self.load_multipoint_widget_config_from_cache()
@@ -6585,6 +6612,46 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.scanCoordinates.set_snake_scan(enabled)
         self.update_coordinates()
 
+    def _tile_wells(self):
+        """Re-tile every selected well with the *Tiling per position* method in force.
+
+        The two methods produce the same region ids (the well id) and the generators
+        skip a well that already has a region, so a re-tile has to clear first -
+        otherwise nothing would change when a tiling parameter or the method itself
+        does.
+        """
+        if self.scanCoordinates.has_regions():
+            self.scanCoordinates.clear_regions()
+        if self.radio_tiling_grid.isChecked():
+            self.scanCoordinates.set_well_coordinates_grid(
+                self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value()
+            )
+        else:
+            self.scanCoordinates.set_well_coordinates(
+                self.entry_scan_size.value(), self.entry_overlap.value(), self.combobox_shape.currentText()
+            )
+
+    def _tile_live(self, x_mm, y_mm):
+        """Current Position counterpart of ``_tile_wells``: one region on the stage."""
+        if self.radio_tiling_grid.isChecked():
+            self.scanCoordinates.set_live_scan_coordinates_grid(
+                x_mm, y_mm, self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value()
+            )
+        else:
+            self.scanCoordinates.set_live_scan_coordinates(
+                x_mm,
+                y_mm,
+                self.entry_scan_size.value(),
+                self.entry_overlap.value(),
+                self.combobox_shape.currentText(),
+            )
+
+    def _on_tiling_method_changed(self):
+        """Swap which tiling rows are on screen, then rebuild the regions with the
+        method now selected."""
+        self.update_scan_control_ui()
+        self.update_coordinates()
+
     def update_coordinates(self):
         if self.tab_widget and self.tab_widget.currentWidget() != self:
             return
@@ -6594,20 +6661,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.set_coordinates_to_current_position()
             return
 
-        scan_size_mm = self.entry_scan_size.value()
-        overlap_percent = self.entry_overlap.value()
-        shape = self.combobox_shape.currentText()
-
         if self.combobox_xy_mode.currentText() == "Manual":
-            self.scanCoordinates.set_manual_coordinates(self.shapes_mm, overlap_percent)
+            self.scanCoordinates.set_manual_coordinates(self.shapes_mm, self.entry_overlap.value())
 
         elif self.combobox_xy_mode.currentText() == "Current Position":
             pos = self.stage.get_pos()
-            self.scanCoordinates.set_live_scan_coordinates(pos.x_mm, pos.y_mm, scan_size_mm, overlap_percent, shape)
+            self._tile_live(pos.x_mm, pos.y_mm)
         else:
-            if self.scanCoordinates.has_regions():
-                self.scanCoordinates.clear_regions()
-            self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
+            self._tile_wells()
 
         _refresh_size_estimate(self)
 
@@ -6617,11 +6678,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         When the objective changes, the FOV size changes, which affects both the
         effective well size (for Circle shapes) and the coverage calculation.
         Scan_size stays constant; coverage is recalculated and coordinates are
-        updated to reflect the new tile positions.
+        updated to reflect the new tile positions. An Nx x Ny grid has no coverage
+        to recompute - it is just re-tiled at the new FOV size.
         """
         if self.tab_widget and self.tab_widget.currentWidget() != self:
             return
-        if self.combobox_xy_mode.currentText() == "Select Wells":
+        if self.combobox_xy_mode.currentText() == "Select Wells" and self.radio_tiling_fraction.isChecked():
             # Coverage is read-only, derived from scan_size and FOV
             self.update_coverage_from_scan_size()
         self.update_coordinates()
@@ -6639,10 +6701,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             return
 
         if selected:
-            scan_size_mm = self.entry_scan_size.value()
-            overlap_percent = self.entry_overlap.value()
-            shape = self.combobox_shape.currentText()
-            self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
+            self._tile_wells()
         elif self.scanCoordinates.has_regions():
             self.scanCoordinates.clear_regions()
 
@@ -6665,10 +6724,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         position_changed = (x_mm != self._last_x_mm) or (y_mm != self._last_y_mm)
         if not position_changed or time.time() - self._last_update_time < 0.5:
             return
-        scan_size_mm = self.entry_scan_size.value()
-        overlap_percent = self.entry_overlap.value()
-        shape = self.combobox_shape.currentText()
-        self.scanCoordinates.set_live_scan_coordinates(x_mm, y_mm, scan_size_mm, overlap_percent, shape)
+        self._tile_live(x_mm, y_mm)
         self._last_update_time = time.time()
         self._last_x_mm = x_mm
         self._last_y_mm = y_mm
@@ -6740,6 +6796,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.multipointController.set_widget_type("wellplate")
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
+            # NX/NY are metadata here (the regions are already tiled), but they are what
+            # the acquisition yaml records, so a fraction-of-well run must not claim a grid.
+            grid_tiling = self.radio_tiling_grid.isChecked()
+            self.multipointController.set_NX(self.entry_NX.value() if grid_tiling else 1)
+            self.multipointController.set_NY(self.entry_NY.value() if grid_tiling else 1)
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self._push_channel_selection_to_controller()
             # Re-push THIS tab's visible save-format + streaming state (the
@@ -7266,6 +7327,10 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 self.checkbox_z,
                 self.checkbox_time,
                 self.checkbox_usePiezo,
+                self.radio_tiling_fraction,
+                self.radio_tiling_grid,
+                self.entry_NX,
+                self.entry_NY,
             ]
         )
 
@@ -7305,6 +7370,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 index = self.combobox_shape.findText(yaml_data.scan_shape)
                 if index >= 0:
                     self.combobox_shape.setCurrentIndex(index)
+
+            # Tiling method: a file that names a real grid asks for Nx x Ny. A 1x1
+            # grid is what the writer emits for a fraction-of-well run too, so it
+            # says nothing and the current method is kept.
+            if yaml_data.nx * yaml_data.ny > 1:
+                self.radio_tiling_grid.setChecked(True)
+                self.entry_NX.setValue(yaml_data.nx)
+                self.entry_NY.setValue(yaml_data.ny)
 
             # Channels
             if yaml_data.channel_names:

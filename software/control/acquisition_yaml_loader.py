@@ -47,11 +47,13 @@ class AcquisitionYAMLData:
     scan_shape: Optional[str] = None
     wellplate_regions: Optional[List[Dict]] = None  # [{name, center_mm, shape}, ...]
 
-    # Flexible-specific
+    # Tiling grid - written by both scan sections, read from whichever the file has
     nx: int = 1
     ny: int = 1
     delta_x_mm: float = 0.9
     delta_y_mm: float = 0.9
+
+    # Flexible-specific
     flexible_positions: Optional[List[Dict]] = None  # [{name, center_mm}, ...]
 
 
@@ -98,13 +100,10 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
     else:
         camera_binning = None
 
-    # Determine overlap_percent from the appropriate section
-    if wellplate_scan:
-        overlap = wellplate_scan.get("overlap_percent", 10.0)
-    elif flexible_scan:
-        overlap = flexible_scan.get("overlap_percent", 10.0)
-    else:
-        overlap = 10.0
+    # Both scan sections carry the same tiling keys (overlap, nx/ny, dx/dy); read them
+    # from whichever section this file has.
+    scan = wellplate_scan or flexible_scan
+    overlap = scan.get("overlap_percent", 10.0)
 
     # Get scan shape from first region if available
     scan_shape = None
@@ -146,11 +145,12 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         overlap_percent=overlap,
         scan_shape=scan_shape,
         wellplate_regions=wellplate_regions,
+        # Tiling grid (either section)
+        nx=scan.get("nx", 1),
+        ny=scan.get("ny", 1),
+        delta_x_mm=scan.get("delta_x_mm", 0.9),
+        delta_y_mm=scan.get("delta_y_mm", 0.9),
         # Flexible-specific
-        nx=flexible_scan.get("nx", 1),
-        ny=flexible_scan.get("ny", 1),
-        delta_x_mm=flexible_scan.get("delta_x_mm", 0.9),
-        delta_y_mm=flexible_scan.get("delta_y_mm", 0.9),
         flexible_positions=flexible_scan.get("positions"),
     )
 

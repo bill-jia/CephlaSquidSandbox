@@ -196,6 +196,46 @@ group.
   scan moved to *Scan behaviour* on the Flexible tab. The `Method` selector only
   swaps which tiling rows are on screen — `Nx × Ny` is not generated yet.
   Tests: the Z/Time group cases in `test_flexible_region_state.py`.
-- **R2-wire (main tree, after both):** wire `Nx × Ny` to the R2-core API in
-  `update_coordinates`, `update_well_coordinates`, `update_live_coordinates`,
-  the cache and the YAML path; screenshots of both panels with wells selected.
+- **R2-wire (main tree, after both): DONE.** Every coordinate path on the wellplate
+  tab now goes through one of two private helpers — `_tile_wells()` (Select Wells)
+  and `_tile_live(x, y)` (Current Position) — which are the single place the
+  `radio_tiling_grid.isChecked()` branch lives, so `update_coordinates`,
+  `update_well_coordinates` and `update_live_coordinates` cannot drift apart.
+  `_tile_wells` always `clear_regions()` first: both methods name a region after the
+  well and both generators skip a well that already has one, so without the clear a
+  changed parameter (or a changed method) would leave the old grid standing.
+  `_on_tiling_method_changed` = `update_scan_control_ui` + `update_coordinates`, wired
+  to `radio_tiling_fraction.toggled` (one radio of an exclusive pair is enough), and
+  `entry_NX/NY.valueChanged` re-tile as well as write the cache.
+  `handle_objective_change` skips the coverage recompute for grids and just re-tiles.
+  `toggle_acquisition` pushes `set_NX`/`set_NY` (the grid values, or 1 for the
+  fraction method) so `acquisition.yaml` records what was really tiled — they are
+  metadata only, the worker does not read them.
+  YAML: `AcquisitionYAMLData.nx/ny` (and `delta_x_mm`/`delta_y_mm`) are now read from
+  whichever scan section the file carries, not just `flexible_scan` — the wellplate
+  writer has always emitted `nx`/`ny` under `wellplate_scan`. A drop with `nx*ny > 1`
+  selects `Nx × Ny` and fills the spinboxes; `1x1` says nothing (it is also what a
+  fraction-of-well run writes) and leaves the method alone.
+  Z-range rows are now identical on both tabs: the Flexible tab gained
+  `goto_minZ_button` / `goto_maxZ_button` and `goto_z_min` / `goto_z_max` (a plain
+  `move_z_to`; the retract-Z-for-XY-moves setting does not apply to a Z-only move),
+  and its `Set` buttons are labelled `Set Z-min` / `Set Z-max`.
+  `tools/screenshot_multipoint.py` gained `--select-wells A1,B2`, `--tiling
+  fraction|grid|both` with `--nx/--ny`, and `--nav-shot`; it raises each panel's tab
+  *before* touching it, because the panels ignore coordinate updates from a background
+  tab. `--tiling both` writes `wellplate_fraction.png` + `wellplate_grid.png`.
+  Tests: `software/tests/control/test_wellplate_tiling_method.py` (9 cases) plus the
+  wellplate-grid case in `test_acquisition_yaml_loader.py`.
+
+## Follow-ups (found during R2-wire, deliberately not fixed here)
+
+- `ScanCoordinates.add_flexible_region` never populates `region_shapes`, so
+  `region_contains_coordinate` raises `KeyError` for regions defined on the Flexible
+  panel (bites focus-map point generation, `control/core/core.py:~1963`). The wellplate
+  grid method dodges it only because `_add_well_grid_region` sets the shape by hand
+  afterwards.
+- The wellplate tab's non-range Z span is `z + dz * (Nz - 1)` where `z` is in mm and
+  `dz` in µm (`entry_deltaZ` has a µm suffix); the Flexible tab divides `dz` by 1000
+  in the same expression. Check and fix in a separate commit if it really is wrong.
+- Channels box placement: still to be decided from the final screenshots (it is a
+  full-width box under the parameter block on both tabs today).

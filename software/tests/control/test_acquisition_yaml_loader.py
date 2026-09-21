@@ -76,6 +76,35 @@ wellplate_scan:
         assert result.scan_shape == "Square"
         assert len(result.wellplate_regions) == 2
         assert result.wellplate_regions[0]["name"] == "C4"
+        # No grid keys in this file: the fraction-of-well method, not a 1xN grid.
+        assert (result.nx, result.ny) == (1, 1)
+
+    def test_parse_wellplate_yaml_with_a_tiling_grid(self, tmp_path):
+        """The Nx x Ny tiling method writes nx/ny into wellplate_scan; a drop of that
+        file has to put the panel back on the grid method, so the loader must read the
+        keys from the wellplate section as well as the flexible one."""
+        yaml_file = tmp_path / "wellplate_grid.yaml"
+        yaml_file.write_text(
+            """
+acquisition:
+  widget_type: wellplate
+  xy_mode: Select Wells
+wellplate_scan:
+  scan_size_mm: 2.1
+  overlap_percent: 20.0
+  nx: 2
+  ny: 3
+  regions:
+    - name: B2
+      center_mm: [38.31, 28.75, 1.2]
+      shape: Square
+"""
+        )
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert (result.nx, result.ny) == (2, 3)
+        assert result.overlap_percent == 20.0
 
     def test_parse_flexible_yaml(self, tmp_path):
         """Test parsing a flexible acquisition YAML file."""
