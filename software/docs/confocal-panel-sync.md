@@ -75,6 +75,54 @@ Loop avoidance, which is load-bearing — this runs on every channel switch:
   will not report cannot put a serial round-trip on the UI thread on every
   channel switch of a running acquisition.
 
+## The Widefield/Confocal switch, the motor, and failure semantics
+
+`switch_confocal` and `switch_motor` are `SegmentedSwitch`es (`gui/widgets/common.py`):
+a two-segment button where clicking the segment that is *not* lit emits
+`state_requested(bool)` rather than lighting itself — the same "ask, don't
+claim" rule as the rest of the panel. `switch_confocal.state_requested` drives
+`request_disk_position`; `switch_motor.state_requested` drives
+`request_motor_state`.
+
+`request_disk_position` runs `serial_peripherals.set_xlight_confocal_mode` on a
+worker thread (`utils.threaded_operation_helper`) and queues
+`_on_disk_position_toggled(moved, position, error_msg)` back onto the UI thread
+with the result.
+
+`set_xlight_confocal_mode(xlight, confocal)` is the single entry point every
+caller (this panel, `ObservationStateController.apply_confocal_mode`,
+`Microscope.set_confocal_mode`) uses to move the disk, because the motor (`N`)
+and the disk position (`D`) are independent commands and driving the disk into
+the light path while the motor is parked images through a static pinhole mask:
+
+- **Entering confocal** starts the motor first (skipping the start if
+  `get_disk_motor_state()` already reports it running), then reads the motor
+  state back. If the motor cannot be confirmed running — the start call raises,
+  or the read-back still says off — it **raises `RuntimeError` without ever
+  touching the disk**. A motor that will not start must fail the whole move,
+  not silently let the disk into the path anyway.
+- **Leaving confocal** never touches the motor at all (and so never raises for
+  a dead one): it is deliberately left spinning to skip the next spin-up, and a
+  spinning disk out of the light path harms nothing.
+
+Both callers that can reach this from outside the panel treat the exception the
+same way: a failed move must never be recorded as a mode change.
+`ObservationStateController.apply_confocal_mode` only calls
+`toggle_confocal_widefield` (which is what flips `state.confocal_mode`) when
+the hardware call did not raise; on failure it logs a warning and leaves the
+state exactly where it was. `Microscope.set_confocal_mode` has no try/except at
+all — the exception propagates to the headless caller, and the `toggle_confocal_widefield`
+call after it is simply never reached.
+
+The panel's own `_on_disk_position_toggled(moved, position, error_msg)` follows
+the same rule for `disk_position_state` / `switch_confocal` /
+`signal_toggle_confocal_widefield`, all gated on `moved`, and logs `error_msg`
+on failure. The motor switch is refreshed from the driver's cached
+`disk_motor_state` **unconditionally**, success or failure: a move into
+confocal can fail *after* the motor already started (the disk write itself
+failed), and the panel must show the motor actually spinning rather than
+"Disk Off" while it does.
+
 ## The filter slider and the UI thread
 
 A slider move is 5 s, so the panel runs it on a worker thread
@@ -93,7 +141,7 @@ thread exists to avoid.
 | Emission filter wheel | driver `rB` + panel | `emission_filter_positions["default"]` | yes (`sleep_time_for_wheel`) |
 | Dichroic wheel | driver `rC` + panel | `confocal_hardware_settings.dichroic_position` | yes (`sleep_time_for_wheel`) |
 | Dichroic filter slider | driver `rP` + panel | `confocal_hardware_settings.filter_slider_position` | yes (5 s) |
-| Disk position (confocal/widefield) | driver `rD` + `Microscope._sync_confocal_mode_from_hardware` | `confocal_mode` | guarded in `apply_confocal_mode`, not in the driver |
+| Disk position (confocal/widefield) | driver `rD` + `Microscope._sync_confocal_mode_from_hardware` | `confocal_mode` | guarded in `set_xlight_confocal_mode` (motor confirmed before the disk moves) and `apply_confocal_mode` (a failed move is never recorded) |
 | Disk motor | driver `rN` + panel button | not in an observation state, by design | no (a stop must always be sent) |
 
 ## Tests

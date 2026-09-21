@@ -229,6 +229,16 @@ group.
 
 ## Follow-ups (found during R2-wire, deliberately not fixed here)
 
+- FIXED (item 9, confocal partial failures): `set_xlight_confocal_mode` now raises
+  instead of moving the disk when the motor cannot be confirmed running, and both
+  `ObservationStateController.apply_confocal_mode` and the panel's
+  `_on_disk_position_toggled` no longer record/light confocal on a failed move; the
+  panel's motor switch is now refreshed on failure too, and the error is logged. See
+  `tests/control/test_confocal_widget_sync.py`, `tests/control/core/test_observation_state_confocal.py`.
+- FIXED (stale doc): `software/docs/confocal-panel-sync.md` now documents the
+  `SegmentedSwitch`-based Widefield/Confocal and Disk Off/Disk On controls,
+  `set_xlight_confocal_mode`'s auto-start, and the failure semantics above.
+
 - FIXED: `ScanCoordinates.add_flexible_region` never populates `region_shapes`, so
   `region_contains_coordinate` raises `KeyError` for regions defined on the Flexible
   panel (bites focus-map point generation, `control/core/core.py:~1963`). The wellplate

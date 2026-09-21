@@ -405,6 +405,7 @@ class ObservationStateController:
         addons = getattr(self.microscope, "addons", None)
         dragonfly = getattr(addons, "dragonfly", None)
         xlight = getattr(addons, "xlight", None)
+        hardware_moved = True
         if dragonfly is not None or xlight is not None:
             try:
                 with self._time("obs:confocal:set_disk_position"):
@@ -414,12 +415,18 @@ class ObservationStateController:
                         # Starts the spinning disk on the way into confocal.
                         serial_peripherals.set_xlight_confocal_mode(xlight, confocal)
             except Exception as e:
+                hardware_moved = False
                 self._log.warning(
                     "Could not move the spinning disk to %s: %s",
                     "confocal" if confocal else "widefield",
                     e,
                 )
-        self.toggle_confocal_widefield(confocal)
+        # Only record the mode if the disk (or dragonfly modality) actually got
+        # there -- otherwise the observation state would claim a light path the
+        # unit never entered (e.g. a confocal channel imaged through a parked
+        # pinhole mask).
+        if hardware_moved:
+            self.toggle_confocal_widefield(confocal)
 
     # ─────────────────────────────────────────────────────────────────────
     # Illumination control (moved from LiveController)

@@ -671,27 +671,34 @@ class SpinningDiskConfocalWidget(QWidget):
                 Qt.QueuedConnection,
                 Q_ARG(bool, bool(success)),
                 Q_ARG(int, target_position),
+                Q_ARG(str, error_msg or ""),
             )
 
         utils.threaded_operation_helper(
             serial_peripherals.set_xlight_confocal_mode, on_finished, xlight=self.xlight, confocal=confocal
         )
 
-    @Slot(bool, int)
-    def _on_disk_position_toggled(self, moved, position):
+    @Slot(bool, int, str)
+    def _on_disk_position_toggled(self, moved, position, error_msg=""):
         """Light the new segment only if the disk actually got there.
 
-        A failed move leaves the switch (and ``disk_position_state``, and the
-        observation state controller) on the position the disk is still in,
-        rather than recording a light path the unit never entered.
+        A failed move leaves the confocal switch (and ``disk_position_state``,
+        and the observation state controller) on the position the disk is still
+        in, rather than recording a light path the unit never entered. The
+        motor switch is refreshed from the driver's cached state regardless of
+        whether the move succeeded: a failed move into confocal can still have
+        started the motor (see ``set_xlight_confocal_mode``), and the panel
+        must not show "Disk Off" while the disk is spinning.
         """
         if moved:
             self.disk_position_state = position
             self.switch_confocal.set_state(position == 1)
-            if self.xlight.has_spinning_disk_motor:
-                running = getattr(self.xlight, "disk_motor_state", None)
-                if running is not None:
-                    self.switch_motor.set_state(bool(running))
+        else:
+            self._log.error("Failed to move the X-Light disk: %s", error_msg or "unknown error")
+        if self.xlight.has_spinning_disk_motor:
+            running = getattr(self.xlight, "disk_motor_state", None)
+            if running is not None:
+                self.switch_motor.set_state(bool(running))
         self.enable_all_buttons(True)
         if moved:
             self.signal_toggle_confocal_widefield.emit(self.disk_position_state)

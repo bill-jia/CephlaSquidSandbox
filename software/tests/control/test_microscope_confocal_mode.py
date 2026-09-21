@@ -20,6 +20,18 @@ class FakeXLight:
         self.disk_positions.append(position)
 
 
+class FakeXLightWithDeadMotor(FakeXLight):
+    """A unit whose motor cannot be confirmed running."""
+
+    has_spinning_disk_motor = True
+
+    def get_disk_motor_state(self):
+        return False
+
+    def set_disk_motor_state(self, state):
+        raise OSError("motor did not answer")
+
+
 class FakeDragonfly:
     def __init__(self):
         self.modalities = []
@@ -92,3 +104,16 @@ def test_raises_when_disabled(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not enabled"):
         Microscope.set_confocal_mode(_scope(xlight=FakeXLight()), True)
+
+
+def test_a_motor_that_will_not_start_is_never_recorded(confocal_enabled):
+    """No try/except here: the exception must propagate, and the mode flag
+    must never flip, since the disk was never actually moved."""
+    xlight = FakeXLightWithDeadMotor()
+    scope = _scope(xlight=xlight)
+
+    with pytest.raises(RuntimeError):
+        Microscope.set_confocal_mode(scope, True)
+
+    assert xlight.disk_positions == []
+    assert scope.obs_controller.toggled == []

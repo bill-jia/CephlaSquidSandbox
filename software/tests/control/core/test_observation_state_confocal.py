@@ -88,6 +88,12 @@ class FakeXLight:
     def get_disk_position(self):
         return self.spinning_disk_pos
 
+    def get_disk_motor_state(self):
+        return self.disk_motor_state
+
+    def set_disk_motor_state(self, state):
+        self.disk_motor_state = state
+
     def set_illumination_iris(self, value):
         self.illumination_iris = value
 
@@ -484,6 +490,29 @@ def test_apply_confocal_mode_survives_a_disk_error(confocal_enabled, caplog):
     ctl = _make_controller(xlight=BadXLight())
     with caplog.at_level("WARNING"):
         ctl.apply_confocal_mode(True)
+    assert any("spinning disk" in rec.getMessage() for rec in caplog.records)
+    # A move that never reached the disk must not be recorded as confocal: a
+    # preset saved right after this would otherwise claim a light path the
+    # unit never entered.
+    assert ctl.is_confocal_mode() is False
+
+
+def test_apply_confocal_mode_does_not_record_when_the_motor_will_not_start(confocal_enabled, caplog):
+    """The motor failing to start must fail the whole move, not just be logged."""
+
+    class DeadMotorXLight(FakeXLight):
+        def set_disk_motor_state(self, state):
+            raise OSError("motor did not answer")
+
+    xlight = DeadMotorXLight()
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _state()
+
+    with caplog.at_level("WARNING"):
+        ctl.apply_confocal_mode(True)
+
+    assert ctl.is_confocal_mode() is False
+    assert xlight.disk_position_calls == []
     assert any("spinning disk" in rec.getMessage() for rec in caplog.records)
 
 

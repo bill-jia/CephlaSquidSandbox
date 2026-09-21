@@ -174,15 +174,19 @@ def set_xlight_confocal_mode(xlight, confocal: bool) -> None:
     to widefield: stopping it costs a spin-up on the next channel switch and a
     spinning disk out of the light path harms nothing.
 
-    A motor that will not start is logged, not raised: the disk move is the
-    operation the caller asked for and it still happens.
+    A motor that will not confirm running is raised, not logged: moving the disk
+    into the path anyway would image through a parked pinhole mask while the
+    caller believes confocal is live, which is worse than not moving at all. The
+    disk is never touched unless the motor is confirmed on first.
     """
     if confocal and getattr(xlight, "has_spinning_disk_motor", False):
         try:
             if not xlight.get_disk_motor_state():
                 xlight.set_disk_motor_state(True)
-        except Exception:
-            log.warning("Could not start the X-Light spinning disk motor for confocal", exc_info=True)
+        except Exception as e:
+            raise RuntimeError(f"Could not start the X-Light spinning disk motor for confocal: {e}") from e
+        if not xlight.get_disk_motor_state():
+            raise RuntimeError("X-Light spinning disk motor did not confirm running after being started")
     xlight.set_disk_position(1 if confocal else 0)
 
 

@@ -465,7 +465,12 @@ def test_entering_confocal_starts_the_motor_first():
     """A parked disk in the light path is a static pinhole mask, never intended."""
     xlight = sp.XLight_Simulation()
     order = []
-    xlight.set_disk_motor_state = lambda state: order.append(("motor", state))
+
+    def start_motor(state):
+        order.append(("motor", state))
+        xlight.disk_motor_state = state  # what a real motor start confirms on read-back
+
+    xlight.set_disk_motor_state = start_motor
     xlight.set_disk_position = lambda position: order.append(("disk", position))
 
     sp.set_xlight_confocal_mode(xlight, True)
@@ -497,7 +502,8 @@ def test_leaving_confocal_leaves_the_disk_spinning():
     assert xlight.disk_motor_state is True
 
 
-def test_a_motor_that_will_not_start_does_not_block_the_disk_move():
+def test_a_motor_that_raises_fails_the_move_and_leaves_the_disk_put():
+    """A parked disk imaged as if it were confocal is worse than not moving."""
     xlight = sp.XLight_Simulation()
 
     def refuse(state):
@@ -505,9 +511,37 @@ def test_a_motor_that_will_not_start_does_not_block_the_disk_move():
 
     xlight.set_disk_motor_state = refuse
 
-    sp.set_xlight_confocal_mode(xlight, True)
+    with pytest.raises(RuntimeError):
+        sp.set_xlight_confocal_mode(xlight, True)
 
-    assert xlight.spinning_disk_pos == 1
+    assert xlight.spinning_disk_pos == 0
+
+
+def test_a_motor_that_does_not_confirm_running_fails_the_move():
+    """The motor call can silently no-op on some faults: the read-back is what counts."""
+    xlight = sp.XLight_Simulation()
+    xlight.set_disk_motor_state = lambda state: None  # "succeeds" but changes nothing
+    xlight.get_disk_motor_state = lambda: False
+
+    with pytest.raises(RuntimeError):
+        sp.set_xlight_confocal_mode(xlight, True)
+
+    assert xlight.spinning_disk_pos == 0
+
+
+def test_leaving_confocal_never_touches_or_needs_the_motor():
+    """Going to widefield must succeed even with a motor that cannot be reached."""
+    xlight = sp.XLight_Simulation()
+
+    def boom(*args, **kwargs):
+        raise OSError("motor is dead")
+
+    xlight.set_disk_motor_state = boom
+    xlight.get_disk_motor_state = boom
+
+    sp.set_xlight_confocal_mode(xlight, False)  # must not raise
+
+    assert xlight.spinning_disk_pos == 0
 
 
 def test_a_unit_without_a_motor_just_moves_the_disk():
@@ -531,3 +565,28 @@ def test_panel_motor_switch_follows_the_spin_up(panel):
 
     assert panel.switch_motor.state() is True
     assert panel.switch_motor.btn_on.isChecked() is True
+
+
+def test_a_failed_disk_move_still_shows_a_motor_that_spun_up(panel):
+    """A failed disk move must not hide a motor that is actually running.
+
+    ``set_xlight_confocal_mode`` starts the motor before moving the disk, so a
+    move into confocal can fail *after* the motor is already spinning. The
+    confocal switch must stay on Widefield (the disk never got there), but the
+    motor switch must reflect the motor, not the failed move.
+    """
+    panel.xlight.set_disk_motor_state(True)
+
+    panel._on_disk_position_toggled(False, 1)
+
+    assert panel.switch_motor.state() is True
+    assert panel.switch_motor.btn_on.isChecked() is True
+    assert panel.switch_confocal.state() is False
+    assert panel.switch_confocal.btn_off.isChecked() is True
+
+
+def test_a_failed_disk_move_logs_the_error(panel, caplog):
+    with caplog.at_level("ERROR"):
+        panel._on_disk_position_toggled(False, 1, "disk did not answer")
+
+    assert any("disk did not answer" in rec.getMessage() for rec in caplog.records)
