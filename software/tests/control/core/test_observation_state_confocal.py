@@ -522,9 +522,11 @@ def test_confocal_mode_round_trips_collect_save_load_apply(tmp_path, confocal_en
     ctl = _make_controller(xlight=xlight, config_repo=repo)
     ctl.current_observation_state = _state()
 
-    # 1. User goes confocal and picks a filter.
+    # 1. User goes confocal, picks a filter and sets both irises on the unit.
     ctl.toggle_confocal_widefield(True)
     ctl.set_emission_filter_position(5)
+    xlight.set_illumination_iris(70)
+    xlight.set_emission_iris(40)
 
     # 2. Collect hardware-true state and save it as a preset.
     collected = ctl._collect_live_state_with_emission_filters()
@@ -547,6 +549,7 @@ def test_confocal_mode_round_trips_collect_save_load_apply(tmp_path, confocal_en
     ctl.toggle_confocal_widefield(False)
     xlight.disk_position_calls.clear()
     xlight.set_emission_filter_calls.clear()
+    xlight.illumination_iris = xlight.emission_iris = 100
 
     ctl.apply_observation_state_preset(loaded)
 
@@ -784,6 +787,43 @@ def test_persist_iris_config_records_on_the_live_state():
 
     hw = ctl.current_observation_state.confocal_hardware_settings
     assert (hw.illumination_iris, hw.emission_iris) == (65.0, 35.0)
+
+
+def test_preset_saves_the_iris_on_the_hardware_not_the_general_yaml_default(tmp_path):
+    """Regression: general.yaml seeds the iris from the machine-config default
+    (70 here); a preset saved after opening the iris to 100 on the panel came
+    back at the default, because collect copied general.yaml's confocal block."""
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight(emission_wheel_pos=1)
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    ctl.current_observation_state = _state()
+
+    # Panel moves the hardware; no persist signal reaches the controller.
+    xlight.set_illumination_iris(100)
+    xlight.set_emission_iris(90)
+
+    repo.save_observation_preset("wide_open", ctl.collect_observation_state())
+    loaded = repo.load_observation_preset("wide_open")
+    hw = loaded.confocal_hardware_settings
+    assert (hw.illumination_iris, hw.emission_iris) == (100.0, 90.0)
+
+    xlight.illumination_iris = 30
+    xlight.emission_iris = 30
+    ctl.apply_observation_state_preset(loaded)
+    assert (xlight.illumination_iris, xlight.emission_iris) == (100, 90)
+
+
+def test_collect_falls_back_to_the_live_state_when_the_driver_does_not_know():
+    """A failed read-back leaves the driver cache None; the live state then wins."""
+    xlight = FakeXLight(emission_wheel_pos=1)
+    xlight.illumination_iris = None
+    ctl = _make_controller(xlight=xlight)
+    ctl.current_observation_state = _state()
+    ctl.persist_iris_config("IlluminationIris", 55.0)
+
+    hw = ctl.collect_observation_state().confocal_hardware_settings
+    assert hw.illumination_iris == 55.0
+    assert hw.emission_iris == 100.0  # still read from the driver
 
 
 def test_dichroic_and_slider_round_trip_through_a_preset(tmp_path):

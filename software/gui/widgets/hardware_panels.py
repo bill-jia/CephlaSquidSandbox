@@ -2410,9 +2410,11 @@ class LiveControlWidget(QFrame):
         used to pass the channel *name* as the setting, so every iris the user
         dialled in was silently discarded ("unknown setting") and came back as 0
         on the next start.
+
+        Not gated on ``currentConfiguration``: the iris moved on the hardware
+        either way, and the controller copes with there being no live state.
         """
-        if self.currentConfiguration:
-            self.liveController.obs_controller.persist_iris_config(setting_name, new_value)
+        self.liveController.obs_controller.persist_iris_config(setting_name, new_value)
 
     def update_config_illumination_iris(self, new_value):
         self._persist_iris_config("IlluminationIris", new_value)

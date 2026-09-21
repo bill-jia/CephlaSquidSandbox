@@ -925,7 +925,7 @@ class ObservationStateController:
             camera_settings=camera_settings,
             illuminator_states=illuminator_states,
             z_offset_um=base.z_offset_um,
-            confocal_hardware_settings=base.confocal_hardware_settings,
+            confocal_hardware_settings=self._collect_confocal_settings(saved),
             display_color=base.display_color,
             channel_groups=base.channel_groups,
             emission_filter_positions=dict(emission_filter_positions or {}),
@@ -936,6 +936,49 @@ class ObservationStateController:
     # ─────────────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────
+
+    # (capability flag, driver cache attribute, ConfocalSettings field, cast)
+    _XLIGHT_CONFOCAL_FIELDS = (
+        ("has_illumination_iris_diaphragm", "illumination_iris", "illumination_iris", float),
+        ("has_emission_iris_diaphragm", "emission_iris", "emission_iris", float),
+        ("has_dichroic_filters_wheel", "dichroic_wheel_pos", "dichroic_position", int),
+        ("has_dichroic_filter_slider", "slider_position", "filter_slider_position", int),
+    )
+
+    def _collect_confocal_settings(self, saved: Optional[ObservationState]) -> Optional[ConfocalSettings]:
+        """The confocal light path as the X-Light actually has it.
+
+        The driver's cached positions are the truth: every move — from the
+        confocal panel or from applying a state — goes through the driver, which
+        records what it last drove. Reading the cache costs no serial round-trip.
+        The general.yaml cache is *not* the truth: it is seeded from the machine
+        config's iris defaults and only follows the panel through a signal chain,
+        so a preset saved from it came back with the default aperture instead of
+        the one on the hardware.
+
+        A field the driver does not know yet (None after a failed read-back, or
+        the unit lacks the mechanism) falls back to the live state, then to
+        general.yaml.
+        """
+        fallback = None
+        if self._current_state is not None:
+            fallback = self._current_state.confocal_hardware_settings
+        if fallback is None and saved is not None:
+            fallback = saved.confocal_hardware_settings
+
+        addons = getattr(self.microscope, "addons", None)
+        xlight = getattr(addons, "xlight", None)
+        if xlight is None or getattr(addons, "dragonfly", None) is not None:
+            return fallback
+
+        settings = fallback.model_copy() if fallback is not None else ConfocalSettings()
+        for capable, cache_attr, field, cast in self._XLIGHT_CONFOCAL_FIELDS:
+            if not getattr(xlight, capable, False):
+                continue
+            value = getattr(xlight, cache_attr, None)
+            if value is not None:
+                setattr(settings, field, cast(value))
+        return settings
 
     def _collect_camera_settings(self) -> Optional[CameraSettings]:
         try:
