@@ -539,3 +539,171 @@ def test_removed_region_is_not_resurrected_by_acquisition_start_retile():
 
     assert list(sc.region_centers.keys()) == ["R1"]
     assert list(sc.region_fov_coordinates.keys()) == ["R1"]
+
+
+class _FakeWellSelector:
+    """Stand-in for the well-selection widget; ScanCoordinates only asks for the cells."""
+
+    def __init__(self, cells):
+        self.cells = [tuple(c) for c in cells]
+
+    def get_selected_cells(self):
+        return self.cells
+
+
+def _make_wellplate_scan_coordinates(cells, fov_w_mm=1.0, fov_h_mm=1.0, update_callback=None):
+    """ScanCoordinates with a deterministic plate geometry: A1 at (10, 10), 9 mm pitch.
+
+    So A1 = (10, 10), A2 = (19, 10), B1 = (10, 19) — all well inside the software limits.
+    """
+    sc = _make_scan_coordinates(fov_w_mm, fov_h_mm)
+    if update_callback is not None:
+        sc._update_callback = update_callback
+    sc.format = "96 well plate"
+    sc.a1_x_mm = 10.0
+    sc.a1_y_mm = 10.0
+    sc.wellplate_offset_x_mm = 0.0
+    sc.wellplate_offset_y_mm = 0.0
+    sc.well_spacing_mm = 9.0
+    sc.well_size_mm = 6.0
+    sc.add_well_selector(_FakeWellSelector(cells))
+    return sc
+
+
+def test_set_well_coordinates_grid_tiles_each_well_as_nx_by_ny():
+    """Nx x Ny tiling: one region per selected well, named by well id, centred on the well.
+
+    The grid is the Flexible panel's lattice applied to a well centre, so the step is
+    FOV * (1 - overlap) on each axis and the FOV count is exactly nx * ny — independent
+    of the well size, which is what distinguishes it from the fraction-of-well method.
+    """
+    adds = []
+    sc = _make_wellplate_scan_coordinates([(0, 0), (0, 1)], fov_w_mm=1.0, fov_h_mm=1.0, update_callback=adds.append)
+    sc.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=1.25)
+
+    sc.set_well_coordinates_grid(2, 3, 10)
+
+    assert list(sc.region_centers.keys()) == ["A1", "A2"], "regions keep the well ids"
+    assert len(adds) == 2 and all(isinstance(u, AddScanCoordinateRegion) for u in adds)
+
+    for well_id, (cx, cy) in (("A1", (10.0, 10.0)), ("A2", (19.0, 10.0))):
+        coords = sc.region_fov_coordinates[well_id]
+        assert len(coords) == 6, "nx * ny FOVs"
+        xs = sorted({round(c[0], 9) for c in coords})
+        ys = sorted({round(c[1], 9) for c in coords})
+        assert len(xs) == 2 and len(ys) == 3
+        assert xs[1] - xs[0] == pytest.approx(0.9), "step is FOV * (1 - overlap)"
+        assert ys[1] - ys[0] == pytest.approx(0.9)
+        assert sum(xs) / len(xs) == pytest.approx(cx), "grid centred on the well centre"
+        assert sum(ys) / len(ys) == pytest.approx(cy)
+        assert all(c[2] == pytest.approx(1.25) for c in coords), "Z comes from the live stage"
+        assert sc.region_centers[well_id] == [cx, cy, 1.25]
+        # Recorded as a grid, so acquisition-time re-tiling replays it as a grid.
+        params = sc.region_generation_params[well_id]
+        assert params["kind"] == "flexible"
+        assert (params["Nx"], params["Ny"], params["overlap_percent"]) == (2, 3, 10)
+        # Focus-map point generation asks for the region shape; it must not KeyError.
+        assert sc.get_region_shape(well_id) == "Square"
+        assert sc.region_contains_coordinate(well_id, cx, cy)
+
+
+def test_set_well_coordinates_grid_1x1_is_exactly_the_well_center():
+    sc = _make_wellplate_scan_coordinates([(0, 0)])
+    sc.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=2.0)
+
+    sc.set_well_coordinates_grid(1, 1, 10)
+
+    assert sc.region_fov_coordinates == {"A1": [(10.0, 10.0, 2.0)]}
+
+
+def test_set_well_coordinates_grid_drops_deselected_wells():
+    """Same incremental well iteration as the fraction method: deselecting removes."""
+    updates = []
+    sc = _make_wellplate_scan_coordinates([(0, 0), (0, 1)], update_callback=updates.append)
+    sc.set_well_coordinates_grid(2, 2, 0)
+    assert list(sc.region_centers.keys()) == ["A1", "A2"]
+
+    sc.well_selector.cells = [(0, 0)]
+    sc.set_well_coordinates_grid(2, 2, 0)
+
+    assert list(sc.region_centers.keys()) == ["A1"]
+    assert "A2" not in sc.region_generation_params
+    assert any(isinstance(u, RemovedScanCoordinateRegion) for u in updates), "overlay told to un-draw A2"
+
+    sc.well_selector.cells = []
+    sc.set_well_coordinates_grid(2, 2, 0)
+    assert sc.region_centers == {}
+    assert isinstance(updates[-1], ClearedScanCoordinates)
+
+
+def test_set_well_coordinates_grid_on_glass_slide_follows_the_stage():
+    """No wells on a glass slide, so the grid lands on the stage position, as 'current'."""
+    sc = _make_wellplate_scan_coordinates([])
+    sc.format = "glass slide"
+    sc.stage.get_pos.return_value = SimpleNamespace(x_mm=30.0, y_mm=31.0, z_mm=0.4)
+
+    sc.set_well_coordinates_grid(2, 2, 0)
+
+    assert list(sc.region_centers.keys()) == ["current"]
+    assert sc.region_centers["current"] == [30.0, 31.0, 0.4]
+    assert len(sc.region_fov_coordinates["current"]) == 4
+
+
+def test_set_live_scan_coordinates_grid_uses_the_live_region_id():
+    """The 'Current Position' grid variant reuses the fraction variant's single region id,
+    so switching tiling methods replaces the region instead of leaving a stale one."""
+    sc = _make_scan_coordinates()
+    sc.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.3)
+
+    sc.set_live_scan_coordinates_grid(20.0, 21.0, 2, 2, 0)
+
+    assert list(sc.region_centers.keys()) == ["current"]
+    coords = sc.region_fov_coordinates["current"]
+    assert len(coords) == 4
+    assert sum(c[0] for c in coords) / 4 == pytest.approx(20.0)
+    assert sum(c[1] for c in coords) / 4 == pytest.approx(21.0)
+
+    # Switching back to the fraction method overwrites the same region.
+    sc.set_live_scan_coordinates(20.0, 21.0, 3.0, 0, "Square")
+    assert list(sc.region_centers.keys()) == ["current"]
+    assert sc.region_generation_params["current"]["kind"] == "well"
+
+
+def test_regenerate_for_fov_keeps_grid_wells_as_grids():
+    """Acquisition-start re-tiling must replay a grid well as a grid.
+
+    Halving the FOV halves the step but keeps nx * ny FOVs. Re-tiling it as a
+    fraction-of-well region instead would *add* tiles to keep the same area covered,
+    which is the regression this guards.
+    """
+    sc = _make_wellplate_scan_coordinates([(0, 0), (0, 1)], fov_w_mm=1.0, fov_h_mm=1.0)
+    sc.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.75)
+    sc.set_well_coordinates_grid(3, 2, 0)
+
+    assert sc.regenerate_for_fov(0.5, 0.5) is True
+
+    assert list(sc.region_centers.keys()) == ["A1", "A2"], "region order preserved"
+    for well_id, cx in (("A1", 10.0), ("A2", 19.0)):
+        coords = sc.region_fov_coordinates[well_id]
+        assert len(coords) == 6, "grid FOV count is fixed by nx * ny"
+        xs = sorted({round(c[0], 9) for c in coords})
+        assert xs[1] - xs[0] == pytest.approx(0.5), "step follows the acquisition FOV"
+        assert sum(xs) / len(xs) == pytest.approx(cx), "still centred on the well"
+        assert all(c[2] == pytest.approx(0.75) for c in coords), "region Z preserved"
+        assert sc.region_generation_params[well_id]["kind"] == "flexible"
+    assert sc._fov_override_mm is None
+
+
+def test_set_well_coordinates_fraction_path_is_unchanged_by_the_shared_iteration():
+    """The refactored fraction method must produce exactly what add_region produced before."""
+    sc = _make_wellplate_scan_coordinates([(0, 0), (1, 0)])
+    sc.set_well_coordinates(3.0, 10, "Square")
+
+    expected = _make_wellplate_scan_coordinates([])
+    expected.add_region("A1", 10.0, 10.0, 3.0, 10, "Square")
+    expected.add_region("B1", 10.0, 19.0, 3.0, 10, "Square")
+
+    assert sc.region_fov_coordinates == expected.region_fov_coordinates
+    assert sc.region_centers == expected.region_centers
+    assert sc.region_shapes == expected.region_shapes
+    assert sc.region_generation_params == expected.region_generation_params
