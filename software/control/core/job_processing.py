@@ -4,6 +4,7 @@ import faulthandler
 import multiprocessing
 import queue
 import os
+import re
 import sys
 import time
 import json
@@ -299,6 +300,76 @@ def _acquire_file_lock(lock_path: str, context: str = ""):
         ) from exc
 
 
+# ── Filename-safe channel labels ────────────────────────────────────────────
+# On-disk filenames must stay ASCII-and-underscored: every image file saved on
+# this rig so far embeds its channel label with spaces already turned into
+# underscores, because every preset saved before the save_observation_preset()
+# display-name fix had its name overwritten by its sanitized filename stem.
+# Preserving that on-disk convention -- even though a freshly-named preset or
+# per-point state may now legitimately have spaces in its display name -- keeps
+# external analysis scripts, which expect underscored channel tokens in
+# filenames, working unchanged.
+#
+# control.core.observation_state_service.sanitize_preset_filename() looks like
+# the natural fit, but it validates against ``[\w\- ]+`` and raises ValueError
+# on anything else (a literal ".", "," or "/", for instance), while
+# ObservationState.name (control/models/observation_state.py) is a plain
+# ``str`` with no such restriction. A legally-named live/per-point state could
+# therefore crash a running acquisition if it were sanitized with that
+# stricter validator. This local helper only normalizes whitespace to "_"
+# (matching sanitize_preset_filename's mapping for names that WOULD pass its
+# validator) and strips path separators; it never raises.
+#
+# Metadata is NOT run through this: zarr/OME channel names, the
+# acquisition-times CSV "channel" column, record_frame_time()'s channel_name,
+# and the OME-TIFF sidecar all keep the display name verbatim.
+def _filename_label(label: str) -> str:
+    stripped = str(label).strip()
+    safe = re.sub(r"\s", "_", stripped)
+    safe = safe.replace("/", "_").replace("\\", "_")
+    return safe if safe else "unnamed"
+
+
+class _FilenameLabelDeduper:
+    """Guards against two differently-named channels silently sharing a filename.
+
+    ``_filename_label`` only maps whitespace to "_", so two distinct
+    observation-state (or postprocess output) names that differ solely in
+    space-vs-underscore -- e.g. "A B" and "A_B" -- sanitize to the identical
+    on-disk label. Undetected, the second channel's frames would land on top
+    of the first's files. Claims are process-local (this runs inside one
+    JobRunner subprocess, one per acquisition) and keyed by the *raw* label so
+    the same channel keeps a stable filename for the whole acquisition; a
+    later, different raw label that collides gets a numeric suffix.
+    """
+
+    _claims: ClassVar[Dict[str, str]] = {}
+
+    @classmethod
+    def label_for(cls, raw_label: str) -> str:
+        base = _filename_label(raw_label)
+        claimed_by = cls._claims.get(base)
+        if claimed_by is None or claimed_by == raw_label:
+            cls._claims[base] = raw_label
+            return base
+        suffix = 2
+        while True:
+            candidate = f"{base}_{suffix}"
+            claimed_by = cls._claims.get(candidate)
+            if claimed_by is None or claimed_by == raw_label:
+                cls._claims[candidate] = raw_label
+                return candidate
+            suffix += 1
+
+    @classmethod
+    def clear(cls) -> None:
+        """Reset claims. Production never needs this (one JobRunner process per
+        acquisition); tests call it between cases to avoid cross-test state
+        bleed, matching SaveOMETiffJob/DownsampledViewJob/PostprocessJob's
+        existing clear_*()/finalize_all_writers() reset pattern."""
+        cls._claims.clear()
+
+
 class SaveImageJob(Job):
     _log: ClassVar = squid.logging.get_logger("SaveImageJob")
 
@@ -368,7 +439,14 @@ class SaveImageJob(Job):
             # (cycles) by folding the frame suffix into the basename's channel
             # label. Kept out of info.filename_channel_label so the channel
             # identity used by zarr/CSV stays clean.
-            _base_label = info.filename_channel_label or info.observation_state.name
+            #
+            # The raw label carries the display name (e.g. "BF LED matrix
+            # full"), which may contain spaces now that save_observation_preset
+            # no longer overwrites it -- sanitize (and dedupe against any other
+            # channel that collides once sanitized) before it becomes part of
+            # the TIFF basename.
+            _raw_label = info.filename_channel_label or info.observation_state.name
+            _base_label = _FilenameLabelDeduper.label_for(_raw_label)
             _disambiguated = f"{_base_label}_{info.frame_suffix}" if info.frame_suffix else _base_label
             saved_image = utils_acquisition.save_image(
                 image=image,
@@ -1587,6 +1665,12 @@ class PostprocessJob(Job):
         The derived array is keyed by ``out_key`` and is single-channel with its
         OWN (T, Z) extent — the routine may collapse an N-plane input to one
         derived plane, so ``save_z_size`` must not be taken from the acquisition.
+
+        ``array_key`` becomes part of the zarr/OME-TIFF output path (see
+        ``ome_tiff_writer.ome_output_path`` / ``ZarrWriterInfo.get_output_path``),
+        so it goes through ``_filename_label``. ``filename_channel_label`` stays
+        the raw ``out_key``: it is only read for ``record_frame_time``'s
+        ``channel_name`` (metadata), never for a path.
         """
         info = self.capture_info
         return CaptureInfo(
@@ -1601,7 +1685,7 @@ class PostprocessJob(Job):
             configuration_idx=0,
             time_point=info.time_point,
             filename_channel_label=out_key,
-            array_key=out_key,
+            array_key=_filename_label(out_key),
             save_t_index=t_scan,
             save_c_index=0,
             save_t_size=int(self.ctx_meta.get("nt", 1)),
@@ -1662,12 +1746,15 @@ class PostprocessJob(Job):
         if is_simulation_enabled():
             return 1
         pad = _def.FILE_ID_PADDING
+        fn_key = _filename_label(out_key)
         for zi in range(z_size):
             zsuffix = "" if z_size == 1 else f"_z{zi:03d}"
-            fname = f"{info.region_id}_{info.fov:0{pad}}_{out_key}{zsuffix}.tiff"
+            fname = f"{info.region_id}_{info.fov:0{pad}}_{fn_key}{zsuffix}.tiff"
             out_path = os.path.join(info.save_directory, fname)
             try:
                 tifffile.imwrite(out_path, arr[zi])
+                # ``channel=out_key`` (not fn_key): the CSV "channel" column is
+                # metadata and keeps the display name.
                 append_frame_acquisition_time_csv(info, fname, channel=out_key, channel_index=0)
             except Exception as e:
                 self._log.error(f"Failed to write postprocess output {out_path}: {e}")
@@ -1680,7 +1767,10 @@ class PostprocessJob(Job):
             return None
         if not (self.upload_target and self.upload_target.enabled):
             return None
-        output_path = self.zarr_writer_info.get_output_path(str(info.region_id), info.fov, out_key)
+        # Must match the array_key SaveZarrJob actually wrote under (set from
+        # this same out_key via _filename_label in _derived_capture_info), or
+        # the barrier stages the wrong (non-existent) path.
+        output_path = self.zarr_writer_info.get_output_path(str(info.region_id), info.fov, _filename_label(out_key))
         barrier = FlushAndStageUploadJob(
             time_point=info.time_point or 0,
             region_id=str(info.region_id),
