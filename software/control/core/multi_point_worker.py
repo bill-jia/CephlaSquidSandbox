@@ -2132,7 +2132,13 @@ class MultiPointWorker:
             # next trigger in parallel with the still-running decode. Cameras
             # without this API fall back to the synchronous path inside
             # _image_callback.
-            self._use_deferred_decode_callback = hasattr(self.camera, "add_frame_arrived_callback")
+            # Check the class, not the instance: SimulatedCamera's __getattr__ shim
+            # fabricates a truthy placeholder for any unknown *public* attribute
+            # (so unimplemented SDK methods can be called harmlessly), which makes
+            # instance-level hasattr() always True even though it doesn't actually
+            # support the deferred-decode callback. Checking the type bypasses that
+            # shim and reflects whether the method is genuinely implemented.
+            self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
             if self._use_deferred_decode_callback:
                 self.camera.add_frame_arrived_callback(self._on_frame_arrived)
             sleep_time = min(self.dt / 20.0, 0.5)
@@ -4015,7 +4021,11 @@ class MultiPointWorker:
         the caller re-raises so run() does the P0 clean abort + finalize. Worst case is
         therefore never worse than the abort-only behavior.
         """
-        if MAX_CAMERA_REINIT_ATTEMPTS <= 0 or not hasattr(self.camera, "reopen"):
+        # Check the class, not the instance: see the comment on the
+        # _use_deferred_decode_callback assignment above for why — SimulatedCamera
+        # doesn't implement reopen() for real, but its __getattr__ shim would make
+        # instance-level hasattr() lie and say it does.
+        if MAX_CAMERA_REINIT_ATTEMPTS <= 0 or not hasattr(type(self.camera), "reopen"):
             return False  # reinit disabled, or this camera can't reopen -> clean abort
 
         self._camera_reinit_attempts += 1
@@ -5253,7 +5263,9 @@ class MultiPointWorker:
         # is intentionally excluded: it's populated on the decode thread AFTER
         # the wait returns, so reading it here is racy and meaningless on the
         # critical-path report. A separate decode timer (future) should own it.
-        cam_ts = getattr(self.camera, "_last_capture_ts", None) or {}
+        cam_ts = getattr(self.camera, "_last_capture_ts", None)
+        if not isinstance(cam_ts, dict):
+            cam_ts = {}
         for key in ("sdk_entry", "sdk_cleared"):
             if key in cam_ts:
                 ts[key] = cam_ts[key]
