@@ -45,6 +45,7 @@ from control.core.waveform_capture import (
 from control.nidaq import TriggerSource
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 from control._sdk_watchdog import CameraTimeoutError
+from squid.stage.utils import move_xy_with_z_retract
 import squid.logging
 import control.core.job_processing
 from control.core.job_processing import FrameWriteResult
@@ -2824,17 +2825,6 @@ class MultiPointWorker:
             z_target_mm = coordinate_mm[2]
 
         retract = self._should_retract_z_for_move(region_id, fov)
-        if retract:
-            # The retract only brackets the XY move; the target Z is still
-            # whatever the AF cache / coordinate picked above. When neither
-            # names one, come back to the Z we are leaving from so the
-            # objective never stays parked at the retract height.
-            if z_target_mm is None:
-                z_target_mm = curr_pos.z_mm
-            self._retract_z_home_for_move(region_id, fov)
-        elif z_target_mm is not None:
-            self.move_to_z_level(z_target_mm, blocking=False)
-            self._log.debug(f"Moved to z position {z_target_mm} [mm]")
 
         # Blocking-longer-axis move. Shorter axis fires non-blocking; the
         # longer axis blocks until motion is complete. Stabilization sleep
@@ -2842,18 +2832,36 @@ class MultiPointWorker:
         # there is no benefit to deferring the sleep — see the
         # _pending_move_settle scaffolding in __init__ for the future async
         # path that _wait_for_move_settled will unlock).
-        if delta_x > delta_y:
-            self.stage.move_y_to(y_mm, blocking=False)
-            self.stage.move_x_to(x_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
-        else:
-            self.stage.move_x_to(x_mm, blocking=False)
-            self.stage.move_y_to(y_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+        def _xy_move():
+            if delta_x > delta_y:
+                self.stage.move_y_to(y_mm, blocking=False)
+                self.stage.move_x_to(x_mm)
+                self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+            else:
+                self.stage.move_x_to(x_mm, blocking=False)
+                self.stage.move_y_to(y_mm)
+                self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
 
         if retract:
-            self._log.debug(f"Lowering z to target {z_target_mm} [mm] after the retracted XY move")
-            self.move_to_z_level(z_target_mm)
+            # The bracket (module-level guard on real XY travel, retract,
+            # XY, restore) lives in squid.stage.utils; the target Z is still
+            # whatever the AF cache / coordinate picked above, falling back
+            # to the current Z when neither names one.
+            move_xy_with_z_retract(
+                self.stage,
+                x_mm,
+                y_mm,
+                retract=True,
+                z_target_mm=z_target_mm,
+                home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                xy_move=_xy_move,
+                log=self._log,
+            )
+        else:
+            if z_target_mm is not None:
+                self.move_to_z_level(z_target_mm, blocking=False)
+                self._log.debug(f"Moved to z position {z_target_mm} [mm]")
+            _xy_move()
 
         self._last_move_region_id = region_id
 
@@ -2865,26 +2873,12 @@ class MultiPointWorker:
         list), any move that lands in a different region than the last one,
         and -- because ``_last_move_region_id`` starts as ``None`` -- the first
         move of the run. Steps across a region's own Nx x Ny grid keep today's
-        behaviour.
+        behaviour. Whether the resulting XY travel is actually large enough to
+        bother retracting for is decided by ``move_xy_with_z_retract`` itself.
         """
         if not self.retract_z_between_regions:
             return False
         return fov == 0 or region_id != self._last_move_region_id
-
-    def _retract_z_home_for_move(self, region_id, fov) -> None:
-        """Park the objective at the retract height, blocking, before an XY move.
-
-        Mirrors the loading-position retract in ``squid/stage/utils.py``:
-        ``OBJECTIVE_RETRACTED_POS_MM`` goes to ``move_z_to`` as-is -- no
-        raw->canonical conversion (that is only for ``Z_HOME_SAFETY_POINT``,
-        which is stored in raw units) and no ``INVERTED_OBJECTIVE`` sign flip,
-        since the stage config already owns the axis sign.
-        """
-        home_z_mm = control._def.OBJECTIVE_RETRACTED_POS_MM
-        self._log.debug(
-            f"Retracting z to {home_z_mm} [mm] before the XY move into region {region_id}, fov {fov}"
-        )
-        self.stage.move_z_to(home_z_mm)
 
     def _wait_for_move_settled(self, timeout_s: float = 30.0) -> None:
         """Join the in-flight stage motion issued by move_to_coordinate and
@@ -4259,10 +4253,24 @@ class MultiPointWorker:
                 if self._alignment_widget is not None and self._alignment_widget.has_offset:
                     x_mm, y_mm = self._alignment_widget.apply_offset(x_mm, y_mm)
 
-                self.stage.move_x_to(x_mm)
-                self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
-                self.stage.move_y_to(y_mm)
-                self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+                def _xy_move():
+                    self.stage.move_x_to(x_mm)
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+                    self.stage.move_y_to(y_mm)
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+
+                # Bracket only the move into a region (its first FOV), same as
+                # the main acquisition loop -- intra-region steps are unchanged.
+                move_xy_with_z_retract(
+                    self.stage,
+                    x_mm,
+                    y_mm,
+                    retract=self.retract_z_between_regions and fov_idx == 0,
+                    z_target_mm=None,
+                    home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                    xy_move=_xy_move,
+                    log=self._log,
+                )
 
                 try:
                     with self._timing.get_timer("af:seed_event"):

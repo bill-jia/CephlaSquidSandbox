@@ -57,6 +57,7 @@ from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 from control.core.config.repository import ConfigRepository
 from squid.abc import CameraFrame, AbstractCamera, AbstractStage
+from squid.stage.utils import move_xy_with_z_retract
 import squid.logging
 
 
@@ -1724,12 +1725,21 @@ class MultiPointController:
                     self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
 
                     # Generate and enable the AF map
-                    self.autofocusController.gen_focus_map(coord1, coord2, coord3)
+                    self.autofocusController.gen_focus_map(
+                        coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
+                    )
                     self.autofocusController.set_focus_map_use(True)
 
                     # Return to center position
-                    self.stage.move_x_to(x_center)
-                    self.stage.move_y_to(y_center)
+                    move_xy_with_z_retract(
+                        self.stage,
+                        x_center,
+                        y_center,
+                        retract=self.retract_z_between_regions,
+                        z_target_mm=None,
+                        home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                        log=self._log,
+                    )
 
                 except ValueError:
                     self._log.exception("Invalid coordinates for autofocus plane, aborting.")
@@ -2065,7 +2075,8 @@ class MultiPointController:
         With ``retract_z_between_regions`` on this travel gets the same bracket
         the worker applies to inter-region moves: Z to
         ``OBJECTIVE_RETRACTED_POS_MM`` (blocking) before XY, then Z down to the
-        recorded start Z.
+        recorded start Z. ``move_xy_with_z_retract`` skips the retract itself
+        when the stage is already at the start XY (e.g. a single-position run).
         """
         if not self._start_position:
             return
@@ -2073,17 +2084,15 @@ class MultiPointController:
         y_mm = self._start_position.y_mm
         z_mm = self._start_position.z_mm
         self._log.info(f"Moving back to start position: (x,y,z) [mm] = ({x_mm}, {y_mm}, {z_mm})")
-        if self.retract_z_between_regions:
-            # The objective clears the sample before the (often long) XY move
-            # back to where the run started.
-            self._log.debug(
-                f"Retracting z to {control._def.OBJECTIVE_RETRACTED_POS_MM} [mm] "
-                "before the XY move back to the start position"
-            )
-            self.stage.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM)
-        self.stage.move_x_to(x_mm)
-        self.stage.move_y_to(y_mm)
-        self.stage.move_z_to(z_mm)
+        move_xy_with_z_retract(
+            self.stage,
+            x_mm,
+            y_mm,
+            retract=self.retract_z_between_regions,
+            z_target_mm=z_mm,
+            home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+            log=self._log,
+        )
         self._start_position = None
 
     def request_abort_acquisition(self):

@@ -4609,12 +4609,25 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.table_location_list.setRowCount(0)
         self._update_position_count()
 
+    # A table click within this of the stage's current XYZ is "already there" -
+    # e.g. the second click of a double-click-to-rename - so it only selects
+    # the row instead of re-issuing the same move (which, with the retract
+    # checkbox on, used to send the objective on a pointless round trip).
+    _GO_TO_POSITION_TOLERANCE_MM = 0.001  # 1 um
+
     def go_to(self, index):
         """Select position ``index`` and drive the stage to it."""
         if not 0 <= index < len(self.location_list):
             return
         x, y, z = self.location_list[index]
-        self._move_stage_to_position(x, y, z)
+        pos = self.stage.get_pos()
+        already_there = (
+            abs(pos.x_mm - x) < self._GO_TO_POSITION_TOLERANCE_MM
+            and abs(pos.y_mm - y) < self._GO_TO_POSITION_TOLERANCE_MM
+            and abs(pos.z_mm - z) < self._GO_TO_POSITION_TOLERANCE_MM
+        )
+        if not already_there:
+            self._move_stage_to_position(x, y, z)
         self._select_row(index)
 
     def _move_stage_to_position(self, x, y, z):
@@ -4623,15 +4636,20 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         With *Retract Z ... for XY moves* on, the objective is raised to
         ``OBJECTIVE_RETRACTED_POS_MM`` and the moves are serialised (Z up, XY, Z
         down) so nothing travels across the sample at working height - the same
-        bracket the worker puts around inter-region moves. The retract height goes
-        to ``move_z_to`` as-is: no raw->canonical conversion and no
-        ``INVERTED_OBJECTIVE`` flip (see ``_retract_z_home_for_move``).
+        bracket the worker puts around inter-region moves (``move_xy_with_z_retract``
+        in ``squid/stage/utils.py``), which also skips the retract for a same-XY,
+        different-Z click (a plain Z move). The retract height goes to
+        ``move_z_to`` as-is: no raw->canonical conversion and no
+        ``INVERTED_OBJECTIVE`` flip.
         """
-        if self.checkbox_retractZBetweenRegions.isChecked():
-            self.stage.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM)
-        self.stage.move_x_to(x)
-        self.stage.move_y_to(y)
-        self.stage.move_z_to(z)
+        move_xy_with_z_retract(
+            self.stage,
+            x,
+            y,
+            retract=self.checkbox_retractZBetweenRegions.isChecked(),
+            z_target_mm=z,
+            home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+        )
 
     def cell_was_clicked(self, row, column):
         # Prev/Next Pos always move - they are navigation. A click only selects
@@ -7581,6 +7599,9 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
         self.checkbox_usePiezo.setChecked(MULTIPOINT_USE_PIEZO_FOR_ZSTACKS)
 
+        # Retract-Z-for-XY-moves checkbox (the other tabs' "Scan behaviour" group)
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
         # Start acquisition button
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
@@ -7656,6 +7677,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
+        options_layout.addWidget(self.checkbox_retractZBetweenRegions)
 
         grid.addLayout(options_layout, 0, 2)
 
@@ -7697,6 +7719,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
@@ -7757,6 +7780,9 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
             self.multipointController.set_reflection_af_flag(
                 self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
+            )
+            self.multipointController.set_retract_z_between_regions(
+                self.checkbox_retractZBetweenRegions.isChecked()
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets

@@ -1142,6 +1142,11 @@ class MicroscopeControlServer:
         # Set the selected channels
         self.multipoint_controller.set_selected_configurations(yaml_data.channel_names)
 
+        # Optional: absent means "leave the controller's current setting alone"
+        # (there is no checkbox on this headless path to have set one either way).
+        if yaml_data.retract_z_between_regions is not None:
+            self.multipoint_controller.set_retract_z_between_regions(yaml_data.retract_z_between_regions)
+
     @schema_method
     def _cmd_run_acquisition_from_yaml(
         self,

@@ -33,7 +33,12 @@ from control.piezo import PiezoStage
 import control.utils as utils
 import control._def  # Import module for runtime access to MCP-modifiable settings
 from squid.abc import AbstractStage, AbstractCamera, AbstractFilterWheelController, CameraAcquisitionMode
-from squid.stage.utils import move_to_loading_position, move_to_scanning_position, move_z_axis_to_safety_position
+from squid.stage.utils import (
+    move_to_loading_position,
+    move_to_scanning_position,
+    move_z_axis_to_safety_position,
+    move_xy_with_z_retract,
+)
 from squid.config import CameraPixelFormat
 
 # set QT_API environment variable
