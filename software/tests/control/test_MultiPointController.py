@@ -284,7 +284,11 @@ def test_multi_point_controller_basic_acquisition():
 
     mpc.run_acquisition()
 
-    timeout_s = 5
+    # A simulated run really acquires: JobRunner subprocess spawn alone is
+
+    # ~2.5 s, so 5 s was a coin flip. This is a ceiling, not an expectation.
+
+    timeout_s = 30
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 
@@ -314,7 +318,11 @@ def test_multi_point_with_laser_af():
 
     mpc.run_acquisition()
 
-    timeout_s = 5
+    # A simulated run really acquires: JobRunner subprocess spawn alone is
+
+    # ~2.5 s, so 5 s was a coin flip. This is a ceiling, not an expectation.
+
+    timeout_s = 30
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 
@@ -340,7 +348,11 @@ def test_multi_point_with_contrast_af():
     mpc.set_af_flag(True)
     mpc.run_acquisition()
 
-    timeout_s = 5
+    # A simulated run really acquires: JobRunner subprocess spawn alone is
+
+    # ~2.5 s, so 5 s was a coin flip. This is a ceiling, not an expectation.
+
+    timeout_s = 30
     assert tt.started_event.wait(timeout_s)
     assert tt.finished_event.wait(timeout_s)
 
