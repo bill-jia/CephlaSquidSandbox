@@ -237,5 +237,21 @@ group.
 - The wellplate tab's non-range Z span is `z + dz * (Nz - 1)` where `z` is in mm and
   `dz` in µm (`entry_deltaZ` has a µm suffix); the Flexible tab divides `dz` by 1000
   in the same expression. Check and fix in a separate commit if it really is wrong.
-- Channels box placement: still to be decided from the final screenshots (it is a
-  full-width box under the parameter block on both tabs today).
+- Channels box placement: **DONE.** The channel list was a full-width box under both
+  columns; it is now the top of a right-hand *group* that mirrors the left box, built for
+  both tabs by one helper, `_make_acquisition_body(widget, focus_section, saving_section,
+  scan_section)`. The panel body is a single QHBoxLayout of two 1:1-stretch columns: the
+  parameter block on the left (topped, with a stretch under it, as before) and, on the
+  right, a QVBoxLayout of the *Channels* header + `list_configurations` (the only item
+  with vertical stretch, so it absorbs the spare height and makes the right group as tall
+  as the left box) above a QHBoxLayout of two 1:1 subcolumns — *Focus* then *Scan
+  behaviour* then stretch; *Saving* then stretch then `btn_snap_images` (1) and
+  `btn_startAcquisition` (2), which puts Start in the panel's bottom-right corner. At half
+  the panel width the *Saving* rows no longer fit on one line, so
+  `_make_file_saving_format_row` returns a QVBoxLayout with the size estimate
+  right-aligned under the dropdown, and `_make_zarr_streaming_row` returns two lines
+  (enable + delete-after-verify, then path + Browse); both attribute names
+  (`fileSavingFormatRow`, `zarrStreamingRow`, `label_size_estimate`) are unchanged, and
+  so is `self.grid_acquisition` (now the body row itself), which `TemplateMultiPointWidget`
+  still inserts between its template row and the progress row. The progress bar stays
+  full-width at the bottom.

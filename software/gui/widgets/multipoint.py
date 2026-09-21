@@ -1893,6 +1893,75 @@ def _make_row_widget() -> "tuple[QWidget, QHBoxLayout]":
     return holder, row
 
 
+def _make_acquisition_body(widget, focus_section, saving_section, scan_section) -> "QHBoxLayout":
+    """The body of a multipoint panel: the parameter block beside the channels group.
+
+    Both panels are laid out the same way, so this is the one builder for it::
+
+        ┌ parameter block ┐  ┌ Channels  [mode ▾]      Per-Point  Edit Cycles ┐
+        │ (Positions …)   │  │ list_configurations (takes the spare height)   │
+        │                 │  ├──────────────────┬────────────────────────────┤
+        │                 │  │ Focus            │ Saving                     │
+        │                 │  │ Scan behaviour   │      [Acquire Current FOV] │
+        └─────────────────┘  └──────────────────┴──────[Start Acquisition ]──┘
+
+    The two top-level columns share the width 1:1, so the channel list is half the
+    panel wide instead of the panel's full width; the list is the only element with
+    vertical stretch, so it grows to match the parameter block's height and keeps
+    growing as the window gets taller, which puts *Start Acquisition* in the
+    panel's bottom-right corner at every size.
+
+    ``widget`` supplies ``parameter_block``, the Channels header widgets, the
+    ``list_configurations`` list and the two action buttons; the three option
+    sections are passed in because each panel fills them with its own controls.
+    """
+    channels_header = QHBoxLayout()
+    channels_header.addWidget(QLabel("<b>Channels</b>"))
+    channels_header.addWidget(widget.combobox_channel_mode)
+    channels_header.addStretch(1)
+    channels_header.addWidget(widget.btn_per_point_channels)
+    channels_header.addWidget(widget.btn_edit_cycles)
+
+    options_left = QVBoxLayout()
+    options_left.addLayout(focus_section)
+    options_left.addLayout(scan_section)
+    options_left.addStretch(1)
+
+    # Actions only: Start is the main verb, the single-FOV acquire is half its
+    # height so the two never get confused at a glance.
+    button_layout = QVBoxLayout()
+    for btn in (widget.btn_snap_images, widget.btn_startAcquisition):
+        btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+    button_layout.addWidget(widget.btn_snap_images, 1)
+    button_layout.addWidget(widget.btn_startAcquisition, 2)
+
+    options_right = QVBoxLayout()
+    options_right.addLayout(saving_section)
+    options_right.addStretch(1)
+    options_right.addLayout(button_layout)
+
+    options_columns = QHBoxLayout()
+    options_columns.addLayout(options_left, 1)
+    options_columns.addSpacing(12)
+    options_columns.addLayout(options_right, 1)
+
+    channels_group = QVBoxLayout()
+    channels_group.setSpacing(4)
+    channels_group.addLayout(channels_header)
+    channels_group.addWidget(widget.list_configurations, 1)
+    channels_group.addLayout(options_columns)
+
+    block_column = QVBoxLayout()
+    block_column.addWidget(widget.parameter_block)
+    block_column.addStretch(1)
+
+    body = QHBoxLayout()
+    body.addLayout(block_column, 1)
+    body.addSpacing(12)
+    body.addLayout(channels_group, 1)
+    return body
+
+
 def _collect_widgets(layout) -> list:
     """Every widget under ``layout``, recursively.
 
@@ -2036,16 +2105,16 @@ def _refresh_size_estimate(widget) -> None:
     label.setText(_format_acquisition_size_estimate(widget.multipointController, has_selection, skip_saving, hint))
 
 
-def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox, QLabel]":
-    """Build a compact ``Save format: [combo] ........ [size estimate]`` row.
+def _make_file_saving_format_row(initial_option=None) -> "tuple[QVBoxLayout, QComboBox, QLabel]":
+    """Build a ``Save format: [combo]`` row with the size estimate right-aligned below it.
 
     The combo only mirrors local UI state; the caller wires its
     ``currentTextChanged`` signal to ``_push_save_format_to_controller`` so the choice
     flows through ``AcquisitionParameters`` to the worker. Its last entry is
     ``DRY_RUN_SAVE_FORMAT``, which sets ``skip_saving`` instead of a format.
-    Compression / chunking knobs live in Settings > Preferences. The trailing label
-    shows a live image-count / disk-size estimate (the caller keeps it updated via
-    ``_refresh_size_estimate``).
+    Compression / chunking knobs live in Settings > Preferences. The grey label under
+    the dropdown shows a live image-count / disk-size estimate (the caller keeps it
+    updated via ``_refresh_size_estimate``).
     """
     label = QLabel("Save format:")
     combo = QComboBox()
@@ -2079,24 +2148,32 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     estimate_label = QLabel("")
     estimate_label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     estimate_label.setStyleSheet("color: gray;")
+    estimate_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-    row = QHBoxLayout()
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(label)
-    row.addWidget(combo)
-    row.addStretch(1)
-    row.addWidget(estimate_label)
-    return row, combo, estimate_label
+    # The *Saving* group is half of the panel's right-hand group, so the estimate gets
+    # its own line under the dropdown instead of being squeezed beside it (at that
+    # width both the combo and the estimate text were clipped).
+    column = QVBoxLayout()
+    column.setContentsMargins(0, 0, 0, 0)
+    column.setSpacing(2)
+    format_row = QHBoxLayout()
+    format_row.setContentsMargins(0, 0, 0, 0)
+    format_row.addWidget(label)
+    format_row.addWidget(combo)
+    format_row.addStretch(1)
+    column.addLayout(format_row)
+    column.addWidget(estimate_label)
+    return column, combo, estimate_label
 
 
-def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict]":
-    """Build an inline ``Stream to network`` row for ZARR_V3 acquisitions.
+def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict]":
+    """Build a stacked ``Stream to network`` block for ZARR_V3 acquisitions.
 
-    The row contains:
-      - Enable checkbox (master switch)
+    Two lines, because the block sits in the *Saving* group at a quarter of the
+    panel's width and a single row clipped the path field:
+      - Enable checkbox (master switch) and "Delete after verify" (default on)
       - Path text field (UNC ``\\\\server\\share\\dir`` on Windows or
         ``/Volumes/share/dir`` POSIX after mount) + Browse button
-      - "Delete after verify" checkbox (default on)
 
     All four child widgets stay disabled until the enable checkbox is on.
     Edits push immediately to ``MultiPointController.set_zarr_upload_target``
@@ -2105,7 +2182,7 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     with the fallback disk-space dialog).
 
     Caller should:
-      1. Place the returned layout next to ``fileSavingFormatRow``.
+      1. Place the returned layout under ``fileSavingFormatRow``.
       2. Toggle the row's visibility based on the file-format combobox
          (only meaningful for ``ZARR_V3``).
     """
@@ -2173,12 +2250,20 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     path_edit.editingFinished.connect(_push_to_controller)
     delete_cb.toggled.connect(_push_to_controller)
 
-    row = QHBoxLayout()
+    row = QVBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(enable_cb)
-    row.addWidget(path_edit, 1)
-    row.addWidget(browse_btn)
-    row.addWidget(delete_cb)
+    row.setSpacing(2)
+    toggles = QHBoxLayout()
+    toggles.setContentsMargins(0, 0, 0, 0)
+    toggles.addWidget(enable_cb)
+    toggles.addWidget(delete_cb)
+    toggles.addStretch(1)
+    row.addLayout(toggles)
+    path_row = QHBoxLayout()
+    path_row.setContentsMargins(0, 0, 0, 0)
+    path_row.addWidget(path_edit, 1)
+    path_row.addWidget(browse_btn)
+    row.addLayout(path_row)
 
     widgets = {
         "enable_cb": enable_cb,
@@ -3629,50 +3714,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         block_content.addLayout(zstack_section)
         block_content.addLayout(timelapse_section)
 
-        options_left = QVBoxLayout()
-        options_left.addWidget(self.parameter_block)
-        options_left.addStretch(1)
-
-        options_right = QVBoxLayout()
-        options_right.addLayout(focus_section)
-        options_right.addLayout(saving_section)
-        options_right.addLayout(scan_section)
-        options_right.addStretch(1)
-
-        options_columns = QHBoxLayout()
-        options_columns.addLayout(options_left, 1)
-        options_columns.addSpacing(12)
-        options_columns.addLayout(options_right, 1)
-
-        # ---- Channels + the actions column ---------------------------------
-        channels_header = QHBoxLayout()
-        channels_header.addWidget(QLabel("<b>Channels</b>"))
-        channels_header.addWidget(self.combobox_channel_mode)
-        channels_header.addStretch(1)
-        channels_header.addWidget(self.btn_per_point_channels)
-        channels_header.addWidget(self.btn_edit_cycles)
-
-        channels_column = QVBoxLayout()
-        channels_column.setSpacing(2)
-        channels_column.addLayout(channels_header)
-        channels_column.addWidget(self.list_configurations)
-
-        # Actions only: Start is the main verb, the single-FOV acquire is half its
-        # height so the two never get confused at a glance.
-        button_layout = QVBoxLayout()
-        for btn in (self.btn_snap_images, self.btn_startAcquisition):
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 2)
-
-        channels_row = QHBoxLayout()
-        channels_row.addLayout(channels_column, 1)
-        channels_row.addSpacing(4)
-        channels_row.addLayout(button_layout)
-
-        self.grid_acquisition = QVBoxLayout()
-        self.grid_acquisition.addLayout(options_columns)
-        self.grid_acquisition.addLayout(channels_row)
+        self.grid_acquisition = _make_acquisition_body(self, focus_section, saving_section, scan_section)
 
         # Row : Progress Bar
         self.row_progress_layout = QHBoxLayout()
@@ -5692,46 +5734,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
         scan_content.addWidget(self.checkbox_retractZBetweenRegions)
 
-        options_left = QVBoxLayout()
-        options_left.addWidget(self.parameter_block)
-        options_left.addStretch(1)
-
-        options_right = QVBoxLayout()
-        options_right.addLayout(focus_section)
-        options_right.addLayout(saving_section)
-        options_right.addLayout(scan_section)
-        options_right.addStretch(1)
-
-        options_columns = QHBoxLayout()
-        options_columns.addLayout(options_left, 1)
-        options_columns.addSpacing(12)
-        options_columns.addLayout(options_right, 1)
-
-        # ---- Channels + the actions column ---------------------------------
-        channels_header = QHBoxLayout()
-        channels_header.addWidget(QLabel("<b>Channels</b>"))
-        channels_header.addWidget(self.combobox_channel_mode)
-        channels_header.addStretch(1)
-        channels_header.addWidget(self.btn_per_point_channels)
-        channels_header.addWidget(self.btn_edit_cycles)
-
-        channels_column = QVBoxLayout()
-        channels_column.setSpacing(2)
-        channels_column.addLayout(channels_header)
-        channels_column.addWidget(self.list_configurations)
-
-        # Actions only: Start is the main verb, the single-FOV acquire is half its
-        # height so the two never get confused at a glance.
-        button_layout = QVBoxLayout()
-        for btn in (self.btn_snap_images, self.btn_startAcquisition):
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 2)
-
-        channels_row = QHBoxLayout()
-        channels_row.addLayout(channels_column, 1)
-        channels_row.addSpacing(4)
-        channels_row.addLayout(button_layout)
+        body_row = _make_acquisition_body(self, focus_section, saving_section, scan_section)
 
         # ---- Main layout ----------------------------------------------------
         main_layout = QVBoxLayout()
@@ -5749,8 +5752,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         row_1_layout.addWidget(self.lineEdit_experimentID)
         main_layout.addLayout(row_1_layout)
 
-        main_layout.addLayout(options_columns)
-        main_layout.addLayout(channels_row)
+        main_layout.addLayout(body_row)
 
         row_progress_layout = QHBoxLayout()
         row_progress_layout.addWidget(self.progress_label)

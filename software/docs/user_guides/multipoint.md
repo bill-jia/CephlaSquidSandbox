@@ -159,8 +159,15 @@ Everything that says *what the stage does at each point of the run* lives in one
 box down the left of the panel, with four sections in scan order: **Positions**,
 **Tiling per position**, **Z‑stack** and **Time‑lapse**. The Flexible tab has the same
 box, in the same order, so the two panels read alike — only the contents of *Positions*
-and *Tiling* differ. The right‑hand column (**Focus**, **Saving**, **Scan behaviour**)
-says how the run behaves.
+and *Tiling* differ.
+
+The right‑hand half of the panel is the **Channels** group and says how the run
+*behaves*. The **Channels** header and its checklist are at the top — the checklist is
+the one part of the panel that grows, so it takes whatever height is spare and gets
+taller as you enlarge the window. Under it are two sub‑columns: **Focus** and **Scan
+behaviour** on the left, **Saving** on the right, with **Acquire Current FOV** and
+**Start Acquisition** stacked at the bottom of the right sub‑column — i.e. Start is
+always the panel's bottom‑right corner. Both multipoint tabs are laid out this way.
 
 The **Z‑stack** and **Time‑lapse** section titles are *checkboxes* that switch those
 dimensions on. Unchecked means one plane / one timepoint: the section's controls are
@@ -356,7 +363,8 @@ Z the acquisition fell back to). Use it to audit focus drift and AF reliability 
   | **ZARR_V3** | OME‑NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines. |
   | **Don't save (dry run)** | Run the acquisition and write no image files — for timing, illumination and stage‑path checks. Also bypasses the disk‑space check. |
 
-- **Size estimate** — to the right of **Save format**, a live `N images · ~size` readout
+- **Size estimate** — on its own grey line under **Save format**, a live
+  `N images · ~size` readout
   updates as you change settings (regions, Nz, Nt, channels/cycles, save format). It
   accounts for the per‑position cycle plan (frames per position, including ragged plans —
   see [acquisition-cycles.md](../acquisition-cycles.md)) and the chosen format: TIFF
