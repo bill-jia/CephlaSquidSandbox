@@ -34,6 +34,23 @@ def _populate(app, microscope, widget, count):
     print(f"populated {widget.table_location_list.rowCount()} positions")
 
 
+def _enable_z_and_time(app, widget):
+    """Turn on the Z-stack and Time-lapse groups (and Set Z-range) before grabbing.
+
+    The two groups default to off, so the shipped screenshot shows every row greyed
+    out; this renders the other half of the state.
+    """
+    widget._zstack_checkbox.setChecked(True)
+    widget._timelapse_checkbox.setChecked(True)
+    widget.entry_NZ.setValue(5)
+    widget.entry_deltaZ.setValue(2.0)
+    widget.entry_Nt.setValue(3)
+    widget.entry_dt.setValue(60)
+    widget.checkbox_set_z_range.setChecked(True)
+    app.processEvents()
+    print(f"enabled Z-stack + Time-lapse on {widget.__class__.__name__}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("out_dir")
@@ -45,6 +62,11 @@ def main():
         default=0,
         metavar="N",
         help="add N positions to the flexible panel's table before grabbing it",
+    )
+    parser.add_argument(
+        "--enable-zt",
+        action="store_true",
+        help="check the Z-stack / Time-lapse groups (and Set Z-range) before grabbing",
     )
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -77,6 +99,8 @@ def main():
             continue
         if args.populate and hasattr(widget, "add_location"):
             _populate(app, microscope, widget, args.populate)
+        if args.enable_zt:
+            _enable_z_and_time(app, widget)
         # Bring the widget's tab to the front so it is laid out at full size.
         parent = widget.parentWidget()
         while parent is not None:

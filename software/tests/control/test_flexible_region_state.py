@@ -13,7 +13,14 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pandas as pd
 import pytest
-from qtpy.QtWidgets import QAbstractItemView, QCheckBox, QTableWidget, QTableWidgetItem
+from qtpy.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QDoubleSpinBox,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+)
 
 import control._def
 from control.core.multi_point_utils import ScanPositionInformation
@@ -398,3 +405,114 @@ def test_restored_references_reach_the_acquisition_snapshot(harness):
     assert set(info.scan_region_laser_af_references) == {"R0", "R1", "R2"}
     region_ids = list(harness.scanCoordinates.region_centers.keys())
     assert all(rid in harness.scanCoordinates.region_laser_af_references for rid in region_ids)
+
+
+class _ZTimeHarness:
+    """Just enough of a multipoint panel to drive the Z-stack / Time-lapse groups.
+
+    Both panels mix in ``_ZTimeGroupMixin`` for this, so the methods are taken off
+    ``FlexibleMultiPointWidget`` (the wellplate tab only renames the two checkboxes).
+    """
+
+    _apply_zstack_enabled = FlexibleMultiPointWidget._apply_zstack_enabled
+    _apply_timelapse_enabled = FlexibleMultiPointWidget._apply_timelapse_enabled
+    _effective_NZ = FlexibleMultiPointWidget._effective_NZ
+    _effective_Nt = FlexibleMultiPointWidget._effective_Nt
+    _zstack_checkbox = FlexibleMultiPointWidget._zstack_checkbox
+    _timelapse_checkbox = FlexibleMultiPointWidget._timelapse_checkbox
+
+    def __init__(self):
+        self.multipointController = MagicMock()
+
+        self.checkbox_zstack = QCheckBox("Z-stack")
+        self.checkbox_timelapse = QCheckBox("Time-lapse")
+        self.checkbox_set_z_range = QCheckBox("Set Z-range")
+
+        self.entry_NZ = QSpinBox()
+        self.entry_NZ.setMaximum(2000)
+        self.entry_NZ.setValue(1)
+        self.entry_Nt = QSpinBox()
+        self.entry_Nt.setMaximum(2000)
+        self.entry_Nt.setValue(1)
+
+        self.entry_deltaZ = QDoubleSpinBox()
+        self.entry_dt = QDoubleSpinBox()
+
+        self._zstack_controls = [self.entry_NZ, self.entry_deltaZ, self.checkbox_set_z_range]
+        self._timelapse_controls = [self.entry_Nt, self.entry_dt]
+
+
+@pytest.fixture
+def z_time(qtbot):
+    h = _ZTimeHarness()
+    for widget in (h.checkbox_zstack, h.checkbox_timelapse, h.checkbox_set_z_range):
+        qtbot.addWidget(widget)
+    return h
+
+
+def test_unchecked_zstack_pushes_one_plane(z_time):
+    z_time.entry_NZ.setValue(11)
+    z_time.checkbox_zstack.setChecked(False)
+
+    z_time._apply_zstack_enabled()
+
+    assert z_time._effective_NZ() == 1
+    z_time.multipointController.set_NZ.assert_called_with(1)
+    assert not z_time.entry_NZ.isEnabled()
+    assert not z_time.entry_deltaZ.isEnabled()
+
+
+def test_checked_zstack_pushes_the_spinbox_value(z_time):
+    z_time.entry_NZ.setValue(11)
+    z_time.checkbox_zstack.setChecked(True)
+
+    z_time._apply_zstack_enabled()
+
+    assert z_time._effective_NZ() == 11
+    z_time.multipointController.set_NZ.assert_called_with(11)
+    assert z_time.entry_NZ.isEnabled()
+
+
+def test_unchecking_zstack_leaves_set_z_range(z_time):
+    """Set Z-range with the group off would strand the Z-min/Z-max rows on screen."""
+    z_time.checkbox_zstack.setChecked(True)
+    z_time.checkbox_set_z_range.setChecked(True)
+
+    z_time.checkbox_zstack.setChecked(False)
+    z_time._apply_zstack_enabled()
+
+    assert not z_time.checkbox_set_z_range.isChecked()
+    assert not z_time.checkbox_set_z_range.isEnabled()
+
+
+def test_set_z_range_keeps_nz_derived_when_the_group_is_on(z_time):
+    z_time.checkbox_zstack.setChecked(True)
+    z_time.checkbox_set_z_range.setChecked(True)
+
+    z_time._apply_zstack_enabled()
+
+    # Nz comes from the Z-min/Z-max span in this mode, so it must not be typeable.
+    assert not z_time.entry_NZ.isEnabled()
+    assert z_time.checkbox_set_z_range.isEnabled()
+
+
+def test_unchecked_timelapse_pushes_one_timepoint(z_time):
+    z_time.entry_Nt.setValue(7)
+    z_time.checkbox_timelapse.setChecked(False)
+
+    z_time._apply_timelapse_enabled()
+
+    assert z_time._effective_Nt() == 1
+    z_time.multipointController.set_Nt.assert_called_with(1)
+    assert not z_time.entry_Nt.isEnabled()
+
+
+def test_checked_timelapse_pushes_the_spinbox_value(z_time):
+    z_time.entry_Nt.setValue(7)
+    z_time.checkbox_timelapse.setChecked(True)
+
+    z_time._apply_timelapse_enabled()
+
+    assert z_time._effective_Nt() == 7
+    z_time.multipointController.set_Nt.assert_called_with(7)
+    assert z_time.entry_dt.isEnabled()

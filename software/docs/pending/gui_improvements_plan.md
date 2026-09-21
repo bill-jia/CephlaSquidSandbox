@@ -46,7 +46,8 @@ layout change is applied to both.
     same label row.
   - **Nz = 1** greys `From` and `Set Z-range` (`_sync_z_stack_controls`, also
     re-applied after `setEnabled_all(True)`); dropping to one plane leaves
-    Set Z-range mode so its Z-min/Z-max rows hide.
+    Set Z-range mode so its Z-min/Z-max rows hide. *(Round 2 replaced this with
+    the Z-stack header checkbox; `_sync_z_stack_controls` is gone.)*
   - **Channels header**: `<b>Channels</b>  Simple ▾  …  Per-Point Channels
     Edit Cycles` above a full-width list; both buttons are single-line now.
   - `ID` → `Experiment ID` with the placeholder *optional name, prefixed to the
@@ -176,11 +177,25 @@ group.
   (same overlay/navigation-viewer behaviour, same region naming as the
   fraction method so per-region maps keep working). Unit tests with the
   existing ScanCoordinates test fixtures.
-- **R2-layout (main tree):** the shared block builder + both panels rebuilt
-  on it, Z/Time enable checkboxes, Wellplate `combobox_z_mode` → Set Z-range,
-  dead style/store machinery removed, cache keys, YAML fix, snake → Scan
-  behaviour. Leaves a `Method` selector in the Wellplate tiling group wired
-  to nothing but the fraction rows' visibility.
+- **R2-layout (main tree): DONE.** `_make_parameter_block` (a `QFrame` named
+  `multipointParameterBlock`) + `_make_checkable_section` + `_make_row_widget` +
+  `_collect_widgets` + `_make_section(title, header_extra)` build both panels'
+  left column; `_ZTimeGroupMixin` holds the group enable logic
+  (`_apply_zstack_enabled` / `_apply_timelapse_enabled` / `_effective_NZ` /
+  `_effective_Nt`), resolved through each panel's `_zstack_checkbox` /
+  `_timelapse_checkbox` property (Flexible: `checkbox_zstack` /
+  `checkbox_timelapse`; Wellplate keeps `checkbox_z` / `checkbox_time`).
+  Wellplate gained `checkbox_set_z_range`, `entry_NX`/`entry_NY`,
+  `radio_tiling_fraction`/`radio_tiling_grid` (`tiling_method_group`) and lost
+  `combobox_z_mode`, `update_tab_styles`, `update_control_visibility`, the
+  `*_not_selected_label`s, the hide/show and store/restore Z/Time machinery, and
+  the `xy_frame`/`z_frame`/`time_frame`/`*_controls_*frame` colour carriers.
+  Cache keys: `set_z_range`, `tiling_method`, `nx`, `ny` (a leftover `z_mode` key
+  is ignored). YAML: `z_stacking_config` now drives `combobox_z_stack`; the loader
+  carries no explicit z range, so `Set Z-range` is left alone on a drop. Snake
+  scan moved to *Scan behaviour* on the Flexible tab. The `Method` selector only
+  swaps which tiling rows are on screen — `Nx × Ny` is not generated yet.
+  Tests: the Z/Time group cases in `test_flexible_region_state.py`.
 - **R2-wire (main tree, after both):** wire `Nx × Ny` to the R2-core API in
   `update_coordinates`, `update_well_coordinates`, `update_live_coordinates`,
   the cache and the YAML path; screenshots of both panels with wells selected.
