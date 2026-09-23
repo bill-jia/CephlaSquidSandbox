@@ -20,11 +20,18 @@ Saved under the active profile; objective-free by design.
 
 import logging
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
+
+
+def default_focus_measure_operator() -> str:
+    # Import lazily: machine configuration also imports observation models.
+    from control._def import FOCUS_MEASURE_OPERATOR
+
+    return FOCUS_MEASURE_OPERATOR.value
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +323,11 @@ class ObservationState(BaseModel):
     z_offset_um: float = Field(0.0, description="Z offset in micrometers")
     confocal_hardware_settings: Optional[ConfocalSettings] = Field(
         None, description="Confocal iris aperture settings"
+    )
+
+    focus_measure_operator: Literal["LAPE", "GLVA", "TENENGRAD"] = Field(
+        default_factory=default_focus_measure_operator,
+        description="Contrast autofocus focus measure",
     )
 
     # Presentation

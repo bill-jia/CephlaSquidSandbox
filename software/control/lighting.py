@@ -1014,7 +1014,7 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         source_code = int(spec["source_code"])
         mcu_name = str(spec.get("matrix_channel_name", "BF LED matrix full"))
         # [LED-DBG] temporary trace; flip serial_peripherals._LED_DBG = False to silence
-        logger.info(
+        logger.debug(
             f"[LED-DBG] LEDMatrix._apply_unified_intensity mode_key='{self._active_mode_key}' "
             f"source_code={source_code} mcu_name='{mcu_name}' intensity_pct={intensity} "
             f"spec_na={spec.get('na')} annulus={spec.get('annulus')} half={spec.get('half')} "
@@ -1674,7 +1674,7 @@ class IlluminationController:
             unified_name, mode_key = lm
             cur = self._channel_state[unified_name].intensity
             # [LED-DBG] log every LED-matrix intensity request (incl. dedup skips)
-            logger.info(
+            logger.debug(
                 f"[LED-DBG] IC.set_channel_intensity LED matrix "
                 f"in='{channel_name}' -> unified='{unified_name}' mode_key={mode_key!r} "
                 f"requested={intensity} current={cur} "
@@ -1702,7 +1702,7 @@ class IlluminationController:
         # [LED-DBG] log every non-matrix (serial/IO-routed) intensity request, incl.
         # dedup skips — lets a rig run confirm whether e.g. the 561 CoolLED actually
         # receives its 100% command before a gated pulse, or is short-circuited here.
-        logger.info(
+        logger.debug(
             f"[LED-DBG] IC.set_channel_intensity ch='{channel_name}' "
             f"requested={intensity} current={cur} "
             f"{'(SKIPPED dedup)' if abs(float(intensity) - float(cur)) < 0.1 else '(SENT)'}"

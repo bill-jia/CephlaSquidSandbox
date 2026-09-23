@@ -356,6 +356,7 @@ def observation_state_to_yaml(
         "name": state.name,
         "version": state.version,
         "confocal_mode": bool(state.confocal_mode),
+        "focus_measure_operator": state.focus_measure_operator,
         "display_color": state.display_color,
         "illuminator_states": illuminator_out,
         "camera_states": {str(camera_label): cam_state},

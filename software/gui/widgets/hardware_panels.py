@@ -2981,6 +2981,13 @@ class AutoFocusWidget(QFrame):
         self.entry_N.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.autofocusController.set_N(10)
 
+        self.dropdown_focus_measure = QComboBox()
+        self.dropdown_focus_measure.addItems([operator.value for operator in FocusMeasureOperator])
+        self.sync_from_observation_state()
+        self.dropdown_focus_measure.currentTextChanged.connect(
+            self.autofocusController.set_focus_measure_operator
+        )
+
         self.btn_autofocus = QPushButton("Autofocus")
         self.btn_autofocus.setDefault(False)
         self.btn_autofocus.setCheckable(True)
@@ -3003,6 +3010,10 @@ class AutoFocusWidget(QFrame):
         grid_line0.addWidget(self.btn_autolevel)
 
         self.grid.addLayout(grid_line0)
+        focus_measure_row = QHBoxLayout()
+        focus_measure_row.addWidget(QLabel("Focus measure"))
+        focus_measure_row.addWidget(self.dropdown_focus_measure)
+        self.grid.addLayout(focus_measure_row)
         self.grid.addWidget(self.btn_autofocus)
         self.setLayout(self.grid)
 
@@ -3012,6 +3023,15 @@ class AutoFocusWidget(QFrame):
         self.entry_delta.valueChanged.connect(self.set_deltaZ)
         self.entry_N.valueChanged.connect(self.autofocusController.set_N)
         self.autofocusController.autofocusFinished.connect(self.autofocus_is_finished)
+
+    def sync_from_observation_state(self, state=None):
+        operator = (
+            state.focus_measure_operator
+            if state is not None
+            else self.autofocusController.focus_measure_operator.value
+        )
+        with QSignalBlocker(self.dropdown_focus_measure):
+            self.dropdown_focus_measure.setCurrentText(operator)
 
     def set_deltaZ(self, value):
         mm_per_ustep = 1.0 / self.stage.get_config().Z_AXIS.convert_real_units_to_ustep(1.0)

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional, Tuple, Sequence, List, Dict
 import abc
 import enum
+import threading
 import time
 
 import pydantic
@@ -422,6 +423,8 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         # to do more than that.
         self._frame_callbacks: List[Tuple[int, Callable[[CameraFrame], None]]] = []
         self._frame_callbacks_enabled = True
+        self._capture_frame_lock = threading.Lock()
+        self._capture_frame_callback = None
 
         # Software crop is applied after hardware crop (setting ROI). The ratio is based on size after hardware crop.
         # Default is 1.0, which means no software crop.
@@ -518,6 +521,33 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         except ValueError:
             self._log.warning(f"No callback with id={callback_id}, cannot remove it.")
 
+    def capture_frame(self, trigger: Optional[Callable[[], None]], timeout_s: float) -> np.ndarray:
+        """Arm reception before triggering and wait for one processed frame.
+
+        Uses the driver's normal frame delivery even when application callbacks
+        are disabled (e.g. during autofocus). Pass None for a continuous stream.
+        The caller owns streaming, illumination, and trigger readiness.
+        """
+        with self._capture_frame_lock:
+            received = threading.Event()
+            frames = []
+
+            def receive(frame):
+                if not frames:
+                    # SDK buffers may be reused as soon as this callback returns.
+                    frames.append(frame.frame.copy())
+                    received.set()
+
+            self._capture_frame_callback = receive
+            try:
+                if trigger is not None:
+                    trigger()
+                if not received.wait(timeout_s):
+                    raise TimeoutError(f"Timed out after {timeout_s:.3f}s waiting for a camera frame")
+                return frames[0]
+            finally:
+                self._capture_frame_callback = None
+
     def _propogate_frame(self, camera_frame: CameraFrame):
         """
         Implementations can call this to propogate a new frame to all registered callbacks.  You should
@@ -525,6 +555,9 @@ class AbstractCamera(metaclass=abc.ABCMeta):
 
         Best practice is to send the same frame here as you assign to your self._current_frame (if you have one).
         """
+        capture_callback = self._capture_frame_callback
+        if capture_callback is not None:
+            capture_callback(camera_frame)
         if not self._frame_callbacks_enabled:
             return
         for _, cb in self._frame_callbacks:

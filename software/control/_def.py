@@ -761,6 +761,8 @@ WELLPLATE_OFFSET_X_mm = 0  # x offset adjustment for using different plates
 WELLPLATE_OFFSET_Y_mm = 0  # y offset adjustment for using different plates
 
 # focus measure operator
+# Default for observation states without a saved contrast autofocus measure.
+# The Contrast AF widget selects the measure for the current observation state.
 FOCUS_MEASURE_OPERATOR = FocusMeasureOperator.LAPE
 
 # controller version
@@ -1330,4 +1332,3 @@ def apply_simulation_mode_defaults(simulation_mode: bool) -> None:
     for config_key, attr_name in defaults:
         if config_key not in SIMULATION_KEYS_FROM_CONFIG:
             g[attr_name] = True
-

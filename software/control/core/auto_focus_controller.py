@@ -48,6 +48,16 @@ class AutoFocusController:
         self.focus_map_coords = []
         self.use_focus_map = False
 
+    @property
+    def focus_measure_operator(self):
+        state = self.liveController.obs_controller.current_observation_state
+        if state is None:
+            return control._def.FOCUS_MEASURE_OPERATOR
+        return control._def.FocusMeasureOperator.convert_to_enum(state.focus_measure_operator)
+
+    def set_focus_measure_operator(self, value):
+        self.liveController.obs_controller.set_focus_measure_operator(value)
+
     def set_N(self, N):
         self.N = N
 

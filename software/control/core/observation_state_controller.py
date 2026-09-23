@@ -117,6 +117,15 @@ class ObservationStateController:
     # Per-property mutation methods (called by widgets)
     # ─────────────────────────────────────────────────────────────────────
 
+    def set_focus_measure_operator(self, value: Union[str, FocusMeasureOperator]) -> None:
+        operator = FocusMeasureOperator.convert_to_enum(value).value
+        if self._current_state is None:
+            self.bootstrap_state_from_hardware()
+        self._current_state.focus_measure_operator = operator
+        cached = self.get_observation_state()
+        if cached is not None:
+            cached.focus_measure_operator = operator
+
     def set_exposure_time(self, value_ms: float) -> None:
         """Update exposure time in ObservationState and apply to camera hardware."""
         if self._current_state is not None:
@@ -929,6 +938,7 @@ class ObservationStateController:
         base = saved or ObservationState()
         return ObservationState(
             name=base.name,
+            focus_measure_operator=(self._current_state or base).focus_measure_operator,
             confocal_mode=self._collect_confocal_mode(),
             camera_settings=camera_settings,
             illuminator_states=illuminator_states,

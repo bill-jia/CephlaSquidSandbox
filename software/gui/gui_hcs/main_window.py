@@ -785,6 +785,8 @@ class HighContentScreeningGui(QMainWindow):
             except (NotImplementedError, Exception):
                 pass
 
+        self.autofocusWidget.sync_from_observation_state(state)
+
         # Sync camera UI widgets
         csw = self.cameraSettingWidget
         if csw is not None and state.camera_settings is not None:
@@ -1456,6 +1458,12 @@ class HighContentScreeningGui(QMainWindow):
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
                 _reselect_current_channel
             )
+        self.liveControlWidget.signal_live_configuration.connect(
+            self.autofocusWidget.sync_from_observation_state
+        )
+        self.multipointController.signal_current_configuration.connect(
+            self.autofocusWidget.sync_from_observation_state
+        )
         # Everything below is X-Light only: the Dragonfly panel has no irises,
         # no dichroic and no filter slider, so it carries none of these signals.
         if self.spinningDiskConfocalWidget is not None and hasattr(
@@ -2170,6 +2178,7 @@ class HighContentScreeningGui(QMainWindow):
     def _on_observation_state_changed(self):
         """After Observation State save/load: refresh channel lists, Camera tab and confocal panel."""
         self._refresh_channel_lists()
+        self.autofocusWidget.sync_from_observation_state()
         if self.cameraSettingWidget:
             self.cameraSettingWidget.sync_controls_from_hardware()
         # The confocal panel is part of the light path a state carries (irises,
