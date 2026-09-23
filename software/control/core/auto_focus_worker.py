@@ -7,6 +7,7 @@ import numpy as np
 import squid.logging
 from control import utils
 import control._def
+from control._sdk_watchdog import CameraTimeoutError
 from control.core.live_controller import LiveController
 from control.microcontroller import Microcontroller
 from control.NL5 import NL5
@@ -44,9 +45,50 @@ class AutofocusWorker:
 
     def run(self):
         try:
-            self.run_autofocus()
+            if getattr(self.autofocusController, "_frequency_request", None) is not None and \
+                    self.autofocusController._frequency_request[0].contrast_af.method == "frequency_assisted":
+                self._run_frequency_assisted()
+            else:
+                self.run_autofocus()
+        except (CameraTimeoutError, Exception) as exc:
+            self.autofocusController.last_error = exc
+            self._log.exception("Autofocus failed")
+            raise
         finally:
             self._finished_fn()
+
+    def _run_frequency_assisted(self):
+        from control.core.contrast_autofocus.capture import StageCaptureSession
+        from control.core.contrast_autofocus.metrics import energy_factor
+        from control.core.contrast_autofocus.search import run_search
+        state, settings, start, lower, upper, increment, travel_lower, travel_upper = (
+            self.autofocusController._frequency_request)
+        cancelled = lambda: not self._keep_running.is_set()
+        session = StageCaptureSession(self.autofocusController, state, lower, upper, cancelled,
+                                      max_time_s=settings.max_time_s,
+                                      travel_lower_um=travel_lower, travel_upper_um=travel_upper)
+        try:
+            with session:
+                def capture_and_display(z_um):
+                    sample = session.capture_at(z_um)
+                    self._image_to_display_fn(sample.image)
+                    return sample
+
+                result = run_search(
+                    capture_at=capture_and_display, move_to=session.move_to, settings=settings,
+                    sharpness=lambda image: utils.calculate_focus_measure(image, self.focus_measure_operator),
+                    energy=lambda image: energy_factor(image, threshold=settings.energy_threshold,
+                                                       sensor_full_scale=settings.sensor_full_scale),
+                    cancelled=cancelled, starting_z_um=start, lower_z_um=lower, upper_z_um=upper,
+                    increment_um=increment, exposure_ms=session.capture_exposure_ms,
+                    restore_to=session.restore_to,
+                    metric=self.focus_measure_operator.value + "/existing-v1",
+                    trigger_route=self.camera.describe_trigger_routing())
+                self.autofocusController.last_result = result
+        finally:
+            if self.autofocusController.last_result is not None:
+                self.autofocusController.last_result.cleanup_errors.extend(
+                    getattr(session, "cleanup_errors", []))
 
     def _acquire_frame(self):
         obs = self.liveController.obs_controller

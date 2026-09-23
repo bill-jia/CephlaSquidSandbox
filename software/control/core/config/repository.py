@@ -1261,6 +1261,7 @@ class ConfigRepository:
                 name=loaded_name,
                 confocal_mode=confocal_mode,
                 **({"focus_measure_operator": data["focus_measure_operator"]} if "focus_measure_operator" in data else {}),
+                **({"contrast_af": data["contrast_af"]} if "contrast_af" in data else {}),
                 camera_settings=camera_settings,
                 camera_live=camera_live,
                 illuminator_states=illuminator_states,

@@ -74,6 +74,75 @@ def test_immediate_frames_are_received_and_routed_via_camera(mode, monkeypatch):
     worker._finished_fn.assert_called_once()
 
 
+def test_owned_immediate_frame_cannot_leak_when_callbacks_reenabled():
+    camera = Camera()
+    camera._frame_callbacks_enabled = True
+    frame = camera.capture_frame(camera.deliver, 0.1)
+    camera._frame_callbacks_enabled = True
+    assert frame[0, 0] == 1
+    camera.downstream.assert_not_called()
+    camera.deliver()
+    camera.downstream.assert_called_once()
+
+
+def test_capture_cancellation_does_not_retrigger():
+    camera = Camera()
+    running = threading.Event()
+    running.set()
+    trigger = MagicMock()
+    timer = threading.Timer(0.01, running.clear)
+    timer.start()
+    try:
+        with pytest.raises(InterruptedError):
+            camera.capture_frame(trigger, 1, cancelled=lambda: not running.is_set())
+    finally:
+        timer.join()
+    trigger.assert_called_once()
+
+
+def test_capture_cancelled_before_trigger_releases_owner():
+    camera = Camera()
+    with pytest.raises(InterruptedError, match="cancelled"):
+        camera.capture_frame(camera.deliver, 0.1, cancelled=lambda: True)
+    assert camera.frame_id == 0
+    assert camera.capture_frame(camera.deliver, 0.1)[0, 0] == 1
+
+
+def test_capture_cancelled_during_immediate_delivery_releases_owner():
+    camera = Camera()
+    cancelled = threading.Event()
+
+    def deliver_and_cancel():
+        camera.deliver()
+        cancelled.set()
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        camera.capture_frame(deliver_and_cancel, 0.1, cancelled=cancelled.is_set)
+    assert camera.frame_id == 1
+    assert camera.capture_frame(camera.deliver, 0.1)[0, 0] == 2
+
+
+def test_capture_rejects_second_owner():
+    camera = Camera()
+    armed = threading.Event()
+    release = threading.Event()
+    received = []
+
+    def first_trigger():
+        armed.set()
+        assert release.wait(1)
+        camera.deliver()
+
+    thread = threading.Thread(target=lambda: received.append(camera.capture_frame(first_trigger, 1)))
+    thread.start()
+    assert armed.wait(1)
+    with pytest.raises(RuntimeError, match="owns frame delivery"):
+        camera.capture_frame(camera.deliver, 0.1)
+    release.set()
+    thread.join(1)
+    assert len(received) == 1
+
+
 def test_capture_waits_for_delayed_frame():
     camera = Camera()
     timer = threading.Timer(0.01, camera.deliver)

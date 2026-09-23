@@ -425,6 +425,7 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         self._frame_callbacks_enabled = True
         self._capture_frame_lock = threading.Lock()
         self._capture_frame_callback = None
+        self._capture_delivery_done = None
 
         # Software crop is applied after hardware crop (setting ROI). The ratio is based on size after hardware crop.
         # Default is 1.0, which means no software crop.
@@ -521,32 +522,50 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         except ValueError:
             self._log.warning(f"No callback with id={callback_id}, cannot remove it.")
 
-    def capture_frame(self, trigger: Optional[Callable[[], None]], timeout_s: float) -> np.ndarray:
+    def capture_frame(self, trigger: Optional[Callable[[], None]], timeout_s: float,
+                      cancelled: Optional[Callable[[], bool]] = None) -> np.ndarray:
         """Arm reception before triggering and wait for one processed frame.
 
         Uses the driver's normal frame delivery even when application callbacks
         are disabled (e.g. during autofocus). Pass None for a continuous stream.
         The caller owns streaming, illumination, and trigger readiness.
         """
-        with self._capture_frame_lock:
-            received = threading.Event()
+        if not self._capture_frame_lock.acquire(blocking=False):
+            raise RuntimeError("Another camera capture owns frame delivery")
+        try:
+            delivered = threading.Event()
             frames = []
 
             def receive(frame):
                 if not frames:
                     # SDK buffers may be reused as soon as this callback returns.
                     frames.append(frame.frame.copy())
-                    received.set()
 
             self._capture_frame_callback = receive
+            self._capture_delivery_done = delivered
             try:
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Camera capture cancelled")
                 if trigger is not None:
                     trigger()
-                if not received.wait(timeout_s):
-                    raise TimeoutError(f"Timed out after {timeout_s:.3f}s waiting for a camera frame")
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Camera capture cancelled")
+                deadline = time.monotonic() + timeout_s
+                while not delivered.wait(min(0.05, max(0, deadline - time.monotonic()))):
+                    if cancelled is not None and cancelled():
+                        raise InterruptedError("Camera capture cancelled")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out after {timeout_s:.3f}s waiting for a camera frame")
+                if not frames:
+                    raise RuntimeError("Camera delivery completed without a frame")
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Camera capture cancelled")
                 return frames[0]
             finally:
                 self._capture_frame_callback = None
+                self._capture_delivery_done = None
+        finally:
+            self._capture_frame_lock.release()
 
     def _propogate_frame(self, camera_frame: CameraFrame):
         """
@@ -557,11 +576,16 @@ class AbstractCamera(metaclass=abc.ABCMeta):
         """
         capture_callback = self._capture_frame_callback
         if capture_callback is not None:
-            capture_callback(camera_frame)
-        if not self._frame_callbacks_enabled:
-            return
-        for _, cb in self._frame_callbacks:
-            cb(camera_frame)
+            done = self._capture_delivery_done
+            try:
+                capture_callback(camera_frame)
+            finally:
+                if done is not None:
+                    done.set()
+            return  # The captured frame belongs to this caller, never to live callbacks.
+        if self._frame_callbacks_enabled:
+            for _, cb in self._frame_callbacks:
+                cb(camera_frame)
 
     @abc.abstractmethod
     def set_exposure_time(self, exposure_time_ms: float):

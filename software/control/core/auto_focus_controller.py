@@ -1,5 +1,6 @@
 import threading
 import time
+import math
 from threading import Thread
 from typing import Optional, Callable
 
@@ -8,6 +9,7 @@ import numpy as np
 import squid.logging
 from control import utils
 import control._def
+from control._sdk_watchdog import CameraTimeoutError
 from control.core.auto_focus_worker import AutofocusWorker
 from control.core.live_controller import LiveController
 from control.microcontroller import Microcontroller
@@ -31,6 +33,11 @@ class AutoFocusController:
         self._autofocus_worker: Optional[AutofocusWorker] = None
         self._focus_thread: Optional[Thread] = None
         self._keep_running = threading.Event()
+        self._completion = threading.Event()
+        self.last_result = None
+        self.last_error = None
+        self.acquisition_active = lambda: False
+        self.piezo_active = lambda: False
         self.camera: AbstractCamera = camera
         self.stage: AbstractStage = stage
         self.microcontroller: Microcontroller = microcontroller
@@ -41,7 +48,7 @@ class AutoFocusController:
 
         # Start with "Reasonable" defaults.
         self.N: int = 10
-        self.deltaZ: float = 1.524
+        self.deltaZ: float = 1.524 / 1000  # legacy scan stores millimetres
         self.crop_width = control._def.AF.CROP_WIDTH
         self.crop_height = control._def.AF.CROP_HEIGHT
         self.autofocus_in_progress = False
@@ -69,18 +76,48 @@ class AutoFocusController:
         self.crop_height = crop_height
 
     def autofocus(self, focus_map_override=False):
+        if self.autofocus_in_progress or (self._focus_thread and self._focus_thread.is_alive()):
+            raise RuntimeError("Autofocus is already running")
+        state = self.liveController.obs_controller.current_observation_state
+        method = state.contrast_af.method if state and state.contrast_af else "legacy"
+        if method == "frequency_assisted":
+            if self.acquisition_active():
+                raise RuntimeError("Frequency-assisted autofocus is manual-only during phase 1")
+            if self.piezo_active():
+                raise RuntimeError("Frequency-assisted autofocus supports stage Z only; disable piezo focus")
+            if state.is_stimulus_only:
+                raise ValueError("Stimulus-only observation cannot capture autofocus frames")
+            if self.use_focus_map and not focus_map_override:
+                raise RuntimeError("Frequency-assisted autofocus needs a measured scan; disable the focus map")
+            self._frequency_request = self._resolve_frequency_request(state)
+            self._completion.clear()
+            self.last_result = self.last_error = None
+            self._keep_running.set()
+            self.autofocus_in_progress = True
+            self._autofocus_worker = AutofocusWorker(
+                self, self._on_frequency_completed, self._image_to_display_fn, self._keep_running)
+            self._focus_thread = Thread(target=self._run_worker, daemon=True)
+            self._focus_thread.start()
+            return
+        self._frequency_request = None
+        self._completion.clear()
+        self.last_result = self.last_error = None
         if self.use_focus_map and (not focus_map_override):
             self.autofocus_in_progress = True
-
-            self.stage.wait_for_idle(1.0)
-            pos = self.stage.get_pos()
-
-            # z here is in mm because that's how the navigation controller stores it
-            target_z = utils.interpolate_plane(*self.focus_map_coords[:3], (pos.x_mm, pos.y_mm))
-            self._log.info(f"Interpolated target z as {target_z} mm from focus map, moving there.")
-            self.stage.move_z_to(target_z)
-            self.autofocus_in_progress = False
-            self._finished_fn()
+            try:
+                self.stage.wait_for_idle(1.0)
+                pos = self.stage.get_pos()
+                # Z is in mm because that is what the navigation controller stores.
+                target_z = utils.interpolate_plane(*self.focus_map_coords[:3], (pos.x_mm, pos.y_mm))
+                self._log.info(f"Interpolated target z as {target_z} mm from focus map, moving there.")
+                self.stage.move_z_to(target_z)
+            except (CameraTimeoutError, Exception) as exc:
+                self.last_error = exc
+                raise
+            finally:
+                self.autofocus_in_progress = False
+                self._completion.set()
+                self._finished_fn()
             return
         # stop live
         if self.liveController.is_live:
@@ -116,8 +153,15 @@ class AutoFocusController:
         self._autofocus_worker = AutofocusWorker(
             self, self._on_autofocus_completed, self._image_to_display_fn, self._keep_running
         )
-        self._focus_thread = Thread(target=self._autofocus_worker.run, daemon=True)
+        self._focus_thread = Thread(target=self._run_worker, daemon=True)
         self._focus_thread.start()
+
+    def _run_worker(self):
+        try:
+            self._autofocus_worker.run()
+        except (CameraTimeoutError, Exception):
+            # The worker already published last_error and logged the traceback.
+            pass
 
     def _on_autofocus_completed(self):
         # re-enable callback
@@ -129,15 +173,59 @@ class AutoFocusController:
             self.liveController.start_live()
 
         # emit the autofocus finished signal to enable the UI
+        self.autofocus_in_progress = False
+        self._completion.set()
         self._finished_fn()
         self._log.info("autofocus finished")
 
-        # update the state
+    def _on_frequency_completed(self):
         self.autofocus_in_progress = False
+        self._completion.set()
+        self._finished_fn()
 
-    def wait_till_autofocus_has_completed(self):
-        while self.autofocus_in_progress:
-            time.sleep(0.005)
+    def cancel_autofocus(self):
+        self._keep_running.clear()
+
+    def _resolve_frequency_request(self, state):
+        from control.models.contrast_autofocus import ContrastAFSettings
+        settings = ContrastAFSettings.model_validate(state.contrast_af.model_dump())
+        # The sensor format alone does not distinguish unshifted 12-bit from
+        # shifted 16-bit pixels. Require an explicit scale for this experiment.
+        if settings.sensor_full_scale is None:
+            raise ValueError("Set the sensor full scale for frequency-assisted autofocus")
+        axis = self.stage.get_config().Z_AXIS
+        if not all(math.isfinite(v) for v in (axis.MIN_POSITION, axis.MAX_POSITION)):
+            raise ValueError("Finite stage Z limits are required")
+        physical = sorted((axis.raw_to_canonical(axis.MIN_POSITION) * 1000,
+                           axis.raw_to_canonical(axis.MAX_POSITION) * 1000))
+        start = self.stage.get_pos().z_mm * 1000
+        travel_lower = max(start - settings.window_below_um, physical[0])
+        travel_upper = min(start + settings.window_above_um, physical[1])
+        # CephlaStage's blocking absolute Z move can overshoot a target by this
+        # amount in the raw-negative direction to clear backlash. Keep every
+        # sampled/final/rollback target one compensation distance inside the
+        # user's explicitly permitted travel interval.
+        backlash_value = getattr(self.stage, "_BACKLASH_COMPENSATION_DISTANCE_MM", 0)
+        backlash_um = float(backlash_value) * 1000 if isinstance(backlash_value, (int, float)) else 0
+        if not math.isfinite(backlash_um) or backlash_um < 0:
+            raise ValueError("Invalid stage backlash compensation distance")
+        lower = travel_lower + backlash_um
+        upper = travel_upper - backlash_um
+        increment = abs(axis.convert_to_real_units(1)) * 1000
+        if not math.isfinite(increment) or increment <= 0 or lower >= upper or not lower <= start <= upper:
+            raise ValueError("Requested autofocus window has no usable stage travel")
+        if min(settings.coarse_step_um, settings.medium_step_um, settings.fine_step_um) < increment:
+            raise ValueError("Autofocus step is below one stage microstep")
+        return (state.model_copy(deep=True), settings, start, lower, upper, increment,
+                travel_lower, travel_upper)
+
+    def wait_till_autofocus_has_completed(self, timeout_s=180):
+        if not self._completion.wait(timeout_s):
+            raise TimeoutError("Autofocus did not finish within the wait limit")
+        if self.last_error is not None:
+            raise RuntimeError("Autofocus failed") from self.last_error
+        if self.last_result is not None and self.last_result.status != "success":
+            raise RuntimeError(f"Autofocus {self.last_result.status}: {self.last_result.error}")
         self._log.info("autofocus wait has completed, exit wait")
 
     def set_focus_map_use(self, enable):

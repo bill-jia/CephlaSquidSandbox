@@ -4398,6 +4398,11 @@ class MultiPointWorker:
                         f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
                         f"State, so autofocus cannot be configured. Available: {available}"
                     )
+                if config_AF.contrast_af and config_AF.contrast_af.method == "frequency_assisted":
+                    raise RuntimeError(
+                        "Frequency-assisted contrast AF is manual-only until phase 3 frame ownership "
+                        "is validated. Select legacy autofocus for multipoint acquisition."
+                    )
                 self._select_config(config_AF)
                 if (
                     self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0

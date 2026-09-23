@@ -15,6 +15,7 @@ from control.core.auto_focus_worker import AutofocusWorker
 from control.core.config.repository import ConfigRepository
 from control.core.observation_state_service import observation_state_to_yaml
 from control.models.observation_state import IlluminatorState, ObservationState
+from control.models.contrast_autofocus import ContrastAFSettings
 from tests.control.core.test_observation_state_confocal import _make_controller, _repo_with_profile
 
 
@@ -83,6 +84,58 @@ def test_invalid_measure_rejected():
         ObservationState(focus_measure_operator="unknown")
 
 
+def test_frequency_settings_roundtrip_and_state_switch(tmp_path):
+    repo = _repo_with_profile(tmp_path)
+    obs = _make_controller(config_repo=repo)
+    first = ObservationState(
+        name="first", illuminator_states=[IlluminatorState(illumination_channel="TestLaser")],
+        contrast_af=ContrastAFSettings(method="frequency_assisted", coarse_step_um=12,
+                                       medium_step_um=3, fine_step_um=1,
+                                       window_below_um=30, window_above_um=40,
+                                       energy_threshold=0.6, sensor_full_scale=4095))
+    second = ObservationState(name="second", contrast_af=ContrastAFSettings(method="legacy"))
+    obs.set_active_observation_state(first)
+    obs.set_contrast_af(first.contrast_af.model_copy(update={"energy_threshold": 0.7}))
+    assert obs.collect_observation_state().contrast_af.energy_threshold == 0.7
+    assert obs.cache_current_state_to_disk()
+    reopened = ConfigRepository(base_path=repo.base_path)
+    reopened.set_profile("p1")
+    assert reopened.get_observation_state().contrast_af.fine_step_um == 1
+    assert reopened.get_observation_state().contrast_af.energy_threshold == 0.7
+    repo.save_observation_preset("first", obs.collect_observation_state())
+    loaded = repo.load_observation_preset("first")
+    assert loaded.contrast_af.coarse_step_um == 12
+    assert loaded.contrast_af.energy_threshold == 0.7
+    assert observation_state_to_yaml(loaded)["contrast_af"]["sensor_full_scale"] == 4095
+    obs.set_active_observation_state(second)
+    assert obs.current_observation_state.contrast_af.method == "legacy"
+    assert first.contrast_af.energy_threshold == 0.7
+    assert repo.get_observation_state().contrast_af.energy_threshold == 0.7
+    obs.set_active_observation_state(loaded)
+    assert obs.current_observation_state.contrast_af.medium_step_um == 3
+
+
+def test_frequency_settings_require_explicit_window():
+    with pytest.raises(ValidationError):
+        ContrastAFSettings(method="frequency_assisted", coarse_step_um=10)
+
+
+def test_multipoint_rejects_new_method_in_preflight():
+    from control.core.multi_point_controller import MultiPointController
+
+    state = ObservationState(contrast_af=ContrastAFSettings(
+        method="frequency_assisted", coarse_step_um=10, medium_step_um=2,
+        fine_step_um=1, window_below_um=20, window_above_um=20))
+    fake = SimpleNamespace(
+        scanCoordinates=SimpleNamespace(region_centers={}), _log=MagicMock(),
+        do_autofocus=True, do_reflection_af=False,
+        liveController=SimpleNamespace(get_observation_state_by_name=MagicMock(return_value=state)),
+        autofocusController=SimpleNamespace(autofocus_in_progress=False), stage=MagicMock())
+    assert MultiPointController.validate_acquisition_settings(fake) is False
+    fake.stage.move_z_to.assert_not_called()
+    assert "manual-only" in fake._log.error.call_args.args[0]
+
+
 def test_focus_widget_selection_and_restore(qtbot, tmp_path):
     from gui.gui_hcs.qt_controllers import QtAutoFocusController
     from gui.widgets.hardware_panels import AutoFocusWidget
@@ -107,3 +160,100 @@ def test_focus_widget_selection_and_restore(qtbot, tmp_path):
     assert widget.dropdown_focus_measure.currentText() == "LAPE"
     # Refresh must not write to the previous state's general cache.
     assert repo.get_observation_state().focus_measure_operator == "TENENGRAD"
+
+
+def test_focus_widget_completion_does_not_restart(qtbot, tmp_path):
+    from gui.gui_hcs.qt_controllers import QtAutoFocusController
+    from gui.widgets.hardware_panels import AutoFocusWidget
+
+    obs = _make_controller(config_repo=_repo_with_profile(tmp_path))
+    obs.set_active_observation_state(ObservationState())
+    af = QtAutoFocusController(
+        camera=MagicMock(), stage=MagicMock(),
+        liveController=SimpleNamespace(obs_controller=obs), microcontroller=MagicMock(), nl5=None)
+    widget = AutoFocusWidget(af)
+    qtbot.addWidget(widget)
+    af.autofocus = MagicMock()
+    af.cancel_autofocus = MagicMock()
+    widget.btn_autofocus.setChecked(True)
+    af.autofocus.assert_called_once_with(False)
+    widget.autofocus_is_finished()
+    assert not widget.btn_autofocus.isChecked()
+    af.autofocus.assert_called_once()
+    af.cancel_autofocus.assert_not_called()
+
+
+def _valid_frequency_widget(qtbot, tmp_path):
+    from gui.gui_hcs.qt_controllers import QtAutoFocusController
+    from gui.widgets.hardware_panels import AutoFocusWidget
+
+    repo = _repo_with_profile(tmp_path)
+    obs = _make_controller(config_repo=repo)
+    settings = ContrastAFSettings(
+        method="frequency_assisted", coarse_step_um=10, medium_step_um=2,
+        fine_step_um=1, window_below_um=20, window_above_um=20,
+        sensor_full_scale=255)
+    state = ObservationState(contrast_af=settings)
+    obs.set_active_observation_state(state)
+    axis = SimpleNamespace(
+        MIN_POSITION=0, MAX_POSITION=0.04,
+        raw_to_canonical=lambda z: z,
+        convert_to_real_units=lambda steps: steps * 0.001)
+    stage = MagicMock()
+    stage.get_config.return_value = SimpleNamespace(Z_AXIS=axis)
+    stage.get_pos.return_value = SimpleNamespace(z_mm=0.02)
+    camera = MagicMock()
+    af = QtAutoFocusController(
+        camera=camera, stage=stage,
+        liveController=SimpleNamespace(obs_controller=obs),
+        microcontroller=MagicMock(), nl5=None)
+    widget = AutoFocusWidget(af)
+    qtbot.addWidget(widget)
+    return widget, af, obs, repo, stage, camera
+
+
+@pytest.mark.parametrize("field", ["fine_step_um", "max_time_s"])
+def test_invalid_displayed_frequency_settings_cannot_start_stale_scan(qtbot, tmp_path, monkeypatch, field):
+    widget, af, obs, _, stage, camera = _valid_frequency_widget(qtbot, tmp_path)
+    assert obs.current_observation_state.contrast_af.fine_step_um == 1
+    monkeypatch.setattr("gui.widgets.hardware_panels.QMessageBox.warning", MagicMock())
+    af.autofocus = MagicMock()
+    widget.af_inputs[field].setValue(0)
+    assert "Configure AF" in widget.af_interval.text()
+    widget.btn_autofocus.setChecked(True)
+    assert not widget.btn_autofocus.isChecked()
+    af.autofocus.assert_not_called()
+    stage.move_z_to.assert_not_called()
+    camera.send_trigger.assert_not_called()
+    assert obs.current_observation_state.contrast_af.fine_step_um == 1
+
+
+def test_widget_refresh_preserves_zero_settings_and_other_state_cache(qtbot, tmp_path):
+    widget, _, obs, repo, _, _ = _valid_frequency_widget(qtbot, tmp_path)
+    zero = obs.current_observation_state.model_copy(deep=True)
+    zero.contrast_af = zero.contrast_af.model_copy(update={
+        "energy_threshold": 0, "verification_tolerance": 0})
+    repo.save_observation_state("p1", zero.model_copy(deep=True))
+    obs.set_active_observation_state(zero)
+    widget.sync_from_observation_state(zero)
+    assert widget.af_inputs["energy_threshold"].value() == 0
+    assert widget.af_inputs["verification_tolerance"].value() == 0
+    assert zero.contrast_af.energy_threshold == 0
+    assert zero.contrast_af.verification_tolerance == 0
+    assert repo.get_observation_state().contrast_af.energy_threshold == 0
+    assert repo.get_observation_state().contrast_af.verification_tolerance == 0
+
+    nonzero = zero.model_copy(deep=True)
+    nonzero.contrast_af = nonzero.contrast_af.model_copy(update={
+        "energy_threshold": 0.7, "verification_tolerance": 0.3})
+    obs.set_active_observation_state(nonzero)
+    widget.sync_from_observation_state(nonzero)
+    assert widget.af_inputs["energy_threshold"].value() == 0.7
+    assert widget.af_inputs["verification_tolerance"].value() == 0.3
+    assert repo.get_observation_state().contrast_af.energy_threshold == 0
+    assert repo.get_observation_state().contrast_af.verification_tolerance == 0
+
+    obs.set_active_observation_state(zero)
+    widget.sync_from_observation_state(zero)
+    assert widget.af_inputs["energy_threshold"].value() == 0
+    assert widget.af_inputs["verification_tolerance"].value() == 0

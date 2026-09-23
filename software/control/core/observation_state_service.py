@@ -362,6 +362,8 @@ def observation_state_to_yaml(
         "camera_states": {str(camera_label): cam_state},
         "channel_groups": [cg.model_dump(mode="json") for cg in state.channel_groups] if state.channel_groups else [],
     }
+    if state.contrast_af is not None:
+        out["contrast_af"] = state.contrast_af.model_dump(mode="json")
 
     if confocal_hw_dict is not None:
         out["confocal_hardware_settings"] = confocal_hw_dict

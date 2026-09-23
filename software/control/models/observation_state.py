@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
+from control.models.contrast_autofocus import ContrastAFSettings
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,7 @@ class ObservationState(BaseModel):
         default_factory=default_focus_measure_operator,
         description="Contrast autofocus focus measure",
     )
+    contrast_af: Optional[ContrastAFSettings] = None
 
     # Presentation
     display_color: str = Field("#FFFFFF", description="Hex color for UI visualization", pattern=r"^#[0-9A-Fa-f]{6}$")

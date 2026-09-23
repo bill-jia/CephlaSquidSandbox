@@ -2954,9 +2954,9 @@ class AutoFocusWidget(QFrame):
         super().__init__(*args, **kwargs)
         self.autofocusController = autofocusController
         self.log = squid.logging.get_logger(self.__class__.__name__)
+        self.stage = self.autofocusController.stage
         self.add_components()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
-        self.stage = self.autofocusController.stage
 
     def add_components(self):
         self.entry_delta = QDoubleSpinBox()
@@ -3014,15 +3014,106 @@ class AutoFocusWidget(QFrame):
         focus_measure_row.addWidget(QLabel("Focus measure"))
         focus_measure_row.addWidget(self.dropdown_focus_measure)
         self.grid.addLayout(focus_measure_row)
+        self.af_method = QComboBox()
+        self.af_method.addItem("Legacy scan", "legacy")
+        self.af_method.addItem("Frequency-assisted (experimental)", "frequency_assisted")
+        self.grid.addWidget(self.af_method)
+        self.af_inputs = {}
+        for field, label, maximum, decimals in (
+            ("coarse_step_um", "Coarse step (µm)", 10000, 3),
+            ("medium_step_um", "Medium step (µm)", 10000, 3),
+            ("fine_step_um", "Fine step (µm)", 10000, 3),
+            ("window_below_um", "Window below current Z (µm)", 100000, 3),
+            ("window_above_um", "Window above current Z (µm)", 100000, 3),
+            ("energy_threshold", "E threshold T (unvalidated)", 1, 3),
+            ("energy_margin", "E margin", 1000000000, 3),
+            ("sensor_full_scale", "Sensor full scale (encoded counts)", 65535, 0),
+            ("max_time_s", "Time budget (s)", 3600, 1),
+            ("max_exposure_ms", "Exposure budget (ms)", 1000000, 1),
+            ("verification_tolerance", "Verify tolerance (fraction)", 1, 3),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            box = QDoubleSpinBox()
+            box.setRange(0, maximum)
+            box.setDecimals(decimals)
+            box.setKeyboardTracking(False)
+            row.addWidget(box)
+            self.grid.addLayout(row)
+            self.af_inputs[field] = box
+            box.valueChanged.connect(self._settings_changed)
+        for field, label in (("max_frames", "Frame budget"), ("max_moves", "Move budget")):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            box = QSpinBox()
+            box.setRange(5, 10000)
+            row.addWidget(box)
+            self.grid.addLayout(row)
+            self.af_inputs[field] = box
+            box.valueChanged.connect(self._settings_changed)
+        self.af_fallback = QCheckBox("Allow one dense fallback")
+        self.grid.addWidget(self.af_fallback)
+        self.af_fallback.toggled.connect(self._settings_changed)
+        self.af_interval = QLabel("Set explicit bounds before starting")
+        self.grid.addWidget(self.af_interval)
         self.grid.addWidget(self.btn_autofocus)
         self.setLayout(self.grid)
 
         # connections
-        self.btn_autofocus.toggled.connect(lambda: self.autofocusController.autofocus(False))
+        self.btn_autofocus.toggled.connect(self._autofocus_toggled)
+        self.af_method.currentIndexChanged.connect(self._settings_changed)
         self.btn_autolevel.toggled.connect(self.signal_autoLevelSetting.emit)
         self.entry_delta.valueChanged.connect(self.set_deltaZ)
         self.entry_N.valueChanged.connect(self.autofocusController.set_N)
         self.autofocusController.autofocusFinished.connect(self.autofocus_is_finished)
+        self.sync_from_observation_state()
+
+    def _validated_settings(self):
+        """Validate the displayed values without changing the active state."""
+        from control.models.contrast_autofocus import ContrastAFSettings
+        method = self.af_method.currentData()
+        if method == "legacy":
+            self.af_interval.setText("Legacy scan")
+            return ContrastAFSettings(method="legacy")
+        values = {name: box.value() for name, box in self.af_inputs.items()}
+        values["method"] = method
+        values["dense_fallback"] = self.af_fallback.isChecked()
+        try:
+            settings = ContrastAFSettings.model_validate(values)
+            state = self.autofocusController.liveController.obs_controller.current_observation_state
+            trial = state.model_copy(deep=True) if state else None
+            if trial is None:
+                raise ValueError("No active observation state")
+            trial.contrast_af = settings
+            lower, upper = self.autofocusController._resolve_frequency_request(trial)[3:5]
+        except (ValueError, TypeError) as exc:
+            self.af_interval.setText(f"Configure AF: {exc}")
+            return None
+        self.af_interval.setText(f"Bounded scan: {lower:.2f} to {upper:.2f} µm")
+        return settings
+
+    def _settings_changed(self, *args):
+        settings = self._validated_settings()
+        if settings is None:
+            return None
+        self.autofocusController.liveController.obs_controller.set_contrast_af(settings)
+        return settings
+
+    def _autofocus_toggled(self, checked):
+        if not checked:
+            self.autofocusController.cancel_autofocus()
+            return
+        try:
+            settings = self._validated_settings()
+            if settings is None:
+                raise ValueError(self.af_interval.text())
+            self.autofocusController.liveController.obs_controller.set_contrast_af(settings)
+            self.autofocusController.autofocus(False)
+        except Exception as exc:
+            self.log.exception("Cannot start autofocus")
+            with QSignalBlocker(self.btn_autofocus):
+                self.btn_autofocus.setChecked(False)
+            QMessageBox.warning(self, "Autofocus", str(exc))
 
     def sync_from_observation_state(self, state=None):
         operator = (
@@ -3032,6 +3123,25 @@ class AutoFocusWidget(QFrame):
         )
         with QSignalBlocker(self.dropdown_focus_measure):
             self.dropdown_focus_measure.setCurrentText(operator)
+        if not hasattr(self, "af_method"):
+            return
+        state = state or self.autofocusController.liveController.obs_controller.current_observation_state
+        settings = state.contrast_af if state else None
+        with QSignalBlocker(self.af_method):
+            self.af_method.setCurrentIndex(1 if settings and settings.method == "frequency_assisted" else 0)
+        for name, box in self.af_inputs.items():
+            default = {"energy_threshold": 0.5, "max_frames": 100, "max_moves": 130,
+                       "max_time_s": 120, "max_exposure_ms": 10000,
+                       "verification_tolerance": 0.25}.get(name, 0)
+            value = getattr(settings, name, None) if settings is not None else None
+            with QSignalBlocker(box):
+                box.setValue(default if value is None else value)
+        with QSignalBlocker(self.af_fallback):
+            self.af_fallback.setChecked(settings.dense_fallback if settings else True)
+        if settings and settings.method == "frequency_assisted":
+            self._validated_settings()
+        else:
+            self.af_interval.setText("Legacy scan")
 
     def set_deltaZ(self, value):
         mm_per_ustep = 1.0 / self.stage.get_config().Z_AXIS.convert_real_units_to_ustep(1.0)
@@ -3042,7 +3152,13 @@ class AutoFocusWidget(QFrame):
         self.autofocusController.set_deltaZ(deltaZ)
 
     def autofocus_is_finished(self):
-        self.btn_autofocus.setChecked(False)
+        with QSignalBlocker(self.btn_autofocus):
+            self.btn_autofocus.setChecked(False)
+        result = self.autofocusController.last_result
+        error = self.autofocusController.last_error
+        if error or (result is not None and result.status != "success"):
+            self.log.error("Autofocus failed: %s", error or result.error)
+            QMessageBox.warning(self, "Autofocus", str(error or result.error or result.status))
 
 
 

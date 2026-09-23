@@ -2129,6 +2129,20 @@ class MultiPointController:
             self._log.error(f"Cannot start acquisition — invalid region name: {name_error}")
             return False
 
+        if self.autofocusController.autofocus_in_progress:
+            self._log.error("Cannot start multipoint acquisition while autofocus is running")
+            return False
+
+        if self.do_autofocus and not self.do_reflection_af:
+            af_state = self.liveController.get_observation_state_by_name(
+                control._def.MULTIPOINT_AUTOFOCUS_CHANNEL)
+            if af_state is not None and af_state.contrast_af and af_state.contrast_af.method == "frequency_assisted":
+                self._log.error(
+                    "Frequency-assisted contrast AF is manual-only until phase 3 frame ownership "
+                    "is validated. Select legacy autofocus for multipoint acquisition."
+                )
+                return False
+
         if self.do_reflection_af:
             # Acceptable when a global reference is set (regions without their own
             # reference fall back to it) OR every region carries a per-region

@@ -437,6 +437,8 @@ class HighContentScreeningGui(QMainWindow):
             laser_autofocus_controller=self.laserAutofocusController,
             fluidics=self.fluidics,
         )
+        self.autofocusController.acquisition_active = self.multipointController.acquisition_in_progress
+        self.autofocusController.piezo_active = lambda: self.multipointController.use_piezo
 
     def setup_hardware(self, skip_init: bool = False, skip_homing: bool = False):
         # Setup hardware components

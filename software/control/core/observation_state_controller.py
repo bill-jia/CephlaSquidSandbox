@@ -126,6 +126,16 @@ class ObservationStateController:
         if cached is not None:
             cached.focus_measure_operator = operator
 
+    def set_contrast_af(self, value) -> None:
+        from control.models.contrast_autofocus import ContrastAFSettings
+        settings = ContrastAFSettings.model_validate(value)
+        if self._current_state is None:
+            self.bootstrap_state_from_hardware()
+        self._current_state.contrast_af = settings
+        cached = self.get_observation_state()
+        if cached is not None:
+            cached.contrast_af = settings.model_copy(deep=True)
+
     def set_exposure_time(self, value_ms: float) -> None:
         """Update exposure time in ObservationState and apply to camera hardware."""
         if self._current_state is not None:
@@ -939,6 +949,7 @@ class ObservationStateController:
         return ObservationState(
             name=base.name,
             focus_measure_operator=(self._current_state or base).focus_measure_operator,
+            contrast_af=(self._current_state or base).contrast_af,
             confocal_mode=self._collect_confocal_mode(),
             camera_settings=camera_settings,
             illuminator_states=illuminator_states,
