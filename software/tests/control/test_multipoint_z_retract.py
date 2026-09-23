@@ -112,9 +112,10 @@ def test_flag_off_with_two_element_coordinates_issues_no_z_move():
     assert stage.calls == _xy((10.0, 20.0))
 
 
-def test_flag_off_uses_the_af_cache_z_without_a_retract():
+@pytest.mark.parametrize("time_point", [0, 1])
+def test_flag_off_uses_the_af_cache_z_without_a_retract(time_point):
     stage = RecordingStage()
-    worker = _worker(stage, retract=False, do_autofocus=True, time_point=1, z_pos_proposal={("R0", 0): 4.25})
+    worker = _worker(stage, retract=False, do_autofocus=True, time_point=time_point, z_pos_proposal={("R0", 0): 4.25})
 
     worker.move_to_coordinate(R0_FOV0, "R0", 0)
 
@@ -175,9 +176,10 @@ def test_a_move_into_a_different_region_is_bracketed_even_when_fov_is_not_zero()
     assert stage.calls[-1] == ("move_z_to", 3.5, True)
 
 
-def test_retract_keeps_the_af_cache_as_the_target_z():
+@pytest.mark.parametrize("time_point", [0, 1])
+def test_retract_keeps_the_af_cache_as_the_target_z(time_point):
     stage = RecordingStage()
-    worker = _worker(stage, retract=True, do_autofocus=True, time_point=1, z_pos_proposal={("R0", 0): 4.25})
+    worker = _worker(stage, retract=True, do_autofocus=True, time_point=time_point, z_pos_proposal={("R0", 0): 4.25})
 
     worker.move_to_coordinate(R0_FOV0, "R0", 0)
 

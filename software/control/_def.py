@@ -806,6 +806,10 @@ LASER_AF_CONSISTENCY_THRESHOLD_UM = 5.0
 # On regions too small to hit the refresh cadence, take one extra displacement
 # measurement at the last FOV to validate focus. Measurement-only, no Z move.
 LASER_AF_CHECK_LAST_FOV_PER_REGION = True
+# Diagnostic: at every table-path FOV, measure displacement before/after a full
+# laser-AF correction and append to table_path_audit.csv. Corrects Z at audited
+# FOVs and costs ~300 ms each — for validation runs, not production.
+LASER_AF_TABLE_PATH_AUDIT = False
 
 MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT = False

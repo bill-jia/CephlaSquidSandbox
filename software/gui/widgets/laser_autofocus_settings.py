@@ -13,7 +13,8 @@ The dialog lets the user pick between:
     identically to the pre-table code path).
 
 Plus the fast-mode parameters: seed behavior (scan vs lazy), refresh cadence,
-consistency warning threshold, and the end-of-region displacement check.
+consistency warning threshold, the end-of-region displacement check, and the
+diagnostic table-path audit.
 """
 
 import os
@@ -41,7 +42,8 @@ class LaserAutofocusSettingsDialog(QDialog):
 
     Reads initial values from the supplied MultiPointController (attributes
     `do_reflection_af`, `laser_af_seed_mode`, `laser_af_refresh_every_n_fovs`,
-    `laser_af_consistency_threshold_um`, `laser_af_check_last_fov_per_region`)
+    `laser_af_consistency_threshold_um`, `laser_af_check_last_fov_per_region`,
+    `laser_af_table_path_audit`)
     and writes the user's choices back via the controller's setters when the
     user clicks OK.
     """
@@ -113,6 +115,15 @@ class LaserAutofocusSettingsDialog(QDialog):
         )
         fast_layout.addWidget(self.cb_check_last_fov)
 
+        self.cb_table_path_audit = QCheckBox(
+            "Table-path audit (diagnostic): full AF + before/after CSV at every table FOV"
+        )
+        self.cb_table_path_audit.setToolTip(
+            "Validation runs only — corrects Z at audited FOVs and adds ~300 ms per FOV.\n"
+            "Writes table_path_audit.csv next to the acquisition data."
+        )
+        fast_layout.addWidget(self.cb_table_path_audit)
+
         layout.addWidget(self.fast_group)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -140,6 +151,9 @@ class LaserAutofocusSettingsDialog(QDialog):
         self.sp_threshold.setValue(float(getattr(c, "laser_af_consistency_threshold_um", 5.0)))
         self.cb_check_last_fov.setChecked(
             bool(getattr(c, "laser_af_check_last_fov_per_region", True))
+        )
+        self.cb_table_path_audit.setChecked(
+            bool(getattr(c, "laser_af_table_path_audit", False))
         )
 
         seed_mode = getattr(c, "laser_af_seed_mode", "scan")
@@ -169,6 +183,7 @@ class LaserAutofocusSettingsDialog(QDialog):
             )
         c.set_laser_af_consistency_threshold_um(float(self.sp_threshold.value()))
         c.set_laser_af_check_last_fov_per_region(self.cb_check_last_fov.isChecked())
+        c.set_laser_af_table_path_audit(self.cb_table_path_audit.isChecked())
         super().accept()
 
 
