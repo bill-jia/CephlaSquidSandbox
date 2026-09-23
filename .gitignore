@@ -6,6 +6,7 @@
 hardware_docs/
 .migration_complete
 .claude/worktrees
+plans/
 
 # PlatformIO
 .pio/
