@@ -456,6 +456,7 @@ class XLight:
         )
 
     def set_emission_filter(self, position, extraction=False, validate=None):
+        self.log.info(f"Setting emission filter to position {position} (extraction={extraction})")
         if self.disable_emission_filter_wheel:
             self.log.info("Emission filter wheel disabled, skipping set_emission_filter")
             return -1
@@ -481,9 +482,11 @@ class XLight:
         # skip, it must make the next call retry.
         self.emission_wheel_pos = None
         if validate:
+            self.log.info(f"Serial command: B{position_to_write}\\r, expecting B{position_to_read}")
             current_pos = self.serial_connection.write_and_check(
-                "B" + position_to_write + "\r", "B" + position_to_read, read_delay=self.sleep_time_for_wheel
+                "B" + position_to_write + "\r", "B" + position_to_read, print_response=True, read_delay=self.sleep_time_for_wheel
             )
+            self.log.info(f"Serial response: {current_pos}")
             self.emission_wheel_pos = int(current_pos[1])
         else:
             self.serial_connection.write("B" + position_to_write + "\r")

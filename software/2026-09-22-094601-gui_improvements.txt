@@ -1,0 +1,1602 @@
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Opus 5 · Claude Max
+  ▝▝ ▝▝    C:\Code\CephlaSquidSandbox\software
+
+
+❯ /clear                                                                        
+
+❯ /model                                                                        
+  ⎿  Set model to Opus 5 (1M context) and saved as your default for new sessions
+
+❯ Set up a branch for GUI improvements. First change to make - change the       
+  "Switch to Widefield"/"Switch to Confocal" button in the "Spinning Disk       
+  Confocal" subpanel to indicate current state visually, i.e. make it a visual  
+  switch                                                                        
+
+● I'll start by finding the confocal panel code.
+
+  Searched for 3 patterns, ran 8 shell commands (ctrl+o to expand)
+
+● Now the reusable switch widget in common.py:
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Now wire it into the Spinning Disk Confocal panel:
+
+  Searched for 1 pattern, read 2 files, ran 9 shell commands (ctrl+o to expand)
+
+● Branch gui-improvements is set up, first change committed (fd48d8a7).
+
+  What changed
+
+  SegmentedSwitch — a new reusable two-position control in
+  software/gui/widgets/common.py:496. A pair of mutually exclusive checkable
+  buttons; the lit segment is where the hardware is.
+
+  SpinningDiskConfocalWidget (software/gui/widgets/hardware_panels.py) now shows
+  Widefield | Confocal in place of the old Switch to Confocal button, same
+  footprint next to Disk Motor On:
+
+  - Widefield active: [Disk Motor On] [**Widefield**| Confocal ]
+  - Confocal active: [Disk Motor On] [ Widefield |**Confocal**]
+
+  One deliberate behavior choice: clicking the dim segment emits state_requested
+  but does not light it. The disk move is threaded and can fail, so the switch
+  keeps showing the real position (with the panel disabled) until
+  _on_disk_position_toggled confirms. set_state() is silent, so an observation
+  state moving the disk updates the switch without re-commanding hardware.
+
+  Verified by screenshot in both states and
+  tests/control/test_confocal_widget_sync.py — 22 passed, including three new
+  tests covering request-without-claiming, clicking the already-lit segment, and
+  the post-move update.
+
+  Two notes:
+  - I scoped this to the "Spinning Disk Confocal" panel as asked.
+    DragonflyConfocalWidget further down the same file still has the old Switch 
+    to Confocal button — say the word and I'll port it to SegmentedSwitch too.
+  - No docs referenced the old button text, so nothing to update under
+    software/docs.
+
+✻ Cooked for 8m 49s · done Friday 10:32 AM
+
+※ recap: Goal: a gui-improvements branch of GUI polish. The confocal Widefield/Confocal button is now a visual two-segment switch, committed and tested. Next: tell me whether to port the same switch to the Dragonfly confocal panel.
+
+❯ Make the "Disk Motor On" button similar - make the two options "Disk On" and  
+  "Disk Off". Check the existing internal logic for switching between widefield 
+  and confocal - is turning the disk motor on/off required for switching?       
+
+  Read 2 files, ran 15 shell commands (ctrl+o to expand)
+
+● Done — 295be89e. The panel row is now [Disk Off | **Disk On**] [Widefield | 
+  **Confocal**], both segmented switches with the lit segment showing the actual
+  hardware state.
+
+  Your question: is the motor required for switching?
+
+  No — not in software, at any layer:
+
+  - Driver (software/control/serial_peripherals.py): set_disk_position sends
+    D<n>, set_disk_motor_state sends N<0|1>. Two independent commands with no
+    cross-reference in either direction.
+  - Observation states: ConfocalSettings
+    (software/control/models/observation_state.py:49) carries the irises,
+    dichroic and slider; ObservationState.confocal_mode carries the disk
+    position. Motor state is on neither — it's deliberately session-level, as
+    the sync comment in the panel says.
+  - Apply paths: ObservationStateController.apply_confocal_mode
+    (software/control/core/observation_state_controller.py:384) and
+    Microscope.set_confocal_mode (software/control/microscope.py:1088) both move
+    the disk only. Nothing in acquisition, multipoint, or startup ever calls
+    set_disk_motor_state.
+  - Only callers of the motor are this GUI panel, the Dragonfly panel, and
+    XLight.close(), which stops it on shutdown.
+
+  So you can select Confocal with the disk parked, and the software will happily
+  acquire that way. Physically that's near-useless — a stationary disk images
+  through a static pinhole mask — so there's a real coupling that the software
+  doesn't enforce or even warn about. Two things I could add if you want them:
+
+  1. Auto-start the motor when the user switches to Confocal (and optionally
+     stop it on Widefield), or
+  2. Leave the control manual but grey/warn the Confocal segment while the disk
+     is parked.
+
+  I didn't do either — it changes hardware behavior rather than just its
+  display, and it's your call which is right for the rig.
+
+  One related bug I did fix while in there: both switches previously updated
+  (and signal_toggle_confocal_widefield fired, recording the mode on the
+  observation state) regardless of whether the threaded move actually succeeded.
+  Now the display and the signal wait on the driver's answer. Covered by two
+  new tests; 24 pass in tests/control/test_confocal_widget_sync.py.
+
+✻ Cooked for 5m 51s · done Friday 10:46 AM
+
+❯ Yes, add auto-start when switching to confocal                                
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Now the shared policy helper in the driver module:
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Now route the three call sites through it:
+
+  Ran 8 shell commands (ctrl+o to expand)
+
+● Done — 8d7d77fb.
+
+  The single choke point: set_xlight_confocal_mode(xlight, confocal) in
+  software/control/serial_peripherals.py:155. All three paths that move the disk
+  now go through it, so the coupling holds no matter where the switch comes
+  from:
+
+  ┌─────────────────────────┬───────────────────────────────────────────────┐
+  │         Caller          │                     Site                      │
+  ├─────────────────────────┼───────────────────────────────────────────────┤
+  │ Confocal panel click    │ hardware_panels.py → request_disk_position    │
+  ├─────────────────────────┼───────────────────────────────────────────────┤
+  │ Applying a saved        │ observation_state_controller.py:384           │
+  │ observation state       │ apply_confocal_mode                           │
+  ├─────────────────────────┼───────────────────────────────────────────────┤
+  │ Headless scripts        │ microscope.py:1088 set_confocal_mode          │
+  └─────────────────────────┴───────────────────────────────────────────────┘
+
+  Behavior
+
+  - Motor starts before the disk moves, so it's at speed by the time it's in the
+    light path.
+  - Already spinning → no N command. That matters: N has a 2.5 s read delay on
+    the real unit, and an acquisition applying confocal states would otherwise
+    pay it at every channel switch.
+  - Motor refuses to start → logged, not raised. The disk move is what the
+    caller asked for and still happens.
+  - Units with has_spinning_disk_motor == False are untouched.
+  - Leaving confocal leaves the disk spinning. Stopping it would cost a spin-up
+    on the next switch and a spinning disk outside the light path harms nothing.
+    XLight.close() still parks it at shutdown.
+
+  The panel refreshes its motor switch from the driver once the move lands, so
+  Disk Off flips to Disk On by itself when it started the disk on your behalf.
+
+  Verified: 30 tests in test_confocal_widget_sync.py (5 new for the auto-start
+  policy, 1 for the panel's switch following the spin-up), plus 55 in the
+  xlight-driver and observation-state suites.
+
+  One judgment call worth flagging: I assumed the firmware's N1 round-trip (2.5
+  s) covers spin-up to speed, since that's the only wait available. If the disk
+  actually needs longer to stabilize, the first frame or two after an auto-start
+  could be taken at partial speed — worth watching on the rig, and easy to add
+  a settle delay if you see it.
+
+✻ Brewed for 5m 58s · done Friday 10:54 AM
+
+[Image #1]
+
+❯ Attached is what the flexible multipoint panel looks like currently - come up 
+  with some suggestions to make this less confusing. Also look into what the    
+  "Snap images" button and the "Skip Saving" check box do - try to describe     
+  their intent and use cases.                                                   
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● I'll check two more things: how the Flexible panel is built (tooltips, hidden
+  elements) and how the acquisition side handles skip-saving and displayed
+  frames. · summarized
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● Last fact-check: the original commits for both controls, so the intent
+  description is grounded rather than guessed.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Nothing changed in the tree for this one — analysis only. Here's what I found,
+  then the suggestions.
+
+  What the two controls actually do
+
+  Snap Images
+
+  Added 2025-05-17 (e8b0c676, "add the ability to snap multi channel images of
+  the current FOV"). Despite the name, it is a one-FOV acquisition run through 
+  the full multipoint pipeline, not a live-view snap:
+
+  - Takes every checked channel (or, with nothing checked, the current live
+    state as a synthetic single channel) at the current stage position, one
+    plane.
+  - Forces dz=0, Nz=1, dt=0, Nt=1, no contrast AF, no laser AF, no piezo, no
+    fluidics. Uses a throwaway region so the Positions table is untouched.
+  - Honours Save format, Skip Saving, and the ID field. Output lands in <Saving 
+    Path>/snapped_images<ID>_<timestamp>/ — note the missing separator: with ID
+    test you get snapped_imagestest_2026-… (multipoint.py:4534).
+  - Locks the panel, triggers the "Finalizing…" wait, writes coordinates.csv +
+    acquisition.yaml, exactly like a real run.
+  - It overwrites the controller's Nz/dz/Nt/AF flags, but Start Acquisition
+    re-pushes all of them from the GUI (multipoint.py:3891-3903), so nothing
+    sticks.
+
+  Intended use cases: a multi-channel capture that comes out in the same on-disk
+  layout and metadata as an acquisition — a reference image at a spot before a
+  run, a check that the full channel set is exposed correctly before committing
+  to a time-lapse, or a quick capture without registering a position. The
+  live-view Snap gives you one channel and a loose TIFF; this gives you the
+  whole channel set as a dataset.
+
+  Skip Saving
+
+  Added 2025-12-24 (PR #383). Runs the acquisition with no image writer at all:
+  no TIFF/zarr/OME job, no postprocess job, downsampled well views not written,
+  disk-space pre-flight skipped, size label reads "Saving disabled — no files
+  written". Frames still go to the napari display — the display path never
+  consults the flag.
+
+  Intended use cases: a rehearsal — run the whole stage/AF/illumination sequence
+  to check positions, focus and timing without producing data; loop-latency
+  profiling without disk IO; and on this rig specifically, driving
+  trigger/illumination for an external camera app where the main-camera frames
+  are irrelevant.
+
+  Gotchas: it still creates the experiment folder and coordinates.csv every run
+  (stray near-empty folders); it hard-refuses online postprocessing at start
+  (multi_point_controller.py:2228); and the Save format dropdown stays enabled
+  while it's checked, so the two controls contradict each other visually.
+
+  Why the panel reads as confusing
+
+  Three structural problems, visible in the screenshot:
+
+  1. The grid block has no grouping. Nx … Ny … FOV Overlap on one row, dz Nz … 
+     dt Nt on the next — seven parameters from three unrelated concerns (tiling,
+     Z-stack, time-lapse) interleaved with unaligned labels.
+  2. The right column is one undifferentiated checklist: focus settings, Z-stack
+     settings, saving settings, and scan-behaviour flags in one stack. "Snake
+     scan" sits between "Save format" and "Keep illuminators on".
+  3. The button column mixes a setting with two actions. "Laser AF: Off ▸" is a
+     configuration button but is drawn the same size as Snap/Start, and "Snap
+     Images" — a secondary action — is drawn as big as the primary one.
+
+  Suggestions, roughly in order of payoff
+
+  1. Regroup into four labelled boxes (QGroupBox or bold header + indent, like
+  the Positions block already does):
+
+  Tiling per position          Focus
+    Nx [1]  Ny [1]               [ ] Contrast AF
+    Overlap [10 %]  [x] Snake     Laser AF   [Off ▸]
+                                  [ ] Use Focus Map
+  Z-stack                      Saving
+    Nz [1]  dz [1.5 µm]           Format [INDIVIDUAL_IMAGES ▾]
+    From [Bottom ▾]  [ ] Set range  ~ 24 images · 190 MB
+                                    (or: "Not saving — dry run")
+  Time-lapse                   Scan behaviour
+    Nt [1]  dt [0 s]              [ ] Keep illuminators on
+                                  [x] Show live preview
+
+  2. Fold "Skip Saving" into the Save format dropdown as a Don't save (dry run)
+  entry. One control instead of two that fight; the size label already knows how
+  to say "no files written"; postprocessing's refusal becomes a greyed-out
+  option rather than a start-time error. This is the single change I'd recommend
+  most.
+
+  3. Make Laser AF a setting row, not a button. Move it into the Focus group at
+  normal row height. Keep the big-button column for actions only.
+
+  4. Rename and demote Snap Images. "Acquire Current FOV" (or "Acquire Here"),
+  half the height of Start, with a tooltip saying it uses the checked channels
+  and the current save format. Fix the folder name to snap_<ID>_<timestamp>.
+
+  5. Grey out what doesn't apply. "Z-stack from" and "Set Z-range" when Nz = 1;
+  "Update Ref" unless Laser AF is on (it currently pops an error dialog
+  instead); the streaming row is already hidden this way, so there's precedent.
+
+  6. Say what Start does with no positions. The "no positions" label could read
+  "no positions — Start acquires the current field", since that's what
+  acquisition_in_place silently does (multipoint.py:3866), then clears the list
+  afterwards, which surprises people.
+
+  7. Small label fixes. ID → Experiment ID with placeholder text; Next → Go to 
+  Next; Update Z → Set Z from Stage; Update Ref → Recapture AF Ref; the
+  unlabelled Simple ▾ combobox becomes a header Channels · Simple ▾ above the
+  list.
+
+  Items 1–3 are one afternoon of layout work in FlexibleMultiPointWidget.init_ui
+  and touch no controller logic; WellplateMultiPointWidget shares nearly all of
+  this code, so whatever we do should be done to both.
+
+  Want me to mock this up as a page you can react to before I touch the layout,
+  or go straight to implementing 1–3 on the branch?
+
+✻ Cogitated for 5m 55s · done Friday 11:40 PM
+
+※ recap: On the gui-improvements branch, the confocal panel now uses Disk Off/On and Widefield/Confocal switches with auto spin-up, and I've analyzed the Flexible Multipoint panel. Next: your call on mockup vs. implementing the regrouping.
+
+❯ Add to the list of things to do:                                              
+                                                                                
+  1. in the regions table move AF ref to the left of region name, and move the  
+  import and export buttons above the table beside Add, Remove, and Clear       
+  2. Move the "Next" button to where Export is currently, rename it "Next Pos", 
+  and add a "Prev Pos" Button where "Import" currently is.                      
+  3. Currently selecting a position automatically moves to that position. Add a 
+  checkbox that enables/disables this feature. Also implement a home z          
+  position at 100 um and expose a checkbox that default moves to this z         
+  position before conducting xy moves between regions and finally returning the 
+  z to the desired position. Plan this to be last - it is the biggest change    
+
+  Ran 4 shell commands (ctrl+o to expand)
+● Added and committed as software/docs/pending/gui_improvements_plan.md
+  (ecb2dca3), so the list survives across sessions. Your three items landed as
+  groups A (positions block) and D (stage motion, last), with my earlier
+  suggestions in between as B and C.
+
+  A few facts I checked while slotting your item 3 in, since they shape the
+  design:
+
+  - Auto-move on click is cellClicked → go_to at multipoint.py:4233, and it's
+    the only thing that moves the stage from the table (programmatic selection
+    after Add/Remove deliberately doesn't). So the checkbox is a one-line gate;
+    Prev Pos/Next Pos stay unconditional since they're navigation.
+  - Z home at 100 µm already exists as OBJECTIVE_RETRACTED_POS_MM = 0.1 in
+    _def.py:814 (used for the loading-position retract). I'd reuse it rather
+    than add a second constant — one place to change if the clearance ever
+    moves.
+  - The worker's inter-region move (move_to_coordinate,
+    multi_point_worker.py:2789) fires Z non-blocking alongside the XY move
+    today. The retract path has to serialise: Z-up blocking → XY → Z-down. It
+    should apply between regions only, not between tiles inside a region's Nx×Ny
+    grid, per your wording — and it should be carried on AcquisitionParameters
+    so it's recorded in acquisition.yaml like skip_saving is.
+
+  Two open questions I parked in the doc rather than guess at — no need to
+  answer now, they only matter when we reach D:
+
+  1. Should the retract also cover the first move of a run and the
+     return-to-start at the end?
+  2. 100 µm is the loading clearance; is it also the right clearance for
+     inter-region travel on the current holder?
+
+  Ordering: A → B → C → D, one commit and screenshot per group, both Flexible
+  and Wellplate widgets each time. Say go and I'll start with A.
+
+✻ Sautéed for 2m 28s · done Friday 11:55 PM
+
+❯ 1. yes. 2. yes. Spin out Opus subagents to do the work. All hardware is       
+  currently off, if you are able to screenshot off simulated hardware do it.    
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● Found that the GUI's multiprocessing workers re-import the main module on
+  Windows, requiring an if __name__ == "__main__": guard. I'll add that fix and
+  retry before spawning agents. · summarized
+
+  Listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● The PNGs were written — the script works; os._exit just dropped the buffered
+  prints. Flushing stdout before exit, then checking both baseline shots.
+
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● Recipe works off simulated hardware — both panels render, hardware off.
+  Committing the tool and the two answers into the plan, then spawning.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 2 background agents launched (↓ to manage)
+   ├ Positions block rework (group A)
+   └ Z-retract between regions core (group D)
+
+● Two Opus agents are running now:
+
+  - Group A (positions block) — in the main tree on gui-improvements: column
+    reorder with named indices, Import/Export up beside Add/Remove/Clear, Prev 
+    Pos/Next Pos, renames, greyed Recapture AF Ref, and the "Start acquires the
+    current field" hint. It will populate the table in the screenshot tool so
+    the new layout is actually visible.
+  - Group D core (Z retract) — in an isolated worktree so it can't collide with
+    the layout work: retract_z_between_regions on AcquisitionParameters (default
+    on, recorded in acquisition.yaml), the serialised Z-home → XY → Z-target
+    sequence in the worker for region boundaries, first move, and
+    return-to-start, with a recording-fake-stage test that also proves the
+    flag-off path is byte-identical to today. No GUI changes from that agent.
+
+  Sequencing, since everything else lives in the same 8000-line multipoint.py:
+
+  1. A finishes → I spawn B+C (parameter-grid regroup, Skip Saving folded into
+     Save format, Laser AF as a setting row, Acquire Current FOV rename) on both
+     Flexible and Wellplate widgets.
+  2. B+C finishes → merge D-core's branch, then spawn D-gui (the two checkboxes:
+     Move stage on click and Retract Z to home for XY moves, wired to the
+     controller setter D-core exposes).
+
+  Screenshots come from software/tools/screenshot_multipoint.py (committed,
+  134dc2db), which builds the whole GUI with every SIMULATE_* flag on — verified
+  working with hardware off; the baseline renders of both panels are already in
+  my scratchpad. Each group's agent produces its own after-shot, and I'll show
+  you before/after per group as they land.
+
+  I'll report when the first two complete.
+
+✻ Baked for 21m 48s · done Saturday 12:21 AM
+
+● Agent "Z-retract between regions core (group D)" finished · 1h 0m 41s
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agent "Positions block rework (group A)" finished · 1h 1m 20s
+
+● Both agents finished. Merging D-core onto the branch (the plan doc was edited
+  by both, so a conflict there is possible), then I'll check A's screenshot.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Agent(Parameter grid + actions rework (B+C)) Opus 5 (1M context)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● Groups A and D-core have landed; B+C is running now. Status:
+
+  A — Positions block (f534714e, screenshot verified off simulated hardware):
+  - Columns are x | y | z | AF Ref | Region Name, all ~11 hard-coded indices now
+    go through _COL_* constants.
+  - Header: Add Remove Clear Import Export. Action row: Prev Pos  Next Pos  Set 
+    Z from Stage  Recapture AF Ref, the last greyed with an explanatory tooltip
+    until Laser AF is on (the error dialog is gone).
+  - Empty hint reads "no positions — Start acquires the current field".
+  - test_flexible_region_state.py: 27 passed (was 24; 3 new).
+
+  D — Z-retract core (5e3e9a04, merged cleanly from its worktree):
+  - AcquisitionParameters.retract_z_between_regions = True, recorded in
+    acquisition.yaml; GUI will call
+    MultiPointController.set_retract_z_between_regions(bool).
+  - Worker: Z → OBJECTIVE_RETRACTED_POS_MM (blocking) → XY → Z target, on the
+    first FOV of each region, the first move of the run, and the (now
+    factored-out) return-to-start. Steps inside a tile grid and the flag-off
+    path are byte-identical to before — a test asserts the exact stage-call
+    sequence.
+  - 16 new tests pass; the 7 failures in test_MultiPointController.py are
+    pre-existing (set_microscope_mode stub) and identical on the untouched tree.
+
+  One design detail from the D agent worth your eye: when the retract fires but
+  no target Z is known (AF on with no cached Z yet, or a 2-element coordinate),
+  it returns Z to where the move started rather than leaving the objective
+  parked at 100 µm. I think that's the right fallback, but it's a judgment call.
+
+  B+C (grid regroup, Skip Saving folded into Save format, Laser AF as a setting
+  row, Acquire Current FOV) is in progress on both Flexible and Wellplate
+  widgets, taking before/after screenshots. When it finishes I'll spawn the
+  final D-gui step (the two checkboxes). I'll report with screenshots.
+
+  Not mine, for the record: there's a pre-existing unstaged edit to
+  machine_configs/library/machine_config_Squid+_LDI_XLight_TucsenAries6506.yaml
+  in the working tree. The agents are instructed to leave it alone.
+
+✻ Sautéed for 2m 3s · done Saturday 1:23 AM
+
+● Agent "Parameter grid + actions rework (B+C)" finished · 7h 25m 16s
+
+  Read 2 files (ctrl+o to expand)
+
+● Both after-shots check out — headers, row heights, dropdown, and button
+  placement all match expectations. Now I'll spawn the final step (D-gui) and
+  clean up the merged D-core worktree. · summarized
+
+● Agent(Stage-motion checkboxes (D-gui)) Opus 5 (1M context)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● B+C landed as b57b5ca9; D-core's worktree is merged and cleaned up. The final
+  agent (D-gui: Move stage on click and Retract Z to 100 µm for XY moves, wired
+  to the controller setter and the go_to path, plus YAML round-trip and
+  user-guide update) is running now.
+
+  What B+C produced, from the after-shots:
+
+  - Flexible panel now reads top-down: Positions → three left-column groups
+    (Tiling per position, Z-stack, Time-lapse) beside three right-column groups
+    (Focus, Saving, Scan behaviour) → a full-width Channels list with Simple ▾
+    and Per-Point Channels in its header → Acquire Current FOV (half height)
+    over Start Acquisition. Z-stack's From ▾ / Set Z-range grey out at Nz = 1.
+    Laser AF is a row-height Laser AF [Off ▸] in Focus.
+  - Wellplate panel keeps its XY / Z / Time boxes and gets the same Focus /
+    Saving / Scan-behaviour groups underneath.
+  - Skip Saving is gone as a checkbox; Don't save (dry run) is the last
+    Save-format entry. The agent found the acquisition-YAML loader never carried
+    skip_saving at all, so it added that field — a dropped YAML with
+    skip_saving: true now lands on the dry-run entry.
+  - Snap folder names are snap_<ID>_<timestamp> / snap_<timestamp>.
+  - 74 tests pass across the touched suites (6 new for the dry-run dropdown);
+    the 8 failures in test_widgets.py are pre-existing and identical with the
+    changes stashed.
+
+  One thing I'd flag for your eye on the Flexible shot: the Channels list is now
+  full-width but only ~4 rows tall at this panel height. With seven QPM
+  channels it will scroll. If that bothers you in use, the fix is to give the
+  Channels row a higher stretch factor than the option groups — a one-line
+  change I'd rather make after you've seen it live than guess at now.
+
+  I'll report with the D-gui screenshots when it completes.
+
+✻ Baked for 1m 33s · done Saturday 8:50 AM
+
+● Agent "Stage-motion checkboxes (D-gui)" finished · 27m 41s
+
+  Read 1 file, ran 2 shell commands, wrote 1 memory (ctrl+o to expand)
+
+● Flexible Multipoint before → after, then Wellplate after. Rendered off
+  simulated hardware.
+
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (35.4K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_baseline\flexibleB)
+          _multipoint.png
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (44.6K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_D\flexible_multipB)
+          oint.png
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6- 
+  [image] 041f-47b7-b19a-df5308482647\scratchpad\shots_D\wellplate_multipo(38KB)
+          int.png
+
+● All four groups are done. gui-improvements is 10 commits over master; the
+  before/after screenshots are attached above.
+
+  What shipped
+
+  ┌────────────┬──────────┬─────────────────────────────────────────────────┐
+  │   Commit   │  Group   │                     Change                      │
+  ├────────────┼──────────┼─────────────────────────────────────────────────┤
+  │ fd48d8a7   │          │ Widefield|Confocal and Disk Off|Disk On         │
+  │ 295be89e   │ Confocal │ segmented switches; disk auto-starts on         │
+  │ 8d7d77fb   │          │ entering confocal (all three call paths)        │
+  ├────────────┼──────────┼─────────────────────────────────────────────────┤
+  │            │          │ Columns x|y|z|AF Ref|Region Name via _COL_*;    │
+  │ f534714e   │ A        │ Import/Export in header; Prev Pos/Next Pos;     │
+  │            │          │ greyed Recapture AF Ref; empty hint             │
+  ├────────────┼──────────┼─────────────────────────────────────────────────┤
+  │            │          │ retract_z_between_regions on                    │
+  │ 5e3e9a04   │ D-core   │ AcquisitionParameters (default on, in           │
+  │            │          │ acquisition.yaml); Z→100 µm → XY → Z-target on  │
+  │            │          │ region entry, first move, return-to-start       │
+  ├────────────┼──────────┼─────────────────────────────────────────────────┤
+  │            │          │ Six labelled option groups on both panels; Skip │
+  │ b57b5ca9   │ B+C      │  Saving folded into Save format as Don't save   │
+  │            │          │ (dry run); Laser AF as a row; Acquire Current   │
+  │            │          │ FOV; snap_<ID> folders                          │
+  ├────────────┼──────────┼─────────────────────────────────────────────────┤
+  │            │          │ Move stage on click (positions row) and Retract │
+  │ cf32a4b0   │ D-gui    │  Z to 100 µm for XY moves (Scan behaviour, both │
+  │            │          │  panels); same bracket applied to go_to         │
+  └────────────┴──────────┴─────────────────────────────────────────────────┘
+
+  Tests: 110 passed across the five touched suites, re-run by me on the final
+  tree (test_flexible_region_state 30, test_multipoint_z_retract 16,
+  test_acquisition_yaml_loader 28, test_save_format_dry_run 6,
+  test_confocal_widget_sync 30). Two pre-existing failure sets are untouched and
+  identical with the changes stashed: 7 in test_MultiPointController.py (stub
+  lacks set_microscope_mode) and 8 in test_widgets.py. Full suite not run, per
+  your rule.
+
+  Docs: docs/user_guides/multipoint.md updated;
+  docs/pending/gui_improvements_plan.md is now a record of what shipped.
+  tools/screenshot_multipoint.py stays as a reusable no-hardware renderer.
+
+  Things to watch on the first rig run
+
+  None of this has touched hardware. Three behaviours change what the stage or
+  disk does, so they deserve a look before the next real acquisition:
+
+  1. Retract is on by default — two extra Z moves per region visit. On a
+     many-region run at 10× that's real time; if it's too much, the checkbox is
+     right there and the yaml records which way a run was driven.
+  2. Disk auto-start assumes the N1 round-trip (2.5 s) covers spin-up. If the
+     first confocal frames after a cold start look under-spun, we add a settle.
+  3. Fallback Z: when the retract fires with no known target Z (AF on, nothing
+     cached yet), the objective returns to where the move started rather than
+     staying parked. I think that's right; it's a judgment call.
+
+  And one cosmetic item I'd hold until you've used it: the Channels list is
+  full-width but ~4 rows tall at default panel height, so your 7 QPM channels
+  will scroll. A one-line stretch-factor change fixes it if it annoys.
+
+  Also still there and not mine: an unstaged edit to
+  machine_configs/library/machine_config_Squid+_LDI_XLight_TucsenAries6506.yaml
+  in the working tree.
+
+✻ Brewed for 9h 22m 50s · done Saturday 9:19 AM
+
+※ recap: GUI improvements for the confocal panel and multipoint panels are all committed on the gui-improvements branch and pass 110 tests. Next action is a first run on real hardware to check the Z-retract and disk auto-start behaviour.
+
+❯ What's the status? There are 7 running tasks still                            
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Everything I started is finished — nothing is pending on my side:
+
+  - 4 subagents, all completed and reported: A (positions block), D-core
+    (worktree, merged, worktree removed), B+C, D-gui. ListAgents shows the three
+    non-worktree ones as completed; the worktree agent's entry went with its
+    worktree.
+  - No background shells from this session; all my Bash calls were foreground.
+  - No stray processes: tasklist shows zero python.exe / pythonw.exe / conda.exe
+    on the machine, so the simulated-GUI screenshot runs (which os._exit at the
+    end) left no orphaned JobRunner workers.
+
+  I can't see your /tasks panel from here, so I can't tell you what the 7
+  entries are, but two likely sources:
+
+  1. Completed subagents stay listed as resumable tasks — they can be sent
+     follow-up messages, so the harness keeps them around after completion. Mine
+     would account for up to 4.
+  2. Other sessions on this account — ListAgents shows 18 peer sessions, one of
+     them (Building Web app GUI data analysis pipeline) currently running,
+     several idle. If /tasks aggregates across sessions, that's where the rest
+     come from.
+
+  Anything in that list carrying one of my agent descriptions (Positions block 
+  rework, Z-retract between regions core, Parameter grid + actions rework,
+  Stage-motion checkboxes) is safe to stop or dismiss — all four committed
+  before exiting and nothing is waiting on them. If an entry's name doesn't
+  match those or another session's, tell me what it says and I'll chase it.
+
+✻ Brewed for 1m 36s · done Saturday 10:15 AM
+
+❯ Is all the work committed?                                                    
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Yes — all ten commits of this session's work are on gui-improvements, no
+  stashes from it, and no unmerged agent branches remain.
+
+  The only uncommitted change in the tree is one line that predates this session
+  and that none of us touched:
+
+  software/machine_configs/library/machine_config_Squid+_LDI_XLight_TucsenAries6
+  506.yaml
+  -          2: "Position 2"
+  +          2: "528/38 (GFP)"
+
+  That's the XLight emission-wheel slot 2 name for the Aries 6506 rig — looks
+  like a real filter label you (or another terminal) entered, so I left it
+  alone. If you want it kept, it belongs in its own commit (it's rig config, not
+  GUI work); say so and I'll commit it, or discard it with git checkout -- 
+  <path> if it was accidental.
+
+✻ Cooked for 1m 6s · done Saturday 10:19 AM
+
+※ recap: GUI improvements branch is complete: all four groups (positions block, option regrouping, dry-run save format, Z-retract and click-to-move checkboxes) plus the confocal switches are committed on gui-improvements. Next: run it on the rig and confirm the retract and disk auto-start behave.
+
+❯ Make a plan to do the following:                                              
+                                                                                
+  In the flexible multipoint section, move the snake scan check to the scan     
+  behavior subheading to keep consistency with the wellplate multipoint         
+  behavior.                                                                     
+                                                                                
+  In the wellplate multipoint, remove the "From" selector in the second column  
+  (redundant with the z checkbox), put the timelapse interval dt and number of  
+  timepoints together with the time checkbox. Allow an option for selection by  
+  Nx and Ny in addition to the current "fraction of well" tiling method.        
+                                                                                
+  Make the position/z-stack/timelapse interface more uniform across the         
+  flexible vs wellplate settings. Have these grouped in the left column         
+  (similar to the current flexible) and have a visual box around them for       
+  emphasis. The only thing that should be different is the availability of the  
+  current "fraction of well" tiling method in wellplate but not flexible. Show  
+  me what the interface looks like when you're done, then we'll decide where to 
+  put the channels box.                                                         
+                                                                                
+  Delegate the coding to Opus subagents.                                        
+
+  Ran 8 shell commands (ctrl+o to expand)
+
+● Reviewing the Wellplate widget revealed three key issues to reconcile: two
+  distinct "From" controls that need unifying (range-mode checkbox vs. AF
+  reference plane dropdown), inconsistent Z/Time checkbox behavior with
+  Flexible, and extra colored frames to remove in favor of one boxed block. I'll
+  document this plan in the branch doc and then spawn the work. · summarized
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 2 background agents launched (↓ to manage)
+   ├ Nx×Ny well tiling core (R2-core)
+   └ Uniform left-column block (R2-layout)
+
+● Plan is committed (7dd2fc38, Round 2 section of
+  docs/pending/gui_improvements_plan.md) and two Opus agents are running in
+  parallel:
+
+  - R2-core (isolated worktree, no GUI):
+    ScanCoordinates.set_well_coordinates_grid(nx, ny, overlap) and
+    set_live_scan_coordinates_grid(...) — the Nx × Ny tiling for wells / current
+    position, reusing add_flexible_region so Wellplate grids are byte-identical
+    to Flexible grids, plus regenerate_for_fov support and tests.
+  - R2-layout (main tree): the shared boxed block builder and both panels
+    rebuilt on it — Positions / Tiling / [x] Z-stack / [x] Time-lapse in one
+    framed left column; Wellplate's From Bottom | Set Range dropdown replaced by
+    Flexible's Set Z-range checkbox; the orange/blue/green frames, hide/show
+    and store/restore machinery deleted; dt/Nt in the Time-lapse group; Snake
+    scan into Flexible's Scan behaviour; a Method: (•) Fraction of well ( ) Nx ×
+    Ny row in Wellplate's tiling group (visibility only, not yet wired); cache
+    keys and the YAML z-mode conflation fixed.
+
+  When both land I merge R2-core and spawn R2-wire to connect Nx × Ny to the new
+  API in update_coordinates / update_well_coordinates /
+  update_live_coordinates, cache and YAML, and take the final screenshots with
+  wells selected. Then you get both panels side by side and we decide where the
+  Channels box goes.
+
+  Two judgment calls I made that you may want to veto before R2-wire starts:
+
+  1. Each panel keeps one From ▾ — the AF reference plane (Bottom / Center /
+     Top) in the Z-stack row, as Flexible already has. What's removed is
+     Wellplate's From Bottom | Set Range dropdown, which becomes the Set Z-range
+     checkbox. If you actually meant "no From at all", that's a five-line
+     change afterward.
+  2. Flexible gains [x] Z-stack / [x] Time-lapse header checkboxes (default
+     unchecked, Nz/Nt forced to 1 while off), so both panels have the same
+     enable model. Today Flexible has no such switch — Nz = 1 is off.
+
+  I'll report when the agents finish.
+
+✻ Churned for 5m 17s · done Monday 7:22 AM
+
+● Agent "Nx×Ny well tiling core (R2-core)" finished · 22m 30s
+
+● R2-core finished and is waiting to be merged: set_well_coordinates_grid(nx, 
+  ny, overlap) and set_live_scan_coordinates_grid(x, y, nx, ny, overlap) on its
+  worktree branch, 38 scan-coordinates tests passing (7 new), fraction path
+  verified bit-identical after the shared-loop refactor. I'm holding the merge
+  until R2-layout commits, so I don't move HEAD under an agent that's mid-edit
+  in the same tree.
+
+  Two useful findings from that agent for later:
+
+  - Grid-tiled wells record kind: "flexible" in region_generation_params, so
+    regenerate_for_fov already re-tiles them correctly with no change — but it
+    also means a grid well is indistinguishable from a Flexible region in that
+    dict; anything that needs to tell them apart must use the panel's
+    tiling_method.
+  - Pre-existing latent bug, not touched: add_flexible_region never populates
+    region_shapes, so region_contains_coordinate raises KeyError for
+    Flexible-panel regions today (hit from focus-map point generation,
+    core.py:1963). The grid path sidesteps it by recording "Square". Worth a
+    separate small fix; I'll add it to the plan doc as a follow-up rather than
+    fold it into this round.
+
+  R2-layout is still running; R2-wire follows it.
+
+✻ Brewed for 14s · done Monday 7:43 AM
+
+● Agent "Uniform left-column block (R2-layout)" finished · 56m 57s
+
+  Read 2 files, ran 2 shell commands (ctrl+o to expand)
+
+● Agent(Wire Nx×Ny tiling + final shots (R2-wire)) Opus 5 (1M context)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● R2-layout landed (eaf0f14c) and R2-core is merged (29144a09); the final agent,
+  R2-wire, is running. It connects Nx × Ny to the new ScanCoordinates API, adds
+  the missing Go To buttons to Flexible's Z-range rows so those match
+  Wellplate's, extends the screenshot tool to select wells and switch tiling
+  method, and produces the final side-by-side shots.
+
+  From the interim R2-layout screenshots (Z-stack + Time-lapse + Set Z-range
+  enabled on both), the two left columns are now the same boxed block:
+
+  Flexible                                  Wellplate
+  ┌ Positions (3) [Add…Export] ─┐            ┌ Positions ──────────────────┐
+  │  table                      │            │  [x] XY  Select Wells ▾      │
+  │  Prev/Next/Set Z/Recapture  │            │  Save Coordinates            │
+  ├ Tiling per position ────────┤            ├ Tiling per position ────────┤
+  │  Nx Ny Overlap              │            │  Method (•) Fraction ( ) Nx×Ny│
+  │                             │            │  Shape  Scan size  Coverage  │
+  │                             │            │  Overlap                     │
+  ├ [x] Z-stack ────────────────┤            ├ [x] Z-stack ────────────────┤
+  │  Nz dz From ▾ [x] Set Z-range│           │  Nz dz From ▾ [x] Set Z-range│
+  │  Set │ Z-min                │            │  Set Z-min │ Go To │ Z-min   │  ←
+  R2-wire unifies these rows
+  ├ [x] Time-lapse ─────────────┤            ├ [x] Time-lapse ─────────────┤
+  │  Nt dt                      │            │  Nt dt                       │
+  └─────────────────────────────┘            └─────────────────────────────┘
+
+  Right column (Focus / Saving / Scan behaviour, with Snake scan now in Scan
+  behaviour on both) is identical between the two. Channels box is unchanged
+  pending your decision.
+
+  Two things the layout agent surfaced that I've queued as follow-ups in the
+  plan doc rather than fold in:
+
+  - Possible unit bug in Wellplate (pre-existing): the non-range Z span is
+    computed as z + dz * (Nz − 1) with dz in µm and z in mm; Flexible divides
+    by 1000. If real, every Wellplate z-stack without Set Z-range has been
+    getting a wildly wrong z_range passed to the controller — worth checking
+    what the controller actually does with z_range in that path before assuming
+    it's harmful.
+  - Manual mode keeps only the Overlap row of the tiling section (not hidden
+    wholesale as the plan said), because set_manual_coordinates consumes the
+    overlap value. Sensible deviation.
+
+  When R2-wire reports I'll send you the final four screenshots.
+
+✻ Cooked for 1m 53s · done Monday 8:20 AM
+
+● Agent "Positions block rework (group A)" finished · 2d 8h 38m
+
+● That was a late re-notification from the group-A agent, not new work: a
+  background screenshot render it had left running finally exited (cleanly), so
+  its task entry closed. Nothing changed — A is still f534714e. It also likely
+  explains the extra "running tasks" you saw earlier: agents' own background
+  jobs stay listed until they exit.
+
+  R2-wire is still running; I'll report with the final screenshots when it
+  completes.
+
+✻ Churned for 6s · done Monday 8:58 AM
+
+● Agent "Positions block rework (group A)" finished · 2d 8h 38m
+
+● Another stale close-out from the group-A agent (its second old screenshot job
+  exiting) — no new work, nothing changed. Still waiting on R2-wire.
+
+✻ Cogitated for 6s · done Monday 8:58 AM
+
+● Agent "Stage-motion checkboxes (D-gui)" finished · 2d 0h 8m
+
+● Same pattern — the D-gui agent's old screenshot job closed out; nothing new.
+  Those lingering jobs are now clearing one by one, which is what your /tasks
+  count was showing. R2-wire is the only live task.
+
+✻ Churned for 5s · done Monday 8:59 AM
+
+● Agent "Parameter grid + actions rework (B+C)" finished · 2d 7h 35m
+
+● The B+C agent's leftover jobs have closed too — that's all of the round-1
+  agents' stragglers accounted for. Nothing changed on the branch. R2-wire is
+  still the only active task.
+
+✻ Cogitated for 4s · done Monday 8:59 AM
+
+● Agent "Uniform left-column block (R2-layout)" finished · 1h 38m 8s
+
+● R2-layout's stragglers closed too. Its note about "another terminal's
+  in-flight work" is just R2-wire editing acquisition_yaml_loader.py and
+  creating test_wellplate_tiling_method.py in the shared tree, as instructed —
+  expected, and it confirmed its own commit eaf0f14c is intact under the R2-core
+  merge. Still waiting on R2-wire.
+
+✻ Cogitated for 6s · done Monday 9:00 AM
+
+● Agent "Wire Nx×Ny tiling + final shots (R2-wire)" finished · 39m 36s
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Btw your preview script for making screenshots opens the software but doesn't 
+  close it properly - it runs into the GUI confirmation popup                   
+
+● Found it: win.close() triggers the main window's closeEvent, which pops a
+  blocking "really quit?" modal—explaining the ~22 minute delay instead of ~60s.
+  I'll examine the close path now and fix it properly. · summarized
+
+  Ran 7 shell commands (ctrl+o to expand)
+
+● Confirmed the auto-Yes closeEvent patch would have corrupted the rig's cached
+  stage position on every screenshot run. I'll replace it with a safer approach:
+  hide the window, tear down the simulated microscope, hard-exit, and stub out
+  the multipoint widgets' cache writer instead of routing through closeEvent. 
+  · summarized
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Patched. Now proving it: a timed run of the tool, with the two cache files'
+  checksums taken before and after so I can show neither was touched.
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Some GUI window popped up and then rapidly closed on my screen, is that what  
+  you were looking for? I'm guessing an expected wait signal didn't fire        
+  adequately?                                                                   
+
+● That flash was expected Qt behavior (show → grab → hide), not a bug — the real
+  issue I fixed was replacing win.close(), which triggered a blocking "Confirm
+  Exit" dialog and risked overwriting cache files, with a direct
+  microscope.close() and a stubbed-out config save. Now let me check if that run
+  completed cleanly before the interruption. · summarized
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The run actually completed cleanly—both PNGs generated at 09:04, no leftover
+  processes, and cache files untouched, taking about a minute total. Committing
+  the tool fix now and pulling up the final round-2 screenshots. · summarized
+
+  Read 3 files, ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● Round 2 final: Flexible; Wellplate with Fraction-of-well; Wellplate with Nx×Ny
+  (2×3); the plate map showing the 2×3 grid on B2 and C3. Z-stack + Time-lapse
+  + Set Z-range enabled in all panel shots.
+
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (51.3K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_R2_final\flexibleB)
+          _multipoint.png
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (47.9K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_R2_final\wellplatB)
+          e_fraction.png
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (45.8K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_R2_final\wellplatB)
+          e_grid.png
+  ›       ~\AppData\Local\Temp\claude\C--Code-CephlaSquidSandbox\73c518d6 (69.7K
+  [image] -041f-47b7-b19a-df5308482647\scratchpad\shots_R2_final\navigatiB)
+          on_grid.png
+
+● Round 2 is complete and committed; the four final screenshots are above.
+  Branch gui-improvements is now 17 commits over master, tree clean apart from
+  that pre-existing machine-config line.
+
+  What landed in round 2 (eaf0f14c layout · 798d5fe4 core · f6762a1e wiring ·
+  5791c8b9 tool fix):
+
+  - Both panels' left column is one boxed block built by one helper: Positions →
+    Tiling per position → [x] Z-stack → [x] Time-lapse. Same Z-stack row on
+    both (Nz dz From ▾ [ ] Set Z-range, then identical Set Z-min | Go To | Z-min
+    rows — Flexible gained the Go To buttons), same Time-lapse row.
+  - Wellplate: From Bottom | Set Range dropdown gone, replaced by Flexible's Set
+    Z-range checkbox; orange/blue/green frames, hide/show and store/restore
+    machinery deleted; dt/Nt sit under the Time-lapse checkbox; Method: (•) 
+    Fraction of well ( ) Nx × Ny — the grid centres an Nx×Ny block on each well
+    (the plate map shows 2×3 on B2 and C3), recorded in acquisition.yaml,
+    restored from the widget cache.
+  - Flexible: Snake scan moved to Scan behaviour, matching Wellplate.
+  - Tests: 118 passing across the five touched suites (16 new), plus 38 in
+    scan-coordinates (7 new).
+
+  Two real bugs found along the way, deliberately not fixed in this round (both
+  in the plan doc's Follow-ups):
+
+  1. Wellplate z-stack span is 1000× too large when Set Z-range is off:
+     set_z_range(z, z + dz*(Nz−1)) with z in mm and dz in µm; Flexible divides
+     by 1000. Pre-existing, confirmed by two agents. I'd fix this next — it's a
+     two-line change, but it changes acquisition behaviour so I'd rather you say
+     go.
+  2. add_flexible_region never populates region_shapes, so focus-map point
+     generation raises KeyError on Flexible-panel regions.
+
+  On the Channels box — your call, but looking at the two panels side by side,
+  the strongest option is to put Channels in the right column, directly under 
+  Focus, spanning down to the bottom, so the left box and right column are the
+  same height and the two big buttons stay bottom-right. Alternatives: keep it
+  full-width at the bottom (current — leaves it ~4 rows tall), or make it a
+  fourth section inside the left box (long lists would push Z/Time down).
+
+  Also on the table for you: whether to make the screenshot tool run under
+  QT_QPA_PLATFORM=offscreen so no window flashes on your screen. Cheap to try,
+  but napari/pyqtgraph might object — I'd want to test it, which means one more
+  run, so I'll only do that on your say-so.
+
+✻ Cogitated for 1h 53m 38s · done Monday 9:10 AM
+
+❯ /model 
+  ⎿  Kept model as Fable 5.1
+
+❯ Generate screenshots of each of wellpoint and flexible multipoint in their    
+  current state and tell me where you've saved them. Then delegate those bug    
+  fixes to Sonnet subagents                                                     
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+● 2 agents finished (ctrl+o to expand)
+   ├ Fix Wellplate z-span unit bug · 0 tool uses
+   │ ⎿  Done
+   └ Fix region_shapes KeyError · 0 tool uses
+     ⎿  Done
+
+❯ Never mind, I see what you've done. Yes, put the channels tab in the bottom   
+  right corner, and make                                                        
+  ⎿  Interrupted · What should Claude do instead?
+
+※ recap: Reworking the multipoint GUI panels on branch gui-improvements; round 2 (uniform boxed Positions/Tiling/Z/Time block plus Nx×Ny well tiling) is committed and screenshotted. Next: decide where the Channels box goes.
+
+❯ Never mind, I see what you've done. Let's rearrange the right group such that 
+  "Focus" and "Scan behaviour" occupy one subcolumn and "Saving" and the        
+  start/acquire buttons occupy a second subcolumn. Then have the channels menu  
+  sit above them (i.e. the start buttons should end up in the bottom right      
+  corner). Delegate this to Opus subagents, then check for bugs, then delegate  
+  the bugfixes and the current issues you've noted to Sonnet subagents.         
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Never mind, I see what you've done. Let's rearrange the right group such that 
+  "Focus" and "Scan behaviour" occupy one subcolumn and "Saving" and the        
+  start/acquire buttons occupy a second subcolumn. Then have the channels menu  
+  sit above these two columns (i.e. the start buttons should end up in the      
+  bottom right corner, and the channels menu should be half the width of the    
+  right group). Delegate this to Opus subagents, then check for bugs, then      
+  delegate the bugfixes and the current issues you've noted to Sonnet           
+  subagents.                                                                    
+
+● I've captured my interpretation of the target layout for the agent spec, with
+  Channels spanning the right group above two option subcolumns and buttons
+  anchored bottom-right. Next, Opus starts the layout work while a Sonnet agent
+  tackles the region_shapes fix in parallel (different file), with the z-span
+  fix and any bug-check findings deferred until after review since they overlap
+  the layout agent's file. · summarized
+
+● 2 background agents launched (↓ to manage)
+   ├ Right-group two-subcolumn layout
+   └ Fix region_shapes KeyError
+
+● Both agents are running:
+
+  - Opus — right-group layout (main tree): Channels over two option subcolumns,
+    buttons bottom-right, both panels; screenshots to
+    C:\Users\jialab\Desktop\squid_gui_screenshots\2026-09-21_right_group\ (plus
+    a narrow\ variant at 1000 px to check nothing clips).
+  - Sonnet — region_shapes fix (worktree, scan_coordinates.py only): every
+    region adder registers a shape through one shared step, so
+    region_contains_coordinate stops raising on Flexible-panel regions.
+
+  Next steps, in order, once the layout commit lands: I run a bug check over the
+  branch (a code review of the full master..gui-improvements diff, with the
+  layout work included), then spawn Sonnet agents for the Wellplate z-span µm/mm
+  fix plus whatever the review turns up, along with the other issues already
+  noted — the stale test stubs behind the pre-existing test_MultiPointController
+  / test_widgets failures, and the update_well_coordinates
+  full-retile-per-click behaviour if the review agrees it's worth restoring
+  incremental updates.
+
+  I'll report when the layout agent finishes, with the new screenshots.
+
+✻ Cooked for 1m 31s · done Monday 9:24 AM
+
+❯ Seems like you are having trouble picking up outputs of the screenshot        
+  rendering script after you dealt with the exit bug, these tasks are running   
+  for several minutes even though we established that the script only runs for  
+  a few seconds and correctly produces .pngs. Can you investigate why?          
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Agent "Fix region_shapes KeyError" finished · 10m 0s
+
+● The delay isn't in rendering—PNGs were written well before the task
+  finished—so it's likely happening during microscope.close()/process exit. I'll
+  add flushed per-phase timestamps and run it once to pinpoint exactly where
+  the time goes. · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The script itself runs fine (30s, exit 0); the delay likely comes from plain
+  conda run capturing stdout that orphaned GUI subprocesses inherit, keeping the
+  pipe open after os._exit(0). I'll test this directly with a plain conda run
+  launch, checking process state at 45s and total wall time. · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Note that you currently have 7 running background tasks, six of which seem to 
+  refer to waiting for screenshots to render, and maybe the seventh (the Opus   
+  coding task) is also waiting for this underneath                              
+● I've confirmed those six conda run wrappers are stuck because orphaned GUI
+  subprocesses still hold their stdout pipes open. I'll list the orphans first
+  to confirm, then patch the tool to terminate its own children before os._exit.
+  · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● No live python.exe or conda.exe processes remain, so the six pending tasks
+  aren't stuck on anything real—likely just delayed exit-status reporting. I'll
+  double-check with tasklist and re-test the patched tool using the agents'
+  exact launch mode to confirm it now returns in ~30s. · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Confirmed and fixed the root cause: the tool now returns in 28s after killing
+  the orphaned JobRunner subprocess that was holding the stdout pipe open.
+  Committing the fix, logging the lesson, and loading the messaging tool to tell
+  the running layout agent to stop waiting on its stale screenshot tasks. 
+  · summarized
+
+  Ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+  ⎿  Message queued for delivery to a9158217c8911afb1 at its next tool 
+     round.
+
+● Message queued for the layout agent — it'll get it at its next tool call, with
+  the pointer that its screenshots already exist and the tool is fixed in the
+  tree it's editing.
+
+  Summary of the investigation:
+
+  Cause. HighContentScreeningGui pre-warms a JobRunner subprocess that inherits
+  the tool's stdout/stderr. The tool ended with os._exit(0), which killed the
+  parent but orphaned that child. Anything capturing the tool's output — plain
+  conda run, and therefore every agent's Bash task — blocked on the still-open
+  pipe until the orphan noticed its parent was gone: minutes, on a script whose
+  PNGs were on disk at 26 s. My timing run happened to use --no-capture-output,
+  which is why it returned in 30 s and looked "fine".
+
+  Fix (b1c90603): kill the process tree via psutil before exiting, plus a
+  flushed [shot +Ns] phase trace. Verified under the agents' exact launch mode:
+  28 s wall, 1 child killed, zero processes left.
+
+  The six stuck task entries have no live process behind them (confirmed with
+  both wmic and tasklist — no python.exe, pythonw.exe, conda.exe, timeout.exe,
+  bash.exe, or cmd.exe). They're the harness waiting to collect shells that have
+  already exited; safe to dismiss from /tasks. The seventh (the Opus layout
+  agent) is live and now told not to wait on them.
+
+  Remaining sequence, unchanged: layout agent commits → I merge the
+  region_shapes fix (228365f5, done, 44 tests passing — held back only to avoid
+  moving HEAD under the layout agent) → bug check over the whole branch → Sonnet
+  agents for the z-span µm/mm fix and whatever the review finds.
+
+✻ Cogitated for 3m 4s · done Monday 9:50 AM
+
+● Agent "Right-group two-subcolumn layout" finished · 39m 0s
+
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● Right group rearranged: Channels over [Focus + Scan behaviour | Saving +
+  buttons]; Start Acquisition in the bottom-right corner. Saved under
+  Desktop\squid_gui_screenshots\2026-09-21_right_group\ (plus narrow\ at 1000 px
+  and template_multipoint.png).
+
+  ›       ~\Desktop\squid_gui_screenshots\2026-09-21_right_group\flexible (49.6K
+  [image] _multipoint.png                                                B)
+  ›       ~\Desktop\squid_gui_screenshots\2026-09-21_right_group\wellplat (47.2K
+  [image] e_multipoint.png                                               B)
+
+● Skill(code-review)
+  ⎿  Running in the background
+
+● Layout and region_shapes fixes are merged and screenshots are done, with 21
+  commits ahead of master. The full-diff code review is running in the
+  background, and I'll kick off Sonnet fixes for the two known issues in
+  isolated worktrees since they don't depend on the review results. · summarized
+
+● 2 background agents launched (↓ to manage)
+   ├ Fix Wellplate z-span unit bug
+   └ Repair stale test stubs
+
+● Three things are now running in parallel, all isolated from each other:
+
+  - /code-review high over master..gui-improvements (21 commits) — the bug
+    check.
+  - Sonnet — z-span fix (worktree): Wellplate's z + dz*(Nz−1) µm/mm mix → shared
+    helper with Flexible, plus a data-impact assessment with line citations so
+    you'll know whether past Wellplate z-stacks were affected or it was
+    metadata-only.
+  - Sonnet — stale test stubs (worktree, tests only): the 7
+    test_MultiPointController failures (set_microscope_mode predates the
+    Observation State migration) and the 8 in test_widgets — instructed to leave
+    anything that turns out to be a real bug failing and report it rather than
+    paper over it.
+
+  When the review lands I'll triage its findings, merge the two fixes, and spawn
+  Sonnet agents for whatever the review confirms. Nothing further to do until
+  then.
+
+✻ Baked for 1m 27s · done Monday 10:04 AM
+
+● Agent "Right-group two-subcolumn layout" finished · 49m 15s
+
+● Stale close-out from the layout agent (its superseded first screenshot job
+  clearing) — nothing new. Still waiting on the code review and the two Sonnet
+  fixes.
+
+✻ Brewed for 4s · done Monday 10:13 AM
+
+● Agent "Right-group two-subcolumn layout" finished · 49m 23s
+
+● Another stale teardown notice from the same agent; nothing new. Review and the
+  two fixes are still in progress.
+
+✻ Crunched for 4s · done Monday 10:13 AM
+
+● Agent "Fix Wellplate z-span unit bug" finished · 27m 11s
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agent "/code-review master..gui-improvements high" finished · 27m 44s
+
+● The review came back with 10 confirmed/plausible findings (14 verdicts, one
+  refuted, two low-priority cut). One is the z-span bug, already merged
+  (8bfe70ed). Triage of the rest — the theme is that round-1's Z-retract has
+  sharp edges the GUI checkbox doesn't cover, and round-2's Nx×Ny wiring
+  inherited a Flexible assumption that's wrong for wells:
+
+  #: 1
+  Finding: Nx×Ny wells bake the selection-time stage Z into every FOV (3-tuples
+  via add_flexible_region); the worker then drives Z back to that stale value
+  at every well. The fraction path emits 2-tuples and never touches Z. Focus
+  after selecting wells → whole run out of focus.
+  Severity: High
+  ────────────────────────────────────────
+  #: 3
+  Finding: Retract fires on fov == 0 regardless of XY distance → a
+  single-position time-lapse retracts to 0.1 mm and back every  timepoint;
+  Acquire Current FOV does it twice.
+  Severity: High
+  ────────────────────────────────────────
+  #: 5
+  Finding: Retract only brackets move_to_coordinate; the laser-AF seed scan,
+  focus-map corners and AF-map return hop use bare XY moves at working height.
+  Three hand-rolled copies of the bracket exist.
+  Severity: Med
+  ────────────────────────────────────────
+  #: 4
+  Finding: Default-on flips behaviour for callers with no checkbox: fluidics
+  widget, MCP run_acquisition_from_yaml (parses the flag, never forwards it).
+  Severity: Med
+  ────────────────────────────────────────
+  #: 8
+  Finding: Table click runs the blocking retract → X → Y → return on the GUI 
+  thread, even when already on that row — so the first press of a
+  double-click-to-rename drives the objective 5 mm and back.
+  Severity: Med
+  ────────────────────────────────────────
+  #: 7
+  Finding: Disabling [x] Z-stack force-unchecks Set Z-range, which clobbers
+  Z-min/Z-max with the stage Z and collapses Nz to 1; nothing restores it. (My
+  spec asked for the uncheck — my error.)
+  Severity: Med
+  ────────────────────────────────────────
+  #: 6
+  Finding: Dropping a pre-branch wellplate YAML switches to Nx×Ny if it carries
+  stale nx/ny (old writer recorded the Flexible tab's spinboxes); no
+  tiling_method in the YAML to disambiguate.
+  Severity: Med
+  ────────────────────────────────────────
+  #: 9
+  Finding: set_xlight_confocal_mode: motor-start failure is swallowed and the
+  disk still moves → panel lights Confocal over a parked disk; and a disk-move
+  failure after a motor start leaves Disk Off lit while it spins.
+  Severity: Med
+  ────────────────────────────────────────
+  #: 10
+  Finding: Flexible toggle_acquisition never re-pushes NX/NY → after a wellplate
+
+  run the Flexible YAML records 1×1.
+  Severity: Low
+  ────────────────────────────────────────
+  #: cut
+  Finding: _tile_wells full rebuild leaves dead incremental code;
+  docs/confocal-panel-sync.md stale.
+  Severity: Low
+
+  Delegating as three Sonnet agents in worktrees, grouped to minimise
+  overlapping edits: retract correctness (3, 5, 4, 8), wellplate grid / YAML / 
+  Z-group state (1, 6, 7, 10, dead code), confocal partial failures + stale doc
+  (9).
+
+● 3 background agents launched (↓ to manage)
+   ├ Retract-Z correctness fixes (W1)
+   ├ Wellplate grid/YAML/Z-group fixes (W2)
+   └ Confocal partial-failure fixes (W3)
+
+● Four Sonnet agents are now running in isolated worktrees (three review-fix
+  groups plus the earlier test-stub repair). Nothing else is actionable until
+  they report; I'll merge in dependency order (W3 → W2 → W1, then tests) and
+  resolve any multipoint.py overlap myself.
+
+  One result from the z-span fix you should know now, since it concerns past
+  data — the agent traced exactly where z_range is consumed:
+
+  - "From Bottom" / "From Center" Wellplate z-stacks were imaged at the correct 
+    positions. initialize_z_stack moves to z_range[0], which was always the true
+    stage Z; per-plane stepping uses deltaZ (correctly converted) not z_range.
+    Only the z_range_mm upper bound in acquisition.yaml is bogus for those runs
+    — metadata pollution, not bad pixels.
+  - "From Top (Z-max)" with Set Z-range off is the one combination that drove 
+    hardware wrong: initialize_z_stack moves to z_range[1], so the stage was
+    commanded to an absolute Z ~1000× the intended offset at the start of each
+    timepoint (multi_point_worker.py:2724-2730). If you ever ran that
+    combination on the Wellplate tab, those stacks are suspect — most likely a
+    soft-limit clamp or an out-of-focus run rather than a subtle error.
+
+✻ Brewed for 3m 6s · done Monday 10:34 AM
+
+● Agent "Repair stale test stubs" finished · 49m 37s
+
+● The test-stub agent paused itself waiting on a background test run rather than
+  finishing. Nudging it to run the tests in the foreground and complete.
+  ⎿  Resuming agent a8d7bf5
+
+● Resumed. Nothing else is actionable until the four agents report.
+
+✻ Sautéed for 18s · done Monday 10:54 AM
+
+● Agent "Confocal partial-failure fixes (W3)" finished · 24m 32s
+  Ran 1 shell command (ctrl+o to expand)
+
+● W3 merged fast-forward (0517d43c): entering confocal now raises before moving
+  the disk if the motor can't be confirmed running, apply_confocal_mode no
+  longer records a mode the hardware didn't reach, and the panel's motor switch
+  refreshes even when the disk move fails. 117 tests pass across the confocal
+  suites.
+
+  Waiting on W1 (retract correctness), W2 (wellplate grid/YAML/Z-group), and the
+  test-stub repair — nothing else is actionable until they report.
+
+✻ Worked for 27s · done Monday 10:59 AM
+
+● Agent "Retract-Z correctness fixes (W1)" finished · 29m 54s
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● W1 merged (7bdf17e1, no conflicts): a single move_xy_with_z_retract helper in
+  squid/stage/utils.py now backs every in-run XY move — worker FOV loop,
+  return-to-start, AF-map hop, focus-map corners, laser-AF seed scan, and the
+  Flexible table click — with a 5 µm no-travel guard so single-position
+  time-lapses and Acquire Current FOV no longer do a Z excursion per timepoint.
+  The fluidics tab got the checkbox; the MCP YAML path forwards the flag. 80
+  tests across the three suites.
+
+  Remaining: W2 (wellplate grid Z / YAML tiling_method / Z-group state / NX-NY
+  push / dead code) and the test-stub repair. Nothing else is actionable until
+  they report; W2 is the one most likely to need a multipoint.py conflict
+  resolved when it lands.
+
+✻ Baked for 21s · done Monday 11:04 AM
+
+● Agent "Wellplate grid/YAML/Z-group fixes (W2)" finished · 33m 40s
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The plan doc has a conflict where both agents appended "FIXED" lines under
+  Follow-ups—I'll keep both, commit the merge, and run the combined test suites
+  to verify the auto-merged multipoint.py works correctly. · summarized
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All three review-fix groups are merged and the combined test suite passes (249
+  tests). I'll do one final render check of both panels to confirm
+  multipoint.py still works, then update memory with the review outcomes. 
+  · summarized
+
+  Read 2 files, ran 1 shell command, wrote 1 memory (ctrl+o to expand)
+
+● Both panels render identically to the layout you approved, from the fully
+  merged tree (c3f59c63, 29 commits over master). Saved to
+  Desktop\squid_gui_screenshots\2026-09-21_after_review_fixes\.
+
+  Review outcome — all 10 findings fixed and merged:
+
+  #: 2
+  Fix: Wellplate z-span µm/mm → shared _compute_z_range
+  Commit: 8bfe70ed
+  ────────────────────────────────────────
+  #: 9
+  Fix: Confocal: raise before moving the disk if the motor can't be confirmed;
+  never record a mode the hardware didn't reach; motor switch refreshes on
+  failure
+  Commit: 0517d43c
+  ────────────────────────────────────────
+  #: 3, 5, 4, 8
+  Fix: One move_xy_with_z_retract helper (5 µm no-travel guard) behind every
+  in-run XY move incl. seed scan, focus-map corners, AF-map hop, table click;
+  fluidics tab checkbox; MCP YAML forwards the flag; same-row click is a no-op
+  Commit: 7103e859
+  ────────────────────────────────────────
+  #: 1, 6, 7, 10, cut
+  Fix: Nx×Ny wells emit Z-less FOVs; tiling_method in YAML gates the drop
+  handler; disabling Z-stack no longer wipes Z-min/Z-max; Flexible re-pushes
+  NX/NY; dead well-diffing removed
+  Commit: 2a6a0995
+  ────────────────────────────────────────
+  #: (a)
+  Fix: region_shapes populated by _register_region for every adder
+  Commit: 228365f5
+
+  249 tests pass across every touched suite on the merged tree. The single merge
+  conflict was two agents appending to the same Follow-ups list in the plan doc
+  — resolved by keeping both.
+
+  Still running: the Sonnet test-stub repair (the 15 pre-existing
+  test_MultiPointController / test_widgets failures). It's tests-only in its own
+  worktree, so nothing on the branch waits on it; I'll merge it when it reports
+  and flag anything it finds to be a genuine bug rather than a stale stub.
+
+  For the first rig run, the behaviours to watch are unchanged from before but
+  now better-bounded: the retract adds two Z moves only on true region entries
+  (not per timepoint), the disk auto-start fails loudly rather than imaging
+  through a parked disk, and Wellplate Nx×Ny wells follow whatever Z you focus
+  to rather than the Z you selected them at.
+
+✻ Crunched for 2m 34s · done Monday 11:11 AM
+
+● Agent "Repair stale test stubs" finished · 1h 38m 44s
+
+● The test-stub agent finished and, beyond the stub repairs, reports two genuine
+  product bugs it left in place. Merging its tests-only commit and verifying
+  both claims in the code before delegating them.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Confirmed both bugs: the simulated camera's catch-all __getattr__ breaks a
+  getattr/in check causing a TypeError, and save_observation_preset overwrites
+  state.name with the sanitized filename, breaking name-based autofocus lookups
+  for existing presets. I'll delegate fixes for both to Sonnet in separate
+  worktrees, clear the locked worktree, and rerun the full touched-suite on the
+  merged tree given the new autouse fixture. · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● 2 background agents launched (↓ to manage)
+   ├ Fix SimulatedCamera placeholder crash
+   └ Fix preset name sanitising
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The merged-tree baseline is clean except for the three known bugs already
+  being fixed (377 passed, 3 failed). The stub agent's worktree is no longer
+  locked by any process, so I'll clear out the leftover folder now. · summarized
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Left the folder alone — it's just a leftover directory with no git
+  registration, harmless; you can delete
+  .claude\worktrees\agent-a8d7bf5c775f032a8 whenever you like.
+
+  State of play:
+
+  - Branch gui-improvements at 33d51287, working tree clean. Merged-tree tests:
+    377 passed, 3 failed, the 3 being exactly the product bugs in flight.
+  - Sonnet (worktree): SimulatedCamera placeholder — stop __getattr__
+    fabricating placeholders for _-prefixed names, plus a dict guard in
+    _record_capture_sub_timings; it's also sweeping the worker/controller for
+    other getattr(self.camera, "_…") sites that would trip the same trap. This
+    one matters beyond tests: it's the first-frame crash of any simulated
+    multipoint run.
+  - Sonnet (worktree): preset name sanitising — investigating first (how lookups
+    are keyed, and a read-only check of the rig's real preset files to see
+    whether they're already underscored), then preserving the display name while
+    sanitising only the filename, for presets and cycles, without breaking
+    presets already on disk.
+
+  Nothing else is actionable until those two report; I'll merge each, re-run the
+  suites, and give you a final summary.
+
+✻ Baked for 5m 6s · done Monday 11:48 AM
+
+● Agent "Fix preset name sanitising" finished · 24m 30s
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The preset fix merged, but I noticed job_processing.py builds TIFF filenames
+  from the label name, which could introduce spaces if a preset name has them,
+  breaking the underscore convention other files rely on. I'll delegate a
+  contained fix to preserve the on-disk naming convention while keeping display
+  names as-is. · summarized
+
+● Agent(Sanitise channel labels in filenames) Sonnet 5
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● Two Sonnet agents remain in flight, both in isolated worktrees on
+  non-overlapping files:
+
+  - SimulatedCamera placeholder crash (squid/camera/utils.py,
+    multi_point_worker.py) — the fix for the three remaining test failures and
+    the first-frame crash of any simulated multipoint run.
+  - Channel labels in filenames (job_processing.py only) — keeps on-disk image
+    names underscored while metadata carries the display name, closing the loose
+    end from the preset-name fix.
+
+  Also worth knowing from the preset investigation: every preset on the rig 
+  already has an underscored name (BF_LED_matrix_full etc.) — all were saved
+  through the old bug — so nothing on disk needs migrating and existing lookups
+  keep working unchanged; only presets saved from now on keep their spaces.
+
+  Nothing else is actionable until those two report. When they land I'll merge,
+  re-run the full touched-suite set (expecting 380+ passed, 0 failed), and give
+  you the closing summary.
+
+✻ Baked for 1m 36s · done Monday 12:12 PM
+
+● Agent "Fix SimulatedCamera placeholder crash" finished · 38m 39s
+
+● Merging the SimulatedCamera fix and running the controller suite here, since
+  the agent's sandbox was too slow to see the two target tests pass on their
+  hard-coded 5 s wait.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The remaining failures aren't real bugs — both target tests now complete a
+  full simulated acquisition and only fail on the test's hard-coded
+  finished_event.wait(5), since subprocess spawn alone takes ~2.5s. I'll just
+  bump that timeout constant directly instead of spawning another agent. 
+  · summarized
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● test_MultiPointController.py is now 7 passed on the branch (caa68199); the
+  controller suite has been fully red or partly red since the Observation State
+  migration, so that's the first time it's been green in a while.
+
+  One thing I have to flag from the SimulatedCamera agent's report: while
+  chasing what it thought were zombie test processes, it ran taskkill on a batch
+  of PIDs and two of them turned out to be Positron's own Python processes
+  (39504, 40680). Positron restarted them (as 53088, 56552) and appeared
+  unaffected, but if a Positron kernel or session lost state in the last half
+  hour, that's why. The agent disclosed it itself; I didn't authorise it and its
+  prompt didn't ask for it. Nothing on the microscope side was touched —
+  hardware is off and no rig process exists.
+
+  The same agent also found a second real bug behind the first:
+  hasattr(self.camera, "add_frame_arrived_callback") was always true for
+  SimulatedCamera because of the same placeholder shim, sending every simulated
+  run down the Tucsen-only deferred-decode path and aborting it. Both the
+  TypeError and that abort are fixed (84e0fb15, merged as 99e3e698).
+
+  Only the filename-sanitising agent is still running (job_processing.py). When
+  it lands I'll merge, run the full touched-suite set — expecting ~390 passed, 0
+  failed — and close out with the summary.
+
+✻ Sautéed for 4m 12s · done Monday 12:29 PM
+● Agent "Sanitise channel labels in filenames" finished · 38m 0s
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The earlier "failure" was only a wrong path in my test list
+  (test_postprocessing.py doesn't live where I guessed). With the verified set,
+  the final tree is 406 passed, 0 failed.
+
+  Wrote 1 memory (ctrl+o to expand)
+
+● All work is merged and the branch is closed out. gui-improvements is at
+  bd35120d, 35 commits over master, working tree clean, 406 tests passing across
+  every suite touched — including test_MultiPointController.py, green for the
+  first time since the Observation State migration.
+
+  What this round delivered
+
+  Layout (ac326ee7) — both panels: boxed Positions / Tiling / [x] Z-stack / [x] 
+  Time-lapse on the left; Channels over [Focus + Scan behaviour | Saving + 
+  buttons] on the right, Start Acquisition bottom-right. Screenshots:
+  Desktop\squid_gui_screenshots\2026-09-21_right_group\ and
+  …\2026-09-21_after_review_fixes\.
+
+  Bug check — /code-review high over the whole branch: 10 findings, all fixed by
+  three Sonnet agents (8bfe70ed, 0517d43c, 7103e859, 2a6a0995). The important
+  ones for the rig:
+  - Z-retract now fires only on true region entries (not per timepoint), through
+    one move_xy_with_z_retract helper that also covers the laser-AF seed scan,
+    focus-map corners, fluidics tab, MCP YAML path, and the table click.
+  - Nx×Ny wells no longer carry a baked-in selection-time Z.
+  - Confocal entry fails loudly if the disk motor can't be confirmed; no mode is
+    recorded on failure.
+  - Disabling [x] Z-stack no longer wipes Z-min/Z-max.
+
+  Three pre-existing product bugs surfaced by repairing the stale test stubs,
+  all fixed:
+  1. SimulatedCamera's placeholder shim answered every hasattr/getattr — so
+     every simulated multipoint run had been silently taking the Tucsen 
+     deferred-decode path and aborting, in addition to the first-frame
+     TypeError. (84e0fb15)
+  2. Saving a preset rewrote its display name with the sanitized filename;
+     that's why every preset on the rig reads BF_LED_matrix_full. Nothing on
+     disk needs migrating; new saves keep their names. (e0914b28)
+  3. Follow-on: on-disk image filenames stay underscored while metadata carries
+     the display name. (94cb03b7)
+
+  For your attention
+
+  - Positron incident, already flagged: one Sonnet agent taskkilled two Positron
+    Python processes it mistook for zombie test workers. Positron restarted
+    them; nothing rig-side was touched. I've recorded a standing rule for future
+    agent prompts — never kill processes you didn't start.
+  - Past Wellplate z-stacks: only From Top + Set Z-range off ever drove hardware
+    to the wrong Z; From Bottom/Center data is fine, though their
+    acquisition.yaml z_range_mm upper bound is bogus.
+  - Leftover empty folder .claude\worktrees\agent-a8d7bf5c775f032a8 — delete at
+    will; git no longer tracks it.
+  - Everything here was built and verified against simulated hardware only. The
+    plan doc (docs/pending/gui_improvements_plan.md) is the full record; my
+    memory notes carry the rig-run watch-list (disk spin-up latency, retract
+    cost per region, Nx×Ny wells now following focus).
+
+✻ Baked for 3h 30m 32s · done Monday 12:53 PM
+
+● Agent "Uniform left-column block (R2-layout)" finished · 5h 57m 6s
+
+● Stale close-out from the R2-layout agent's last background job — nothing new,
+  nothing outstanding. The branch stands at bd35120d, 406 tests green.
+
+✻ Baked for 5s · done Monday 1:19 PM
+
+● Remote Control disconnected — Remote Control server rejected the 
+  request (HTTP 403) — run /remote-control to retry
