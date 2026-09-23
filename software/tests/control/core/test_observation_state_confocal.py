@@ -14,14 +14,19 @@ driver over a faked serial port. No COM port is opened and no hardware object is
 ever constructed.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
 import control.serial_peripherals as sp
 from control.core.config.repository import ConfigRepository
+from control.core.multi_point_controller import MultiPointController
+from control.core.multi_point_worker import MultiPointWorker
 from control.core.observation_state_controller import ObservationStateController
 from control.core.observation_state_service import (
     collect_emission_filter_positions,
@@ -523,6 +528,7 @@ def test_confocal_mode_round_trips_collect_save_load_apply(tmp_path, confocal_en
     ctl.current_observation_state = _state()
 
     # 1. User goes confocal, picks a filter and sets both irises on the unit.
+    xlight.set_disk_position(1)
     ctl.toggle_confocal_widefield(True)
     ctl.set_emission_filter_position(5)
     xlight.set_illumination_iris(70)
@@ -546,6 +552,7 @@ def test_confocal_mode_round_trips_collect_save_load_apply(tmp_path, confocal_en
 
     # 4. Hardware has since been put back in widefield; applying the preset must
     #    move the disk back, not just flip the software flag.
+    xlight.set_disk_position(0)
     ctl.toggle_confocal_widefield(False)
     xlight.disk_position_calls.clear()
     xlight.set_emission_filter_calls.clear()
@@ -565,13 +572,151 @@ def test_widefield_preset_moves_the_disk_back(tmp_path, confocal_enabled):
     xlight = FakeXLight(emission_wheel_pos=1)
     ctl = _make_controller(xlight=xlight, config_repo=repo)
     ctl.current_observation_state = _state()
+    xlight.set_disk_position(1)
     ctl.toggle_confocal_widefield(True)
+    xlight.disk_position_calls.clear()
 
     widefield = _state(name="wf", confocal=False, emission={"default": 2})
     ctl.apply_observation_state_preset(widefield)
 
     assert ctl.is_confocal_mode() is False
     assert xlight.disk_position_calls == [0]
+
+
+def test_loading_preset_checks_disk_even_when_controller_flag_matches(tmp_path, confocal_enabled):
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    repo.save_observation_preset("widefield", _state(name="widefield", confocal=False))
+
+    # The controller still says widefield, but the disk was moved into the path.
+    xlight.set_disk_position(1)
+    xlight.disk_position_calls.clear()
+    ctl.apply_observation_state_preset(repo.load_observation_preset("widefield"))
+    assert xlight.disk_position_calls == [0]
+    assert ctl.is_confocal_mode() is False
+
+
+def test_loading_preset_syncs_flag_when_disk_is_already_in_position(tmp_path, confocal_enabled):
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    repo.save_observation_preset("confocal", _state(name="confocal", confocal=True))
+
+    xlight.set_disk_position(1)
+    xlight.disk_motor_state = True
+    xlight.disk_position_calls.clear()
+    ctl.apply_observation_state_preset(repo.load_observation_preset("confocal"))
+    assert xlight.disk_position_calls == []
+    assert ctl.is_confocal_mode() is True
+
+
+def test_loading_confocal_preset_starts_motor_if_disk_is_in_but_stopped(tmp_path, confocal_enabled):
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    repo.save_observation_preset("confocal", _state(name="confocal", confocal=True))
+
+    xlight.set_disk_position(1)
+    xlight.disk_position_calls.clear()
+    ctl.apply_observation_state_preset(repo.load_observation_preset("confocal"))
+    assert xlight.disk_motor_state is True
+    assert ctl.is_confocal_mode() is True
+
+
+def test_preset_saves_widefield_from_disk_when_controller_flag_is_stale(tmp_path, confocal_enabled):
+    repo = _repo_with_profile(tmp_path)
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight, config_repo=repo)
+    ctl.current_observation_state = _state(confocal=True)
+    ctl.toggle_confocal_widefield(True)
+
+    # The panel moved the disk, but its state signal has not reached the
+    # controller. The preset must follow the hardware, as the iris fields do.
+    xlight.set_disk_position(0)
+    repo.save_observation_preset("widefield", ctl.collect_observation_state())
+    loaded = repo.load_observation_preset("widefield")
+    assert loaded.confocal_mode is False
+
+    xlight.set_disk_position(1)
+    ctl.toggle_confocal_widefield(True)
+    xlight.disk_position_calls.clear()
+    ctl.apply_observation_state_preset(loaded)
+    assert xlight.disk_position_calls == [0]
+
+
+def test_collect_confocal_mode_falls_back_when_disk_position_unknown(confocal_enabled):
+    xlight = FakeXLight()
+    xlight.spinning_disk_pos = None
+    ctl = _make_controller(xlight=xlight)
+    ctl.toggle_confocal_widefield(True)
+    assert ctl.collect_observation_state().confocal_mode is True
+
+
+def test_multipoint_inline_live_state_keeps_widefield_mode(confocal_enabled):
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight)
+    ctl.toggle_confocal_widefield(True)  # stale after the panel parked the disk
+    live_state = ctl.collect_observation_state().model_copy(update={"name": "live"})
+    assert live_state.confocal_mode is False
+
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker._observation_preset_cache = {"live": live_state}
+    worker.liveController = SimpleNamespace(obs_controller=ctl)
+    worker._emission_filter_wheel = None
+    worker._timing = SimpleNamespace(get_timer=lambda _name: nullcontext())
+    worker._log = MagicMock()
+    worker.microscope = ctl.microscope
+    worker.observation_state_names = ["live"]
+    worker.scan_region_fov_coords_mm = {"R0": [(0, 0)]}
+    worker._get_observation_states_for_region = lambda _region: ["live"]
+    # A user preset called "live" must not replace the inline hardware snapshot.
+    worker.microscope.config_repo.load_observation_preset = MagicMock(return_value=_state(name="live", confocal=True))
+    MultiPointWorker._prewarm_observation_states(worker)
+    MultiPointWorker._apply_observation_state(worker, "live")
+
+    worker.microscope.config_repo.load_observation_preset.assert_not_called()
+    assert xlight.disk_position_calls == []
+    assert ctl.is_confocal_mode() is False
+
+
+def test_multipoint_restores_prior_disk_mode_after_preset_changes_it(monkeypatch, confocal_enabled):
+    xlight = FakeXLight()
+    ctl = _make_controller(xlight=xlight)
+    ctl.apply_confocal_mode(True)  # the last acquisition preset left the disk in
+    xlight.disk_position_calls.clear()
+    ctl.apply_full_observation_state = MagicMock()
+
+    multipoint = MultiPointController.__new__(MultiPointController)
+    multipoint._log = MagicMock()
+    multipoint.selected_observation_state_names = ["confocal"]
+    multipoint._selected_observation_state_names_before_run = ["confocal"]
+    multipoint._inline_observation_states_for_run = {}
+    multipoint.gen_focus_map = False
+    multipoint.configuration_before_running_multipoint = _state(confocal=True)  # stale state flag
+    multipoint._confocal_mode_before_multipoint = False  # disk was widefield at start
+    multipoint.callbacks = SimpleNamespace(signal_current_configuration=MagicMock(), signal_current_fov=MagicMock())
+    multipoint.liveController = SimpleNamespace(obs_controller=ctl, trigger_mode="software")
+    multipoint._camera_live_snapshot_before_multipoint = None
+    multipoint._illumination_snapshot_before_acquisition = None
+    multipoint._trigger_mode_before_multipoint = None
+    multipoint.camera = SimpleNamespace(enable_callbacks=MagicMock())
+    multipoint.camera_callback_was_enabled_before_multipoint = False
+    multipoint.liveController_was_live_before_multipoint = False
+    multipoint._memory_monitor = None
+    multipoint.recording_start_time = 0
+    multipoint.base_path = "."
+    multipoint.experiment_ID = "test"
+    multipoint.run_acquisition_current_fov = False
+    multipoint._move_back_to_start_position = MagicMock()
+    multipoint.stage = SimpleNamespace(get_pos=lambda: SimpleNamespace(x_mm=0, y_mm=0))
+    monkeypatch.setattr("control.core.multi_point_controller.utils.create_done_file", lambda _path: None)
+
+    multipoint._restore_state_after_acquisition()
+    assert xlight.disk_position_calls == [0]
+    assert ctl.is_confocal_mode() is False
+    displayed = multipoint.callbacks.signal_current_configuration.call_args.args[0]
+    assert displayed.confocal_mode is False
 
 
 # ── Redundant optical-path writes ─────────────────────────────────────────────

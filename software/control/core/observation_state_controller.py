@@ -393,18 +393,26 @@ class ObservationStateController:
         with the disk parked in widefield.
 
         A disk move is several seconds, so hardware is only touched when the
-        requested mode differs from the mode the controller believes the
-        hardware is in.
+        requested mode differs from the X-Light's cached disk position (or the
+        controller's last known mode if the hardware position is unavailable).
         """
         confocal = bool(confocal)
-        if confocal == self._confocal_mode:
-            return
         # Presence of the addon, not a _def flag: `from control._def import *`
         # binds a copy at import time and the machine config is applied after
         # these modules are imported, so the flag reads stale False here.
         addons = getattr(self.microscope, "addons", None)
         dragonfly = getattr(addons, "dragonfly", None)
         xlight = getattr(addons, "xlight", None)
+        motor_stopped = (
+            confocal
+            and dragonfly is None
+            and xlight is not None
+            and getattr(xlight, "has_spinning_disk_motor", False)
+            and getattr(xlight, "disk_motor_state", None) is not True
+        )
+        if confocal == self._collect_confocal_mode() and not motor_stopped:
+            self.toggle_confocal_widefield(confocal)
+            return
         hardware_moved = True
         if dragonfly is not None or xlight is not None:
             try:
@@ -921,7 +929,7 @@ class ObservationStateController:
         base = saved or ObservationState()
         return ObservationState(
             name=base.name,
-            confocal_mode=self.is_confocal_mode(),
+            confocal_mode=self._collect_confocal_mode(),
             camera_settings=camera_settings,
             illuminator_states=illuminator_states,
             z_offset_um=base.z_offset_um,
@@ -936,6 +944,21 @@ class ObservationStateController:
     # ─────────────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────
+
+    def _collect_confocal_mode(self) -> bool:
+        """Use the X-Light's last known disk position when saving a state.
+
+        The panel moves the disk directly, so the controller's mode flag can
+        lag behind the hardware. An unknown driver position falls back to the
+        controller's last known mode without making a serial request.
+        """
+        addons = getattr(self.microscope, "addons", None)
+        if getattr(addons, "dragonfly", None) is None:
+            xlight = getattr(addons, "xlight", None)
+            position = getattr(xlight, "spinning_disk_pos", None)
+            if position is not None:
+                return bool(position)
+        return self.is_confocal_mode()
 
     # (capability flag, driver cache attribute, ConfocalSettings field, cast)
     _XLIGHT_CONFOCAL_FIELDS = (

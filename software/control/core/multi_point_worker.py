@@ -3816,7 +3816,9 @@ class MultiPointWorker:
                         continue
                     seen.add(preset_name)
                     try:
-                        state = repo.load_observation_preset(preset_name)
+                        state = self._observation_preset_cache.get(preset_name)
+                        if state is None:
+                            state = repo.load_observation_preset(preset_name)
                         if state is None:
                             continue
                         # Cache so _apply_observation_state can skip the YAML

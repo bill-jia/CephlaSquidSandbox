@@ -1598,6 +1598,7 @@ class MultiPointController:
             self.abort_acqusition_requested = False
 
             self.configuration_before_running_multipoint = self.liveController.obs_controller.current_observation_state
+            self._confocal_mode_before_multipoint = self.liveController.obs_controller._collect_confocal_mode()
 
             # Snapshot the live camera geometry/mode (binning, ROI, pixel_format,
             # camera_mode) so it can be restored after the run. The acquisition
@@ -2007,9 +2008,18 @@ class MultiPointController:
         # The Qt signal for signal_current_configuration is typed as Signal(ObservationState)
         # and will reject None.
         prior_config = self.configuration_before_running_multipoint
+        prior_mode = getattr(self, "_confocal_mode_before_multipoint", None)
         if prior_config is not None:
-            self.callbacks.signal_current_configuration(prior_config)
+            display_config = (
+                prior_config.model_copy(update={"confocal_mode": prior_mode})
+                if prior_mode is not None
+                else prior_config
+            )
+            self.callbacks.signal_current_configuration(display_config)
             self.liveController.obs_controller.apply_full_observation_state(prior_config)
+        if prior_mode is not None:
+            self.liveController.obs_controller.apply_confocal_mode(prior_mode)
+            self._confocal_mode_before_multipoint = None
 
         # Restore the live camera geometry/mode captured at acquisition start.
         # apply_full_observation_state above only restores exposure/gain/illumination,
