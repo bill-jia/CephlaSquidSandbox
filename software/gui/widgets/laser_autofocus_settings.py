@@ -18,6 +18,8 @@ diagnostic table-path audit.
 """
 
 import os
+import json
+from collections import deque
 
 os.environ.setdefault("QT_API", "pyqt5")
 
@@ -37,12 +39,13 @@ from qtpy.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSpinBox,
+    QTextEdit,
     QVBoxLayout,
 )
 
 from control._def import MULTIPOINT_AUTOFOCUS_CHANNEL, FocusMeasureOperator, Acquisition
 from control.models.contrast_autofocus import (
-    AcquisitionContrastAFOverride, ContrastAFSettings,
+    AcquisitionContrastAFOverride, ContrastAFSettings, ContrastSupervisionPolicy,
     default_20x_contrast_af_settings,
 )
 from gui.widgets.contrast_af_editor import add_phase1_fields, validated_settings
@@ -187,6 +190,91 @@ class LaserAutofocusSettingsDialog(QDialog):
 
         layout.addWidget(self.fast_group)
 
+        supervision = QGroupBox("Contrast supervision of laser AF")
+        sf = QFormLayout(supervision)
+        self.supervision_mode = QComboBox()
+        for label, value in (("Off", "off"), ("Monitor only", "monitor"),
+                             ("Correct when quality is persistently poor", "quality")):
+            self.supervision_mode.addItem(label, value)
+        sf.addRow("Mode:", self.supervision_mode)
+        self.supervision_entry = QCheckBox("Check on every region/timepoint entry")
+        sf.addRow(self.supervision_entry)
+        self.supervision_verify_baseline = QCheckBox("Verify a trusted baseline once with a bounded contrast scan")
+        sf.addRow(self.supervision_verify_baseline)
+        self.supervision_confirm_reference = QCheckBox(
+            "I independently confirmed the region laser references are in focus; seed from first good check")
+        sf.addRow(self.supervision_confirm_reference)
+        self.supervision_inputs = {}
+        for key, label, low, high in (
+            ("every_n_completed_fovs", "Check every N completed FOVs (0=off)", 0, 10000),
+            ("min_baseline_fields", "Trusted independent fields", 1, 1000),
+            ("bad_checks_required", "Consecutive bad checks", 1, 100),
+            ("max_attempts_per_region", "Maximum attempts per region", 0, 100),
+            ("cooldown_completed_fovs", "Cooldown in completed FOVs", 0, 10000),
+            ("max_frames_per_correction", "Frames per correction", 1, 10000),
+            ("max_frames_per_region", "Frames per region", 1, 100000),
+            ("max_frames_per_run", "Frames per run", 1, 1000000),
+        ):
+            box = QSpinBox()
+            box.setRange(low, high)
+            sf.addRow(label, box)
+            self.supervision_inputs[key] = box
+        for key, label, low, high, suffix in (
+            ("relative_drop", "Relative sharpness drop (provisional)", 0.01, 0.99, ""),
+            ("max_baseline_age_s", "Maximum baseline age", 1, 86400, " s"),
+            ("max_laser_age_s", "Maximum laser evidence age", 0.1, 3600, " s"),
+            ("min_correlation", "Minimum laser correlation", -1, 1, ""),
+            ("max_residual_um", "Maximum laser residual", 0.01, 100, " µm"),
+            ("min_brightness_fraction", "Minimum brightness / full scale (provisional)", 0, 1, ""),
+            ("min_absolute_signal_adu", "Minimum absolute signal (provisional)", 0, 65535, " ADU"),
+            ("min_absolute_noise_adu", "Minimum absolute noise floor (provisional)", 0, 65535, " ADU"),
+            ("max_saturation_fraction", "Maximum saturated fraction (provisional)", 0, 1, ""),
+            ("min_tile_coverage", "Minimum textured tile coverage (provisional)", 0, 1, ""),
+            ("min_tile_contrast_fraction", "Minimum tile contrast / full scale (provisional)", 0, 1, ""),
+            ("min_brightness_ratio", "Minimum brightness / baseline (provisional)", 0.01, 1, ""),
+            ("max_brightness_ratio", "Maximum brightness / baseline (provisional)", 1, 10, ""),
+            ("max_noise_ratio", "Maximum noise / baseline (provisional)", 1, 10, ""),
+            ("min_peak_margin_fraction", "Minimum peak neighbor margin (provisional)", 0, 1, ""),
+            ("max_good_learning_drop_fraction", "Maximum downward baseline learning (provisional)", 0, 1, ""),
+            ("max_correction_um", "Maximum correction", 0.1, 1000, " µm"),
+            ("max_scan_travel_um", "Maximum scan travel including backlash", 0.1, 2000, " µm"),
+            ("confirmation_spacing_um", "Local confirmation spacing", 0.1, 100, " µm"),
+            ("max_exposure_ms_per_correction", "Exposure per correction", 1, 100000, " ms"),
+            ("max_exposure_ms_per_region", "Exposure per region", 1, 1000000, " ms"),
+            ("max_exposure_ms_per_run", "Exposure per run", 1, 10000000, " ms"),
+            ("max_laser_exposure_ms_per_correction", "Laser exposure per correction", 1, 100000, " ms"),
+            ("max_laser_exposure_ms_per_region", "Laser exposure per region", 1, 1000000, " ms"),
+            ("max_laser_exposure_ms_per_run", "Laser exposure per run", 1, 10000000, " ms"),
+            ("max_time_s_per_correction", "Time per correction", 1, 3600, " s"),
+            ("max_time_s_per_region", "Added time per region", 1, 86400, " s"),
+            ("max_time_s_per_run", "Added time per run", 1, 604800, " s"),
+            ("nominal_plane_offset_um", "Monitor-to-nominal plane offset", -1000, 1000, " µm"),
+        ):
+            box = QDoubleSpinBox()
+            box.setRange(low, high)
+            box.setDecimals(3)
+            box.setSuffix(suffix)
+            sf.addRow(label, box)
+            self.supervision_inputs[key] = box
+        self.supervision_failure = QComboBox()
+        self.supervision_failure.addItem("Stop acquisition", "stop")
+        self.supervision_failure.addItem("Continue after verified optical rollback", "continue_restored")
+        sf.addRow("Correction failure:", self.supervision_failure)
+        self.supervision_status = QLabel("Supervision is off; laser anchor refresh has its own cadence.")
+        self.supervision_status.setWordWrap(True)
+        sf.addRow(self.supervision_status)
+        details_button = QPushButton("Show latest supervision details")
+        details_button.clicked.connect(self._show_supervision_details)
+        sf.addRow(details_button)
+        supervision_scroll = QScrollArea()
+        supervision_scroll.setWidgetResizable(True)
+        supervision_scroll.setWidget(supervision)
+        supervision_scroll.setMinimumHeight(220)
+        layout.addWidget(supervision_scroll)
+        self.supervision_mode.currentIndexChanged.connect(self._update_supervision_summary)
+        self.supervision_entry.toggled.connect(self._update_supervision_summary)
+        self.supervision_inputs["every_n_completed_fovs"].valueChanged.connect(self._update_supervision_summary)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -230,12 +318,82 @@ class LaserAutofocusSettingsDialog(QDialog):
         self.cb_table_path_audit.setChecked(
             bool(getattr(c, "laser_af_table_path_audit", False))
         )
-
+        policy = getattr(c, "contrast_supervision_policy", ContrastSupervisionPolicy())
+        self.supervision_mode.setCurrentIndex(self.supervision_mode.findData(policy.mode))
+        self.supervision_entry.setChecked(policy.check_on_entry)
+        self.supervision_verify_baseline.setChecked(policy.verify_baseline_once)
+        self.supervision_confirm_reference.setChecked(policy.operator_confirms_reference_focus)
+        for key, box in self.supervision_inputs.items():
+            box.setValue(getattr(policy, key))
+        self.supervision_failure.setCurrentIndex(self.supervision_failure.findData(policy.failure_action))
+        self._update_supervision_summary()
+        live_status = getattr(c, "last_supervision_status", None)
+        self._latest_supervision_status = live_status
+        if isinstance(live_status, dict):
+            self.supervision_status.setText(
+                self.supervision_status.text() +
+                f" Last: {live_status.get('event')} at t={live_status.get('timepoint')}, "
+                f"region={live_status.get('region')}, FOV={live_status.get('fov')}; "
+                f"reference revision {live_status.get('revision')}, "
+                f"quality {live_status.get('quality', live_status.get('reason', '—'))}, "
+                f"score {live_status.get('score', '—')}, support {live_status.get('support', '—')}; "
+                f"attempts {live_status.get('correction_attempts_region', '—')}, "
+                f"resets {live_status.get('reference_resets_region', '—')}, "
+                f"added {live_status.get('added_time_s', '—')} s, "
+                f"main/laser exposure {live_status.get('main_exposure_ms_reserved', '—')}/"
+                f"{live_status.get('laser_exposure_ms_reserved', '—')} ms reserved.")
+        path = os.path.join(getattr(c, "base_path", "") or "", getattr(c, "experiment_ID", "") or "",
+                            "contrast_supervision.jsonl")
+        if live_status is None and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    last_line = next(iter(deque(stream, maxlen=1)), None)
+                if last_line:
+                    last = json.loads(last_line)
+                    self._latest_supervision_status = last
+                    self.supervision_status.setText(
+                        self.supervision_status.text() +
+                        f" Last: {last.get('event')} at t={last.get('timepoint')}, "
+                        f"region={last.get('region')}, FOV={last.get('fov')}; "
+                        f"reference revision {last.get('revision')}, "
+                        f"quality {last.get('quality', last.get('reason', '—'))}, "
+                        f"score {last.get('score', '—')}, support {last.get('support', '—')}; "
+                        f"attempts {last.get('correction_attempts_region', '—')}, "
+                        f"resets {last.get('reference_resets_region', '—')}, "
+                        f"added {last.get('added_time_s', '—')} s, "
+                        f"main/laser exposure {last.get('main_exposure_ms_reserved', '—')}/"
+                        f"{last.get('laser_exposure_ms_reserved', '—')} ms reserved.")
+            except (OSError, ValueError):
+                pass
         seed_mode = getattr(c, "laser_af_seed_mode", "scan")
         if seed_mode == "lazy":
             self.rb_seed_lazy.setChecked(True)
         else:
             self.rb_seed_scan.setChecked(True)
+
+    def _show_supervision_details(self):
+        details = QDialog(self)
+        details.setWindowTitle("Latest contrast supervision details")
+        layout = QVBoxLayout(details)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(json.dumps(self._latest_supervision_status or {}, indent=2, default=str))
+        layout.addWidget(view)
+        details.resize(700, 500)
+        details.exec_()
+
+    def _update_supervision_summary(self, *_):
+        mode = self.supervision_mode.currentText()
+        self.supervision_verify_baseline.setEnabled(self.supervision_mode.currentData() == "quality")
+        parts = []
+        if self.supervision_entry.isChecked():
+            parts.append("each region/timepoint entry")
+        n = self.supervision_inputs["every_n_completed_fovs"].value()
+        if n:
+            parts.append(f"every {n} completed FOVs within that visit")
+        self.supervision_status.setText(
+            f"{mode}: " + (" and ".join(parts) or "no check scheduled") +
+            ". Laser anchor refresh uses its separate cadence. Thresholds are provisional.")
 
     def _update_enabled_states(self, *_):
         enabled = self.cb_enabled.isChecked()
@@ -276,7 +434,11 @@ class LaserAutofocusSettingsDialog(QDialog):
         name = self.af_state.currentData() or self.af_state.currentText()
         state = c.liveController.get_observation_state_by_name(name)
         contrast_enabled = self.cb_contrast_enabled.isChecked()
-        if contrast_enabled and (state is None or state.is_stimulus_only):
+        supervision_mode = self.supervision_mode.currentData()
+        if supervision_mode != "off" and not (self.cb_enabled.isChecked() and self._has_laser):
+            QMessageBox.warning(self, "Autofocus Settings", "Contrast supervision requires laser AF enabled.")
+            return
+        if (contrast_enabled or supervision_mode != "off") and (state is None or state.is_stimulus_only):
             QMessageBox.warning(self, "Autofocus Settings", "Select an existing imaging observation state.")
             return
         values = {key: box.value() for key, box in self.af_inputs.items()}
@@ -293,12 +455,25 @@ class LaserAutofocusSettingsDialog(QDialog):
                     metric=self.af_metric.currentData(),
                     failure_policy=self.af_failure.currentData(), **legacy)
             except (ValueError, TypeError) as exc:
-                if contrast_enabled:
+                if contrast_enabled or supervision_mode != "off":
                     QMessageBox.warning(self, "Autofocus Settings", str(exc))
                     return
+        try:
+            policy = ContrastSupervisionPolicy(
+                mode=supervision_mode,
+                check_on_entry=self.supervision_entry.isChecked(),
+                verify_baseline_once=self.supervision_verify_baseline.isChecked(),
+                operator_confirms_reference_focus=self.supervision_confirm_reference.isChecked(),
+                failure_action=self.supervision_failure.currentData(),
+                **{key: box.value() for key, box in self.supervision_inputs.items()})
+        except ValueError as exc:
+            QMessageBox.warning(self, "Autofocus Settings", str(exc))
+            return
         if override is not None:
             c.set_contrast_af_acquisition_settings(name, override)
         c.set_af_flag(contrast_enabled)
+        if hasattr(c, "set_contrast_supervision_policy"):
+            c.set_contrast_supervision_policy(policy)
         c.set_reflection_af_flag(self.cb_enabled.isChecked() and self._has_laser)
         if self.rb_legacy.isChecked():
             # Legacy = AF every FOV. Force lazy seed so we don't waste ~90 s on

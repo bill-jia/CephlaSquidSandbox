@@ -69,6 +69,7 @@ class AcquisitionParameters:
     contrast_af_crop_width: Optional[int] = None
     contrast_af_crop_height: Optional[int] = None
     contrast_af_failure_policy: str = "stop"
+    contrast_supervision_policy: Optional["ContrastSupervisionPolicy"] = None
     contrast_af_use_focus_map: bool = False
     contrast_af_focus_map_coords: Tuple[Tuple[float, float, float], ...] = ()
     skip_saving: bool = False
@@ -204,6 +205,7 @@ class MultiPointControllerFunctions:
     signal_current_fov: Callable[[float, float], None]
     signal_overall_progress: Callable[[OverallProgressUpdate], None]
     signal_region_progress: Callable[[RegionProgressUpdate], None]
+    signal_supervision_progress: Callable[[dict], None] = lambda *a, **kw: None
     # Optional plate view callbacks. Default no-op lambdas avoid None checks at every call site.
     # Unlike mutable defaults (lists/dicts), lambdas are safe as defaults since they're not modified.
     signal_plate_view_init: Callable[[PlateViewInit], None] = lambda *a, **kw: None

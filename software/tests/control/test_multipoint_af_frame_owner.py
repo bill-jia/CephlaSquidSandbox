@@ -152,6 +152,11 @@ def test_owned_scan_runs_synchronously_without_imaging_dispatch(monkeypatch, met
     assert worker._pending_capture_info_by_frame_id == {}
     worker.autofocusController.autofocus.assert_not_called()
     worker.request_abort_fn.assert_not_called()
+    monitor = worker._run_owned_contrast_scan(state, capture_only=True)
+    assert isinstance(monitor, FocusSample)
+    assert worker._af_expected_raw == 0
+    assert worker._pending_capture_info_by_frame_id == {}
+    worker.request_abort_fn.assert_not_called()
 
 
 @pytest.mark.parametrize("deferred,decode_on_thread", [(True, False), (True, True), (False, False)])
@@ -264,11 +269,16 @@ def test_immediate_camera_capture_then_normal_imaging_callback(monkeypatch, defe
     assert camera.get_callbacks_enabled() is True
     assert camera.get_is_streaming() is True
 
+    monitor = worker._run_owned_contrast_scan(ObservationState(name="AF"), capture_only=True)
+    assert isinstance(monitor, FocusSample)
+    assert delivered_imaging == []
+    assert worker._pending_capture_info_by_frame_id == {}
+
     worker._current_capture_info = SimpleNamespace(file_id="next-imaging")
     worker._ready_for_next_trigger.clear()
     camera.send_trigger()
-    assert delivered_imaging == [4]
+    assert delivered_imaging == [5]
     if deferred:
-        assert worker._pending_capture_info_by_frame_id[4].file_id == "next-imaging"
+        assert worker._pending_capture_info_by_frame_id[5].file_id == "next-imaging"
     worker.autofocusController.autofocus.assert_not_called()
     worker.request_abort_fn.assert_not_called()

@@ -808,6 +808,64 @@ class LaserAutofocusController(QObject):
         self._log.info(f"Captured laser AF reference at x={x:.1f}")
         return LaserAFReference.from_capture(x_reference=x, crop=crop)
 
+    def capture_reference_strict(self) -> LaserAFReference:
+        """Capture a transaction candidate; fail if spot or laser cleanup is uncertain."""
+        if not self.is_initialized:
+            raise RuntimeError("Laser autofocus is not initialized")
+        result = None
+        error = None
+        try:
+            self.turn_on_AF_laser()
+            spot = self._get_laser_spot_centroid(restrict_to_reference=False)
+            image = self.image
+            if spot is None or image is None:
+                raise RuntimeError("Reference spot or image unavailable")
+            crop = self._normalized_spot_crop(image, spot[0])
+            if crop.size < 9 or not np.all(np.isfinite(crop)):
+                raise RuntimeError("Reference crop is unusable")
+            result = LaserAFReference.from_capture(x_reference=spot[0], crop=crop)
+        except BaseException as exc:
+            error = exc
+        finally:
+            try:
+                self.turn_off_AF_laser()
+            except BaseException as exc:
+                raise RuntimeError("Laser cleanup failed during reference capture") from exc
+        if error is not None:
+            raise error
+        return result
+
+    def assess_active_reference(self):
+        """Return a fresh, nonmoving laser measurement for supervision."""
+        from control.models.laser_af_reference import LaserAssessment
+        measured_at = time.time()
+        if self.get_active_reference() is None:
+            return LaserAssessment(measured_at=measured_at, reason="no_reference")
+        displacement = correlation = None
+        valid = False
+        reason = None
+        try:
+            self.turn_on_AF_laser()
+            displacement = self._measure_displacement_with_laser_on()
+            if not math.isfinite(displacement):
+                reason = "invalid_spot"
+            else:
+                valid, correlation = self._verify_spot_alignment_with_laser_on()
+                if not math.isfinite(correlation):
+                    valid, reason = False, "invalid_correlation"
+                elif not valid:
+                    reason = "correlation_failed"
+        except Exception as exc:
+            reason = f"laser_measurement_failed: {exc}"
+        finally:
+            try:
+                self.turn_off_AF_laser()
+            except Exception as exc:
+                valid, reason = False, f"laser_cleanup_failed: {exc}"
+        return LaserAssessment(measured_at=measured_at, spot_valid=displacement is not None and math.isfinite(displacement),
+                               residual_um=displacement, correlation=correlation,
+                               correlation_valid=valid, reason=reason)
+
     def apply_reference(self, reference: LaserAFReference) -> None:
         """Make ``reference`` the controller's active focus target.
 
@@ -909,7 +967,8 @@ class LaserAutofocusController(QObject):
 
         with self._time("af:verify_spot_alignment"):
             # Get current spot image
-            self._get_laser_spot_centroid()
+            if self._get_laser_spot_centroid() is None:
+                return failure_return_value
             current_image = self.image
 
             if self.reference_crop is None:

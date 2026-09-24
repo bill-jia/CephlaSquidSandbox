@@ -23,6 +23,28 @@ import numpy as np
 from pydantic import BaseModel, Field, field_validator
 
 
+class LaserAssessment(BaseModel):
+    """One fresh, nonmoving diagnostic measurement against the active reference."""
+    measured_at: float
+    spot_valid: bool = False
+    residual_um: Optional[float] = None
+    correlation: Optional[float] = None
+    correlation_valid: bool = False
+    reference_revision: Optional[int] = None
+    iterations: int = 0
+    fallback_used: bool = False
+    reason: Optional[str] = None
+
+    def good(self, *, now: float, max_age_s: float, max_residual_um: float,
+             min_correlation: float) -> bool:
+        return (self.spot_valid and self.correlation_valid and
+                self.residual_um is not None and math.isfinite(self.residual_um) and
+                abs(self.residual_um) <= max_residual_um and
+                self.correlation is not None and math.isfinite(self.correlation) and
+                self.correlation >= min_correlation and
+                0 <= now - self.measured_at <= max_age_s)
+
+
 def encode_reference_image(image: Optional[np.ndarray]) -> Tuple[Optional[str], Optional[List[int]], Optional[str]]:
     """Encode a numpy image as ``(base64_str, shape, dtype)``.
 

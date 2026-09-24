@@ -1,6 +1,7 @@
 import atexit
 import csv
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -134,6 +135,10 @@ _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS = (
 # per-timepoint folder. Distinct from the controller's ``coordinates.csv``,
 # which records the PLANNED grid before the run starts.
 ACQUIRED_POSITIONS_FILENAME = "acquired_positions.csv"
+
+
+class SupervisionOpticalRejection(ValueError):
+    """A safe, verified optical nonacceptance eligible for continue-restored."""
 
 
 class SummarizeResult(NamedTuple):
@@ -1200,6 +1205,15 @@ class MultiPointWorker:
         self.do_autofocus = acquisition_parameters.do_autofocus
         self.do_reflection_af = acquisition_parameters.do_reflection_autofocus
         self._contrast_af_state = acquisition_parameters.contrast_af_state
+        from control.models.contrast_autofocus import ContrastSupervisionPolicy
+        self._supervision_policy = ContrastSupervisionPolicy.model_validate(
+            acquisition_parameters.contrast_supervision_policy or {}).model_copy(deep=True)
+        self._supervision_objective = getattr(self.objectiveStore, "current_objective", None)
+        self._supervision_fingerprint = hashlib.sha256(json.dumps({
+            "policy": self._supervision_policy.model_dump(mode="json"),
+            "state": self._contrast_af_state.model_dump(mode="json") if self._contrast_af_state is not None else None,
+            "objective": self._supervision_objective,
+        }, sort_keys=True, default=str).encode()).hexdigest()
         self._contrast_af_step_um = (acquisition_parameters.contrast_af_legacy_step_um
                                      if acquisition_parameters.contrast_af_legacy_step_um is not None
                                      else getattr(self.autofocusController, "deltaZ", 0.001524) * 1000)
@@ -1221,6 +1235,8 @@ class MultiPointWorker:
         self.experiment_ID = acquisition_parameters.experiment_ID
         self.base_path = acquisition_parameters.base_path
         self.experiment_path = os.path.join(self.base_path or "", self.experiment_ID or "")
+        from control.core.contrast_autofocus.supervision import require_new_supervised_run
+        require_new_supervised_run(self.experiment_path, self._supervision_policy)
         self.observation_state_names = list(acquisition_parameters.selected_observation_state_names or [])
         self._use_observation_presets = bool(self.observation_state_names)
         self.region_observation_state_map = acquisition_parameters.region_observation_state_map
@@ -1421,6 +1437,22 @@ class MultiPointWorker:
         # vs table prediction) and end-of-region logic (==1 = no mid-region
         # refresh fired, optionally take a verification displacement).
         self._region_refresh_count_this_entry: int = 0
+        from control.core.contrast_autofocus.supervision import VisitCadence
+        self._supervision_cadence = VisitCadence()
+        self._supervision_histories = {}
+        self._supervision_revision = {}
+        self._supervision_attempts = {}
+        self._supervision_checks_by_region = {}
+        self._supervision_frames_by_region = {}
+        self._supervision_frames_run = 0
+        self._supervision_exposure_ms_by_region = {}
+        self._supervision_exposure_ms_run = 0.0
+        self._supervision_laser_exposure_ms_run = 0.0
+        self._supervision_laser_exposure_ms_by_region = {}
+        self._supervision_time_s_by_region = {}
+        self._supervision_time_s_run = 0.0
+        self._supervision_last_attempt_completed = {}
+        self._supervision_region_completed_total = {}
 
         self.skip_saving = acquisition_parameters.skip_saving or self.validation_only
         self._af_validator = None
@@ -4153,6 +4185,9 @@ class MultiPointWorker:
             )
             self._timepoint_fov_count += 1
             self.af_fov_count += 1
+            if self._supervision_policy.mode != "off":
+                self._supervision_cadence.complete()
+                self._supervision_region_completed_total[region_id] = self._supervision_region_completed_total.get(region_id, 0) + 1
             return
 
         if self.NZ > 1:
@@ -4298,6 +4333,9 @@ class MultiPointWorker:
         # Contrast-AF cadence counter: one increment per FOV visit, never per
         # z-slice (inside the z loop the cadence period becomes NZ-dependent).
         self.af_fov_count += 1
+        if self._supervision_policy.mode != "off":
+            self._supervision_cadence.complete()
+            self._supervision_region_completed_total[region_id] = self._supervision_region_completed_total.get(region_id, 0) + 1
 
         # Increment FOV counter for Slack notification stats
         self._timepoint_fov_count += 1
@@ -4442,7 +4480,467 @@ class MultiPointWorker:
         if reference is not None:
             self.laser_auto_focus_controller.apply_reference(reference)
 
-    def _run_owned_contrast_scan(self, state):
+    def _supervision_log(self, region_id, fov, event, **details):
+        record = {"version": 1, "time": time.time(), "acquisition": self.experiment_ID,
+                  "timepoint": self.time_point, "region": str(region_id), "fov": fov,
+                  "mode": self._supervision_policy.mode, "event": event,
+                  "effective_policy": self._supervision_policy.model_dump(mode="json"),
+                  "config_fingerprint": getattr(self, "_supervision_fingerprint", None),
+                  "revision": self._supervision_revision.get(region_id, 0),
+                  "main_frames_reserved": self._supervision_frames_run,
+                  "main_exposure_ms_reserved": self._supervision_exposure_ms_run,
+                  "laser_exposure_ms_reserved": self._supervision_laser_exposure_ms_run,
+                  "added_time_s": self._supervision_time_s_run,
+                  "correction_attempts_region": self._supervision_attempts.get(region_id, 0),
+                  "reference_resets_region": self._supervision_revision.get(region_id, 0),
+                  **details}
+        with open(os.path.join(self.experiment_path, "contrast_supervision.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, default=str) + "\n")
+        try:
+            self.callbacks.signal_supervision_progress(record)
+        except Exception as exc:
+            self._log.warning("Supervision progress callback failed: %s", exc)
+
+    def _reserve_supervision_laser_exposures(self, region_id, frame_slots):
+        # get_new_frame may retry up to three triggers; this is a conservative
+        # illumination-dose reservation, separate from main-camera exposure.
+        from control.core.laser_auto_focus_controller import LASER_AF_TRIGGER_ATTEMPTS
+        exposure = float(self.laser_auto_focus_controller.camera.get_exposure_time())
+        reserved = frame_slots * LASER_AF_TRIGGER_ATTEMPTS * exposure
+        policy = self._supervision_policy
+        attempt = getattr(self, "_supervision_laser_exposure_ms_attempt", None)
+        if (self._supervision_laser_exposure_ms_run + reserved > policy.max_laser_exposure_ms_per_run or
+                self._supervision_laser_exposure_ms_by_region.get(region_id, 0) + reserved > policy.max_laser_exposure_ms_per_region or
+                (attempt is not None and attempt + reserved > policy.max_laser_exposure_ms_per_correction)):
+            raise SupervisionOpticalRejection("Laser exposure budget exhausted")
+        self._supervision_laser_exposure_ms_run += reserved
+        self._supervision_laser_exposure_ms_by_region[region_id] = (
+            self._supervision_laser_exposure_ms_by_region.get(region_id, 0) + reserved)
+        if attempt is not None:
+            self._supervision_laser_exposure_ms_attempt = attempt + reserved
+
+    def _time_supervision_laser_call(self, region_id, operation):
+        began = time.monotonic()
+        try:
+            return operation()
+        finally:
+            elapsed = time.monotonic() - began
+            self._supervision_time_s_run += elapsed
+            self._supervision_time_s_by_region[region_id] = (
+                self._supervision_time_s_by_region.get(region_id, 0) + elapsed)
+
+    def _supervision_capture(self, state, z_um=None, artifact_path=None, deadline=None):
+        from control.core.contrast_autofocus.supervision import inspect_image
+        began = time.monotonic()
+        policy = self._supervision_policy
+        region_id = getattr(self, "_supervision_active_region", None)
+        remaining = min(policy.max_time_s_per_run - self._supervision_time_s_run,
+                        policy.max_time_s_per_region - self._supervision_time_s_by_region.get(region_id, 0))
+        if deadline is not None:
+            remaining = min(remaining, deadline - began)
+        if remaining <= 0:
+            raise SupervisionOpticalRejection("Supervision time budget exhausted")
+        exposure = float(state.exposure_time)
+        if (self._supervision_frames_run + 1 > policy.max_frames_per_run or
+                self._supervision_frames_by_region.get(region_id, 0) + 1 > policy.max_frames_per_region or
+                self._supervision_exposure_ms_run + exposure > policy.max_exposure_ms_per_run or
+                self._supervision_exposure_ms_by_region.get(region_id, 0) + exposure > policy.max_exposure_ms_per_region):
+            raise SupervisionOpticalRejection("Main-camera supervision budget exhausted")
+        self._supervision_frames_run += 1
+        self._supervision_exposure_ms_run += exposure
+        if region_id is not None:
+            self._supervision_frames_by_region[region_id] = self._supervision_frames_by_region.get(region_id, 0) + 1
+            self._supervision_exposure_ms_by_region[region_id] = self._supervision_exposure_ms_by_region.get(region_id, 0) + exposure
+        try:
+            sample = self._run_owned_contrast_scan(
+                state, capture_only=True, capture_z_um=z_um, max_time_s=remaining)
+        finally:
+            elapsed = time.monotonic() - began
+            self._supervision_time_s_run += elapsed
+            if region_id is not None:
+                self._supervision_time_s_by_region[region_id] = self._supervision_time_s_by_region.get(region_id, 0) + elapsed
+        metric = FocusMeasureOperator.convert_to_enum(state.focus_measure_operator)
+        try:
+            score = float(utils.calculate_focus_measure(sample.image, metric))
+        except (ValueError, TypeError, OverflowError):
+            score = float("nan")
+        if artifact_path is not None:
+            np.save(artifact_path, sample.image, allow_pickle=False)
+        full_scale = state.contrast_af.sensor_full_scale if state.contrast_af is not None else None
+        return inspect_image(sample.image, score, sensor_full_scale=full_scale,
+                             policy=self._supervision_policy)
+
+    def _supervision_attempt_correction(self, region_id, fov, state, history):
+        """Synchronous region-local reference transaction; image triggers remain quiescent."""
+        import copy
+        import math
+        from control.core.contrast_autofocus.supervision import TrustedHistory
+        policy = self._supervision_policy
+        from control.models.contrast_autofocus import ContrastAFSettings
+        settings = state.contrast_af or ContrastAFSettings()
+        reserve = settings.max_frames + 6
+        used = self._supervision_frames_by_region.get(region_id, 0)
+        if (reserve > policy.max_frames_per_correction or
+                used + reserve > policy.max_frames_per_region or
+                self._supervision_frames_run + reserve > policy.max_frames_per_run or
+                reserve * state.exposure_time > policy.max_exposure_ms_per_correction or
+                self._supervision_exposure_ms_by_region.get(region_id, 0) + reserve * state.exposure_time > policy.max_exposure_ms_per_region or
+                self._supervision_exposure_ms_run + reserve * state.exposure_time > policy.max_exposure_ms_per_run or
+                self._supervision_time_s_by_region.get(region_id, 0) >= policy.max_time_s_per_region or
+                self._supervision_time_s_run >= policy.max_time_s_per_run):
+            self._supervision_log(region_id, fov, "budget_exhausted", reserved_frames=reserve)
+            if policy.failure_action == "stop":
+                self.request_abort_fn()
+                raise RuntimeError("Supervision correction budget exhausted")
+            return
+        self._supervision_attempts[region_id] = self._supervision_attempts.get(region_id, 0) + 1
+        self._supervision_last_attempt_completed[region_id] = self._supervision_region_completed_total.get(region_id, 0)
+        # Reserve the whole scan allowance before its first trigger. A failed
+        # camera call can have exposed a frame without returning a SearchResult.
+        self._supervision_frames_run += settings.max_frames
+        self._supervision_frames_by_region[region_id] = used + settings.max_frames
+        reserved_exposure = settings.max_frames * float(state.exposure_time)
+        self._supervision_exposure_ms_run += reserved_exposure
+        self._supervision_exposure_ms_by_region[region_id] = self._supervision_exposure_ms_by_region.get(region_id, 0) + reserved_exposure
+        self._wait_for_move_settled()
+        laser = self.laser_auto_focus_controller
+        before = self.stage.get_pos()
+        old_reference = laser.get_active_reference()
+        old_reference_id = (hashlib.sha256(old_reference.model_dump_json().encode()).hexdigest()[:16]
+                            if old_reference is not None else None)
+        old_region_reference = self._region_laser_af_references.get(region_id)
+        old_anchor = (self._region_anchor_z_current.get(region_id), self._region_anchor_fov.get(region_id))
+        old_refresh = self._fovs_since_refresh.get(region_id)
+        old_refresh_count_this_entry = self._region_refresh_count_this_entry
+        old_history = copy.deepcopy(self._supervision_histories.get(region_id))
+        maps = (copy.deepcopy(self._fov_z_map), copy.deepcopy(self._fov_z_delta_map),
+                copy.deepcopy(self._z_pos_proposal))
+        piezo_before = self.piezo.position if self.piezo is not None else None
+        revision = self._supervision_revision.get(region_id, 0)
+        self._supervision_log(region_id, fov, "begin", old_revision=revision,
+                              old_reference_id=old_reference_id,
+                              z_mm=before.z_mm, piezo_um=piezo_before)
+        attempt_started = time.monotonic()
+        artifact_dir = (os.path.join(self.experiment_path, "contrast_supervision_artifacts")
+                        if getattr(self, "_supervision_save_artifacts", True) else None)
+        if artifact_dir is not None:
+            os.makedirs(artifact_dir, exist_ok=True)
+        artifact_prefix = f"{region_id}_t{self.time_point}_f{fov}_a{self._supervision_attempts[region_id]}"
+        artifact_index = 0
+        verification_trace = []
+        deadline = attempt_started + min(
+            policy.max_time_s_per_correction,
+            policy.max_time_s_per_region - self._supervision_time_s_by_region.get(region_id, 0),
+            policy.max_time_s_per_run - self._supervision_time_s_run)
+
+        def verified_capture(z_um):
+            nonlocal artifact_index
+            if time.monotonic() >= deadline:
+                raise SupervisionOpticalRejection("Correction time budget exhausted")
+            artifact_index += 1
+            artifact_path = (os.path.join(artifact_dir, f"{artifact_prefix}_image{artifact_index}.npy")
+                             if artifact_dir is not None else None)
+            observation = self._supervision_capture(state, z_um, artifact_path=artifact_path,
+                                                    deadline=deadline)
+            verification_trace.append({"z_um": z_um, "score": observation.score,
+                                       "quality_reason": observation.reason,
+                                       "artifact": os.path.basename(artifact_path) if artifact_path else None})
+            if time.monotonic() > deadline:
+                raise SupervisionOpticalRejection("Correction time budget exhausted")
+            return observation
+
+        committed = False
+        self._supervision_laser_exposure_ms_attempt = 0.0
+        scan_result = None
+        try:
+            if old_reference is None or self.abort_requested_fn():
+                raise RuntimeError("Missing laser reference or acquisition cancelled")
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise SupervisionOpticalRejection("Correction time budget exhausted")
+            scan_started = time.monotonic()
+            try:
+                result = self._run_owned_contrast_scan(
+                    state, max_travel_um=policy.max_scan_travel_um, max_time_s=remaining_time)
+                scan_result = result
+            finally:
+                scan_elapsed = time.monotonic() - scan_started
+                self._supervision_time_s_run += scan_elapsed
+                self._supervision_time_s_by_region[region_id] = self._supervision_time_s_by_region.get(region_id, 0) + scan_elapsed
+            if time.monotonic() >= deadline:
+                raise SupervisionOpticalRejection("Correction time budget exhausted")
+            if result.status != "success" or result.accepted_z_um is None:
+                if result.status in ("no_texture", "ambiguous_peak", "no_bracket", "range_exhausted"):
+                    raise SupervisionOpticalRejection(f"Contrast search rejected: {result.status}: {result.error}")
+                raise RuntimeError(f"Contrast search failed: {result.status}: {result.error}")
+            candidate = float(result.accepted_z_um)
+            if not math.isfinite(candidate) or abs(candidate - before.z_mm * 1000) > policy.max_correction_um:
+                raise SupervisionOpticalRejection("Contrast correction exceeds configured magnitude")
+            measured_z = []
+            for row in result.trace:
+                if row.get("phase") in ("move", "candidate", "stop"):
+                    continue
+                z_um = row.get("z_um", row.get("actual_z_um"))
+                score = row.get("score")
+                if z_um is not None and score is not None and math.isfinite(z_um) and math.isfinite(score):
+                    measured_z.append(z_um)
+            if len(set(measured_z)) < 3 or candidate <= min(measured_z) or candidate >= max(measured_z):
+                raise SupervisionOpticalRejection("Contrast peak lacks an interior bracket")
+            spacing = policy.confirmation_spacing_um
+            if abs(candidate - before.z_mm * 1000) + spacing > policy.max_correction_um:
+                raise SupervisionOpticalRejection("Verification neighbors exceed correction bound")
+            center1 = verified_capture(candidate)
+            center2 = verified_capture(candidate)
+            left = verified_capture(candidate - spacing)
+            right = verified_capture(candidate + spacing)
+            scores = [x.score for x in (center1, center2, left, right)]
+            if any(v is None for v in scores):
+                raise SupervisionOpticalRejection("Contrast verification image is unusable")
+            if (abs(scores[0] - scores[1]) / max(scores[0], scores[1]) > settings.verification_tolerance or
+                    min(scores[:2]) <= (1 + policy.min_peak_margin_fraction) * max(scores[2:])):
+                raise SupervisionOpticalRejection("Contrast peak is ambiguous or not repeatable")
+            nominal = candidate + policy.nominal_plane_offset_um
+            if abs(nominal - before.z_mm * 1000) > policy.max_correction_um:
+                raise SupervisionOpticalRejection("Final nominal plane exceeds correction bound")
+            final_image = verified_capture(nominal)
+            if final_image.score is None:
+                raise SupervisionOpticalRejection("Final nominal image is unusable")
+            if (policy.nominal_plane_offset_um == 0 and
+                    final_image.score < (1 - settings.verification_tolerance) * min(scores[:2])):
+                raise SupervisionOpticalRejection("Final nominal image lost verified focus")
+            self._reserve_supervision_laser_exposures(region_id, 1)
+            captured = self._time_supervision_laser_call(region_id, laser.capture_reference_strict)
+            new_reference_id = hashlib.sha256(captured.model_dump_json().encode()).hexdigest()[:16]
+            if artifact_dir is not None:
+                reference_artifact = os.path.join(artifact_dir, f"{artifact_prefix}_candidate_reference.json")
+                with open(reference_artifact, "w", encoding="utf-8") as output:
+                    json.dump(captured.model_dump(mode="json"), output)
+            laser.apply_reference(captured)
+            self._reserve_supervision_laser_exposures(region_id, 2)
+            assessment = self._time_supervision_laser_call(region_id, laser.assess_active_reference)
+            assessment = assessment.model_copy(update={"reference_revision": revision + 1})
+            if not assessment.good(now=time.time(), max_age_s=policy.max_laser_age_s,
+                                   max_residual_um=policy.max_residual_um,
+                                   min_correlation=policy.min_correlation):
+                raise RuntimeError(f"Candidate laser reference did not verify: {assessment.reason}")
+            confirmed = verified_capture(nominal)
+            if confirmed.score is None or abs(confirmed.score - final_image.score) / max(confirmed.score, final_image.score) > settings.verification_tolerance:
+                raise SupervisionOpticalRejection("Final image focus did not repeat")
+            if self.abort_requested_fn():
+                raise InterruptedError("Acquisition cancelled before reference commit")
+            if time.monotonic() > deadline:
+                raise SupervisionOpticalRejection("Correction time budget exhausted before commit")
+            self.wait_till_operation_is_completed()
+            if self.abort_requested_fn():
+                raise InterruptedError("Acquisition cancelled immediately before reference commit")
+            if time.monotonic() > deadline:
+                raise SupervisionOpticalRejection("Correction time budget exhausted before commit")
+            current_z = self.stage.get_pos().z_mm
+            self._region_laser_af_references[region_id] = captured
+            for table in (self._fov_z_map, self._fov_z_delta_map, self._z_pos_proposal):
+                for key in [key for key in table if key[0] == region_id]:
+                    del table[key]
+            self._fov_z_map[(region_id, fov)] = current_z
+            self._fov_z_delta_map[(region_id, fov)] = 0.0
+            self._z_pos_proposal[(region_id, fov)] = current_z
+            self._region_anchor_z_current[region_id] = current_z
+            self._region_anchor_fov[region_id] = fov
+            self._fovs_since_refresh[region_id] = 0
+            self._region_refresh_count_this_entry = 0
+            self._supervision_revision[region_id] = revision + 1
+            self._supervision_histories[region_id] = TrustedHistory(revision=revision + 1)
+            self._supervision_histories[region_id].seed(fov, confirmed)
+            committed = True
+            self._supervision_log(region_id, fov, "commit", new_revision=revision + 1,
+                                  z_mm=current_z,
+                                  piezo_um=self.piezo.position if self.piezo is not None else None,
+                                  score=confirmed.score, laser=assessment.model_dump(),
+                                  old_reference_id=old_reference_id, new_reference_id=new_reference_id,
+                                  artifact_prefix=artifact_prefix,
+                                  invalidated_region=region_id,
+                                  elapsed_s=time.monotonic() - attempt_started,
+                                  reserved_scan_frames=settings.max_frames,
+                                  actual_scan_frames=result.frames,
+                                  scan_status=result.status, scan_best_score=result.best_score,
+                                  scan_moves=result.moves, scan_trace=result.trace,
+                                  verification_trace=verification_trace,
+                                  scan_cleanup_errors=result.cleanup_errors)
+        except BaseException as exc:
+            rollback_errors = []
+            try:
+                if old_reference is not None:
+                    laser.apply_reference(old_reference)
+                    if laser.get_active_reference() != old_reference:
+                        raise RuntimeError("Laser reference rollback readback mismatch")
+            except BaseException as failure:
+                rollback_errors.append(f"reference: {failure}")
+            try:
+                self.stage.move_z_to(before.z_mm)
+                self.stage.wait_for_idle(2.0)
+                if abs(self.stage.get_pos().z_mm - before.z_mm) > 0.001:
+                    raise RuntimeError("Stage Z rollback readback mismatch")
+            except BaseException as failure:
+                rollback_errors.append(f"stage: {failure}")
+            if piezo_before is not None:
+                try:
+                    self.piezo.move_to(piezo_before)
+                    if abs(self.piezo.position - piezo_before) > 0.5:
+                        raise RuntimeError("Piezo rollback readback mismatch")
+                except BaseException as failure:
+                    rollback_errors.append(f"piezo: {failure}")
+            if old_region_reference is None:
+                self._region_laser_af_references.pop(region_id, None)
+            else:
+                self._region_laser_af_references[region_id] = old_region_reference
+            self._fov_z_map, self._fov_z_delta_map, self._z_pos_proposal = maps
+            if old_anchor[0] is None:
+                self._region_anchor_z_current.pop(region_id, None)
+            else:
+                self._region_anchor_z_current[region_id] = old_anchor[0]
+            if old_anchor[1] is None:
+                self._region_anchor_fov.pop(region_id, None)
+            else:
+                self._region_anchor_fov[region_id] = old_anchor[1]
+            self._supervision_revision[region_id] = revision
+            if old_refresh is None:
+                self._fovs_since_refresh.pop(region_id, None)
+            else:
+                self._fovs_since_refresh[region_id] = old_refresh
+            self._region_refresh_count_this_entry = old_refresh_count_this_entry
+            if old_history is None:
+                self._supervision_histories.pop(region_id, None)
+            else:
+                self._supervision_histories[region_id] = old_history
+            self._supervision_log(region_id, fov, "rollback", reason=str(exc), errors=rollback_errors,
+                                  old_reference_id=old_reference_id,
+                                  restored_z_mm=self.stage.get_pos().z_mm if not rollback_errors else None,
+                                  restored_piezo_um=self.piezo.position if self.piezo is not None and not rollback_errors else None,
+                                  scan_status=getattr(scan_result, "status", None),
+                                  scan_trace=getattr(scan_result, "trace", None),
+                                  verification_trace=verification_trace,
+                                  elapsed_s=time.monotonic() - attempt_started)
+            if rollback_errors or not isinstance(exc, SupervisionOpticalRejection) or policy.failure_action == "stop":
+                self.request_abort_fn()
+                raise RuntimeError(f"Supervision correction failed: {exc}; rollback: {rollback_errors}") from exc
+            self._af_failed_for_fov = True
+            self._last_af_status = "supervision_rolled_back"
+        finally:
+            self._supervision_laser_exposure_ms_attempt = None
+        return committed
+
+    def _supervise_nominal_plane(self, region_id, fov):
+        from control.core.contrast_autofocus.supervision import TrustedHistory
+        policy = self._supervision_policy
+        if policy.mode == "off" or not self.do_reflection_af:
+            return
+        if getattr(self.objectiveStore, "current_objective", None) != self._supervision_objective:
+            self.request_abort_fn()
+            raise RuntimeError("Objective changed during supervised acquisition")
+        if not self._supervision_cadence.due(str(region_id), self.time_point, policy):
+            return
+        state = self._contrast_af_state
+        if state is None:
+            raise RuntimeError("Supervision monitor state was not frozen at run construction")
+        if (self._supervision_frames_run >= policy.max_frames_per_run or
+                self._supervision_frames_by_region.get(region_id, 0) >= policy.max_frames_per_region or
+                self._supervision_exposure_ms_run + state.exposure_time > policy.max_exposure_ms_per_run or
+                self._supervision_exposure_ms_by_region.get(region_id, 0) + state.exposure_time > policy.max_exposure_ms_per_region or
+                self._supervision_time_s_run >= policy.max_time_s_per_run or
+                self._supervision_time_s_by_region.get(region_id, 0) >= policy.max_time_s_per_region):
+            self._supervision_log(region_id, fov, "monitor_budget_exhausted")
+            return
+        self._supervision_active_region = region_id
+        try:
+            self._reserve_supervision_laser_exposures(region_id, 2)
+        except SupervisionOpticalRejection as exc:
+            self._supervision_log(region_id, fov, "laser_budget_exhausted", reason=str(exc))
+            return
+        laser = self._time_supervision_laser_call(
+            region_id, self.laser_auto_focus_controller.assess_active_reference)
+        laser = laser.model_copy(update={"reference_revision": self._supervision_revision.get(region_id, 0)})
+        good_laser = laser.good(now=time.time(), max_age_s=policy.max_laser_age_s,
+                                max_residual_um=policy.max_residual_um,
+                                min_correlation=policy.min_correlation)
+        if not good_laser:
+            if laser.reason and "cleanup_failed" in laser.reason:
+                self._supervision_log(region_id, fov, "laser_unknown", laser=laser.model_dump())
+                self.request_abort_fn()
+                raise RuntimeError("Laser cleanup failed during supervision check")
+            # A table move and stale-anchor fallback are not evidence. Use the
+            # ordinary laser recovery path once, then require a fresh read.
+            from control.core.laser_auto_focus_controller import MOVE_TO_TARGET_MAX_ITERATIONS
+            try:
+                self._reserve_supervision_laser_exposures(region_id, MOVE_TO_TARGET_MAX_ITERATIONS + 2)
+            except SupervisionOpticalRejection as exc:
+                self._supervision_log(region_id, fov, "laser_budget_exhausted", reason=str(exc))
+                return
+            recovered = self._time_supervision_laser_call(
+                region_id, lambda: self._run_laser_af_refresh(region_id, fov))
+            if recovered and self._last_af_status == "ok":
+                try:
+                    self._reserve_supervision_laser_exposures(region_id, 2)
+                except SupervisionOpticalRejection as exc:
+                    self._supervision_log(region_id, fov, "laser_budget_exhausted", reason=str(exc))
+                    return
+                laser = self._time_supervision_laser_call(
+                    region_id, self.laser_auto_focus_controller.assess_active_reference)
+                laser = laser.model_copy(update={"reference_revision": self._supervision_revision.get(region_id, 0)})
+                good_laser = laser.good(now=time.time(), max_age_s=policy.max_laser_age_s,
+                                        max_residual_um=policy.max_residual_um,
+                                        min_correlation=policy.min_correlation)
+            if not good_laser:
+                self._supervision_log(region_id, fov, "laser_unknown", laser=laser.model_dump())
+                if laser.reason and "cleanup_failed" in laser.reason:
+                    self.request_abort_fn()
+                    raise RuntimeError("Laser cleanup failed during supervision recovery")
+                return
+        try:
+            quality = self._supervision_capture(state)
+        except SupervisionOpticalRejection as exc:
+            self._supervision_log(region_id, fov, "monitor_budget_exhausted", reason=str(exc))
+            return
+        self._supervision_checks_by_region[region_id] = self._supervision_checks_by_region.get(region_id, 0) + 1
+        history = self._supervision_histories.setdefault(region_id, TrustedHistory(
+            revision=self._supervision_revision.get(region_id, 0)))
+        if (not history.samples and policy.operator_confirms_reference_focus and
+                not (policy.mode == "quality" and policy.verify_baseline_once) and
+                quality.score is not None):
+            history.seed(fov, quality)
+            self._supervision_log(region_id, fov, "operator_confirmed_seed", score=quality.score)
+        classification, reason = history.classify(fov, quality, policy)
+        self._supervision_log(region_id, fov, "check", quality=classification, reason=reason,
+                              score=quality.score, support=history.support,
+                              bad_check_streak=history.bad_streak, laser=laser.model_dump(),
+                              baseline=history.statistics(time.time(), policy.max_baseline_age_s),
+                              qc=quality.__dict__)
+        if classification == "good":
+            history.record_good(fov, quality, policy)
+        elif reason == "insufficient_trusted_baseline":
+            history.extend_verified_basis(fov, quality, policy)
+        if policy.mode == "monitor":
+            return
+        due = (classification == "poor" or (policy.verify_baseline_once and not history.samples))
+        if not due or self._supervision_attempts.get(region_id, 0) >= policy.max_attempts_per_region:
+            return
+        last = self._supervision_last_attempt_completed.get(region_id)
+        if last is not None and self._supervision_region_completed_total.get(region_id, 0) - last < policy.cooldown_completed_fovs:
+            return
+        if history.samples:
+            if self._supervision_frames_run >= policy.max_frames_per_run:
+                return
+            try:
+                confirmation = self._supervision_capture(state)
+            except SupervisionOpticalRejection as exc:
+                self._supervision_log(region_id, fov, "confirmation_budget_exhausted", reason=str(exc))
+                return
+            confirmed, _ = history.classify(fov, confirmation, policy)
+            if confirmed != "poor":
+                self._supervision_log(region_id, fov, "confirmation_rejected", quality=confirmed)
+                return
+        self._supervision_attempt_correction(region_id, fov, state, history)
+
+    def _run_owned_contrast_scan(self, state, *, capture_only=False, capture_z_um=None,
+                                 max_travel_um=None, max_time_s=None):
         """Drain imaging, run one synchronous scan, then restore camera ownership.
 
         The worker is the sole trigger scheduler here. Raw-arrival IDs remain
@@ -4471,12 +4969,20 @@ class MultiPointWorker:
 
         settings = ContrastAFSettings.model_validate(
             state.contrast_af.model_dump() if state.contrast_af is not None else {"method": "legacy"})
+        if max_time_s is not None:
+            settings = settings.model_copy(update={"max_time_s": min(settings.max_time_s, max_time_s)})
         start = self.stage.get_pos().z_mm * 1000
         axis = self.stage.get_config().Z_AXIS
         physical = sorted((axis.raw_to_canonical(axis.MIN_POSITION) * 1000,
                            axis.raw_to_canonical(axis.MAX_POSITION) * 1000))
         backlash = float(getattr(self.stage, "_BACKLASH_COMPENSATION_DISTANCE_MM", 0)) * 1000
-        if settings.method == "frequency_assisted":
+        if capture_only:
+            target = start if capture_z_um is None else float(capture_z_um)
+            lower = upper = target
+            travel_lower, travel_upper = target - backlash, target + backlash
+            if not physical[0] <= travel_lower <= target <= travel_upper <= physical[1]:
+                raise ValueError("Monitor capture exceeds stage Z limits")
+        elif settings.method == "frequency_assisted":
             _, _, _, lower, upper, increment, travel_lower, travel_upper = (
                 self.autofocusController._resolve_frequency_request(state))
         else:
@@ -4490,6 +4996,9 @@ class MultiPointWorker:
                 # Zero backlash makes the strict inequalities at the ends equal.
                 if not (backlash == 0 and physical[0] <= lower <= start <= upper <= physical[1]):
                     raise ValueError("Legacy autofocus travel exceeds stage Z limits")
+        if max_travel_um is not None and not capture_only:
+            if travel_lower < start - max_travel_um or travel_upper > start + max_travel_um:
+                raise ValueError("Contrast scan window exceeds supervision correction bound")
         metric = FocusMeasureOperator.convert_to_enum(state.focus_measure_operator)
         cancelled = self.abort_requested_fn
         session = StageCaptureSession(
@@ -4514,7 +5023,10 @@ class MultiPointWorker:
                             self._af_expected_raw += 1
                     return session.capture_at(z_um)
 
-                result = run_contrast_search(
+                if capture_only:
+                    result = capture_at(target)
+                else:
+                    result = run_contrast_search(
                     settings=settings,
                     legacy_options={
                         "step_um": self._contrast_af_step_um,
@@ -4533,7 +5045,8 @@ class MultiPointWorker:
                     upper_z_um=upper, increment_um=increment,
                     exposure_ms=session.capture_exposure_ms, metric=metric.value,
                     trigger_route=self._describe_camera_trigger_routing())
-            result.cleanup_errors.extend(session.cleanup_errors)
+            if not capture_only:
+                result.cleanup_errors.extend(session.cleanup_errors)
             with self._af_owner_lock:
                 if self._af_expected_raw != 0:
                     raise RuntimeError("AF raw arrivals did not drain; imaging cannot resume")
@@ -4541,8 +5054,8 @@ class MultiPointWorker:
                 # every trigger. Any surviving IDs were consumed by its private
                 # capture callback and never entered acquisition dispatch.
                 self._af_frame_ids.clear()
-            if result.cleanup_errors:
-                raise RuntimeError("Autofocus cleanup failed: " + "; ".join(result.cleanup_errors))
+            if session.cleanup_errors:
+                raise RuntimeError("Autofocus cleanup failed: " + "; ".join(session.cleanup_errors))
             returned_successfully = True
             return result
         except BaseException as exc:
@@ -4552,11 +5065,12 @@ class MultiPointWorker:
                     "cancelled" if isinstance(exc, InterruptedError) else "hardware_failed",
                     start, settings=settings.model_dump(mode="json"),
                     metric=metric.value, trigger_route=self._describe_camera_trigger_routing())
-            elif not isinstance(exc, InterruptedError):
+            elif not capture_only and not isinstance(exc, InterruptedError):
                 result.status = "hardware_failed"
-            result.error = str(exc)
+            if not capture_only:
+                result.error = str(exc)
             for error in session.cleanup_errors:
-                if error not in result.cleanup_errors:
+                if not capture_only and error not in result.cleanup_errors:
                     result.cleanup_errors.append(error)
             self._last_af_result = result
             raise
@@ -5061,6 +5575,9 @@ class MultiPointWorker:
                 f"Autofocus failed at region={region_id} fov={fov}. Continuing to acquire "
                 f"anyway using the current z position (z={self.stage.get_pos().z_mm} [mm])"
             )
+
+        if self.do_reflection_af and self._supervision_policy.mode != "off":
+            self._supervise_nominal_plane(region_id, fov)
 
         # Laser-AF characterization debug image (unchanged behavior).
         if self.laser_auto_focus_controller and getattr(

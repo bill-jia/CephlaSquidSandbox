@@ -44,6 +44,7 @@ class AcquisitionYAMLData:
     laser_af: bool = False
     contrast_af_state_name: Optional[str] = None
     contrast_af_effective: Optional[Dict] = None
+    contrast_supervision: Optional[Dict] = None
 
     # Wellplate-specific
     scan_size_mm: Optional[float] = None
@@ -153,6 +154,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         laser_af=autofocus.get("laser_af", False),
         contrast_af_state_name=autofocus.get("contrast_af_state_name"),
         contrast_af_effective=autofocus.get("contrast_af_effective"),
+        contrast_supervision=autofocus.get("contrast_supervision"),
         # Wellplate-specific
         scan_size_mm=wellplate_scan.get("scan_size_mm"),
         overlap_percent=overlap,

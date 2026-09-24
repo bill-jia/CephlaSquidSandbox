@@ -389,6 +389,7 @@ def _save_unified_multipoint_acquisition_yaml(
         "autofocus": {
             "contrast_af": params.do_autofocus,
             "laser_af": params.do_reflection_autofocus,
+            "contrast_supervision": _serialize_for_yaml(params.contrast_supervision_policy),
             "contrast_af_state_name": (params.contrast_af_state.name
                                         if params.contrast_af_state is not None else None),
             "contrast_af_effective": (
@@ -581,6 +582,10 @@ class MultiPointController:
         self.contrast_af_state_name = control._def.MULTIPOINT_AUTOFOCUS_CHANNEL
         self.contrast_af_override = None
         self._load_contrast_af_settings_from_cache()
+        from control.models.contrast_autofocus import ContrastSupervisionPolicy
+        self.contrast_supervision_policy = ContrastSupervisionPolicy()
+        self._load_contrast_supervision_policy()
+        self.last_supervision_status = None
         self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
         self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS
         self.experiment_ID = None
@@ -881,6 +886,32 @@ class MultiPointController:
 
     _CONTRAST_AF_SETTINGS_CACHE_PATH = "cache/acquisition_contrast_af.yaml"
 
+    def set_contrast_supervision_policy(self, policy):
+        from control.models.contrast_autofocus import ContrastSupervisionPolicy
+        validated = ContrastSupervisionPolicy.model_validate(policy)
+        self.contrast_supervision_policy = validated
+        self._save_contrast_af_settings_to_cache()
+
+    def restore_supervision_policy_from_acquisition_yaml(self, policy):
+        """Restore persistent controls without replaying a one-time focus attestation."""
+        from control.models.contrast_autofocus import ContrastSupervisionPolicy
+        restored = ContrastSupervisionPolicy.model_validate(policy or {}).model_copy(
+            update={"operator_confirms_reference_focus": False})
+        self.set_contrast_supervision_policy(restored)
+
+    def _load_contrast_supervision_policy(self):
+        from control.models.contrast_autofocus import ContrastSupervisionPolicy
+        try:
+            with open(self._CONTRAST_AF_SETTINGS_CACHE_PATH) as f:
+                data = yaml.safe_load(f) or {}
+            self.contrast_supervision_policy = ContrastSupervisionPolicy.model_validate(
+                data.get("supervision") or {}).model_copy(
+                    update={"operator_confirms_reference_focus": False})
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._log.warning("Failed to read contrast supervision settings: %s", exc)
+
     def set_contrast_af_acquisition_settings(self, state_name, override):
         """Commit a dialog draft without modifying its source observation preset."""
         from control.models.contrast_autofocus import AcquisitionContrastAFOverride
@@ -901,6 +932,9 @@ class MultiPointController:
             with open(path, "w") as f:
                 yaml.safe_dump({
                     "state_name": self.contrast_af_state_name,
+                    "supervision": getattr(self, "contrast_supervision_policy", None).model_copy(
+                        update={"operator_confirms_reference_focus": False}).model_dump(mode="json")
+                    if getattr(self, "contrast_supervision_policy", None) is not None else None,
                     "override": self.contrast_af_override.model_dump(mode="json")
                     if self.contrast_af_override is not None else None,
                 }, f, sort_keys=False)
@@ -1871,7 +1905,15 @@ class MultiPointController:
                 finally:
                     self._stop_per_acquisition_log()
 
-            updated_callbacks = dataclasses.replace(self.callbacks, signal_acquisition_finished=finish_fn)
+            upstream_supervision = self.callbacks.signal_supervision_progress
+
+            def supervision_progress(record):
+                self.last_supervision_status = record
+                upstream_supervision(record)
+
+            updated_callbacks = dataclasses.replace(
+                self.callbacks, signal_acquisition_finished=finish_fn,
+                signal_supervision_progress=supervision_progress)
 
             acquisition_params = self.build_params(scan_position_information=scan_position_information)
 
@@ -1985,6 +2027,10 @@ class MultiPointController:
                 )
                 raise
 
+            if self.contrast_supervision_policy.operator_confirms_reference_focus:
+                self.contrast_supervision_policy = self.contrast_supervision_policy.model_copy(
+                    update={"operator_confirms_reference_focus": False})
+
             # Signal after worker creation so backpressure_controller is available
             self.callbacks.signal_acquisition_start(acquisition_params)
 
@@ -2046,7 +2092,9 @@ class MultiPointController:
             do_autofocus=self.do_autofocus,
             do_reflection_autofocus=self.do_reflection_af,
             contrast_af_state=(self._effective_contrast_af_state()
-                               if self.do_autofocus and not self.do_reflection_af else None),
+                               if (self.do_autofocus and not self.do_reflection_af) or
+                               (self.do_reflection_af and self.contrast_supervision_policy.mode != "off") else None),
+            contrast_supervision_policy=self.contrast_supervision_policy.model_copy(deep=True),
             contrast_af_legacy_step_um=(af_override.legacy_step_um if af_override else self.autofocusController.deltaZ * 1000),
             contrast_af_legacy_count=(af_override.legacy_count if af_override else self.autofocusController.N),
             contrast_af_crop_width=(af_override.crop_width if af_override else self.autofocusController.crop_width),
@@ -2266,7 +2314,12 @@ class MultiPointController:
             self._log.error("Cannot start multipoint acquisition while autofocus is running")
             return False
 
-        if self.do_autofocus and not self.do_reflection_af:
+        if self.contrast_supervision_policy.mode != "off" and not self.do_reflection_af:
+            self._log.error("Contrast supervision requires laser autofocus enabled")
+            return False
+
+        if (self.do_autofocus and not self.do_reflection_af) or (
+                self.do_reflection_af and self.contrast_supervision_policy.mode != "off"):
             af_state = self._effective_contrast_af_state()
             if af_state is None:
                 self._log.error("Contrast autofocus observation state %r is missing",
@@ -2275,10 +2328,17 @@ class MultiPointController:
             if af_state.is_stimulus_only:
                 self._log.error("Contrast autofocus requires an imaging observation state")
                 return False
+            if (self.do_reflection_af and self.contrast_supervision_policy.mode != "off" and
+                    af_state.camera_settings is None):
+                self._log.error("Contrast supervision requires an observation state with explicit camera exposure/gain")
+                return False
             try:
                 from control.models.contrast_autofocus import ContrastAFSettings
                 settings = ContrastAFSettings.model_validate(
                     af_state.contrast_af.model_dump() if af_state.contrast_af is not None else {"method": "legacy"})
+                if (self.do_reflection_af and self.contrast_supervision_policy.mode != "off" and
+                        settings.sensor_full_scale is None):
+                    raise ValueError("Contrast supervision requires an explicit sensor full scale for image QC")
                 control._def.FocusMeasureOperator.convert_to_enum(af_state.focus_measure_operator)
                 if not callable(getattr(self.microscope.camera, "send_trigger", None)):
                     raise ValueError("Camera has no autofocus trigger route")
@@ -2289,7 +2349,9 @@ class MultiPointController:
                     build_pulse_waveform_for_state(
                         af_state, self.microscope.illumination_controller,
                         sample_rate_hz=float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ))
-                if settings.method == "frequency_assisted":
+                if self.do_reflection_af and self.contrast_supervision_policy.mode == "monitor":
+                    pass
+                elif settings.method == "frequency_assisted":
                     self.autofocusController._resolve_frequency_request(af_state)
                 else:
                     override = self.contrast_af_override
@@ -2315,6 +2377,45 @@ class MultiPointController:
                 return False
 
         if self.do_reflection_af:
+            supervision = self.contrast_supervision_policy
+            if supervision.mode != "off":
+                if self.laserAutoFocusController is None or not self.laserAutoFocusController.is_initialized:
+                    self._log.error("Contrast supervision requires initialized laser autofocus")
+                    return False
+                if supervision.mode == "quality":
+                    from control.models.contrast_autofocus import ContrastAFSettings
+                    if getattr(self.laserAutoFocusController, "piezo", None) is not None:
+                        self._log.error("Contrast correction requires stage-only laser AF; piezo laser correction is unsupported")
+                        return False
+                    af_settings = (self._effective_contrast_af_state().contrast_af or
+                                   ContrastAFSettings())
+                    if (af_settings.max_frames + 6 > supervision.max_frames_per_correction or
+                            af_settings.max_time_s > supervision.max_time_s_per_correction or
+                            (af_settings.max_frames + 6) * af_state.exposure_time >
+                            supervision.max_exposure_ms_per_correction):
+                        self._log.error("Contrast search exceeds supervision correction budget")
+                        return False
+                    if af_settings.method == "frequency_assisted":
+                        request = self.autofocusController._resolve_frequency_request(
+                            self._effective_contrast_af_state())
+                        current_um = self.stage.get_pos().z_mm * 1000
+                        if (request[6] < current_um - supervision.max_scan_travel_um or
+                                request[7] > current_um + supervision.max_scan_travel_um):
+                            self._log.error("Contrast search window exceeds supervision correction bound")
+                            return False
+                    else:
+                        step = (self.contrast_af_override.legacy_step_um
+                                if self.contrast_af_override is not None and
+                                self.contrast_af_override.state_name == self.contrast_af_state_name
+                                else self.autofocusController.deltaZ * 1000)
+                        count = (self.contrast_af_override.legacy_count
+                                 if self.contrast_af_override is not None and
+                                 self.contrast_af_override.state_name == self.contrast_af_state_name
+                                 else self.autofocusController.N)
+                        backlash_um = float(getattr(self.stage, "_BACKLASH_COMPENSATION_DISTANCE_MM", 0)) * 1000
+                        if step * max(round(count / 2), count - round(count / 2)) + backlash_um > supervision.max_scan_travel_um:
+                            self._log.error("Legacy scan window exceeds supervision correction bound")
+                            return False
             # Acceptable when a global reference is set (regions without their own
             # reference fall back to it) OR every region carries a per-region
             # reference (no global needed). Otherwise some region would have no
@@ -2330,6 +2431,18 @@ class MultiPointController:
                     "starting acquisition with laser AF enabled."
                 )
                 return False
+            if supervision.mode != "off":
+                global_reference = self.laserAutoFocusController.get_active_reference()
+                for region_id in region_ids:
+                    region_reference = region_refs.get(region_id)
+                    reference = region_reference or global_reference
+                    crop = (reference.reference_crop if reference is not None else None)
+                    if crop is None and global_reference is not None:
+                        crop = global_reference.reference_crop
+                    if (crop is None or crop.size < 9 or not np.all(np.isfinite(crop)) or
+                            float(np.ptp(crop)) <= 0):
+                        self._log.error("Contrast supervision needs a usable laser reference crop for region %s", region_id)
+                        return False
 
         # An AF-only walk never executes imaging/stimulus/postprocessing plans.
         if self.validation_only:

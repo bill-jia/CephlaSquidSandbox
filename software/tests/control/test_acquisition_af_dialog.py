@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from control.models.observation_state import ObservationState
 from control.models.contrast_autofocus import AcquisitionContrastAFOverride, ContrastAFSettings
+from control.models.contrast_autofocus import ContrastSupervisionPolicy
 from gui.widgets.laser_autofocus_settings import LaserAutofocusSettingsDialog
 
 
@@ -20,6 +21,8 @@ def _controller():
         set_reflection_af_flag=MagicMock(), set_laser_af_refresh_every_n_fovs=MagicMock(),
         set_laser_af_seed_mode=MagicMock(), set_laser_af_consistency_threshold_um=MagicMock(),
         set_laser_af_check_last_fov_per_region=MagicMock(), set_laser_af_table_path_audit=MagicMock(),
+        contrast_supervision_policy=ContrastSupervisionPolicy(),
+        set_contrast_supervision_policy=MagicMock(),
     )
 
 
@@ -99,3 +102,25 @@ def test_window_close_discards_laser_and_contrast_draft(qtbot):
     controller.set_contrast_af_acquisition_settings.assert_not_called()
     controller.set_af_flag.assert_not_called()
     controller.set_reflection_af_flag.assert_not_called()
+
+
+def test_combined_mode_commits_only_on_ok(qtbot):
+    controller = _controller()
+    controller.laserAutoFocusController = object()
+    dialog = LaserAutofocusSettingsDialog(controller)
+    qtbot.addWidget(dialog)
+    dialog.cb_enabled.setChecked(True)
+    dialog.supervision_mode.setCurrentIndex(dialog.supervision_mode.findData("quality"))
+    dialog.supervision_inputs["every_n_completed_fovs"].setValue(3)
+    dialog.reject()
+    controller.set_contrast_supervision_policy.assert_not_called()
+
+    dialog = LaserAutofocusSettingsDialog(controller)
+    qtbot.addWidget(dialog)
+    dialog.cb_enabled.setChecked(True)
+    dialog.supervision_mode.setCurrentIndex(dialog.supervision_mode.findData("quality"))
+    dialog.supervision_inputs["every_n_completed_fovs"].setValue(3)
+    dialog.accept()
+    accepted = controller.set_contrast_supervision_policy.call_args.args[0]
+    assert accepted.mode == "quality"
+    assert accepted.every_n_completed_fovs == 3

@@ -5226,6 +5226,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # Autofocus
             self.multipointController.restore_contrast_af_from_acquisition_yaml(
                 yaml_data.contrast_af_state_name, yaml_data.contrast_af_effective)
+            self.multipointController.restore_supervision_policy_from_acquisition_yaml(yaml_data.contrast_supervision)
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
@@ -7522,6 +7523,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # Autofocus
             self.multipointController.restore_contrast_af_from_acquisition_yaml(
                 yaml_data.contrast_af_state_name, yaml_data.contrast_af_effective)
+            self.multipointController.restore_supervision_policy_from_acquisition_yaml(yaml_data.contrast_supervision)
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
