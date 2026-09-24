@@ -1784,6 +1784,9 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
     Only the dry-run flag travels in the file (``acquisition.skip_saving``); the format
     itself is not recorded, so a normal run just brings the combo back out of dry run.
     """
+    validation_checkbox = getattr(widget, "checkbox_afValidation", None)
+    if validation_checkbox is not None:
+        validation_checkbox.setChecked(yaml_data.validation_mode)
     combo = widget.combobox_fileSavingFormat
     if yaml_data.skip_saving:
         combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
@@ -2136,6 +2139,11 @@ def _refresh_size_estimate(widget) -> None:
     """
     label = getattr(widget, "label_size_estimate", None)
     if label is None:
+        return
+    validation_checkbox = getattr(widget, "checkbox_afValidation", None)
+    if validation_checkbox is not None and validation_checkbox.isChecked():
+        label.setText("AF validation: diagnostics only; size depends on failures")
+        label.setToolTip("No channel images. AF frames and metadata are saved in af_validation.")
         return
     widget._push_channel_selection_to_controller()
     plan_error = getattr(widget.multipointController, "plan_error", None)
@@ -3518,6 +3526,15 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_afValidation.setToolTip(
+            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
+            "in the experiment's af_validation folder."
+        )
+        self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
+
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
@@ -3749,6 +3766,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
 
@@ -4312,13 +4330,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # flexible and wellplate tabs each have their own combo/row bound
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
+            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
             self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
@@ -4327,19 +4346,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # "start without streaming" here disables the upload target, and
             # the space check must then be evaluated against full local
             # retention rather than the streaming per-timepoint discount.
-            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if _is_dry_run(self.combobox_fileSavingFormat):
+            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if not check_ram_available_with_error_dialog(
+            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
@@ -4978,6 +4997,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
+        self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
         self._push_channel_selection_to_controller()
@@ -5538,6 +5558,15 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_afValidation.setToolTip(
+            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
+            "in the experiment's af_validation folder."
+        )
+        self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
+
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
         )
@@ -5789,6 +5818,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
 
@@ -6866,32 +6896,33 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # Re-push THIS tab's visible save-format + streaming state (the
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
+            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
             self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
             # Probe the streaming target BEFORE the disk-space check (see the
             # flexible widget's start flow for the rationale).
-            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 return
 
-            if _is_dry_run(self.combobox_fileSavingFormat):
+            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 return
 
-            if not check_ram_available_with_error_dialog(
+            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self.btn_startAcquisition.setChecked(False)
@@ -7026,6 +7057,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.base_path_is_set = True
 
     def on_snap_images(self):
+        self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
         self._push_channel_selection_to_controller()
@@ -7818,6 +7850,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
                 self.checkbox_retractZBetweenRegions.isChecked()
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
+            self.multipointController.set_validation_mode(False)
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)

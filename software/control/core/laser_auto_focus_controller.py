@@ -45,6 +45,10 @@ SIMULATION_PIXEL_TO_UM = 0.4
 DEBUG_IMAGE_KEEP = 20
 
 
+class AFValidationRestoreError(TimeoutError):
+    """A diagnostic snapshot could not restore the focus camera or laser."""
+
+
 class LaserAutofocusController(QObject):
     image_to_display = Signal(np.ndarray)
     signal_displacement_um = Signal(float)
@@ -85,6 +89,8 @@ class LaserAutofocusController(QObject):
         self.spot_spacing_pixels = None  # spacing between the spots from the two interfaces (unit: pixel)
 
         self.image = None  # for saving the focus camera image for debugging when centroid cannot be found
+        self._validation_records = None
+        self._validation_current = None
 
         # Optional TimingManager for fine-grained profiling of move_to_target and
         # its sub-steps. None means timers are no-ops. MultiPointWorker attaches
@@ -154,6 +160,61 @@ class LaserAutofocusController(QObject):
             return contextlib.nullcontext()
         return self._timing.get_timer(name)
 
+    @contextlib.contextmanager
+    def collect_validation_event(self):
+        """Collect operation results and frame evidence for one FOV visit."""
+        previous = self._validation_records, self._validation_current
+        records = []
+        self._validation_records, self._validation_current = records, None
+        try:
+            yield records
+        finally:
+            self._validation_records, self._validation_current = previous
+
+    @contextlib.contextmanager
+    def _validation_operation(self, kind):
+        if self._validation_records is None:
+            yield
+            return
+        previous = self._validation_current
+        props = self.laser_af_properties
+        record = {
+            "kind": kind, "success": False, "failure_reason": None,
+            "timestamp": time.time(), "displacement_um": None, "correlation": None,
+            "z_before_mm": self.stage.get_pos().z_mm,
+            "piezo_before_um": self.piezo.position if self.piezo is not None else None,
+            "config": props.model_dump(mode="json", exclude={
+                "reference_image", "reference_image_shape", "reference_image_dtype",
+            }),
+            "reference_crop": None if self.reference_crop is None else self.reference_crop.copy(),
+            "frame": None, "rejected_frames": [], "measurements": [], "warning": None,
+        }
+        self._validation_current = record
+        try:
+            yield
+        except BaseException as exc:
+            record["failure_reason"] = f"exception: {type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record["z_after_mm"] = self.stage.get_pos().z_mm
+            record["piezo_after_um"] = self.piezo.position if self.piezo is not None else None
+            self._validation_records.append(record)
+            self._validation_current = previous
+
+    def _validation_update(self, **values):
+        if self._validation_current is not None:
+            self._validation_current.update(values)
+
+    def _validation_result(self, success, reason=None):
+        self._validation_update(success=bool(success), failure_reason=reason)
+        return success
+
+    def _validation_reject(self, frame, reason, **details):
+        if self._validation_current is not None:
+            self._validation_current["rejected_frames"].append(
+                (None if frame is None else frame.copy(), {"reason": reason, **details})
+            )
+
     def turn_on_AF_laser(self):
         """Turn on the AF laser via IO endpoint or direct MCU call."""
         with self._time("af:turn_on_AF_laser"):
@@ -178,6 +239,7 @@ class LaserAutofocusController(QObject):
                     return
                 except TimeoutError:
                     if attempt:
+                        self._validation_update(warning="AF laser shutdown timed out twice")
                         self._log.error("AF laser shutdown timed out twice; laser state is unknown.")
                         raise
                     self._log.warning("AF laser shutdown timed out; retrying once.")
@@ -502,16 +564,19 @@ class LaserAutofocusController(QObject):
         Returns:
             float: Displacement in micrometers, or float('nan') if measurement fails
         """
-        with self._time("af:measure_displacement"):
+        with self._validation_operation("measurement"), self._time("af:measure_displacement"):
             try:
                 self.turn_on_AF_laser()
             except TimeoutError:
                 self._log.exception("Turning on AF laser timed out, failed to measure displacement.")
                 self.signal_displacement_um.emit(float("nan"))
+                self._validation_update(failure_reason="laser_on_timeout")
                 return float("nan")
 
             try:
-                return self._measure_displacement_with_laser_on()
+                value = self._measure_displacement_with_laser_on()
+                self._validation_result(math.isfinite(value), None if math.isfinite(value) else "measurement_nan")
+                return value
             finally:
                 try:
                     self.turn_off_AF_laser()
@@ -529,6 +594,12 @@ class LaserAutofocusController(QObject):
         """
 
         def finish_with(um: float) -> float:
+            self._validation_update(displacement_um=float(um))
+            if self._validation_current is not None:
+                self._validation_current["measurements"].append({
+                    "displacement_um": float(um), "z_mm": self.stage.get_pos().z_mm,
+                    "piezo_um": self.piezo.position if self.piezo is not None else None,
+                })
             self.signal_displacement_um.emit(um)
             return um
 
@@ -564,17 +635,17 @@ class LaserAutofocusController(QObject):
         Returns:
             bool: True if move was successful, False if measurement failed or displacement was out of range
         """
-        with self._time("af:move_to_target"):
+        with self._validation_operation("correction"), self._time("af:move_to_target"):
             props = self.laser_af_properties
             if not props.has_reference:
                 self._log.warning("Cannot move to target - reference not set")
-                return False
+                return self._validation_result(False, "no_reference")
 
             try:
                 self.turn_on_AF_laser()
             except TimeoutError:
                 self._log.exception("Turning on AF laser timed out, cannot move to target.")
-                return False
+                return self._validation_result(False, "laser_on_timeout")
 
             total_moved_um = 0.0
             try:
@@ -583,13 +654,13 @@ class LaserAutofocusController(QObject):
 
                 if math.isnan(current_um):
                     self._log.error("Cannot move to target: failed to measure current displacement")
-                    return False
+                    return self._validation_result(False, "measurement_nan")
 
                 if abs(current_um) > props.laser_af_range:
                     self._log.warning(
                         f"Measured displacement ({current_um:.1f} μm) is unreasonably large, using previous z position"
                     )
-                    return False
+                    return self._validation_result(False, "displacement_out_of_range")
 
                 window_um = max(props.displacement_success_window_um, 1e-3)
                 iterations = 0
@@ -606,7 +677,7 @@ class LaserAutofocusController(QObject):
                             f"(iteration {iterations}); rolling back to the starting z"
                         )
                         self._rollback_z(total_moved_um)
-                        return False
+                        return self._validation_result(False, "spot_lost_after_move")
 
                     # A correction that doesn't shrink the residual (beyond noise)
                     # means the configured scale doesn't match the spot's response.
@@ -625,7 +696,7 @@ class LaserAutofocusController(QObject):
                             f"≈{implied_scale:.4f} μm/px) — recalibrate the laser AF. Rolling back to the starting z."
                         )
                         self._rollback_z(total_moved_um)
-                        return False
+                        return self._validation_result(False, "correction_diverged")
 
                     current_um = new_um
 
@@ -646,19 +717,20 @@ class LaserAutofocusController(QObject):
                     if not isinstance(exc, Exception):
                         raise
                     self._log.exception("Laser AF verification raised; restored starting Z.")
-                    return False
+                    return self._validation_result(False, "verify_exception")
+                self._validation_update(correlation=float(correlation))
                 self.signal_cross_correlation.emit(correlation)
                 if not cc_result:
                     self._log.warning("Cross correlation check failed - spots not well aligned")
                     # move back to the starting position
                     self._rollback_z(total_moved_um)
-                    return False
+                    return self._validation_result(False, "verify_failed")
 
                 self._log.debug(
                     f"Moved to target: displacement {current_um:.2f} μm (target {target_um:.2f} μm) "
                     f"after {iterations} correction(s)"
                 )
-                return True
+                return self._validation_result(True)
             finally:
                 try:
                     self.turn_off_AF_laser()
@@ -992,13 +1064,20 @@ class LaserAutofocusController(QObject):
         try:
             with self._time("af:spot_centroid_loop"):
                 for i in range(n_frames):
+                    image = None
                     try:
                         with self._time("af:spot_centroid_loop:get_frame"):
                             image = self.get_new_frame()
                         if image is None:
                             self._log.warning(f"Failed to read frame {i + 1}/{n_frames}")
+                            self._validation_reject(None, "read_failed", frame_index=i)
                             continue
                         self.image = image  # store for debugging and cross-correlation checks
+                        if self._validation_current is not None:
+                            self._validation_update(
+                                frame=image.copy(), frame_z_mm=self.stage.get_pos().z_mm,
+                                frame_piezo_um=self.piezo.position if self.piezo is not None else None,
+                            )
 
                         with self._time("af:spot_centroid_loop:calculations"):
                             full_height, full_width = image.shape[:2]
@@ -1031,6 +1110,7 @@ class LaserAutofocusController(QObject):
                                 )
                             if result is None:
                                 self._log.warning(f"No spot detected in frame {i + 1}/{n_frames}")
+                                self._validation_reject(self.image, "no_spot", frame_index=i)
                                 continue
 
                             if use_center_crop is not None:
@@ -1046,6 +1126,7 @@ class LaserAutofocusController(QObject):
 
                     except Exception as e:
                         self._log.error(f"Error processing frame {i + 1}/{n_frames}: {str(e)}")
+                        self._validation_reject(image, "detection_exception", frame_index=i, error=str(e))
                         continue
         finally:
             self.camera.enable_callbacks(callbacks_were_enabled)
@@ -1096,6 +1177,48 @@ class LaserAutofocusController(QObject):
                 os.remove(os.path.join(directory, old))
         except Exception:
             self._log.exception("Failed to save laser AF debug image")
+
+    def capture_validation_frame(self) -> Optional[np.ndarray]:
+        """Take a fresh full-sensor snapshot and restore actual camera state.
+
+        Snapshot failures leave metadata/native AF frames available. Restoration
+        failure aborts the run: subsequent AF must not use an incorrect ROI.
+        """
+        camera = self.camera
+        saved_roi = camera.get_region_of_interest()
+        was_streaming = camera.get_is_streaming()
+        callbacks_enabled = camera.get_callbacks_enabled()
+        try:
+            camera.enable_callbacks(False)
+            camera.stop_streaming()
+            width, height = camera.get_resolution()
+            camera.set_region_of_interest(0, 0, width, height)
+            camera.start_streaming()
+            self.turn_on_AF_laser()
+            frame = self.get_new_frame()
+            return None if frame is None else frame.copy()
+        except Exception:
+            self._log.exception("Full-sensor AF snapshot failed; preserving native AF evidence.")
+            return None
+        finally:
+            # Try each cleanup even if an earlier cleanup failed.
+            errors = []
+            actions = [
+                self.turn_off_AF_laser,
+                camera.stop_streaming,
+                lambda: camera.set_region_of_interest(*saved_roi),
+                lambda: camera.enable_callbacks(callbacks_enabled),
+            ]
+            if was_streaming:
+                actions.append(camera.start_streaming)
+            for action in actions:
+                try:
+                    action()
+                except BaseException as exc:
+                    errors.append(exc)
+                    self._log.error("AF snapshot cleanup failed: %s", exc)
+            if errors:
+                raise AFValidationRestoreError("Could not restore focus camera/laser after validation snapshot") from errors[0]
 
     def get_image(self) -> Optional[np.ndarray]:
         """Capture and display a single image from the laser autofocus camera.
