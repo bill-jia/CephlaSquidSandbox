@@ -883,10 +883,15 @@ class TucsenCamera(AbstractCamera):
         here so the worker can start the next capture in parallel with the
         still-running decode + job dispatch for this frame.
         """
-        self._frame_arrived_callbacks.append(fn)
+        if fn not in self._frame_arrived_callbacks:
+            self._frame_arrived_callbacks.append(fn)
+
+    def remove_frame_arrived_callback(self, fn: Callable[[int], None]) -> None:
+        """Unregister a raw-arrival listener when its acquisition ends."""
+        self._frame_arrived_callbacks = [cb for cb in self._frame_arrived_callbacks if cb != fn]
 
     def _fire_frame_arrived_callbacks(self, frame_id: int) -> None:
-        for cb in self._frame_arrived_callbacks:
+        for cb in tuple(self._frame_arrived_callbacks):
             try:
                 cb(frame_id)
             except Exception:

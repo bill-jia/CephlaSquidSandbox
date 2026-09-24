@@ -91,6 +91,7 @@ def test_diagnostics_do_not_change_correction_and_reset_each_operation():
 def test_rejected_frames_survive_subsequent_verification_measurements():
     controller, stage, camera = controller_fixture()
     render = camera._render
+    controller._validation_boundary = MagicMock()  # isolate centroid rejection from diagnostic captures
     images = [np.zeros_like(render())]
     camera._render = lambda: images.pop() if images else render()
     with controller.collect_validation_event() as records:
@@ -184,6 +185,7 @@ def make_worker(tmp_path):
     worker.stage = stage
     worker.do_reflection_af, worker.do_autofocus = True, False
     worker.use_piezo = False
+    worker._supervision_policy = SimpleNamespace(mode="off")
     worker.Nt, worker.NZ, worker.time_point, worker.af_fov_count = 2, 3, 0, 0
     worker._log = MagicMock()
     worker._timing = SimpleNamespace(get_timer=lambda *args: nullcontext())
@@ -303,10 +305,10 @@ def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled, with_imaging)
 def test_fatal_af_error_records_evidence_without_another_camera_call(tmp_path):
     worker, controller, _ = make_worker(tmp_path)
     controller.get_new_frame = MagicMock(side_effect=KeyboardInterrupt("SDK stopped"))
-    controller.capture_validation_frame = MagicMock(side_effect=AssertionError("no snapshot after fatal error"))
+    controller.capture_validation_frame = MagicMock(return_value=np.ones((8, 8), dtype=np.uint8))
     with pytest.raises(KeyboardInterrupt):
         worker.acquire_at_position("R0", str(tmp_path), 0)
-    controller.capture_validation_frame.assert_not_called()
+    assert controller.capture_validation_frame.call_count == 2  # before only; none after fatal AF
     event = rows(tmp_path)[0]
     assert event["af_success"] == "False"
     assert "KeyboardInterrupt" in event["failure_reason"]
@@ -315,12 +317,14 @@ def test_fatal_af_error_records_evidence_without_another_camera_call(tmp_path):
 
 def test_fatal_snapshot_error_preserves_completed_af_result(tmp_path):
     worker, controller, _ = make_worker(tmp_path)
-    controller.capture_validation_frame = MagicMock(side_effect=KeyboardInterrupt("SDK stopped"))
+    controller.capture_validation_frame = MagicMock(side_effect=[
+        np.ones((8, 8), dtype=np.uint8), np.ones((8, 8), dtype=np.uint8), KeyboardInterrupt("SDK stopped"),
+    ])
     with pytest.raises(KeyboardInterrupt):
         worker.acquire_at_position("R0", str(tmp_path), 0)
     event = rows(tmp_path)[0]
     assert event["af_success"] == "True"
-    assert "Fatal snapshot error" in event["snapshot_error"]
+    assert "KeyboardInterrupt" in event["boundary_error"]
 
 
 def test_save_all_retains_each_success_and_table_metadata(tmp_path):
@@ -397,6 +401,11 @@ def test_build_params_retains_imaging_plan_and_save_settings_only_in_imaging_mod
     controller.timestamp_acquisition_started = 0.0
     controller.do_reflection_af = True
     controller.set_validation_mode(True, with_imaging=imaging)
+    controller.contrast_af_override = None
+    controller.contrast_supervision_policy = MagicMock(mode="off")
+    controller.autofocusController = SimpleNamespace(
+        deltaZ=0.001, N=5, crop_width=256, crop_height=256, use_focus_map=False, focus_map_coords=[],
+    )
     controller.zarr_upload_enabled = True
     plan = RegionPlan.from_events(_index_events([("state", ("BF", True))]))
     controller._build_region_plans = MagicMock(return_value=(plan, {}))

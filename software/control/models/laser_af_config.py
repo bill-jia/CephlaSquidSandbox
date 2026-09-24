@@ -69,7 +69,7 @@ class LaserAFConfig(BaseModel):
     filter_sigma: Optional[float] = Field(None, description="Gaussian filter sigma (-1 to disable)")
 
     # Camera settings
-    focus_camera_exposure_time_ms: float = Field(0.2, description="Focus camera exposure time in ms")
+    focus_camera_exposure_time_ms: float = Field(0.8, description="Focus camera exposure time in ms")
     focus_camera_analog_gain: float = Field(0.0, description="Focus camera analog gain")
 
     # Reference image (base64 encoded)

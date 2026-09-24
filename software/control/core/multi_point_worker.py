@@ -1374,6 +1374,7 @@ class MultiPointWorker:
         # the info when dispatching jobs). Without this, deferred decode
         # would read the NEXT capture's info instead of its own.
         self._pending_capture_info_by_frame_id: Dict[int, CaptureInfo] = {}
+        self._acquisition_callbacks_active = False
         # Raw arrivals are assigned to the AF session before Tucsen's deferred
         # decode can call application callbacks.  A timed-out AF trigger never
         # releases this ownership into a resumed imaging run.
@@ -2198,22 +2199,7 @@ class MultiPointWorker:
                 self._seed_camera_for_first_observation_state()
                 self.camera.start_streaming()
                 # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
-                this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
-                # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
-                # soon as raw bytes arrive, before decode. Snapshots capture_info
-                # and signals _ready_for_next_trigger so the worker can issue the
-                # next trigger in parallel with the still-running decode. Cameras
-                # without this API fall back to the synchronous path inside
-                # _image_callback.
-                # Check the class, not the instance: SimulatedCamera's __getattr__ shim
-                # fabricates a truthy placeholder for any unknown *public* attribute
-                # (so unimplemented SDK methods can be called harmlessly), which makes
-                # instance-level hasattr() always True even though it doesn't actually
-                # support the deferred-decode callback. Checking the type bypasses that
-                # shim and reflects whether the method is genuinely implemented.
-                self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
-                if self._use_deferred_decode_callback:
-                    self.camera.add_frame_arrived_callback(self._on_frame_arrived)
+                this_image_callback_id = self._register_acquisition_frame_callbacks()
             sleep_time = min(self.dt / 20.0, 0.5)
 
             # Send Slack acquisition start notification
@@ -2361,20 +2347,22 @@ class MultiPointWorker:
             obs_controller._timing = None
             if laser_af is not None:
                 laser_af._timing = None
-            if this_image_callback_id:
+            self._acquisition_callbacks_active = False
+            if this_image_callback_id is not None:
                 # Guard each SDK call: a raising/wedging camera teardown here
                 # used to skip _finish_jobs entirely — no writer finalize, no
                 # upload-drainer handoff, GUI stuck "Finalizing…".
                 try:
                     self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
-                except Exception:
+                except (Exception, CameraTimeoutError):
                     self._log.exception("camera.stop_streaming failed at end of acquisition")
-                try:
-                    self.camera.remove_frame_callback(this_image_callback_id)
-                except Exception:
-                    self._log.exception("camera.remove_frame_callback failed at end of acquisition")
+                finally:
+                    self._detach_acquisition_frame_callbacks(this_image_callback_id)
 
-            self._finish_jobs()
+            try:
+                self._finish_jobs()
+            finally:
+                self._finalize_af_validation()
 
             # Send Slack acquisition finished notification via callback (ensures ordering with timepoint notifications)
             if self._slack_notifier is not None:
@@ -5332,6 +5320,8 @@ class MultiPointWorker:
         try:
             with self._timing.get_timer("af:table_path_audit_full_af"):
                 corrected = bool(controller.move_to_target(0))
+        except AFValidationRestoreError:
+            raise
         except Exception:
             self._log.exception(
                 f"Table-path audit: move_to_target raised at region={region_id} fov={fov}"
@@ -5356,6 +5346,8 @@ class MultiPointWorker:
         try:
             with self._timing.get_timer(f"af:table_path_audit_disp_{phase}"):
                 result["displacement_um"] = float(controller.measure_displacement())
+        except AFValidationRestoreError:
+            raise
         except Exception:
             self._log.exception(
                 f"Table-path audit ({phase}): measure_displacement raised at region={region_id} fov={fov}"
@@ -5366,6 +5358,8 @@ class MultiPointWorker:
                     cc_ok, correlation = controller._verify_spot_alignment()
                 result["correlation"] = float(correlation) if correlation is not None else float("nan")
                 result["cc_ok"] = bool(cc_ok)
+            except AFValidationRestoreError:
+                raise
             except Exception:
                 self._log.exception(
                     f"Table-path audit ({phase}): _verify_spot_alignment raised at region={region_id} fov={fov}"
@@ -5414,6 +5408,8 @@ class MultiPointWorker:
         try:
             with self._timing.get_timer("af:last_fov_check"):
                 displacement_um = controller.measure_displacement()
+        except AFValidationRestoreError:
+            raise
         except Exception:
             self._log.exception(
                 f"Last-FOV laser-AF check raised at region={region_id} fov={fov}"
@@ -5449,6 +5445,8 @@ class MultiPointWorker:
         measured_ok = False
         try:
             measured_ok = self.laser_auto_focus_controller.move_to_target(0)
+        except AFValidationRestoreError:
+            raise
         except Exception as e:
             # Best-effort debug image — the per-timepoint folder may not exist
             # (ZARR_V3 mode), and a raise here would skip the status/counter
@@ -5620,7 +5618,7 @@ class MultiPointWorker:
             try:
                 yield
             except BaseException as exc:
-                if not isinstance(exc, Exception):
+                if not isinstance(exc, Exception) or isinstance(exc, AFValidationRestoreError):
                     fatal_error = str(exc)
                 raise
             finally:
@@ -5657,6 +5655,7 @@ class MultiPointWorker:
                     "warning": getattr(self, "_last_af_validation_warning", None) if phase == "acquisition" else None,
                 }
                 try:
+                    recorded = []
                     for operation in operations or [None]:
                         row = dict(metadata)
                         if operation is not None and operation.get("warning"):
@@ -5665,12 +5664,30 @@ class MultiPointWorker:
                             displacement = operation["displacement_um"]
                             if displacement is not None and abs(displacement) > self._laser_af_consistency_threshold_um:
                                 row["warning"] = f"Measured displacement {displacement:.1f} um exceeds consistency threshold"
-                        collector.record(row, operation, snapshot)
+                        recorded.append(collector.record(row, operation, snapshot))
+                    collector.link_visit(recorded)
                 except Exception:
                     self._log.exception("Could not save AF validation evidence")
                     self.request_abort_fn()
                 if restore_error is not None:
                     raise restore_error
+
+    def _finalize_af_validation(self):
+        collector = getattr(self, "_af_validator", None)
+        if collector is not None:
+            try:
+                collector.finalize()
+            except Exception:
+                self._log.exception("Could not compile AF validation reports; per-event artifacts remain available")
+
+    def _record_validation_image(self, image, info):
+        collector = getattr(self, "_af_validator", None)
+        if collector is not None and getattr(self, "validation_with_imaging", False):
+            try:
+                collector.record_image(image, info)
+            except Exception:
+                self._log.exception("Could not record validation data-image sharpness")
+                self.request_abort_fn()
 
     def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status, region_id=None):
         """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
@@ -5777,6 +5794,34 @@ class MultiPointWorker:
             self.wait_till_operation_is_completed()
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
+    def _register_acquisition_frame_callbacks(self):
+        """Own both decoded-frame and raw-arrival subscriptions for this run."""
+        # Check the class: simulation cameras may fabricate instance attributes.
+        self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
+        self._acquisition_callbacks_active = True
+        callback_id = None
+        try:
+            callback_id = self.camera.add_frame_callback(self._image_callback)
+            if self._use_deferred_decode_callback:
+                self.camera.add_frame_arrived_callback(self._on_frame_arrived)
+            return callback_id
+        except BaseException:
+            self._detach_acquisition_frame_callbacks(callback_id)
+            raise
+
+    def _detach_acquisition_frame_callbacks(self, callback_id):
+        self._acquisition_callbacks_active = False
+        if self._use_deferred_decode_callback:
+            try:
+                self.camera.remove_frame_arrived_callback(self._on_frame_arrived)
+            except Exception:
+                self._log.exception("camera.remove_frame_arrived_callback failed at end of acquisition")
+        if callback_id is not None:
+            try:
+                self.camera.remove_frame_callback(callback_id)
+            except Exception:
+                self._log.exception("camera.remove_frame_callback failed at end of acquisition")
+
     def _on_frame_arrived(self, frame_id: int) -> None:
         """Fired on the camera's delivery thread the moment raw bytes arrive,
         BEFORE decode. Runs once per frame and must stay fast — it's on the
@@ -5795,6 +5840,8 @@ class MultiPointWorker:
           * Set _ready_for_next_trigger so the worker can proceed to the next
             capture while this frame's decode + dispatch continue in parallel.
         """
+        if not getattr(self, "_acquisition_callbacks_active", True):
+            return  # A delivery may have snapshotted this callback before removal.
         with self._af_owner_lock:
             if self._af_session_active:
                 self._af_frame_ids.add(frame_id)
@@ -5821,6 +5868,8 @@ class MultiPointWorker:
         self._capture_ts["ic_event_set"] = time.perf_counter()
 
     def _image_callback(self, camera_frame: CameraFrame):
+        if not getattr(self, "_acquisition_callbacks_active", True):
+            return
         with self._af_owner_lock:
             if camera_frame.frame_id in self._af_frame_ids:
                 self._af_frame_ids.discard(camera_frame.frame_id)
@@ -5877,6 +5926,7 @@ class MultiPointWorker:
                 # Increment image counter for Slack notification stats
                 self._timepoint_image_count += 1
                 self.image_count += 1
+                self._record_validation_image(image, info)
 
                 with self._timing.get_timer("job creation and dispatch"):
                     # Wait for subprocess to be ready before first dispatch.

@@ -194,16 +194,41 @@ class LaserAutofocusController(QObject):
             "frame": None, "frames": [], "rejected_frames": [], "measurements": [], "warning": None,
         }
         self._validation_current = record
+        fatal = False
         try:
+            self._validation_boundary(record, "before")
             yield
         except BaseException as exc:
+            fatal = not isinstance(exc, Exception) or isinstance(exc, AFValidationRestoreError)
             record["failure_reason"] = f"exception: {type(exc).__name__}: {exc}"
             raise
         finally:
-            record["z_after_mm"] = self.stage.get_pos().z_mm
-            record["piezo_after_um"] = self.piezo.position if self.piezo is not None else None
-            self._validation_records.append(record)
-            self._validation_current = previous
+            try:
+                record["z_after_mm"] = self.stage.get_pos().z_mm
+                record["piezo_after_um"] = self.piezo.position if self.piezo is not None else None
+                if not fatal:
+                    self._validation_boundary(record, "after")
+            finally:
+                self._validation_records.append(record)
+                self._validation_current = previous
+
+    def _validation_boundary(self, record, prefix):
+        """Fresh diagnostic frames before any correction, or after its rollback/cleanup."""
+        details = {
+            "timestamp": time.time(), "z_mm": self.stage.get_pos().z_mm,
+            "piezo_um": self.piezo.position if self.piezo is not None else None,
+            "roi": list(self.camera.get_region_of_interest()),
+        }
+        record[prefix + "_metadata"] = details
+        try:
+            record[prefix + "_native"] = self.capture_validation_frame(full_sensor=False)
+            record[prefix + "_full_sensor"] = self.capture_validation_frame()
+            details["native_available"] = record[prefix + "_native"] is not None
+            details["full_sensor_available"] = record[prefix + "_full_sensor"] is not None
+        except BaseException as exc:
+            details["error"] = f"{type(exc).__name__}: {exc}"
+            record["boundary_error"] = details["error"]
+            raise
 
     def _validation_update(self, **values):
         if self._validation_current is not None:
@@ -1249,8 +1274,8 @@ class LaserAutofocusController(QObject):
         except Exception:
             self._log.exception("Failed to save laser AF debug image")
 
-    def capture_validation_frame(self) -> Optional[np.ndarray]:
-        """Take a fresh full-sensor snapshot and restore actual camera state.
+    def capture_validation_frame(self, full_sensor=True) -> Optional[np.ndarray]:
+        """Take a fresh native-ROI or full-sensor snapshot and restore camera state.
 
         Snapshot failures leave metadata/native AF frames available. Restoration
         failure aborts the run: subsequent AF must not use an incorrect ROI.
@@ -1262,8 +1287,9 @@ class LaserAutofocusController(QObject):
         try:
             camera.enable_callbacks(False)
             camera.stop_streaming()
-            width, height = camera.get_resolution()
-            camera.set_region_of_interest(0, 0, width, height)
+            if full_sensor:
+                width, height = camera.get_resolution()
+                camera.set_region_of_interest(0, 0, width, height)
             camera.start_streaming()
             self.turn_on_AF_laser()
             frame = self.get_new_frame()
