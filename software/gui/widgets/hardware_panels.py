@@ -3027,33 +3027,8 @@ class AutoFocusWidget(QFrame):
         method_row.addWidget(self.af_method)
         self.grid.addLayout(method_row)
         self.grid.addWidget(QLabel("Advanced settings: Tools → Contrast AF Tuning."))
-        self.af_inputs = {}
-        for field, label, maximum, decimals in (
-            ("coarse_step_um", "Coarse step (µm)", 10000, 3),
-            ("medium_step_um", "Medium step (µm)", 10000, 3),
-            ("fine_step_um", "Fine step (µm)", 10000, 3),
-            ("window_below_um", "Window below current Z (µm)", 100000, 3),
-            ("window_above_um", "Window above current Z (µm)", 100000, 3),
-            ("energy_threshold", "E threshold T (unvalidated)", 1, 3),
-            ("energy_margin", "E margin", 1000000000, 3),
-            ("sensor_full_scale", "Sensor full scale (encoded counts)", 65535, 0),
-            ("max_time_s", "Time budget (s)", 3600, 1),
-            ("max_exposure_ms", "Exposure budget (ms)", 1000000, 1),
-            ("verification_tolerance", "Verify tolerance (fraction)", 1, 3),
-        ):
-            box = QDoubleSpinBox()
-            box.setRange(0, maximum)
-            box.setDecimals(decimals)
-            box.setKeyboardTracking(False)
-            tuning_form.addRow(label, box)
-            self.af_inputs[field] = box
-            box.valueChanged.connect(self._settings_changed)
-        for field, label in (("max_frames", "Frame budget"), ("max_moves", "Move budget")):
-            box = QSpinBox()
-            box.setRange(5, 10000)
-            tuning_form.addRow(label, box)
-            self.af_inputs[field] = box
-            box.valueChanged.connect(self._settings_changed)
+        from gui.widgets.contrast_af_editor import add_phase1_fields
+        self.af_inputs = add_phase1_fields(tuning_form, self._settings_changed)
         self.af_fallback = QCheckBox("Allow one dense fallback")
         tuning_form.addRow(self.af_fallback)
         self.af_fallback.toggled.connect(self._settings_changed)
@@ -3084,16 +3059,13 @@ class AutoFocusWidget(QFrame):
 
     def _validated_settings(self):
         """Validate the displayed values without changing the active state."""
-        from control.models.contrast_autofocus import ContrastAFSettings
+        from gui.widgets.contrast_af_editor import validated_settings
         method = self.af_method.currentData()
         if method == "legacy":
             self.af_interval.setText("Legacy scan")
-            return ContrastAFSettings(method="legacy")
-        values = {name: box.value() for name, box in self.af_inputs.items()}
-        values["method"] = method
-        values["dense_fallback"] = self.af_fallback.isChecked()
+            return validated_settings(self.af_inputs, method, self.af_fallback.isChecked())
         try:
-            settings = ContrastAFSettings.model_validate(values)
+            settings = validated_settings(self.af_inputs, method, self.af_fallback.isChecked())
             state = self.autofocusController.liveController.obs_controller.current_observation_state
             trial = state.model_copy(deep=True) if state else None
             if trial is None:

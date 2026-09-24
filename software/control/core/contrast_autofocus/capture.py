@@ -14,7 +14,9 @@ import cv2
 
 class StageCaptureSession:
     def __init__(self, controller, state, lower_um, upper_um, cancelled, max_time_s=None,
-                 travel_lower_um=None, travel_upper_um=None):
+                 travel_lower_um=None, travel_upper_um=None,
+                 apply_camera_live_geometry=False, apply_optical_state=False,
+                 wait_for_hardware=None):
         self.controller = controller
         self.camera = controller.camera
         capture_lock = getattr(self.camera, "_capture_frame_lock", None)
@@ -49,6 +51,12 @@ class StageCaptureSession:
         ) if self.original_gain is not None else None
         self.geometry = (self.camera.get_binning(), self.camera.get_region_of_interest(),
                          self.camera.get_pixel_format(), self.camera.get_camera_mode())
+        self.original_geometry = self.geometry
+        self.apply_camera_live_geometry = apply_camera_live_geometry
+        self.apply_optical_state = apply_optical_state
+        self.wait_for_hardware = wait_for_hardware
+        self.original_optical_state = None
+        self.original_logical_state = None
         self.entered = False
         self.cleanup_errors = []
 
@@ -60,8 +68,43 @@ class StageCaptureSession:
             # Drain live delivery and give this session a fresh trigger stream.
             if self.camera.get_is_streaming():
                 self.camera.stop_streaming()
+            if self.apply_optical_state:
+                obs = self.live.obs_controller
+                self.original_logical_state = obs.current_observation_state
+                self.original_optical_state = obs.read_capture_optical_state()
+                self._apply_optical_state(self.state)
+            if self.apply_camera_live_geometry and self.state.camera_live is not None:
+                snap = self.state.camera_live
+                if snap.pixel_format is not None:
+                    from squid.config import CameraPixelFormat
+                    pixel_format = next((value for value in CameraPixelFormat
+                                         if snap.pixel_format in (value.name, value.value)), None)
+                    if pixel_format is None:
+                        raise ValueError(f"Unknown AF camera pixel format {snap.pixel_format!r}")
+                    if self.camera.get_pixel_format() != pixel_format:
+                        self.camera.set_pixel_format(pixel_format)
+                if snap.camera_mode is not None and self.camera.get_camera_mode() != snap.camera_mode:
+                    self.camera.set_camera_mode(snap.camera_mode)
+                if self.camera.get_binning() != (snap.binning_x, snap.binning_y):
+                    self.camera.set_binning(snap.binning_x, snap.binning_y)
+                if snap.roi_width > 0 and snap.roi_height > 0:
+                    roi = (snap.roi_offset_x, snap.roi_offset_y, snap.roi_width, snap.roi_height)
+                    if self.camera.get_region_of_interest() != roi:
+                        self.camera.set_region_of_interest(*roi)
+                self.geometry = (self.camera.get_binning(), self.camera.get_region_of_interest(),
+                                 self.camera.get_pixel_format(), self.camera.get_camera_mode())
+                if self.geometry[0] != (snap.binning_x, snap.binning_y):
+                    raise RuntimeError("AF camera binning did not apply")
+                if snap.roi_width > 0 and snap.roi_height > 0 and self.geometry[1] != roi:
+                    raise RuntimeError("AF camera ROI did not apply")
+                if snap.pixel_format is not None and self.geometry[2] != pixel_format:
+                    raise RuntimeError("AF camera pixel format did not apply")
+                if snap.camera_mode is not None and self.geometry[3] != snap.camera_mode:
+                    raise RuntimeError("AF camera mode did not apply")
             if self.mode != TriggerMode.SOFTWARE:
                 self.live.set_trigger_mode(TriggerMode.SOFTWARE)
+            if self.live.trigger_mode != TriggerMode.SOFTWARE:
+                raise RuntimeError("AF software trigger mode did not apply")
             if self.camera.get_exposure_time() != self.capture_exposure_ms:
                 self.camera.set_exposure_time(self.capture_exposure_ms)
             if self.capture_gain is not None and self.camera.get_analog_gain() != self.capture_gain:
@@ -76,6 +119,39 @@ class StageCaptureSession:
             self.__exit__(type(exc), exc, exc.__traceback__)
             raise
 
+    def _apply_optical_state(self, state):
+        """Apply requested optics and verify device readback before exposure."""
+        obs = self.live.obs_controller
+        obs.apply_capture_optical_state(state)
+        if self.wait_for_hardware is not None:
+            self.wait_for_hardware()
+        actual = obs.read_capture_optical_state()
+        requested_filters = obs.capture_filter_targets(state)
+        requested_confocal = ({key: value for key, value in state.confocal_hardware_settings.model_dump().items()
+                               if value is not None} if state.confocal_hardware_settings is not None else {})
+        before = self.original_optical_state
+        if (actual["confocal_mode"] != state.confocal_mode or
+                (state.confocal_mode and actual["motor_running"] is False) or
+                any(actual["filters"].get(key) != value for key, value in requested_filters.items()) or
+                any(actual["confocal"].get(key) != value for key, value in requested_confocal.items()) or
+                any(actual["filters"].get(key) != value for key, value in before["filters"].items()
+                    if key not in requested_filters) or
+                any(actual["confocal"].get(key) != value for key, value in before["confocal"].items()
+                    if key not in requested_confocal)):
+            raise RuntimeError("Autofocus optical state did not apply")
+
+    def _restore_optical_state(self):
+        obs = self.live.obs_controller
+        obs.restore_capture_optical_state(self.original_optical_state)
+        if self.wait_for_hardware is not None:
+            self.wait_for_hardware()
+        actual = obs.read_capture_optical_state()
+        before = self.original_optical_state
+        if (any(actual[key] != before[key] for key in
+                ("confocal_mode", "filters", "confocal", "auto_switch")) or
+                (before["confocal_mode"] and actual["motor_running"] is False)):
+            raise RuntimeError("Imaging optical state restoration did not verify")
+
     def __exit__(self, exc_type, exc, tb):
         errors = []
         # Camera ownership ends inside capture_frame, after its delivery barrier.
@@ -84,11 +160,40 @@ class StageCaptureSession:
                 self.camera.stop_streaming()
         except (CameraTimeoutError, Exception) as e:
             errors.append(e)
+        if self.original_optical_state is not None:
+            try:
+                self._restore_optical_state()
+            except Exception as e:
+                errors.append(e)
+            finally:
+                self.live.obs_controller.current_observation_state = self.original_logical_state
+        if self.apply_camera_live_geometry:
+            original_binning, original_roi, original_format, original_mode = self.original_geometry
+            for getter, setter, args in (
+                (self.camera.get_pixel_format, self.camera.set_pixel_format, (original_format,)),
+                (self.camera.get_camera_mode, self.camera.set_camera_mode, (original_mode,)),
+                (self.camera.get_binning, self.camera.set_binning, original_binning),
+                (self.camera.get_region_of_interest, self.camera.set_region_of_interest, original_roi),
+            ):
+                try:
+                    if getter() != (args if len(args) > 1 else args[0]):
+                        setter(*args)
+                except (CameraTimeoutError, Exception) as e:
+                    errors.append(e)
+            try:
+                restored = (self.camera.get_binning(), self.camera.get_region_of_interest(),
+                            self.camera.get_pixel_format(), self.camera.get_camera_mode())
+                if restored != self.original_geometry:
+                    errors.append(RuntimeError("AF camera geometry restoration did not verify"))
+            except (CameraTimeoutError, Exception) as e:
+                errors.append(e)
         if self.live.trigger_mode != self.mode:
             try:
                 self.live.set_trigger_mode(self.mode)
             except (CameraTimeoutError, Exception) as e:
                 errors.append(e)
+        if self.live.trigger_mode != self.mode:
+            errors.append(RuntimeError("AF trigger mode restoration did not verify"))
         settings_to_restore = [
             (self.camera.get_exposure_time, self.camera.set_exposure_time, self.original_exposure_ms),
         ]
@@ -98,18 +203,25 @@ class StageCaptureSession:
             try:
                 if getter() != original:
                     setter(original)
+                if getter() != original:
+                    raise RuntimeError("AF exposure or gain restoration did not verify")
             except (CameraTimeoutError, Exception) as e:
                 errors.append(e)
-        try:
-            self.camera.enable_callbacks(self.callbacks_enabled)
-        except (CameraTimeoutError, Exception) as e:
-            errors.append(e)
-        if self.was_live:
+        # A failed geometry restore must not restart live capture or release
+        # callbacks into acquisition. The owner will abort the run.
+        if not errors:
+            try:
+                self.camera.enable_callbacks(self.callbacks_enabled)
+                if self.camera.get_callbacks_enabled() != self.callbacks_enabled:
+                    raise RuntimeError("AF camera callback restoration did not verify")
+            except (CameraTimeoutError, Exception) as e:
+                errors.append(e)
+        if self.was_live and not errors:
             try:
                 self.live.start_live()
             except (CameraTimeoutError, Exception) as e:
                 errors.append(e)
-        elif self.was_streaming:
+        elif self.was_streaming and not errors:
             try:
                 self.camera.start_streaming()
             except (CameraTimeoutError, Exception) as e:
@@ -216,7 +328,7 @@ class StageCaptureSession:
                     raise SearchStopped("range_exhausted", "Autofocus time budget exhausted",
                                         actual_z_um=actual, frame_attempted=True) from exc
                 raise CaptureCancelled(actual) from exc
-            except (CameraError, CameraTimeoutError, OSError) as exc:
+            except (CameraError, CameraTimeoutError, OSError, TimeoutError) as exc:
                 if self.deadline is not None and time.monotonic() >= self.deadline:
                     raise SearchStopped("range_exhausted", "Autofocus time budget exhausted",
                                         actual_z_um=actual, frame_attempted=True) from exc

@@ -71,6 +71,8 @@ def test_immediate_frames_are_received_and_routed_via_camera(mode, monkeypatch):
     )
     assert worker.liveController.obs_controller.ic.turn_off_all.call_count == 3
     assert worker.stage.move_z.call_args.args == (0.002,)
+    assert worker.autofocusController.last_result.status == "success"
+    assert worker.autofocusController.last_result.frames == 3
     worker._finished_fn.assert_called_once()
 
 

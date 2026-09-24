@@ -52,6 +52,14 @@ def test_manual_controller_runs_frequency_search_and_publishes_once():
                                        window_below_um=20, window_above_um=20,
                                        sensor_full_scale=255))
     obs = SimpleNamespace(current_observation_state=state, ic=MagicMock(), microscope=MagicMock())
+    active_state = [state]
+    obs.read_capture_optical_state = lambda: {
+        "confocal_mode": active_state[0].confocal_mode,
+        "motor_running": None,
+        "filters": {}, "confocal": {}, "auto_switch": False}
+    obs.apply_capture_optical_state = lambda applied: active_state.__setitem__(0, applied)
+    obs.capture_filter_targets = lambda applied: {}
+    obs.restore_capture_optical_state = lambda snapshot: active_state.__setitem__(0, state)
     live = SimpleNamespace(is_live=False, trigger_mode=TriggerMode.SOFTWARE, obs_controller=obs)
     live.stop_live = MagicMock()
     live.start_live = MagicMock()

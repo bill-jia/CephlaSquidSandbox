@@ -62,9 +62,20 @@ class AcquisitionParameters:
     z_range: Tuple[float, float]
 
     use_fluidics: bool
+    # Resolved at run creation; live preset edits cannot change the AF search.
+    contrast_af_state: Optional["ObservationState"] = None
+    contrast_af_legacy_step_um: Optional[float] = None
+    contrast_af_legacy_count: Optional[int] = None
+    contrast_af_crop_width: Optional[int] = None
+    contrast_af_crop_height: Optional[int] = None
+    contrast_af_failure_policy: str = "stop"
+    contrast_af_use_focus_map: bool = False
+    contrast_af_focus_map_coords: Tuple[Tuple[float, float, float], ...] = ()
     skip_saving: bool = False
-    # AF-only diagnostic walk: no channel images, stacks, stimuli or fluidics.
+    # Diagnostics default to an AF-only walk; with_imaging retains normal capture
+    # and saves every AF operation's artifacts.
     validation_mode: bool = False
+    validation_with_imaging: bool = False
     # Which wellplate tiling method NX/NY describe ("fraction" or "grid"); metadata only
     # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
     # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.

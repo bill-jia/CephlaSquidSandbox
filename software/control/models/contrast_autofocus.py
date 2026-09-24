@@ -59,3 +59,26 @@ def default_20x_contrast_af_settings() -> ContrastAFSettings:
         max_exposure_ms=10000, verification_tolerance=0.25,
         dense_fallback=True,
     )
+
+
+class AcquisitionContrastAFOverride(BaseModel):
+    """Accepted acquisition-only AF values, bound to one source preset."""
+
+    state_name: str
+    settings: ContrastAFSettings
+    metric: Literal["LAPE", "GLVA", "TENENGRAD"]
+    legacy_step_um: float = Field(gt=0)
+    legacy_count: int = Field(ge=1)
+    crop_width: int = Field(ge=1)
+    crop_height: int = Field(ge=1)
+    failure_policy: Literal["stop", "continue_restored"] = "stop"
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def check_override(self):
+        if not self.state_name.strip():
+            raise ValueError("An autofocus observation state is required")
+        if not math.isfinite(self.legacy_step_um):
+            raise ValueError("legacy_step_um must be finite")
+        return self

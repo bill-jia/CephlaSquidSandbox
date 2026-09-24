@@ -277,8 +277,8 @@ def test_preflight_requires_laser_af():
     assert not controller.validate_acquisition_settings()
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize("enabled,with_imaging", [(True, False), (True, True), (False, False)])
+def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled, with_imaging):
     from control.acquisition_yaml_loader import parse_acquisition_yaml
     from control.core.multi_point_controller import _save_unified_multipoint_acquisition_yaml
     from tests.control.test_multipoint_z_retract import _params
@@ -288,14 +288,16 @@ def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled):
         lambda base_yaml, **kwargs: {"schema_version": 2, **base_yaml},
     )
     _save_unified_multipoint_acquisition_yaml(
-        _params(validation_mode=enabled, skip_saving=enabled), str(tmp_path),
+        _params(validation_mode=enabled, validation_with_imaging=with_imaging,
+                skip_saving=enabled and not with_imaging), str(tmp_path),
         widget_type="flexible", repo=MagicMock(), live_controller=MagicMock(),
         camera=MagicMock(), objective_store=MagicMock(), recording_start_time=0.0,
         selected_observation_state_names=[], use_manual_focus_map=False, logger=MagicMock(),
     )
     restored = parse_acquisition_yaml(str(tmp_path / "acquisition.yaml"))
     assert restored.validation_mode is enabled
-    assert restored.skip_saving is enabled
+    assert restored.validation_with_imaging is with_imaging
+    assert restored.skip_saving is (enabled and not with_imaging)
 
 
 def test_fatal_af_error_records_evidence_without_another_camera_call(tmp_path):
@@ -319,3 +321,90 @@ def test_fatal_snapshot_error_preserves_completed_af_result(tmp_path):
     event = rows(tmp_path)[0]
     assert event["af_success"] == "True"
     assert "Fatal snapshot error" in event["snapshot_error"]
+
+
+def test_save_all_retains_each_success_and_table_metadata(tmp_path):
+    collector = AFValidationCollector(tmp_path, save_all=True)
+    for fov in range(3):
+        collector.record({**metadata(), "fov": fov}, operation(), np.eye(12, dtype=np.uint8))
+    collector.record(metadata(status="table"))
+    for event in rows(tmp_path):
+        folder = tmp_path / event["artifacts_path"]
+        assert (folder / "current.yaml").exists()
+        if event["af_attempted"] == "True":
+            assert (folder / "current_native.tiff").exists()
+            assert (folder / "current_full_sensor.tiff").exists()
+
+
+def test_validation_with_imaging_captures_channels_and_stack_and_saves_every_af_frame(tmp_path):
+    from control._def import FILE_ID_PADDING
+    from control.models.acquisition_cycle import RegionPlan, _index_events
+
+    worker, controller, stage = make_worker(tmp_path)
+    worker.validation_with_imaging = True
+    worker._af_validator = AFValidationCollector(tmp_path, save_all=True)
+    worker._reference_z_level = lambda: 1
+    worker.prepare_z_stack = MagicMock()
+    worker.move_z_for_stack = MagicMock()
+    worker.move_z_back_after_stack = MagicMock()
+    worker.acquire_camera_image = MagicMock()
+    worker._apply_observation_state = lambda name: SimpleNamespace(name=name, is_stimulus_only=False)
+    worker._build_save_layout = lambda *args: SimpleNamespace(c_index=0)
+    plan = RegionPlan.from_events(_index_events([("state", ("BF", True)), ("state", ("GFP", True))]))
+    worker._get_region_plan = lambda region: plan
+    worker.total_scans = 6
+    stage.z_um = 20
+    worker.acquire_at_position("R0", str(tmp_path), 0)
+
+    assert worker.acquire_camera_image.call_count == 6
+    assert [c.args[3] for c in worker.acquire_camera_image.call_args_list] == [0, 0, 1, 1, 2, 2]
+    worker.prepare_z_stack.assert_called_once()
+    assert worker.move_z_for_stack.call_count == 2
+    worker.move_z_back_after_stack.assert_called_once()
+    event = rows(tmp_path)[0]
+    assert event["af_success"] == "True" and event["imaging_enabled"] == "True"
+    prefix = f"R0_{0:0{FILE_ID_PADDING}}_"
+    assert event["image_file_prefix"] == prefix
+    assert all(c.args[1].startswith(prefix) for c in worker.acquire_camera_image.call_args_list)
+    folder = tmp_path / event["artifacts_path"]
+    assert int(event["native_frame_count"]) >= 3
+    assert len(list(folder.glob("native_*.tiff"))) == int(event["native_frame_count"])
+    assert (folder / "current_full_sensor.tiff").exists()
+    assert controller._validation_save_all is False
+    worker.request_abort_fn.assert_not_called()
+
+
+def test_validation_with_imaging_rejects_dry_run():
+    controller = MultiPointController.__new__(MultiPointController)
+    controller.set_validation_mode(True, with_imaging=True)
+    controller.do_reflection_af = True
+    controller.laserAutoFocusController = MagicMock()
+    controller.skip_saving = True
+    controller._log = MagicMock()
+    assert not controller.validate_acquisition_settings()
+
+
+@pytest.mark.parametrize("imaging", [False, True])
+def test_build_params_retains_imaging_plan_and_save_settings_only_in_imaging_mode(imaging):
+    from tests.control.test_multipoint_z_retract import _params
+    from control.models.acquisition_cycle import RegionPlan, _index_events
+
+    params = _params(selected_observation_state_names=["BF"])
+    controller = MultiPointController.__new__(MultiPointController)
+    for key, value in vars(params).items():
+        setattr(controller, key, value)
+    controller.scanCoordinates = SimpleNamespace(format=None)
+    controller.timestamp_acquisition_started = 0.0
+    controller.do_reflection_af = True
+    controller.set_validation_mode(True, with_imaging=imaging)
+    controller.zarr_upload_enabled = True
+    plan = RegionPlan.from_events(_index_events([("state", ("BF", True))]))
+    controller._build_region_plans = MagicMock(return_value=(plan, {}))
+    controller._estimated_disk_bytes_or_zero = lambda: 1234
+
+    built = controller.build_params(params.scan_position_information)
+    assert built.skip_saving is (not imaging)
+    assert built.validation_with_imaging is imaging
+    assert built.zarr_upload_enabled is imaging
+    assert built.global_region_plan is (plan if imaging else None)
+    assert built.estimated_total_disk_bytes == (1234 if imaging else 0)

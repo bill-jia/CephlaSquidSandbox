@@ -28,13 +28,24 @@ from qtpy.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
+    QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
 )
+
+from control._def import MULTIPOINT_AUTOFOCUS_CHANNEL, FocusMeasureOperator, Acquisition
+from control.models.contrast_autofocus import (
+    AcquisitionContrastAFOverride, ContrastAFSettings,
+    default_20x_contrast_af_settings,
+)
+from gui.widgets.contrast_af_editor import add_phase1_fields, validated_settings
 
 
 class LaserAutofocusSettingsDialog(QDialog):
@@ -51,7 +62,7 @@ class LaserAutofocusSettingsDialog(QDialog):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self.setWindowTitle("Laser Autofocus Settings")
+        self.setWindowTitle("Autofocus Settings")
         self.setModal(True)
 
         self._build_ui()
@@ -61,11 +72,61 @@ class LaserAutofocusSettingsDialog(QDialog):
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
+        contrast_group = QGroupBox("Contrast AF — acquisition settings")
+        contrast_layout = QVBoxLayout(contrast_group)
+        self.cb_contrast_enabled = QCheckBox("Enable contrast AF during acquisition")
+        contrast_layout.addWidget(self.cb_contrast_enabled)
+        form = QFormLayout()
+        self.af_state = QComboBox()
+        self.af_state.setEditable(False)
+        self.af_method = QComboBox()
+        self.af_method.addItem("Legacy contrast scan", "legacy")
+        self.af_method.addItem("Frequency-assisted contrast search", "frequency_assisted")
+        self.af_metric = QComboBox()
+        for metric in FocusMeasureOperator:
+            self.af_metric.addItem(metric.value, metric.value)
+        form.addRow("AF observation state:", self.af_state)
+        form.addRow("Algorithm:", self.af_method)
+        form.addRow("Sharpness:", self.af_metric)
+        self.af_inputs = add_phase1_fields(form)
+        box = QDoubleSpinBox()
+        box.setRange(0, 10000)
+        box.setDecimals(3)
+        form.addRow("Legacy step (µm)", box)
+        self.af_inputs["legacy_step_um"] = box
+        for name, label, minimum in (
+            ("legacy_count", "Legacy plane count", 1),
+            ("crop_width", "Crop width", 1),
+            ("crop_height", "Crop height", 1),
+        ):
+            box = QSpinBox()
+            box.setRange(minimum, 10000)
+            form.addRow(label, box)
+            self.af_inputs[name] = box
+        self.af_fallback = QCheckBox("Allow one dense fallback")
+        form.addRow(self.af_fallback)
+        self.af_failure = QComboBox()
+        self.af_failure.addItem("Stop acquisition", "stop")
+        self.af_failure.addItem("Continue at restored nominal Z after optical failure", "continue_restored")
+        form.addRow("On search failure:", self.af_failure)
+        contrast_layout.addLayout(form)
+        self.af_cadence = QLabel(
+            f"Measured scan every {Acquisition.NUMBER_OF_FOVS_PER_AF} FOV visits; "
+            "a valid focus map takes precedence. Laser AF takes precedence if enabled.")
+        self.af_cadence.setWordWrap(True)
+        contrast_layout.addWidget(self.af_cadence)
+        contrast_scroll = QScrollArea()
+        contrast_scroll.setWidgetResizable(True)
+        contrast_scroll.setWidget(contrast_group)
+        contrast_scroll.setMinimumHeight(320)
+        layout.addWidget(contrast_scroll)
+        self.af_state.currentIndexChanged.connect(self._load_contrast_state)
+
         self.cb_enabled = QCheckBox("Enable laser autofocus during acquisition")
         layout.addWidget(self.cb_enabled)
 
-        mode_group = QGroupBox("Mode")
-        mode_layout = QVBoxLayout(mode_group)
+        self.laser_mode_group = QGroupBox("Laser AF mode")
+        mode_layout = QVBoxLayout(self.laser_mode_group)
         self.rb_fast = QRadioButton(
             "Fast — per-FOV offset table + anchor refresh every N FOVs"
         )
@@ -77,7 +138,7 @@ class LaserAutofocusSettingsDialog(QDialog):
         self.mode_bg.addButton(self.rb_legacy, 1)
         mode_layout.addWidget(self.rb_fast)
         mode_layout.addWidget(self.rb_legacy)
-        layout.addWidget(mode_group)
+        layout.addWidget(self.laser_mode_group)
 
         self.fast_group = QGroupBox("Fast mode options")
         fast_layout = QVBoxLayout(self.fast_group)
@@ -136,7 +197,21 @@ class LaserAutofocusSettingsDialog(QDialog):
 
     def _populate_from_controller(self):
         c = self.controller
+        self.cb_contrast_enabled.setChecked(bool(getattr(c, "do_autofocus", False)))
+        names = [state.name for state in c.liveController.get_observation_states()]
+        self.af_state.addItems(names)
+        selected = getattr(c, "contrast_af_state_name", MULTIPOINT_AUTOFOCUS_CHANNEL)
+        if selected not in names:
+            self.af_state.addItem(f"{selected} (missing)", selected)
+        self.af_state.setCurrentIndex(self.af_state.findData(selected) if self.af_state.findData(selected) >= 0
+                                      else self.af_state.findText(selected))
+        self._load_contrast_state()
         self.cb_enabled.setChecked(bool(getattr(c, "do_reflection_af", False)))
+        has_laser = getattr(c, "laserAutoFocusController", None) is not None
+        self._has_laser = has_laser
+        self.cb_enabled.setVisible(has_laser)
+        self.laser_mode_group.setVisible(has_laser)
+        self.fast_group.setVisible(has_laser)
 
         refresh_n = int(getattr(c, "laser_af_refresh_every_n_fovs", 10))
         if refresh_n <= 1:
@@ -168,9 +243,63 @@ class LaserAutofocusSettingsDialog(QDialog):
         self.rb_legacy.setEnabled(enabled)
         self.fast_group.setEnabled(enabled and self.rb_fast.isChecked())
 
+    def _load_contrast_state(self, *_):
+        name = self.af_state.currentData() or self.af_state.currentText()
+        state = self.controller.liveController.get_observation_state_by_name(name)
+        if state is None:
+            return
+        override = getattr(self.controller, "contrast_af_override", None)
+        if override is not None and override.state_name != name:
+            override = None
+        defaults = default_20x_contrast_af_settings()
+        settings = override.settings if override else (state.contrast_af or ContrastAFSettings())
+        self.af_method.setCurrentIndex(self.af_method.findData(settings.method))
+        metric = override.metric if override else state.focus_measure_operator
+        self.af_metric.setCurrentIndex(self.af_metric.findData(metric))
+        values = {
+            "legacy_step_um": override.legacy_step_um if override else self.controller.autofocusController.deltaZ * 1000,
+            "legacy_count": override.legacy_count if override else self.controller.autofocusController.N,
+            "crop_width": override.crop_width if override else self.controller.autofocusController.crop_width,
+            "crop_height": override.crop_height if override else self.controller.autofocusController.crop_height,
+        }
+        for name, box in self.af_inputs.items():
+            value = values.get(name, getattr(settings, name, None))
+            if value is None:
+                value = getattr(defaults, name)
+            box.setValue(value)
+        self.af_fallback.setChecked(settings.dense_fallback)
+        self.af_failure.setCurrentIndex(self.af_failure.findData(
+            override.failure_policy if override else "stop"))
+
     def accept(self):
         c = self.controller
-        c.set_reflection_af_flag(self.cb_enabled.isChecked())
+        name = self.af_state.currentData() or self.af_state.currentText()
+        state = c.liveController.get_observation_state_by_name(name)
+        contrast_enabled = self.cb_contrast_enabled.isChecked()
+        if contrast_enabled and (state is None or state.is_stimulus_only):
+            QMessageBox.warning(self, "Autofocus Settings", "Select an existing imaging observation state.")
+            return
+        values = {key: box.value() for key, box in self.af_inputs.items()}
+        legacy = {key: values.pop(key) for key in
+                  ("legacy_step_um", "legacy_count", "crop_width", "crop_height")}
+        override = None
+        if state is not None and not state.is_stimulus_only:
+            try:
+                override = AcquisitionContrastAFOverride(
+                    state_name=name, settings=validated_settings(
+                        {key: self.af_inputs[key] for key in values},
+                        self.af_method.currentData(), self.af_fallback.isChecked(),
+                        preserve_legacy=True),
+                    metric=self.af_metric.currentData(),
+                    failure_policy=self.af_failure.currentData(), **legacy)
+            except (ValueError, TypeError) as exc:
+                if contrast_enabled:
+                    QMessageBox.warning(self, "Autofocus Settings", str(exc))
+                    return
+        if override is not None:
+            c.set_contrast_af_acquisition_settings(name, override)
+        c.set_af_flag(contrast_enabled)
+        c.set_reflection_af_flag(self.cb_enabled.isChecked() and self._has_laser)
         if self.rb_legacy.isChecked():
             # Legacy = AF every FOV. Force lazy seed so we don't waste ~90 s on
             # an upfront pass when every FOV will be measured anyway.
@@ -201,6 +330,7 @@ class LaserAutofocusButton(QPushButton):
     """
 
     toggled = Signal(bool)
+    contrastToggled = Signal(bool)
 
     def __init__(self, multipoint_controller, parent=None):
         super().__init__(parent)
@@ -232,25 +362,14 @@ class LaserAutofocusButton(QPushButton):
     def _refresh_label(self):
         # The caller puts a "Laser AF" label beside the button, so the text is just
         # the current state — repeating the name here read as "Laser AF Laser AF: Off".
-        if not self._checked_state:
-            self.setText("Off ▸")  # ▸
-            return
-        n = int(getattr(self._mpc, "laser_af_refresh_every_n_fovs", 10))
-        if n <= 1:
-            self.setText("Every FOV ▸")
-        else:
-            self.setText(f"Fast (N={n}) ▸")
+        self.setText("Autofocus Settings ▸")
 
     def _open_dialog(self):
-        # Push the button's local enable state to the controller before showing
-        # the dialog so the dialog's "Enable" checkbox starts in sync.
-        if bool(self._mpc.do_reflection_af) != self._checked_state:
-            self._mpc.set_reflection_af_flag(self._checked_state)
-
         dlg = LaserAutofocusSettingsDialog(self._mpc, parent=self)
         if dlg.exec_() == QDialog.Accepted:
             new_state = bool(self._mpc.do_reflection_af)
             if new_state != self._checked_state:
                 self._checked_state = new_state
                 self.toggled.emit(self._checked_state)
+            self.contrastToggled.emit(bool(self._mpc.do_autofocus))
             self._refresh_label()

@@ -120,20 +120,19 @@ def test_frequency_settings_require_explicit_window():
         ContrastAFSettings(method="frequency_assisted", coarse_step_um=10)
 
 
-def test_multipoint_rejects_new_method_in_preflight():
+def test_multipoint_snapshots_frequency_settings_from_selected_state():
     from control.core.multi_point_controller import MultiPointController
 
     state = ObservationState(contrast_af=ContrastAFSettings(
         method="frequency_assisted", coarse_step_um=10, medium_step_um=2,
         fine_step_um=1, window_below_um=20, window_above_um=20))
     fake = SimpleNamespace(
-        scanCoordinates=SimpleNamespace(region_centers={}), _log=MagicMock(),
-        do_autofocus=True, do_reflection_af=False,
-        liveController=SimpleNamespace(get_observation_state_by_name=MagicMock(return_value=state)),
-        autofocusController=SimpleNamespace(autofocus_in_progress=False), stage=MagicMock())
-    assert MultiPointController.validate_acquisition_settings(fake) is False
-    fake.stage.move_z_to.assert_not_called()
-    assert "manual-only" in fake._log.error.call_args.args[0]
+        contrast_af_state_name=state.name, contrast_af_override=None,
+        liveController=SimpleNamespace(get_observation_state_by_name=MagicMock(return_value=state)))
+    snapshot = MultiPointController._effective_contrast_af_state(fake)
+    assert snapshot.contrast_af.method == "frequency_assisted"
+    state.contrast_af.coarse_step_um = 99
+    assert snapshot.contrast_af.coarse_step_um == 10
 
 
 def test_focus_widget_selection_and_restore(qtbot, tmp_path):

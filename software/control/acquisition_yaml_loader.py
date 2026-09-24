@@ -15,6 +15,7 @@ class AcquisitionYAMLData:
     xy_mode: str = "Select Wells"
     skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
     validation_mode: bool = False
+    validation_with_imaging: bool = False
     # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
     # None means the file predates the flag, and the GUI then leaves its checkbox alone.
     retract_z_between_regions: Optional[bool] = None
@@ -41,6 +42,8 @@ class AcquisitionYAMLData:
     # Autofocus
     contrast_af: bool = False
     laser_af: bool = False
+    contrast_af_state_name: Optional[str] = None
+    contrast_af_effective: Optional[Dict] = None
 
     # Wellplate-specific
     scan_size_mm: Optional[float] = None
@@ -122,6 +125,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         xy_mode=acq.get("xy_mode", "Select Wells"),
         skip_saving=bool(acq.get("skip_saving", False)),
         validation_mode=bool(acq.get("validation_mode", False)),
+        validation_with_imaging=bool(acq.get("validation_with_imaging", False)),
         retract_z_between_regions=(
             None if acq.get("retract_z_between_regions") is None else bool(acq["retract_z_between_regions"])
         ),
@@ -147,6 +151,8 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         # Autofocus
         contrast_af=autofocus.get("contrast_af", False),
         laser_af=autofocus.get("laser_af", False),
+        contrast_af_state_name=autofocus.get("contrast_af_state_name"),
+        contrast_af_effective=autofocus.get("contrast_af_effective"),
         # Wellplate-specific
         scan_size_mm=wellplate_scan.get("scan_size_mm"),
         overlap_percent=overlap,

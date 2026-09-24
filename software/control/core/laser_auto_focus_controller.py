@@ -91,6 +91,7 @@ class LaserAutofocusController(QObject):
         self.image = None  # for saving the focus camera image for debugging when centroid cannot be found
         self._validation_records = None
         self._validation_current = None
+        self._validation_save_all = False
 
         # Optional TimingManager for fine-grained profiling of move_to_target and
         # its sub-steps. None means timers are no-ops. MultiPointWorker attaches
@@ -161,15 +162,18 @@ class LaserAutofocusController(QObject):
         return self._timing.get_timer(name)
 
     @contextlib.contextmanager
-    def collect_validation_event(self):
+    def collect_validation_event(self, save_all=False):
         """Collect operation results and frame evidence for one FOV visit."""
         previous = self._validation_records, self._validation_current
+        previous_save_all = self._validation_save_all
+        self._validation_save_all = save_all
         records = []
         self._validation_records, self._validation_current = records, None
         try:
             yield records
         finally:
             self._validation_records, self._validation_current = previous
+            self._validation_save_all = previous_save_all
 
     @contextlib.contextmanager
     def _validation_operation(self, kind):
@@ -187,7 +191,7 @@ class LaserAutofocusController(QObject):
                 "reference_image", "reference_image_shape", "reference_image_dtype",
             }),
             "reference_crop": None if self.reference_crop is None else self.reference_crop.copy(),
-            "frame": None, "rejected_frames": [], "measurements": [], "warning": None,
+            "frame": None, "frames": [], "rejected_frames": [], "measurements": [], "warning": None,
         }
         self._validation_current = record
         try:
@@ -1078,6 +1082,14 @@ class LaserAutofocusController(QObject):
                                 frame=image.copy(), frame_z_mm=self.stage.get_pos().z_mm,
                                 frame_piezo_um=self.piezo.position if self.piezo is not None else None,
                             )
+                            if self._validation_save_all:
+                                self._validation_current["frames"].append((
+                                    image.copy(), {
+                                        "z_mm": self.stage.get_pos().z_mm,
+                                        "piezo_um": self.piezo.position if self.piezo is not None else None,
+                                        "frame_index": i, "timestamp": time.time(),
+                                    },
+                                ))
 
                         with self._time("af:spot_centroid_loop:calculations"):
                             full_height, full_width = image.shape[:2]

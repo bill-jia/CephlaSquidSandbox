@@ -366,6 +366,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
             "validation_mode": params.validation_mode,
+            "validation_with_imaging": params.validation_with_imaging,
             "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
@@ -388,6 +389,18 @@ def _save_unified_multipoint_acquisition_yaml(
         "autofocus": {
             "contrast_af": params.do_autofocus,
             "laser_af": params.do_reflection_autofocus,
+            "contrast_af_state_name": (params.contrast_af_state.name
+                                        if params.contrast_af_state is not None else None),
+            "contrast_af_effective": (
+                {
+                    "settings": _serialize_for_yaml(params.contrast_af_state.contrast_af),
+                    "metric": params.contrast_af_state.focus_measure_operator,
+                    "legacy_step_um": params.contrast_af_legacy_step_um,
+                    "legacy_count": params.contrast_af_legacy_count,
+                    "crop_width": params.contrast_af_crop_width,
+                    "crop_height": params.contrast_af_crop_height,
+                    "failure_policy": params.contrast_af_failure_policy,
+                } if params.contrast_af_state is not None else None),
         },
         "channels": {
             "observation_state_names": list(params.selected_observation_state_names),
@@ -565,6 +578,9 @@ class MultiPointController:
         # configured via the settings dialog. Load is widget-agnostic so the
         # values carry regardless of which multipoint tab is in use.
         self._load_laser_af_settings_from_cache()
+        self.contrast_af_state_name = control._def.MULTIPOINT_AUTOFOCUS_CHANNEL
+        self.contrast_af_override = None
+        self._load_contrast_af_settings_from_cache()
         self.display_resolution_scaling = control._def.Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
         self.use_piezo = control._def.MULTIPOINT_USE_PIEZO_FOR_ZSTACKS
         self.experiment_ID = None
@@ -573,6 +589,7 @@ class MultiPointController:
         self.use_fluidics = False
         self.skip_saving = False
         self.validation_mode = False
+        self.validation_with_imaging = False
         self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
@@ -862,6 +879,78 @@ class MultiPointController:
         if "laser_af_table_path_audit" in data:
             self.laser_af_table_path_audit = bool(data["laser_af_table_path_audit"])
 
+    _CONTRAST_AF_SETTINGS_CACHE_PATH = "cache/acquisition_contrast_af.yaml"
+
+    def set_contrast_af_acquisition_settings(self, state_name, override):
+        """Commit a dialog draft without modifying its source observation preset."""
+        from control.models.contrast_autofocus import AcquisitionContrastAFOverride
+        validated = AcquisitionContrastAFOverride.model_validate(override)
+        if validated.state_name != state_name:
+            raise ValueError("Autofocus override belongs to a different state")
+        state = self.liveController.get_observation_state_by_name(state_name)
+        if state is None or state.is_stimulus_only:
+            raise ValueError("Select an existing imaging observation state for autofocus")
+        self.contrast_af_state_name = state_name
+        self.contrast_af_override = validated
+        self._save_contrast_af_settings_to_cache()
+
+    def _save_contrast_af_settings_to_cache(self):
+        try:
+            path = self._CONTRAST_AF_SETTINGS_CACHE_PATH
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                yaml.safe_dump({
+                    "state_name": self.contrast_af_state_name,
+                    "override": self.contrast_af_override.model_dump(mode="json")
+                    if self.contrast_af_override is not None else None,
+                }, f, sort_keys=False)
+        except Exception as exc:
+            self._log.warning("Failed to persist acquisition contrast AF settings: %s", exc)
+
+    def _load_contrast_af_settings_from_cache(self):
+        from control.models.contrast_autofocus import AcquisitionContrastAFOverride
+        path = self._CONTRAST_AF_SETTINGS_CACHE_PATH
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            name = data.get("state_name")
+            if isinstance(name, str) and name:
+                self.contrast_af_state_name = name
+            if data.get("override") is not None:
+                self.contrast_af_override = AcquisitionContrastAFOverride.model_validate(data["override"])
+        except Exception as exc:
+            self._log.warning("Failed to read acquisition contrast AF settings: %s", exc)
+
+    def _effective_contrast_af_state(self):
+        source = self.liveController.get_observation_state_by_name(self.contrast_af_state_name)
+        if source is None:
+            return None
+        state = source.model_copy(deep=True)
+        override = self.contrast_af_override
+        if override is not None and override.state_name == self.contrast_af_state_name:
+            state.contrast_af = override.settings.model_copy(deep=True)
+            state.focus_measure_operator = override.metric
+        return state
+
+    def restore_contrast_af_from_acquisition_yaml(self, state_name, effective):
+        """Restore an accepted acquisition snapshot without editing its preset."""
+        from control.models.contrast_autofocus import AcquisitionContrastAFOverride
+        if not state_name:
+            self.contrast_af_state_name = control._def.MULTIPOINT_AUTOFOCUS_CHANNEL
+            self.contrast_af_override = None
+            self._save_contrast_af_settings_to_cache()
+            return
+        self.contrast_af_state_name = state_name
+        self.contrast_af_override = None
+        if effective is not None:
+            self.contrast_af_override = AcquisitionContrastAFOverride.model_validate({
+                "state_name": state_name,
+                **effective,
+            })
+        self._save_contrast_af_settings_to_cache()
+
     def set_manual_focus_map_flag(self, flag):
         self.use_manual_focus_map = flag
 
@@ -882,8 +971,13 @@ class MultiPointController:
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
 
-    def set_validation_mode(self, enabled: bool):
+    def set_validation_mode(self, enabled: bool, with_imaging: bool = False):
         self.validation_mode = bool(enabled)
+        self.validation_with_imaging = bool(enabled and with_imaging)
+
+    @property
+    def validation_only(self):
+        return self.validation_mode and not self.validation_with_imaging
 
     def set_retract_z_between_regions(self, retract_z_between_regions):
         """Retract the objective to Z home for every XY move that enters a region.
@@ -1928,10 +2022,13 @@ class MultiPointController:
                 )
 
         global_plan, region_plans = (
-            (None, {}) if self.validation_mode
+            (None, {}) if self.validation_only
             else self._build_region_plans(scan_position_information.scan_region_names)
         )
 
+        af_override = self.contrast_af_override
+        if af_override is not None and af_override.state_name != self.contrast_af_state_name:
+            af_override = None
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
             base_path=self.base_path,
@@ -1948,13 +2045,23 @@ class MultiPointController:
             deltat=self.deltat,
             do_autofocus=self.do_autofocus,
             do_reflection_autofocus=self.do_reflection_af,
+            contrast_af_state=(self._effective_contrast_af_state()
+                               if self.do_autofocus and not self.do_reflection_af else None),
+            contrast_af_legacy_step_um=(af_override.legacy_step_um if af_override else self.autofocusController.deltaZ * 1000),
+            contrast_af_legacy_count=(af_override.legacy_count if af_override else self.autofocusController.N),
+            contrast_af_crop_width=(af_override.crop_width if af_override else self.autofocusController.crop_width),
+            contrast_af_crop_height=(af_override.crop_height if af_override else self.autofocusController.crop_height),
+            contrast_af_failure_policy=(af_override.failure_policy if af_override else "stop"),
+            contrast_af_use_focus_map=bool(self.autofocusController.use_focus_map),
+            contrast_af_focus_map_coords=tuple(tuple(p) for p in self.autofocusController.focus_map_coords),
             use_piezo=self.use_piezo,
             display_resolution_scaling=self.display_resolution_scaling,
             z_stacking_config=self.z_stacking_config,
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
-            skip_saving=self.skip_saving or self.validation_mode,
+            skip_saving=self.skip_saving or self.validation_only,
             validation_mode=self.validation_mode,
+            validation_with_imaging=self.validation_with_imaging,
             retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
@@ -1980,10 +2087,10 @@ class MultiPointController:
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
             laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
             laser_af_table_path_audit=self.laser_af_table_path_audit,
-            zarr_upload_enabled=self.zarr_upload_enabled and not self.validation_mode,
+            zarr_upload_enabled=self.zarr_upload_enabled and not self.validation_only,
             zarr_upload_remote_root=self.zarr_upload_remote_root,
             zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,
-            estimated_total_disk_bytes=0 if self.validation_mode else self._estimated_disk_bytes_or_zero(),
+            estimated_total_disk_bytes=0 if self.validation_only else self._estimated_disk_bytes_or_zero(),
         )
 
     def _estimated_disk_bytes_or_zero(self) -> int:
@@ -2143,6 +2250,9 @@ class MultiPointController:
         if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
             self._log.error("AF validation requires laser autofocus and a valid reference.")
             return False
+        if self.validation_mode and self.validation_with_imaging and self.skip_saving:
+            self._log.error("AF validation with imaging requires an image-saving format; disable dry run.")
+            return False
         # Region names (user-editable on the Flexible tab) become folder names, image
         # filename prefixes and the "region" column of every sidecar. Catch anything
         # unsafe here rather than mid-run, and cover the headless/SiLA entry points
@@ -2157,13 +2267,51 @@ class MultiPointController:
             return False
 
         if self.do_autofocus and not self.do_reflection_af:
-            af_state = self.liveController.get_observation_state_by_name(
-                control._def.MULTIPOINT_AUTOFOCUS_CHANNEL)
-            if af_state is not None and af_state.contrast_af and af_state.contrast_af.method == "frequency_assisted":
-                self._log.error(
-                    "Frequency-assisted contrast AF is manual-only until phase 3 frame ownership "
-                    "is validated. Select legacy autofocus for multipoint acquisition."
-                )
+            af_state = self._effective_contrast_af_state()
+            if af_state is None:
+                self._log.error("Contrast autofocus observation state %r is missing",
+                                self.contrast_af_state_name)
+                return False
+            if af_state.is_stimulus_only:
+                self._log.error("Contrast autofocus requires an imaging observation state")
+                return False
+            try:
+                from control.models.contrast_autofocus import ContrastAFSettings
+                settings = ContrastAFSettings.model_validate(
+                    af_state.contrast_af.model_dump() if af_state.contrast_af is not None else {"method": "legacy"})
+                control._def.FocusMeasureOperator.convert_to_enum(af_state.focus_measure_operator)
+                if not callable(getattr(self.microscope.camera, "send_trigger", None)):
+                    raise ValueError("Camera has no autofocus trigger route")
+                if af_state.is_waveform_driven:
+                    from control.core.waveform_observation_state import build_pulse_waveform_for_state
+                    if getattr(self.microscope.addons, "nidaq", None) is None:
+                        raise ValueError("Timed AF illumination requires NI-DAQ")
+                    build_pulse_waveform_for_state(
+                        af_state, self.microscope.illumination_controller,
+                        sample_rate_hz=float(control._def.NIDAQ_PULSE_SAMPLE_RATE_HZ))
+                if settings.method == "frequency_assisted":
+                    self.autofocusController._resolve_frequency_request(af_state)
+                else:
+                    override = self.contrast_af_override
+                    if override is not None and override.state_name == self.contrast_af_state_name:
+                        step_um, count = override.legacy_step_um, override.legacy_count
+                    else:
+                        step_um, count = self.autofocusController.deltaZ * 1000, self.autofocusController.N
+                    axis = self.stage.get_config().Z_AXIS
+                    physical = sorted((axis.raw_to_canonical(axis.MIN_POSITION) * 1000,
+                                       axis.raw_to_canonical(axis.MAX_POSITION) * 1000))
+                    backlash_um = float(getattr(self.stage, "_BACKLASH_COMPENSATION_DISTANCE_MM", 0)) * 1000
+                    start_um = self.stage.get_pos().z_mm * 1000
+                    for candidate in [start_um] + [
+                        p[2] * 1000 for positions in
+                        getattr(self.scanCoordinates, "region_fov_coordinates", {}).values()
+                        for p in positions if len(p) >= 3]:
+                        lower = candidate - step_um * round(count / 2) - backlash_um
+                        upper = candidate + step_um * (count - round(count / 2)) + backlash_um
+                        if not physical[0] <= lower <= upper <= physical[1]:
+                            raise ValueError("Legacy autofocus travel exceeds stage Z limits")
+            except (ValueError, TypeError, RuntimeError) as exc:
+                self._log.error("Contrast autofocus preflight failed: %s", exc)
                 return False
 
         if self.do_reflection_af:
@@ -2183,8 +2331,8 @@ class MultiPointController:
                 )
                 return False
 
-        # Validation never executes imaging/stimulus/postprocessing plans.
-        if self.validation_mode:
+        # An AF-only walk never executes imaging/stimulus/postprocessing plans.
+        if self.validation_only:
             return True
 
         # When any selected observation state has timed illuminators (capture-

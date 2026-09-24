@@ -1,4 +1,4 @@
-"""Bounded-memory AF evidence collection; image files grow with noteworthy events."""
+"""AF evidence collection, with optional retention of every operation's artifacts."""
 
 import csv
 import hashlib
@@ -15,13 +15,14 @@ EVENT_COLUMNS = (
     "kind", "af_attempted", "af_success", "af_status", "failure_reason", "warning",
     "z_before_mm", "z_after_mm", "piezo_before_um", "piezo_after_um", "frame_z_mm", "snapshot_z_mm",
     "displacement_um", "correlation", "reference_id", "snapshot_captured", "snapshot_error",
-    "rejected_count",
+    "rejected_count", "native_frame_count", "artifacts_path", "imaging_enabled", "image_file_prefix",
 )
 
 
 class AFValidationCollector:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, save_all=False):
         self.output_dir = Path(output_dir)
+        self.save_all = save_all
         self._last_success = None
         self._baseline_written = False
         self._references = set()
@@ -81,6 +82,15 @@ class AFValidationCollector:
             meta.update(kind="table", af_attempted=False, af_success=None)
         meta.update(event_id=self._next_event, snapshot_captured=snapshot is not None, rejected_count=len(rejects))
         self._next_event += 1
+        frames = operation.get("frames", []) if operation is not None else []
+        noteworthy = operation is not None and (
+            not meta["af_success"] or bool(meta.get("warning")) or bool(rejects) or bool(meta.get("snapshot_error"))
+        )
+        retain = self.save_all or noteworthy
+        meta.update(
+            native_frame_count=len(frames),
+            artifacts_path=f"events/{meta['event_id']}" if retain else None,
+        )
         path = self.output_dir / "events.csv"
         header = not path.exists()
         with path.open("a", newline="", encoding="utf-8") as out:
@@ -89,15 +99,21 @@ class AFValidationCollector:
                 writer.writeheader()
             writer.writerow(meta)
         if operation is None:
+            if self.save_all:
+                folder = self.output_dir / "events" / str(meta["event_id"])
+                folder.mkdir(parents=True, exist_ok=True)
+                self._yaml(folder / "current.yaml", meta)
             return
 
         # Retain only one previous success, and never compare different regions,
         # reference targets or kinds of operation as if they were equivalent.
         key = (meta["region_id"], meta["reference_id"], meta["kind"])
-        noteworthy = not meta["af_success"] or bool(meta.get("warning")) or bool(rejects) or bool(meta.get("snapshot_error"))
-        if noteworthy:
+        if retain:
             folder = self.output_dir / "events" / str(meta["event_id"])
             self._pair(folder, "current", frame, snapshot, meta)
+            for index, (native_frame, details) in enumerate(frames):
+                self._image(folder / f"native_{index:03d}.tiff", native_frame)
+                self._yaml(folder / f"native_{index:03d}.yaml", details)
             if self._last_success is not None and self._last_success[0] == key:
                 _, prior_frame, prior_snapshot, prior_meta = self._last_success
                 self._pair(folder, "previous_success", prior_frame, prior_snapshot, prior_meta)

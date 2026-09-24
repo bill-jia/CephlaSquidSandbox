@@ -108,6 +108,7 @@ class CaptureInfo:
     region_id: int
     fov: int
     configuration_idx: int
+    acquired_after_af_failure: bool = False
     z_piezo_um: Optional[float] = None
     time_point: Optional[int] = None
     filename_channel_label: Optional[str] = None
@@ -250,6 +251,7 @@ def append_frame_acquisition_time_csv(
         "filename",
         "unix_time_s",
         "utc_iso",
+        "acquired_after_af_failure",
     ]
     ch = channel if channel is not None else (info.filename_channel_label or info.observation_state.name)
     cidx = channel_index if channel_index is not None else info.configuration_idx
@@ -267,6 +269,7 @@ def append_frame_acquisition_time_csv(
         "filename": filename,
         "unix_time_s": f"{float(info.capture_time):.6f}",
         "utc_iso": datetime.fromtimestamp(float(info.capture_time), tz=timezone.utc).isoformat(),
+        "acquired_after_af_failure": info.acquired_after_af_failure,
     }
     try:
         with _acquire_file_lock(lock_path, context=path):
@@ -405,6 +408,7 @@ class SaveImageJob(Job):
                 "x_mm": info.position.x_mm,
                 "y_mm": info.position.y_mm,
                 "z_mm": info.position.z_mm,
+                "acquired_after_af_failure": info.acquired_after_af_failure,
             }
             # Add requested fields: human-readable time and optional piezo position
             try:
@@ -1683,6 +1687,7 @@ class PostprocessJob(Job):
             region_id=info.region_id,
             fov=info.fov,
             configuration_idx=0,
+            acquired_after_af_failure=info.acquired_after_af_failure,
             time_point=info.time_point,
             filename_channel_label=out_key,
             array_key=_filename_label(out_key),

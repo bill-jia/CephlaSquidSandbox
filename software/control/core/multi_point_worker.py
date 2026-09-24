@@ -1178,7 +1178,8 @@ class MultiPointWorker:
         self.objectiveStore: ObjectiveStore = objective_store
         self.fluidics = scope.addons.fluidics
         self.validation_mode = acquisition_parameters.validation_mode
-        self.use_fluidics = acquisition_parameters.use_fluidics and not self.validation_mode
+        self.validation_with_imaging = acquisition_parameters.validation_with_imaging
+        self.use_fluidics = acquisition_parameters.use_fluidics and not self.validation_only
         self.keep_illuminators_on_between_captures = (
             acquisition_parameters.keep_illuminators_on_between_captures
         )
@@ -1198,6 +1199,22 @@ class MultiPointWorker:
 
         self.do_autofocus = acquisition_parameters.do_autofocus
         self.do_reflection_af = acquisition_parameters.do_reflection_autofocus
+        self._contrast_af_state = acquisition_parameters.contrast_af_state
+        self._contrast_af_step_um = (acquisition_parameters.contrast_af_legacy_step_um
+                                     if acquisition_parameters.contrast_af_legacy_step_um is not None
+                                     else getattr(self.autofocusController, "deltaZ", 0.001524) * 1000)
+        self._contrast_af_count = (acquisition_parameters.contrast_af_legacy_count
+                                   if acquisition_parameters.contrast_af_legacy_count is not None
+                                   else getattr(self.autofocusController, "N", 10))
+        self._contrast_af_crop_width = (acquisition_parameters.contrast_af_crop_width
+                                        if acquisition_parameters.contrast_af_crop_width is not None
+                                        else getattr(self.autofocusController, "crop_width", AF.CROP_WIDTH))
+        self._contrast_af_crop_height = (acquisition_parameters.contrast_af_crop_height
+                                         if acquisition_parameters.contrast_af_crop_height is not None
+                                         else getattr(self.autofocusController, "crop_height", AF.CROP_HEIGHT))
+        self._contrast_af_failure_policy = acquisition_parameters.contrast_af_failure_policy
+        self._contrast_af_use_focus_map = acquisition_parameters.contrast_af_use_focus_map
+        self._contrast_af_focus_map_coords = tuple(acquisition_parameters.contrast_af_focus_map_coords)
         self.use_piezo = acquisition_parameters.use_piezo
         self.display_resolution_scaling = acquisition_parameters.display_resolution_scaling
 
@@ -1341,6 +1358,13 @@ class MultiPointWorker:
         # the info when dispatching jobs). Without this, deferred decode
         # would read the NEXT capture's info instead of its own.
         self._pending_capture_info_by_frame_id: Dict[int, CaptureInfo] = {}
+        # Raw arrivals are assigned to the AF session before Tucsen's deferred
+        # decode can call application callbacks.  A timed-out AF trigger never
+        # releases this ownership into a resumed imaging run.
+        self._af_owner_lock = threading.Lock()
+        self._af_session_active = False
+        self._af_expected_raw = 0
+        self._af_frame_ids: Set[int] = set()
         # Per-capture timing breakdown populated by acquire_camera_image and
         # _image_callback; read after the wait returns so we can split the
         # "exposure_time_done_sleep_hw or wait_for_image_sw" window into
@@ -1398,13 +1422,17 @@ class MultiPointWorker:
         # refresh fired, optionally take a verification displacement).
         self._region_refresh_count_this_entry: int = 0
 
-        self.skip_saving = acquisition_parameters.skip_saving or self.validation_mode
+        self.skip_saving = acquisition_parameters.skip_saving or self.validation_only
         self._af_validator = None
         if self.validation_mode:
             if not self.do_reflection_af or self.laser_auto_focus_controller is None:
                 raise ValueError("AF validation requires laser autofocus")
+            if self.validation_with_imaging and self.skip_saving:
+                raise ValueError("AF validation with imaging requires image saving")
             from control.core.af_validation_collector import AFValidationCollector
-            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, "af_validation"))
+            self._af_validator = AFValidationCollector(
+                os.path.join(self.experiment_path, "af_validation"), save_all=self.validation_with_imaging
+            )
         # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
         # move that enters a region (and before the very first move of the
         # run), then drive Z back to the target. Never fires between FOVs
@@ -1420,8 +1448,8 @@ class MultiPointWorker:
         # Guards the once-per-timepoint append to the root acquired_positions.csv.
         self._acquired_positions_appended = False
         job_classes = []
-        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF and not self.validation_mode
-        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3 and not self.validation_mode
+        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF and not self.validation_only
+        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3 and not self.validation_only
         if not self.skip_saving:
             if use_ome_tiff:
                 job_classes.append(SaveOMETiffJob)
@@ -1430,7 +1458,7 @@ class MultiPointWorker:
             else:
                 job_classes.append(SaveImageJob)
 
-        if extra_job_classes and not self.validation_mode:
+        if extra_job_classes and not self.validation_only:
             job_classes.extend(extra_job_classes)
 
         # Online postprocessing runs in its own runner (created only when a plan
@@ -1443,7 +1471,7 @@ class MultiPointWorker:
         # Only generate downsampled views for well-based acquisitions
         is_select_wells = acquisition_parameters.xy_mode == "Select Wells"
         is_loaded_wells = acquisition_parameters.xy_mode == "Load Coordinates" and self._is_well_based_acquisition()
-        self._generate_downsampled_views = not self.validation_mode and acquisition_parameters.generate_downsampled_views and (
+        self._generate_downsampled_views = not self.validation_only and acquisition_parameters.generate_downsampled_views and (
             is_select_wells or is_loaded_wells
         )
         self._downsampled_view_manager: Optional[DownsampledViewManager] = None
@@ -1750,6 +1778,10 @@ class MultiPointWorker:
         self._zarr_writer_info: Optional[ZarrWriterInfo] = zarr_writer_info
         self._abort_on_failed_job = abort_on_failed_jobs
         self._first_job_dispatched = False  # Track if we've waited for subprocess warmup
+
+    @property
+    def validation_only(self):
+        return getattr(self, "validation_mode", False) and not getattr(self, "validation_with_imaging", False)
 
     def update_use_piezo(self, value):
         self.use_piezo = value
@@ -2123,7 +2155,7 @@ class MultiPointWorker:
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
             # frames, stale trigger config) is discarded before acquisition begins.
-            if not self.validation_mode:
+            if not self.validation_only:
                 self.camera.stop_streaming()
                 # One-time apply of the first observation state's camera_live snapshot
                 # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
@@ -2653,7 +2685,7 @@ class MultiPointWorker:
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                if self.NZ > 1 and not self.validation_mode:
+                if self.NZ > 1 and not self.validation_only:
                     self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
@@ -3872,13 +3904,13 @@ class MultiPointWorker:
         # set_camera_mode pays the first time it actually switches modes)
         # into a dedicated init timer instead of polluting the first FOV's
         # per-capture stats. Amortizes to ~zero over long runs.
-        if not self.validation_mode:
+        if not self.validation_only:
             self._prewarm_observation_states()
 
         # Precompute FOV-shared postprocessing state (e.g. transfer functions)
         # before any hardware fires, so the first FOV's compute is a cache hit
         # and never stalls the first save/display.
-        if not self.validation_mode:
+        if not self.validation_only:
             self._prewarm_postprocess_routines()
 
         n_regions = len(self.scan_region_coords_mm)
@@ -3895,7 +3927,7 @@ class MultiPointWorker:
             self.num_fovs = len(coordinates)
             # Count imaged frames per position (cycles capture several frames per
             # state), not just distinct channels.
-            if self.validation_mode:
+            if self.validation_only:
                 self.total_scans = self.num_fovs
             else:
                 frames_per_pos = self._get_region_plan(region_id).frames_per_position
@@ -3931,8 +3963,8 @@ class MultiPointWorker:
                         self.acquire_at_position(region_id, current_path, fov)
                 except CameraTimeoutError as ce:
                     if self.validation_mode:
-                        # This error came from the focus camera. Reopening the
-                        # main camera cannot recover it; finalize the run.
+                        # Validation also touches the focus camera. Do not
+                        # assume a fatal SDK error belongs to the main camera.
                         raise
                     # Camera wedged mid-capture in a native SDK call. Try to reopen the
                     # camera and continue — losing at most this FOV — instead of losing
@@ -4112,7 +4144,7 @@ class MultiPointWorker:
         # (target vs. corrected Z) to autofocus_log.csv.
         self._autofocus_and_record(region_id, fov, current_path)
 
-        if getattr(self, "validation_mode", False):
+        if self.validation_only:
             pos = self.stage.get_pos()
             self.update_coordinates_dataframe(region_id, 0, pos, fov)
             self.callbacks.signal_current_fov(pos.x_mm, pos.y_mm)
@@ -4410,6 +4442,130 @@ class MultiPointWorker:
         if reference is not None:
             self.laser_auto_focus_controller.apply_reference(reference)
 
+    def _run_owned_contrast_scan(self, state):
+        """Drain imaging, run one synchronous scan, then restore camera ownership.
+
+        The worker is the sole trigger scheduler here. Raw-arrival IDs remain
+        tagged as AF until decoded propagation has completed. A missing raw
+        arrival or failed cleanup aborts the run before any imaging trigger.
+        """
+        from control.core.contrast_autofocus.capture import StageCaptureSession
+        from control.core.contrast_autofocus.metrics import energy_factor
+        from control.core.contrast_autofocus.service import run_contrast_search
+        from control.models.contrast_autofocus import ContrastAFSettings
+
+        if self.abort_requested_fn():
+            raise InterruptedError("Acquisition aborted before contrast autofocus")
+        def wait_for(event, description):
+            deadline = time.monotonic() + self._frame_wait_timeout_s()
+            while not event.wait(0.05):
+                if self.abort_requested_fn():
+                    raise InterruptedError("Acquisition aborted while draining " + description)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(description + " did not drain before autofocus")
+
+        wait_for(self._ready_for_next_trigger, "imaging raw arrival")
+        wait_for(self._image_callback_idle, "imaging decode/dispatch")
+        if self._current_capture_info is not None or self._pending_capture_info_by_frame_id:
+            raise RuntimeError("Imaging metadata remained pending before autofocus")
+
+        settings = ContrastAFSettings.model_validate(
+            state.contrast_af.model_dump() if state.contrast_af is not None else {"method": "legacy"})
+        start = self.stage.get_pos().z_mm * 1000
+        axis = self.stage.get_config().Z_AXIS
+        physical = sorted((axis.raw_to_canonical(axis.MIN_POSITION) * 1000,
+                           axis.raw_to_canonical(axis.MAX_POSITION) * 1000))
+        backlash = float(getattr(self.stage, "_BACKLASH_COMPENSATION_DISTANCE_MM", 0)) * 1000
+        if settings.method == "frequency_assisted":
+            _, _, _, lower, upper, increment, travel_lower, travel_upper = (
+                self.autofocusController._resolve_frequency_request(state))
+        else:
+            step_um = self._contrast_af_step_um
+            count = self._contrast_af_count
+            lower = start - step_um * round(count / 2)
+            upper = lower + count * step_um
+            travel_lower, travel_upper = lower - backlash, upper + backlash
+            increment = abs(axis.convert_to_real_units(1)) * 1000
+            if not physical[0] <= travel_lower < lower <= start <= upper < travel_upper <= physical[1]:
+                # Zero backlash makes the strict inequalities at the ends equal.
+                if not (backlash == 0 and physical[0] <= lower <= start <= upper <= physical[1]):
+                    raise ValueError("Legacy autofocus travel exceeds stage Z limits")
+        metric = FocusMeasureOperator.convert_to_enum(state.focus_measure_operator)
+        cancelled = self.abort_requested_fn
+        session = StageCaptureSession(
+            self.autofocusController, state, lower, upper, cancelled,
+            max_time_s=settings.max_time_s,
+            travel_lower_um=travel_lower, travel_upper_um=travel_upper,
+            apply_camera_live_geometry=True, apply_optical_state=True,
+            wait_for_hardware=self.wait_till_operation_is_completed)
+        session.crop_width = self._contrast_af_crop_width
+        session.crop_height = self._contrast_af_crop_height
+        with self._af_owner_lock:
+            self._af_expected_raw = 0
+            self._af_frame_ids.clear()
+            self._af_session_active = True
+        result = None
+        returned_successfully = False
+        try:
+            with session:
+                def capture_at(z_um):
+                    if self._use_deferred_decode_callback:
+                        with self._af_owner_lock:
+                            self._af_expected_raw += 1
+                    return session.capture_at(z_um)
+
+                result = run_contrast_search(
+                    settings=settings,
+                    legacy_options={
+                        "step_um": self._contrast_af_step_um,
+                        "count": self._contrast_af_count,
+                        "stop_threshold": AF.STOP_THRESHOLD,
+                        "crop_width": self._contrast_af_crop_width,
+                        "crop_height": self._contrast_af_crop_height,
+                    },
+                    capture_at=capture_at, move_to=session.move_to,
+                    restore_to=session.restore_to,
+                    score=lambda image: utils.calculate_focus_measure(image, metric),
+                    energy=lambda image: energy_factor(
+                        image, threshold=settings.energy_threshold,
+                        sensor_full_scale=settings.sensor_full_scale),
+                    cancelled=cancelled, starting_z_um=start, lower_z_um=lower,
+                    upper_z_um=upper, increment_um=increment,
+                    exposure_ms=session.capture_exposure_ms, metric=metric.value,
+                    trigger_route=self._describe_camera_trigger_routing())
+            result.cleanup_errors.extend(session.cleanup_errors)
+            with self._af_owner_lock:
+                if self._af_expected_raw != 0:
+                    raise RuntimeError("AF raw arrivals did not drain; imaging cannot resume")
+                # capture_frame's decoded delivery barrier has returned for
+                # every trigger. Any surviving IDs were consumed by its private
+                # capture callback and never entered acquisition dispatch.
+                self._af_frame_ids.clear()
+            if result.cleanup_errors:
+                raise RuntimeError("Autofocus cleanup failed: " + "; ".join(result.cleanup_errors))
+            returned_successfully = True
+            return result
+        except BaseException as exc:
+            from control.core.contrast_autofocus.search import SearchResult
+            if result is None:
+                result = SearchResult(
+                    "cancelled" if isinstance(exc, InterruptedError) else "hardware_failed",
+                    start, settings=settings.model_dump(mode="json"),
+                    metric=metric.value, trigger_route=self._describe_camera_trigger_routing())
+            elif not isinstance(exc, InterruptedError):
+                result.status = "hardware_failed"
+            result.error = str(exc)
+            for error in session.cleanup_errors:
+                if error not in result.cleanup_errors:
+                    result.cleanup_errors.append(error)
+            self._last_af_result = result
+            raise
+        finally:
+            with self._af_owner_lock:
+                self._af_session_active = False
+            if not returned_successfully:
+                self.request_abort_fn()
+
     def perform_autofocus(self, region_id, fov):
         # Phase F: the stage move that brought us to this FOV was fired async
         # by move_to_coordinate. When AF will actually touch hardware below,
@@ -4422,6 +4578,8 @@ class MultiPointWorker:
         # Reset per call so a prior FOV's status can't leak; the branches below set
         # the real value (ok / stale / table / failed).
         self._last_af_status = "skipped"
+        self._last_af_result = None
+        self._af_failed_for_fov = False
         self._last_af_validation_warning = None
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
@@ -4430,12 +4588,25 @@ class MultiPointWorker:
             # focal/reference plane and acquire_at_position/prepare_z_stack then
             # position the stack around it (bottom/center/top). Cadence-gated by
             # NUMBER_OF_FOVS_PER_AF.
-            if (
-                (self.do_autofocus)
-                and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
-            ):
+            cadence_due = (
+                self.do_autofocus
+                and self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
+            )
+            map_valid = self.do_autofocus and getattr(
+                self, "_contrast_af_use_focus_map", self.autofocusController.use_focus_map)
+            if map_valid:
+                coords = getattr(self, "_contrast_af_focus_map_coords",
+                                 self.autofocusController.focus_map_coords)
+                if len(coords) < 3:
+                    map_valid = False
+                else:
+                    x1, y1, _ = coords[0]
+                    x2, y2, _ = coords[1]
+                    x3, y3, _ = coords[2]
+                    map_valid = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3) != 0
+            if map_valid or cadence_due:
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
+                config_AF = self._contrast_af_state
                 if config_AF is None:
                     available = [s.name for s in self.liveController.get_observation_states()]
                     raise RuntimeError(
@@ -4443,38 +4614,53 @@ class MultiPointWorker:
                         f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
                         f"State, so autofocus cannot be configured. Available: {available}"
                     )
-                if config_AF.contrast_af and config_AF.contrast_af.method == "frequency_assisted":
-                    raise RuntimeError(
-                        "Frequency-assisted contrast AF is manual-only until phase 3 frame ownership "
-                        "is validated. Select legacy autofocus for multipoint acquisition."
-                    )
-                self._select_config(config_AF)
-                if (
-                    self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
-                ) or self.autofocusController.use_focus_map:
-                    self.autofocusController.autofocus()
-                    self.autofocusController.wait_till_autofocus_has_completed()
+                if map_valid:
+                    self.stage.wait_for_idle(1.0)
+                    pos = self.stage.get_pos()
+                    target = utils.interpolate_plane(
+                        *coords[:3],
+                        (pos.x_mm, pos.y_mm))
+                    self.stage.move_z_to(target)
                     # The map short-circuit is a bare move_z_to; give it the
                     # same settle every other pre-capture Z move gets (with
                     # NZ==1 no later stack move sleeps before the trigger).
                     self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
                     self._last_af_status = "map"
-                elif self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0:
-                    configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                    config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
-                    if config_AF is None:
-                        available = [s.name for s in self.liveController.get_observation_states()]
-                        raise RuntimeError(
-                            f"Contrast autofocus channel {configuration_name_AF!r} "
-                            f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
-                            f"State, so autofocus cannot be configured. Available: {available}"
+                elif cadence_due:
+                    result = self._run_owned_contrast_scan(config_AF)
+                    self._last_af_result = result
+                    if result.status != "success":
+                        self._last_af_status = "failed"
+                        can_continue = (
+                            getattr(self, "_contrast_af_failure_policy", "stop") == "continue_restored"
+                            and (
+                                result.status in {"no_texture", "no_bracket", "ambiguous_peak"}
+                                or (result.status == "range_exhausted" and
+                                    result.error in {
+                                        "Move budget exhausted",
+                                        "Frame or exposure budget exhausted",
+                                        "Sharpness still rising at upper Z bound",
+                                        "No accepted interior coarse peak",
+                                        "No two-sided fine peak",
+                                    })
+                            )
+                            and not result.cleanup_errors
+                            and not self.abort_requested_fn()
+                            and result.final_z_um is not None
+                            and abs(result.final_z_um - result.starting_z_um) <= (
+                                abs(self.stage.get_config().Z_AXIS.convert_to_real_units(1)) * 1000)
+                            and abs(self.stage.get_pos().z_mm * 1000 - result.starting_z_um) <= (
+                                abs(self.stage.get_config().Z_AXIS.convert_to_real_units(1)) * 1000)
                         )
-                    self._select_config(config_AF)
-                    # focus_map_override guards the degenerate case of a map
-                    # toggle left on with <3 points — force the real sweep.
-                    self.autofocusController.autofocus(focus_map_override=True)
-                    self.autofocusController.wait_till_autofocus_has_completed()
+                        if can_continue:
+                            self._af_failed_for_fov = True
+                            self._log.warning("Contrast AF %s; acquiring at restored nominal Z", result.status)
+                            return result
+                        self.request_abort_fn()
+                        raise RuntimeError(
+                            f"Contrast autofocus {result.status}: {result.error}")
                     self._last_af_status = "ok"
+                    return result
         else:
             # Laser-AF path. Decide between a full laser-AF "refresh" or a
             # table-only Z move, then run consistency checks where possible.
@@ -4850,8 +5036,26 @@ class MultiPointWorker:
         if self.Nt > 1:
             self._z_pos_proposal[(region_id, fov)] = z_expected_mm
 
-        with self._collect_af_validation(region_id, fov), self._timing.get_timer("perform_autofocus"):
-            af_ok = self.perform_autofocus(region_id, fov)
+        try:
+            with self._collect_af_validation(region_id, fov), self._timing.get_timer("perform_autofocus"):
+                af_outcome = self.perform_autofocus(region_id, fov)
+                from control.core.contrast_autofocus.search import SearchResult
+                if isinstance(af_outcome, SearchResult):
+                    self._last_af_result = af_outcome
+                    af_ok = af_outcome.status == "success" or self._af_failed_for_fov
+                else:
+                    af_ok = bool(af_outcome)
+        except BaseException:
+            try:
+                pos_failed = self.stage.get_pos()
+            except Exception:
+                pos_failed = pos_before
+            self._record_autofocus_event(
+                position_index=fov, region_id=region_id,
+                x_mm=pos_failed.x_mm, y_mm=pos_failed.y_mm,
+                z_expected_mm=z_expected_mm, z_actual_mm=pos_failed.z_mm,
+                status="failed")
+            raise
         if not af_ok:
             self._log.error(
                 f"Autofocus failed at region={region_id} fov={fov}. Continuing to acquire "
@@ -4879,6 +5083,7 @@ class MultiPointWorker:
             self._z_pos_proposal[(region_id, fov)] = pos_after.z_mm
         self._record_autofocus_event(
             position_index=fov,
+            region_id=region_id,
             x_mm=pos_after.x_mm,
             y_mm=pos_after.y_mm,
             z_expected_mm=z_expected_mm,
@@ -4893,7 +5098,7 @@ class MultiPointWorker:
             yield
             return
         controller = self.laser_auto_focus_controller
-        with controller.collect_validation_event() as operations:
+        with controller.collect_validation_event(save_all=collector.save_all) as operations:
             fatal_error = None
             try:
                 yield
@@ -4926,6 +5131,11 @@ class MultiPointWorker:
                     "timestamp": time.time(), "phase": phase, "time_point": self.time_point,
                     "region_id": str(region_id), "fov": fov, "x_mm": pos.x_mm, "y_mm": pos.y_mm,
                     "snapshot_z_mm": pos.z_mm, "snapshot_error": snapshot_error,
+                    "imaging_enabled": bool(getattr(self, "validation_with_imaging", False)),
+                    "image_file_prefix": (
+                        f"{region_id}_{fov:0{FILE_ID_PADDING}}_"
+                        if phase == "acquisition" and getattr(self, "validation_with_imaging", False) else None
+                    ),
                     "af_status": self._last_af_status if phase == "acquisition" else "seed",
                     "warning": getattr(self, "_last_af_validation_warning", None) if phase == "acquisition" else None,
                 }
@@ -4945,7 +5155,7 @@ class MultiPointWorker:
                 if restore_error is not None:
                     raise restore_error
 
-    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status):
+    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status, region_id=None):
         """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
 
         Best-effort: a logging failure must never interrupt the acquisition.
@@ -4973,6 +5183,47 @@ class MultiPointWorker:
                 )
         except Exception as e:
             self._log.warning(f"Failed to append autofocus_log.csv: {e}")
+        # Versioned detail is keyed to the same FOV row as the compatibility
+        # CSV.  Map and skipped rows carry no measured search result.
+        try:
+            result = getattr(self, "_last_af_result", None)
+            state = getattr(self, "_contrast_af_state", None)
+            detail = {
+                "schema_version": 1,
+                "acquisition": self.experiment_ID,
+                "time_point": self.time_point,
+                "region_id": region_id,
+                "fov": position_index,
+                "attempt": 1,
+                "status": status,
+                "z_expected_mm": z_expected_mm,
+                "z_actual_mm": z_actual_mm,
+                "stage_z_before_mm": z_expected_mm,
+                "stage_z_after_mm": z_actual_mm,
+                "piezo_um_before": getattr(self, "z_piezo_um", None) if getattr(self, "use_piezo", False) else None,
+                "piezo_um_after": getattr(self, "z_piezo_um", None) if getattr(self, "use_piezo", False) else None,
+                "x_mm": x_mm,
+                "y_mm": y_mm,
+                "af_state": getattr(state, "name", None),
+                "af_settings": (
+                    state.contrast_af.model_dump(mode="json")
+                    if state is not None and state.contrast_af is not None else None),
+                "method": getattr(getattr(state, "contrast_af", None), "method", None),
+                "metric": getattr(state, "focus_measure_operator", None),
+                "search_status": getattr(result, "status", None),
+                "reason": getattr(result, "error", None),
+                "frames": getattr(result, "frames", 0),
+                "moves": getattr(result, "moves", 0),
+                "elapsed_s": getattr(result, "elapsed_s", 0),
+                "fallback_used": getattr(result, "fallback_used", False),
+                "trigger_route": getattr(result, "trigger_route", None),
+                "logical_mode": getattr(result, "logical_mode", None),
+                "cleanup_errors": getattr(result, "cleanup_errors", []),
+            }
+            with open(os.path.join(self.experiment_path, "autofocus_detail.jsonl"), "a") as f:
+                f.write(json.dumps(detail, default=str) + "\n")
+        except Exception as e:
+            self._log.warning("Failed to append autofocus_detail.jsonl: %s", e)
 
     def _reference_z_level(self) -> int:
         """Z-plane index of the focus/reference plane within the stack.
@@ -5027,24 +5278,36 @@ class MultiPointWorker:
           * Set _ready_for_next_trigger so the worker can proceed to the next
             capture while this frame's decode + dispatch continue in parallel.
         """
+        with self._af_owner_lock:
+            if self._af_session_active:
+                self._af_frame_ids.add(frame_id)
+                self._af_expected_raw -= 1
+                if self._af_expected_raw < 0:
+                    self._log.error("Untriggered frame arrived during contrast AF; aborting")
+                    self.request_abort_fn()
+                return
         ic_entry = time.perf_counter()
         info = self._current_capture_info
         self._current_capture_info = None
-        # Only track outstanding for frames we actually expect _image_callback
-        # to dispatch. A None info means the frame arrived without a matching
-        # CaptureInfo — that's an error condition; _image_callback will log+abort,
-        # and we don't want the missing-info case to leak a phantom outstanding
-        # count into the end-of-acquisition wait.
-        if info is not None:
-            self._pending_capture_info_by_frame_id[frame_id] = info
-            with self._outstanding_lock:
-                self._outstanding_frames += 1
-                self._image_callback_idle.clear()
+        if info is None:
+            self._log.error("Raw frame arrived without imaging CaptureInfo after contrast AF; aborting")
+            self.request_abort_fn()
+            return
+        # Only track outstanding for frames that have imaging metadata. A
+        # stale AF arrival after release cannot wake the imaging trigger loop.
+        self._pending_capture_info_by_frame_id[frame_id] = info
+        with self._outstanding_lock:
+            self._outstanding_frames += 1
+            self._image_callback_idle.clear()
         self._capture_ts["ic_entry"] = ic_entry
         self._ready_for_next_trigger.set()
         self._capture_ts["ic_event_set"] = time.perf_counter()
 
     def _image_callback(self, camera_frame: CameraFrame):
+        with self._af_owner_lock:
+            if camera_frame.frame_id in self._af_frame_ids:
+                self._af_frame_ids.discard(camera_frame.frame_id)
+                return
         # Deferred path (Tucsen SDK callback): _on_frame_arrived already
         # snapshotted the CaptureInfo under this frame_id, signalled the
         # worker, and bumped the outstanding counter. We just pop the info
@@ -5276,6 +5539,7 @@ class MultiPointWorker:
                 region_id=region_id,
                 fov=fov,
                 configuration_idx=config_idx,
+                acquired_after_af_failure=getattr(self, "_af_failed_for_fov", False),
                 time_point=self.time_point,
                 filename_channel_label=filename_channel_label,
                 file_saving_option=self.file_saving_option,

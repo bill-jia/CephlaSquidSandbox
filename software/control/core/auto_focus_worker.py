@@ -60,13 +60,14 @@ class AutofocusWorker:
     def _run_frequency_assisted(self):
         from control.core.contrast_autofocus.capture import StageCaptureSession
         from control.core.contrast_autofocus.metrics import energy_factor
-        from control.core.contrast_autofocus.search import run_search
+        from control.core.contrast_autofocus.service import run_contrast_search
         state, settings, start, lower, upper, increment, travel_lower, travel_upper = (
             self.autofocusController._frequency_request)
         cancelled = lambda: not self._keep_running.is_set()
         session = StageCaptureSession(self.autofocusController, state, lower, upper, cancelled,
                                       max_time_s=settings.max_time_s,
-                                      travel_lower_um=travel_lower, travel_upper_um=travel_upper)
+                                      travel_lower_um=travel_lower, travel_upper_um=travel_upper,
+                                      apply_optical_state=True)
         try:
             with session:
                 def capture_and_display(z_um):
@@ -74,9 +75,10 @@ class AutofocusWorker:
                     self._image_to_display_fn(sample.image)
                     return sample
 
-                result = run_search(
+                result = run_contrast_search(
                     capture_at=capture_and_display, move_to=session.move_to, settings=settings,
-                    sharpness=lambda image: utils.calculate_focus_measure(image, self.focus_measure_operator),
+                    legacy_options={},
+                    score=lambda image: utils.calculate_focus_measure(image, self.focus_measure_operator),
                     energy=lambda image: energy_factor(image, threshold=settings.energy_threshold,
                                                        sensor_full_scale=settings.sensor_full_scale),
                     cancelled=cancelled, starting_z_um=start, lower_z_um=lower, upper_z_um=upper,
@@ -144,54 +146,46 @@ class AutofocusWorker:
                 self.camera.stop_streaming()
 
     def _run_autofocus_scan(self):
-        # @@@ to add: increase gain, decrease exposure time
-        # @@@ can move the execution into a thread - done 08/21/2021
-        self._log.info(f"Starting autofocus with {self.N} steps and deltaZ={self.deltaZ} mm")
-        measurements = []
-        focus_measure_max = 0
-        z_af_offset = self.deltaZ * round(self.N / 2)
-        steps_moved = 0
-        self.stage.move_z(-z_af_offset)
-        try:
-            for i in range(self.N):
-                if not self._keep_running.is_set():
-                    self._log.warning("Signal to abort autofocus received, aborting!")
-                    break
-                self.stage.move_z(self.deltaZ)
-                steps_moved += 1
-                image = self._acquire_frame()
-                if image is None:
-                    raise RuntimeError("Autofocus received no camera frame")
-                image = utils.crop_image(image, self.crop_width, self.crop_height)
-                self._image_to_display_fn(image)
+        from control.core.contrast_autofocus.search import FocusSample, StageFault
+        from control.core.contrast_autofocus.service import run_legacy_scan
 
-                timestamp_0 = time.time()
-                focus_measure = utils.calculate_focus_measure(image, self.focus_measure_operator)
-                self._log.info(
-                    "Calculating focus measure %s took %.3f seconds",
-                    self.focus_measure_operator, time.time() - timestamp_0,
-                )
-                measurements.append((i, focus_measure))
-                self._log.info(
-                    "%s %s vs max focus measure %s at z=%s mm",
-                    i, focus_measure, focus_measure_max, self.stage.get_pos().z_mm,
-                )
-                focus_measure_max = max(focus_measure, focus_measure_max)
-                if focus_measure < focus_measure_max * control._def.AF.STOP_THRESHOLD:
-                    break
-        except BaseException:
-            # A missing frame is a failed scan, never an in-focus plane.
-            self.stage.move_z(z_af_offset - steps_moved * self.deltaZ)
-            raise
+        z_mm = self.stage.get_pos().z_mm
+        start_um = float(z_mm) * 1000 if isinstance(z_mm, (int, float)) else 0.0
+        current_um = start_um
 
-        # Approach the chosen plane in the same direction as the scan.
-        self.stage.move_z(-steps_moved * self.deltaZ)
-        if not measurements:
-            self.stage.move_z(z_af_offset)
+        def move_to(target_um):
+            nonlocal current_um
+            try:
+                self.stage.move_z((target_um - current_um) / 1000)
+                current_um = target_um
+                return current_um
+            except Exception as exc:
+                raise StageFault(str(exc)) from exc
+
+        def capture_at(target_um):
+            actual_um = move_to(target_um)
+            image = self._acquire_frame()
+            if image is None:
+                return FocusSample(None, actual_um)
+            image = utils.crop_image(image, self.crop_width, self.crop_height)
+            self._image_to_display_fn(image)
+            return FocusSample(image, actual_um)
+
+        result = run_legacy_scan(
+            capture_at=capture_at, move_to=move_to, restore_to=move_to,
+            score=lambda image: utils.calculate_focus_measure(image, self.focus_measure_operator),
+            cancelled=lambda: not self._keep_running.is_set(),
+            starting_z_um=start_um, step_um=self.deltaZ * 1000, count=self.N,
+            stop_threshold=control._def.AF.STOP_THRESHOLD,
+            metric=self.focus_measure_operator.value,
+            settings={"method": "legacy", "count": self.N,
+                      "step_um": self.deltaZ * 1000,
+                      "crop_width": self.crop_width, "crop_height": self.crop_height},
+            trigger_route=getattr(self.camera, "describe_trigger_routing", lambda: "unknown")())
+        self.autofocusController.last_result = result
+        if result.status == "cancelled":
             return
-        idx_in_focus = max(measurements, key=lambda item: item[1])[0]
-        self.stage.move_z((idx_in_focus + 1) * self.deltaZ)
-        if idx_in_focus == 0:
-            self._log.info("moved to the bottom end of the AF range")
-        if idx_in_focus == self.N - 1:
-            self._log.info("moved to the top end of the AF range")
+        if result.status != "success":
+            if result.error and "timed out" in result.error.lower():
+                raise TimeoutError(result.error)
+            raise RuntimeError(result.error or result.status)

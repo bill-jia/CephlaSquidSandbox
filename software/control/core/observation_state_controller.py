@@ -790,6 +790,112 @@ class ObservationStateController:
             self.turn_on_illumination()
             lc._start_new_timer()
 
+    def read_capture_optical_state(self) -> dict:
+        """Read optical hardware for AF handoff; never substitute preset values."""
+        addons = getattr(self.microscope, "addons", None)
+        wheel = getattr(addons, "emission_filter_wheel", None)
+        xlight = getattr(addons, "xlight", None)
+        dragonfly = getattr(addons, "dragonfly", None)
+        if dragonfly is not None:
+            mode = str(dragonfly.get_modality()).upper() == "CONFOCAL"
+        elif xlight is not None:
+            mode = bool(int(xlight.get_disk_position()))
+        else:
+            mode = self.is_confocal_mode()
+        motor_running = (bool(xlight.get_disk_motor_state())
+                         if xlight is not None and dragonfly is None and mode and
+                         getattr(xlight, "has_spinning_disk_motor", False) else None)
+        filters = {}
+        if wheel is not None:
+            positions = wheel.get_filter_wheel_position()
+            if not isinstance(positions, dict) or not positions:
+                raise RuntimeError("Emission wheel readback is unavailable")
+            filters = {int(k): int(v) for k, v in positions.items()}
+        elif dragonfly is not None:
+            port = int(dragonfly.get_camera_port())
+            filters = {port: int(dragonfly.get_emission_filter(port))}
+        elif xlight is not None and not getattr(xlight, "disable_emission_filter_wheel", False) and getattr(xlight, "has_emission_filters_wheel", True):
+            filters = {1: int(xlight.get_emission_filter())}
+        confocal = {}
+        if xlight is not None and dragonfly is None:
+            for capable, _, field, cast in self._XLIGHT_CONFOCAL_FIELDS:
+                if getattr(xlight, capable, False):
+                    getter = {
+                        "illumination_iris": "get_illumination_iris",
+                        "emission_iris": "get_emission_iris",
+                        "dichroic_position": "get_dichroic",
+                        "filter_slider_position": "get_filter_slider",
+                    }[field]
+                    confocal[field] = cast(getattr(xlight, getter)())
+        return {"confocal_mode": mode, "motor_running": motor_running,
+                "filters": filters, "confocal": confocal,
+                "auto_switch": self.enable_channel_auto_filter_switching}
+
+    def _write_capture_optical_values(self, values: dict) -> None:
+        addons = getattr(self.microscope, "addons", None)
+        wheel = getattr(addons, "emission_filter_wheel", None)
+        xlight = getattr(addons, "xlight", None)
+        dragonfly = getattr(addons, "dragonfly", None)
+        mode = values["confocal_mode"]
+        if dragonfly is not None:
+            dragonfly.set_modality("CONFOCAL" if mode else "BF")
+        elif xlight is not None:
+            motor_stopped = (mode and getattr(xlight, "has_spinning_disk_motor", False)
+                             and not xlight.get_disk_motor_state())
+            if getattr(xlight, "spinning_disk_pos", None) != int(mode) or motor_stopped:
+                serial_peripherals.set_xlight_confocal_mode(xlight, mode)
+        elif mode != self.is_confocal_mode():
+            raise RuntimeError("No confocal device is available for the requested optical mode")
+        self.toggle_confocal_widefield(mode)
+        filters = values["filters"]
+        if filters:
+            if wheel is not None:
+                wheel.set_filter_wheel_position(filters)
+            elif dragonfly is not None:
+                for port, position in filters.items():
+                    dragonfly.set_emission_filter(port, position)
+            elif xlight is not None and not getattr(xlight, "disable_emission_filter_wheel", False) and getattr(xlight, "has_emission_filters_wheel", True):
+                xlight.set_emission_filter(filters[1], extraction=False)
+            else:
+                raise RuntimeError("No emission filter wheel is available for the requested optical state")
+        if values["confocal"]:
+            if xlight is None or dragonfly is not None:
+                raise RuntimeError("No X-Light is available for the requested confocal settings")
+            setters = {
+                "illumination_iris": "set_illumination_iris",
+                "emission_iris": "set_emission_iris",
+                "dichroic_position": "set_dichroic",
+                "filter_slider_position": "set_filter_slider",
+            }
+            for field, value in values["confocal"].items():
+                getattr(xlight, setters[field])(value)
+        self.enable_channel_auto_filter_switching = values["auto_switch"]
+
+    def apply_capture_optical_state(self, state: ObservationState) -> None:
+        """Apply only explicitly requested AF optics; propagate device errors."""
+        filters = self.capture_filter_targets(state)
+        confocal = ({field: value for field, value in state.confocal_hardware_settings.model_dump().items()
+                     if value is not None} if state.confocal_hardware_settings is not None else {})
+        self._write_capture_optical_values({
+            "confocal_mode": state.confocal_mode, "filters": filters,
+            "confocal": confocal,
+            "auto_switch": (self.enable_channel_auto_filter_switching if
+                            state.enable_channel_auto_filter_switching is None else
+                            bool(state.enable_channel_auto_filter_switching)),
+        })
+        self._current_state = state
+
+    def capture_filter_targets(self, state: ObservationState) -> dict:
+        """Map a preset's default filter to the active physical wheel port."""
+        dragonfly = getattr(getattr(self.microscope, "addons", None), "dragonfly", None)
+        default_port = int(dragonfly.get_camera_port()) if dragonfly is not None else 1
+        return {default_port if str(k) == "default" else int(k): int(v)
+                for k, v in state.emission_filter_positions.items()}
+
+    def restore_capture_optical_state(self, snapshot: dict) -> None:
+        """Restore the measured imaging path, including partially specified optics."""
+        self._write_capture_optical_values(snapshot)
+
     # ─────────────────────────────────────────────────────────────────────
     # Preset apply
     # ─────────────────────────────────────────────────────────────────────

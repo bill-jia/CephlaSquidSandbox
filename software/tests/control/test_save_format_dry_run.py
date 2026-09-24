@@ -10,11 +10,12 @@ against the real combobox and a mock controller.
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 pytest.importorskip("qtpy")
-from qtpy.QtWidgets import QApplication
+from qtpy.QtWidgets import QApplication, QCheckBox
 
 from control._def import FileSavingOption
 from gui.widgets.multipoint import (
@@ -24,6 +25,8 @@ from gui.widgets.multipoint import (
     _is_dry_run,
     _make_file_saving_format_row,
     _push_save_format_to_controller,
+    _af_validation_only,
+    _validate_af_image_saving,
 )
 
 
@@ -100,3 +103,30 @@ def test_yaml_without_skip_saving_leaves_dry_run(qt_app):
     _apply_save_format_from_yaml(widget, SimpleNamespace(skip_saving=False))
 
     assert widget.combobox_fileSavingFormat.currentText() == FileSavingOption.OME_TIFF.name
+
+
+@pytest.mark.parametrize("enabled, imaging, only", [(False, False, False), (False, True, False),
+                                                    (True, False, True), (True, True, False)])
+def test_validation_imaging_controls_and_yaml_restore(qt_app, enabled, imaging, only):
+    widget = _Widget()
+    widget.checkbox_afValidation = QCheckBox()
+    widget.checkbox_afValidationImaging = QCheckBox()
+    _apply_save_format_from_yaml(widget, SimpleNamespace(
+        validation_mode=enabled, validation_with_imaging=imaging, skip_saving=False,
+    ))
+    assert widget.checkbox_afValidation.isChecked() is enabled
+    assert widget.checkbox_afValidationImaging.isChecked() is imaging
+    assert _af_validation_only(widget) is only
+    assert _validate_af_image_saving(widget)
+
+
+def test_imaging_validation_dry_run_shows_actionable_error(qt_app):
+    widget = _Widget()
+    widget.checkbox_afValidation = QCheckBox()
+    widget.checkbox_afValidationImaging = QCheckBox()
+    widget.checkbox_afValidation.setChecked(True)
+    widget.checkbox_afValidationImaging.setChecked(True)
+    widget.combobox_fileSavingFormat.setCurrentText(DRY_RUN_SAVE_FORMAT)
+    with patch("gui.widgets.multipoint.QMessageBox.warning") as warning:
+        assert not _validate_af_image_saving(widget)
+        assert "image-saving format" in warning.call_args.args[2]

@@ -1787,6 +1787,7 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
     validation_checkbox = getattr(widget, "checkbox_afValidation", None)
     if validation_checkbox is not None:
         validation_checkbox.setChecked(yaml_data.validation_mode)
+        widget.checkbox_afValidationImaging.setChecked(yaml_data.validation_with_imaging)
     combo = widget.combobox_fileSavingFormat
     if yaml_data.skip_saving:
         combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
@@ -2129,6 +2130,20 @@ _SIZE_ESTIMATE_TOOLTIP = (
 )
 
 
+def _af_validation_only(widget):
+    enabled = getattr(widget, "checkbox_afValidation", None)
+    imaging = getattr(widget, "checkbox_afValidationImaging", None)
+    return bool(enabled is not None and enabled.isChecked() and not (imaging is not None and imaging.isChecked()))
+
+
+def _validate_af_image_saving(widget):
+    if (widget.checkbox_afValidation.isChecked() and widget.checkbox_afValidationImaging.isChecked()
+            and _is_dry_run(widget.combobox_fileSavingFormat)):
+        QMessageBox.warning(widget, "AF validation", "Select an image-saving format instead of dry run to save imaging alongside AF artifacts.")
+        return False
+    return True
+
+
 def _refresh_size_estimate(widget) -> None:
     """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
 
@@ -2141,7 +2156,7 @@ def _refresh_size_estimate(widget) -> None:
     if label is None:
         return
     validation_checkbox = getattr(widget, "checkbox_afValidation", None)
-    if validation_checkbox is not None and validation_checkbox.isChecked():
+    if _af_validation_only(widget):
         label.setText("AF validation: diagnostics only; size depends on failures")
         label.setToolTip("No channel images. AF frames and metadata are saved in af_validation.")
         return
@@ -2163,6 +2178,9 @@ def _refresh_size_estimate(widget) -> None:
         else "Select a channel to estimate size"
     )
     label.setText(_format_acquisition_size_estimate(widget.multipointController, has_selection, skip_saving, hint))
+    if validation_checkbox is not None and validation_checkbox.isChecked():
+        label.setText(label.text() + " + all AF artifacts")
+        label.setToolTip(_SIZE_ESTIMATE_TOOLTIP + "\nAF artifact storage is additional and is not included in this estimate.")
 
 
 def _make_file_saving_format_row(initial_option=None) -> "tuple[QVBoxLayout, QComboBox, QLabel]":
@@ -3511,7 +3529,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
         else:
             self.checkbox_withReflectionAutofocus.setChecked(False)
-            self.checkbox_withReflectionAutofocus.setVisible(False)
             self.multipointController.set_reflection_af_flag(False)
 
         self.checkbox_genAFMap = QCheckBox("Generate Focus Map")
@@ -3526,14 +3543,23 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
-        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation = QCheckBox("AF validation run")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
-            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Requires Laser AF. By default, walk positions and timepoints using the normal AF cadence. "
             "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
             "in the experiment's af_validation folder."
         )
+        self.checkbox_afValidationImaging = QCheckBox("Also image and save all AF artifacts")
+        self.checkbox_afValidationImaging.setEnabled(False)
+        self.checkbox_afValidationImaging.setToolTip(
+            "Run normal channel and Z-stack imaging while saving every AF operation's native frames, "
+            "full-sensor snapshot and metadata. Match images by timepoint, region and FOV. "
+            "Requires an image-saving format; adds capture time and disk usage."
+        )
+        self.checkbox_afValidation.toggled.connect(self.checkbox_afValidationImaging.setEnabled)
         self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
+        self.checkbox_afValidationImaging.toggled.connect(lambda *_: _refresh_size_estimate(self))
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
@@ -3755,18 +3781,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # Laser AF is a settings *button* (it opens a dialog), but it is a focus
         # setting like the two checkboxes around it, so it sits here at normal
         # control height rather than in the actions column.
-        if self._enable_laser_autofocus:
-            laser_af_row = QHBoxLayout()
-            laser_af_row.addWidget(QLabel("Laser AF"))
-            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
-            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
-            laser_af_row.addStretch(1)
-            focus_content.addLayout(laser_af_row)
+        laser_af_row = QHBoxLayout()
+        self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+        laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+        laser_af_row.addStretch(1)
+        focus_content.addLayout(laser_af_row)
         # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
         saving_content.addWidget(self.checkbox_afValidation)
+        saving_content.addWidget(self.checkbox_afValidationImaging)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
 
@@ -3820,6 +3845,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
+        self.checkbox_withReflectionAutofocus.contrastToggled.connect(self.checkbox_withAutofocus.setChecked)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
@@ -4330,14 +4356,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # flexible and wellplate tabs each have their own combo/row bound
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
-            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
+            self.multipointController.set_validation_mode(
+                self.checkbox_afValidation.isChecked(), self.checkbox_afValidationImaging.isChecked()
+            )
+            if not _validate_af_image_saving(self):
+                self.btn_startAcquisition.setChecked(False)
+                return
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
             self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not _af_validation_only(self) and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
@@ -4346,19 +4377,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # "start without streaming" here disables the upload target, and
             # the space check must then be evaluated against full local
             # retention rather than the streaming per-timepoint discount.
-            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
+            if not _af_validation_only(self) and not check_streaming_target_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
+            if _af_validation_only(self) or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
+            if not _af_validation_only(self) and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
@@ -5064,8 +5095,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
-        if self._enable_laser_autofocus:
-            self.checkbox_withReflectionAutofocus.setEnabled(enabled)
+        self.checkbox_withReflectionAutofocus.setEnabled(enabled)
         self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
         self.checkbox_zstack.setEnabled(enabled)
@@ -5194,6 +5224,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                 self.list_configurations.blockSignals(False)
 
             # Autofocus
+            self.multipointController.restore_contrast_af_from_acquisition_yaml(
+                yaml_data.contrast_af_state_name, yaml_data.contrast_af_effective)
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
@@ -5549,7 +5581,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
         else:
             self.checkbox_withReflectionAutofocus.setChecked(False)
-            self.checkbox_withReflectionAutofocus.setVisible(False)
             self.multipointController.set_reflection_af_flag(False)
 
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
@@ -5558,14 +5589,23 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
-        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation = QCheckBox("AF validation run")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
-            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Requires Laser AF. By default, walk positions and timepoints using the normal AF cadence. "
             "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
             "in the experiment's af_validation folder."
         )
+        self.checkbox_afValidationImaging = QCheckBox("Also image and save all AF artifacts")
+        self.checkbox_afValidationImaging.setEnabled(False)
+        self.checkbox_afValidationImaging.setToolTip(
+            "Run normal channel and Z-stack imaging while saving every AF operation's native frames, "
+            "full-sensor snapshot and metadata. Match images by timepoint, region and FOV. "
+            "Requires an image-saving format; adds capture time and disk usage."
+        )
+        self.checkbox_afValidation.toggled.connect(self.checkbox_afValidationImaging.setEnabled)
         self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
+        self.checkbox_afValidationImaging.toggled.connect(lambda *_: _refresh_size_estimate(self))
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
@@ -5807,18 +5847,17 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         focus_content.addWidget(self.checkbox_withAutofocus)
         # Laser AF is a settings button (it opens a dialog) but it is a focus setting,
         # so it sits here at normal control height, not in the actions column.
-        if self._enable_laser_autofocus:
-            laser_af_row = QHBoxLayout()
-            laser_af_row.addWidget(QLabel("Laser AF"))
-            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
-            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
-            laser_af_row.addStretch(1)
-            focus_content.addLayout(laser_af_row)
+        laser_af_row = QHBoxLayout()
+        self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+        laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+        laser_af_row.addStretch(1)
+        focus_content.addLayout(laser_af_row)
         # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
         saving_content.addWidget(self.checkbox_afValidation)
+        saving_content.addWidget(self.checkbox_afValidationImaging)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
 
@@ -5879,6 +5918,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         # Coverage is read-only, derived from scan_size, FOV, and overlap
         self.combobox_shape.currentTextChanged.connect(self.on_shape_changed)
         self.checkbox_withAutofocus.toggled.connect(self.multipointController.set_af_flag)
+        self.checkbox_withReflectionAutofocus.contrastToggled.connect(self.checkbox_withAutofocus.setChecked)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
@@ -6896,33 +6936,38 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # Re-push THIS tab's visible save-format + streaming state (the
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
-            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
+            self.multipointController.set_validation_mode(
+                self.checkbox_afValidation.isChecked(), self.checkbox_afValidationImaging.isChecked()
+            )
+            if not _validate_af_image_saving(self):
+                self.btn_startAcquisition.setChecked(False)
+                return
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
             self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
             self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not _af_validation_only(self) and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
             # Probe the streaming target BEFORE the disk-space check (see the
             # flexible widget's start flow for the rationale).
-            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
+            if not _af_validation_only(self) and not check_streaming_target_with_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.info("Acquisition cancelled by user over unusable streaming target.")
                 return
 
-            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
+            if _af_validation_only(self) or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 return
 
-            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
+            if not _af_validation_only(self) and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self.btn_startAcquisition.setChecked(False)
@@ -7475,6 +7520,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 self.list_configurations.blockSignals(False)
 
             # Autofocus
+            self.multipointController.restore_contrast_af_from_acquisition_yaml(
+                yaml_data.contrast_af_state_name, yaml_data.contrast_af_effective)
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
@@ -7657,7 +7704,6 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_reflection_af_flag(MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT)
         else:
             self.checkbox_withReflectionAutofocus.setChecked(False)
-            self.checkbox_withReflectionAutofocus.setVisible(False)
             self.multipointController.set_reflection_af_flag(False)
 
         # Piezo checkbox
@@ -7729,14 +7775,11 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
 
         # Options layout
         options_layout = QVBoxLayout()
-        if self._enable_laser_autofocus:
-            # The button's text is only the state ("Off ▸"), so it needs its name beside it.
-            laser_af_row = QHBoxLayout()
-            laser_af_row.addWidget(QLabel("Laser AF"))
-            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
-            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
-            laser_af_row.addStretch(1)
-            options_layout.addLayout(laser_af_row)
+        laser_af_row = QHBoxLayout()
+        self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+        laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+        laser_af_row.addStretch(1)
+        options_layout.addLayout(laser_af_row)
         if HAS_OBJECTIVE_PIEZO:
             options_layout.addWidget(self.checkbox_usePiezo)
             if IS_PIEZO_ONLY:

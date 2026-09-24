@@ -12,3 +12,4 @@ plans/
 .pio/
 
 example_outputs/
+.claude/laser-af-validation-original.zip
