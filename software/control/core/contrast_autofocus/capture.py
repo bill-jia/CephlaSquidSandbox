@@ -35,9 +35,18 @@ class StageCaptureSession:
         self.callbacks_enabled = self.camera.get_callbacks_enabled()
         self.mode = self.live.trigger_mode
         self.original_exposure_ms = float(self.camera.get_exposure_time())
-        self.original_gain = float(self.camera.get_analog_gain())
+        try:
+            self.original_gain = float(self.camera.get_analog_gain())
+        except NotImplementedError:
+            # Some cameras expose no analog-gain API. Leave their gain untouched.
+            self.original_gain = None
+            if state.camera_settings is not None:
+                controller._log.warning(
+                    "Contrast AF is leaving analog gain unchanged: this camera does not support gain control")
         self.capture_exposure_ms = state.exposure_time if state.camera_settings else self.original_exposure_ms
-        self.capture_gain = state.analog_gain if state.camera_settings else self.original_gain
+        self.capture_gain = (
+            state.analog_gain if state.camera_settings else self.original_gain
+        ) if self.original_gain is not None else None
         self.geometry = (self.camera.get_binning(), self.camera.get_region_of_interest(),
                          self.camera.get_pixel_format(), self.camera.get_camera_mode())
         self.entered = False
@@ -55,10 +64,11 @@ class StageCaptureSession:
                 self.live.set_trigger_mode(TriggerMode.SOFTWARE)
             if self.camera.get_exposure_time() != self.capture_exposure_ms:
                 self.camera.set_exposure_time(self.capture_exposure_ms)
-            if self.camera.get_analog_gain() != self.capture_gain:
+            if self.capture_gain is not None and self.camera.get_analog_gain() != self.capture_gain:
                 self.camera.set_analog_gain(self.capture_gain)
             self.capture_exposure_ms = float(self.camera.get_exposure_time())
-            self.capture_gain = float(self.camera.get_analog_gain())
+            if self.capture_gain is not None:
+                self.capture_gain = float(self.camera.get_analog_gain())
             self.camera.start_streaming()
             self.entered = True
             return self
@@ -79,10 +89,12 @@ class StageCaptureSession:
                 self.live.set_trigger_mode(self.mode)
             except (CameraTimeoutError, Exception) as e:
                 errors.append(e)
-        for getter, setter, original in (
+        settings_to_restore = [
             (self.camera.get_exposure_time, self.camera.set_exposure_time, self.original_exposure_ms),
-            (self.camera.get_analog_gain, self.camera.set_analog_gain, self.original_gain),
-        ):
+        ]
+        if self.original_gain is not None:
+            settings_to_restore.append((self.camera.get_analog_gain, self.camera.set_analog_gain, self.original_gain))
+        for getter, setter, original in settings_to_restore:
             try:
                 if getter() != original:
                     setter(original)
@@ -147,7 +159,7 @@ class StageCaptureSession:
                 self.camera.get_pixel_format(), self.camera.get_camera_mode()) != self.geometry:
             raise CaptureFailure("Camera geometry or pixel format changed during autofocus")
         if (self.camera.get_exposure_time() != self.capture_exposure_ms or
-                self.camera.get_analog_gain() != self.capture_gain):
+                (self.capture_gain is not None and self.camera.get_analog_gain() != self.capture_gain)):
             raise CaptureFailure("Camera exposure or gain changed during autofocus")
         actual = self._move(z_um)
         if self.cancelled():

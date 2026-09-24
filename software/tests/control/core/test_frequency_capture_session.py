@@ -7,10 +7,10 @@ import pytest
 from control._def import TriggerMode
 from control.core.contrast_autofocus.capture import StageCaptureSession
 from control.core.contrast_autofocus.search import CaptureFailure
-from control.models.observation_state import ObservationState
+from control.models.observation_state import CameraSettings, ObservationState
 
 
-def make_session():
+def make_session(*, unsupported_gain=False, state=None):
     streaming = [True]
     callbacks = [True]
     camera = MagicMock()
@@ -22,7 +22,13 @@ def make_session():
     camera.get_ready_for_trigger.return_value = True
     camera.get_total_frame_time.return_value = 1
     camera.get_exposure_time.return_value = 1
-    camera.get_analog_gain.return_value = 0
+    if unsupported_gain:
+        camera.get_analog_gain.side_effect = NotImplementedError(
+            "Analog gain is not implemented for this camera.")
+        camera.set_analog_gain.side_effect = NotImplementedError(
+            "Analog gain is not implemented for this camera.")
+    else:
+        camera.get_analog_gain.return_value = 0
     camera.get_binning.return_value = (1, 1)
     camera.get_region_of_interest.return_value = (0, 0, 4, 4)
     camera.get_pixel_format.return_value = "MONO8"
@@ -44,7 +50,7 @@ def make_session():
     live.obs_controller = SimpleNamespace(ic=MagicMock(), microscope=MagicMock())
     controller = SimpleNamespace(camera=camera, stage=stage, liveController=live,
                                  crop_width=4, crop_height=4, _log=MagicMock())
-    return StageCaptureSession(controller, ObservationState(), 0, 40, lambda: False), camera, live, pos, callbacks
+    return StageCaptureSession(controller, state or ObservationState(), 0, 40, lambda: False), camera, live, pos, callbacks
 
 
 def test_session_trigger_and_restore_live_stream_callbacks():
@@ -61,6 +67,21 @@ def test_session_trigger_and_restore_live_stream_callbacks():
     assert callbacks == [True]
     assert camera.stop_streaming.call_count == 2
     assert camera.start_streaming.call_count == 1  # session; mock live has no camera implementation
+
+
+def test_session_captures_without_analog_gain_support():
+    state = ObservationState(camera_settings=CameraSettings(exposure_time_ms=1, gain_mode=3))
+    session, camera, live, _, callbacks = make_session(unsupported_gain=True, state=state)
+    assert session.original_gain is None
+    session.controller._log.warning.assert_called_once()
+    with session:
+        frame = session.capture_at(25)
+        assert frame.actual_z_um == 25
+    camera.get_analog_gain.assert_called_once()
+    camera.set_analog_gain.assert_not_called()
+    assert live.is_live
+    assert callbacks == [True]
+    assert session.cleanup_errors == []
 
 
 def test_session_restores_after_trigger_failure():
