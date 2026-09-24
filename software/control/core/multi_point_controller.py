@@ -365,6 +365,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "widget_type": widget_type,
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
+            "validation_mode": params.validation_mode,
             "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
@@ -571,6 +572,7 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.validation_mode = False
         self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
@@ -879,6 +881,9 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_validation_mode(self, enabled: bool):
+        self.validation_mode = bool(enabled)
 
     def set_retract_z_between_regions(self, retract_z_between_regions):
         """Retract the objective to Z home for every XY move that enters a region.
@@ -1922,7 +1927,10 @@ class MultiPointController:
                     f"Unknown wellplate format '{self.scanCoordinates.format}', using default 96-well dimensions"
                 )
 
-        global_plan, region_plans = self._build_region_plans(scan_position_information.scan_region_names)
+        global_plan, region_plans = (
+            (None, {}) if self.validation_mode
+            else self._build_region_plans(scan_position_information.scan_region_names)
+        )
 
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
@@ -1945,7 +1953,8 @@ class MultiPointController:
             z_stacking_config=self.z_stacking_config,
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
-            skip_saving=self.skip_saving,
+            skip_saving=self.skip_saving or self.validation_mode,
+            validation_mode=self.validation_mode,
             retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
@@ -1971,10 +1980,10 @@ class MultiPointController:
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
             laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
             laser_af_table_path_audit=self.laser_af_table_path_audit,
-            zarr_upload_enabled=self.zarr_upload_enabled,
+            zarr_upload_enabled=self.zarr_upload_enabled and not self.validation_mode,
             zarr_upload_remote_root=self.zarr_upload_remote_root,
             zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,
-            estimated_total_disk_bytes=self._estimated_disk_bytes_or_zero(),
+            estimated_total_disk_bytes=0 if self.validation_mode else self._estimated_disk_bytes_or_zero(),
         )
 
     def _estimated_disk_bytes_or_zero(self) -> int:
@@ -2131,6 +2140,9 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
+            self._log.error("AF validation requires laser autofocus and a valid reference.")
+            return False
         # Region names (user-editable on the Flexible tab) become folder names, image
         # filename prefixes and the "region" column of every sidecar. Catch anything
         # unsafe here rather than mid-run, and cover the headless/SiLA entry points
@@ -2170,6 +2182,10 @@ class MultiPointController:
                     "starting acquisition with laser AF enabled."
                 )
                 return False
+
+        # Validation never executes imaging/stimulus/postprocessing plans.
+        if self.validation_mode:
+            return True
 
         # When any selected observation state has timed illuminators (capture-
         # window or stimulus-only), the worker arms an NIDAQ pulse waveform.

@@ -436,9 +436,16 @@ class DefaultCamera(AbstractCamera):
 
         total_exposure_time_ms = self._exposure_time_ms + self._strobe_delay_us / 1000.0
 
-        # If the last frame we got was from <exposure time ago, use it.
-        if self._current_frame and time.time() - self._current_frame.timestamp <= total_exposure_time_ms / 1000.0:
-            return self._current_frame
+        # Cache only frames delivered since the latest trigger. The timestamp
+        # is callback arrival time, not exposure time: triggered consumers
+        # still need a frame-id fence (laser AF also retries dropped triggers).
+        cached_frame = self._current_frame
+        if (
+            cached_frame is not None
+            and cached_frame.timestamp >= self._last_trigger_timestamp
+            and time.time() - cached_frame.timestamp <= total_exposure_time_ms / 1000.0
+        ):
+            return cached_frame
 
         # The camera api isn't really fast, so it is easy to time out waiting for a frame and its processing.  So
         # for the timeout, we add a flat 100 ms to account for that.

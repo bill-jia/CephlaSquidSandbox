@@ -63,6 +63,8 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # AF-only diagnostic walk: no channel images, stacks, stimuli or fluidics.
+    validation_mode: bool = False
     # Which wellplate tiling method NX/NY describe ("fraction" or "grid"); metadata only
     # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
     # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.

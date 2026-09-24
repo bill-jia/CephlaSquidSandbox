@@ -1,5 +1,6 @@
 import atexit
 import csv
+import contextlib
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ import control._def
 from control import utils
 from control.slack_notifier import TimepointStats, AcquisitionStats
 from control.core.auto_focus_controller import AutoFocusController
-from control.core.laser_auto_focus_controller import LaserAutofocusController
+from control.core.laser_auto_focus_controller import LaserAutofocusController, AFValidationRestoreError
 from control.core.live_controller import LiveController
 from control.core.multi_point_utils import (
     AcquisitionParameters,
@@ -1176,7 +1177,8 @@ class MultiPointWorker:
         self.laser_auto_focus_controller: Optional[LaserAutofocusController] = laser_auto_focus_controller
         self.objectiveStore: ObjectiveStore = objective_store
         self.fluidics = scope.addons.fluidics
-        self.use_fluidics = acquisition_parameters.use_fluidics
+        self.validation_mode = acquisition_parameters.validation_mode
+        self.use_fluidics = acquisition_parameters.use_fluidics and not self.validation_mode
         self.keep_illuminators_on_between_captures = (
             acquisition_parameters.keep_illuminators_on_between_captures
         )
@@ -1396,7 +1398,13 @@ class MultiPointWorker:
         # refresh fired, optionally take a verification displacement).
         self._region_refresh_count_this_entry: int = 0
 
-        self.skip_saving = acquisition_parameters.skip_saving
+        self.skip_saving = acquisition_parameters.skip_saving or self.validation_mode
+        self._af_validator = None
+        if self.validation_mode:
+            if not self.do_reflection_af or self.laser_auto_focus_controller is None:
+                raise ValueError("AF validation requires laser autofocus")
+            from control.core.af_validation_collector import AFValidationCollector
+            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, "af_validation"))
         # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
         # move that enters a region (and before the very first move of the
         # run), then drive Z back to the target. Never fires between FOVs
@@ -1412,8 +1420,8 @@ class MultiPointWorker:
         # Guards the once-per-timepoint append to the root acquired_positions.csv.
         self._acquired_positions_appended = False
         job_classes = []
-        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF
-        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3
+        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF and not self.validation_mode
+        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3 and not self.validation_mode
         if not self.skip_saving:
             if use_ome_tiff:
                 job_classes.append(SaveOMETiffJob)
@@ -1422,7 +1430,7 @@ class MultiPointWorker:
             else:
                 job_classes.append(SaveImageJob)
 
-        if extra_job_classes:
+        if extra_job_classes and not self.validation_mode:
             job_classes.extend(extra_job_classes)
 
         # Online postprocessing runs in its own runner (created only when a plan
@@ -1435,7 +1443,7 @@ class MultiPointWorker:
         # Only generate downsampled views for well-based acquisitions
         is_select_wells = acquisition_parameters.xy_mode == "Select Wells"
         is_loaded_wells = acquisition_parameters.xy_mode == "Load Coordinates" and self._is_well_based_acquisition()
-        self._generate_downsampled_views = acquisition_parameters.generate_downsampled_views and (
+        self._generate_downsampled_views = not self.validation_mode and acquisition_parameters.generate_downsampled_views and (
             is_select_wells or is_loaded_wells
         )
         self._downsampled_view_manager: Optional[DownsampledViewManager] = None
@@ -2115,32 +2123,33 @@ class MultiPointWorker:
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
             # frames, stale trigger config) is discarded before acquisition begins.
-            self.camera.stop_streaming()
-            # One-time apply of the first observation state's camera_live snapshot
-            # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
-            # stopped — Tucsen camera mode switches while streaming have caused
-            # issues. Per-FOV applies skip this block (apply_camera_live_snapshot=
-            # False below); without this seed, streaming would start in whatever
-            # mode live mode left the camera in.
-            self._seed_camera_for_first_observation_state()
-            self.camera.start_streaming()
-            # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
-            this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
-            # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
-            # soon as raw bytes arrive, before decode. Snapshots capture_info
-            # and signals _ready_for_next_trigger so the worker can issue the
-            # next trigger in parallel with the still-running decode. Cameras
-            # without this API fall back to the synchronous path inside
-            # _image_callback.
-            # Check the class, not the instance: SimulatedCamera's __getattr__ shim
-            # fabricates a truthy placeholder for any unknown *public* attribute
-            # (so unimplemented SDK methods can be called harmlessly), which makes
-            # instance-level hasattr() always True even though it doesn't actually
-            # support the deferred-decode callback. Checking the type bypasses that
-            # shim and reflects whether the method is genuinely implemented.
-            self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
-            if self._use_deferred_decode_callback:
-                self.camera.add_frame_arrived_callback(self._on_frame_arrived)
+            if not self.validation_mode:
+                self.camera.stop_streaming()
+                # One-time apply of the first observation state's camera_live snapshot
+                # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
+                # stopped — Tucsen camera mode switches while streaming have caused
+                # issues. Per-FOV applies skip this block (apply_camera_live_snapshot=
+                # False below); without this seed, streaming would start in whatever
+                # mode live mode left the camera in.
+                self._seed_camera_for_first_observation_state()
+                self.camera.start_streaming()
+                # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
+                this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
+                # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
+                # soon as raw bytes arrive, before decode. Snapshots capture_info
+                # and signals _ready_for_next_trigger so the worker can issue the
+                # next trigger in parallel with the still-running decode. Cameras
+                # without this API fall back to the synchronous path inside
+                # _image_callback.
+                # Check the class, not the instance: SimulatedCamera's __getattr__ shim
+                # fabricates a truthy placeholder for any unknown *public* attribute
+                # (so unimplemented SDK methods can be called harmlessly), which makes
+                # instance-level hasattr() always True even though it doesn't actually
+                # support the deferred-decode callback. Checking the type bypasses that
+                # shim and reflects whether the method is genuinely implemented.
+                self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
+                if self._use_deferred_decode_callback:
+                    self.camera.add_frame_arrived_callback(self._on_frame_arrived)
             sleep_time = min(self.dt / 20.0, 0.5)
 
             # Send Slack acquisition start notification
@@ -2644,7 +2653,7 @@ class MultiPointWorker:
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                if self.NZ > 1:
+                if self.NZ > 1 and not self.validation_mode:
                     self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
@@ -3863,12 +3872,14 @@ class MultiPointWorker:
         # set_camera_mode pays the first time it actually switches modes)
         # into a dedicated init timer instead of polluting the first FOV's
         # per-capture stats. Amortizes to ~zero over long runs.
-        self._prewarm_observation_states()
+        if not self.validation_mode:
+            self._prewarm_observation_states()
 
         # Precompute FOV-shared postprocessing state (e.g. transfer functions)
         # before any hardware fires, so the first FOV's compute is a cache hit
         # and never stalls the first save/display.
-        self._prewarm_postprocess_routines()
+        if not self.validation_mode:
+            self._prewarm_postprocess_routines()
 
         n_regions = len(self.scan_region_coords_mm)
 
@@ -3884,8 +3895,11 @@ class MultiPointWorker:
             self.num_fovs = len(coordinates)
             # Count imaged frames per position (cycles capture several frames per
             # state), not just distinct channels.
-            frames_per_pos = self._get_region_plan(region_id).frames_per_position
-            self.total_scans = self.num_fovs * self.NZ * frames_per_pos
+            if self.validation_mode:
+                self.total_scans = self.num_fovs
+            else:
+                frames_per_pos = self._get_region_plan(region_id).frames_per_position
+                self.total_scans = self.num_fovs * self.NZ * frames_per_pos
 
             for fov, coordinate_mm in enumerate(coordinates):
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
@@ -3916,6 +3930,10 @@ class MultiPointWorker:
                     with self._timing.get_timer("acquire_at_position"):
                         self.acquire_at_position(region_id, current_path, fov)
                 except CameraTimeoutError as ce:
+                    if self.validation_mode:
+                        # This error came from the focus camera. Reopening the
+                        # main camera cannot recover it; finalize the run.
+                        raise
                     # Camera wedged mid-capture in a native SDK call. Try to reopen the
                     # camera and continue — losing at most this FOV — instead of losing
                     # the rest of the run. If reinit is disabled, exhausted, or fails,
@@ -4093,6 +4111,17 @@ class MultiPointWorker:
         # center, or top slice (see prepare_z_stack). Also records the AF event
         # (target vs. corrected Z) to autofocus_log.csv.
         self._autofocus_and_record(region_id, fov, current_path)
+
+        if getattr(self, "validation_mode", False):
+            pos = self.stage.get_pos()
+            self.update_coordinates_dataframe(region_id, 0, pos, fov)
+            self.callbacks.signal_current_fov(pos.x_mm, pos.y_mm)
+            self.callbacks.signal_region_progress(
+                RegionProgressUpdate(current_fov=fov + 1, region_fovs=len(self.scan_region_fov_coords_mm[region_id]))
+            )
+            self._timepoint_fov_count += 1
+            self.af_fov_count += 1
+            return
 
         if self.NZ > 1:
             self.prepare_z_stack()
@@ -4298,7 +4327,7 @@ class MultiPointWorker:
                 )
 
                 try:
-                    with self._timing.get_timer("af:seed_event"):
+                    with self._collect_af_validation(region_id, fov_idx, "seed"), self._timing.get_timer("af:seed_event"):
                         ok = self.laser_auto_focus_controller.move_to_target(0)
                     if ok:
                         self._fov_z_map[(region_id, fov_idx)] = self.stage.get_pos().z_mm
@@ -4306,6 +4335,8 @@ class MultiPointWorker:
                     else:
                         failed += 1
                         self._log.warning(f"Laser AF failed during seed at region={region_id} fov={fov_idx}")
+                except AFValidationRestoreError:
+                    raise
                 except Exception:
                     failed += 1
                     self._log.exception(f"Laser AF exception during seed at region={region_id} fov={fov_idx}")
@@ -4391,6 +4422,7 @@ class MultiPointWorker:
         # Reset per call so a prior FOV's status can't leak; the branches below set
         # the real value (ok / stale / table / failed).
         self._last_af_status = "skipped"
+        self._last_af_validation_warning = None
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
         if not self.do_reflection_af:
@@ -4504,6 +4536,7 @@ class MultiPointWorker:
                         measured_z = self._region_anchor_z_current[region_id]
                         diff_um = abs(predicted_z - measured_z) * 1000.0
                         if diff_um > self._laser_af_consistency_threshold_um:
+                            self._last_af_validation_warning = f"Table prediction differs by {diff_um:.1f} um"
                             self._log.warning(
                                 f"Laser-AF consistency: table predicted z={predicted_z:.4f} mm, "
                                 f"measured {measured_z:.4f} mm (diff={diff_um:.1f} µm) "
@@ -4543,9 +4576,8 @@ class MultiPointWorker:
                 self._laser_af_check_last_fov_per_region
                 and is_last_fov_in_region
                 and self._region_refresh_count_this_entry == 1
-                # The audit just corrected this FOV, so the check would always
-                # measure ~0; table_path_audit.csv already holds the true error.
-                and self._last_af_status != "audit"
+                # A successful refresh or audit already verified this FOV.
+                and self._last_af_status not in ("ok", "audit")
             ):
                 self._check_last_fov_displacement(region_id, fov)
         return True
@@ -4818,7 +4850,7 @@ class MultiPointWorker:
         if self.Nt > 1:
             self._z_pos_proposal[(region_id, fov)] = z_expected_mm
 
-        with self._timing.get_timer("perform_autofocus"):
+        with self._collect_af_validation(region_id, fov), self._timing.get_timer("perform_autofocus"):
             af_ok = self.perform_autofocus(region_id, fov)
         if not af_ok:
             self._log.error(
@@ -4853,6 +4885,65 @@ class MultiPointWorker:
             z_actual_mm=pos_after.z_mm,
             status=self._last_af_status,
         )
+
+    @contextlib.contextmanager
+    def _collect_af_validation(self, region_id, fov, phase="acquisition"):
+        collector = getattr(self, "_af_validator", None)
+        if collector is None:
+            yield
+            return
+        controller = self.laser_auto_focus_controller
+        with controller.collect_validation_event() as operations:
+            fatal_error = None
+            try:
+                yield
+            except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    fatal_error = str(exc)
+                raise
+            finally:
+                pos = self.stage.get_pos()
+                snapshot, snapshot_error, restore_error = None, None, None
+                if fatal_error is not None:
+                    snapshot_error = f"Snapshot skipped after fatal AF error: {fatal_error}"
+                elif operations:
+                    try:
+                        snapshot = controller.capture_validation_frame()
+                        if snapshot is None:
+                            snapshot_error = "Full-sensor frame unavailable; native AF evidence retained"
+                    except AFValidationRestoreError as exc:
+                        snapshot_error = str(exc)
+                        restore_error = exc
+                    except Exception as exc:
+                        snapshot_error = str(exc)
+                        self._log.exception("AF validation snapshot failed")
+                    except BaseException as exc:
+                        # Preserve the completed AF operation even when the
+                        # subsequent diagnostic capture hits a fatal SDK error.
+                        snapshot_error = f"Fatal snapshot error: {type(exc).__name__}: {exc}"
+                        restore_error = exc
+                metadata = {
+                    "timestamp": time.time(), "phase": phase, "time_point": self.time_point,
+                    "region_id": str(region_id), "fov": fov, "x_mm": pos.x_mm, "y_mm": pos.y_mm,
+                    "snapshot_z_mm": pos.z_mm, "snapshot_error": snapshot_error,
+                    "af_status": self._last_af_status if phase == "acquisition" else "seed",
+                    "warning": getattr(self, "_last_af_validation_warning", None) if phase == "acquisition" else None,
+                }
+                try:
+                    for operation in operations or [None]:
+                        row = dict(metadata)
+                        if operation is not None and operation.get("warning"):
+                            row["warning"] = operation["warning"]
+                        if operation is not None and operation["kind"] == "measurement":
+                            displacement = operation["displacement_um"]
+                            if displacement is not None and abs(displacement) > self._laser_af_consistency_threshold_um:
+                                row["warning"] = f"Measured displacement {displacement:.1f} um exceeds consistency threshold"
+                        collector.record(row, operation, snapshot)
+                except Exception:
+                    self._log.exception("Could not save AF validation evidence")
+                    self.request_abort_fn()
+                if restore_error is not None:
+                    raise restore_error
 
     def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status):
         """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
