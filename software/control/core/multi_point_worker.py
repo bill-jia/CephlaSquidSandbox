@@ -4529,9 +4529,8 @@ class MultiPointWorker:
                 self._laser_af_check_last_fov_per_region
                 and is_last_fov_in_region
                 and self._region_refresh_count_this_entry == 1
-                # The audit just corrected this FOV, so the check would always
-                # measure ~0; table_path_audit.csv already holds the true error.
-                and self._last_af_status != "audit"
+                # A successful refresh or audit already verified this FOV.
+                and self._last_af_status not in ("ok", "audit")
             ):
                 self._check_last_fov_displacement(region_id, fov)
         return True

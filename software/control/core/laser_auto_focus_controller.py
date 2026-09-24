@@ -167,12 +167,21 @@ class LaserAutofocusController(QObject):
     def turn_off_AF_laser(self):
         """Turn off the AF laser via IO endpoint or direct MCU call."""
         with self._time("af:turn_off_AF_laser"):
-            if self._af_laser_ep is not None:
-                self._af_laser_ep.set_digital(False)
-                self._af_laser_ep.wait()
-            else:
-                self.microcontroller.turn_off_AF_laser()
-                self.microcontroller.wait_till_operation_is_completed()
+            for attempt in range(2):
+                try:
+                    if self._af_laser_ep is not None:
+                        self._af_laser_ep.set_digital(False)
+                        self._af_laser_ep.wait()
+                    else:
+                        self.microcontroller.turn_off_AF_laser()
+                        self.microcontroller.wait_till_operation_is_completed()
+                    return
+                except TimeoutError:
+                    if attempt:
+                        self._log.error("AF laser shutdown timed out twice; laser state is unknown.")
+                        raise
+                    self._log.warning("AF laser shutdown timed out; retrying once.")
+                    time.sleep(0.05)
 
     @property
     def _config_repo(self) -> ConfigRepository:
@@ -627,7 +636,17 @@ class LaserAutofocusController(QObject):
                     )
 
                 # Verify using cross-correlation that spot is in same location as reference
-                cc_result, correlation = self._verify_spot_alignment_with_laser_on()
+                try:
+                    cc_result, correlation = self._verify_spot_alignment_with_laser_on()
+                except BaseException as exc:
+                    # Undo the entire correction sequence, including multiple
+                    # iterations. Fatal camera/interrupt exceptions still reach
+                    # the acquisition's abort handler after rollback.
+                    self._rollback_z(total_moved_um)
+                    if not isinstance(exc, Exception):
+                        raise
+                    self._log.exception("Laser AF verification raised; restored starting Z.")
+                    return False
                 self.signal_cross_correlation.emit(correlation)
                 if not cc_result:
                     self._log.warning("Cross correlation check failed - spots not well aligned")
