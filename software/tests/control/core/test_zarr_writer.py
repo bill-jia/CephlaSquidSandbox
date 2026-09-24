@@ -597,6 +597,19 @@ class TestZarrWriterInfo:
         assert cols == [1, 2, 3]
         assert ("A", 1) in wells and ("B", 3) in wells
 
+    def test_snake_acquisition_has_geometric_hcs_field_order(self):
+        # Acquisition starts at the right edge and alternates travel direction.
+        positions = {row * 4 + col: (row * 740.0, (3 - col if row % 2 == 0 else col) * 740.0)
+                     for row in range(4) for col in range(4)}
+        info = ZarrWriterInfo(base_path="/exp", t_size=1, c_size=1, z_size=1,
+                              is_hcs=True, region_fov_counts={"A1": 16},
+                              fov_translations_um={"A1": positions})
+        assert info.get_hcs_field_display_order("A1") == [
+            3, 2, 1, 0, 4, 5, 6, 7, 11, 10, 9, 8, 12, 13, 14, 15]
+        # An incomplete map does not manufacture a display geometry.
+        info.fov_translations_um["A1"].pop(15)
+        assert info.get_hcs_field_display_order("A1") == list(range(16))
+
 
 # ---------------------------------------------------------------------------
 # SaveZarrJob end-to-end (single-process path)
@@ -604,6 +617,28 @@ class TestZarrWriterInfo:
 
 
 class TestSaveZarrJob:
+    def test_well_metadata_lists_snake_fields_by_stage_position(self, monkeypatch):
+        from control.core import zarr_writer
+
+        saved = {}
+        monkeypatch.setattr(zarr_writer, "write_plate_metadata", lambda *args, **kwargs: None)
+        monkeypatch.setattr(zarr_writer, "write_well_metadata",
+                            lambda path, fields, **kwargs: saved.update(path=path, fields=fields))
+        info = ZarrWriterInfo(
+            base_path=f"mock-snake-layout-{time.time_ns()}", t_size=1, c_size=1, z_size=1,
+            is_hcs=True, region_fov_counts={"A1": 4},
+            fov_translations_um={"A1": {
+                0: (5000.0, 9000.0), 1: (5000.0, 8000.0),
+                2: (6000.0, 8000.0), 3: (6000.0, 9000.0),
+            }},
+        )
+        job = SaveZarrJob(capture_info=_capture(region_id="A1"),
+                          capture_image=JobImage(image_array=np.zeros((16, 16), dtype=np.uint16)),
+                          zarr_writer_info=info)
+        job._write_hcs_metadata_if_needed("A1", 0)
+        assert saved["path"] == info.get_well_path("A1")
+        assert saved["fields"] == [1, 0, 2, 3]
+
     def test_writes_frame_and_frame_time(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             info = ZarrWriterInfo(

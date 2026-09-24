@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import json
+import math
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Any, ClassVar, Dict, Generic, List, Optional, Set, Tuple, TypeVar, Union
@@ -783,7 +784,8 @@ class ZarrWriterInfo:
             enumerate fields for OME-NGFF well metadata and to derive plate
             row/column layout).
         fov_translations_um: Per-region per-FOV ``(y_um, x_um)`` stage positions
-            of the FOV origin, embedded as OME-NGFF ``translation`` transforms.
+            embedded as OME-NGFF ``translation`` transforms and used to order
+            the HCS well's image list for viewers that ignore those transforms.
         pixel_size_um: Physical pixel size in micrometers.
         z_step_um: Z step size in micrometers (optional).
         time_increment_s: Time between timepoints in seconds (optional).
@@ -896,6 +898,21 @@ class ZarrWriterInfo:
         """Stage position (y_um, x_um) for the FOV; (0, 0) if unknown."""
         region_map = self.fov_translations_um.get(str(region_id), {})
         return region_map.get(int(fov), (0.0, 0.0))
+
+    def get_hcs_field_display_order(self, region_id: str) -> List[int]:
+        """List field paths in geometric row-major order for HCS well readers.
+
+        The FOV directory names retain acquisition indices. Some viewers tile
+        ``well.images`` in list order and ignore each image's stage transform.
+        If coordinates are incomplete, retain acquisition order rather than
+        claim a geometry we cannot establish.
+        """
+        fields = list(range(self.get_fov_count(region_id)))
+        positions = self.fov_translations_um.get(str(region_id), {})
+        if any(fov not in positions or len(positions[fov]) != 2 or
+               not all(math.isfinite(value) for value in positions[fov]) for fov in fields):
+            return fields
+        return sorted(fields, key=lambda fov: (positions[fov][0], positions[fov][1], fov))
 
     def get_manifest_path(self, region_id: str, fov: int, array_key: Optional[str] = None) -> str:
         """Relative path from the FOV group to the experiment's acquisition.yaml.
@@ -1040,9 +1057,10 @@ class SaveZarrJob(Job):
         # Write well metadata (once per well per plate)
         well_path = info.get_well_path(region_id, array_key)
         if well_path not in self._hcs_wells_written:
-            # Get FOV count for this well
+            # Keep acquisition-index paths, but list them in spatial order.
+            # ome-zarr-py lays out well fields from this list as a row-major grid.
             fov_count = info.get_fov_count(region_id)
-            fields = list(range(fov_count))
+            fields = info.get_hcs_field_display_order(region_id)
             squid_well_attrs = None
             if info.region_well_ids:
                 squid_well_attrs = {"region": str(region_id), "field_count": fov_count}
