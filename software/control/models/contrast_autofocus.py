@@ -41,3 +41,21 @@ class ContrastAFSettings(BaseModel):
             if not self.coarse_step_um >= self.medium_step_um >= self.fine_step_um:
                 raise ValueError("Require coarse >= medium >= fine step")
         return self
+
+
+def default_20x_contrast_af_settings() -> ContrastAFSettings:
+    """Provisional manual-scan starting point for a 20× objective.
+
+    The window is deliberately narrow and still clips to stage limits. Pixel
+    encoding and specimen-dependent thresholds must be checked on the rig.
+    """
+    return ContrastAFSettings(
+        method="frequency_assisted",
+        coarse_step_um=10, medium_step_um=2, fine_step_um=1,
+        window_below_um=30, window_above_um=30,
+        energy_threshold=0.5, energy_margin=0,
+        sensor_full_scale=65535,
+        max_frames=100, max_moves=130, max_time_s=120,
+        max_exposure_ms=10000, verification_tolerance=0.25,
+        dense_fallback=True,
+    )

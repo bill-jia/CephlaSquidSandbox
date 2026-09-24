@@ -372,9 +372,14 @@ class HighContentScreeningGui(QMainWindow):
             filter_wheel_config_action.triggered.connect(self.openFilterWheelConfigEditor)
             advanced_menu.addAction(filter_wheel_config_action)
 
-        # Tools menu (only populated when the focus camera is present for now)
+        # Contrast AF tuning is available with the main camera, regardless of
+        # whether the optional laser-focus camera is installed.
+        tools_menu = menubar.addMenu("Tools")
+        contrast_af_action = QAction("Contrast AF Tuning...", self)
+        contrast_af_action.setMenuRole(QAction.NoRole)
+        contrast_af_action.triggered.connect(self.openContrastAFTuning)
+        tools_menu.addAction(contrast_af_action)
         if self.microscope.addons.camera_focus and getattr(self, "focusCameraDialog", None) is not None:
-            tools_menu = menubar.addMenu("Tools")
             focus_camera_action = QAction("Focus Camera / Laser AF Setup...", self)
             focus_camera_action.setMenuRole(QAction.NoRole)
             focus_camera_action.triggered.connect(self.openFocusCameraDialog)
@@ -981,6 +986,10 @@ class HighContentScreeningGui(QMainWindow):
         dialog_layout.setContentsMargins(0, 0, 0, 0)
         dialog_layout.addWidget(focus_dockArea)
         self.focusCameraDialog.resize(1000, 700)
+
+    def openContrastAFTuning(self):
+        if self.autofocusWidget is not None:
+            self.autofocusWidget.open_tuning_dialog()
 
     def openFocusCameraDialog(self):
         """Show (or re-show) the focus-camera live view popup."""

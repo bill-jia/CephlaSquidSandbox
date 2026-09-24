@@ -2959,6 +2959,12 @@ class AutoFocusWidget(QFrame):
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
 
     def add_components(self):
+        self.tuning_dialog = QDialog(self)
+        self.tuning_dialog.setWindowTitle("Contrast AF Tuning")
+        self.tuning_dialog.setMinimumWidth(430)
+        tuning_layout = QVBoxLayout(self.tuning_dialog)
+        tuning_form = QFormLayout()
+        tuning_layout.addLayout(tuning_form)
         self.entry_delta = QDoubleSpinBox()
         self.entry_delta.setMinimum(0)
         self.entry_delta.setMaximum(20)
@@ -2998,18 +3004,17 @@ class AutoFocusWidget(QFrame):
         self.btn_autolevel.setChecked(False)
         self.btn_autolevel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # layout
+        # Keep the everyday controls visible; advanced tuning lives in Tools.
         self.grid = QVBoxLayout()
-        grid_line0 = QHBoxLayout()
-        grid_line0.addWidget(QLabel("\u0394 Z"))
-        grid_line0.addWidget(self.entry_delta)
-        grid_line0.addSpacing(20)
-        grid_line0.addWidget(QLabel("# of Z-Planes"))
-        grid_line0.addWidget(self.entry_N)
-        grid_line0.addSpacing(20)
-        grid_line0.addWidget(self.btn_autolevel)
-
-        self.grid.addLayout(grid_line0)
+        legacy_row = QHBoxLayout()
+        legacy_row.addWidget(QLabel("Δ Z"))
+        legacy_row.addWidget(self.entry_delta)
+        legacy_row.addSpacing(20)
+        legacy_row.addWidget(QLabel("# of Z-Planes"))
+        legacy_row.addWidget(self.entry_N)
+        legacy_row.addSpacing(20)
+        legacy_row.addWidget(self.btn_autolevel)
+        self.grid.addLayout(legacy_row)
         focus_measure_row = QHBoxLayout()
         focus_measure_row.addWidget(QLabel("Focus measure"))
         focus_measure_row.addWidget(self.dropdown_focus_measure)
@@ -3017,7 +3022,11 @@ class AutoFocusWidget(QFrame):
         self.af_method = QComboBox()
         self.af_method.addItem("Legacy scan", "legacy")
         self.af_method.addItem("Frequency-assisted (experimental)", "frequency_assisted")
-        self.grid.addWidget(self.af_method)
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Method"))
+        method_row.addWidget(self.af_method)
+        self.grid.addLayout(method_row)
+        self.grid.addWidget(QLabel("Advanced settings: Tools → Contrast AF Tuning."))
         self.af_inputs = {}
         for field, label, maximum, decimals in (
             ("coarse_step_um", "Coarse step (µm)", 10000, 3),
@@ -3032,31 +3041,30 @@ class AutoFocusWidget(QFrame):
             ("max_exposure_ms", "Exposure budget (ms)", 1000000, 1),
             ("verification_tolerance", "Verify tolerance (fraction)", 1, 3),
         ):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
             box = QDoubleSpinBox()
             box.setRange(0, maximum)
             box.setDecimals(decimals)
             box.setKeyboardTracking(False)
-            row.addWidget(box)
-            self.grid.addLayout(row)
+            tuning_form.addRow(label, box)
             self.af_inputs[field] = box
             box.valueChanged.connect(self._settings_changed)
         for field, label in (("max_frames", "Frame budget"), ("max_moves", "Move budget")):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
             box = QSpinBox()
             box.setRange(5, 10000)
-            row.addWidget(box)
-            self.grid.addLayout(row)
+            tuning_form.addRow(label, box)
             self.af_inputs[field] = box
             box.valueChanged.connect(self._settings_changed)
         self.af_fallback = QCheckBox("Allow one dense fallback")
-        self.grid.addWidget(self.af_fallback)
+        tuning_form.addRow(self.af_fallback)
         self.af_fallback.toggled.connect(self._settings_changed)
         self.af_interval = QLabel("Set explicit bounds before starting")
-        self.grid.addWidget(self.af_interval)
+        self.af_interval.setWordWrap(True)
+        tuning_layout.addWidget(self.af_interval)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.tuning_dialog.accept)
+        tuning_layout.addWidget(close_button)
         self.grid.addWidget(self.btn_autofocus)
+        self.grid.addStretch()
         self.setLayout(self.grid)
 
         # connections
@@ -3067,6 +3075,12 @@ class AutoFocusWidget(QFrame):
         self.entry_N.valueChanged.connect(self.autofocusController.set_N)
         self.autofocusController.autofocusFinished.connect(self.autofocus_is_finished)
         self.sync_from_observation_state()
+
+    def open_tuning_dialog(self):
+        self.sync_from_observation_state()
+        self.tuning_dialog.show()
+        self.tuning_dialog.raise_()
+        self.tuning_dialog.activateWindow()
 
     def _validated_settings(self):
         """Validate the displayed values without changing the active state."""
@@ -3116,6 +3130,8 @@ class AutoFocusWidget(QFrame):
             QMessageBox.warning(self, "Autofocus", str(exc))
 
     def sync_from_observation_state(self, state=None):
+        from control.models.contrast_autofocus import default_20x_contrast_af_settings
+
         operator = (
             state.focus_measure_operator
             if state is not None
@@ -3126,19 +3142,17 @@ class AutoFocusWidget(QFrame):
         if not hasattr(self, "af_method"):
             return
         state = state or self.autofocusController.liveController.obs_controller.current_observation_state
-        settings = state.contrast_af if state else None
+        defaults = default_20x_contrast_af_settings()
+        settings = state.contrast_af if state and state.contrast_af else defaults
         with QSignalBlocker(self.af_method):
-            self.af_method.setCurrentIndex(1 if settings and settings.method == "frequency_assisted" else 0)
+            self.af_method.setCurrentIndex(1 if settings.method == "frequency_assisted" else 0)
         for name, box in self.af_inputs.items():
-            default = {"energy_threshold": 0.5, "max_frames": 100, "max_moves": 130,
-                       "max_time_s": 120, "max_exposure_ms": 10000,
-                       "verification_tolerance": 0.25}.get(name, 0)
-            value = getattr(settings, name, None) if settings is not None else None
+            value = getattr(settings, name)
             with QSignalBlocker(box):
-                box.setValue(default if value is None else value)
+                box.setValue(value if value is not None else getattr(defaults, name))
         with QSignalBlocker(self.af_fallback):
-            self.af_fallback.setChecked(settings.dense_fallback if settings else True)
-        if settings and settings.method == "frequency_assisted":
+            self.af_fallback.setChecked(settings.dense_fallback)
+        if settings.method == "frequency_assisted":
             self._validated_settings()
         else:
             self.af_interval.setText("Legacy scan")

@@ -6,18 +6,24 @@ The selected top-level focus measure remains LAPE, GLVA, or TENENGRAD. Multipoin
 acquisition refuses a frequency-assisted autofocus state until phase 3 validates
 frame ownership in that path.
 
-Before a run, enter explicit coarse, medium, and fine steps in micrometres, window
-extents below and above the current Z, and the **encoded sensor full scale**. The
-last value must reflect the actual pixel processing path: a 12-bit signal in a
-16-bit array may use a scale of 4095 when unshifted, or a different scale when
-shifted. The software does not infer it from a single frame. E uses T=0.50 as an
-unvalidated initial amplitude threshold; it is not a spatial-frequency cutoff.
-Set bounded frame, move, elapsed-time, and exposure budgets before trying a
-specimen. The panel shows the physical interval after intersecting the requested
-window with configured stage limits and reserving CephlaStage's backlash travel
-inside the permitted bounds. The search starts at the lower end of that
-interval and will restore the starting plane after a non-success outcome when
-motion remains healthy.
+The Contrast AF tab keeps the legacy Δ Z and plane count, Autolevel, focus
+measure, Method, and run button visible. Tools → Contrast AF Tuning opens the
+advanced frequency-assisted settings popup. A state with no contrast-AF block displays a provisional
+20× preset and starts the frequency-assisted method when the operator presses
+Autofocus: coarse/medium/fine steps of 10/2/1 µm, a ±30 µm window about current
+Z, T=0.50, a 100-frame/130-move limit, 120-second elapsed and 10-second total
+exposure budgets. Existing states with an explicit legacy method retain it.
+
+**Check the encoded sensor full scale before the first hardware run.** The preset
+uses 65535 encoded counts, but a 12-bit signal in a 16-bit array may use 4095
+when unshifted or a different scale when shifted. The software does not infer
+this from a frame. The defaults are only a starting point for a 20× objective;
+they do not establish a specimen-safe travel interval or calibrated focus
+performance. E uses T=0.50 as an unvalidated amplitude threshold, not a
+spatial-frequency cutoff. The popup shows the physical interval after clipping
+the requested window to configured stage limits and reserving CephlaStage's
+backlash travel. The search starts at the lower end of that interval and
+restores the starting plane after a non-success outcome when motion is healthy.
 
 The code has only software/simulation validation. For hardware acceptance on a
 representative textured field:

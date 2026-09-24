@@ -167,7 +167,8 @@ def test_focus_widget_completion_does_not_restart(qtbot, tmp_path):
     from gui.widgets.hardware_panels import AutoFocusWidget
 
     obs = _make_controller(config_repo=_repo_with_profile(tmp_path))
-    obs.set_active_observation_state(ObservationState())
+    obs.set_active_observation_state(ObservationState(
+        contrast_af=ContrastAFSettings(method="legacy")))
     af = QtAutoFocusController(
         camera=MagicMock(), stage=MagicMock(),
         liveController=SimpleNamespace(obs_controller=obs), microcontroller=MagicMock(), nl5=None)
@@ -210,6 +211,32 @@ def _valid_frequency_widget(qtbot, tmp_path):
     widget = AutoFocusWidget(af)
     qtbot.addWidget(widget)
     return widget, af, obs, repo, stage, camera
+
+
+def test_tuning_popup_holds_controls_and_20x_defaults_start_frequency_scan(qtbot, tmp_path):
+    from control.models.contrast_autofocus import default_20x_contrast_af_settings
+
+    widget, af, obs, _, _, _ = _valid_frequency_widget(qtbot, tmp_path)
+    obs.set_active_observation_state(ObservationState())
+    widget.sync_from_observation_state()
+    defaults = default_20x_contrast_af_settings()
+    assert widget.tuning_dialog.windowTitle() == "Contrast AF Tuning"
+    assert widget.af_method.parentWidget() is widget
+    assert widget.entry_delta.parentWidget() is widget
+    assert widget.entry_N.parentWidget() is widget
+    assert widget.btn_autolevel.parentWidget() is widget
+    assert widget.dropdown_focus_measure.parentWidget() is widget
+    assert widget.tuning_dialog.isAncestorOf(widget.af_inputs["coarse_step_um"])
+    assert widget.tuning_dialog.isAncestorOf(widget.af_fallback)
+    assert widget.layout().count() == 6  # Three control rows, help text, run button, stretch.
+    assert widget.af_method.currentData() == "frequency_assisted"
+    assert widget.af_inputs["coarse_step_um"].value() == defaults.coarse_step_um
+    assert widget.af_inputs["window_below_um"].value() == defaults.window_below_um
+    assert widget.af_inputs["sensor_full_scale"].value() == defaults.sensor_full_scale
+    af.autofocus = MagicMock()
+    widget.btn_autofocus.setChecked(True)
+    af.autofocus.assert_called_once_with(False)
+    assert obs.current_observation_state.contrast_af == defaults
 
 
 @pytest.mark.parametrize("field", ["fine_step_um", "max_time_s"])
