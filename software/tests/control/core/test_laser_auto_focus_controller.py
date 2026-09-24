@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from control.core.laser_auto_focus_controller import LASER_AF_TRIGGER_ATTEMPTS, LaserAutofocusController
 
@@ -277,3 +278,36 @@ def test_measure_displacement_sign_and_magnitude():
     stage.z_um = -20.0
     measured = controller.measure_displacement()
     assert abs(measured + 20.0) < 1.0
+
+
+@pytest.mark.parametrize("error", [RuntimeError("verify failed"), BaseException("camera fatal")])
+def test_verify_exception_restores_all_corrections(error):
+    stage = FakeStage()
+    controller = make_controller(FakeFocusCamera(render_spot(stage, 0.2)), stage, pixel_to_um=0.24)
+    apply_reference_at_current_position(controller)
+    stage.z_um = 30.0
+    controller._verify_spot_alignment_with_laser_on = MagicMock(side_effect=error)
+    if isinstance(error, Exception):
+        assert controller.move_to_target(0) is False
+    else:
+        with pytest.raises(BaseException, match="camera fatal"):
+            controller.move_to_target(0)
+    assert abs(stage.z_um - 30.0) < 1e-6
+    controller.microcontroller.turn_off_AF_laser.assert_called()
+
+
+def test_laser_shutdown_retries_timeout_once():
+    stage = FakeStage()
+    controller = make_controller(FakeFocusCamera(render_spot(stage, 0.2)), stage)
+    controller.microcontroller.wait_till_operation_is_completed.side_effect = [TimeoutError(), None]
+    controller.turn_off_AF_laser()
+    assert controller.microcontroller.turn_off_AF_laser.call_count == 2
+
+
+def test_laser_shutdown_persistent_timeout_is_bounded():
+    stage = FakeStage()
+    controller = make_controller(FakeFocusCamera(render_spot(stage, 0.2)), stage)
+    controller.microcontroller.wait_till_operation_is_completed.side_effect = TimeoutError()
+    with pytest.raises(TimeoutError):
+        controller.turn_off_AF_laser()
+    assert controller.microcontroller.turn_off_AF_laser.call_count == 2
