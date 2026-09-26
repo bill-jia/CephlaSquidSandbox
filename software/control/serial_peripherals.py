@@ -456,9 +456,9 @@ class XLight:
         )
 
     def set_emission_filter(self, position, extraction=False, validate=None):
-        self.log.info(f"Setting emission filter to position {position} (extraction={extraction})")
+        self.log.debug(f"Setting emission filter to position {position} (extraction={extraction})")
         if self.disable_emission_filter_wheel:
-            self.log.info("Emission filter wheel disabled, skipping set_emission_filter")
+            self.log.debug("Emission filter wheel disabled, skipping set_emission_filter")
             return -1
         _validate_emission_filter_position(position, self.emission_filter_positions)
         position = int(position)

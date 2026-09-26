@@ -17,6 +17,32 @@ position (plus a small crop of the spot image) captured at the in-focus plane �
 defines displacement zero. Focusing is then: measure the spot, convert
 `(x − x_reference) · pixel_to_um` to a displacement, and move z to cancel it.
 
+## Focus-camera exposure and gain
+
+Set defaults in `machine_configs/machine_config.yaml` under `devices.laser_af.config`:
+
+```yaml
+focus_camera_exposure_time_ms: 0.8
+focus_camera_analog_gain: 10.0
+```
+
+These are defaults for a profile/objective without a saved laser-AF configuration.
+Existing `user_profiles/<profile>/laser_af_configs/<objective>.yaml` values take
+precedence. Switching to an empty profile/objective resets to the machine defaults
+and clears the previous reference/calibration state. Restart the application after
+editing machine defaults, since they are read when the controller is constructed.
+
+Changing exposure or gain in either the laser-AF popup or the focus-camera settings
+panel applies the value immediately and saves it for the current profile/objective.
+It preserves the existing calibration and reference; no Initialize click is needed
+for these two settings. Detection-mode changes still require Initialize and a new
+reference. Profiles created with Save As copy the source profile's saved values.
+
+The popup's Run Spot Detection button works with live view off: it takes a fresh
+native-ROI frame through the laser-AF controller, starts streaming if necessary,
+retries dropped triggers, then restores streaming, ROI and callback state and turns
+off the AF laser. A missing frame is reported in the popup.
+
 ## The correction loop (`move_to_target`)
 
 1. Measure displacement. Fail out if it can't be measured or exceeds
@@ -100,6 +126,8 @@ devices:
   laser_af:
     config:
       spot_detection_mode: dual_left    # default for objectives with no saved config
+      focus_camera_exposure_time_ms: 0.8
+      focus_camera_analog_gain: 10.0
       calibration:
         distance_um: 6.0                # sweep at reference_magnification
         reference_magnification: 20     # the objective distance_um was tuned for

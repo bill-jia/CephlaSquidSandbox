@@ -83,7 +83,7 @@ class LaserAutofocusController(QObject):
         self._machine_settings: LaserAFDeviceSettings = self._resolve_machine_settings()
         # A fresh (uncalibrated) per-objective config inherits the machine's
         # spot detection mode; a saved per-objective config overrides it on load.
-        self.laser_af_properties = LaserAFConfig(spot_detection_mode=self._machine_settings.spot_detection_mode)
+        self.laser_af_properties = self._default_configuration()
         self.reference_crop = None
 
         self.spot_spacing_pixels = None  # spacing between the spots from the two interfaces (unit: pixel)
@@ -319,6 +319,33 @@ class LaserAutofocusController(QObject):
                 self._current_profile, self.objectiveStore.current_objective, updated_config
             )
 
+    def _default_configuration(self):
+        return LaserAFConfig(
+            spot_detection_mode=self._machine_settings.spot_detection_mode,
+            focus_camera_exposure_time_ms=self._machine_settings.focus_camera_exposure_time_ms,
+            focus_camera_analog_gain=self._machine_settings.focus_camera_analog_gain,
+        )
+
+    def update_camera_settings(self, *, exposure_time_ms=None, analog_gain=None):
+        """Apply and persist camera edits without invalidating the AF reference."""
+        updates = {}
+        if exposure_time_ms is not None:
+            self.camera.set_exposure_time(exposure_time_ms)
+            updates["focus_camera_exposure_time_ms"] = float(exposure_time_ms)
+        if analog_gain is not None:
+            self.camera.set_analog_gain(analog_gain)
+            updates["focus_camera_analog_gain"] = float(analog_gain)
+        changed = any(getattr(self.laser_af_properties, key) != value for key, value in updates.items())
+        self.laser_af_properties = self.laser_af_properties.model_copy(update=updates)
+        if changed and self._current_profile and self.objectiveStore and self.objectiveStore.current_objective:
+            # Runtime reference X is ROI-relative; saved configs use sensor X.
+            props = self.laser_af_properties
+            config = props.model_copy(update={
+                "x_reference": None if props.x_reference is None else props.x_reference + props.x_offset,
+            })
+            config.set_reference_image(self.reference_crop)
+            self._config_repo.save_laser_af_config(self._current_profile, self.objectiveStore.current_objective, config)
+
     def load_cached_configuration(self):
         """Load configuration from the cache if available."""
         self._log.info(f"Loading cached configuration for profile: {self._current_profile}")
@@ -331,6 +358,16 @@ class LaserAutofocusController(QObject):
 
         config = self._config_repo.get_laser_af_config(current_objective)
         if config is None:
+            # An empty profile/objective starts with machine defaults, not the
+            # previous user's exposure, gain, calibration or reference.
+            self.laser_af_properties = self._default_configuration()
+            self.reference_crop = None
+            self.is_initialized = False
+            self.camera.set_exposure_time(self.laser_af_properties.focus_camera_exposure_time_ms)
+            try:
+                self.camera.set_analog_gain(self.laser_af_properties.focus_camera_analog_gain)
+            except NotImplementedError:
+                pass
             return
         # self._log.info(f"Loaded cached configuration successfully: {config}")
 

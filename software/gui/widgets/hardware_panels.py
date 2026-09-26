@@ -308,9 +308,11 @@ class LaserAutofocusSettingWidget(QWidget):
         self.laserAutofocusController.characterization_mode = state
 
     def update_exposure_time(self, value):
+        self.laserAutofocusController.update_camera_settings(exposure_time_ms=value)
         self.signal_newExposureTime.emit(value)
 
     def update_analog_gain(self, value):
+        self.laserAutofocusController.update_camera_settings(analog_gain=value)
         self.signal_newAnalogGain.emit(value)
 
     def update_values(self):
@@ -327,8 +329,9 @@ class LaserAutofocusSettingWidget(QWidget):
                 spinbox.setValue(current_value)
 
         # Update exposure and gain
-        self.exposure_spinbox.setValue(self.laserAutofocusController.laser_af_properties.focus_camera_exposure_time_ms)
-        self.analog_gain_spinbox.setValue(self.laserAutofocusController.laser_af_properties.focus_camera_analog_gain)
+        with QSignalBlocker(self.exposure_spinbox), QSignalBlocker(self.analog_gain_spinbox):
+            self.exposure_spinbox.setValue(self.laserAutofocusController.laser_af_properties.focus_camera_exposure_time_ms)
+            self.analog_gain_spinbox.setValue(self.laserAutofocusController.laser_af_properties.focus_camera_analog_gain)
 
         # Update spot detection mode
         current_mode = self.laserAutofocusController.laser_af_properties.spot_detection_mode
@@ -397,19 +400,10 @@ class LaserAutofocusSettingWidget(QWidget):
         self.layout().addWidget(self.calibration_label)
 
     def illuminate_and_get_frame(self):
-        # Get a frame from the live controller.  We need to reach deep into the liveController here which
-        # is not ideal.
-        self.liveController.microscope.low_level_drivers.microcontroller.turn_on_AF_laser()
-        self.liveController.microscope.low_level_drivers.microcontroller.wait_till_operation_is_completed()
-        self.liveController.trigger_acquisition()
-
-        try:
-            frame = self.liveController.camera.read_frame()
-        finally:
-            self.liveController.microscope.low_level_drivers.microcontroller.turn_off_AF_laser()
-            self.liveController.microscope.low_level_drivers.microcontroller.wait_till_operation_is_completed()
-
-        return frame
+        # This is a standalone capture: liveController.trigger_acquisition()
+        # intentionally does nothing when live view is off. Use the AF path
+        # that starts streaming, retries dropped triggers and restores state.
+        return self.laserAutofocusController.capture_validation_frame(full_sensor=False)
 
     def clear_labels(self):
         # Remove any existing error or correlation labels
@@ -434,24 +428,20 @@ class LaserAutofocusSettingWidget(QWidget):
         mode = self.spot_mode_combo.currentData()
         sigma = self.spinboxes["filter_sigma"].value()
 
-        frame = self.illuminate_and_get_frame()
-        if frame is not None:
-            try:
-                result = utils.find_spot_location(frame, mode=mode, params=params, filter_sigma=sigma, debug_plot=True)
-                if result is not None:
-                    x, y = result
-                    self.signal_laser_spot_location.emit(frame, x, y)
-                else:
-                    raise Exception("No spot detection result returned")
-            except Exception:
-                # Show error message
-                # Clear previous error label if it exists
-                if hasattr(self, "spot_detection_error_label"):
-                    self.spot_detection_error_label.deleteLater()
-
-                # Create and add new error label
-                self.spot_detection_error_label = QLabel("Spot detection failed!")
-                self.layout().addWidget(self.spot_detection_error_label)
+        try:
+            frame = self.illuminate_and_get_frame()
+            if frame is None:
+                raise RuntimeError("No fresh focus-camera frame received")
+            result = utils.find_spot_location(frame, mode=mode, params=params, filter_sigma=sigma, debug_plot=True)
+            if result is None:
+                raise RuntimeError("No spot detected")
+            x, y = result
+            self.signal_laser_spot_location.emit(frame, x, y)
+        except Exception as exc:
+            if hasattr(self, "spot_detection_error_label"):
+                self.spot_detection_error_label.deleteLater()
+            self.spot_detection_error_label = QLabel(f"Spot detection failed: {exc}")
+            self.layout().addWidget(self.spot_detection_error_label)
 
     def show_cross_correlation_result(self, value):
         """Show cross-correlation value from validating laser af images"""

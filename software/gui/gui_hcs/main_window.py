@@ -1397,6 +1397,7 @@ class HighContentScreeningGui(QMainWindow):
                 self.laserAutofocusController.on_settings_changed()
                 self.laserAutofocusControlWidget.update_init_state()
                 self.laserAutofocusSettingWidget.update_values()
+                self.cameraSettingWidget_focus_camera.sync_controls_from_hardware()
 
             self.profileWidget.signal_profile_changed.connect(slot_settings_changed_laser_af)
             self.objectivesWidget.signal_objective_changed.connect(slot_settings_changed_laser_af)
@@ -1405,6 +1406,19 @@ class HighContentScreeningGui(QMainWindow):
             )
             self.laserAutofocusSettingWidget.signal_newAnalogGain.connect(
                 self.cameraSettingWidget_focus_camera.set_analog_gain
+            )
+            # Camera-panel edits must persist just like edits in the AF popup.
+            self.cameraSettingWidget_focus_camera.entry_exposureTime.valueChanged.connect(
+                lambda value: self.laserAutofocusController.update_camera_settings(exposure_time_ms=value)
+            )
+            self.cameraSettingWidget_focus_camera.entry_analogGain.valueChanged.connect(
+                lambda value: self.laserAutofocusController.update_camera_settings(analog_gain=value)
+            )
+            self.cameraSettingWidget_focus_camera.entry_exposureTime.valueChanged.connect(
+                self.laserAutofocusSettingWidget.exposure_spinbox.setValue
+            )
+            self.cameraSettingWidget_focus_camera.entry_analogGain.valueChanged.connect(
+                self.laserAutofocusSettingWidget.analog_gain_spinbox.setValue
             )
             # "Initialize" lives in the control widget; route the click to the
             # settings widget (which owns the spinboxes apply_and_initialize needs)

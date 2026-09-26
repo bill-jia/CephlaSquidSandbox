@@ -424,6 +424,12 @@ class LaserAFDeviceSettings(BaseModel):
         SpotDetectionMode.DUAL_RIGHT,
         description="Default spot detection mode for objectives with no saved laser AF config",
     )
+    focus_camera_exposure_time_ms: float = Field(
+        0.8, gt=0, description="Default focus-camera exposure in ms; saved profile/objective settings override it",
+    )
+    focus_camera_analog_gain: float = Field(
+        10.0, ge=0, description="Default focus-camera analog gain; saved profile/objective settings override it",
+    )
     calibration: LaserAFCalibrationSettings = Field(default_factory=LaserAFCalibrationSettings)
 
     model_config = {"extra": "forbid"}

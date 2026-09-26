@@ -70,7 +70,7 @@ class LaserAFConfig(BaseModel):
 
     # Camera settings
     focus_camera_exposure_time_ms: float = Field(0.8, description="Focus camera exposure time in ms")
-    focus_camera_analog_gain: float = Field(0.0, description="Focus camera analog gain")
+    focus_camera_analog_gain: float = Field(10, description="Focus camera analog gain")
 
     # Reference image (base64 encoded)
     reference_image: Optional[str] = Field(None, description="Base64-encoded reference image data")
