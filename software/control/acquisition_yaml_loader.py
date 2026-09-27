@@ -15,6 +15,7 @@ class AcquisitionYAMLData:
     xy_mode: str = "Select Wells"
     skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
     validation_mode: bool = False
+    snake_observation_states: bool = False
     # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
     # None means the file predates the flag, and the GUI then leaves its checkbox alone.
     retract_z_between_regions: Optional[bool] = None
@@ -122,6 +123,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         xy_mode=acq.get("xy_mode", "Select Wells"),
         skip_saving=bool(acq.get("skip_saving", False)),
         validation_mode=bool(acq.get("validation_mode", False)),
+        snake_observation_states=bool(acq.get("snake_observation_states", False)),
         retract_z_between_regions=(
             None if acq.get("retract_z_between_regions") is None else bool(acq["retract_z_between_regions"])
         ),

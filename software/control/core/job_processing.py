@@ -972,8 +972,8 @@ class SaveZarrJob(Job):
             cls._hcs_wells_written.clear()
 
     @classmethod
-    def finalize_all_writers(cls) -> bool:
-        """Finalize all active zarr writers.
+    def finalize_all_writers(cls, upload_target: Optional[UploadTarget] = None) -> bool:
+        """Finalize all active zarr writers, staging any final partial shards.
 
         Call at end of acquisition to ensure all data is written.
 
@@ -985,6 +985,15 @@ class SaveZarrJob(Job):
             if writer.is_initialized and not writer.is_finalized:
                 try:
                     writer.finalize()
+                    # Finalization may commit a short/aborted stack that was
+                    # intentionally withheld from earlier upload barriers.
+                    if upload_target is not None and upload_target.enabled:
+                        FlushAndStageUploadJob(
+                            time_point=-1,
+                            region_id="(finalize)",
+                            output_path=path,
+                            upload_target=upload_target,
+                        ).run()
                     cls._log.info(f"Finalized zarr writer: {path}")
                 except Exception as e:
                     cls._log.error(f"Error finalizing writer {path}: {e}")
@@ -1173,6 +1182,7 @@ class SaveZarrJob(Job):
                 translation_um=translation_um,
                 manifest_path=manifest_path,
                 shard_per_z=_def.ZARR_SHARD_PER_Z,
+                chunk_separator=_def.ZARR_CHUNK_SEPARATOR,
                 squid_extras=squid_extras,
             )
             try:
@@ -2564,7 +2574,7 @@ class JobRunner(multiprocessing.Process):
         # Finalize any zarr writers that are still open
         t_finalize_start = time.perf_counter()
         try:
-            success = SaveZarrJob.finalize_all_writers()
+            success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:

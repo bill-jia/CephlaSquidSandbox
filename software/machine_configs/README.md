@@ -29,6 +29,25 @@ configs and remembered between runs.
 Steps 2–3 are fallbacks for setups that pin a config by dropping a file in the
 root; normal use goes through the library + startup selector (step 1).
 
+## Acquisition throttling
+
+Set the pending-job limit in the selected machine YAML:
+
+```yaml
+software:
+  acquisition:
+    max_pending_jobs: 50
+```
+
+`max_pending_jobs` must be a positive integer and defaults to 10 when omitted.
+Acquisition pauses before a camera trigger when the total unfinished job count
+reaches this limit, or when the separate pending-image byte limit is reached.
+This is a queue allowance, not a worker count or a measurement of free RAM.
+
+Restart the application to load a YAML change. The machine value takes precedence
+over the legacy INI value at startup. Preferences can override it for subsequent
+acquisitions in the current session; the machine YAML is reapplied on restart.
+
 ## Files
 
 ### `library/`

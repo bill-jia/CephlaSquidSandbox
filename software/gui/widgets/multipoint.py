@@ -1796,6 +1796,17 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
         combo.setCurrentIndex(index if index >= 0 else 0)
 
 
+def _make_snake_observation_states_checkbox(controller) -> "QCheckBox":
+    checkbox = QCheckBox("Snake observation states")
+    checkbox.setChecked(bool(getattr(controller, "snake_observation_states", False)))
+    checkbox.setToolTip(
+        "Alternate acquisition order between FOVs. Simple mode reverses states and Z planes.\n"
+        "Advanced mode reverses whole steps/groups, preserving their internal order and Z stacks."
+    )
+    checkbox.toggled.connect(controller.set_snake_observation_states)
+    return checkbox
+
+
 def _make_retract_z_checkbox() -> "QCheckBox":
     """The *Scan behaviour* checkbox that brackets XY travel with a Z retract.
 
@@ -3545,6 +3556,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
+        self.checkbox_snakeObservationStates = _make_snake_observation_states_checkbox(self.multipointController)
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -3774,6 +3786,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # Snake scan is a property of the whole scan path, not of one position's tile
         # grid, and the Wellplate tab has always carried it here.
         scan_content.addWidget(self.checkbox_snakeScan)
+        scan_content.addWidget(self.checkbox_snakeObservationStates)
         scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
         scan_content.addWidget(self.checkbox_retractZBetweenRegions)
@@ -4320,6 +4333,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
+            self.multipointController.set_snake_observation_states(self.checkbox_snakeObservationStates.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
@@ -5061,6 +5075,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.entry_overlap.setEnabled(enabled)
         self.list_configurations.setEnabled(enabled)
         self.btn_per_point_channels.setEnabled(enabled)
+        self.checkbox_snakeObservationStates.setEnabled(enabled)
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
@@ -5203,6 +5218,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
             # Scan behaviour
             _apply_retract_z_from_yaml(self, yaml_data)
+            self.checkbox_snakeObservationStates.setChecked(yaml_data.snake_observation_states)
 
             # Load positions if present
             if yaml_data.flexible_positions:
@@ -5577,6 +5593,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
+        self.checkbox_snakeObservationStates = _make_snake_observation_states_checkbox(self.multipointController)
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -5824,6 +5841,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
 
         scan_section, scan_content = _make_section("Scan behaviour")
         scan_content.addWidget(self.checkbox_snakeScan)
+        scan_content.addWidget(self.checkbox_snakeObservationStates)
         scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
         scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
         scan_content.addWidget(self.checkbox_retractZBetweenRegions)
@@ -6879,6 +6897,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
+            self.multipointController.set_snake_observation_states(self.checkbox_snakeObservationStates.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
@@ -7484,6 +7503,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
 
             # Scan behaviour
             _apply_retract_z_from_yaml(self, yaml_data)
+            self.checkbox_snakeObservationStates.setChecked(yaml_data.snake_observation_states)
 
             # XY mode - set to Select Wells for wellplate YAML
             if yaml_data.xy_mode in ["Current Position", "Select Wells", "Manual", "Load Coordinates"]:

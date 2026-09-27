@@ -800,10 +800,10 @@ class PreferencesDialog(QDialog):
         throttle_layout.addRow("Enable Throttling:", self.throttling_enabled_checkbox)
 
         self.max_pending_jobs_spinbox = QSpinBox()
-        self.max_pending_jobs_spinbox.setRange(1, 100)
-        self.max_pending_jobs_spinbox.setValue(
-            self._get_config_int("GENERAL", "acquisition_max_pending_jobs", control._def.ACQUISITION_MAX_PENDING_JOBS)
-        )
+        # Machine YAML overrides the legacy INI at startup. Show the effective
+        # value so applying unrelated preferences does not restore a stale limit.
+        self.max_pending_jobs_spinbox.setRange(1, max(100, control._def.ACQUISITION_MAX_PENDING_JOBS))
+        self.max_pending_jobs_spinbox.setValue(control._def.ACQUISITION_MAX_PENDING_JOBS)
         self.max_pending_jobs_spinbox.setToolTip(
             "Maximum number of jobs in flight before throttling.\n"
             "Higher values allow more parallelism but use more RAM."
@@ -1579,9 +1579,7 @@ class PreferencesDialog(QDialog):
         if old_val != new_val:
             changes.append(("Acquisition Throttling", str(old_val), str(new_val), False))
 
-        old_val = self._get_config_int(
-            "GENERAL", "acquisition_max_pending_jobs", control._def.ACQUISITION_MAX_PENDING_JOBS
-        )
+        old_val = control._def.ACQUISITION_MAX_PENDING_JOBS
         new_val = self.max_pending_jobs_spinbox.value()
         if old_val != new_val:
             changes.append(("Max Pending Jobs", str(old_val), str(new_val), False))

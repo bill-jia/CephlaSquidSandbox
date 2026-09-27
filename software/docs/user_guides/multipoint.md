@@ -391,6 +391,20 @@ production runs.
   to reclaim disk space. See [zarr-network-streaming.md](zarr-network-streaming.md).
 - **Snake scan** — alternate the tile direction each row (boustrophedon) to minimize
   stage travel. When off, every row starts from the same side.
+- **Snake observation states** (off by default) — alternate acquisition order between
+  FOVs, independently of the XY snake scan. In **Simple** mode the full state-and-Z
+  sequence reverses: `A(z0), B(z0), A(z1), B(z1)` becomes
+  `B(z1), A(z1), B(z0), A(z0)` at the next FOV. In **Advanced** mode each top-level
+  step/group is an atomic block, including its Z stack: `step A, group B, step C`
+  becomes `step C, group B, step A`. Internal frame order, group repeats, waits,
+  stimuli, FPM patterns, and Z direction within a block stay unchanged. A block
+  finishes its stack before the next block starts; reference-only steps still
+  capture only at the focus plane. Thus the last *block* is repeated first at the
+  next FOV; a multi-state group's internal order remains intact. Alternation
+  continues across regions and timepoints, with each region using its own selected
+  states/cycles. Saved channel, frame, and Z indices retain their canonical
+  meaning (multipage TIFF pages follow capture order and carry these labels).
+  The option is stored in `acquisition.yaml` and restored when loading it.
 - **Keep illuminators on between captures** — leaves the light source on between frames
   (faster, more light exposure).
 - **Show live preview during acquisition** — when unchecked, skips per‑frame display

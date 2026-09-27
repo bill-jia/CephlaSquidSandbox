@@ -26,8 +26,8 @@ the worker iterates and the save layer keys on.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -280,6 +280,9 @@ class ResolvedEvent:
     acquire_z_stack: bool = True
     postprocess: Optional[PostprocessSpec] = None
     postprocess_group: Optional[str] = None
+    # One top-level step/group/sweep occurrence, including all group repeats.
+    # None identifies simple-mode events, whose individual Z captures may snake.
+    acquisition_block_index: Optional[int] = None
 
 
 # Suffix appended to a ragged array key for a reference-z-only ("single plane")
@@ -380,18 +383,30 @@ def _expand_item(
         out.extend([("state", (item.observation_state, az, pp))] * item.n_frames)
 
 
-def _raw_events(
+def _raw_event_blocks(
     cycle: AcquisitionCycle,
     fpm_provider: Optional[FpmPatternProvider] = None,
     pp_alloc: Optional[_PostprocessGroupAllocator] = None,
-) -> List[_RawEvent]:
-    """Expand a single cycle's outer repeat / groups / steps / waits into an
-    ordered list of tagged raw events (one entry per event)."""
-    out: List[_RawEvent] = []
+) -> List[List[_RawEvent]]:
+    """Preserve each top-level item's boundary while expanding its contents."""
+    blocks: List[List[_RawEvent]] = []
     for _ in range(cycle.repeat):
         for item in cycle.items:
+            out: List[_RawEvent] = []
             _expand_item(item, out, fpm_provider, pp_alloc)
-    return out
+            blocks.append(out)
+    return blocks
+
+
+def _index_event_blocks(
+    blocks: List[List[_RawEvent]], is_stimulus: Optional[StimulusPredicate]
+) -> List[ResolvedEvent]:
+    raw = [event for block in blocks for event in block]
+    indices = [index for index, block in enumerate(blocks) for _ in block]
+    return [
+        replace(event, acquisition_block_index=index)
+        for event, index in zip(_index_events(raw, is_stimulus), indices)
+    ]
 
 
 def _index_events(
@@ -482,7 +497,7 @@ def resolve_cycle(
     fpm_provider: Optional[FpmPatternProvider] = None,
 ) -> List[ResolvedEvent]:
     """Flatten a single cycle into its ordered event list."""
-    return _index_events(_raw_events(cycle, fpm_provider, _PostprocessGroupAllocator()), is_stimulus)
+    return _index_event_blocks(_raw_event_blocks(cycle, fpm_provider, _PostprocessGroupAllocator()), is_stimulus)
 
 
 def resolve_chain(
@@ -499,15 +514,46 @@ def resolve_chain(
     *whole* concatenated chain, not per cycle. ``fpm_provider`` supplies the
     multiplexed LED groups for any ``CycleFPMDarkfield`` items.
     """
-    raw: List[_RawEvent] = []
+    blocks: List[List[_RawEvent]] = []
     pp_alloc = _PostprocessGroupAllocator()  # one allocator ⇒ group ids unique across the chain
     for name in cycle_names:
         cycle = load_cycle(name)
         if cycle is None:
             logger.warning("Acquisition cycle %r not found, skipping", name)
             continue
-        raw.extend(_raw_events(cycle, fpm_provider, pp_alloc))
-    return _index_events(raw, is_stimulus)
+        blocks.extend(_raw_event_blocks(cycle, fpm_provider, pp_alloc))
+    return _index_event_blocks(blocks, is_stimulus)
+
+
+def iter_acquisition_planes(
+    events: Sequence[ResolvedEvent], nz: int, reference_z: int, *, snake: bool = False, reverse: bool = False
+) -> Iterator[Tuple[int, List[ResolvedEvent]]]:
+    """Yield (canonical Z index, events) in execution order without reindexing.
+
+    Simple mode reverses the entire Z/event traversal. Advanced mode snakes
+    top-level blocks, each with its own forward Z traversal and unchanged event
+    order. With snaking off, retain the original Z-major traversal in both modes.
+    """
+    if snake and events and events[0].acquisition_block_index is not None:
+        blocks = []
+        for event in events:
+            if not blocks or blocks[-1][0].acquisition_block_index != event.acquisition_block_index:
+                blocks.append([])
+            blocks[-1].append(event)
+        if reverse:
+            blocks.reverse()
+        z_levels = range(nz)
+    else:
+        blocks = [list(reversed(events)) if snake and reverse else events]
+        z_levels = range(nz - 1, -1, -1) if snake and reverse else range(nz)
+    for block in blocks:
+        for z in z_levels:
+            plane_events = [
+                event for event in block
+                if event.is_wait or event.is_stimulus or event.acquire_z_stack or z == reference_z
+            ]
+            if plane_events:
+                yield z, plane_events
 
 
 def chain_frame_counts(events: List[ResolvedEvent]) -> Dict[str, int]:

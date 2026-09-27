@@ -319,6 +319,7 @@ software:
     use_napari_for_live_view: false
     use_napari_for_mosaic: true
   acquisition:
+    max_pending_jobs: 50  # Pause capture at this many unfinished jobs; increase to allow a larger backlog.
     image_format: tif
     scaling_factor: 0.85
     dx: 0.9

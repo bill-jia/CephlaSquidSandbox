@@ -214,6 +214,7 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
                     "wait_ms": ev.wait_ms,
                     "state_frame_index": ev.state_frame_index,
                     "cycle_event_index": ev.cycle_event_index,
+                    "acquisition_block_index": ev.acquisition_block_index,
                     # False => captured only at the reference/focus plane (single z).
                     "acquire_z_stack": ev.acquire_z_stack,
                     # Source-coded FPM: the exact LED indices lit for this frame,
@@ -369,6 +370,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
+            "snake_observation_states": params.snake_observation_states,
         },
         "objective": objective_info or {},
         "sample": {
@@ -576,6 +578,7 @@ class MultiPointController:
         self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
+        self.snake_observation_states = False
         # Live ZARR_V3 upload settings (off by default; configured per-acquisition).
         self.zarr_upload_enabled = False
         self.zarr_upload_remote_root = ""
@@ -905,6 +908,9 @@ class MultiPointController:
 
     def set_keep_illuminators_on_between_captures(self, keep_on: bool):
         self.keep_illuminators_on_between_captures = bool(keep_on)
+
+    def set_snake_observation_states(self, enabled: bool):
+        self.snake_observation_states = bool(enabled)
 
     def set_zarr_upload_target(
         self,
@@ -1958,6 +1964,7 @@ class MultiPointController:
             retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
+            snake_observation_states=self.snake_observation_states,
             # Downsampled view generation parameters
             generate_downsampled_views=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES or control._def.DISPLAY_PLATE_VIEW,
             save_downsampled_well_images=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES,

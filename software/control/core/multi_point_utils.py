@@ -79,6 +79,8 @@ class AcquisitionParameters:
     file_saving_option: FileSavingOption = FileSavingOption.INDIVIDUAL_IMAGES
     # Software trigger: if True, skip turn_off_illumination after each frame until channel changes
     keep_illuminators_on_between_captures: bool = False
+    # Alternate simple Z/event traversal or advanced atomic step/group order per FOV.
+    snake_observation_states: bool = False
 
     # Downsampled view generation parameters
     generate_downsampled_views: bool = False

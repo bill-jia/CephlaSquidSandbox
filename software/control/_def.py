@@ -1189,11 +1189,12 @@ ZARR_COMPRESSION = ZarrCompression.BALANCED
 #            z-slice once all its channels arrive, synchronously with the
 #            z-outer/channel-inner acquisition loop. No per-frame read-modify-
 #            write of a giant shard => ~30x faster writeback on deep stacks.
-#   False -> legacy one shard per FOV-timepoint (1, C, Z, Y, X), committed in
-#            one burst (fewest files, but must buffer the whole FOV).
-# Reads are identical either way (the inner chunk is one plane). Flip to False
-# for an instant rollback to the legacy layout.
-ZARR_SHARD_PER_Z = True
+#   False -> one shard per FOV-timepoint (1, C, Z, Y, X), buffered and committed
+#            once per level. Oversized/incomplete stacks use bounded disk spill.
+# Reads are identical either way (the inner chunk is one plane).
+ZARR_SHARD_PER_Z = False
+# Flat filenames avoid a directory for every coordinate. Use "/" for the old layout.
+ZARR_CHUNK_SEPARATOR = "."
 
 # Flexible (non-wellplate) multipoint saves as an OME-NGFF HCS plate.
 #   True (default) -> each scan region is mapped to a synthetic plate well, so a
@@ -1334,4 +1335,3 @@ def apply_simulation_mode_defaults(simulation_mode: bool) -> None:
     for config_key, attr_name in defaults:
         if config_key not in SIMULATION_KEYS_FROM_CONFIG:
             g[attr_name] = True
-

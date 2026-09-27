@@ -250,7 +250,7 @@ def _fake_experiment(root, plates):
             os.path.join(fov, "frame_times", "zarr.json"),
         ):
             with open(p, "w", encoding="utf-8") as f:
-                f.write("{}")
+                f.write('{"chunk_key_encoding": {"name": "default"}}')
         with open(os.path.join(fov, "frame_times", "c", "0", "0", "0"), "wb") as f:
             f.write(b"\x00" * 16)
 
@@ -283,12 +283,21 @@ class TestMetadataResync:
             chunk = os.path.join(fov, "frame_times", "c", "0", "0", "0")
             assert chunk in sent, f"{plate} frame_times chunk missing"
 
-    def test_frame_times_chunk_has_a_resync_uploader(self, tmp_path):
+    @pytest.mark.parametrize("separator", ["/", "."])
+    def test_frame_times_chunk_has_a_resync_uploader(self, tmp_path, separator):
         """frame_times/c/0/0/0 was removed from the per-barrier metadata set to
         avoid the Windows rename-vs-open collision, which makes this pass its
         ONLY uploader. If it stops covering the chunk, remote timestamps are
         silently lost rather than merely stale."""
         _fake_experiment(str(tmp_path), ["plate"])
+        ft = tmp_path / "plate.ome.zarr" / "A" / "1" / "0" / "frame_times"
+        chunk = ft / "c" / "0" / "0" / "0"
+        if separator == ".":
+            chunk.rename(ft / "c.0.0.0")
+            chunk = ft / "c.0.0.0"
+            (ft / "zarr.json").write_text(
+                '{"chunk_key_encoding": {"name": "default", "configuration": {"separator": "."}}}'
+            )
         worker = _FakeWorker()
         target = UploadTarget(
             enabled=True,
@@ -300,10 +309,7 @@ class TestMetadataResync:
         d._enqueue_post_finalize_metadata_resync()
 
         sent = {local for task in worker.submitted_tasks for local, _remote in task.files}
-        chunk = os.path.join(
-            str(tmp_path), "plate.ome.zarr", "A", "1", "0", "frame_times", "c", "0", "0", "0"
-        )
-        assert chunk in sent
+        assert str(chunk) in sent
 
     def test_resync_files_are_never_marked_deletable(self, tmp_path):
         _fake_experiment(str(tmp_path), ["plate"])

@@ -617,13 +617,14 @@ class _BackgroundUploadDrainer:
             return
         from uuid import uuid4
         from control.core.zarr_upload import UploadTask, local_to_remote_path
+        from control.core.zarr_layout import array_chunk_path
 
         meta_files: List[str] = []
         for root, dirs, files in os.walk(self._experiment_path):
             if "zarr.json" in files:
                 meta_files.append(os.path.join(root, "zarr.json"))
-            if os.path.basename(root) == "frame_times":
-                chunk = os.path.join(root, "c", "0", "0", "0")
+            if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                chunk = str(array_chunk_path(root, (0, 0, 0)))
                 if os.path.isfile(chunk):
                     meta_files.append(chunk)
         if not meta_files:
@@ -1311,6 +1312,7 @@ class MultiPointWorker:
         )
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
+        self.snake_observation_states = acquisition_parameters.snake_observation_states
 
         self.t_dpc = []
         self.t_inf = []
@@ -3128,7 +3130,10 @@ class MultiPointWorker:
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
-        """Remove ``<level_dir>/c/<t>`` if empty after batched delete.
+        """Prune old slash-layout directories after deleting verified files.
+
+        Flat-key arrays need no pruning: deletion already removed their shard
+        files directly, and the shared level directory must remain.
 
         Only descends into ``c/<t>`` and prunes upward to the level dir; never
         touches sibling timepoints' shard files or array metadata.
@@ -3898,8 +3903,7 @@ class MultiPointWorker:
             if self.validation_mode:
                 self.total_scans = self.num_fovs
             else:
-                frames_per_pos = self._get_region_plan(region_id).frames_per_position
-                self.total_scans = self.num_fovs * self.NZ * frames_per_pos
+                self.total_scans = self.num_fovs * self._captured_frames_per_fov(self._get_region_plan(region_id))
 
             for fov, coordinate_mm in enumerate(coordinates):
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
@@ -4104,6 +4108,23 @@ class MultiPointWorker:
         )
         return True
 
+    def _captured_frames_per_fov(self, plan):
+        return sum(
+            self.NZ if event.acquire_z_stack else 1
+            for event in plan.events if not (event.is_wait or event.is_stimulus)
+        )
+
+    def _reverse_observation_order(self, region_id, fov):
+        """Alternate across region and timepoint boundaries, including single-tile regions."""
+        if not getattr(self, "snake_observation_states", False):
+            return False
+        ordinal = self.time_point * sum(len(coords) for coords in self.scan_region_fov_coords_mm.values()) + fov
+        for name, coords in self.scan_region_fov_coords_mm.items():
+            if str(name) == str(region_id):
+                break
+            ordinal += len(coords)
+        return bool(ordinal % 2)
+
     def acquire_at_position(self, region_id, current_path, fov):
         # Autofocus once at the FOV's nominal plane to establish the focal
         # (reference) plane BEFORE the z-stack is positioned around it. The
@@ -4134,7 +4155,24 @@ class MultiPointWorker:
         # the middle plane for From Center. See _reference_z_level.
         ref_z_level = self._reference_z_level()
 
-        for z_level in range(self.NZ):
+        from control.models.acquisition_cycle import iter_acquisition_planes
+
+        region_plan = self._get_region_plan(region_id)
+        if not region_plan.events:
+            raise ValueError("No observation states selected for acquisition.")
+        frames_per_fov = self._captured_frames_per_fov(region_plan)
+        imaged_step = 0
+        current_z_level = 0  # prepare_z_stack positions the canonical first plane
+        recorded_z_levels = set()
+        planes = iter_acquisition_planes(
+            region_plan.events, self.NZ, ref_z_level,
+            snake=getattr(self, "snake_observation_states", False),
+            reverse=self._reverse_observation_order(region_id, fov),
+        )
+        for z_level, plane_events in planes:
+            if z_level != current_z_level:
+                self.move_z_for_stack(z_level - current_z_level)
+                current_z_level = z_level
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 
             acquire_pos = self.stage.get_pos()
@@ -4145,123 +4183,108 @@ class MultiPointWorker:
             # just a 1-frame-per-state plan, so this single path serves both. The
             # plan's ordered events preserve interleave / chain order; imaged
             # events capture a frame, stimulus events fire an NIDAQ pulse comb.
-            region_plan = self._get_region_plan(region_id)
-            # Captured (not just saved) frames per (FOV, z): postprocessed events
-            # are captured too, so include them so imaged_step stays aligned.
-            frames_per_pos = region_plan.captured_frames_per_position
-            if region_plan.events:
-                imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
-                for event in region_plan.events:
-                    if event.is_wait:
-                        # Timed delay between events — no frame, no AF, no progress
-                        # tick. Sleep in short slices so an abort interrupts it.
-                        with self._timing.get_timer("cycle_wait"):
-                            self._interruptible_sleep(event.wait_ms / 1000.0)
-                        continue
-                    # Reference-z-only step/sweep: capture a single frame at the
-                    # focus/reference plane and skip it at every other z-level.
-                    # Stimulus events are unaffected (they fire at every z as before).
-                    if (not event.acquire_z_stack) and (not event.is_stimulus) and (z_level != ref_z_level):
-                        continue
-                    preset_name = event.observation_state
+            for event in plane_events:
+                if event.is_wait:
+                    # Timed delay between events — no frame, no AF, no progress
+                    # tick. Sleep in short slices so an abort interrupts it.
+                    with self._timing.get_timer("cycle_wait"):
+                        self._interruptible_sleep(event.wait_ms / 1000.0)
+                    continue
+                preset_name = event.observation_state
+                try:
+                    with self._timing.get_timer("apply_observation_state"):
+                        config = self._apply_observation_state(preset_name)
+                except Exception as e:
+                    self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                    self.request_abort_fn()
+                    return
+                # Source-coded FPM darkfield frame: override the LED matrix to
+                # this multiplexed pattern (base state supplies exposure/gain/
+                # color; the matrix channel must be ON in that base state — this
+                # is enforced pre-flight in validate_acquisition_settings). The
+                # override switches the device to 'mux' mode, so the capture
+                # path's re-fire lights exactly this LED set. A False return
+                # means no SciMicroscopy array is available, which would
+                # silently capture the wrong pattern — abort instead.
+                if event.multiplexed_leds is not None:
+                    ok = False
                     try:
-                        with self._timing.get_timer("apply_observation_state"):
-                            config = self._apply_observation_state(preset_name)
+                        ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
+                            event.multiplexed_leds
+                        )
                     except Exception as e:
-                        self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                        self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
+                    if not ok:
+                        self._log.error(
+                            "FPM: could not light multiplexed darkfield pattern for base state %r "
+                            "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
+                            preset_name,
+                        )
                         self.request_abort_fn()
                         return
-                    # Source-coded FPM darkfield frame: override the LED matrix to
-                    # this multiplexed pattern (base state supplies exposure/gain/
-                    # color; the matrix channel must be ON in that base state — this
-                    # is enforced pre-flight in validate_acquisition_settings). The
-                    # override switches the device to 'mux' mode, so the capture
-                    # path's re-fire lights exactly this LED set. A False return
-                    # means no SciMicroscopy array is available, which would
-                    # silently capture the wrong pattern — abort instead.
-                    if event.multiplexed_leds is not None:
-                        ok = False
-                        try:
-                            ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
-                                event.multiplexed_leds
-                            )
-                        except Exception as e:
-                            self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
-                        if not ok:
-                            self._log.error(
-                                "FPM: could not light multiplexed darkfield pattern for base state %r "
-                                "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
-                                preset_name,
-                            )
-                            self.request_abort_fn()
-                            return
-                    if self.NZ == 1:  # TODO: handle z offset for z stack
-                        self.handle_z_offset(config, True)
+                if self.NZ == 1:  # TODO: handle z offset for z stack
+                    self.handle_z_offset(config, True)
 
-                    # (Autofocus now runs once per FOV in _autofocus_and_record,
-                    # before the z-stack is positioned — see acquire_at_position.)
+                # (Autofocus now runs once per FOV in _autofocus_and_record,
+                # before the z-stack is positioned — see acquire_at_position.)
 
-                    if event.is_stimulus or config.is_stimulus_only:
-                        with self._timing.get_timer("run_nidaq_stimulus"):
-                            self._run_nidaq_stimulus(config)
-                        if self.NZ == 1:
-                            self.handle_z_offset(config, False)
-                        continue  # no frame, no progress tick
-
-                    # Postprocessed frames are routed to the PostprocessJob runner
-                    # (raw not saved), so they carry no save layout — the group id
-                    # tags the frame for accumulation. A ref-z-only postprocessed
-                    # step still passes NZ frames? No: it is captured only at the
-                    # reference plane like any ref-z step (skip handled above), so
-                    # eff_z_index follows the same rule.
-                    if event.postprocess is not None:
-                        save_layout = None
-                        config_idx = 0
-                    else:
-                        save_layout = self._build_save_layout(region_plan, event)
-                        config_idx = save_layout.c_index
-                    # A reference-z-only frame lives at z=0 of its Z=1 array; a
-                    # normal frame at its stack level.
-                    eff_z_index = z_level if event.acquire_z_stack else 0
-                    with self._timing.get_timer("acquire_camera_image"):
-                        with self._timing.get_timer("acquire_camera_image_inner"):
-                            self.acquire_camera_image(
-                                config,
-                                file_ID,
-                                current_path,
-                                eff_z_index,
-                                region_id=region_id,
-                                fov=fov,
-                                config_idx=config_idx,
-                                filename_channel_label=preset_name,
-                                save_layout=save_layout,
-                                postprocess_group=event.postprocess_group,
-                            )
-
+                if event.is_stimulus or config.is_stimulus_only:
+                    with self._timing.get_timer("run_nidaq_stimulus"):
+                        self._run_nidaq_stimulus(config)
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
+                    continue  # no frame, no progress tick
 
-                    current_image = fov * self.NZ * frames_per_pos + z_level * frames_per_pos + imaged_step + 1
-                    imaged_step += 1
-                    self.callbacks.signal_region_progress(
-                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
-                    )
-            else:
-                raise ValueError("No observation states selected for acquisition.")
+                # Postprocessed frames are routed to the PostprocessJob runner
+                # (raw not saved), so they carry no save layout — the group id
+                # tags the frame for accumulation. Reference-z-only inputs are
+                # scheduled only at the reference plane and use saved Z index 0.
+                if event.postprocess is not None:
+                    save_layout = None
+                    config_idx = 0
+                else:
+                    save_layout = self._build_save_layout(region_plan, event)
+                    config_idx = save_layout.c_index
+                # A reference-z-only frame lives at z=0 of its Z=1 array; a
+                # normal frame at its stack level.
+                eff_z_index = z_level if event.acquire_z_stack else 0
+                with self._timing.get_timer("acquire_camera_image"):
+                    with self._timing.get_timer("acquire_camera_image_inner"):
+                        self.acquire_camera_image(
+                            config,
+                            file_ID,
+                            current_path,
+                            eff_z_index,
+                            region_id=region_id,
+                            fov=fov,
+                            config_idx=config_idx,
+                            filename_channel_label=preset_name,
+                            save_layout=save_layout,
+                            postprocess_group=event.postprocess_group,
+                            state_frame_index=event.state_frame_index,
+                        )
 
-            # updates coordinates df
-            self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+                if self.NZ == 1:
+                    self.handle_z_offset(config, False)
+
+                current_image = fov * frames_per_fov + imaged_step + 1
+                imaged_step += 1
+                self.callbacks.signal_region_progress(
+                    RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
+                )
+
+            # Advanced blocks may revisit a plane; keep one coordinate row per FOV/Z.
+            if z_level not in recorded_z_levels:
+                self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+                recorded_z_levels.add(z_level)
             self.callbacks.signal_current_fov(acquire_pos.x_mm, acquire_pos.y_mm)
 
             # check if the acquisition should be aborted
             if self.abort_requested_fn():
                 self.handle_acquisition_abort(current_path)
 
-            if z_level < self.NZ - 1:
-                self.move_z_for_stack()
-
         if self.NZ > 1:
-            self.move_z_back_after_stack()
+            self.move_z_back_after_stack(current_z_level)
 
         # Contrast-AF cadence counter: one increment per FOV visit, never per
         # z-slice (inside the z loop the cadence period becomes NZ-dependent).
@@ -5179,6 +5202,7 @@ class MultiPointWorker:
         filename_channel_label: Optional[str] = None,
         save_layout=None,
         postprocess_group: Optional[str] = None,
+        state_frame_index: Optional[int] = None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -5273,7 +5297,7 @@ class MultiPointWorker:
                 save_c_size=(save_layout.c_size if save_layout else None),
                 save_z_size=(save_layout.z_size if save_layout else None),
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
-                state_frame_index=(save_layout.state_frame_index if save_layout else None),
+                state_frame_index=(save_layout.state_frame_index if save_layout else state_frame_index),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
                 array_channel_names=(list(save_layout.channel_names) if save_layout else None),
                 array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
@@ -5467,30 +5491,34 @@ class MultiPointWorker:
 
         self._wait_for_outstanding_callback_images()
 
-    def move_z_for_stack(self):
+    def move_z_for_stack(self, steps=1):
         if self.use_piezo:
-            self.z_piezo_um += self.deltaZ * 1000
+            self.z_piezo_um += self.deltaZ * 1000 * steps
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
         else:
-            self.stage.move_z(self.deltaZ)
+            self.stage.move_z(self.deltaZ * steps)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
-    def move_z_back_after_stack(self):
+    def move_z_back_after_stack(self, z_level=None):
+        if z_level is None:
+            z_level = self.NZ - 1
         if self.use_piezo:
-            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * (self.NZ - 1)
+            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * z_level
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
+            if self.z_stacking_config == "FROM CENTER":
+                self.stage.move_z(self.deltaZ * round((self.NZ - 1) / 2))
         else:
             if self.z_stacking_config == "FROM CENTER":
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1) + self.deltaZ * round((self.NZ - 1) / 2)
+                rel_z_to_start = -self.deltaZ * z_level + self.deltaZ * round((self.NZ - 1) / 2)
             else:
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1)
+                rel_z_to_start = -self.deltaZ * z_level
 
             self.stage.move_z(rel_z_to_start)

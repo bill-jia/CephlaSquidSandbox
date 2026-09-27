@@ -73,6 +73,7 @@ if str(_SOFTWARE_DIR) not in sys.path:
     sys.path.insert(0, str(_SOFTWARE_DIR))
 
 import squid.logging  # noqa: E402
+from control.core.zarr_layout import array_chunk_path, chunk_separator, timepoint_shards
 
 from control.core.zarr_upload import (  # noqa: E402
     UploadTarget,
@@ -215,6 +216,9 @@ def enumerate_levels(fov_group: Path) -> List[Path]:
 def shard_files_for_timepoint(level_dir: Path, time_point: int) -> List[Path]:
     """Every shard file belonging to ``time_point`` at this pyramid level.
 
+    Flat ``c.<t>...`` keys and legacy ``c/<t>/...`` keys are both supported;
+    the array metadata selects the encoding. Temporary/lock files are excluded.
+
     With zarr-v3 ``default`` chunk-key encoding the shard path *is* its grid
     coordinate, and the leading component is the ``t`` grid index — so the whole
     ``c/<t>/`` subtree belongs to exactly that timepoint (guaranteed by
@@ -224,32 +228,12 @@ def shard_files_for_timepoint(level_dir: Path, time_point: int) -> List[Path]:
     the default per-z layout, and anything else with the same ``t``-first
     ordering — instead of hardcoding one shape and silently missing the rest.
     """
-    tp_dir = level_dir / "c" / str(time_point)
-    if not tp_dir.is_dir():
-        return []
-    out: List[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(tp_dir):
-        for name in filenames:
-            out.append(Path(dirpath) / name)
-    return sorted(out)
+    return [path for _, path in timepoint_shards(level_dir, time_point)]
 
 
 def enumerate_timepoints_for_level(level_dir: Path) -> List[int]:
     """Timepoint indices for which at least one shard file exists at this level."""
-    c_dir = level_dir / "c"
-    if not c_dir.is_dir():
-        return []
-    tps: List[int] = []
-    for entry in sorted(c_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        try:
-            tp = int(entry.name)
-        except ValueError:
-            continue
-        if shard_files_for_timepoint(level_dir, tp):
-            tps.append(tp)
-    return tps
+    return sorted({tp for tp, _ in timepoint_shards(level_dir)})
 
 
 def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
@@ -314,6 +298,10 @@ def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
     cke = data.get("chunk_key_encoding", {}) or {}
     if cke.get("name") != "default":
         return False, f"unexpected chunk_key_encoding.name: {cke.get('name')!r}"
+    try:
+        chunk_separator(fov_group / "0")
+    except ValueError as e:
+        return False, str(e)
 
     if list(chunk_shape[1:]) == list(shape[1:]):
         kind = "one shard per FOV-timepoint"
@@ -436,9 +424,10 @@ def gather_metadata_files(fov_group: Path) -> List[Path]:
         ftj = ft / "zarr.json"
         if ftj.is_file():
             out.append(ftj)
-        ft_chunk = ft / "c" / "0" / "0" / "0"
-        if ft_chunk.is_file():
-            out.append(ft_chunk)
+        if ftj.is_file():
+            ft_chunk = array_chunk_path(ft, (0, 0, 0))
+            if ft_chunk.is_file():
+                out.append(ft_chunk)
     return out
 
 
@@ -641,6 +630,31 @@ def delete_verified_locals(
 # ---------------------------------------------------------------------------
 
 
+def _read_verified_bytes_since(manifest_path: str, offset: int) -> Tuple[int, int]:
+    """Read complete new manifest records and return (verified bytes, offset).
+
+    Keep an incomplete trailing line for the next poll while the worker is
+    appending. A prior run's records are excluded by the caller's initial
+    offset at the end of the existing manifest.
+    """
+    if not os.path.exists(manifest_path):
+        return 0, offset
+    verified_bytes = 0
+    with open(manifest_path, "rb") as manifest:
+        manifest.seek(offset)
+        while True:
+            line_start = manifest.tell()
+            line = manifest.readline()
+            if not line or not line.endswith(b"\n"):
+                return verified_bytes, line_start
+            try:
+                n_bytes = json.loads(line).get("bytes")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(n_bytes, int) and n_bytes >= 0:
+                verified_bytes += n_bytes
+
+
 def run_backfill(
     experiment_dir: Path,
     remote_root: str,
@@ -756,6 +770,36 @@ def run_backfill(
     initial_size = measure_local_size_bytes(experiment_dir)
     log.info(f"local archive at start: {_format_bytes(initial_size)}")
 
+    # The worker writes one manifest record per verified file, often well
+    # before its enclosing task finishes. Polling new records keeps the rate
+    # visible even when a large task has not produced a result yet.
+    rate_interval_s = 60.0
+    manifest_offset = os.path.getsize(manifest_path) if os.path.exists(manifest_path) else 0
+    last_rate_poll = time.monotonic()
+    verified_bytes_total = 0
+
+    def poll_upload_rate(*, force: bool = False) -> None:
+        nonlocal manifest_offset, last_rate_poll, verified_bytes_total
+        now = time.monotonic()
+        elapsed = now - last_rate_poll
+        if not force and elapsed < rate_interval_s:
+            return
+        try:
+            verified_bytes, manifest_offset = _read_verified_bytes_since(
+                manifest_path, manifest_offset
+            )
+        except OSError as e:
+            log.debug(f"Could not poll upload manifest: {e}")
+            return
+        verified_bytes_total += verified_bytes
+        if elapsed > 0:
+            log.info(
+                f"Verified upload rate: {_format_bytes(verified_bytes / elapsed)}/s "
+                f"({_format_bytes(verified_bytes)} in {elapsed:.0f}s, "
+                f"{_format_bytes(verified_bytes_total)} this run)"
+            )
+        last_rate_poll = now
+
     # Submit every task.
     for t in tasks:
         worker.submit(t)
@@ -774,9 +818,12 @@ def run_backfill(
     t_start = time.time()
     try:
         while received < expected_results:
+            poll_upload_rate()
             try:
-                result: UploadResult = worker.output_queue.get(timeout=60.0)
+                timeout = max(0.1, rate_interval_s - (time.monotonic() - last_rate_poll))
+                result: UploadResult = worker.output_queue.get(timeout=timeout)
             except queue.Empty:
+                poll_upload_rate()
                 elapsed = int(time.time() - t_start)
                 log.info(f"Waiting on uploads... ({received}/{expected_results} done, {elapsed}s elapsed)")
                 continue
@@ -842,6 +889,8 @@ def run_backfill(
             worker.close()
         except Exception:
             pass
+
+        poll_upload_rate(force=True)
 
         # Final size report so the operator sees the net effect of the run.
         # Logs a running total every 5 s during the walk so the user can

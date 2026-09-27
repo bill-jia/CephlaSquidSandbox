@@ -462,6 +462,9 @@ class AcquisitionSettings(BaseModel):
     fast_acquisition: bool = False
     default_nx: int = 1
     default_ny: int = 1
+    max_pending_jobs: int = Field(
+        default=10, ge=1, description="Maximum unfinished acquisition jobs before pausing camera triggers"
+    )
     # Delay (ms) between asserting the illumination shutter and firing the camera
     # trigger. Needed on rolling-shutter sensors so row 0 does not start integrating
     # on the LED's rising edge — otherwise the top rows undershoot and show a
