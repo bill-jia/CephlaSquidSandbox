@@ -50,6 +50,7 @@ def _write_fov(group_dir: Path, *, shard_per_z: bool, nz=NZ):
         manifest_path="../../../acquisition.yaml",
         max_pyramid_levels=0,
         shard_per_z=shard_per_z,
+        chunk_separator="/",  # Keep regression coverage for existing datasets.
     )
     writer = ZarrWriter(cfg)
     writer.initialize()

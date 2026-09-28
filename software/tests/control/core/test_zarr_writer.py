@@ -158,6 +158,7 @@ def _make_writer(
         translation_um=translation_um,
         manifest_path=manifest_path,
         shard_per_z=shard_per_z,
+        chunk_separator="/",  # Existing cases retain coverage of the legacy key encoding.
     )
     return ZarrWriter(cfg), out
 

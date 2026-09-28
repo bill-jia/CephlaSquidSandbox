@@ -16,6 +16,7 @@ from control.core.zarr_upload import (
     UploadTarget,
     UploadTask,
     UploadWorker,
+    append_manifest_record,
     collect_sidecar_files,
     drain_output_queue_nonblocking,
     local_to_remote_path,
@@ -78,6 +79,8 @@ def test_worker_uploads_verifies_and_records(tmp_path, pipelined):
         enabled=True, remote_root=remote_root, local_base=local_base, delete_after_verify=True
     )
     manifest = str(tmp_path / "manifest.jsonl")
+    previous_record = {"local_path": "previous-run", "remote_path": "previous-destination"}
+    append_manifest_record(manifest, previous_record)
     worker = UploadWorker(
         target=target, manifest_path=manifest, pipelined=pipelined, threads=3
     )
@@ -98,9 +101,13 @@ def test_worker_uploads_verifies_and_records(tmp_path, pipelined):
                 assert a.read() == b.read()
             assert not os.path.exists(remote + ".part")
         # Manifest has one valid record per file.
-        recs = read_manifest(manifest)
+        history = read_manifest(manifest)
+        assert history[0] == previous_record
+        recs = history[1:]
         assert len(recs) == len(files)
         assert all(rec["sha256"] for rec in recs)
+        assert all(rec["remote_root"] == remote_root for rec in recs)
+        assert all(rec["task_id"] == task.task_id for rec in recs)
         assert {rec["local_path"] for rec in recs} == set(files)
         # Worker stamped progress.
         assert worker.heartbeat > 0

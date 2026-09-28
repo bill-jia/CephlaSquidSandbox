@@ -187,17 +187,17 @@ class TestJobRunnerHasPending:
         runner.start()
 
         try:
-            # Wait for worker process to fully initialize (loads config ~0.5s)
-            time.sleep(1.0)
-
             job = make_none_result_job(duration_s=0.1)
             runner.dispatch(job)
 
             assert runner.has_pending() is True
 
-            # Job returns None, so nothing in output queue
-            # Wait for job to complete
-            time.sleep(0.5)
+            # No output result to wait for. Windows subprocess imports can
+            # exceed a fixed sleep, so wait for completion with the same
+            # deadline used by the result-producing job tests above.
+            deadline = time.monotonic() + 5.0
+            while runner.has_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
             assert runner.has_pending() is False
         finally:

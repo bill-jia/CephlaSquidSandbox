@@ -31,7 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import squid.logging
 
@@ -401,8 +401,15 @@ def append_manifest_record(
     line = json.dumps(record, sort_keys=True) + "\n"
     try:
         os.makedirs(os.path.dirname(manifest_path) or ".", exist_ok=True)
-        with open(manifest_path, "a", encoding="utf-8") as f:
-            f.write(line)
+        with open(manifest_path, "ab+") as f:
+            # A cancelled run may leave an incomplete last line. Preserve it
+            # as history, but keep the next record independently readable.
+            f.seek(0, os.SEEK_END)
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+            f.write(line.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
     except OSError as e:
@@ -455,6 +462,66 @@ def read_manifest(manifest_path: str) -> List[dict]:
     return out
 
 
+class VerifiedUploadManifest:
+    """Incremental index of append-only upload history for one destination.
+
+    Full remote paths must match exactly. Legacy records without a root are
+    usable only through that exact path match; explicit roots must also match.
+    """
+
+    def __init__(self, path: str, target: UploadTarget):
+        self.path = path
+        self.target = target
+        self.offset = 0
+        self.records: Dict[str, dict] = {}
+
+    def refresh(self) -> None:
+        with open(self.path, "rb") as manifest:
+            manifest.seek(self.offset)
+            while True:
+                line = manifest.readline()
+                if not line or not line.endswith(b"\n"):
+                    break  # Do not consume a record still being appended.
+                self.offset = manifest.tell()
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(record, dict) and isinstance(record.get("remote_path"), str):
+                    self.records[record["remote_path"]] = record
+
+    def get(self, remote_path: str) -> Optional[dict]:
+        record = self.records.get(remote_path)
+        if not record or record.get("deletable") is not True or not record.get("verified_utc"):
+            return None
+        digest, size = record.get("sha256"), record.get("bytes")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or type(size) is not int or size < 0):
+            return None
+        if "remote_root" in record:
+            root = record["remote_root"]
+            if not isinstance(root, str) or not root:
+                return None
+            normalize = lambda p: os.path.normcase(os.path.abspath(os.path.normpath(p)))
+            if normalize(root) != normalize(self.target.remote_root):
+                return None
+        return record
+
+
+def verify_manifest_copy(record: dict, local_path: str, remote_path: str, heartbeat=None) -> bool:
+    """Revalidate both copies before trusting a historical upload record."""
+    try:
+        return (
+            os.path.getsize(local_path) == record["bytes"]
+            and os.path.getsize(remote_path) == record["bytes"]
+            and _sha256_of_file(local_path, heartbeat=heartbeat) == record["sha256"]
+            and _sha256_of_file(remote_path, heartbeat=heartbeat) == record["sha256"]
+        )
+    except OSError:
+        return False
+
+
 class UploadWorker(multiprocessing.Process):
     """Dedicated subprocess that drains ``UploadTask``s onto the SMB share.
 
@@ -475,6 +542,7 @@ class UploadWorker(multiprocessing.Process):
         threads: int = UPLOAD_WORKER_THREADS,
         max_inflight_files: int = UPLOAD_MAX_INFLIGHT_FILES,
         verify_readback: bool = UPLOAD_VERIFY_READBACK,
+        resume_manifest: bool = False,
     ):
         super().__init__()
         # Non-daemon: explicit drain on shutdown, not silent kill. The owning
@@ -490,6 +558,21 @@ class UploadWorker(multiprocessing.Process):
         self._threads = max(1, threads)
         self._max_inflight_files = max(self._threads, max_inflight_files)
         self._verify_readback = verify_readback
+        self._resume_manifest = None
+        if resume_manifest:
+            history = VerifiedUploadManifest(manifest_path, target)
+            try:
+                history.refresh()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                squid.logging.get_logger("zarr_upload").warning(f"Cannot load upload history: {e}")
+            else:
+                self._resume_manifest = history
+        # Only successful metadata transfers enter this process-local cache.
+        # Pipelined callers hold the destination lock through checking/updating
+        # it; changed content and failed uploads always go through verification.
+        self._verified_metadata: Dict[Tuple[str, str], Tuple[str, int]] = {}
         self._input_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._output_queue: multiprocessing.Queue = multiprocessing.Queue()
         # Wall-clock (time.time()) of the worker's last byte of forward
@@ -645,6 +728,45 @@ class UploadWorker(multiprocessing.Process):
         except (OSError, ValueError) as e:
             log.warning(f"failed to enqueue result for task {st['task_id']}: {e}")
 
+    def _upload_file(self, local_path, remote_path, *, stable_read, deletable, heartbeat, log):
+        """Return (ok, sha, size, error, reused_verified_metadata).
+
+        Deduplicate immutable metadata across barriers by content, after a
+        verified upload, not by submission. Timestamp chunks and image shards
+        never use this cache. The final metadata resync naturally sends any
+        changed content (including acquisition_complete/aborted flags).
+        """
+        if deletable and not stable_read and self._resume_manifest is not None:
+            expected = local_to_remote_path(local_path, self._target.local_base, self._target.remote_root)
+            record = self._resume_manifest.get(expected) if remote_path == expected else None
+            if record is not None and verify_manifest_copy(record, local_path, remote_path, heartbeat):
+                # Append a fresh verification record for this task, without
+                # copying the already correct remote file again.
+                return True, record["sha256"], record["bytes"], None, False
+        cacheable = stable_read and not deletable and os.path.basename(local_path) == "zarr.json"
+        key = (local_path, remote_path)
+        if cacheable:
+            try:
+                digest = _sha256_of_file(local_path)
+            except OSError:
+                digest = None
+            cached = self._verified_metadata.get(key)
+            if cached is not None and digest == cached[0]:
+                return True, cached[0], cached[1], None, True
+        ok, sha, n_bytes, err = upload_one_file(
+            local_path,
+            remote_path,
+            log=log,
+            max_attempts=self._max_attempts,
+            initial_backoff_s=self._initial_backoff_s,
+            stable_read=stable_read,
+            verify_readback=self._verify_readback,
+            heartbeat=heartbeat,
+        )
+        if cacheable and ok:
+            self._verified_metadata[key] = (sha, n_bytes)
+        return ok, sha, n_bytes, err, False
+
     def _do_upload(
         self, local_path, remote_path, stable_read, task_fields, deletable,
         manifest_lock, heartbeat, log, path_lock=None,
@@ -660,26 +782,24 @@ class UploadWorker(multiprocessing.Process):
         if path_lock is not None:
             path_lock.acquire()
         try:
-            ok, sha, n_bytes, err = upload_one_file(
+            ok, sha, n_bytes, err, reused = self._upload_file(
                 local_path,
                 remote_path,
                 log=log,
-                max_attempts=self._max_attempts,
-                initial_backoff_s=self._initial_backoff_s,
                 stable_read=stable_read,
-                verify_readback=self._verify_readback,
+                deletable=deletable,
                 heartbeat=heartbeat,
             )
         finally:
             if path_lock is not None:
                 path_lock.release()
         elapsed = time.perf_counter() - t_start
-        if ok:
+        if ok and not reused:
             # Only verified completion counts as watchdog progress; a failure
             # grind against a dead share must look idle so the drainer can
             # re-probe and abandon fast instead of grinding for hours.
             heartbeat(0)
-        if ok:
+        if ok and not reused:
             # Serialize manifest appends across lanes: one fsynced record at a
             # time keeps the durability ordering the recovery path relies on.
             with manifest_lock:
@@ -689,8 +809,10 @@ class UploadWorker(multiprocessing.Process):
                         "time_point": task_fields[0],
                         "region_id": task_fields[1],
                         "fov": task_fields[2],
+                        "task_id": task_fields[3],
                         "local_path": local_path,
                         "remote_path": remote_path,
+                        "remote_root": self._target.remote_root,
                         "sha256": sha,
                         "bytes": n_bytes,
                         "elapsed_s": round(elapsed, 3),
@@ -698,7 +820,7 @@ class UploadWorker(multiprocessing.Process):
                         "deletable": deletable,
                     },
                 )
-        else:
+        elif not ok:
             log.error(
                 f"giving up after {self._max_attempts} attempts: "
                 f"{local_path} -> {remote_path} ({err})"
@@ -791,7 +913,7 @@ class UploadWorker(multiprocessing.Process):
                 base["remaining"] = len(task.files)
                 with state_lock:
                     pending[task.task_id] = base
-                task_fields = (task.time_point, task.region_id, task.fov)
+                task_fields = (task.time_point, task.region_id, task.fov, task.task_id)
                 for local_path, remote_path in task.files:
                     inflight.acquire()
                     stable_read = local_path in task.stable_read_paths
@@ -841,31 +963,33 @@ class UploadWorker(multiprocessing.Process):
         for local_path, remote_path in task.files:
             t_start = time.perf_counter()
             stable_read = local_path in task.stable_read_paths
-            ok, sha, n_bytes, err = upload_one_file(
+            ok, sha, n_bytes, err, reused = self._upload_file(
                 local_path,
                 remote_path,
                 log=log,
-                max_attempts=self._max_attempts,
-                initial_backoff_s=self._initial_backoff_s,
                 stable_read=stable_read,
-                verify_readback=self._verify_readback,
+                deletable=local_path in task.deletable_local_paths,
                 heartbeat=heartbeat,
             )
             elapsed = time.perf_counter() - t_start
-            if ok and heartbeat is not None:
+            if ok and not reused and heartbeat is not None:
                 heartbeat(0)
             if ok:
                 uploaded.append(local_path)
                 if local_path in task.deletable_local_paths:
                     deletable_uploaded.append(local_path)
+                if reused:
+                    continue
                 append_manifest_record(
                     self._manifest_path,
                     {
                         "time_point": task.time_point,
                         "region_id": task.region_id,
                         "fov": task.fov,
+                        "task_id": task.task_id,
                         "local_path": local_path,
                         "remote_path": remote_path,
+                        "remote_root": self._target.remote_root,
                         "sha256": sha,
                         "bytes": n_bytes,
                         "elapsed_s": round(elapsed, 3),
