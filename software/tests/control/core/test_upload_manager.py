@@ -4,6 +4,7 @@ import hashlib
 import json
 
 import pytest
+import squid.logging
 
 from control.core.upload_manager import (
     DatasetOwnershipError,
@@ -106,15 +107,22 @@ def test_engine_transfers_verifies_and_deletes_with_global_lane(tmp_path):
         "dataset", "one", [SubmittedFile("a.bin", source.stat().st_size, deletable=True)]
     )
     store.seal_dataset("dataset")
+    log_path = tmp_path / "upload_manager.log"
+    handler = squid.logging.add_file_handler(str(log_path), replace_existing=True)
     engine = UploadManagerEngine(store, max_lanes=1)
     deadline = time.monotonic() + 15
     while store.dataset_status("dataset")["state"] != "complete" and time.monotonic() < deadline:
         engine.tick()
         time.sleep(0.05)
     engine.stop()
+    if handler is not None:
+        squid.logging.remove_handler(handler)
     assert (remote / "a.bin").read_bytes() == b"manager-owned transfer"
     assert not source.exists()
     assert store.dataset_status("dataset")["deleted_bytes"] == len(b"manager-owned transfer")
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "Verified file_id=" in log_text
+    assert "Deleted verified local file" in log_text
 
 
 def test_legacy_manifest_is_revalidated_without_counting_network_write(tmp_path):
@@ -148,3 +156,45 @@ def test_legacy_manifest_is_revalidated_without_counting_network_write(tmp_path)
     assert row["state"] == "verified"
     assert row["transferred_bytes"] == 0
     assert target.stat().st_mtime_ns == before
+
+
+def test_seal_recovers_unsubmitted_zarr_shards_and_keeps_metadata(tmp_path):
+    store = make_store(tmp_path); local, remote = register(store, tmp_path)
+    array = local / "plate.ome.zarr" / "A" / "1" / "0" / "0"
+    array.mkdir(parents=True)
+    shard = array / "c.0.0.0.0.0"; shard.write_bytes(b"image shard")
+    metadata = array / "zarr.json"; metadata.write_text("{}", encoding="utf-8")
+    status = store.seal_dataset("dataset")
+    assert status["file_count"] == 1
+    queued = store.claim_next()
+    assert queued["deletable"] == 1
+    # Put the claimed row back through restart recovery, then exercise the engine.
+    store.recover_interrupted_work()
+    engine = UploadManagerEngine(store, max_lanes=1)
+    deadline = time.monotonic() + 15
+    while store.dataset_status("dataset")["state"] != "complete" and time.monotonic() < deadline:
+        engine.tick(); time.sleep(0.05)
+    engine.stop()
+    assert not shard.exists()
+    assert metadata.exists()
+    assert (remote / shard.relative_to(local)).read_bytes() == b"image shard"
+
+
+def test_restart_repairs_completed_database_from_first_manager_release(tmp_path):
+    store = make_store(tmp_path); local, _remote = register(store, tmp_path)
+    array = local / "plate.ome.zarr" / "A" / "1" / "0" / "0"
+    array.mkdir(parents=True)
+    (array / "c.0.0.0.0.0").write_bytes(b"missed shard")
+    # Model the first-release database: sealed/complete with no shard rows.
+    with store._db:
+        store._db.execute(
+            "UPDATE datasets SET sealed=1,state='complete',seal_status='complete' WHERE id='dataset'"
+        )
+    store.close()
+
+    repaired = make_store(tmp_path)
+    assert repaired.recovered_shards == 1
+    status = repaired.dataset_status("dataset")
+    assert status["state"] == "draining"
+    assert status["file_count"] == 1
+    assert repaired.claim_next()["deletable"] == 1

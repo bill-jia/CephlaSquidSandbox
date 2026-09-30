@@ -1355,20 +1355,6 @@ class FlushAndStageUploadJob:
         deletable = set(shard_paths)
         stable_read = set(metadata_paths)
 
-        if FlushAndStageUploadJob._upload_input_queue is None:
-            self._log.error(
-                "Upload enabled but UploadWorker queue not initialized in this "
-                "JobRunner subprocess — dropping task. Check JobRunner.run()."
-            )
-            return BarrierResult(
-                task_id=task_id,
-                time_point=self.time_point,
-                region_id=self.region_id,
-                fov=self.fov,
-                file_count=len(files),
-                submitted=False,
-            )
-
         task = UploadTask(
             task_id=task_id,
             time_point=self.time_point,
@@ -1427,6 +1413,19 @@ class FlushAndStageUploadJob:
                 file_count=len(files),
                 submitted=False,
                 manager_owned=True,
+            )
+        if FlushAndStageUploadJob._upload_input_queue is None:
+            self._log.error(
+                "Upload enabled but UploadWorker queue not initialized in this "
+                "JobRunner subprocess — dropping legacy task. Check JobRunner.run()."
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
             )
         if FlushAndStageUploadJob._upload_tasks_submitted is not None:
             with FlushAndStageUploadJob._upload_tasks_submitted.get_lock():

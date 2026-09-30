@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ from control.core.zarr_upload import (
     upload_one_file,
     verify_manifest_copy,
 )
+import squid.logging
 
 
 PROTOCOL_VERSION = 1
@@ -167,6 +169,7 @@ class UploadStore:
         self._lock = threading.RLock()
         self._create_schema()
         self.recover_interrupted_work()
+        self.recovered_shards = self.reconcile_sealed_datasets()
 
     def close(self) -> None:
         with self._lock:
@@ -347,6 +350,7 @@ class UploadStore:
             raise ValueError("invalid seal status")
         with self._lock, self._db:
             self._dataset(dataset_id)
+            recovered = self._inventory_unsubmitted_zarr_shards(dataset_id)
             state = "needs_attention" if status == "needs_attention" else "draining"
             self._db.execute(
                 """UPDATE datasets SET sealed=1, seal_status=?, sealed_utc=?,
@@ -354,6 +358,13 @@ class UploadStore:
                 (status, utc_now(), state, dataset_id),
             )
             self._event(dataset_id, None, "dataset_sealed", detail=status)
+            if recovered:
+                self._event(
+                    dataset_id,
+                    None,
+                    "recovery_inventory",
+                    detail=f"{recovered} unsubmitted zarr shard(s)",
+                )
             self._update_dataset_state(dataset_id)
             return self.dataset_status(dataset_id)
 
@@ -532,6 +543,71 @@ class UploadStore:
                     (state, state, utc_now(), row["id"]),
                 )
 
+    def reconcile_sealed_datasets(self) -> int:
+        """Inventory shards missed before a crash or by an older producer.
+
+        A sealed dataset is immutable, so walking it cannot race a writer. This
+        also repairs databases produced by the first manager release, where a
+        legacy queue guard accidentally bypassed every live shard submission.
+        """
+        with self._lock, self._db:
+            total = 0
+            rows = self._db.execute(
+                "SELECT id FROM datasets WHERE sealed=1 AND delete_after_verify=1"
+            ).fetchall()
+            for row in rows:
+                inserted = self._inventory_unsubmitted_zarr_shards(row["id"])
+                if inserted:
+                    total += inserted
+                    self._db.execute(
+                        "UPDATE datasets SET state='draining',last_error=NULL WHERE id=?",
+                        (row["id"],),
+                    )
+                    self._event(
+                        row["id"],
+                        None,
+                        "recovery_inventory",
+                        detail=f"{inserted} unsubmitted zarr shard(s)",
+                    )
+            return total
+
+    def _inventory_unsubmitted_zarr_shards(self, dataset_id: str) -> int:
+        dataset = self._dataset(dataset_id)
+        local_root = dataset["local_root"]
+        if not os.path.isdir(local_root):
+            return 0
+        inserted = 0
+        for root, _dirs, files in os.walk(local_root):
+            relative_root = os.path.relpath(root, local_root)
+            parts = Path(relative_root).parts
+            if not any(part.endswith(".ome.zarr") for part in parts):
+                continue
+            if "frame_times" in parts:
+                continue
+            for name in files:
+                if name == "zarr.json" or name.endswith(".lock") or ".part-" in name:
+                    continue
+                # Zarr v3 flat chunks are named c.<coords>; slash-separated
+                # chunks have a literal c directory and numeric descendants.
+                if not (name.startswith("c.") or "c" in parts):
+                    continue
+                local_path = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(local_path)
+                except OSError:
+                    continue
+                relative_path = os.path.relpath(local_path, local_root).replace("\\", "/")
+                task_key = os.path.dirname(relative_path).replace("\\", "/")
+                task_id = "recovery:" + hashlib.sha256(task_key.encode("utf-8")).hexdigest()[:20]
+                cur = self._db.execute(
+                    """INSERT OR IGNORE INTO files
+                       (dataset_id,task_id,relative_path,generation,size,deletable,stable_read,state)
+                       VALUES(?,?,?,'1',?,1,0,'pending')""",
+                    (dataset_id, task_id, relative_path, size),
+                )
+                inserted += cur.rowcount
+        return inserted
+
     def dataset_status(self, dataset_id: str) -> dict:
         with self._lock:
             d = dict(self._dataset(dataset_id))
@@ -689,6 +765,7 @@ class UploadManagerEngine:
         self._ctx = multiprocessing.get_context("spawn")
         self._results = self._ctx.Queue()
         self._active: Dict[int, multiprocessing.Process] = {}
+        self._log = squid.logging.get_logger("UploadManager")
 
     def tick(self) -> None:
         self._collect_results()
@@ -702,6 +779,10 @@ class UploadManagerEngine:
             process = self._ctx.Process(target=_transfer_process, args=(item, self._results), daemon=True)
             process.start()
             self._active[int(item["id"])] = process
+            self._log.info(
+                "Started transfer file_id=%s dataset=%s %s -> %s",
+                item["id"], item["dataset_id"], item["local_path"], item["remote_path"],
+            )
         self._delete_verified_files()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -745,6 +826,16 @@ class UploadManagerEngine:
                     },
                 )
             self.store.record_transfer(result)
+            if result.ok:
+                self._log.info(
+                    "Verified file_id=%s bytes=%s transferred_bytes=%s path=%s",
+                    result.file_id, result.size, result.transferred_bytes, row["relative_path"],
+                )
+            else:
+                self._log.error(
+                    "Transfer failed file_id=%s path=%s error=%s",
+                    result.file_id, row["relative_path"], result.error,
+                )
 
     def _reconcile_dead_processes(self) -> None:
         for file_id, process in list(self._active.items()):
@@ -757,6 +848,7 @@ class UploadManagerEngine:
                 continue
             process.join(timeout=0)
             self._active.pop(file_id, None)
+            self._log.error("Transfer process exited unexpectedly for file_id=%s", file_id)
             self.store.record_transfer(TransferResult(file_id, False, None, None, "transfer process exited", 0, 0.0))
 
     def _delete_verified_files(self) -> None:
@@ -775,6 +867,16 @@ class UploadManagerEngine:
             except OSError as exc:
                 error = str(exc)
             self.store.finish_delete(item["id"], error)
+            if error:
+                self._log.error(
+                    "Delete failed file_id=%s path=%s error=%s",
+                    item["id"], item["local_path"], error,
+                )
+            else:
+                self._log.info(
+                    "Deleted verified local file file_id=%s path=%s",
+                    item["id"], item["local_path"],
+                )
 
 
 class ManagerInstanceLock:

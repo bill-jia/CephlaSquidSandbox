@@ -21,6 +21,7 @@ from control.core.upload_manager import (  # noqa: E402
     handle_request,
 )
 from control.core.upload_manager_client import server_name  # noqa: E402
+import squid.logging  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,17 @@ def main(argv=None) -> int:
     except RuntimeError:
         return 0
 
+    log_path = args.state_dir / "upload_manager.log"
+    log_handler = squid.logging.add_file_handler(
+        str(log_path), replace_existing=True
+    )
+    log = squid.logging.get_logger("UploadManagerApp")
+    squid.logging.setup_uncaught_exception_logging()
+    log.info(
+        "Upload Manager starting pid=%s state_dir=%s max_lanes=%s rate_limit_mbps=%s",
+        os.getpid(), args.state_dir, args.max_lanes, args.rate_limit_mbps,
+    )
+
     from qtpy.QtCore import QTimer, Qt
     from qtpy.QtGui import QDesktopServices
     from qtpy.QtNetwork import QLocalServer
@@ -56,6 +68,9 @@ def main(argv=None) -> int:
     app.setApplicationName("Squid Upload Manager")
     app.setQuitOnLastWindowClosed(False)
     store = UploadStore(args.state_dir / "uploads.sqlite3")
+    recovered = store.recovered_shards
+    if recovered:
+        log.warning("Recovered %s previously unsubmitted zarr shard(s)", recovered)
     # Producer requests are written here before IPC.  Replay them before the
     # first scheduling tick so a crash after writer finalization cannot lose a
     # batch. Duplicate submission IDs make this safe after uncertain acks.
@@ -66,7 +81,7 @@ def main(argv=None) -> int:
                 store.submit_batch(**json.loads(entry.read_text(encoding="utf-8")))
                 entry.unlink()
             except Exception:
-                pass
+                log.exception("Could not replay producer outbox entry %s", entry)
     engine = UploadManagerEngine(store, args.max_lanes, args.rate_limit_mbps * 1_000_000)
 
     class Window(QMainWindow):
@@ -91,7 +106,7 @@ def main(argv=None) -> int:
                 ("Retry failed", lambda: self._selected_action("retry_failed")),
                 ("Open local folder", lambda: self._open_folder("local_root")),
                 ("Open remote folder", lambda: self._open_folder("remote_root")),
-                ("View log", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(args.state_dir / "manager.stderr.log")))),
+                ("View log", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))),
             ):
                 button = QPushButton(label); button.clicked.connect(callback); controls.addWidget(button)
             controls.addStretch(1); layout.addLayout(controls)
@@ -189,19 +204,38 @@ def main(argv=None) -> int:
             try:
                 request = json.loads(line.decode("utf-8")); response = handle_request(store, request)
             except Exception as exc:
+                log.exception("Invalid IPC request")
                 response = {"request_id": None, "ok": False, "error": str(exc)}
+            else:
+                if response.get("ok"):
+                    log.debug("IPC request completed method=%s", request.get("method"))
+                else:
+                    log.error(
+                        "IPC request failed method=%s error=%s",
+                        request.get("method"), response.get("error"),
+                    )
             if response.get("result", {}).get("show_window"):
                 window.show(); window.raise_(); window.activateWindow()
             socket.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")); socket.flush()
 
     server.newConnection.connect(accept_connections)
-    timer = QTimer(); timer.timeout.connect(lambda: (engine.tick(), window.refresh())); timer.start(1000)
+    def update_manager():
+        try:
+            engine.tick()
+            window.refresh()
+        except Exception:
+            log.exception("Upload Manager update failed")
+
+    timer = QTimer(); timer.timeout.connect(update_manager); timer.start(1000)
     window.refresh()
     if not args.hidden: window.show()
     try:
         return app.exec_()
     finally:
+        log.info("Upload Manager stopping")
         server.close(); engine.stop(); store.close(); lock.release()
+        if log_handler is not None:
+            squid.logging.remove_handler(log_handler)
 
 
 if __name__ == "__main__":
