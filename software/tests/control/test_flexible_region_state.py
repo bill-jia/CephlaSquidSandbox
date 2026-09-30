@@ -626,9 +626,16 @@ def test_push_tiling_grid_to_controller_pushes_the_current_spinbox_values(qtbot)
     qtbot.addWidget(entry_NX)
     qtbot.addWidget(entry_NY)
 
-    widget = SimpleNamespace(entry_NX=entry_NX, entry_NY=entry_NY, multipointController=MagicMock())
+    entry_overlap = QDoubleSpinBox()
+    entry_overlap.setValue(15)
+    qtbot.addWidget(entry_overlap)
+    widget = SimpleNamespace(
+        entry_NX=entry_NX, entry_NY=entry_NY, entry_overlap=entry_overlap, multipointController=MagicMock()
+    )
 
     _push_tiling_grid_to_controller(widget)
 
     widget.multipointController.set_NX.assert_called_once_with(4)
     widget.multipointController.set_NY.assert_called_once_with(7)
+    widget.multipointController.set_overlap_percent.assert_called_once_with(15)
+    assert widget.multipointController.tile_spacing == {}

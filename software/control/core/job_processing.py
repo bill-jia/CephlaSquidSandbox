@@ -1937,6 +1937,7 @@ class DownsampledViewResult:
     well_col: int
     well_images: Dict[int, np.ndarray]  # channel_idx -> downsampled image
     channel_names: List[str]
+    time_point: int = 0
 
 
 @dataclass
@@ -1962,6 +1963,7 @@ class DownsampledViewJob(Job):
 
     # All fields must have defaults because parent class Job has job_id with default
     well_id: str = ""
+    time_point: int = 0
     well_row: int = 0
     well_col: int = 0
     fov_index: int = 0
@@ -1982,11 +1984,11 @@ class DownsampledViewJob(Job):
     interpolation_method: Union[DownsamplingMethod, str] = DownsamplingMethod.INTER_AREA_FAST
     skip_saving: bool = False  # Skip TIFF file saving (just generate for display)
 
-    # Class-level accumulator storage keyed by well_id.
+    # Class-level accumulator storage keyed by output directory, timepoint and well.
     # Note: This runs inside JobRunner (a multiprocessing.Process), so each worker
     # process has its own copy of this class variable. It is process-local and
     # safe to mutate without cross-process synchronization.
-    _well_accumulators: ClassVar[Dict[str, WellTileAccumulator]] = {}
+    _well_accumulators: ClassVar[Dict[Tuple[str, int, str], WellTileAccumulator]] = {}
     # Track wells that encountered errors during processing
     _failed_wells: ClassVar[Dict[str, str]] = {}  # well_id -> error message
 
@@ -2034,9 +2036,10 @@ class DownsampledViewJob(Job):
 
         t_crop = time.perf_counter()
 
-        # Get or create accumulator for this well
-        if self.well_id not in self._well_accumulators:
-            self._well_accumulators[self.well_id] = WellTileAccumulator(
+        # T may be inside Pos/Z/C, so several timepoints can be incomplete together.
+        accumulator_key = (self.output_dir, self.time_point, self.well_id)
+        if accumulator_key not in self._well_accumulators:
+            self._well_accumulators[accumulator_key] = WellTileAccumulator(
                 well_id=self.well_id,
                 total_fovs=self.total_fovs_in_well,
                 total_channels=self.total_channels,
@@ -2046,7 +2049,7 @@ class DownsampledViewJob(Job):
                 z_projection_mode=self.z_projection_mode,
             )
 
-        accumulator = self._well_accumulators[self.well_id]
+        accumulator = self._well_accumulators[accumulator_key]
         accumulator.add_tile(
             cropped,
             self.fov_position_in_well,
@@ -2176,6 +2179,7 @@ class DownsampledViewJob(Job):
             )
 
             return DownsampledViewResult(
+                time_point=self.time_point,
                 well_id=self.well_id,
                 well_row=self.well_row,
                 well_col=self.well_col,
@@ -2190,7 +2194,7 @@ class DownsampledViewJob(Job):
             raise
         finally:
             # Ensure accumulator is always cleaned up after processing a complete well
-            self._well_accumulators.pop(self.well_id, None)
+            self._well_accumulators.pop(accumulator_key, None)
 
 
 # TODO: For Zarr with FULL_FRAME chunks, writes to different FOVs/regions are

@@ -54,6 +54,22 @@ The acquisition controls are split between two areas of the main window:
 
 ## Core concepts
 
+**Loop order.** In either multipoint tab, drag the **T**, **Z**, **C**, and **Pos**
+blocks under **Scan behaviour** to choose acquisition order. Left is outermost;
+right is innermost. The nested-bracket preview skips inactive dimensions. For
+example, `[ T [ Pos [ Z [ C [ Capture ] ] ] ] ]` completes channels and Z at each
+position before advancing time. With Pos outside T, each position completes its
+time series before moving on; **dt** applies within each enclosing loop's series.
+Pos includes the generated tiles as well as the selected positions/wells.
+
+In Simple mode, C iterates selected observation states. In Advanced mode, C
+iterates complete selected cycles: every item's nested repeats, steps, waits,
+and stimuli stay together. Placing C outside Z or Pos runs that whole item at
+each inner Z/Pos value before advancing to the next item. Per-position channel
+overrides are respected. The selected order is recorded in acquisition YAML;
+the Wellplate tab also remembers it across restarts. Fluidics protocols require
+T outermost. AF-validation runs retain their diagnostic traversal.
+
 **Observation state = channel.** An *observation state* is the complete light‑path
 configuration for one acquisition step — illumination source and intensity, camera
 exposure/gain, emission filter, Z‑offset, and so on. It is the equivalent of a
@@ -61,6 +77,16 @@ exposure/gain, emission filter, Z‑offset, and so on. It is the equivalent of a
 Observation states are saved as **named presets per user profile**; you pick which
 ones to image from a checkbox list. The preset name also becomes part of the saved
 file names.
+
+**Tile mode.** Both multipoint tabs offer **Overlap**, **Spacing**, and a disabled
+**Auto-find** option (coming later). The controls share a single row. Overlap uses a percentage; Spacing uses an
+**Nx × Ny** grid with separate X/Y pitches in **Distance** (mm) or **N FOVs**.
+Spacing is measured between tile centers: 1 FOV means touching tiles, and 2 FOVs
+leaves a one-FOV gap. FOV counts use the image width for X and height for Y and
+follow the acquisition FOV when it changes. Distance pitches stay fixed in mm.
+The grid is centered on each selected position or well. In Wellplate, Spacing
+automatically selects Nx × Ny; **Well area** (fraction of well) remains available in Overlap.
+The mode and pitch are included in saved acquisition YAML settings.
 
 **Region.** A region is one area to be imaged — a selected well, an imported
 coordinate, or a manually added position. Each region is covered by a grid of
@@ -522,10 +548,11 @@ position, or `—` when none is set.
 
 ### Per‑position tile grid
 
-Each position is imaged as a small tile grid. Depending on configuration you set either:
+Each position is imaged as a small tile grid. Choose the tile mode:
 
-- **Nx** / **Ny** (number of tiles in X and Y) and **Overlap** (%), or
-- **dx** / **dy** (step sizes in mm) together with **Nx** / **Ny**.
+- **Overlap**: **Nx** / **Ny** (number of tiles in X and Y) and overlap (%).
+- **Spacing**: **Nx** / **Ny**, then **Distance** (mm) or **N FOVs** with X/Y pitches.
+- **Auto-find** is disabled and reserved for future implementation.
 
 **Snake scan** is not in this section — it is a property of the whole scan path, so it
 lives in **Scan behaviour** on the right of both tabs.

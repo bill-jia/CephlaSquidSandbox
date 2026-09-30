@@ -371,6 +371,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
             "snake_observation_states": params.snake_observation_states,
+            "loop_order": list(params.acquisition_order or ("T", "Pos", "Z", "C")),
         },
         "objective": objective_info or {},
         "sample": {
@@ -402,6 +403,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "scan_size_mm": scan_size_mm,
             "overlap_percent": overlap_percent,
             "tiling_method": params.tiling_method,
+            "tile_spacing": params.tile_spacing,
             "nx": params.NX,
             "ny": params.NY,
             "delta_x_mm": params.deltaX,
@@ -420,6 +422,7 @@ def _save_unified_multipoint_acquisition_yaml(
         }
     else:  # flexible
         yaml_dict["flexible_scan"] = {
+            "tile_spacing": params.tile_spacing,
             "nx": params.NX,
             "ny": params.NY,
             "delta_x_mm": params.deltaX,
@@ -550,6 +553,8 @@ class MultiPointController:
         # dropped file can tell a real grid from the 1x1 a fraction-of-well run also
         # emits, instead of the drop handler guessing from nx*ny alone (F6).
         self.tiling_method = "fraction"
+        self.tile_spacing = {}
+        self.acquisition_order = None
         self.NZ = 1  # Number of Z positions (for Z-stacks)
         # TODO(imo): Switch all to consistent mm units
         self.deltaZ = control._def.Acquisition.DZ / 1000  # Z step size (mm, converted from um)
@@ -1948,6 +1953,8 @@ class MultiPointController:
             NY=self.NY,
             deltaY=self.deltaY,
             tiling_method=self.tiling_method,
+            tile_spacing=dict(self.tile_spacing),
+            acquisition_order=tuple(self.acquisition_order) if self.acquisition_order is not None else None,
             NZ=self.NZ,
             deltaZ=self.deltaZ,
             Nt=self.Nt,
@@ -2147,6 +2154,16 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        if getattr(self, "acquisition_order", None) is not None:
+            from control.models.acquisition_order import validate_order
+            try:
+                order = validate_order(self.acquisition_order)
+            except ValueError as exc:
+                self._log.error(str(exc))
+                return False
+            if self.use_fluidics and self.Nt > 1 and order[0] != "T":
+                self._log.error("Fluidics requires T as the outermost acquisition loop.")
+                return False
         if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
             self._log.error("AF validation requires laser autofocus and a valid reference.")
             return False

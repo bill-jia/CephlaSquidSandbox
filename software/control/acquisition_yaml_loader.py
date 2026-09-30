@@ -16,6 +16,7 @@ class AcquisitionYAMLData:
     skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
     validation_mode: bool = False
     snake_observation_states: bool = False
+    acquisition_order: Tuple[str, ...] = ("T", "Pos", "Z", "C")
     # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
     # None means the file predates the flag, and the GUI then leaves its checkbox alone.
     retract_z_between_regions: Optional[bool] = None
@@ -46,6 +47,7 @@ class AcquisitionYAMLData:
     # Wellplate-specific
     scan_size_mm: Optional[float] = None
     overlap_percent: float = 10.0
+    tile_spacing: Dict = field(default_factory=dict)
     scan_shape: Optional[str] = None
     wellplate_regions: Optional[List[Dict]] = None  # [{name, center_mm, shape}, ...]
 
@@ -152,6 +154,8 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         # Wellplate-specific
         scan_size_mm=wellplate_scan.get("scan_size_mm"),
         overlap_percent=overlap,
+        tile_spacing=scan.get("tile_spacing", {}),
+        acquisition_order=tuple(acq.get("loop_order", ("T", "Pos", "Z", "C"))),
         scan_shape=scan_shape,
         wellplate_regions=wellplate_regions,
         # Tiling grid (either section)

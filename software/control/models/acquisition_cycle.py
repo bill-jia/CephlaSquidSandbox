@@ -283,6 +283,9 @@ class ResolvedEvent:
     # One top-level step/group/sweep occurrence, including all group repeats.
     # None identifies simple-mode events, whose individual Z captures may snake.
     acquisition_block_index: Optional[int] = None
+    # One entry in the Advanced selection list, including the cycle's full
+    # repeated/nested contents. Independent of the finer-grained snake blocks.
+    channel_block_index: Optional[int] = None
 
 
 # Suffix appended to a ragged array key for a reference-z-only ("single plane")
@@ -515,14 +518,20 @@ def resolve_chain(
     multiplexed LED groups for any ``CycleFPMDarkfield`` items.
     """
     blocks: List[List[_RawEvent]] = []
+    channel_indices = []
     pp_alloc = _PostprocessGroupAllocator()  # one allocator ⇒ group ids unique across the chain
-    for name in cycle_names:
+    for channel_index, name in enumerate(cycle_names):
         cycle = load_cycle(name)
         if cycle is None:
             logger.warning("Acquisition cycle %r not found, skipping", name)
             continue
-        blocks.extend(_raw_event_blocks(cycle, fpm_provider, pp_alloc))
-    return _index_event_blocks(blocks, is_stimulus)
+        cycle_blocks = _raw_event_blocks(cycle, fpm_provider, pp_alloc)
+        blocks.extend(cycle_blocks)
+        channel_indices.extend([channel_index] * sum(len(block) for block in cycle_blocks))
+    return [
+        replace(event, channel_block_index=index)
+        for event, index in zip(_index_event_blocks(blocks, is_stimulus), channel_indices)
+    ]
 
 
 def iter_acquisition_planes(

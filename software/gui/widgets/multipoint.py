@@ -12,6 +12,8 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
+from .tile_spacing import TileSpacingWidget, spacing_parameters
+from .acquisition_order import AcquisitionOrderWidget
 from control.core.scan_coordinates import normalize_region_name, validate_region_name
 from control.models import LaserAFReference
 
@@ -1752,6 +1754,57 @@ def _is_dry_run(combo: "QComboBox") -> bool:
     return combo.currentText() == DRY_RUN_SAVE_FORMAT
 
 
+def _uses_ordered_progress(widget):
+    controls = getattr(widget, "acquisition_order", None)
+    return controls is not None and not widget.checkbox_afValidation.isChecked() and (
+        controls.order() != ("T", "Pos", "Z", "C") or widget.checkbox_snakeObservationStates.isChecked()
+    )
+
+
+def _update_ordered_progress(widget, completed, total):
+    if not _uses_ordered_progress(widget):
+        return False
+    widget.progress_bar.setMaximum(total)
+    widget.progress_bar.setValue(completed)
+    if widget.acquisition_start_time is not None and completed > 0:
+        elapsed = max(0, time.time() - widget.acquisition_start_time)
+        widget.eta_seconds = max(0, total - completed) * elapsed / completed
+        widget.update_eta_display()
+        widget.eta_timer.start(1000)
+    return True
+
+
+def _make_acquisition_order(widget):
+    controls = AcquisitionOrderWidget()
+    def refresh(*_):
+        _refresh_acquisition_order(widget, controls)
+    widget._timelapse_checkbox.toggled.connect(refresh)
+    widget._zstack_checkbox.toggled.connect(refresh)
+    widget.list_configurations.itemChanged.connect(refresh)
+    widget.list_configurations.model().rowsInserted.connect(refresh)
+    widget.list_configurations.model().rowsRemoved.connect(refresh)
+    if hasattr(widget, "checkbox_xy"):
+        widget.checkbox_xy.toggled.connect(refresh)
+    refresh()
+    return controls
+
+
+def _refresh_acquisition_order(widget, controls=None):
+    controls = controls if controls is not None else getattr(widget, "acquisition_order", None)
+    if controls is None:
+        return
+    active = {"Pos"}
+    if widget._timelapse_checkbox.isChecked():
+        active.add("T")
+    if widget._zstack_checkbox.isChecked():
+        active.add("Z")
+    if _has_checked_items(widget.list_configurations):
+        active.add("C")
+    if hasattr(widget, "checkbox_xy") and not widget.checkbox_xy.isChecked():
+        active.discard("Pos")
+    controls.set_active(active)
+
+
 def _push_tiling_grid_to_controller(widget) -> None:
     """Push the panel's Nx/Ny spinboxes into the shared controller.
 
@@ -1763,6 +1816,8 @@ def _push_tiling_grid_to_controller(widget) -> None:
     """
     widget.multipointController.set_NX(widget.entry_NX.value())
     widget.multipointController.set_NY(widget.entry_NY.value())
+    widget.multipointController.tile_spacing = spacing_parameters(widget)
+    widget.multipointController.set_overlap_percent(widget.entry_overlap.value())
 
 
 def _push_save_format_to_controller(widget) -> None:
@@ -1801,7 +1856,7 @@ def _make_snake_observation_states_checkbox(controller) -> "QCheckBox":
     checkbox.setChecked(bool(getattr(controller, "snake_observation_states", False)))
     checkbox.setToolTip(
         "Alternate acquisition order between FOVs. Simple mode reverses states and Z planes.\n"
-        "Advanced mode reverses whole steps/groups, preserving their internal order and Z stacks."
+        "Advanced mode reverses selected cycles, preserving each cycle's complete internal order."
     )
     checkbox.toggled.connect(controller.set_snake_observation_states)
     return checkbox
@@ -2057,6 +2112,7 @@ class _ZTimeGroupMixin:
             # In Set Z-range mode Nz is derived from the range, not typed.
             self.entry_NZ.setEnabled(False)
         self.multipointController.set_NZ(self._effective_NZ())
+        _refresh_acquisition_order(self)
         # The image count just changed, so the estimate is refreshed from here rather
         # than from a separate signal connection that could fire before the push.
         _refresh_size_estimate(self)
@@ -2066,6 +2122,7 @@ class _ZTimeGroupMixin:
         for widget in self._timelapse_controls:
             widget.setEnabled(enabled)
         self.multipointController.set_Nt(self._effective_Nt())
+        _refresh_acquisition_order(self)
         _refresh_size_estimate(self)
 
     def _effective_NZ(self) -> int:
@@ -3309,7 +3366,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # which drops the references it holds; the widget owns the position list, so
         # it owns the references too and re-applies them after each rebuild.
         self._region_laser_af_references = {}
-        self.use_overlap = USE_OVERLAP_FOR_FLEXIBLE
+        self.use_overlap = True  # All interactive pitch modes use the shared grid generator.
         self.add_components()
         self.setup_layout()
         self.setup_connections()
@@ -3700,28 +3757,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # behaves (focus, saving, scan behaviour).
 
         tiling_section, tiling_content = _make_section("Tiling per position")
-        tiling_row = QHBoxLayout()
+        tiling_grid_row, tiling_row = _make_row_widget()
         tiling_row.addWidget(QLabel("Nx"))
         tiling_row.addWidget(self.entry_NX)
         tiling_row.addWidget(QLabel("Ny"))
         tiling_row.addWidget(self.entry_NY)
-        if self.use_overlap:
-            tiling_row.addWidget(QLabel("Overlap"))
-            tiling_row.addWidget(self.entry_overlap)
-            tiling_row.addStretch(1)
-            tiling_content.addLayout(tiling_row)
-        else:
-            # Alternate geometry (use_overlap off): the tile pitch is given directly
-            # as dx/dy instead of being derived from the FOV and an overlap fraction.
-            tiling_row.addStretch(1)
-            tiling_content.addLayout(tiling_row)
-            pitch_row = QHBoxLayout()
-            pitch_row.addWidget(QLabel("dx"))
-            pitch_row.addWidget(self.entry_deltaX)
-            pitch_row.addWidget(QLabel("dy"))
-            pitch_row.addWidget(self.entry_deltaY)
-            pitch_row.addStretch(1)
-            tiling_content.addLayout(pitch_row)
+        self.tile_spacing = TileSpacingWidget(self.entry_overlap)
+        self.tile_spacing.layout().insertWidget(1, tiling_grid_row)
+        if not USE_OVERLAP_FOR_FLEXIBLE:
+            self.tile_spacing.restore(dict(
+                spacing_mode="distance", spacing_x=self.entry_deltaX.value(), spacing_y=self.entry_deltaY.value()
+            ))
+        tiling_content.insertWidget(0, self.tile_spacing)
+        self.tile_spacing.changed.connect(self.update_fov_positions)
 
         # The header checkbox is the group's on/off switch: unchecked is a single
         # plane, and the rows below are greyed out rather than hidden so the user can
@@ -3796,6 +3844,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         saving_content.addLayout(self.zarrStreamingRow)
 
         scan_section, scan_content = _make_section("Scan behaviour")
+        self.acquisition_order = _make_acquisition_order(self)
+        scan_content.addWidget(self.acquisition_order)
         # Snake scan is a property of the whole scan path, not of one position's tile
         # grid, and the Wellplate tab has always carried it here.
         scan_content.addWidget(self.checkbox_snakeScan)
@@ -4059,6 +4109,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
     def update_region_progress(self, current_fov, num_fovs):
         self._log.debug(f"Updating region progress for {current_fov=}, {num_fovs=}")
+        if _update_ordered_progress(self, current_fov, num_fovs):
+            return
         self.progress_bar.setMaximum(num_fovs)
         self.progress_bar.setValue(current_fov)
 
@@ -4093,7 +4145,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.current_region = current_region
         self.current_time_point = current_time_point
 
-        if self.current_region == 1 and self.current_time_point == 0:  # First region
+        if self.acquisition_start_time is None or (
+            not _uses_ordered_progress(self) and self.current_region == 1 and self.current_time_point == 0
+        ):
             self.acquisition_start_time = time.time()
             self.num_regions = num_regions
 
@@ -4110,7 +4164,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         progress_text = "  ".join(progress_parts)
         self.progress_label.setText(progress_text if progress_text else "Progress")
 
-        self.progress_bar.setValue(0)
+        if not _uses_ordered_progress(self):
+            self.progress_bar.setValue(0)
 
     def update_eta_display(self):
         if self.eta_seconds > 0:
@@ -4160,7 +4215,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4352,6 +4407,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             )
             self.multipointController.set_widget_type("flexible")
             _push_tiling_grid_to_controller(self)
+            self.multipointController.acquisition_order = self.acquisition_order.order()
             self._push_channel_selection_to_controller()
             # Re-push THIS tab's visible save-format + streaming state. The
             # flexible and wellplate tabs each have their own combo/row bound
@@ -4583,7 +4639,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4841,7 +4897,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4996,7 +5052,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                             z,
                             self.entry_NX.value(),
                             self.entry_NY.value(),
-                            overlap_percent=self.entry_overlap.value(),
+                            overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                         )
                     else:
                         self.scanCoordinates.add_flexible_region_with_step_size(
@@ -5077,6 +5133,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.lineEdit_experimentID.setEnabled(enabled)
         self.entry_NX.setEnabled(enabled)
         self.entry_NY.setEnabled(enabled)
+        self.tile_spacing.setEnabled(enabled)
+        self.acquisition_order.setEnabled(enabled)
         self.entry_deltaZ.setEnabled(enabled)
         self.entry_NZ.setEnabled(enabled)
         self.entry_dt.setEnabled(enabled)
@@ -5199,6 +5257,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                 self.entry_deltaY.setValue(yaml_data.delta_y_mm)
             if hasattr(self, "entry_overlap") and self.use_overlap:
                 self.entry_overlap.setValue(yaml_data.overlap_percent)
+            self.tile_spacing.restore(yaml_data.tile_spacing)
+            self.acquisition_order.restore(yaml_data.acquisition_order)
 
             # Z-stack settings: more than one plane in the file means the group is on.
             self.checkbox_zstack.setChecked(yaml_data.nz > 1)
@@ -5304,7 +5364,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -5726,8 +5786,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         # Two ways to say how much of each well to cover: a scan area that is a
         # fraction of the well, or the Flexible tab's explicit Nx x Ny grid centred
         # on the well centre (on the stage position in Current Position mode).
-        self.radio_tiling_fraction = QRadioButton("Fraction of well")
-        self.radio_tiling_grid = QRadioButton("Nx × Ny")
+        self.radio_tiling_fraction = QRadioButton("Well area")
+        self.radio_tiling_grid = QRadioButton("Grid")
         self.radio_tiling_fraction.setChecked(True)
         self.radio_tiling_fraction.setToolTip(
             "Cover a scan area of the given size in each well, tiled to fill the shape."
@@ -5740,11 +5800,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.tiling_method_group.addButton(self.radio_tiling_grid)
 
         self.tiling_method_row, method_row = _make_row_widget()
-        method_row.addWidget(QLabel("Method"))
         method_row.addWidget(self.radio_tiling_fraction)
         method_row.addWidget(self.radio_tiling_grid)
-        method_row.addStretch(1)
-        tiling_content.addWidget(self.tiling_method_row)
 
         self.tiling_fraction_row, fraction_row = _make_row_widget()
         fraction_row.addWidget(self.scan_shape_label)
@@ -5753,23 +5810,22 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         fraction_row.addWidget(self.entry_scan_size)
         fraction_row.addWidget(self.coverage_label)
         fraction_row.addWidget(self.entry_well_coverage)
-        fraction_row.addStretch(1)
-        tiling_content.addWidget(self.tiling_fraction_row)
 
         self.tiling_grid_row, grid_row = _make_row_widget()
         grid_row.addWidget(QLabel("Nx"))
         grid_row.addWidget(self.entry_NX)
         grid_row.addWidget(QLabel("Ny"))
         grid_row.addWidget(self.entry_NY)
-        grid_row.addStretch(1)
-        tiling_content.addWidget(self.tiling_grid_row)
 
         # Overlap applies to both methods (and to Manual mode's own shapes).
         self.tiling_overlap_row, overlap_row = _make_row_widget()
-        overlap_row.addWidget(self.fov_overlap_label)
-        overlap_row.addWidget(self.entry_overlap)
-        overlap_row.addStretch(1)
-        tiling_content.addWidget(self.tiling_overlap_row)
+        self.tile_spacing = TileSpacingWidget(self.entry_overlap)
+        self.tile_spacing.layout().insertWidget(1, self.tiling_method_row)
+        self.tile_spacing.layout().insertWidget(2, self.tiling_fraction_row)
+        self.tile_spacing.layout().insertWidget(3, self.tiling_grid_row)
+        overlap_row.addWidget(self.tile_spacing)
+        self.tile_spacing.changed.connect(self._on_tile_spacing_changed)
+        tiling_content.insertWidget(0, self.tiling_overlap_row)
 
         self.tiling_section_widget = QWidget()
         self.tiling_section_widget.setLayout(tiling_section)
@@ -5853,6 +5909,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         saving_content.addLayout(self.zarrStreamingRow)
 
         scan_section, scan_content = _make_section("Scan behaviour")
+        self.acquisition_order = _make_acquisition_order(self)
+        self.acquisition_order.changed.connect(self.save_multipoint_widget_config_to_cache)
+        scan_content.addWidget(self.acquisition_order)
         scan_content.addWidget(self.checkbox_snakeScan)
         scan_content.addWidget(self.checkbox_snakeObservationStates)
         scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
@@ -6032,6 +6091,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 "nx": self.entry_NX.value(),
                 "ny": self.entry_NY.value(),
                 "fov_overlap": self.entry_overlap.value(),
+                "tile_spacing": spacing_parameters(self),
+                "loop_order": list(self.acquisition_order.order()) if hasattr(self, "acquisition_order") else ["T", "Pos", "Z", "C"],
                 "scan_size_mm": self.entry_scan_size.value(),
                 "dt": self.entry_dt.value(),
                 "nt": self.entry_Nt.value(),
@@ -6121,6 +6182,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.entry_NX.setValue(settings.get("nx", 1))
             self.entry_NY.setValue(settings.get("ny", 1))
             self.entry_overlap.setValue(settings.get("fov_overlap", 10))
+            if hasattr(self, "tile_spacing"):
+                self.tile_spacing.restore(settings.get("tile_spacing", {}))
+                if spacing_parameters(self):
+                    self.radio_tiling_grid.setChecked(True)
+            if hasattr(self, "acquisition_order"):
+                self.acquisition_order.restore(settings.get("loop_order", ["T", "Pos", "Z", "C"]))
             cached_scan_size = settings.get("scan_size_mm")
             if cached_scan_size is not None:
                 self.entry_scan_size.setValue(cached_scan_size)
@@ -6306,9 +6373,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.tiling_section_widget.setVisible(xy_checked and not loading_coordinates)
         fraction_mode = self.radio_tiling_fraction.isChecked()
         tiles_a_region = xy_checked and xy_mode in ("Current Position", "Select Wells")
-        self.tiling_method_row.setVisible(tiles_a_region)
+        self.tiling_method_row.setVisible(tiles_a_region and not bool(spacing_parameters(self)))
         self.tiling_fraction_row.setVisible(tiles_a_region and fraction_mode)
         self.tiling_grid_row.setVisible(tiles_a_region and not fraction_mode)
+        self.tile_spacing.mode.setVisible(tiles_a_region)
+        self.radio_tiling_fraction.setEnabled(not bool(spacing_parameters(self)))
 
         if not xy_checked:
             return
@@ -6417,6 +6486,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # to avoid conflicts with range setting and UI state management
 
     def update_region_progress(self, current_fov, num_fovs):
+        if _update_ordered_progress(self, current_fov, num_fovs):
+            return
         self.progress_bar.setMaximum(num_fovs)
         self.progress_bar.setValue(current_fov)
 
@@ -6448,7 +6519,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.current_region = current_region
         self.current_time_point = current_time_point
 
-        if self.current_region == 1 and self.current_time_point == 0:  # First region
+        if self.acquisition_start_time is None or (
+            not _uses_ordered_progress(self) and self.current_region == 1 and self.current_time_point == 0
+        ):
             self.acquisition_start_time = time.time()
             self.num_regions = num_regions
 
@@ -6464,7 +6537,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         # Set the progress label text, ensuring it's not empty
         progress_text = "  ".join(progress_parts)
         self.progress_label.setText(progress_text if progress_text else "Progress")
-        self.progress_bar.setValue(0)
+        if not _uses_ordered_progress(self):
+            self.progress_bar.setValue(0)
 
     def update_eta_display(self):
         if self.eta_seconds > 0:
@@ -6751,7 +6825,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.scanCoordinates.clear_regions()
         if self.radio_tiling_grid.isChecked():
             self.scanCoordinates.set_well_coordinates_grid(
-                self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value()
+                self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value(), **spacing_parameters(self)
             )
         else:
             self.scanCoordinates.set_well_coordinates(
@@ -6762,7 +6836,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         """Current Position counterpart of ``_tile_wells``: one region on the stage."""
         if self.radio_tiling_grid.isChecked():
             self.scanCoordinates.set_live_scan_coordinates_grid(
-                x_mm, y_mm, self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value()
+                x_mm, y_mm, self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value(),
+                **spacing_parameters(self),
             )
         else:
             self.scanCoordinates.set_live_scan_coordinates(
@@ -6772,6 +6847,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 self.entry_overlap.value(),
                 self.combobox_shape.currentText(),
             )
+
+    def _on_tile_spacing_changed(self):
+        if spacing_parameters(self):
+            self.radio_tiling_grid.setChecked(True)
+        self._on_tiling_method_changed()
+        self.save_multipoint_widget_config_to_cache()
 
     def _on_tiling_method_changed(self):
         """Swap which tiling rows are on screen, then rebuild the regions with the
@@ -6915,8 +6996,10 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("wellplate")
+            self.multipointController.acquisition_order = self.acquisition_order.order()
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
+            self.multipointController.tile_spacing = spacing_parameters(self) if self.radio_tiling_grid.isChecked() else {}
             # NX/NY are metadata here (the regions are already tiled), but they are what
             # the acquisition yaml records, so a fraction-of-well run must not claim a grid.
             grid_tiling = self.radio_tiling_grid.isChecked()
@@ -7497,6 +7580,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
 
             # Tiling method (F6): see _apply_tiling_method_from_yaml.
             _apply_tiling_method_from_yaml(self, yaml_data)
+            self.acquisition_order.restore(yaml_data.acquisition_order)
+            self.tile_spacing.restore(yaml_data.tile_spacing)
+            if spacing_parameters(self):
+                self.radio_tiling_grid.setChecked(True)
+                self.entry_NX.setValue(yaml_data.nx)
+                self.entry_NY.setValue(yaml_data.ny)
 
             # Channels
             if yaml_data.channel_names:
