@@ -1594,10 +1594,9 @@ class MultiPointWorker:
             mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
 
-        # Live ZARR_V3 upload (per-acquisition setting). When enabled, spawn a
-        # dedicated UploadWorker process and wire its input queue into the
-        # SaveZarrJob runner. Acquisition continues even if the network is
-        # down — uploads queue, deletions defer.
+        # Live ZARR_V3 upload (per-acquisition setting). The detached Upload
+        # Manager owns transfer processes and durable queue state. This worker
+        # only gives writer subprocesses its dataset identity.
         self._upload_target: Optional[UploadTarget] = None
         self._upload_worker: Optional[UploadWorker] = None
         self._save_zarr_runner: Optional[JobRunner] = None
@@ -1638,17 +1637,23 @@ class MultiPointWorker:
                 remote_root=remote_experiment_root,
                 local_base=self.experiment_path,
                 delete_after_verify=acquisition_parameters.zarr_upload_delete_after_verify,
+                manager_owned=True,
             )
-            manifest_path = os.path.join(self.experiment_path, "upload_manifest.jsonl")
-            self._upload_worker = UploadWorker(
-                target=self._upload_target, manifest_path=manifest_path
+            from uuid import uuid4
+            from control.core.upload_manager_client import UploadManagerClient
+
+            dataset_id = str(uuid4())
+            UploadManagerClient().register_dataset(
+                dataset_id=dataset_id,
+                name=os.path.basename(os.path.normpath(self.experiment_path)),
+                local_root=self.experiment_path,
+                remote_root=remote_experiment_root,
+                delete_after_verify=self._upload_target.delete_after_verify,
+                deletion_mode="individual",
             )
-            self._upload_worker.start()
-            # Reachable by the app-close/atexit kill path from the moment it
-            # exists — NOT only once the end-of-run drainer takes ownership.
-            register_live_upload_worker(self._upload_worker)
+            self._upload_target.manager_dataset_id = dataset_id
             self._log.info(
-                f"Started UploadWorker (pid={self._upload_worker.pid}) "
+                f"Registered persistent upload dataset {dataset_id} "
                 f"-> {self._upload_target.remote_root}, "
                 f"delete_after_verify={self._upload_target.delete_after_verify}"
             )
@@ -2482,6 +2487,64 @@ class MultiPointWorker:
             # The upload drainer waits on this before its "post-finalize"
             # metadata resync — only now is every zarr.json actually final.
             runners_exited_event.set()
+            if self._upload_target is not None and self._upload_target.manager_owned:
+                try:
+                    from control.core.upload_manager_client import UploadManagerClient
+                    from control.core.zarr_upload import collect_sidecar_files
+                    from control.core.zarr_layout import array_chunk_path
+                    from uuid import uuid4
+
+                    final_paths = set(
+                        collect_sidecar_files(
+                            self.experiment_path,
+                            {
+                                "upload_manifest.jsonl",
+                                "upload_manifest_backfill.jsonl",
+                                "RAW_DATA_UPLOADED.txt",
+                                "UPLOAD_INCOMPLETE.txt",
+                            },
+                        )
+                    )
+                    # Include every level of zarr hierarchy, including plate,
+                    # row, well, ragged, and derived-output metadata that is
+                    # outside any per-FOV writer's metadata_paths().
+                    for root, _dirs, files in os.walk(self.experiment_path):
+                        if "zarr.json" in files:
+                            final_paths.add(os.path.join(root, "zarr.json"))
+                        if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                            chunk = str(array_chunk_path(root, (0, 0, 0)))
+                            if os.path.isfile(chunk):
+                                final_paths.add(chunk)
+                    final_files = []
+                    for local_path in sorted(final_paths):
+                        stat = os.stat(local_path)
+                        final_files.append(
+                            {
+                                "relative_path": os.path.relpath(
+                                    local_path, self.experiment_path
+                                ).replace("\\", "/"),
+                                "size": stat.st_size,
+                                "generation": f"final:{stat.st_mtime_ns}:{stat.st_size}",
+                                "deletable": False,
+                                "stable_read": True,
+                            }
+                        )
+                    client = UploadManagerClient()
+                    if final_files:
+                        final_batch = f"final-sidecars-{uuid4()}"
+                        client.submit_batch(
+                            self._upload_target.manager_dataset_id,
+                            final_batch,
+                            final_files,
+                            task_id=final_batch,
+                        )
+                    seal_status = "aborted" if self.abort_requested_fn() else "complete"
+                    client.seal_dataset(
+                        self._upload_target.manager_dataset_id, seal_status
+                    )
+                    log.info("Persistent upload dataset sealed (%s).", seal_status)
+                except Exception:
+                    log.exception("Could not seal persistent upload dataset")
             try:
                 signal_writing_complete()
             except Exception as e:
@@ -3226,6 +3289,10 @@ class MultiPointWorker:
         """Track an upload barrier: register its task_id (submitted) or account it
         as completed-non-uploading (no writer/shards) so the timepoint tally can
         still close. Shared by the raw-plate and derived-plate (postprocess) paths."""
+        if getattr(br, "manager_owned", False):
+            # The manager has acknowledged and now owns scheduling, progress,
+            # verification, and deletion for this task.
+            return
         if br.submitted:
             if br.task_id in self._upload_completed_task_ids:
                 # Its UploadResult already arrived and was consumed —

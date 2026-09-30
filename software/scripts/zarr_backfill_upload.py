@@ -1025,6 +1025,87 @@ def run_backfill(
     return failed_files
 
 
+def submit_backfill_to_manager(
+    experiment_dir: Path,
+    remote_root: str,
+    delete_after_verify: bool,
+    in_progress: bool,
+) -> int:
+    """Discover a backfill and durably enqueue it in the detached manager."""
+    from control.core.upload_manager import normalize_path
+    from control.core.upload_manager_client import UploadManagerClient
+
+    if not experiment_dir.is_dir():
+        log.error(f"Experiment directory not found: {experiment_dir}")
+        return 1
+    fov_groups = find_fov_groups(experiment_dir)
+    if not fov_groups or not _validate_all_layouts(fov_groups):
+        log.error(f"No supported OME-Zarr FOV groups found under {experiment_dir}")
+        return 2
+    target = UploadTarget(True, remote_root, str(experiment_dir), delete_after_verify)
+    tasks: List[UploadTask] = []
+    for group in fov_groups:
+        tasks.extend(build_tasks_for_fov(group, experiment_dir, target, in_progress))
+        metadata = build_metadata_task(group, experiment_dir, target, in_progress)
+        if metadata:
+            tasks.append(metadata)
+    if not in_progress:
+        metadata_paths = gather_hcs_plate_metadata(experiment_dir) + gather_experiment_root_files(experiment_dir)
+        if metadata_paths:
+            tasks.append(
+                UploadTask(
+                    task_id=str(uuid4()), time_point=-1, region_id="(metadata)", fov=-1,
+                    files=[(str(path), local_to_remote_path(str(path), target.local_base, target.remote_root)) for path in metadata_paths],
+                    stable_read_paths={str(path) for path in metadata_paths},
+                )
+            )
+    client = UploadManagerClient()
+    snapshot = client.get_status()
+    dataset_id = None
+    for row in snapshot["datasets"]:
+        if (normalize_path(row["local_root"]) == normalize_path(str(experiment_dir))
+                and normalize_path(row["remote_root"]) == normalize_path(remote_root)
+                and row["state"] != "complete"):
+            dataset_id = row["id"]
+            break
+    if dataset_id is None:
+        dataset_id = str(uuid4())
+        client.register_dataset(
+            dataset_id=dataset_id,
+            name=experiment_dir.name,
+            local_root=str(experiment_dir),
+            remote_root=remote_root,
+            delete_after_verify=delete_after_verify,
+            deletion_mode="whole_task",
+        )
+    submitted_files = 0
+    for task in tasks:
+        values = []
+        for local, _remote in task.files:
+            stat = os.stat(local)
+            values.append(
+                {
+                    "relative_path": os.path.relpath(local, experiment_dir).replace("\\", "/"),
+                    "size": stat.st_size,
+                    "generation": (
+                        f"metadata:{stat.st_mtime_ns}:{stat.st_size}"
+                        if local in task.stable_read_paths else "1"
+                    ),
+                    "deletable": local in task.deletable_local_paths,
+                    "stable_read": local in task.stable_read_paths,
+                }
+            )
+        result = client.submit_batch(dataset_id, task.task_id, values, task_id=task.task_id)
+        submitted_files += result["file_count"]
+    if not in_progress:
+        client.seal_dataset(dataset_id)
+    log.info(
+        f"Queued {submitted_files} file(s) in Upload Manager (dataset {dataset_id}). "
+        "Transfers continue after this command exits."
+    )
+    return 0
+
+
 def measure_local_size_bytes(
     path: Path,
     *,
@@ -1629,6 +1710,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "criterion). Set this if you want the script to give up "
                              "on a backlog after a known time regardless of progress.")
     parser.add_argument("--dry-run", action="store_true", help="List planned uploads and exit.")
+    parser.add_argument("--manager", action="store_true",
+                        help="Submit to the persistent Upload Manager and exit after durable acknowledgement.")
     args = parser.parse_args(argv)
 
     if args.follow:
@@ -1643,6 +1726,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_idle_s=args.max_idle,
             drain_stall_window_s=args.drain_stall_window,
             drain_timeout_s=args.drain_timeout,
+        )
+
+    if args.manager and not args.dry_run:
+        return submit_backfill_to_manager(
+            experiment_dir=args.experiment_dir.resolve(),
+            remote_root=args.remote,
+            delete_after_verify=args.delete_after_verify,
+            in_progress=args.in_progress,
         )
 
     return run_backfill(

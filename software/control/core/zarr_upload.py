@@ -87,6 +87,10 @@ class UploadTarget:
     remote_root: str = ""
     local_base: str = ""
     delete_after_verify: bool = True
+    # Set for the persistent manager path.  Legacy callers leave these at
+    # their defaults and continue to use an in-process UploadWorker queue.
+    manager_owned: bool = False
+    manager_dataset_id: str = ""
 
 
 @dataclass

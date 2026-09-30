@@ -1221,6 +1221,7 @@ class BarrierResult:
     fov: int
     file_count: int
     submitted: bool  # False means upload disabled or writer missing — no UploadResult will ever arrive
+    manager_owned: bool = False
 
 
 @dataclass
@@ -1377,6 +1378,56 @@ class FlushAndStageUploadJob:
             deletable_local_paths=deletable,
             stable_read_paths=stable_read,
         )
+        if self.upload_target.manager_owned:
+            # Submission is committed to the manager's SQLite inventory before
+            # this call returns.  Its local outbox survives a manager restart
+            # between writer completion and acknowledgement.
+            from control.core.upload_manager_client import UploadManagerClient
+
+            root = self.upload_target.local_base
+            manager_files = []
+            for local, _remote in task.files:
+                manager_files.append(
+                    {
+                        "relative_path": os.path.relpath(local, root).replace("\\", "/"),
+                        "size": os.path.getsize(local),
+                        # Mutable metadata is a new generation when its bytes
+                        # change; immutable shards retain their task generation.
+                        "generation": (
+                            f"metadata:{os.stat(local).st_mtime_ns}:{os.path.getsize(local)}"
+                            if local in stable_read else "1"
+                        ),
+                        "deletable": local in deletable,
+                        "stable_read": local in stable_read,
+                    }
+                )
+            try:
+                UploadManagerClient().submit_batch(
+                    self.upload_target.manager_dataset_id,
+                    task_id,
+                    manager_files,
+                    task_id=task_id,
+                )
+            except Exception:
+                self._log.exception("Could not durably submit upload task %s", task_id)
+                return BarrierResult(
+                    task_id=task_id,
+                    time_point=self.time_point,
+                    region_id=self.region_id,
+                    fov=self.fov,
+                    file_count=len(files),
+                    submitted=False,
+                    manager_owned=True,
+                )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+                manager_owned=True,
+            )
         if FlushAndStageUploadJob._upload_tasks_submitted is not None:
             with FlushAndStageUploadJob._upload_tasks_submitted.get_lock():
                 FlushAndStageUploadJob._upload_tasks_submitted.value += 1

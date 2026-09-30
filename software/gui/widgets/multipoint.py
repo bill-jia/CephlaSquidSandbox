@@ -2262,7 +2262,7 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict
         "Stream ZARR_V3 output to a mounted network share as the acquisition "
         "runs. The selected folder is the PARENT: each acquisition mirrors "
         "into its own subfolder named after the experiment, sidecars included. "
-        "Each timepoint is sha256-verified on the remote before local files "
+        "Each shard is sha256-verified on the remote before local files "
         "are deleted."
     )
 
@@ -2284,10 +2284,21 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict
     delete_cb.setChecked(True)
     delete_cb.setEnabled(False)
     delete_cb.setToolTip(
-        "After every shard of a timepoint is sha256-verified on the remote, "
-        "delete the local copies. Required to reclaim disk space during a "
+        "After a shard is sha256-verified on the remote, delete its local "
+        "copy. Required to reclaim disk space during a "
         "long acquisition; uncheck to keep local copies."
     )
+    show_btn = QPushButton("Show uploads")
+    show_btn.setToolTip("Open the persistent Upload Manager status window.")
+
+    def _show_uploads():
+        try:
+            from control.core.upload_manager_client import UploadManagerClient
+            UploadManagerClient().show_window()
+        except Exception as exc:
+            QMessageBox.warning(None, "Upload Manager", f"Could not open Upload Manager:\n{exc}")
+
+    show_btn.clicked.connect(_show_uploads)
 
     def _push_to_controller():
         if multi_point_controller is None:
@@ -2328,6 +2339,7 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict
     toggles.setContentsMargins(0, 0, 0, 0)
     toggles.addWidget(enable_cb)
     toggles.addWidget(delete_cb)
+    toggles.addWidget(show_btn)
     toggles.addStretch(1)
     row.addLayout(toggles)
     path_row = QHBoxLayout()
@@ -2341,6 +2353,7 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict
         "path_edit": path_edit,
         "browse_btn": browse_btn,
         "delete_cb": delete_cb,
+        "show_btn": show_btn,
         "_push": _push_to_controller,
     }
     return row, widgets
