@@ -6,6 +6,8 @@ Hardware collection, application, and serialization logic lives in
 that are shared across the codebase:
 
 - ``collect_emission_filter_positions`` — read emission filter wheel hardware
+  (standalone wheel, or the wheel inside a confocal unit via
+  ``confocal_emission_filter_position``)
 - ``infer_roi_centered_from_camera`` — used by ObservationStateController
 - ``observation_state_binning_mode_for_metadata`` — for AcquisitionMetadata
 - ``observation_state_to_yaml`` — serialise ObservationState to YAML dict
@@ -36,8 +38,51 @@ _PRESET_FILENAME_RE = re.compile(r"^[\w\- ]+$")
 # ── Hardware reads ────────────────────────────────────────────────────────────
 
 
-def collect_emission_filter_positions(emission_filter_wheel: Optional[Any]) -> Dict[str, Union[str, int]]:
-    """Read emission filter wheel positions for observation state and snap metadata."""
+def confocal_emission_filter_position(xlight: Optional[Any]) -> Optional[int]:
+    """Current emission wheel slot of a confocal unit (X-Light), or None.
+
+    On an X-Light rig the only emission wheel lives *inside* the confocal unit
+    (declared under ``devices.xlight.config.emission_filter_wheel``), so
+    ``addons.emission_filter_wheel`` is None and the standalone-wheel read below
+    finds nothing.
+
+    The driver's cached ``emission_wheel_pos`` is preferred over
+    ``get_emission_filter()``: collection runs on the periodic state-cache timer,
+    while ``get_emission_filter()`` is a blocking serial round-trip that sleeps
+    ``sleep_time_for_wheel`` — hitting the port on every tick would be a
+    regression. The driver updates the cache on every move, so it is the truth
+    for anything the software drove. Hardware is queried only when the cache is
+    unset (i.e. once, at bootstrap).
+    """
+    if xlight is None:
+        return None
+    if getattr(xlight, "disable_emission_filter_wheel", False):
+        return None
+    if not getattr(xlight, "has_emission_filters_wheel", True):
+        return None
+    pos = getattr(xlight, "emission_wheel_pos", None)
+    if pos is None:
+        try:
+            pos = xlight.get_emission_filter()
+        except Exception:
+            return None
+    try:
+        return int(pos)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_emission_filter_positions(
+    emission_filter_wheel: Optional[Any],
+    xlight: Optional[Any] = None,
+) -> Dict[str, Union[str, int]]:
+    """Read emission filter wheel positions for observation state and snap metadata.
+
+    A standalone wheel (``addons.emission_filter_wheel``) wins when the rig has
+    one. ``xlight`` is an optional fallback for rigs whose only emission wheel is
+    inside the confocal unit; it yields ``{"default": <slot>}``, the key
+    ``ObservationStateController.apply_optical_path`` applies from.
+    """
     emission: Dict[str, Union[str, int]] = {}
     if emission_filter_wheel and hasattr(emission_filter_wheel, "get_filter_wheel_position"):
         try:
@@ -48,6 +93,10 @@ def collect_emission_filter_positions(emission_filter_wheel: Optional[Any]) -> D
                 }
         except Exception:
             pass
+    if not emission:
+        confocal_pos = confocal_emission_filter_position(xlight)
+        if confocal_pos is not None:
+            emission = {"default": confocal_pos}
     return emission
 
 

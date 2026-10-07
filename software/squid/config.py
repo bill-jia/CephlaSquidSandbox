@@ -6,6 +6,10 @@ import pydantic
 
 from control.utils import FlipVariant
 from control.models import DeviceEntry, MachineConfig
+from control.models.machine_config import (
+    SoftwareTriggerRouting,
+    resolve_software_trigger_routing,
+)
 
 
 class FilterWheelControllerVariant(enum.Enum):
@@ -712,6 +716,19 @@ class CameraConfig(pydantic.BaseModel):
     # Set the hardware trigger mode of the camera to this value once on initialization.
     hardware_triggering_enabled: Optional[bool] = None
 
+    # How a SOFTWARE_TRIGGER request is actually delivered to this camera.  See
+    # SoftwareTriggerRouting: "hardware_line" puts the camera in hardware-trigger
+    # mode and pulses the io.trigger endpoint on every send_trigger; "native" uses
+    # the SDK's own software-trigger command.  Resolved from the machine config by
+    # control.models.machine_config.resolve_software_trigger_routing.
+    software_trigger_routing: SoftwareTriggerRouting = SoftwareTriggerRouting.NATIVE
+
+    # Human-readable description of the camera's io.trigger endpoint, e.g.
+    # "nidaq port0/line6".  None when the camera declares no trigger line.  Purely
+    # diagnostic: it is what a frame-timeout error prints so a misrouted trigger is
+    # legible in the log instead of being inferred from a silent timeout.
+    trigger_endpoint_description: Optional[str] = None
+
     # Set the readout mode of the camera to this value once on initialization.
     # If None, the camera will use its default readout mode or the mode will be set from _def.py.
     default_readout_mode: Optional[str] = None  # String representation to avoid circular imports
@@ -909,6 +926,17 @@ def _build_camera_config_from_device(
     if wb:
         wb_gains = RGBValue(r=wb.get("r", 1), g=wb.get("g", 1), b=wb.get("b", 1))
 
+    # Software-trigger routing is an explicit, validated per-camera decision; the
+    # default (hardware_line iff a trigger line is declared) is resolved in exactly
+    # one place, resolve_software_trigger_routing.
+    trigger_line = dev.io.get("trigger")
+    trigger_routing = resolve_software_trigger_routing(
+        cfg.get("software_trigger_routing"), trigger_line is not None
+    )
+    trigger_endpoint_description = (
+        f"{trigger_line.controller} {trigger_line.channel_id}" if trigger_line else None
+    )
+
     return CameraConfig(
         camera_type=cam_type,
         camera_model=model_str,
@@ -932,6 +960,8 @@ def _build_camera_config_from_device(
         reverse_x=cfg.get("reverse_x"),
         reverse_y=cfg.get("reverse_y"),
         external_frame_grabbing=cfg.get("external_frame_grabbing", False),
+        software_trigger_routing=trigger_routing,
+        trigger_endpoint_description=trigger_endpoint_description,
     )
 
 

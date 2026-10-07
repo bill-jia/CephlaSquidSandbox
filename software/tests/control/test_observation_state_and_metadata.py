@@ -1,11 +1,14 @@
 """Tests for Observation State presets and Acquisition Metadata manifests."""
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import yaml
 
+import squid.abc
 from control.core.config.repository import ConfigRepository
 from control.core.observation_state_service import (
     observation_state_binning_mode_for_metadata,
@@ -310,6 +313,255 @@ def test_config_repository_observation_preset_io(tmp_path: Path):
     assert loaded.name == "test_preset"
 
 
+def _repo_for_preset_io(tmp_path: Path) -> ConfigRepository:
+    base = tmp_path / "sw"
+    (base / "machine_configs").mkdir(parents=True)
+    (base / "user_profiles" / "p1" / "channel_configs").mkdir(parents=True)
+    (base / "user_profiles" / "p1" / "observation_presets").mkdir(parents=True)
+    (base / "machine_configs" / "illumination_channel_config.yaml").write_text(
+        "version: 1\ncontroller_port_mapping: {}\nchannels: []\n", encoding="utf-8"
+    )
+    state_for_general = ObservationState(
+        version=3,
+        name="TestLaser",
+        display_color="#FF0000",
+        camera_settings=CameraSettings(exposure_time_ms=10.0, gain_mode=1.0),
+        illuminator_states=[
+            IlluminatorState(illumination_channel="TestLaser", intensity=50.0, on=False),
+        ],
+    )
+    (base / "user_profiles" / "p1" / "channel_configs" / "general.yaml").write_text(
+        yaml.safe_dump(state_for_general.model_dump(mode="json", exclude_none=True)), encoding="utf-8"
+    )
+    repo = ConfigRepository(base_path=base)
+    repo.set_profile("p1")
+    return repo
+
+
+def test_preset_display_name_with_spaces_survives_save_load_round_trip(tmp_path: Path):
+    """A preset name with spaces (e.g. the default contrast-AF channel
+
+    'BF LED matrix full') must keep its exact display name after a
+    save/load round trip. Only the on-disk filename is sanitized; the name
+    the user typed is preserved verbatim in the saved state and in
+    ``list_observation_presets()``/name-based lookup, matching what the
+    Observation State save/load dropdown and MULTIPOINT_AUTOFOCUS_CHANNEL
+    depend on.
+    """
+    repo = _repo_for_preset_io(tmp_path)
+    state = _minimal_state(name="whatever", illumination_channel="BF LED matrix full", on=True)
+
+    path = repo.save_observation_preset("BF LED matrix full", state)
+
+    # Filename is sanitized (spaces -> underscores).
+    assert path.name == "BF_LED_matrix_full.yaml"
+
+    # The display name is preserved verbatim, not sanitized, in the saved file.
+    loaded = repo.load_observation_preset("BF LED matrix full")
+    assert loaded is not None
+    assert loaded.name == "BF LED matrix full"
+
+    # list_observation_presets() returns the display name, not the file stem.
+    assert repo.list_observation_presets() == ["BF LED matrix full"]
+
+    # Name-based lookup (what get_observation_state_by_name/perform_autofocus use)
+    # resolves the display name including its spaces.
+    resolved = repo.get_observation_state_by_name("BF LED matrix full")
+    assert resolved is not None
+    assert resolved.name == "BF LED matrix full"
+
+
+def test_preexisting_underscored_preset_still_loads_and_lists_correctly(tmp_path: Path):
+    """A preset saved by the old buggy code (name already underscored on disk)
+
+    must keep loading and listing unchanged -- this is a data-compatibility
+    guarantee, not a code shim.
+    """
+    repo = _repo_for_preset_io(tmp_path)
+    legacy_path = repo.user_profiles_path / "p1" / "observation_presets" / "BF_LED_matrix_full.yaml"
+    legacy_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 3,
+                "name": "BF_LED_matrix_full",
+                "illuminator_states": [
+                    {"illumination_channel": "BF LED matrix full", "intensity": 100.0, "on": True}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert repo.list_observation_presets() == ["BF_LED_matrix_full"]
+
+    loaded = repo.load_observation_preset("BF_LED_matrix_full")
+    assert loaded is not None
+    assert loaded.name == "BF_LED_matrix_full"
+
+    resolved = repo.get_observation_state_by_name("BF_LED_matrix_full")
+    assert resolved is not None
+    assert resolved.name == "BF_LED_matrix_full"
+
+
+# ── Filename sanitization at the point images are saved ─────────────────────
+#
+# save_observation_preset() (above) now keeps a preset's display name intact,
+# so an ObservationState.name can carry spaces that used to be impossible.
+# job_processing.py's SaveImageJob/PostprocessJob still fold that name into a
+# TIFF/zarr/OME-TIFF filename or directory component, and every image saved
+# on this rig so far has an underscored channel label baked into it (every
+# preset used to have its display name overwritten by its sanitized filename
+# stem). These tests pin the resulting contract: filenames stay underscored
+# and collision-free; metadata (zarr channel names, record_frame_time's
+# channel_name) keeps the display name verbatim.
+
+
+def _capture_info_for(state, tmp_path: Path, file_id: str = "A1_0_0"):
+    from control.core.job_processing import CaptureInfo
+
+    return CaptureInfo(
+        position=squid.abc.Pos(x_mm=0.0, y_mm=0.0, z_mm=0.0, theta_rad=None),
+        z_index=0,
+        capture_time=time.time(),
+        observation_state=state,
+        save_directory=str(tmp_path),
+        file_id=file_id,
+        region_id="A1",
+        fov=0,
+        configuration_idx=0,
+    )
+
+
+def test_save_image_job_sanitizes_display_name_for_tiff_basename(tmp_path: Path):
+    from control.core.job_processing import JobImage, SaveImageJob, _FilenameLabelDeduper
+
+    _FilenameLabelDeduper.clear()
+    state = _minimal_state(name="BF LED matrix full", illumination_channel="BF LED matrix full")
+    info = _capture_info_for(state, tmp_path)
+    image = np.zeros((8, 8), dtype=np.uint16)
+
+    SaveImageJob(capture_info=info, capture_image=JobImage(image_array=image)).save_image(
+        image, info, is_color=False
+    )
+
+    saved = list(tmp_path.glob("*.tiff"))
+    assert len(saved) == 1
+    assert "BF_LED_matrix_full" in saved[0].name
+    assert " " not in saved[0].name
+
+
+def test_save_image_job_dedupes_names_colliding_after_sanitizing(tmp_path: Path):
+    """Two states differing only by space vs. underscore ("A B" / "A_B") both
+
+    sanitize to "A_B". Without deduplication the second channel's frame would
+    silently overwrite the first's file.
+    """
+    from control.core.job_processing import JobImage, SaveImageJob, _FilenameLabelDeduper
+
+    _FilenameLabelDeduper.clear()
+    image = np.zeros((8, 8), dtype=np.uint16)
+
+    info_a = _capture_info_for(_minimal_state(name="A B", illumination_channel="A B"), tmp_path)
+    info_b = _capture_info_for(_minimal_state(name="A_B", illumination_channel="A_B"), tmp_path)
+
+    SaveImageJob(capture_info=info_a, capture_image=JobImage(image_array=image)).save_image(
+        image, info_a, is_color=False
+    )
+    SaveImageJob(capture_info=info_b, capture_image=JobImage(image_array=image)).save_image(
+        image, info_b, is_color=False
+    )
+
+    saved = sorted(p.name for p in tmp_path.glob("*.tiff"))
+    assert len(saved) == 2, f"expected two distinct files, got {saved}"
+    assert saved[0] != saved[1]
+    assert saved == ["A1_0_0_A_B.tiff", "A1_0_0_A_B_2.tiff"]
+
+
+def test_zarr_frame_time_and_channel_names_keep_display_name(tmp_path: Path, monkeypatch):
+    """The on-disk filename convention must not leak into zarr metadata:
+
+    ``record_frame_time``'s ``channel_name`` and the writer's ``channel_names``
+    config must still carry the unsanitized display name.
+    """
+    from control.core.job_processing import CaptureInfo, JobImage, SaveZarrJob, ZarrWriterInfo
+
+    recorded = {}
+
+    class FakeZarrWriter:
+        def __init__(self, config):
+            recorded["channel_names"] = list(config.channel_names)
+
+        def initialize(self):
+            pass
+
+        def write_frame(self, image, t, c, z):
+            pass
+
+        def record_frame_time(self, t, c, z, unix_time_s, channel_name):
+            recorded["channel_name"] = channel_name
+
+    monkeypatch.setattr("control.core.zarr_writer.ZarrWriter", FakeZarrWriter)
+
+    state = _minimal_state(name="BF LED matrix full", illumination_channel="BF LED matrix full")
+    info = _capture_info_for(state, tmp_path)
+    zwi = ZarrWriterInfo(
+        base_path=str(tmp_path),
+        t_size=1,
+        c_size=1,
+        z_size=1,
+        is_hcs=False,
+        channel_names=["BF LED matrix full"],
+        channel_colors=["#FFFFFF"],
+        channel_wavelengths=[None],
+    )
+    image = np.zeros((8, 8), dtype=np.uint16)
+    job = SaveZarrJob(capture_info=info, capture_image=JobImage(image_array=image), zarr_writer_info=zwi)
+
+    try:
+        result = job.run()
+    finally:
+        # SaveZarrJob._zarr_writers is a process-wide ClassVar keyed by output
+        # path; clear it directly (not via clear_writers(), which calls
+        # writer.is_initialized/is_finalized -- attributes FakeZarrWriter
+        # doesn't have) so the stub writer doesn't leak into other tests.
+        SaveZarrJob._zarr_writers.clear()
+
+    assert recorded["channel_name"] == "BF LED matrix full"
+    assert recorded["channel_names"] == ["BF LED matrix full"]
+    assert result.channel_name == "BF LED matrix full"
+
+
+def test_postprocess_derived_capture_info_sanitizes_array_key_only(tmp_path: Path):
+    """PostprocessJob._derived_capture_info's array_key becomes part of the
+
+    derived plate's directory name (``{array_key}.ome.zarr`` /
+    ``{region}__{array_key}.ome.tiff``), so it is sanitized. filename_channel_label
+    and array_channel_names are metadata (record_frame_time's channel_name /
+    the OME channel name) and stay the raw, space-containing label.
+    """
+    from control.core.job_processing import JobImage, PostprocessJob
+
+    info = _capture_info_for(_minimal_state(name="live"), tmp_path)
+    job = PostprocessJob(
+        capture_info=info,
+        capture_image=JobImage(image_array=None),
+        label="Phase 2D Group",
+    )
+
+    ci = job._derived_capture_info(
+        out_key="Phase 2D Group_phase",
+        spec={"channel_color": "#FFFFFF", "wavelength_nm": None},
+        zi=0,
+        z_size=1,
+        t_scan=0,
+        capture_time=time.time(),
+    )
+
+    assert ci.array_key == "Phase_2D_Group_phase"
+    assert ci.filename_channel_label == "Phase 2D Group_phase"
+    assert ci.array_channel_names == ["Phase 2D Group_phase"]
+
+
 def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, CycleStep, CycleWait
 
@@ -352,12 +604,14 @@ def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     )
     path = repo.save_acquisition_cycle("opto v1", cycle)
     assert path.exists()
-    # Sanitized name becomes the file stem and the in-file name.
-    assert repo.list_acquisition_cycles() == ["opto_v1"]
+    # The sanitized name becomes the file stem, but the display name (as the
+    # user typed it) is preserved verbatim in the file and in the listing.
+    assert path.stem == "opto_v1"
+    assert repo.list_acquisition_cycles() == ["opto v1"]
 
-    loaded = repo.load_acquisition_cycle("opto_v1")
+    loaded = repo.load_acquisition_cycle("opto v1")
     assert loaded is not None
-    assert loaded.name == "opto_v1"
+    assert loaded.name == "opto v1"
     assert loaded.repeat == 4
     assert isinstance(loaded.items[0], CycleGroup)
     assert loaded.items[0].repeat == 3
@@ -371,9 +625,9 @@ def test_config_repository_acquisition_cycle_io(tmp_path: Path):
     assert isinstance(loaded.items[2], CycleStep)
     assert loaded.items[2].n_frames == 5
 
-    assert repo.delete_acquisition_cycle("opto_v1") is True
+    assert repo.delete_acquisition_cycle("opto v1") is True
     assert repo.list_acquisition_cycles() == []
-    assert repo.load_acquisition_cycle("opto_v1") is None
+    assert repo.load_acquisition_cycle("opto v1") is None
 
 
 def test_last_active_profile_persisted_across_set_profile(tmp_path: Path):

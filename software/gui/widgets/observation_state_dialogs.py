@@ -39,9 +39,11 @@ def run_save_observation_state_dialog(
     name, ok = QInputDialog.getText(parent, "Save Observation State", "Preset name:")
     if not ok or not name.strip():
         return False
-    emission = collect_emission_filter_positions(emission_filter_wheel)
+    obs_controller = live_controller.obs_controller
+    xlight = getattr(getattr(obs_controller.microscope, "addons", None), "xlight", None)
+    emission = collect_emission_filter_positions(emission_filter_wheel, xlight=xlight)
     try:
-        state = live_controller.obs_controller.collect_observation_state(
+        state = obs_controller.collect_observation_state(
             emission_filter_positions=emission or None,
         )
         repo.save_observation_preset(name.strip(), state)

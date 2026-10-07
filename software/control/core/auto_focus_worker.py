@@ -73,9 +73,14 @@ class AutofocusWorker:
             # trigger acquisition (including turning on the illumination) and read frame
             if self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE:
                 self.liveController.obs_controller.turn_on_illumination()
-                self.wait_till_operation_is_completed()
-                self.camera.send_trigger()
-                image = self.camera.read_frame()
+                try:
+                    self.wait_till_operation_is_completed()
+                    self.camera.send_trigger()
+                    image = self.camera.read_frame()
+                finally:
+                    # Must run even when read_frame returns None or raises —
+                    # otherwise the illumination stays on into the next z step.
+                    self.liveController.obs_controller.turn_off_illumination()
             elif self.liveController.trigger_mode == control._def.TriggerMode.HARDWARE:
                 if (
                     "Fluorescence" in self.liveController.obs_controller.current_observation_state.name
@@ -93,9 +98,6 @@ class AutofocusWorker:
                     image = self.camera.read_frame()
             if image is None:
                 continue
-            # tunr of the illumination if using software trigger
-            if self.liveController.trigger_mode == control._def.TriggerMode.SOFTWARE:
-                self.liveController.obs_controller.turn_off_illumination()
 
             image = utils.crop_image(image, self.crop_width, self.crop_height)
             self._image_to_display_fn(image)

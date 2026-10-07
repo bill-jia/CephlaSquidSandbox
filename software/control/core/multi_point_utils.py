@@ -63,11 +63,26 @@ class AcquisitionParameters:
 
     use_fluidics: bool
     skip_saving: bool = False
+    # AF-only diagnostic walk: no channel images, stacks, stimuli or fluidics.
+    validation_mode: bool = False
+    # Which wellplate tiling method NX/NY describe ("fraction" or "grid"); metadata only
+    # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
+    # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.
+    tiling_method: str = "fraction"
+    tile_spacing: Dict = field(default_factory=dict)
+    acquisition_order: Optional[Tuple[str, ...]] = None
+    # Bracket every XY move that enters a region with a retract to
+    # OBJECTIVE_RETRACTED_POS_MM (Z home, blocking) and a return to the target
+    # Z. Covers the first move of the run and the end-of-run return to the
+    # start position; never fires between FOVs inside a region's tile grid.
+    retract_z_between_regions: bool = True
     # On-disk format for saved images (INDIVIDUAL_IMAGES, MULTI_PAGE_TIFF, OME_TIFF, ZARR_V3).
     # Snapshotted at acquisition start so the worker doesn't depend on a mutable global.
     file_saving_option: FileSavingOption = FileSavingOption.INDIVIDUAL_IMAGES
     # Software trigger: if True, skip turn_off_illumination after each frame until channel changes
     keep_illuminators_on_between_captures: bool = False
+    # Alternate simple Z/event traversal or advanced atomic step/group order per FOV.
+    snake_observation_states: bool = False
 
     # Downsampled view generation parameters
     generate_downsampled_views: bool = False
@@ -114,18 +129,28 @@ class AcquisitionParameters:
     laser_af_refresh_every_n_fovs: int = 10
     laser_af_consistency_threshold_um: float = 5.0
     laser_af_check_last_fov_per_region: bool = True
+    # Diagnostic before/after AF comparison at every table FOV (see
+    # _def.LASER_AF_TABLE_PATH_AUDIT). Corrects Z at audited FOVs.
+    laser_af_table_path_audit: bool = False
 
     # Live ZARR_V3 streaming upload to a network drive. When ``zarr_upload_enabled``
-    # is True and ``file_saving_option == ZARR_V3``, each timepoint's shard
-    # files are pushed to ``zarr_upload_remote_root`` (UNC ``\\server\share\dir``
-    # on Windows or ``//server/share/dir`` POSIX) by a dedicated UploadWorker.
-    # When ``zarr_upload_delete_after_verify`` is True, local shard files are
+    # is True and ``file_saving_option == ZARR_V3``, the acquisition is mirrored
+    # to ``<zarr_upload_remote_root>/<experiment_ID>/`` (the configured path is
+    # the PARENT folder; UNC ``\\server\share\dir`` on Windows or
+    # ``//server/share/dir`` POSIX) by a dedicated UploadWorker — shards stream
+    # per timepoint, metadata and every sidecar follow at end of run. When
+    # ``zarr_upload_delete_after_verify`` is True, local shard files are
     # deleted in batches at the end of each timepoint once every shard in that
     # timepoint has been sha256-verified on the remote. See
     # ``control.core.zarr_upload`` for details.
     zarr_upload_enabled: bool = False
     zarr_upload_remote_root: str = ""
     zarr_upload_delete_after_verify: bool = True
+    # Pre-run estimate of the acquisition's total on-disk size (bytes), from
+    # MultiPointController.get_estimated_acquisition_disk_storage(). The
+    # worker's mid-run upload health check divides by Nt to warn when local
+    # free space drops below a couple of timepoints' headroom. 0 = unknown.
+    estimated_total_disk_bytes: int = 0
 
 
 @dataclass
@@ -179,9 +204,10 @@ class MultiPointControllerFunctions:
     # Optional Slack notification callbacks (allows main thread to capture screenshot and maintain ordering)
     signal_slack_timepoint_notification: Callable[["TimepointStats"], None] = lambda *a, **kw: None
     signal_slack_acquisition_finished: Callable[["AcquisitionStats"], None] = lambda *a, **kw: None
-    # Zarr frame written callback - called when subprocess completes writing a frame
+    # Frame-written callback - called when the save subprocess reports a frame is
+    # on disk (ZARR_V3 and OME_TIFF, i.e. every mode that writes out-of-process).
     # Args: (fov, time_point, z_index, channel_name, region_idx)
-    signal_zarr_frame_written: Callable[[int, int, int, str, int], None] = lambda *a, **kw: None
+    signal_frame_written: Callable[[int, int, int, str, int], None] = lambda *a, **kw: None
     # Fires at the start of each timepoint (arg: time_point index). Used by napari
     # views to flush per-timepoint state so peak RAM tracks a single timepoint
     # rather than accumulating across the run.

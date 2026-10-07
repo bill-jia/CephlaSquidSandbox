@@ -13,7 +13,7 @@ is handled by ObservationStateController.
 from __future__ import annotations
 
 import threading
-from typing import Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 import squid.logging
 from squid.abc import CameraAcquisitionMode, AbstractCamera
@@ -21,6 +21,7 @@ from control._def import *
 
 if TYPE_CHECKING:
     from control.core.observation_state_controller import ObservationStateController
+    from control.models.observation_state import ObservationState
 
 
 class LiveController:
@@ -77,8 +78,15 @@ class LiveController:
 
     def start_live(self):
         self.is_live = True
-        # Open the streaming gate and turn on illumination BEFORE camera
-        # so the first frame is correctly illuminated.
+        # Start the camera BEFORE opening the streaming gate / illumination:
+        # start_streaming can stall for seconds (e.g. the Tucsen SDK reset when
+        # leaving a triggered acquisition), and the sample must not sit
+        # illuminated while no frames can be served. In triggered modes the
+        # first exposure only happens once the trigger timer fires, well after
+        # the illumination below is asserted; in CONTINUOUS the first frame or
+        # two may be dark, which the free-running stream immediately replaces.
+        self.camera.start_streaming()
+
         if self.control_illumination and self.obs_controller:
             config = self.obs_controller.current_observation_state
             waveform_driven = bool(config is not None and getattr(config, "is_waveform_driven", False))
@@ -100,8 +108,6 @@ class LiveController:
                 self.obs_controller.turn_on_illumination()
             ic = self.microscope.illumination_controller
             ic.set_streaming_active(True)
-
-        self.camera.start_streaming()
 
         if self.trigger_mode == TriggerMode.SOFTWARE or (
             self.trigger_mode == TriggerMode.HARDWARE and self.use_internal_timer_for_hardware_trigger
@@ -301,6 +307,23 @@ class LiveController:
 
     def get_trigger_mode(self):
         return self.trigger_mode
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Channel lookup
+    #
+    # "Channel" and "Observation State" are the same thing: the whole light
+    # path for one acquisition. The namespace is the saved preset set — what
+    # the Observation State save/load dropdown lists — falling back to the
+    # working state in general.yaml when a profile has saved none.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_observation_states(self) -> List["ObservationState"]:
+        """Every selectable Observation State."""
+        return self.microscope.config_repo.get_observation_states()
+
+    def get_observation_state_by_name(self, name: str) -> Optional["ObservationState"]:
+        """Resolve a channel name to an Observation State, or None."""
+        return self.microscope.config_repo.get_observation_state_by_name(name)
 
     # ─────────────────────────────────────────────────────────────────────
     # Frame callback

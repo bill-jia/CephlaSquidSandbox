@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 import control.microcontroller
+import control.microscope
 from control.firmware_sim_serial import FirmwareSimSerial
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,50 @@ def cleanup_microcontrollers():
                     micro.close()
         except Exception as e:
             logger.warning(f"Failed to close Microcontroller in test cleanup: {e}")
+
+
+def _make_tracking_factory(original_factory, instances_list):
+    """Create a wrapper that tracks Microscope instances built via the factory."""
+
+    def _tracking_factory(*args, **kwargs):
+        scope = original_factory(*args, **kwargs)
+        instances_list.append(scope)
+        return scope
+
+    return _tracking_factory
+
+
+@pytest.fixture(autouse=True)
+def cleanup_microscopes():
+    """
+    Fixture that automatically closes every Microscope built via
+    Microscope.build_from_global_config() during a test.
+
+    A Microscope owns a camera, illumination controller, and addons on top of
+    the Microcontroller that cleanup_microcontrollers already handles - all of
+    which keep background threads (memory monitor, illumination watchdog
+    heartbeat, camera streaming) alive until Microscope.close() runs. Tests
+    that build a fresh Microscope (many now do, e.g. RAM-estimate and
+    MultiPointController fixtures) never called close(), so those threads
+    piled up for the rest of the pytest session. In this environment that
+    accumulation reliably crashes the interpreter after only 2-3 un-closed
+    Microscope instances, well before all tests in a file get a chance to run.
+    """
+    active_scopes = []
+    original_factory = control.microscope.Microscope.build_from_global_config
+
+    with patch.object(
+        control.microscope.Microscope,
+        "build_from_global_config",
+        staticmethod(_make_tracking_factory(original_factory, active_scopes)),
+    ):
+        yield
+
+    for scope in active_scopes:
+        try:
+            scope.close()
+        except Exception as e:
+            logger.warning(f"Failed to close Microscope in test cleanup: {e}")
 
 
 @pytest.fixture

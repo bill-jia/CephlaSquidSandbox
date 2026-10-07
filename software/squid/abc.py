@@ -247,6 +247,25 @@ class AbstractStage(metaclass=abc.ABCMeta):
     def __init__(self, stage_config: StageConfig):
         self._config = stage_config
         self._log = squid.logging.get_logger(self.__class__.__name__)
+        # Canonical Z to return to after parking; position polling freezes it while retracted.
+        self.working_z_mm: Optional[float] = None
+        self.is_z_retracted = False
+        self._z_retraction_in_progress = False
+        self._retracted_z_mm: Optional[float] = None
+
+    def _update_z_position(self, z_mm: float):
+        """Track working Z, including joystick moves reported by position polling."""
+        if self._z_retraction_in_progress:
+            return
+        if self.is_z_retracted:
+            if z_mm == self._retracted_z_mm:
+                return
+            self.is_z_retracted = False
+        self.working_z_mm = z_mm
+
+    def _begin_z_move(self):
+        if not self._z_retraction_in_progress:
+            self.is_z_retracted = False
 
     @abc.abstractmethod
     def move_x(self, rel_mm: float, blocking: bool = True):
@@ -882,6 +901,21 @@ class AbstractCamera(metaclass=abc.ABCMeta):
                 )
 
         return self._set_acquisition_mode_imp(acquisition_mode=acquisition_mode)
+
+    def describe_trigger_routing(self) -> str:
+        """One-line description of how a software trigger reaches this camera.
+
+        Diagnostic only.  A frame that never arrives is almost always a trigger
+        that never arrived, so error paths print this instead of leaving the
+        operator to guess which line was wired where.
+        """
+        routing = self._config.software_trigger_routing.value
+        endpoint = self._config.trigger_endpoint_description
+        if endpoint:
+            return f"{routing} via {endpoint}"
+        if routing == "hardware_line":
+            return f"{routing} (no io.trigger endpoint declared!)"
+        return routing
 
     @abc.abstractmethod
     def _set_acquisition_mode_imp(self, acquisition_mode: CameraAcquisitionMode):

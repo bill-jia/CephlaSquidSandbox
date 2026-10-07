@@ -224,7 +224,7 @@ class DefaultCamera(AbstractCamera):
         pixel_size_bytes = self._get_pixel_size_bytes(self.get_pixel_format())
         exposure_delay_us = pixel_size_bytes * exposure_delay_us_8bit
         exposure_time_us = 1000.0 * self._exposure_time_ms
-        row_count = self.get_resolution()[1]  # TODO: this should be the row count after setting ROI
+        row_count = self.get_region_of_interest()[3]
         row_period_us = 10
 
         # NOTE(imo): Our strobe delay calculation is not perfect, so add 10ms buffer to make sure we are good to go.  It'd
@@ -436,9 +436,16 @@ class DefaultCamera(AbstractCamera):
 
         total_exposure_time_ms = self._exposure_time_ms + self._strobe_delay_us / 1000.0
 
-        # If the last frame we got was from <exposure time ago, use it.
-        if self._current_frame and time.time() - self._current_frame.timestamp <= total_exposure_time_ms / 1000.0:
-            return self._current_frame
+        # Cache only frames delivered since the latest trigger. The timestamp
+        # is callback arrival time, not exposure time: triggered consumers
+        # still need a frame-id fence (laser AF also retries dropped triggers).
+        cached_frame = self._current_frame
+        if (
+            cached_frame is not None
+            and cached_frame.timestamp >= self._last_trigger_timestamp
+            and time.time() - cached_frame.timestamp <= total_exposure_time_ms / 1000.0
+        ):
+            return cached_frame
 
         # The camera api isn't really fast, so it is easy to time out waiting for a frame and its processing.  So
         # for the timeout, we add a flat 100 ms to account for that.
@@ -578,6 +585,13 @@ class DefaultCamera(AbstractCamera):
             raise CameraError(
                 f"After request to update roi to {requested_roi=}, new roi is {updated_roi=} instead.  Existing was {(existing_offset_x, existing_offset_y, existing_width, existing_height)}"
             )
+
+        # Force re-calc of exposure time to account for strobe, since the strobe
+        # delay depends on row count and the ROI height just changed.  Skip this
+        # if exposure hasn't been set yet (still the 0 default from __init__) -
+        # the camera may reject a 0 ms ExposureTime.set().
+        if self._exposure_time_ms != 0:
+            self.set_exposure_time(self.get_exposure_time())
 
     def get_region_of_interest(self) -> Tuple[int, int, int, int]:
         return (

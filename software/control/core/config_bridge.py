@@ -87,13 +87,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.ENABLE_SPINNING_DISK_CONFOCAL = xlight_enabled or dragonfly_enabled
     control._def.USE_DRAGONFLY = dragonfly_enabled
 
-    if xlight_enabled:
-        control._def.XLIGHT_SERIAL_NUMBER = _dev_connection("xlight", "serial_number", "")
-        xlight_cfg = mc.get_device("xlight").config if mc.get_device("xlight") else {}
-        control._def.XLIGHT_SLEEP_TIME_FOR_WHEEL = xlight_cfg.get(
-            "sleep_time_for_wheel", 0.25
-        )
-
     if dragonfly_enabled:
         control._def.DRAGONFLY_SERIAL_NUMBER = _dev_connection(
             "dragonfly", "serial_number", ""
@@ -184,6 +177,7 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.Acquisition.DZ = acq.dz
     control._def.Acquisition.NUMBER_OF_FOVS_PER_AF = acq.fovs_per_af
     control._def.Acquisition.ILLUMINATION_SETTLE_MS = float(acq.illumination_settle_ms)
+    control._def.ACQUISITION_MAX_PENDING_JOBS = acq.max_pending_jobs
     control._def.ENABLE_FLEXIBLE_MULTIPOINT = acq.flexible_multipoint
     control._def.ENABLE_WELLPLATE_MULTIPOINT = acq.wellplate_multipoint
     control._def.ENABLE_RECORDING = acq.recording

@@ -78,7 +78,13 @@ def test_check_ram_available_with_error_dialog_insufficient_ram():
         mock_vmem.available = 1024  # Only 1KB available
 
         with patch("psutil.virtual_memory", return_value=mock_vmem):
-            with patch("gui.widgets.error_dialog"):  # Mock dialog to avoid GUI
+            # Patch where error_dialog is actually looked up (module globals of
+            # gui.widgets.common, where check_ram_available_with_error_dialog calls
+            # it unqualified) - "gui.widgets.error_dialog" only rebinds the name
+            # re-exported by `from .common import *` and leaves the real function
+            # in place, so the unpatched version opens a real modal QMessageBox
+            # and blocks/crashes in this headless test environment.
+            with patch("gui.widgets.common.error_dialog"):  # Mock dialog to avoid GUI
                 result = check_ram_available_with_error_dialog(mpc, logger, performance_mode=False)
                 assert result is False
 
@@ -131,7 +137,7 @@ def test_check_ram_available_with_error_dialog_factor_of_safety():
         mock_vmem.available = base_estimate  # Exactly equal to base estimate
 
         with patch("psutil.virtual_memory", return_value=mock_vmem):
-            with patch("gui.widgets.error_dialog"):
+            with patch("gui.widgets.common.error_dialog"):
                 # With default factor_of_safety=1.15, should fail (needs 15% more)
                 result = check_ram_available_with_error_dialog(
                     mpc, logger, factor_of_safety=1.15, performance_mode=False

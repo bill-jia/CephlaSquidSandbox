@@ -22,7 +22,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import squid.logging
+import control.serial_peripherals as serial_peripherals
 from control._def import *
+from control._sdk_watchdog import CameraTimeoutError
 from control.models.observation_state import (
     CameraLiveSnapshot,
     CameraSettings,
@@ -316,8 +318,18 @@ class ObservationStateController:
             self.live_controller.set_trigger_fps(fps)
 
     def persist_iris_config(self, setting_name: str, value: float) -> None:
-        """Persist confocal iris setting to in-memory config."""
+        """Record a confocal iris aperture the user just dialled in.
+
+        Written to the repository's cached observation state (flushed to
+        general.yaml by the periodic cache timer) *and* to the live state, which
+        is the object a preset is saved from — without the second write an iris
+        set from the panel would be missing from any preset saved afterwards.
+        """
         self.config_repo.update_channel_setting(setting_name, value)
+        field = {"IlluminationIris": "illumination_iris", "EmissionIris": "emission_iris"}.get(setting_name)
+        hw_settings = self._confocal_settings_for_write() if field else None
+        if hw_settings is not None:
+            setattr(hw_settings, field, float(value))
 
     # ─────────────────────────────────────────────────────────────────────
     # State management (moved from LiveController)
@@ -326,6 +338,18 @@ class ObservationStateController:
     def get_observation_state(self) -> Optional[ObservationState]:
         """Get the observation state from the current profile's general.yaml."""
         return self.config_repo.get_observation_state()
+
+    def get_observation_states(self) -> List[ObservationState]:
+        """Every selectable Observation State — the saved presets, else general.yaml."""
+        return self.config_repo.get_observation_states()
+
+    def get_observation_state_by_name(self, name: str) -> Optional[ObservationState]:
+        """Resolve a channel name to an Observation State, or None.
+
+        The namespace is the saved preset set, the same one the Observation
+        State save/load dropdown lists.
+        """
+        return self.config_repo.get_observation_state_by_name(name)
 
     def set_active_observation_state(self, state: Optional[ObservationState]) -> None:
         """Record the selected observation state without touching hardware."""
@@ -357,6 +381,60 @@ class ObservationStateController:
 
     def sync_confocal_mode_from_hardware(self, confocal: bool) -> None:
         self.toggle_confocal_widefield(confocal)
+
+    def apply_confocal_mode(self, confocal: bool) -> None:
+        """Record the confocal/widefield mode *and* move the spinning disk.
+
+        ``toggle_confocal_widefield`` is the GUI's state-only entry point: the
+        confocal panel drives the disk itself and then tells the controller what
+        it did. Applying a saved observation state has no widget in the loop, so
+        the disk has to be driven here — otherwise ``state.confocal_mode`` would
+        be a software-only flag and a preset saved in confocal would come back
+        with the disk parked in widefield.
+
+        A disk move is several seconds, so hardware is only touched when the
+        requested mode differs from the X-Light's cached disk position (or the
+        controller's last known mode if the hardware position is unavailable).
+        """
+        confocal = bool(confocal)
+        # Presence of the addon, not a _def flag: `from control._def import *`
+        # binds a copy at import time and the machine config is applied after
+        # these modules are imported, so the flag reads stale False here.
+        addons = getattr(self.microscope, "addons", None)
+        dragonfly = getattr(addons, "dragonfly", None)
+        xlight = getattr(addons, "xlight", None)
+        motor_stopped = (
+            confocal
+            and dragonfly is None
+            and xlight is not None
+            and getattr(xlight, "has_spinning_disk_motor", False)
+            and getattr(xlight, "disk_motor_state", None) is not True
+        )
+        if confocal == self._collect_confocal_mode() and not motor_stopped:
+            self.toggle_confocal_widefield(confocal)
+            return
+        hardware_moved = True
+        if dragonfly is not None or xlight is not None:
+            try:
+                with self._time("obs:confocal:set_disk_position"):
+                    if dragonfly is not None:
+                        dragonfly.set_modality("CONFOCAL" if confocal else "BF")
+                    else:
+                        # Starts the spinning disk on the way into confocal.
+                        serial_peripherals.set_xlight_confocal_mode(xlight, confocal)
+            except Exception as e:
+                hardware_moved = False
+                self._log.warning(
+                    "Could not move the spinning disk to %s: %s",
+                    "confocal" if confocal else "widefield",
+                    e,
+                )
+        # Only record the mode if the disk (or dragonfly modality) actually got
+        # there -- otherwise the observation state would claim a light path the
+        # unit never entered (e.g. a confocal channel imaged through a parked
+        # pinhole mask).
+        if hardware_moved:
+            self.toggle_confocal_widefield(confocal)
 
     # ─────────────────────────────────────────────────────────────────────
     # Illumination control (moved from LiveController)
@@ -467,19 +545,27 @@ class ObservationStateController:
                             self.microscope.addons.cellx.set_laser_power(NL5_WAVENLENGTH_MAP[wavelength], int(ist.intensity))
 
     def apply_optical_path(self) -> None:
-        """Set emission filter positions and confocal iris values."""
+        """Set emission filter positions, irises, dichroic wheel and filter slider.
+
+        Every value is written unconditionally: the X-Light driver is the one
+        that knows whether the hardware is already there, and it skips the serial
+        round-trip when the requested wheel slot / iris aperture matches the one
+        it last drove (see ``XLight.set_emission_filter``). Deduping here instead
+        would go stale the moment the confocal panel moved the wheel itself.
+        """
         if self._current_state is None:
             return
         emission_filter_position = self._current_state.emission_filter_positions.get("default")
 
-        if ENABLE_SPINNING_DISK_CONFOCAL and self.microscope.addons.xlight and not USE_DRAGONFLY:
+        # Branch on the built hardware; the _def flags are stale copies here
+        # (see toggle_confocal_widefield).
+        if self.microscope.addons.xlight is not None and self.microscope.addons.dragonfly is None:
             try:
                 if emission_filter_position is not None:
                     with self._time("obs:op:xlight_set_emission_filter"):
                         self.microscope.addons.xlight.set_emission_filter(
                             emission_filter_position,
                             extraction=False,
-                            validate=XLIGHT_VALIDATE_WHEEL_POS,
                         )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
@@ -494,7 +580,22 @@ class ObservationStateController:
                             xlight.set_emission_iris(int(hw_settings.emission_iris))
                 except (OSError, ValueError) as e:
                     self._log.warning("Not setting iris values: %s", e)
-        elif ENABLE_SPINNING_DISK_CONFOCAL and USE_DRAGONFLY and self.microscope.addons.dragonfly:
+                # A state that does not carry a dichroic / slider position leaves
+                # both mechanisms alone: presets predating these fields must not
+                # drive the wheel (or the 5 s slider) to an invented default.
+                try:
+                    with self._time("obs:op:xlight_dichroic"):
+                        if hw_settings.dichroic_position is not None and xlight.has_dichroic_filters_wheel:
+                            xlight.set_dichroic(int(hw_settings.dichroic_position))
+                except (OSError, ValueError) as e:
+                    self._log.warning("Not setting dichroic position: %s", e)
+                try:
+                    with self._time("obs:op:xlight_filter_slider"):
+                        if hw_settings.filter_slider_position is not None and xlight.has_dichroic_filter_slider:
+                            xlight.set_filter_slider(int(hw_settings.filter_slider_position))
+                except (OSError, ValueError) as e:
+                    self._log.warning("Not setting filter slider position: %s", e)
+        elif self.microscope.addons.dragonfly is not None:
             try:
                 with self._time("obs:op:dragonfly_set_emission_filter"):
                     self.microscope.addons.dragonfly.set_emission_filter(
@@ -521,6 +622,104 @@ class ObservationStateController:
                     )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
+
+    def set_emission_filter_position(self, position: int) -> None:
+        """Record an emission filter move on the live state and apply it.
+
+        Called by the confocal panel when the user picks a filter, so the choice
+        becomes part of the observation state (and of any preset saved from it)
+        instead of being a driver-only side effect the state never learns about.
+
+        The X-Light is preferred when the rig has one (its wheel is the confocal
+        unit's own); otherwise the standalone wheel is used. Hardware errors are
+        logged, never raised — a stuck wheel must not break the GUI.
+        """
+        try:
+            slot = int(position)
+        except (TypeError, ValueError):
+            self._log.warning("Ignoring invalid emission filter position: %r", position)
+            return
+
+        if self._current_state is not None:
+            self._current_state.emission_filter_positions["default"] = slot
+
+        addons = getattr(self.microscope, "addons", None)
+        xlight = getattr(addons, "xlight", None)
+        wheel = getattr(addons, "emission_filter_wheel", None)
+        try:
+            if xlight is not None:
+                # validate/readback comes from the driver's own validate_wheel_pos
+                xlight.set_emission_filter(slot, extraction=False)
+            elif wheel is not None:
+                wheel.set_filter_wheel_position({1: slot})
+        except Exception as e:
+            self._log.warning("Not setting emission filter position: %s", e)
+
+    def _confocal_settings_for_write(self) -> Optional[ConfocalSettings]:
+        """The live state's ConfocalSettings, created empty if it has none yet.
+
+        Returns None when there is no live state at all (nothing to record onto).
+        An empty ``ConfocalSettings`` is all-None, i.e. "nothing recorded yet",
+        which is exactly what the apply path treats as "leave the hardware alone".
+        """
+        state = self._current_state
+        if state is None:
+            return None
+        if state.confocal_hardware_settings is None:
+            state.confocal_hardware_settings = ConfocalSettings()
+        return state.confocal_hardware_settings
+
+    def set_dichroic_position(self, position: int) -> None:
+        """Record a dichroic wheel move on the live state and apply it.
+
+        Same shape as ``set_emission_filter_position``: the confocal panel tells
+        the controller what the user picked, the controller records it on the
+        observation state (so it saves with a preset) and then drives the
+        hardware. The driver skips the serial round-trip when the wheel is
+        already there.
+        """
+        try:
+            slot = int(position)
+        except (TypeError, ValueError):
+            self._log.warning("Ignoring invalid dichroic position: %r", position)
+            return
+
+        hw_settings = self._confocal_settings_for_write()
+        if hw_settings is not None:
+            hw_settings.dichroic_position = slot
+
+        xlight = getattr(getattr(self.microscope, "addons", None), "xlight", None)
+        if xlight is None:
+            return
+        try:
+            xlight.set_dichroic(slot)
+        except Exception as e:
+            self._log.warning("Not setting dichroic position: %s", e)
+
+    def set_filter_slider_position(self, position: int) -> None:
+        """Record a dichroic filter slider move on the live state and apply it.
+
+        The slider is the slowest mechanism on the unit (5 s); the driver's
+        write-skipping is what keeps a channel switch that does not change it
+        free, so this always asks and lets the driver decide.
+        """
+        try:
+            slot = int(position)
+        except (TypeError, ValueError):
+            self._log.warning("Ignoring invalid filter slider position: %r", position)
+            return
+
+        hw_settings = self._confocal_settings_for_write()
+        if hw_settings is not None:
+            hw_settings.filter_slider_position = slot
+
+        xlight = getattr(getattr(self.microscope, "addons", None), "xlight", None)
+        if xlight is None:
+            return
+        try:
+            xlight.set_filter_slider(slot)
+        except Exception as e:
+            self._log.warning("Not setting filter slider position: %s", e)
 
     # ─────────────────────────────────────────────────────────────────────
     # Full observation state apply (replaces LiveController.set_observation_state)
@@ -554,6 +753,11 @@ class ObservationStateController:
             try:
                 with self._time("obs:fos:set_analog_gain"):
                     self.camera.set_analog_gain(state.analog_gain)
+            except CameraTimeoutError:
+                # A wedged camera is fatal, not a per-op glitch — must not be
+                # swallowed here (that would let the acquisition limp on against a
+                # dead camera). Propagate so the worker aborts and finalizes.
+                raise
             except Exception as e:
                 self._log.warning("Could not set analog gain: %s", e)
 
@@ -590,7 +794,7 @@ class ObservationStateController:
         ``camera_mode`` saved by a different camera class).
         """
         with self._time("obs:preset:toggle_confocal_widefield"):
-            self.toggle_confocal_widefield(state.confocal_mode)
+            self.apply_confocal_mode(state.confocal_mode)
 
         if state.enable_channel_auto_filter_switching is not None:
             self.enable_channel_auto_filter_switching = bool(state.enable_channel_auto_filter_switching)
@@ -651,10 +855,13 @@ class ObservationStateController:
         from control.core.observation_state_service import collect_emission_filter_positions
 
         wheel = None
+        xlight = None
         if self.microscope is not None:
-            wheel = getattr(self.microscope.addons, "emission_filter_wheel", None)
+            addons = getattr(self.microscope, "addons", None)
+            wheel = getattr(addons, "emission_filter_wheel", None)
+            xlight = getattr(addons, "xlight", None)
         try:
-            emission = collect_emission_filter_positions(wheel) if wheel else {}
+            emission = collect_emission_filter_positions(wheel, xlight=xlight)
         except Exception:
             emission = {}
         if not emission and self._current_state is not None:
@@ -722,11 +929,11 @@ class ObservationStateController:
         base = saved or ObservationState()
         return ObservationState(
             name=base.name,
-            confocal_mode=self.is_confocal_mode(),
+            confocal_mode=self._collect_confocal_mode(),
             camera_settings=camera_settings,
             illuminator_states=illuminator_states,
             z_offset_um=base.z_offset_um,
-            confocal_hardware_settings=base.confocal_hardware_settings,
+            confocal_hardware_settings=self._collect_confocal_settings(saved),
             display_color=base.display_color,
             channel_groups=base.channel_groups,
             emission_filter_positions=dict(emission_filter_positions or {}),
@@ -737,6 +944,64 @@ class ObservationStateController:
     # ─────────────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────
+
+    def _collect_confocal_mode(self) -> bool:
+        """Use the X-Light's last known disk position when saving a state.
+
+        The panel moves the disk directly, so the controller's mode flag can
+        lag behind the hardware. An unknown driver position falls back to the
+        controller's last known mode without making a serial request.
+        """
+        addons = getattr(self.microscope, "addons", None)
+        if getattr(addons, "dragonfly", None) is None:
+            xlight = getattr(addons, "xlight", None)
+            position = getattr(xlight, "spinning_disk_pos", None)
+            if position is not None:
+                return bool(position)
+        return self.is_confocal_mode()
+
+    # (capability flag, driver cache attribute, ConfocalSettings field, cast)
+    _XLIGHT_CONFOCAL_FIELDS = (
+        ("has_illumination_iris_diaphragm", "illumination_iris", "illumination_iris", float),
+        ("has_emission_iris_diaphragm", "emission_iris", "emission_iris", float),
+        ("has_dichroic_filters_wheel", "dichroic_wheel_pos", "dichroic_position", int),
+        ("has_dichroic_filter_slider", "slider_position", "filter_slider_position", int),
+    )
+
+    def _collect_confocal_settings(self, saved: Optional[ObservationState]) -> Optional[ConfocalSettings]:
+        """The confocal light path as the X-Light actually has it.
+
+        The driver's cached positions are the truth: every move — from the
+        confocal panel or from applying a state — goes through the driver, which
+        records what it last drove. Reading the cache costs no serial round-trip.
+        The general.yaml cache is *not* the truth: it is seeded from the machine
+        config's iris defaults and only follows the panel through a signal chain,
+        so a preset saved from it came back with the default aperture instead of
+        the one on the hardware.
+
+        A field the driver does not know yet (None after a failed read-back, or
+        the unit lacks the mechanism) falls back to the live state, then to
+        general.yaml.
+        """
+        fallback = None
+        if self._current_state is not None:
+            fallback = self._current_state.confocal_hardware_settings
+        if fallback is None and saved is not None:
+            fallback = saved.confocal_hardware_settings
+
+        addons = getattr(self.microscope, "addons", None)
+        xlight = getattr(addons, "xlight", None)
+        if xlight is None or getattr(addons, "dragonfly", None) is not None:
+            return fallback
+
+        settings = fallback.model_copy() if fallback is not None else ConfocalSettings()
+        for capable, cache_attr, field, cast in self._XLIGHT_CONFOCAL_FIELDS:
+            if not getattr(xlight, capable, False):
+                continue
+            value = getattr(xlight, cache_attr, None)
+            if value is not None:
+                setattr(settings, field, cast(value))
+        return settings
 
     def _collect_camera_settings(self) -> Optional[CameraSettings]:
         try:

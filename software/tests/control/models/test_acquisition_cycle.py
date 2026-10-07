@@ -449,3 +449,54 @@ class TestFlatSelectionRawEvents:
         # Guards the regression: a flat selection MUST wrap names as (name, az).
         with pytest.raises(ValueError):
             _index_events([("state", "GFP")])
+
+
+class TestPostprocessGroupLabels:
+    """Two cycles selected together must not fight over one derived output plate.
+
+    Regression: two cycles each carrying an unlabelled DPC group over the same
+    input states both derived the label "DPC_circ_bot", so both claimed the
+    "DPC_circ_bot_phase" plate and _attach_postprocess_outputs raised — from a
+    plain GUI selection change.
+    """
+
+    @staticmethod
+    def _dpc_cycle(name):
+        from control.models.acquisition_cycle import PostprocessSpec
+
+        return AcquisitionCycle(
+            name=name,
+            items=[
+                CycleGroup(
+                    steps=[CycleStep(observation_state=s) for s in ("bot", "left", "right", "top")],
+                    postprocess=PostprocessSpec(routine="dpc2d"),
+                ),
+                CycleStep(observation_state="GFP"),
+            ],
+        )
+
+    def _plan(self, names):
+        cycles = {n: self._dpc_cycle(n) for n in names}
+        return RegionPlan.from_events(resolve_chain(names, cycles.get))
+
+    def test_single_cycle_uses_first_input_state(self):
+        plan = self._plan(["a"])
+        assert [g.label for g in plan.postprocess_groups.values()] == ["bot"]
+
+    def test_two_identical_cycles_get_distinct_labels(self):
+        plan = self._plan(["a", "b"])
+        labels = [g.label for g in plan.postprocess_groups.values()]
+        assert labels == ["bot", "bot_pp1"]
+        assert len(set(labels)) == len(labels)
+
+    def test_explicit_label_is_never_rewritten(self):
+        from control.models.acquisition_cycle import PostprocessSpec
+
+        cycles = {}
+        for n in ("a", "b"):
+            cyc = self._dpc_cycle(n)
+            cyc.items[0].postprocess = PostprocessSpec(routine="dpc2d", label="mine")
+            cycles[n] = cyc
+        plan = RegionPlan.from_events(resolve_chain(["a", "b"], cycles.get))
+        # Left alone so the controller can report the collision actionably.
+        assert [g.label for g in plan.postprocess_groups.values()] == ["mine", "mine"]

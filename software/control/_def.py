@@ -806,6 +806,10 @@ LASER_AF_CONSISTENCY_THRESHOLD_UM = 5.0
 # On regions too small to hit the refresh cadence, take one extra displacement
 # measurement at the last FOV to validate focus. Measurement-only, no Z move.
 LASER_AF_CHECK_LAST_FOV_PER_REGION = True
+# Diagnostic: at every table-path FOV, measure displacement before/after a full
+# laser-AF correction and append to table_path_audit.csv. Corrects Z at audited
+# FOVs and costs ~300 ms each — for validation runs, not production.
+LASER_AF_TABLE_PATH_AUDIT = False
 
 MULTIPOINT_REFLECTION_AUTOFOCUS_ENABLE_BY_DEFAULT = False
 MULTIPOINT_CONTRAST_AUTOFOCUS_ENABLE_BY_DEFAULT = False
@@ -826,17 +830,8 @@ CAMERA_TYPE = "Default"
 
 # Spinning disk confocal integration
 ENABLE_SPINNING_DISK_CONFOCAL = False
-LDI_INTENSITY_MODE = "PC"
-LDI_SHUTTER_MODE = "PC"
 ANDOR_LASER_VID = 0x1BDB
 ANDOR_LASER_PID = 0x0300
-
-XLIGHT_SERIAL_NUMBER = "B00031BE"
-XLIGHT_SLEEP_TIME_FOR_WHEEL = 0.25
-XLIGHT_VALIDATE_WHEEL_POS = False
-XLIGHT_EMISSION_FILTER_POSITIONS = 8  # 5 for Cicero, 8 for XLight V3
-XLIGHT_ILLUMINATION_IRIS_DEFAULT = 100
-XLIGHT_EMISSION_IRIS_DEFAULT = 100
 
 # Dragonfly integration
 USE_DRAGONFLY = False
@@ -1178,14 +1173,13 @@ Z_HOME_SAFETY_MARGIN_UM = 100
 # safety point
 X_HOME_SAFETY_POINT = 0
 Y_HOME_SAFETY_POINT = 0
-Z_HOME_SAFETY_POINT = 100
+Z_HOME_SAFETY_POINT = OBJECTIVE_RETRACTED_POS_MM * 1000  # Legacy µm alias; homing uses the retraction position.
 
-# When the last stage position cache is missing or unreadable, move here after homing (mm).
+# Default workspace coordinates when the stage position cache is unavailable (mm).
+# Startup restores XY and remembers working Z while leaving Z retracted.
 STARTUP_DEFAULT_STAGE_X_MM = 30.0
 STARTUP_DEFAULT_STAGE_Y_MM = 15.0
-STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # 200 µm; kept above Z_HOME_SAFETY_POINT (0.1 mm) and the
-# z lower software limit (0.05 mm) so the post-homing restore moves *up* to it and never
-# triggers move_z_to's backlash dip into the lower limit (which could stall at the boundary).
+STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # Default working Z; startup does not move Z here.
 
 USE_XERYON = False
 XERYON_SERIAL_NUMBER = "95130303033351E02050"
@@ -1212,11 +1206,12 @@ ZARR_COMPRESSION = ZarrCompression.BALANCED
 #            z-slice once all its channels arrive, synchronously with the
 #            z-outer/channel-inner acquisition loop. No per-frame read-modify-
 #            write of a giant shard => ~30x faster writeback on deep stacks.
-#   False -> legacy one shard per FOV-timepoint (1, C, Z, Y, X), committed in
-#            one burst (fewest files, but must buffer the whole FOV).
-# Reads are identical either way (the inner chunk is one plane). Flip to False
-# for an instant rollback to the legacy layout.
-ZARR_SHARD_PER_Z = True
+#   False -> one shard per FOV-timepoint (1, C, Z, Y, X), buffered and committed
+#            once per level. Oversized/incomplete stacks use bounded disk spill.
+# Reads are identical either way (the inner chunk is one plane).
+ZARR_SHARD_PER_Z = False
+# Flat filenames avoid a directory for every coordinate. Use "/" for the old layout.
+ZARR_CHUNK_SEPARATOR = "."
 
 # Flexible (non-wellplate) multipoint saves as an OME-NGFF HCS plate.
 #   True (default) -> each scan region is mapped to a synthetic plate well, so a
@@ -1361,4 +1356,3 @@ def apply_simulation_mode_defaults(simulation_mode: bool) -> None:
     for config_key, attr_name in defaults:
         if config_key not in SIMULATION_KEYS_FROM_CONFIG:
             g[attr_name] = True
-

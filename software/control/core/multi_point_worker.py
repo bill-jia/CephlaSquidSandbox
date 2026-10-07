@@ -1,6 +1,6 @@
 import atexit
 import csv
-import glob
+import contextlib
 import json
 import logging
 import os
@@ -20,7 +20,7 @@ import control._def
 from control import utils
 from control.slack_notifier import TimepointStats, AcquisitionStats
 from control.core.auto_focus_controller import AutoFocusController
-from control.core.laser_auto_focus_controller import LaserAutofocusController
+from control.core.laser_auto_focus_controller import LaserAutofocusController, AFValidationRestoreError
 from control.core.live_controller import LiveController
 from control.core.multi_point_utils import (
     AcquisitionParameters,
@@ -35,6 +35,8 @@ from control.microcontroller import Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
 from control.models.observation_state import ObservationState
+from control.models.acquisition_order import DEFAULT_ORDER, validate_order
+from control.core.ordered_acquisition import OrderedAcquisitionMixin
 from control.core.waveform_observation_state import (
     build_pulse_waveform_for_state,
     nidaq_lines_for_state,
@@ -45,9 +47,11 @@ from control.core.waveform_capture import (
 )
 from control.nidaq import TriggerSource
 from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
+from control._sdk_watchdog import CameraTimeoutError
+from squid.stage.utils import move_xy_with_z_retract
 import squid.logging
 import control.core.job_processing
-from control.core.job_processing import ZarrWriteResult
+from control.core.job_processing import FrameWriteResult
 from control.core.job_processing import (
     CaptureInfo,
     SaveImageJob,
@@ -89,6 +93,17 @@ from squid.config import CameraPixelFormat
 # Module-level logger for static methods
 _log = squid.logging.get_logger(__name__)
 
+# Max times a wedged camera will be reopened-and-resumed within a single acquisition
+# before giving up and aborting. Each recovery costs at most the current FOV. Set to
+# 0 to disable reinit entirely and always fall back to the clean-abort behavior (P0).
+MAX_CAMERA_REINIT_ATTEMPTS = 3
+
+# A single timepoint dropping at least this many camera frames aborts the acquisition
+# (clean finalize). 0 = disabled: drops are always logged but never abort. Off by
+# default because the safe reaction is visibility; enable to hard-stop a run whose
+# camera is shedding frames instead of letting it silently degrade to a wedge.
+CAMERA_DROP_ABORT_PER_TIMEPOINT = 0
+
 # Time budget for the JobRunner subprocess to flush + finalize all zarr writers
 # during shutdown. The final commit of a per-FOV shard (one timepoint =
 # (1, C, Z, Y, X), routinely ~1 GB for a deep z-stack) is a single TensorStore
@@ -107,6 +122,20 @@ JOB_RUNNER_FINALIZE_TIMEOUT_S = 600
 # result-only window because the heartbeat tells a slow large file apart from a
 # stuck one; a wedged worker is force-terminated instead of waited out.
 UPLOAD_DRAINER_STALL_WINDOW_S = 120
+
+# The saving modes whose image files land in ``{exp}/{timepoint}/``. Everything
+# else (OME_TIFF, ZARR_V3) writes to its own root-level tree and keeps its
+# sidecars at the experiment root, so no per-timepoint folder is created.
+_PER_TIMEPOINT_FOLDER_SAVING_OPTIONS = (
+    FileSavingOption.INDIVIDUAL_IMAGES,
+    FileSavingOption.MULTI_PAGE_TIFF,
+)
+
+# Root-level CSV of MEASURED stage positions (one row per FOV *and* z level,
+# with a timestamp), accumulated across timepoints for the modes that have no
+# per-timepoint folder. Distinct from the controller's ``coordinates.csv``,
+# which records the PLANNED grid before the run starts.
+ACQUIRED_POSITIONS_FILENAME = "acquired_positions.csv"
 
 
 class SummarizeResult(NamedTuple):
@@ -129,6 +158,30 @@ class SummarizeResult(NamedTuple):
 _active_upload_drainers: List["_BackgroundUploadDrainer"] = []
 _active_upload_drainers_lock = threading.Lock()
 
+# UploadWorkers that have been started but not yet handed to a drainer. From
+# UploadWorker.start() until _spawn_background_upload_drainer, the worker was
+# previously reachable by NO kill path — an exception in MultiPointWorker
+# setup/run, or an app close mid-acquisition, left a non-daemon subprocess
+# that blocked interpreter exit forever. Registering at spawn time makes
+# terminate_all_upload_drainers() (close + atexit) able to reap it in every
+# window of its life.
+_live_upload_workers: List["UploadWorker"] = []
+
+
+def register_live_upload_worker(worker: "UploadWorker") -> None:
+    with _active_upload_drainers_lock:
+        _live_upload_workers.append(worker)
+
+
+def unregister_live_upload_worker(worker: "UploadWorker") -> None:
+    """Remove a worker from the pre-drainer registry (ownership moved to a
+    drainer, which has its own force-stop path)."""
+    with _active_upload_drainers_lock:
+        try:
+            _live_upload_workers.remove(worker)
+        except ValueError:
+            pass
+
 
 def register_active_upload_drainer(drainer: "_BackgroundUploadDrainer") -> None:
     """Add a drainer to the live registry, pruning completed ones first."""
@@ -149,16 +202,86 @@ def active_upload_drainer_count() -> int:
 
 
 def active_upload_drainer_summary() -> List[dict]:
-    """Snapshot of each running drainer's experiment path + outstanding count.
+    """Snapshot of every pending upload owner: drainers AND live workers.
 
-    Useful for the GUI to surface to the user before starting a new run
-    ("3 previous acquisitions are still uploading, X tasks total").
+    Useful for the GUI to surface to the user before starting a new run or
+    closing the app ("3 previous acquisitions are still uploading, X tasks
+    total"). Workers still owned by a running acquisition (no drainer yet)
+    are included too — closing the app kills those uploads just the same.
     """
     with _active_upload_drainers_lock:
         _active_upload_drainers[:] = [
             d for d in _active_upload_drainers if not d.is_done()
         ]
-        return [d.snapshot() for d in _active_upload_drainers]
+        out = [d.snapshot() for d in _active_upload_drainers]
+        for w in _live_upload_workers:
+            out.append(
+                {
+                    "experiment_path": _worker_experiment_path(w),
+                    "outstanding": 0,  # unknown mid-acquisition; listed for visibility
+                    "alive": True,
+                    "acquisition_in_progress": True,
+                }
+            )
+        return out
+
+
+def format_upload_failure(result, limit: int = 5) -> str:
+    """One log line describing *which* files failed in an UploadResult, and why.
+
+    ``UploadResult.error`` is only an aggregate ("5 file(s) failed"), and the
+    per-file error strings live in the UploadWorker subprocess whose logger
+    output does not reach any log file. Dropping ``failed_paths`` on the floor
+    therefore made upload failures undiagnosable after the fact — a real run
+    lost 10 tasks and the logs could not say whether it was a transient SMB
+    OSError, a torn stable-read, or a sha256 mismatch. Capped so a task that
+    fails wholesale cannot flood the log.
+    """
+    failed = list(getattr(result, "failed_paths", None) or [])
+    if not failed:
+        return str(getattr(result, "error", "") or "unknown error")
+    shown = []
+    for entry in failed[:limit]:
+        # Entries are (local_path, error); tolerate a bare path.
+        if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+            shown.append(f"{os.path.basename(str(entry[0]))}: {entry[1]}")
+        else:
+            shown.append(os.path.basename(str(entry)))
+    more = len(failed) - len(shown)
+    tail = f" (+{more} more)" if more > 0 else ""
+    return f"{getattr(result, 'error', '') or 'failed'} -> " + "; ".join(shown) + tail
+
+
+def _worker_experiment_path(worker: "UploadWorker") -> str:
+    """Best-effort experiment dir for a worker (manifest lives at its root)."""
+    try:
+        return os.path.dirname(getattr(worker, "_manifest_path", "") or "") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _write_orphan_incomplete_record(worker: "UploadWorker") -> None:
+    """Persist UPLOAD_INCOMPLETE.txt for a worker killed before any drainer
+    took ownership (app close mid-acquisition) — same contract as the
+    drainer's record: no abandonment may be invisible after restart."""
+    exp = _worker_experiment_path(worker)
+    if not exp or exp == "unknown":
+        return
+    from datetime import datetime, timezone
+    remote = getattr(getattr(worker, "_target", None), "remote_root", "")
+    try:
+        with open(os.path.join(exp, "UPLOAD_INCOMPLETE.txt"), "w", encoding="utf-8") as f:
+            f.write(
+                f"Streaming upload for this acquisition did NOT complete.\n\n"
+                f"Reason: app closed during the acquisition (upload worker terminated)\n"
+                f"Remote root: {remote}\n"
+                f"Recorded at: {datetime.now(timezone.utc).isoformat()}\n\n"
+                f"Local data has NOT been deleted for unverified timepoints.\n"
+                f"To finish the upload, run:\n"
+                f"    python scripts/zarr_backfill_upload.py \"{exp}\" --remote \"{remote}\"\n"
+            )
+    except OSError:
+        pass
 
 
 def terminate_all_upload_drainers() -> None:
@@ -174,16 +297,38 @@ def terminate_all_upload_drainers() -> None:
     """
     with _active_upload_drainers_lock:
         drainers = list(_active_upload_drainers)
+        orphans = list(_live_upload_workers)
+        _live_upload_workers.clear()
     for d in drainers:
         try:
             d.force_stop()
         except Exception:
             pass
+    # Workers spawned but never handed to a drainer (setup crash, app close
+    # mid-acquisition): terminate them too, or multiprocessing's exit join
+    # blocks forever on the non-daemon child. Leave the same persistent
+    # record a drainer force-stop would.
+    for w in orphans:
+        try:
+            _write_orphan_incomplete_record(w)
+        except Exception:
+            pass
+        try:
+            w.force_stop()
+        except Exception:
+            pass
 
 
-# Registered last (after multiprocessing's own atexit), so it runs FIRST at
-# interpreter shutdown — terminating wedged workers before multiprocessing
-# tries (and would hang) to join them.
+# atexit is LIFO, so for this handler to run BEFORE multiprocessing's
+# _exit_function (which joins non-daemon children and would hang on a wedged
+# worker), _exit_function must already be registered when we register ours.
+# ``import multiprocessing`` alone does NOT import multiprocessing.util or
+# register _exit_function — that happens lazily when the first mp primitive
+# is created, which in this codebase is at RUNTIME (constructors), i.e. AFTER
+# this module is imported. Import util explicitly to force its registration
+# now, making the LIFO ordering deterministic.
+import multiprocessing.util  # noqa: E402  (side effect: registers _exit_function)
+
 atexit.register(terminate_all_upload_drainers)
 
 
@@ -216,10 +361,14 @@ class _BackgroundUploadDrainer:
         expected_by_tp: Dict[int, int],
         deletion_done: Set[int],
         failed_tasks: List,
+        completed_task_ids: Set[str],
+        results_received: int,
         zarr_writer_info,
         experiment_path: Optional[str],
-        metadata_paths_builder,
-        stall_window_s: float,
+        runner_output_queues: Optional[List] = None,
+        runners_done_event: Optional[threading.Event] = None,
+        stall_window_s: float = 120.0,
+        failed_deletions: int = 0,
     ):
         self._worker = upload_worker
         self._target = upload_target
@@ -228,14 +377,28 @@ class _BackgroundUploadDrainer:
         self._expected_by_tp = expected_by_tp
         self._deletion_done = deletion_done
         self._failed_tasks = failed_tasks
+        # Task_ids whose UploadResult has already been consumed. Guards the
+        # register-after-complete race: a BarrierResult that arrives after its
+        # UploadResult must not re-add a task_id nothing will ever discard.
+        self._completed_task_ids = completed_task_ids
+        # Count of UploadResults consumed so far (main-worker phase included).
+        # outstanding = worker.tasks_submitted - results_received: authoritative
+        # regardless of BarrierResult delivery.
+        self._results_received = int(results_received)
         self._zarr_writer_info = zarr_writer_info
         self._experiment_path = experiment_path
-        self._metadata_paths_for_fov = metadata_paths_builder
+        # Output queues of upload-enabled JobRunners (shutdown with
+        # close_output_queue=False): late BarrierResults keep arriving on them
+        # during the up-to-600s background finalize; we consume them here.
+        self._runner_queues: List = list(runner_output_queues or [])
+        self._runners_done = runners_done_event
         self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
         self._stop_requested = threading.Event()
         self._last_result_time = 0.0
+        self._failed_deletions = int(failed_deletions)
+        self._consecutive_failed_tasks = 0
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -249,10 +412,9 @@ class _BackgroundUploadDrainer:
         return self._done.is_set()
 
     def snapshot(self) -> dict:
-        outstanding = sum(len(s) for s in self._tasks_by_tp.values())
         return {
             "experiment_path": self._experiment_path,
-            "outstanding": outstanding,
+            "outstanding": self._outstanding(),
             "alive": self._thread.is_alive(),
         }
 
@@ -262,8 +424,18 @@ class _BackgroundUploadDrainer:
         Idempotent. The drain loop (running in the daemon thread) checks
         ``_stop_requested`` each pass and exits promptly. Called by
         ``terminate_all_upload_drainers`` on app close / at interpreter exit.
+        Leaves a persistent on-disk record so the abandonment is visible
+        after restart (the in-memory registry does not survive one).
         """
+        already = self._stop_requested.is_set()
         self._stop_requested.set()
+        if not already:
+            try:
+                self._write_upload_incomplete_record(
+                    reason="force-stopped (app close / interpreter exit)"
+                )
+            except Exception:
+                pass
         worker = self._worker
         if worker is not None:
             try:
@@ -272,8 +444,17 @@ class _BackgroundUploadDrainer:
                 pass
         self._done.set()
 
+    def _tasks_submitted(self) -> int:
+        worker = self._worker
+        if worker is None:
+            return self._results_received
+        try:
+            return worker.tasks_submitted
+        except Exception:
+            return self._results_received
+
     def _outstanding(self) -> int:
-        return sum(len(s) for s in self._tasks_by_tp.values())
+        return max(0, self._tasks_submitted() - self._results_received)
 
     def _drain_available_results(self) -> int:
         """Pull every available UploadResult; apply per-timepoint deletion."""
@@ -287,18 +468,89 @@ class _BackgroundUploadDrainer:
             return 0
         for result in results:
             tp = result.time_point
+            self._results_received += 1
+            self._completed_task_ids.add(result.task_id)
             self._tasks_by_tp.get(tp, set()).discard(result.task_id)
             self._results_by_tp.setdefault(tp, []).append(result)
             if not result.success:
                 self._failed_tasks.append(result)
+                self._consecutive_failed_tasks += 1
                 self._log.warning(
                     f"Upload task {result.task_id} for t={tp} fov={result.fov} "
-                    f"failed: {result.error}"
+                    f"failed: {format_upload_failure(result)}"
                 )
-            self._maybe_batched_delete(tp)
+            else:
+                self._consecutive_failed_tasks = 0
+            self._delete_verified_result_files(result)
+            self._maybe_prune_timepoint(tp)
         return len(results)
 
-    def _maybe_batched_delete(self, time_point: int) -> None:
+    def _drain_runner_barrier_results(self) -> None:
+        """Consume late JobResults from the upload-enabled JobRunners.
+
+        Only BarrierResults (raw or embedded in PostprocessResults) matter for
+        upload bookkeeping; everything else at this stage is display-only and
+        is dropped. Queues that close under us are removed from the poll set.
+        """
+        if not self._runner_queues:
+            return
+        import queue as _queue
+        from control.core.job_processing import BarrierResult, PostprocessResult
+        dead: List = []
+        for q in self._runner_queues:
+            while True:
+                try:
+                    job_result = q.get_nowait()
+                except _queue.Empty:
+                    break
+                except (OSError, ValueError, EOFError):
+                    dead.append(q)
+                    break
+                result = getattr(job_result, "result", None)
+                if isinstance(result, BarrierResult):
+                    self._note_barrier(result)
+                elif isinstance(result, PostprocessResult):
+                    for br in result.barrier_results:
+                        self._note_barrier(br)
+        for q in dead:
+            self._runner_queues.remove(q)
+
+    def _note_barrier(self, br) -> None:
+        """Late-arriving barrier bookkeeping (mirrors _handle_barrier_result)."""
+        if br.submitted:
+            if br.task_id not in self._completed_task_ids:
+                self._tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
+        else:
+            self._results_by_tp.setdefault(br.time_point, []).append(
+                UploadResult(
+                    task_id=br.task_id,
+                    time_point=br.time_point,
+                    region_id=br.region_id,
+                    fov=br.fov,
+                    success=True,
+                    uploaded_paths=[],
+                    failed_paths=[],
+                    error=None,
+                )
+            )
+            self._maybe_prune_timepoint(br.time_point)
+
+    def _delete_verified_result_files(self, result) -> None:
+        """Reclaim a verified task's shards immediately (mirrors the
+        MultiPointWorker-side method; see its docstring)."""
+        if self._target is None or not self._target.delete_after_verify:
+            return
+        for local_path in result.deletable_uploaded_paths:
+            try:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+            except OSError as e:
+                self._failed_deletions += 1
+                self._log.warning(
+                    f"Failed to delete {local_path} after verified upload: {e}"
+                )
+
+    def _maybe_prune_timepoint(self, time_point: int) -> None:
         if time_point in self._deletion_done:
             return
         if self._target is None or not self._target.delete_after_verify:
@@ -309,25 +561,14 @@ class _BackgroundUploadDrainer:
         results = self._results_by_tp.get(time_point, [])
         if len(results) < expected:
             return
-        if any(not r.success for r in results):
-            return
-        deleted = 0
-        for result in results:
-            for local_path in result.deletable_uploaded_paths:
-                try:
-                    if os.path.isfile(local_path):
-                        os.remove(local_path)
-                        deleted += 1
-                except OSError as e:
-                    self._log.warning(
-                        f"Failed to delete {local_path} after verified upload: {e}"
-                    )
         self._prune_empty_shard_dirs(time_point)
         self._deletion_done.add(time_point)
+        n_files = sum(len(r.deletable_uploaded_paths) for r in results)
+        failures = sum(1 for r in results if not r.success)
         self._log.info(
             f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-            f"Reclaimed local disk: deleted {deleted} files "
-            f"for verified timepoint t={time_point}"
+            f"Timepoint t={time_point}: {n_files} verified shard file(s) reclaimed"
+            + (f"; {failures} task(s) failed (their files kept)" if failures else "")
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
@@ -354,64 +595,88 @@ class _BackgroundUploadDrainer:
         "upload_manifest.jsonl",
         "upload_manifest_backfill.jsonl",
         "RAW_DATA_UPLOADED.txt",
+        "UPLOAD_INCOMPLETE.txt",
     })
 
     def _enqueue_post_finalize_metadata_resync(self) -> None:
-        if self._zarr_writer_info is None or self._target is None or not self._target.enabled:
+        """Re-upload EVERY zarr metadata file in the experiment tree.
+
+        The caller runs this only after the JobRunner subprocesses have
+        exited (``runners_done``), so every ``zarr.json`` — including the
+        finalize rewrite that sets ``_squid.acquisition_complete=true`` — and
+        every ``frame_times`` chunk is stable on disk. Enumerating by
+        filesystem walk (not through ``ZarrWriterInfo``) covers ALL plates:
+        the dense plate, ragged per-state plates (``{state}.ome.zarr``,
+        ``{state}_refz.ome.zarr``), derived postprocess plates
+        (``{label}_{output}.ome.zarr``), their plate-root and per-well group
+        ``zarr.json``, and the non-HCS ``zarr/<region>/fov_*.ome.zarr`` tree —
+        the old writer-info-based enumeration silently skipped everything but
+        the dense plate.
+        """
+        if self._worker is None or self._target is None or not self._target.enabled:
+            return
+        if not self._experiment_path or not os.path.isdir(self._experiment_path):
             return
         from uuid import uuid4
         from control.core.zarr_upload import UploadTask, local_to_remote_path
-        info = self._zarr_writer_info
+        from control.core.zarr_layout import array_chunk_path
+
+        meta_files: List[str] = []
+        for root, dirs, files in os.walk(self._experiment_path):
+            if "zarr.json" in files:
+                meta_files.append(os.path.join(root, "zarr.json"))
+            if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                chunk = str(array_chunk_path(root, (0, 0, 0)))
+                if os.path.isfile(chunk):
+                    meta_files.append(chunk)
+        if not meta_files:
+            return
+        # Chunk into modest tasks so results (and watchdog progress) keep
+        # flowing instead of one giant task holding everything.
         submitted = 0
-        for region_id, fov_count in info.region_fov_counts.items():
-            for fov in range(fov_count):
-                candidates = self._metadata_paths_for_fov(str(region_id), fov)
-                if not candidates:
-                    continue
-                files = [
-                    (
-                        local,
-                        local_to_remote_path(
-                            local, self._target.local_base, self._target.remote_root,
-                        ),
-                    )
-                    for local in candidates
-                ]
-                task = UploadTask(
-                    task_id=str(uuid4()),
-                    time_point=-1,  # sentinel
-                    region_id=str(region_id),
-                    fov=fov,
-                    files=files,
-                    deletable_local_paths=set(),
-                    stable_read_paths=set(candidates),
+        batch_size = 100
+        for i in range(0, len(meta_files), batch_size):
+            batch = meta_files[i : i + batch_size]
+            files = [
+                (
+                    local,
+                    local_to_remote_path(
+                        local, self._target.local_base, self._target.remote_root,
+                    ),
                 )
-                self._worker.submit(task)
-                self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
-                self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
-                submitted += 1
-        if submitted:
-            self._log.info(
-                f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-                f"Submitted {submitted} post-finalize metadata resync task(s)"
+                for local in batch
+            ]
+            task = UploadTask(
+                task_id=str(uuid4()),
+                time_point=-1,  # sentinel
+                region_id="(metadata-resync)",
+                fov=-1,
+                files=files,
+                deletable_local_paths=set(),
+                stable_read_paths=set(batch),
             )
+            self._worker.submit(task)
+            self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+            self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+            submitted += 1
+        self._log.info(
+            f"[{os.path.basename(self._experiment_path or 'unknown')}] "
+            f"Submitted post-finalize metadata resync: {len(meta_files)} file(s) "
+            f"in {submitted} task(s)"
+        )
 
-        # Plate/well group metadata sits above the per-FOV groups and is
-        # required for the remote to open as a valid HCS plate.
-        self._enqueue_plate_metadata_resync()
+        # Also mirror every sidecar so the remote holds the FULL acquisition
+        # record, not just the zarr trees.
+        self._enqueue_sidecar_resync()
 
-        # Also push every experiment-root file (acquisition.yaml, run logs,
-        # config dumps, …) so the remote ends up with the full acquisition
-        # record, not just the zarr-internal metadata.
-        self._enqueue_experiment_root_resync()
+    def _enqueue_sidecar_resync(self) -> None:
+        """Mirror every non-zarr file in the experiment dir, recursively.
 
-    def _enqueue_plate_metadata_resync(self) -> None:
-        """Upload plate-root and per-well ``zarr.json`` for every HCS plate.
-
-        ``_metadata_paths_for_fov`` only covers per-FOV groups; without the
-        plate-root (``<plate>.ome.zarr/zarr.json``) and per-well
-        (``<plate>.ome.zarr/<row>/<col>/zarr.json``) group metadata the
-        remote tree is a headless collection of images, not a readable plate.
+        Covers what the live barriers and metadata resync do not: top-level
+        records (acquisition.yaml, logs, config dumps, coordinate CSVs) AND
+        sidecar subdirectories — per-timepoint folders with downsampled well
+        views, laser-AF debug images, etc. The old top-level-files-only pass
+        silently left every sidecar folder behind.
         """
         if (
             self._target is None
@@ -419,107 +684,54 @@ class _BackgroundUploadDrainer:
             or not self._experiment_path
         ):
             return
-        import json as _json
         from uuid import uuid4
-        from control.core.zarr_upload import UploadTask, local_to_remote_path
-        meta_files: List[str] = []
-        try:
-            plate_roots = sorted(glob.glob(os.path.join(self._experiment_path, "*.ome.zarr")))
-        except OSError:
-            return
-        for plate_root in plate_roots:
-            root_json = os.path.join(plate_root, "zarr.json")
-            try:
-                with open(root_json, "r", encoding="utf-8") as f:
-                    ome = (_json.load(f).get("attributes", {}) or {}).get("ome", {}) or {}
-            except (OSError, ValueError):
-                continue
-            if "plate" not in ome:
-                continue
-            meta_files.append(root_json)
-            for row in sorted(os.listdir(plate_root)):
-                row_dir = os.path.join(plate_root, row)
-                if not os.path.isdir(row_dir):
-                    continue
-                rj = os.path.join(row_dir, "zarr.json")
-                if os.path.isfile(rj):
-                    meta_files.append(rj)
-                for col in sorted(os.listdir(row_dir)):
-                    wj = os.path.join(row_dir, col, "zarr.json")
-                    if os.path.isfile(wj):
-                        meta_files.append(wj)
-        if not meta_files:
-            return
-        files = [
-            (local, local_to_remote_path(local, self._target.local_base, self._target.remote_root))
-            for local in meta_files
-        ]
-        task = UploadTask(
-            task_id=str(uuid4()),
-            time_point=-1,
-            region_id="(plate)",
-            fov=-1,
-            files=files,
-            deletable_local_paths=set(),
-            stable_read_paths=set(meta_files),
+        from control.core.zarr_upload import (
+            UploadTask,
+            collect_sidecar_files,
+            local_to_remote_path,
         )
-        self._worker.submit(task)
-        self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
-        self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
-        self._log.info(
-            f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-            f"Submitted plate/well metadata resync ({len(meta_files)} file(s))"
-        )
-
-    def _enqueue_experiment_root_resync(self) -> None:
-        if (
-            self._target is None
-            or not self._target.enabled
-            or not self._experiment_path
-        ):
-            return
-        from uuid import uuid4
-        from control.core.zarr_upload import UploadTask, local_to_remote_path
         try:
-            entries = sorted(os.listdir(self._experiment_path))
+            sidecars = sorted(
+                collect_sidecar_files(
+                    self._experiment_path, self._EXPERIMENT_ROOT_SKIP_NAMES
+                )
+            )
         except OSError as e:
             self._log.warning(
-                f"Could not list experiment root {self._experiment_path}: {e}"
+                f"Could not enumerate sidecars under {self._experiment_path}: {e}"
             )
             return
-        root_files: List[str] = []
-        for name in entries:
-            if name in self._EXPERIMENT_ROOT_SKIP_NAMES:
-                continue
-            full = os.path.join(self._experiment_path, name)
-            if os.path.isfile(full):
-                root_files.append(full)
-        if not root_files:
+        if not sidecars:
             return
-        files = [
-            (
-                local,
-                local_to_remote_path(
-                    local, self._target.local_base, self._target.remote_root,
-                ),
+        submitted = 0
+        batch_size = 100
+        for i in range(0, len(sidecars), batch_size):
+            batch = sidecars[i : i + batch_size]
+            files = [
+                (
+                    local,
+                    local_to_remote_path(
+                        local, self._target.local_base, self._target.remote_root,
+                    ),
+                )
+                for local in batch
+            ]
+            task = UploadTask(
+                task_id=str(uuid4()),
+                time_point=-1,
+                region_id="(sidecars)",
+                fov=-1,
+                files=files,
+                deletable_local_paths=set(),
+                stable_read_paths=set(batch),
             )
-            for local in root_files
-        ]
-        task = UploadTask(
-            task_id=str(uuid4()),
-            time_point=-1,
-            region_id="",
-            fov=-1,
-            files=files,
-            deletable_local_paths=set(),
-            stable_read_paths=set(root_files),
-        )
-        self._worker.submit(task)
-        self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
-        self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+            self._worker.submit(task)
+            self._tasks_by_tp.setdefault(-1, set()).add(task.task_id)
+            self._expected_by_tp[-1] = self._expected_by_tp.get(-1, 0) + 1
+            submitted += 1
         self._log.info(
             f"[{os.path.basename(self._experiment_path or 'unknown')}] "
-            f"Submitted experiment-root resync ({len(root_files)} file(s))"
+            f"Submitted sidecar resync: {len(sidecars)} file(s) in {submitted} task(s)"
         )
 
     def _write_upload_complete_marker(self) -> None:
@@ -535,13 +747,29 @@ class _BackgroundUploadDrainer:
         from datetime import datetime, timezone
         marker = os.path.join(self._experiment_path, "RAW_DATA_UPLOADED.txt")
         manifest = os.path.join(self._experiment_path, "upload_manifest.jsonl")
+        if self._target.delete_after_verify:
+            if self._failed_deletions:
+                deletion_note = (
+                    f"Per-timepoint shard data was removed from local disk after\n"
+                    f"verification, EXCEPT {self._failed_deletions} file(s) that could\n"
+                    f"not be deleted (locked by another process); they remain locally.\n"
+                )
+            else:
+                deletion_note = (
+                    "Local zarr metadata (zarr.json, frame_times) is preserved so this\n"
+                    "directory is still a valid OME-NGFF reader pointer. Only the\n"
+                    "per-timepoint shard data has been removed from local disk.\n"
+                )
+        else:
+            deletion_note = (
+                "delete-after-verify was OFF for this run: the complete local copy\n"
+                "is still in place alongside the verified remote copy.\n"
+            )
         content = (
             f"Raw zarr shard data for this acquisition has been uploaded to:\n"
             f"    {self._target.remote_root}\n"
             f"\n"
-            f"Local zarr metadata (zarr.json, frame_times) is preserved so this\n"
-            f"directory is still a valid OME-NGFF reader pointer. Only the\n"
-            f"per-timepoint shard data has been removed from local disk.\n"
+            f"{deletion_note}"
             f"\n"
             f"Uploaded at: {datetime.now(timezone.utc).isoformat()}\n"
             f"Upload manifest: {manifest}\n"
@@ -549,6 +777,13 @@ class _BackgroundUploadDrainer:
         try:
             with open(marker, "w", encoding="utf-8") as f:
                 f.write(content)
+            # A clean completion supersedes any stale incomplete record.
+            incomplete = os.path.join(self._experiment_path, "UPLOAD_INCOMPLETE.txt")
+            if os.path.isfile(incomplete):
+                try:
+                    os.remove(incomplete)
+                except OSError:
+                    pass
             self._log.info(
                 f"[{os.path.basename(self._experiment_path or 'unknown')}] "
                 f"Wrote upload-complete marker: {marker}"
@@ -558,17 +793,106 @@ class _BackgroundUploadDrainer:
                 f"Could not write upload-complete marker {marker}: {e}"
             )
 
+    def _write_upload_incomplete_record(self, reason: str) -> None:
+        """Persist an ``UPLOAD_INCOMPLETE.txt`` next to the data.
+
+        The in-memory drainer registry dies with the process; this file is
+        the only record after an app restart that uploads were abandoned and
+        the backfill script is needed. Overwritten by each abandonment;
+        removed when a later clean drain writes the complete marker.
+        """
+        if not self._experiment_path:
+            return
+        from datetime import datetime, timezone
+        path = os.path.join(self._experiment_path, "UPLOAD_INCOMPLETE.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"Streaming upload for this acquisition did NOT complete.\n"
+                    f"\n"
+                    f"Reason: {reason}\n"
+                    f"Outstanding upload task(s): {self._outstanding()}\n"
+                    f"Failed upload task(s): {len(self._failed_tasks)}\n"
+                    f"Remote root: {getattr(self._target, 'remote_root', '?')}\n"
+                    f"Recorded at: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"\n"
+                    f"Local data has NOT been deleted for unverified timepoints.\n"
+                    f"To finish the upload, run:\n"
+                    f"    python scripts/zarr_backfill_upload.py \"{self._experiment_path}\" "
+                    f"--remote \"{getattr(self._target, 'remote_root', '')}\"\n"
+                )
+        except OSError as e:
+            self._log.warning(f"Could not write UPLOAD_INCOMPLETE record: {e}")
+
+    def _wait_for_runners_to_exit(self, tag: str) -> None:
+        """Phase 1: keep bookkeeping current while the JobRunner subprocesses
+        finish their queued backlog + finalize (up to the 600s budget).
+
+        Late BarrierResults are consumed from the runner output queues here —
+        the main process's last drain happened before the background shutdown,
+        so without this the tasks those barriers staged would be untracked.
+        """
+        if self._runners_done is None:
+            return
+        deadline = time.time() + JOB_RUNNER_FINALIZE_TIMEOUT_S + 60.0
+        last_log = 0.0
+        while not self._runners_done.is_set() and not self._stop_requested.is_set():
+            self._drain_runner_barrier_results()
+            self._drain_available_results()
+            now = time.time()
+            if now > deadline:
+                self._log.error(
+                    f"[{tag}] JobRunners did not finish within "
+                    f"{int(JOB_RUNNER_FINALIZE_TIMEOUT_S + 60)}s; proceeding with "
+                    f"metadata resync against possibly-unfinalized zarr.json."
+                )
+                break
+            if now - last_log > 30.0:
+                self._log.info(
+                    f"[{tag}] waiting for writer finalize before metadata resync "
+                    f"({self._outstanding()} upload(s) in flight meanwhile)"
+                )
+                last_log = now
+            self._runners_done.wait(timeout=0.5)
+        # Sweep any barriers that landed right before the runners exited.
+        self._drain_runner_barrier_results()
+
+    def _remote_reachable(self, timeout_s: float = 5.0) -> bool:
+        """Reachability of the per-experiment remote root, falling back to
+        its parent (the folder the user actually selected): the experiment
+        subdir may not exist yet when no upload has completed, and that must
+        not read as "share gone"."""
+        from control.core.zarr_upload import remote_root_reachable
+
+        root = getattr(self._target, "remote_root", "") or ""
+        if remote_root_reachable(root, timeout_s=timeout_s):
+            return True
+        parent = os.path.dirname(root.rstrip("/\\"))
+        return bool(parent) and remote_root_reachable(parent, timeout_s=timeout_s)
+
+    def _worker_alive(self) -> bool:
+        """is_alive() that tolerates a concurrently force-stopped (closed)
+        Process handle — close() makes is_alive() raise ValueError."""
+        worker = self._worker
+        if worker is None:
+            return False
+        try:
+            return worker.is_alive()
+        except Exception:
+            return False
+
     def _run(self) -> None:
         tag = os.path.basename(self._experiment_path or "unknown")
+        crashed = False
+        abandon_reason: Optional[str] = None
         try:
             # Fail fast if the share is simply gone: don't pay the stall window
             # per file when the mount is unreachable. Probe is timeout-bounded
             # so a wedged mount can't block here either.
-            from control.core.zarr_upload import remote_root_reachable
             if (
                 self._target is not None
                 and getattr(self._target, "enabled", False)
-                and not remote_root_reachable(self._target.remote_root, timeout_s=5.0)
+                and not self._remote_reachable()
             ):
                 self._log.error(
                     f"[{tag}] remote {self._target.remote_root} is unreachable; "
@@ -576,34 +900,61 @@ class _BackgroundUploadDrainer:
                     f"waiting. Re-run the backfill script over "
                     f"{self._experiment_path} once the share is back."
                 )
-                self._teardown_worker(tag)
+                abandon_reason = "remote share unreachable at drain start"
                 return
 
+            # Phase 1: wait for the JobRunners to drain their backlog and
+            # finalize the writers, consuming late BarrierResults meanwhile.
+            # Only AFTER this is the metadata resync genuinely post-finalize
+            # (zarr.json carries acquisition_complete=true).
+            self._wait_for_runners_to_exit(tag)
+            if self._stop_requested.is_set():
+                return
+
+            # Phase 2: resync every metadata file, now stable on disk.
             self._enqueue_post_finalize_metadata_resync()
-            # Heartbeat-based wedge detection, NOT a wallclock cap. The worker
-            # stamps ``worker.heartbeat`` on every chunk it moves, so a healthy
+
+            # Phase 3: drain until nothing is outstanding. Heartbeat-based
+            # wedge detection, NOT a wallclock cap: the worker stamps
+            # ``worker.heartbeat`` on every chunk it moves, so a healthy
             # transfer — however slow or large its backlog — keeps the idle
-            # clock near zero and is never abandoned. We only give up when
-            # neither a result nor a single byte has moved for
-            # ``stall_window_s`` (a genuinely wedged SMB handle), which the old
-            # result-only window could not tell apart from one slow big file.
+            # clock near zero and is never abandoned. The heartbeat is NOT
+            # stamped by failing uploads, so a dead-share failure grind looks
+            # idle here; we then re-probe reachability to distinguish "share
+            # gone" (abandon fast with a persistent record) from "worker
+            # wedged" (terminate, same record).
             stall_window_s = self._stall_window_s
             last_log = 0.0
             self._last_result_time = time.time()
             while True:
                 if self._stop_requested.is_set():
-                    break
+                    return
                 outstanding = self._outstanding()
                 if outstanding == 0:
                     break
                 # A crashed/terminated worker will never emit more results.
-                if self._worker is None or not self._worker.is_alive():
+                if not self._worker_alive():
                     self._log.error(f"[{tag}] UploadWorker is not alive; stopping drain.")
+                    abandon_reason = "UploadWorker process died"
                     break
                 got = self._drain_available_results()
+                self._drain_runner_barrier_results()
                 now = time.time()
                 if got:
                     self._last_result_time = now
+                # Many consecutive whole-task failures usually mean the share
+                # went away mid-drain: re-probe instead of grinding the whole
+                # backlog through 5-attempt retry ladders.
+                if self._consecutive_failed_tasks >= 5:
+                    if not self._remote_reachable():
+                        self._log.error(
+                            f"[{tag}] remote became unreachable mid-drain "
+                            f"({self._consecutive_failed_tasks} consecutive task "
+                            f"failures); abandoning {outstanding} upload(s)."
+                        )
+                        abandon_reason = "remote share became unreachable mid-drain"
+                        break
+                    self._consecutive_failed_tasks = 0
                 hb = 0.0
                 try:
                     hb = float(self._worker.heartbeat)
@@ -612,12 +963,21 @@ class _BackgroundUploadDrainer:
                 last_progress = max(hb, self._last_result_time)
                 idle = now - last_progress if last_progress > 0 else 0.0
                 if last_progress > 0 and idle > stall_window_s:
-                    self._log.error(
-                        f"[{tag}] UploadWorker wedged: no progress for "
-                        f"{int(idle)}s with {outstanding} upload(s) outstanding; "
-                        f"terminating. Re-run the backfill script over "
-                        f"{self._experiment_path} to finish the upload."
-                    )
+                    if not self._remote_reachable():
+                        self._log.error(
+                            f"[{tag}] no progress for {int(idle)}s and the remote is "
+                            f"unreachable; abandoning {outstanding} upload(s). Re-run "
+                            f"the backfill script once the share is back."
+                        )
+                        abandon_reason = "remote share unreachable (no progress)"
+                    else:
+                        self._log.error(
+                            f"[{tag}] UploadWorker wedged: no progress for "
+                            f"{int(idle)}s with {outstanding} upload(s) outstanding "
+                            f"although the share is reachable; terminating. Re-run "
+                            f"the backfill script over {self._experiment_path}."
+                        )
+                        abandon_reason = "UploadWorker wedged (no progress, share reachable)"
                     break
                 if now - last_log > 30.0:
                     self._log.info(
@@ -627,8 +987,30 @@ class _BackgroundUploadDrainer:
                     last_log = now
                 time.sleep(0.5)
 
-            self._drain_available_results()
+        except Exception:
+            crashed = True
+            self._log.exception(
+                f"[{tag}] upload drainer crashed; worker will be torn down."
+            )
+        finally:
+            # Teardown ALWAYS runs (a raised exception must not leak a live
+            # non-daemon worker that only atexit could reap). All final
+            # accounting happens AFTER teardown: results that complete during
+            # the shutdown grace still count, so the marker/incomplete
+            # decision reflects what actually reached the remote.
+            worker_clean = False
+            try:
+                worker_clean = self._teardown_worker(tag)
+            except Exception:
+                self._log.exception(f"[{tag}] worker teardown failed")
+            try:
+                self._drain_available_results()
+                self._drain_runner_barrier_results()
+            except Exception:
+                pass
             remaining = self._outstanding()
+            runners_done = self._runners_done is None or self._runners_done.is_set()
+            stopped = self._stop_requested.is_set()
             if remaining:
                 self._log.error(
                     f"[{tag}] UploadWorker drain ended with {remaining} upload(s) "
@@ -641,37 +1023,123 @@ class _BackgroundUploadDrainer:
                     f"this run; local files for the affected timepoints have NOT "
                     f"been deleted."
                 )
-            # Marker only on a fully-clean drain: every task accounted for AND
-            # no task reported failure. If a subsequent backfill run closes the
-            # gap, that run will drop the marker instead.
-            if remaining == 0 and not self._failed_tasks:
-                self._write_upload_complete_marker()
-            self._teardown_worker(tag)
-        finally:
+            # Log timepoints whose delete-after-verify never fired, so a
+            # partially-reclaimed disk is explainable from the log.
+            try:
+                if self._target is not None and self._target.delete_after_verify:
+                    undeleted = sorted(
+                        tp for tp, expected in self._expected_by_tp.items()
+                        if tp >= 0 and expected and tp not in self._deletion_done
+                        and self._results_by_tp.get(tp)
+                    )
+                    if undeleted:
+                        self._log.warning(
+                            f"[{tag}] timepoint(s) {undeleted} did not fully verify; "
+                            f"verified shards were reclaimed as they landed, but the "
+                            f"unverified files (and empty-dir pruning) were left."
+                        )
+            except Exception:
+                pass
+            complete = (
+                not crashed
+                and not stopped
+                and remaining == 0
+                and not self._failed_tasks
+                and worker_clean
+                and runners_done
+            )
+            try:
+                if complete:
+                    self._write_upload_complete_marker()
+                else:
+                    if crashed:
+                        reason = "drainer crashed (see log)"
+                    elif stopped:
+                        reason = "force-stopped (app close / interpreter exit)"
+                    elif abandon_reason:
+                        reason = abandon_reason
+                    elif self._failed_tasks:
+                        reason = f"{len(self._failed_tasks)} upload task(s) failed"
+                    elif not runners_done:
+                        reason = "writer finalize did not finish within its budget"
+                    elif remaining:
+                        reason = f"{remaining} upload(s) never completed"
+                    else:
+                        reason = "upload worker did not exit cleanly"
+                    self._write_upload_incomplete_record(reason)
+            except Exception:
+                pass
+            self._close_runner_queues()
             self._done.set()
             self._log.info(f"[{tag}] background upload drainer finished.")
 
-    def _teardown_worker(self, tag: str) -> None:
-        """Stop the worker: a healthy idle worker exits on the sentinel; a
-        wedged one is force-terminated. Either way queue feeder threads are
-        released so the host process can exit promptly."""
+    def _close_runner_queues(self) -> None:
+        """Release the parent-side handles of the runner output queues we own
+        (their shutdown ran with close_output_queue=False)."""
+        for q in self._runner_queues:
+            try:
+                q.close()
+            except Exception:
+                pass
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
+        self._runner_queues = []
+
+    def _teardown_worker(self, tag: str) -> bool:
+        """Stop the worker. Returns True iff it exited cooperatively.
+
+        The shutdown sentinel sits BEHIND any still-queued tasks, so the wait
+        is progress-aware rather than a fixed grace: as long as the worker
+        keeps moving bytes (heartbeat) or emitting results it gets more time;
+        only an idle-past-stall-window worker is terminated. A fixed 5s join
+        used to kill workers that were still legitimately uploading.
+        """
         worker = self._worker
         if worker is None:
-            return
+            return True
+        clean = False
         try:
             worker.shutdown()
-            worker.join(timeout=5.0)
+            sentinel_sent_at = time.time()
+            while True:
+                worker.join(timeout=2.0)
+                if not worker.is_alive():
+                    clean = True
+                    break
+                self._drain_available_results()
+                hb = 0.0
+                try:
+                    hb = float(worker.heartbeat)
+                except Exception:
+                    pass
+                last_progress = max(hb, self._last_result_time, sentinel_sent_at)
+                if time.time() - last_progress > self._stall_window_s:
+                    self._log.warning(
+                        f"[{tag}] UploadWorker idle past the stall window after "
+                        f"the shutdown sentinel; terminating."
+                    )
+                    break
+                if self._stop_requested.is_set():
+                    break
         except Exception as e:
             self._log.debug(f"[{tag}] graceful worker shutdown: {e}")
+        if clean:
+            try:
+                clean = worker.exitcode == 0
+            except Exception:
+                pass
         # force_stop() is a no-op if the worker already exited; otherwise it
         # terminate()s a worker still wedged in SMB I/O and releases queues.
         try:
             worker.force_stop()
         except Exception as e:
             self._log.error(f"[{tag}] Error force-stopping UploadWorker: {e}")
+        return clean
 
 
-class MultiPointWorker:
+class MultiPointWorker(OrderedAcquisitionMixin):
     def __init__(
         self,
         scope: Microscope,
@@ -712,7 +1180,8 @@ class MultiPointWorker:
         self.laser_auto_focus_controller: Optional[LaserAutofocusController] = laser_auto_focus_controller
         self.objectiveStore: ObjectiveStore = objective_store
         self.fluidics = scope.addons.fluidics
-        self.use_fluidics = acquisition_parameters.use_fluidics
+        self.validation_mode = acquisition_parameters.validation_mode
+        self.use_fluidics = acquisition_parameters.use_fluidics and not self.validation_mode
         self.keep_illuminators_on_between_captures = (
             acquisition_parameters.keep_illuminators_on_between_captures
         )
@@ -720,6 +1189,10 @@ class MultiPointWorker:
         self.callbacks: MultiPointControllerFunctions = callbacks
         self.abort_requested_fn: Callable[[], bool] = abort_requested_fn
         self.request_abort_fn: Callable[[], None] = request_abort_fn
+        # Set when an abort is requested because a triggered frame never arrived.
+        # The teardown path then knows the outstanding frame is never coming and
+        # must not burn another _frame_wait_timeout_s() waiting for it.
+        self._aborted_on_frame_timeout = False
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
 
@@ -798,11 +1271,27 @@ class MultiPointWorker:
             physical_size_z_um=self._physical_size_z_um,
             physical_size_x_um=self._pixel_size_um,
             physical_size_y_um=self._pixel_size_um,
+            # One OME-TIFF per region holds one series per FOV, all pre-allocated
+            # on the region's first frame, so the save layer needs the counts.
+            fovs_per_region={
+                str(region_id): len(coords)
+                for region_id, coords in (
+                    acquisition_parameters.scan_position_information.scan_region_fov_coords_mm or {}
+                ).items()
+            },
         )
 
         self.time_point = 0
         self._first_fov_pre_moved = False
         self.af_fov_count = 0
+        # Count of camera reopen recoveries performed this run (bounded by
+        # MAX_CAMERA_REINIT_ATTEMPTS). See _recover_wedged_camera.
+        self._camera_reinit_attempts = 0
+        # Outcome of the last perform_autofocus() call, recorded to
+        # autofocus_log.csv. Full status vocabulary: see the comment above
+        # _AUTOFOCUS_LOG_HEADER. Distinguishing these is what surfaces
+        # focus-camera trouble that a bare "ok"/"failed" hid.
+        self._last_af_status = "skipped"
         self.num_fovs = 0
         self.total_scans = 0
         self._z_pos_proposal = {}
@@ -825,6 +1314,9 @@ class MultiPointWorker:
         )
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
+        self.snake_observation_states = acquisition_parameters.snake_observation_states
+        self.acquisition_order = validate_order(acquisition_parameters.acquisition_order or DEFAULT_ORDER)
+        self._explicit_acquisition_order = acquisition_parameters.acquisition_order is not None
 
         self.t_dpc = []
         self.t_inf = []
@@ -896,6 +1388,7 @@ class MultiPointWorker:
         self._laser_af_refresh_every_n_fovs = max(1, int(acquisition_parameters.laser_af_refresh_every_n_fovs))
         self._laser_af_consistency_threshold_um = float(acquisition_parameters.laser_af_consistency_threshold_um)
         self._laser_af_check_last_fov_per_region = bool(acquisition_parameters.laser_af_check_last_fov_per_region)
+        self._laser_af_table_path_audit = bool(acquisition_parameters.laser_af_table_path_audit)
         self._fov_z_map: dict[tuple[str, int], float] = {}
         self._fov_z_delta_map: dict[tuple[str, int], float] = {}
         self._region_anchor_z_current: dict[str, float] = {}
@@ -911,14 +1404,30 @@ class MultiPointWorker:
         # refresh fired, optionally take a verification displacement).
         self._region_refresh_count_this_entry: int = 0
 
-        self.skip_saving = acquisition_parameters.skip_saving
+        self.skip_saving = acquisition_parameters.skip_saving or self.validation_mode
+        self._af_validator = None
+        if self.validation_mode:
+            if not self.do_reflection_af or self.laser_auto_focus_controller is None:
+                raise ValueError("AF validation requires laser autofocus")
+            from control.core.af_validation_collector import AFValidationCollector
+            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, "af_validation"))
+        # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
+        # move that enters a region (and before the very first move of the
+        # run), then drive Z back to the target. Never fires between FOVs
+        # inside one region's tile grid.
+        self.retract_z_between_regions = acquisition_parameters.retract_z_between_regions
+        # Region of the previous move_to_coordinate, so a move into a different
+        # region can be told apart from a step across the current region's grid.
+        self._last_move_region_id: Optional[str] = None
         self.file_saving_option = acquisition_parameters.file_saving_option
         # Tracks whether the most recent run_single_time_point created a per-timepoint
         # folder (so we know whether to drop a per-timepoint .done marker into it).
         self._wrote_per_timepoint_folder = False
+        # Guards the once-per-timepoint append to the root acquired_positions.csv.
+        self._acquired_positions_appended = False
         job_classes = []
-        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF
-        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3
+        use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF and not self.validation_mode
+        use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3 and not self.validation_mode
         if not self.skip_saving:
             if use_ome_tiff:
                 job_classes.append(SaveOMETiffJob)
@@ -927,7 +1436,7 @@ class MultiPointWorker:
             else:
                 job_classes.append(SaveImageJob)
 
-        if extra_job_classes:
+        if extra_job_classes and not self.validation_mode:
             job_classes.extend(extra_job_classes)
 
         # Online postprocessing runs in its own runner (created only when a plan
@@ -940,7 +1449,7 @@ class MultiPointWorker:
         # Only generate downsampled views for well-based acquisitions
         is_select_wells = acquisition_parameters.xy_mode == "Select Wells"
         is_loaded_wells = acquisition_parameters.xy_mode == "Load Coordinates" and self._is_well_based_acquisition()
-        self._generate_downsampled_views = acquisition_parameters.generate_downsampled_views and (
+        self._generate_downsampled_views = not self.validation_mode and acquisition_parameters.generate_downsampled_views and (
             is_select_wells or is_loaded_wells
         )
         self._downsampled_view_manager: Optional[DownsampledViewManager] = None
@@ -1089,10 +1598,9 @@ class MultiPointWorker:
             mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
 
-        # Live ZARR_V3 upload (per-acquisition setting). When enabled, spawn a
-        # dedicated UploadWorker process and wire its input queue into the
-        # SaveZarrJob runner. Acquisition continues even if the network is
-        # down — uploads queue, deletions defer.
+        # Live ZARR_V3 upload (per-acquisition setting). The detached Upload
+        # Manager owns transfer processes and durable queue state. This worker
+        # only gives writer subprocesses its dataset identity.
         self._upload_target: Optional[UploadTarget] = None
         self._upload_worker: Optional[UploadWorker] = None
         self._save_zarr_runner: Optional[JobRunner] = None
@@ -1101,31 +1609,62 @@ class MultiPointWorker:
         self._upload_expected_count_by_tp: Dict[int, int] = {}
         self._upload_deletion_done: Set[int] = set()
         self._upload_failed_tasks: List[UploadResult] = []
+        # Order-independent completion tracking: count of UploadResults
+        # consumed, plus the task_ids they carried (guards the case where a
+        # result arrives before its BarrierResult registers the task).
+        self._upload_results_received = 0
+        self._upload_completed_task_ids: Set[str] = set()
+        self._upload_failed_deletions = 0
+        self._upload_health_last_check = 0.0
+        self._upload_health_last_warn = 0.0
+        # Per-timepoint size estimate for the low-disk warning (0 = unknown).
+        self._upload_est_tp_bytes = (
+            getattr(acquisition_parameters, "estimated_total_disk_bytes", 0)
+            / max(1, self.Nt)
+        )
         if (
             use_zarr_v3
             and getattr(acquisition_parameters, "zarr_upload_enabled", False)
             and getattr(acquisition_parameters, "zarr_upload_remote_root", "")
         ):
+            # The user-selected folder is the PARENT: each acquisition mirrors
+            # into its own subfolder named after the experiment, exactly like
+            # local {base_path}/{experiment_ID}. Mapping the selection to the
+            # experiment dir itself made every run reusing the cached path
+            # spray its files into the same remote folder.
+            remote_experiment_root = os.path.join(
+                acquisition_parameters.zarr_upload_remote_root,
+                os.path.basename(os.path.normpath(self.experiment_path)),
+            )
             self._upload_target = UploadTarget(
                 enabled=True,
-                remote_root=acquisition_parameters.zarr_upload_remote_root,
+                remote_root=remote_experiment_root,
                 local_base=self.experiment_path,
                 delete_after_verify=acquisition_parameters.zarr_upload_delete_after_verify,
+                manager_owned=True,
             )
-            manifest_path = os.path.join(self.experiment_path, "upload_manifest.jsonl")
-            self._upload_worker = UploadWorker(
-                target=self._upload_target, manifest_path=manifest_path
+            from uuid import uuid4
+            from control.core.upload_manager_client import UploadManagerClient
+
+            dataset_id = str(uuid4())
+            UploadManagerClient().register_dataset(
+                dataset_id=dataset_id,
+                name=os.path.basename(os.path.normpath(self.experiment_path)),
+                local_root=self.experiment_path,
+                remote_root=remote_experiment_root,
+                delete_after_verify=self._upload_target.delete_after_verify,
+                deletion_mode="individual",
             )
-            self._upload_worker.start()
+            self._upload_target.manager_dataset_id = dataset_id
             self._log.info(
-                f"Started UploadWorker (pid={self._upload_worker.pid}) "
+                f"Registered persistent upload dataset {dataset_id} "
                 f"-> {self._upload_target.remote_root}, "
                 f"delete_after_verify={self._upload_target.delete_after_verify}"
             )
             # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
             # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
             # run has len(array_keys) raw plates, and postprocessing adds one per
-            # derived output. Seeding to bare FOV count made _maybe_batched_delete
+            # derived output. Seeding to bare FOV count made the per-timepoint tally
             # fire after only 1/N barriers for ragged/postprocess runs (deletion
             # would then never reclaim later shards). Count keys per FOV per region.
             barriers_per_tp = 0
@@ -1192,9 +1731,13 @@ class MultiPointWorker:
                     needs_upload = job_class in (SaveZarrJob, PostprocessJob)
                     runner_upload_target = self._upload_target if needs_upload else None
                     runner_upload_queue = upload_queue_for_zarr_runner if needs_upload else None
+                    runner_upload_counter = (
+                        self._upload_worker.tasks_submitted_value
+                        if needs_upload and self._upload_worker is not None
+                        else None
+                    )
                     job_runner = control.core.job_processing.JobRunner(
                         self.acquisition_info,
-                        cleanup_stale_ome_files=use_ome_tiff,
                         log_file_path=log_file_path,
                         # Pass backpressure shared values for cross-process tracking
                         bp_pending_jobs=self._backpressure.pending_jobs_value,
@@ -1204,6 +1747,7 @@ class MultiPointWorker:
                         zarr_writer_info=zarr_writer_info,
                         upload_target=runner_upload_target,
                         upload_input_queue=runner_upload_queue,
+                        upload_tasks_submitted=runner_upload_counter,
                     )
                     job_runner.start()
                     # Subprocess starts warming up in background - don't block here
@@ -1590,26 +2134,33 @@ class MultiPointWorker:
             start_time = time.perf_counter_ns()
             # Force a clean stop→start so any streaming state left by live mode (queued
             # frames, stale trigger config) is discarded before acquisition begins.
-            self.camera.stop_streaming()
-            # One-time apply of the first observation state's camera_live snapshot
-            # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
-            # stopped — Tucsen camera mode switches while streaming have caused
-            # issues. Per-FOV applies skip this block (apply_camera_live_snapshot=
-            # False below); without this seed, streaming would start in whatever
-            # mode live mode left the camera in.
-            self._seed_camera_for_first_observation_state()
-            self.camera.start_streaming()
-            # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
-            this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
-            # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
-            # soon as raw bytes arrive, before decode. Snapshots capture_info
-            # and signals _ready_for_next_trigger so the worker can issue the
-            # next trigger in parallel with the still-running decode. Cameras
-            # without this API fall back to the synchronous path inside
-            # _image_callback.
-            self._use_deferred_decode_callback = hasattr(self.camera, "add_frame_arrived_callback")
-            if self._use_deferred_decode_callback:
-                self.camera.add_frame_arrived_callback(self._on_frame_arrived)
+            if not self.validation_mode:
+                self.camera.stop_streaming()
+                # One-time apply of the first observation state's camera_live snapshot
+                # (ROI, binning, camera_mode, pixel_format, trigger) while streaming is
+                # stopped — Tucsen camera mode switches while streaming have caused
+                # issues. Per-FOV applies skip this block (apply_camera_live_snapshot=
+                # False below); without this seed, streaming would start in whatever
+                # mode live mode left the camera in.
+                self._seed_camera_for_first_observation_state()
+                self.camera.start_streaming()
+                # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
+                this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
+                # Deferred-decode cameras (Tucsen SDK-callback path) fire this as
+                # soon as raw bytes arrive, before decode. Snapshots capture_info
+                # and signals _ready_for_next_trigger so the worker can issue the
+                # next trigger in parallel with the still-running decode. Cameras
+                # without this API fall back to the synchronous path inside
+                # _image_callback.
+                # Check the class, not the instance: SimulatedCamera's __getattr__ shim
+                # fabricates a truthy placeholder for any unknown *public* attribute
+                # (so unimplemented SDK methods can be called harmlessly), which makes
+                # instance-level hasattr() always True even though it doesn't actually
+                # support the deferred-decode callback. Checking the type bypasses that
+                # shim and reflects whether the method is genuinely implemented.
+                self._use_deferred_decode_callback = hasattr(type(self.camera), "add_frame_arrived_callback")
+                if self._use_deferred_decode_callback:
+                    self.camera.add_frame_arrived_callback(self._on_frame_arrived)
             sleep_time = min(self.dt / 20.0, 0.5)
 
             # Send Slack acquisition start notification
@@ -1647,7 +2198,16 @@ class MultiPointWorker:
                 finally:
                     self.laser_auto_focus_controller._timing = saved_af_timing
 
-            while self.time_point < self.Nt:
+            ordered_run = (
+                self._explicit_acquisition_order and not self.validation_mode
+                and (self.acquisition_order != DEFAULT_ORDER or self.snake_observation_states)
+            )
+            if ordered_run:
+                self.run_ordered_acquisition()
+                if not self.abort_requested_fn():
+                    self.time_point = self.Nt
+
+            while not ordered_run and self.time_point < self.Nt:
                 # check if abort acquisition has been requested
                 if self.abort_requested_fn():
                     self._log.debug("In run, abort_acquisition_requested=True")
@@ -1663,9 +2223,11 @@ class MultiPointWorker:
                         self._log.debug("Abort requested after fluidics, skipping imaging")
                         break
 
+                cam_drops_before = self._camera_dropped_frame_count()
                 with self._timing.get_timer("run_single_time_point"):
                     self.timestamp_prev_timepoint_started = time.time()
                     self.run_single_time_point()
+                self._report_timepoint_frame_drops(cam_drops_before)
 
                 if self.fluidics and self.use_fluidics:
                     # For MERFISH, after imaging, run the following 2 sequences (Cleavage buffer, SSC rinse)
@@ -1707,6 +2269,18 @@ class MultiPointWorker:
             # Since we use callback based acquisition, make sure to wait for any final images to come in
             self._wait_for_outstanding_callback_images()
             self._log.info(f"Time taken for acquisition/processing: {(time.perf_counter_ns() - start_time) / 1e9} [s]")
+        except CameraTimeoutError as ce:
+            # A camera SDK control call wedged in native code (unrecoverable — the
+            # watchdog cannot cancel a blocked ctypes call). Abort cleanly so the
+            # store is finalized and the operator is alerted, instead of the
+            # historical failure mode: the worker frozen mid-frame for days until a
+            # manual kill, leaving the run unfinalized. Data through the last
+            # committed frame is already saved (shard-per-z commits during capture).
+            self._log.error(
+                f"Camera SDK wedged during acquisition ({ce}); aborting and finalizing. "
+                f"Frames captured so far are saved; restart the app to recover the camera."
+            )
+            self.request_abort_fn()
         except TimeoutError as te:
             origin = None
             tb = te.__traceback__
@@ -1744,8 +2318,17 @@ class MultiPointWorker:
             if laser_af is not None:
                 laser_af._timing = None
             if this_image_callback_id:
-                self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
-                self.camera.remove_frame_callback(this_image_callback_id)
+                # Guard each SDK call: a raising/wedging camera teardown here
+                # used to skip _finish_jobs entirely — no writer finalize, no
+                # upload-drainer handoff, GUI stuck "Finalizing…".
+                try:
+                    self.camera.stop_streaming()  # Stop streaming to prevent any more frames from coming in after we remove the callback
+                except Exception:
+                    self._log.exception("camera.stop_streaming failed at end of acquisition")
+                try:
+                    self.camera.remove_frame_callback(this_image_callback_id)
+                except Exception:
+                    self._log.exception("camera.remove_frame_callback failed at end of acquisition")
 
             self._finish_jobs()
 
@@ -1767,17 +2350,46 @@ class MultiPointWorker:
             self.callbacks.signal_acquisition_finished()
 
     def _wait_for_outstanding_callback_images(self):
-        # If there are outstanding frames, wait for them to come in.
-        self._log.info("Waiting for any outstanding frames.")
-        if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-            self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
+        # If there are outstanding frames, wait for them to come in.  Except when the
+        # abort was itself caused by a frame that never arrived: that frame is not
+        # late, it does not exist, and blocking another _frame_wait_timeout_s() on it
+        # only delays teardown.  The normal-completion path is untouched — the flag is
+        # only ever set by a frame-timeout abort.
+        if self._aborted_on_frame_timeout:
+            self._log.info(
+                "Skipping the outstanding-frame wait: the acquisition was aborted by a frame "
+                "timeout, so the triggered frame is never going to arrive."
+            )
+        else:
+            self._log.info("Waiting for any outstanding frames.")
+            if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
+                self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
 
+        # In-flight image callbacks are real work on frames that DID arrive, so this
+        # wait stands either way.
         if not self._image_callback_idle.wait(self._frame_wait_timeout_s()):
             self._log.warning("Timed out waiting for the last image to process!")
 
         # No matter what, set the flags so things can continue
         self._ready_for_next_trigger.set()
         self._image_callback_idle.set()
+
+    def _wait_for_dispatched_frames(self, region_id, fov):
+        """Block until every in-flight image callback has dispatched its jobs.
+
+        Mid-acquisition counterpart to :meth:`_wait_for_outstanding_callback_images`,
+        which force-sets the flags afterwards — correct at end of acquisition,
+        but here it would mask a frame that is genuinely still outstanding.
+        Timing out is not destructive: the writer holds an incomplete z-slice
+        until its last channel lands, so the only cost is that this FOV's
+        shards stage at a later barrier.
+        """
+        if not self._image_callback_idle.wait(self._frame_wait_timeout_s()):
+            self._log.warning(
+                f"Timed out waiting for image callbacks to dispatch before the upload "
+                f"barrier at region={region_id} fov={fov}; this FOV's shards will stage "
+                f"at a later barrier."
+            )
 
     def _finish_jobs(self, timeout_s=10):
         # Drain and summarize all currently available job results before waiting for completion
@@ -1837,9 +2449,9 @@ class MultiPointWorker:
         #    from blocking acquisition completion
         log = self._log  # Capture for closure
 
-        def shutdown_runner(job_runner, timeout):
+        def shutdown_runner(job_runner, timeout, close_output_queue=True):
             try:
-                job_runner.shutdown(timeout)
+                job_runner.shutdown(timeout, close_output_queue=close_output_queue)
             except Exception as e:
                 log.error(f"Error shutting down job runner in background: {e}")
 
@@ -1848,14 +2460,26 @@ class MultiPointWorker:
         # leftover of the short drain timeout above. ``shutdown()`` sends the
         # stop sentinel and then ``join()``s for this long before resorting to
         # terminate(), which is exactly the window the subprocess needs to run
-        # ``finalize_all_writers()`` (the large level-0 shard commit). Because
+        # its remaining queued jobs plus ``finalize_all_writers()``. Because
         # this runs in a daemon thread, the long budget does not block the
         # controller or the next acquisition.
+        #
+        # Upload-enabled runners keep their output queues OPEN
+        # (close_output_queue=False): BarrierResults keep arriving on them for
+        # the whole background shutdown, and the upload drainer — not this
+        # method's final drain — is what consumes those. The drainer owns
+        # closing the queues when it finishes.
+        upload_runner_queues = []
+        runners_exited_event = threading.Event()
         shutdown_threads = []
         for job_class, job_runner in active_runners:
+            keep_queue_open = job_runner.has_upload_pipeline()
+            if keep_queue_open:
+                upload_runner_queues.append(job_runner.output_queue())
             t = threading.Thread(
                 target=shutdown_runner,
                 args=(job_runner, JOB_RUNNER_FINALIZE_TIMEOUT_S),
+                kwargs={"close_output_queue": not keep_queue_open},
                 daemon=True,
             )
             t.start()
@@ -1873,6 +2497,67 @@ class MultiPointWorker:
         def _announce_writeback_complete(threads):
             for th in threads:
                 th.join()
+            # The upload drainer waits on this before its "post-finalize"
+            # metadata resync — only now is every zarr.json actually final.
+            runners_exited_event.set()
+            if self._upload_target is not None and self._upload_target.manager_owned:
+                try:
+                    from control.core.upload_manager_client import UploadManagerClient
+                    from control.core.zarr_upload import collect_sidecar_files
+                    from control.core.zarr_layout import array_chunk_path
+                    from uuid import uuid4
+
+                    final_paths = set(
+                        collect_sidecar_files(
+                            self.experiment_path,
+                            {
+                                "upload_manifest.jsonl",
+                                "upload_manifest_backfill.jsonl",
+                                "RAW_DATA_UPLOADED.txt",
+                                "UPLOAD_INCOMPLETE.txt",
+                            },
+                        )
+                    )
+                    # Include every level of zarr hierarchy, including plate,
+                    # row, well, ragged, and derived-output metadata that is
+                    # outside any per-FOV writer's metadata_paths().
+                    for root, _dirs, files in os.walk(self.experiment_path):
+                        if "zarr.json" in files:
+                            final_paths.add(os.path.join(root, "zarr.json"))
+                        if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                            chunk = str(array_chunk_path(root, (0, 0, 0)))
+                            if os.path.isfile(chunk):
+                                final_paths.add(chunk)
+                    final_files = []
+                    for local_path in sorted(final_paths):
+                        stat = os.stat(local_path)
+                        final_files.append(
+                            {
+                                "relative_path": os.path.relpath(
+                                    local_path, self.experiment_path
+                                ).replace("\\", "/"),
+                                "size": stat.st_size,
+                                "generation": f"final:{stat.st_mtime_ns}:{stat.st_size}",
+                                "deletable": False,
+                                "stable_read": True,
+                            }
+                        )
+                    client = UploadManagerClient()
+                    if final_files:
+                        final_batch = f"final-sidecars-{uuid4()}"
+                        client.submit_batch(
+                            self._upload_target.manager_dataset_id,
+                            final_batch,
+                            final_files,
+                            task_id=final_batch,
+                        )
+                    seal_status = "aborted" if self.abort_requested_fn() else "complete"
+                    client.seal_dataset(
+                        self._upload_target.manager_dataset_id, seal_status
+                    )
+                    log.info("Persistent upload dataset sealed (%s).", seal_status)
+                except Exception:
+                    log.exception("Could not seal persistent upload dataset")
             try:
                 signal_writing_complete()
             except Exception as e:
@@ -1896,7 +2581,9 @@ class MultiPointWorker:
         # the worker makes byte-progress (heartbeat advances); it only gives up
         # after this many seconds of a genuinely wedged worker.
         self._spawn_background_upload_drainer(
-            stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S
+            stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S,
+            runner_output_queues=upload_runner_queues,
+            runners_done_event=runners_exited_event,
         )
 
         # Release backpressure resources now that all jobs are complete
@@ -1905,91 +2592,12 @@ class MultiPointWorker:
         except Exception as e:
             self._log.error(f"Error closing backpressure controller: {e}")
 
-    def _enqueue_post_finalize_metadata_resync(self) -> None:
-        """Submit one fresh metadata-only upload per FOV after writer finalize.
-
-        Called from ``_drain_upload_worker_on_shutdown`` immediately after
-        the JobRunner subprocess has exited (which is when
-        ``finalize_all_writers()`` ran and rewrote each FOV's group
-        ``zarr.json`` with ``_squid.acquisition_complete = True``). At this
-        point the local writer is gone, so every metadata file is stable
-        and can be uploaded without racing the writer. This guarantees the
-        remote ends up reflecting the finalized state even if the last live
-        barrier raced finalize.
-        """
-        if self._upload_worker is None or self._zarr_writer_info is None:
-            return
-        if self._upload_target is None or not self._upload_target.enabled:
-            return
-        # Build metadata path enumeration locally — we don't have a writer
-        # instance any more (the subprocess is gone). Recompute the same
-        # candidate set ``ZarrWriter.metadata_paths`` would have returned.
-        info = self._zarr_writer_info
-        submitted = 0
-        for region_id, fov_count in info.region_fov_counts.items():
-            for fov in range(fov_count):
-                group_dir = info.get_group_path(region_id, fov)
-                if not os.path.isdir(group_dir):
-                    continue
-                candidates: List[str] = []
-                gj = os.path.join(group_dir, "zarr.json")
-                if os.path.isfile(gj):
-                    candidates.append(gj)
-                # Level zarr.jsons — discover by directory presence rather
-                # than guessing pyramid depth.
-                for entry in sorted(os.listdir(group_dir)):
-                    if entry.isdigit():
-                        lj = os.path.join(group_dir, entry, "zarr.json")
-                        if os.path.isfile(lj):
-                            candidates.append(lj)
-                ft_dir = os.path.join(group_dir, "frame_times")
-                if os.path.isdir(ft_dir):
-                    ftj = os.path.join(ft_dir, "zarr.json")
-                    if os.path.isfile(ftj):
-                        candidates.append(ftj)
-                    ft_chunk = os.path.join(ft_dir, "c", "0", "0", "0")
-                    if os.path.isfile(ft_chunk):
-                        candidates.append(ft_chunk)
-                if not candidates:
-                    continue
-                files = [
-                    (
-                        local,
-                        local_to_remote_path(
-                            local,
-                            self._upload_target.local_base,
-                            self._upload_target.remote_root,
-                        ),
-                    )
-                    for local in candidates
-                ]
-                from uuid import uuid4
-                task = UploadTask(
-                    task_id=str(uuid4()),
-                    time_point=-1,  # sentinel: post-finalize metadata resync
-                    region_id=str(region_id),
-                    fov=fov,
-                    files=files,
-                    deletable_local_paths=set(),  # never delete metadata locally
-                    # ``stable_read`` is irrelevant now (no writer is active),
-                    # but harmless and matches the live barriers' metadata
-                    # behavior so manifest records are consistent.
-                    stable_read_paths=set(candidates),
-                )
-                self._upload_worker.submit(task)
-                # Account for it in the per-timepoint tally under the
-                # sentinel key -1 so the drain loop can wait for it too.
-                self._upload_tasks_by_tp.setdefault(-1, set()).add(task.task_id)
-                self._upload_expected_count_by_tp[-1] = (
-                    self._upload_expected_count_by_tp.get(-1, 0) + 1
-                )
-                submitted += 1
-        if submitted:
-            self._log.info(
-                f"Submitted {submitted} post-finalize metadata resync task(s)"
-            )
-
-    def _spawn_background_upload_drainer(self, stall_window_s: float) -> None:
+    def _spawn_background_upload_drainer(
+        self,
+        stall_window_s: float,
+        runner_output_queues: Optional[List] = None,
+        runners_done_event: Optional[threading.Event] = None,
+    ) -> None:
         """Detach the UploadWorker drain to a background thread.
 
         The thread takes over ownership of:
@@ -2018,12 +2626,19 @@ class MultiPointWorker:
             expected_by_tp=self._upload_expected_count_by_tp,
             deletion_done=self._upload_deletion_done,
             failed_tasks=self._upload_failed_tasks,
+            completed_task_ids=self._upload_completed_task_ids,
+            results_received=self._upload_results_received,
             zarr_writer_info=self._zarr_writer_info,
             experiment_path=self.experiment_path,
-            metadata_paths_builder=self._collect_metadata_paths_for_fov,
+            runner_output_queues=runner_output_queues,
+            runners_done_event=runners_done_event,
             stall_window_s=stall_window_s,
+            failed_deletions=self._upload_failed_deletions,
         )
         register_active_upload_drainer(drainer)
+        # The drainer's force_stop path now covers the worker; drop it from
+        # the pre-drainer orphan registry.
+        unregister_live_upload_worker(self._upload_worker)
         drainer.start()
         active = active_upload_drainer_count()
         self._log.info(
@@ -2042,46 +2657,8 @@ class MultiPointWorker:
         self._upload_expected_count_by_tp = {}
         self._upload_deletion_done = set()
         self._upload_failed_tasks = []
-
-    def _collect_metadata_paths_for_fov(
-        self, region_id: str, fov: int
-    ) -> List[str]:
-        """Enumerate the same shared-metadata files
-        ``ZarrWriter.metadata_paths`` would return for one (region, fov).
-
-        Kept as a method so the background drainer can call it after the
-        JobRunner subprocess (and its in-memory writer instances) is gone.
-
-        KNOWN GAP: resolves the group path with ``array_key=None``, so only the
-        dense store is resynced. A ragged/derived run's final ``zarr.json``
-        (carrying ``acquisition_complete=true``) and last ``frame_times`` chunk
-        are not re-pushed — the shard data is complete on the remote (the
-        per-FOV barriers do iterate every ``array_key``), but the remote
-        completion flag stays false. See docs/zarr-network-streaming.md.
-        """
-        if self._zarr_writer_info is None:
-            return []
-        group_dir = self._zarr_writer_info.get_group_path(region_id, fov)
-        if not os.path.isdir(group_dir):
-            return []
-        out: List[str] = []
-        gj = os.path.join(group_dir, "zarr.json")
-        if os.path.isfile(gj):
-            out.append(gj)
-        for entry in sorted(os.listdir(group_dir)):
-            if entry.isdigit():
-                lj = os.path.join(group_dir, entry, "zarr.json")
-                if os.path.isfile(lj):
-                    out.append(lj)
-        ft_dir = os.path.join(group_dir, "frame_times")
-        if os.path.isdir(ft_dir):
-            ftj = os.path.join(ft_dir, "zarr.json")
-            if os.path.isfile(ftj):
-                out.append(ftj)
-            ft_chunk = os.path.join(ft_dir, "c", "0", "0", "0")
-            if os.path.isfile(ft_chunk):
-                out.append(ft_chunk)
-        return out
+        self._upload_completed_task_ids = set()
+        self._upload_results_received = 0
 
     def wait_till_operation_is_completed(self):
         self.microcontroller.wait_till_operation_is_completed()
@@ -2094,19 +2671,33 @@ class MultiPointWorker:
             self._timepoint_fov_count = 0
             self._laser_af_successes = 0
             self._laser_af_failures = 0
+            # Force a region entry (anchor refresh) at the first FOV of every
+            # timepoint. Without this, a run whose first region equals the
+            # previous timepoint's last region — always true single-region —
+            # keeps its anchor across timepoints indefinitely.
+            self._last_region_id = None
+            # Restart the contrast-AF cadence at the first FOV each timepoint.
+            # This repeats the same FOV selection; it does not rotate coverage.
+            self.af_fov_count = 0
+            self._restore_ordered_timepoint()
             self.microcontroller.enable_joystick(False)
 
             self._log.info("multipoint acquisition - time point " + str(self.time_point + 1))
 
             # Notify listeners (napari views flush their per-timepoint caches on
             # this signal so peak RAM tracks a single timepoint, not the whole run).
-            self.callbacks.signal_new_time_point(self.time_point)
+            if (getattr(self, "_ordered_visit", None) is None
+                    or getattr(self, "_ordered_display_timepoint", None) != self.time_point):
+                self.callbacks.signal_new_time_point(self.time_point)
+                self._ordered_display_timepoint = self.time_point
 
             # For each time point, create a per-timepoint folder *only if* something
-            # actually lands in it. ZARR_V3 streams images to its own per-FOV trees and
-            # consolidates the per-frame timing CSV at the experiment root, so the
-            # timepoint folder is otherwise empty in the common case. We still create
-            # it when downsampled views or laser-AF characterization debug images need it.
+            # actually lands in it. OME_TIFF writes one multi-series file per region
+            # under ome_tiff/ and ZARR_V3 streams images to its own per-FOV trees; both
+            # consolidate their per-frame timing CSV and their measured positions at the
+            # experiment root, so the timepoint folder is otherwise empty. We still
+            # create it when downsampled views or laser-AF characterization debug images
+            # need it.
             with self._timing.get_timer("create_new_timepoint"):
                 if self.experiment_path:
                     utils.ensure_directory_exists(str(self.experiment_path))
@@ -2120,10 +2711,7 @@ class MultiPointWorker:
 
                 # Write acquisition metadata sidecar for individual TIFF saving modes.
                 # This makes per-timepoint folders self-describing without parsing filenames.
-                if (
-                    not self.skip_saving
-                    and self.file_saving_option in (FileSavingOption.INDIVIDUAL_IMAGES, FileSavingOption.MULTI_PAGE_TIFF)
-                ):
+                if not self.skip_saving and self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
                     metadata_path = os.path.join(current_path, "metadata.json")
                     if not os.path.exists(metadata_path):
                         sidecar = {
@@ -2143,19 +2731,23 @@ class MultiPointWorker:
                             self._log.warning(f"Failed to write metadata sidecar: {e}")
             # create a dataframe to save coordinates
             with self._timing.get_timer("initialize_coordinates_dataframe"):
-                self.initialize_coordinates_dataframe()
+                if getattr(self, "_ordered_visit", None) is None:
+                    self.initialize_coordinates_dataframe()
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                if self.NZ > 1:
+                if self.NZ > 1 and not self.validation_mode:
                     self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
                 self.run_coordinate_acquisition(current_path)
+            if getattr(self, "_ordered_visit", None) is not None:
+                self._wait_for_outstanding_callback_images()
 
             # Save plate view for this timepoint
             with self._timing.get_timer("save_plate_view"):
-                if self._generate_downsampled_views and self._downsampled_view_manager is not None:
+                if (self._generate_downsampled_views and self._downsampled_view_manager is not None
+                        and getattr(self, "_ordered_final_timepoint", True)):
                     # Wait for pending downsampled view jobs to complete
                     self._wait_for_downsampled_view_jobs()
                     # Save plate view
@@ -2166,16 +2758,13 @@ class MultiPointWorker:
                     # Clear plate view for next timepoint
                     self._downsampled_view_manager.clear()
 
-            # finished region scan. Skip the per-timepoint coordinates.csv for ZARR_V3,
-            # since the controller already wrote {exp}/coordinates.csv with the same data.
-            if self.file_saving_option != FileSavingOption.ZARR_V3:
-                with self._timing.get_timer("save_coordinates_csv"):
-                    self.coordinates_pd.to_csv(
-                        os.path.join(current_path, "coordinates.csv"), index=False, header=True
-                    )
+            # finished region scan - persist the positions we actually visited.
+            with self._timing.get_timer("save_coordinates_csv"):
+                self._write_timepoint_coordinates_csv(current_path)
+                self._append_acquired_positions_csv()
 
             # Send Slack timepoint notification via callback (allows main thread to capture screenshot)
-            if self._slack_notifier is not None:
+            if self._slack_notifier is not None and getattr(self, "_ordered_final_timepoint", True):
                 try:
                     elapsed = time.time() - self.timestamp_acquisition_started
                     timepoint_duration = time.time() - self._timepoint_start_time
@@ -2200,7 +2789,8 @@ class MultiPointWorker:
             # Per-timepoint .done marker only when we actually have a per-timepoint folder.
             # Acquisition-level completion is marked separately at experiment root by the
             # controller in _restore_state_after_acquisition.
-            if self._wrote_per_timepoint_folder:
+            if (self._wrote_per_timepoint_folder and getattr(self, "_ordered_final_timepoint", True)
+                    and not self.abort_requested_fn()):
                 utils.create_done_file(current_path)
             self._log.debug(f"Single time point took: {time.time() - start} [s]")
         finally:
@@ -2221,19 +2811,17 @@ class MultiPointWorker:
     def _needs_per_timepoint_folder(self) -> bool:
         """True when something will write into ``{exp}/{timepoint}/``.
 
-        ZARR_V3 alone does not — its image data lives under ``plate.ome.zarr``
-        / ``zarr/`` and the per-frame CSV is consolidated at the experiment root.
-        We keep the folder when:
+        Only the per-frame TIFF modes put images there. OME_TIFF's image data
+        lives in ``ome_tiff/{region}.ome.tiff`` and ZARR_V3's under
+        ``plate.ome.zarr`` / ``zarr/``; both consolidate their per-frame timing
+        CSV and their measured positions at the experiment root. We keep the
+        folder when:
 
-        * skip_saving is off and we're using a TIFF mode (images land here)
+        * skip_saving is off and images land here (INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF)
         * downsampled views are enabled (``plate_<r>um.tiff`` lands here per timepoint)
         * laser-AF characterization mode is on (debug bmps land here)
         """
-        if self.skip_saving:
-            tiff_mode_writes = False
-        else:
-            tiff_mode_writes = self.file_saving_option != FileSavingOption.ZARR_V3
-        if tiff_mode_writes:
+        if not self.skip_saving and self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
             return True
         if self._generate_downsampled_views:
             return True
@@ -2256,8 +2844,16 @@ class MultiPointWorker:
 
     def initialize_coordinates_dataframe(self):
         self._coordinate_rows: list[dict] = []
+        self._acquired_positions_appended = False
+        self._acquired_positions_row_count = 0
+        self._ordered_recorded_coordinates = set()
 
     def update_coordinates_dataframe(self, region_id, z_level, pos: squid.abc.Pos, fov=None):
+        if getattr(self, "_ordered_visit", None) is not None:
+            key = (region_id, fov, z_level)
+            if key in self._ordered_recorded_coordinates:
+                return
+            self._ordered_recorded_coordinates.add(key)
         row = {
             "region": region_id,
             "fov": fov,
@@ -2275,6 +2871,51 @@ class MultiPointWorker:
     def coordinates_pd(self) -> pd.DataFrame:
         return pd.DataFrame(self._coordinate_rows)
 
+    def _write_timepoint_coordinates_csv(self, current_path):
+        """Write ``{exp}/{timepoint}/coordinates.csv`` for the per-frame TIFF modes.
+
+        Only INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF have a per-timepoint folder to
+        put it in; the other modes accumulate the same measurements in the root
+        ``acquired_positions.csv`` instead.
+        """
+        if self.file_saving_option not in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
+            return
+        self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+
+    def _append_acquired_positions_csv(self):
+        """Append this timepoint's MEASURED positions to ``{exp}/acquired_positions.csv``.
+
+        For OME_TIFF / ZARR_V3 only — the modes without a per-timepoint folder.
+        One file for the whole run, header written once, with a leading
+        ``time_point`` column in front of the per-z measurement columns. This is
+        not a copy of the root ``coordinates.csv``: that one holds the PLANNED
+        region/x/y/z grid the controller writes before the run, this one holds
+        where the stage actually was, per z level, with a timestamp.
+        """
+        if self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
+            return
+        # An abort unwinds through here after the per-position writes have
+        # already run, so guard against appending the same rows twice.
+        ordered = getattr(self, "_ordered_visit", None) is not None
+        if self._acquired_positions_appended and not ordered:
+            return
+        df = self.coordinates_pd
+        if ordered:
+            df = df.iloc[self._acquired_positions_row_count:]
+        if df.empty or not self.experiment_path:
+            return
+        df = df.copy()
+        df.insert(0, "time_point", self.time_point)
+        path = os.path.join(self.experiment_path, ACQUIRED_POSITIONS_FILENAME)
+        try:
+            write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+            df.to_csv(path, mode="a", index=False, header=write_header)
+        except OSError as e:
+            self._log.warning(f"Failed to append measured positions to {path}: {e}")
+        else:
+            self._acquired_positions_appended = True
+            self._acquired_positions_row_count = len(self._coordinate_rows)
+
     def move_to_coordinate(self, coordinate_mm, region_id, fov):
         curr_pos = self.stage.get_pos()
         x_mm = coordinate_mm[0]
@@ -2291,20 +2932,24 @@ class MultiPointWorker:
         else:
             self._log.debug(f"moving to coordinate {coordinate_mm}")
 
-        # Pick the Z source. On subsequent timepoints with AF enabled, prefer
-        # the focused Z cached from the previous timepoint over the
-        # coordinate's nominal Z. The X/Y move below must still run — only
-        # the Z source changes here.
-        if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
-            if (region_id, fov) in self._z_pos_proposal:
-                last_z_mm = self._z_pos_proposal[(region_id, fov)]
-                self.move_to_z_level(last_z_mm, blocking=False)
-                self._log.debug(f"Moved to last z position {last_z_mm} [mm]")
-            else:
-                self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
+        # Pick the Z source. With AF enabled, prefer the per-FOV focused-Z
+        # proposal (seeded by the pre-acquisition scan, so valid at t=0 too,
+        # and re-seated after every successful refresh) over the coordinate's
+        # nominal Z. The X/Y move below must still run — only the Z source
+        # changes here.
+        z_target_mm = None
+        if (self.do_reflection_af or self.do_autofocus) and (region_id, fov) in self._z_pos_proposal:
+            z_target_mm = self._z_pos_proposal[(region_id, fov)]
         elif len(coordinate_mm) == 3:
-            z_mm = coordinate_mm[2]
-            self.move_to_z_level(z_mm, blocking=False)
+            if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
+                self._log.warning(
+                    f"No last z position found for region {region_id}, fov {fov}; using nominal z"
+                )
+            z_target_mm = coordinate_mm[2]
+        elif (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
+            self._log.warning(f"No last z position found for region {region_id}, fov {fov}")
+
+        retract = self._should_retract_z_for_move(region_id, fov)
 
         # Blocking-longer-axis move. Shorter axis fires non-blocking; the
         # longer axis blocks until motion is complete. Stabilization sleep
@@ -2312,14 +2957,53 @@ class MultiPointWorker:
         # there is no benefit to deferring the sleep — see the
         # _pending_move_settle scaffolding in __init__ for the future async
         # path that _wait_for_move_settled will unlock).
-        if delta_x > delta_y:
-            self.stage.move_y_to(y_mm, blocking=False)
-            self.stage.move_x_to(x_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+        def _xy_move():
+            if delta_x > delta_y:
+                self.stage.move_y_to(y_mm, blocking=False)
+                self.stage.move_x_to(x_mm)
+                self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+            else:
+                self.stage.move_x_to(x_mm, blocking=False)
+                self.stage.move_y_to(y_mm)
+                self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+
+        if retract:
+            # The bracket (module-level guard on real XY travel, retract,
+            # XY, restore) lives in squid.stage.utils; the target Z is still
+            # whatever the AF cache / coordinate picked above, falling back
+            # to the current Z when neither names one.
+            move_xy_with_z_retract(
+                self.stage,
+                x_mm,
+                y_mm,
+                retract=True,
+                z_target_mm=z_target_mm,
+                home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                xy_move=_xy_move,
+                log=self._log,
+            )
         else:
-            self.stage.move_x_to(x_mm, blocking=False)
-            self.stage.move_y_to(y_mm)
-            self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+            if z_target_mm is not None:
+                self.move_to_z_level(z_target_mm, blocking=False)
+                self._log.debug(f"Moved to z position {z_target_mm} [mm]")
+            _xy_move()
+
+        self._last_move_region_id = region_id
+
+    def _should_retract_z_for_move(self, region_id, fov) -> bool:
+        """Does this move need the Z retract bracket?
+
+        Only moves that enter a region do: the first FOV of a region (``fov ==
+        0``, which is the first entry in the region's already-snaked coordinate
+        list), any move that lands in a different region than the last one,
+        and -- because ``_last_move_region_id`` starts as ``None`` -- the first
+        move of the run. Steps across a region's own Nx x Ny grid keep today's
+        behaviour. Whether the resulting XY travel is actually large enough to
+        bother retracting for is decided by ``move_xy_with_z_retract`` itself.
+        """
+        if not self.retract_z_between_regions:
+            return False
+        return fov == 0 or region_id != self._last_move_region_id
 
     def _wait_for_move_settled(self, timeout_s: float = 30.0) -> None:
         """Join the in-flight stage motion issued by move_to_coordinate and
@@ -2401,25 +3085,127 @@ class MultiPointWorker:
             return
         for result in results:
             tp = result.time_point
+            self._upload_results_received += 1
+            # Remember completion by task_id: if the matching BarrierResult
+            # has not been consumed yet (independent queues, different drain
+            # rates), _handle_barrier_result must NOT re-register this task —
+            # nothing would ever discard it again and the end-of-run drain
+            # would wait on a phantom.
+            self._upload_completed_task_ids.add(result.task_id)
             self._upload_tasks_by_tp.get(tp, set()).discard(result.task_id)
             self._upload_results_by_tp.setdefault(tp, []).append(result)
             if not result.success:
                 self._upload_failed_tasks.append(result)
                 self._log.warning(
                     f"Upload task {result.task_id} for t={tp} fov={result.fov} "
-                    f"failed: {result.error}"
+                    f"failed: {format_upload_failure(result)}"
                 )
-            self._maybe_batched_delete(tp)
+            self._delete_verified_result_files(result)
+            self._maybe_prune_timepoint(tp)
+        self._maybe_warn_upload_health()
 
-    def _maybe_batched_delete(self, time_point: int) -> None:
-        """If every FOV in ``time_point`` has uploaded successfully, delete
-        the local shard files for that timepoint in one batch.
+    # Mid-run upload supervision (previously the heartbeat had no consumer
+    # until the end-of-run drainer): throttled check that the worker process
+    # is alive and not silently drowning. Log + Slack only — the acquisition
+    # itself deliberately never blocks on upload state.
+    _UPLOAD_HEALTH_CHECK_INTERVAL_S = 60.0
+    _UPLOAD_HEALTH_WARN_INTERVAL_S = 300.0
+    _UPLOAD_BACKLOG_WARN_TASKS = 100
 
-        We require *all* expected FOVs to be present (so a partial timepoint
-        with one failure does not silently drop the remainder), *and* every
-        result to be ``success=True``. A single failure defers deletion for
-        that timepoint until either a retry succeeds or the user intervenes.
+    def _maybe_warn_upload_health(self) -> None:
+        if self._upload_worker is None:
+            return
+        now = time.time()
+        if now - self._upload_health_last_check < self._UPLOAD_HEALTH_CHECK_INTERVAL_S:
+            return
+        self._upload_health_last_check = now
+        problems = []
+        try:
+            if not self._upload_worker.is_alive():
+                problems.append("UploadWorker process is not alive")
+        except Exception:
+            return
+        backlog = max(
+            0, self._upload_worker.tasks_submitted - self._upload_results_received
+        )
+        if backlog >= self._UPLOAD_BACKLOG_WARN_TASKS:
+            problems.append(
+                f"upload backlog is {backlog} task(s) — the share is slower than "
+                f"the acquisition writes; local disk keeps filling until it catches up"
+            )
+        hb = float(self._upload_worker.heartbeat or 0.0)
+        if backlog and hb and now - hb > UPLOAD_DRAINER_STALL_WINDOW_S:
+            problems.append(
+                f"no upload progress for {int(now - hb)}s with {backlog} task(s) queued"
+            )
+        if self._upload_failed_tasks:
+            problems.append(f"{len(self._upload_failed_tasks)} upload task(s) failed so far")
+        # Low-disk early warning: streaming is supposed to keep local usage
+        # bounded, so shrinking headroom means uploads/deletion are falling
+        # behind the writer. Threshold = 2 timepoints of estimated data (or
+        # 20 GB when no estimate is available).
+        try:
+            free = utils.get_available_disk_space(self.base_path)
+        except Exception:
+            free = None
+        if free is not None:
+            floor = (
+                2.0 * self._upload_est_tp_bytes
+                if self._upload_est_tp_bytes > 0
+                else 20 * 1024 ** 3
+            )
+            if free < floor:
+                problems.append(
+                    f"local free disk is low ({free / 1e9:.1f} GB) while streaming — "
+                    f"uploads are not reclaiming space fast enough"
+                )
+        if not problems:
+            return
+        if now - self._upload_health_last_warn < self._UPLOAD_HEALTH_WARN_INTERVAL_S:
+            return
+        self._upload_health_last_warn = now
+        msg = "Streaming upload health: " + "; ".join(problems)
+        self._log.warning(msg)
+        if self._slack_notifier is not None:
+            try:
+                self._slack_notifier.notify_error(msg, {"experiment": self.experiment_ID})
+            except Exception:
+                pass
+
+    def _delete_verified_result_files(self, result: UploadResult) -> None:
+        """Reclaim a verified task's shards IMMEDIATELY (per FOV visit).
+
+        Every path in ``deletable_uploaded_paths`` is sha256-verified on the
+        remote, so deleting it is safe regardless of what the rest of the
+        timepoint is doing. The old per-timepoint batch held a whole
+        timepoint's disk hostage to its slowest/failed task (and to the
+        expected-barrier tally), letting local usage balloon exactly when
+        streaming was supposed to bound it.
         """
+        if self._upload_target is None or not self._upload_target.delete_after_verify:
+            return
+        deleted = 0
+        for local_path in result.deletable_uploaded_paths:
+            try:
+                if os.path.isfile(local_path):
+                    os.remove(local_path)
+                    deleted += 1
+            except OSError as e:
+                self._upload_failed_deletions += 1
+                self._log.warning(
+                    f"Failed to delete {local_path} after verified upload: {e}"
+                )
+        if deleted:
+            self._log.debug(
+                f"Reclaimed {deleted} verified shard file(s) "
+                f"(t={result.time_point} fov={result.fov})"
+            )
+
+    def _maybe_prune_timepoint(self, time_point: int) -> None:
+        """Bookkeeping once every expected barrier of a timepoint reported:
+        prune the now-empty ``c/<t>/`` dirs and log one reclaim summary.
+        Files were already deleted per verified result; pruning only removes
+        empty directories, so task failures don't block it."""
         if time_point in self._upload_deletion_done:
             return
         if self._upload_target is None or not self._upload_target.delete_after_verify:
@@ -2430,33 +3216,20 @@ class MultiPointWorker:
         results = self._upload_results_by_tp.get(time_point, [])
         if len(results) < expected:
             return
-        if any(not r.success for r in results):
-            return
-        # All bundles for this timepoint are verified on the remote. Delete
-        # only the per-timepoint shard files that the upload worker tagged
-        # as deletable — never the shared metadata (zarr.json / frame_times),
-        # which the live writer is still using.
-        deleted = 0
-        for result in results:
-            for local_path in result.deletable_uploaded_paths:
-                try:
-                    if os.path.isfile(local_path):
-                        os.remove(local_path)
-                        deleted += 1
-                except OSError as e:
-                    self._log.warning(
-                        f"Failed to delete {local_path} after verified upload: {e}"
-                    )
-        # Best-effort prune of the now-empty `c/<t>/...` shard subtrees so
-        # the local directory listing stays tidy.
         self._prune_empty_shard_dirs(time_point)
         self._upload_deletion_done.add(time_point)
+        n_files = sum(len(r.deletable_uploaded_paths) for r in results)
+        failures = sum(1 for r in results if not r.success)
         self._log.info(
-            f"Reclaimed local disk: deleted {deleted} files for verified timepoint t={time_point}"
+            f"Timepoint t={time_point}: {n_files} verified shard file(s) reclaimed"
+            + (f"; {failures} task(s) failed (their files kept)" if failures else "")
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
-        """Remove ``<level_dir>/c/<t>`` if empty after batched delete.
+        """Prune old slash-layout directories after deleting verified files.
+
+        Flat-key arrays need no pruning: deletion already removed their shard
+        files directly, and the shared level directory must remain.
 
         Only descends into ``c/<t>`` and prunes upward to the level dir; never
         touches sibling timepoints' shard files or array metadata.
@@ -2504,10 +3277,10 @@ class MultiPointWorker:
             # Handle DownsampledViewResult - update plate view
             if isinstance(job_result.result, DownsampledViewResult) and job_result.result.well_images:
                 self._handle_downsampled_view_result(job_result.result)
-            # Handle ZarrWriteResult - notify viewer that frame is written
-            elif isinstance(job_result.result, ZarrWriteResult):
+            # Handle FrameWriteResult - notify viewer that frame is written
+            elif isinstance(job_result.result, FrameWriteResult):
                 r = job_result.result
-                self.callbacks.signal_zarr_frame_written(r.fov, r.time_point, r.z_index, r.channel_name, r.region_idx)
+                self.callbacks.signal_frame_written(r.fov, r.time_point, r.z_index, r.channel_name, r.region_idx)
             # Handle BarrierResult - the upload barrier has flushed this (t, fov)
             # and enqueued the upload task; track its task_id so we can match
             # the matching UploadResult later.
@@ -2549,7 +3322,15 @@ class MultiPointWorker:
         """Track an upload barrier: register its task_id (submitted) or account it
         as completed-non-uploading (no writer/shards) so the timepoint tally can
         still close. Shared by the raw-plate and derived-plate (postprocess) paths."""
+        if getattr(br, "manager_owned", False):
+            # The manager has acknowledged and now owns scheduling, progress,
+            # verification, and deletion for this task.
+            return
         if br.submitted:
+            if br.task_id in self._upload_completed_task_ids:
+                # Its UploadResult already arrived and was consumed —
+                # registering now would create a task_id nothing discards.
+                return
             self._upload_tasks_by_tp.setdefault(br.time_point, set()).add(br.task_id)
         elif self._upload_target is not None:
             self._upload_results_by_tp.setdefault(br.time_point, []).append(
@@ -2564,7 +3345,7 @@ class MultiPointWorker:
                     error=None,
                 )
             )
-            self._maybe_batched_delete(br.time_point)
+            self._maybe_prune_timepoint(br.time_point)
 
     def _emit_postprocess_display(self, pr: "PostprocessResult") -> None:
         """Push each derived output preview to the live image display.
@@ -2620,10 +3401,13 @@ class MultiPointWorker:
         """Update plate view with completed well image."""
         t_start = time.perf_counter()
 
-        if self._downsampled_view_manager is None:
+        manager = self._downsampled_view_manager
+        if getattr(self, "_ordered_visit", None) is not None and result.time_point != self.time_point:
+            manager = self._ordered_time_states.get(result.time_point, {}).get("_downsampled_view_manager")
+        if manager is None:
             return
         try:
-            self._downsampled_view_manager.update_well(
+            manager.update_well(
                 result.well_row,
                 result.well_col,
                 result.well_images,
@@ -2636,10 +3420,10 @@ class MultiPointWorker:
             )
 
             # Emit plate view update for each channel
-            for ch_idx, plate_image in enumerate(self._downsampled_view_manager.plate_view):
+            for ch_idx, plate_image in enumerate(manager.plate_view):
                 channel_name = (
-                    self._downsampled_view_manager.channel_names[ch_idx]
-                    if ch_idx < len(self._downsampled_view_manager.channel_names)
+                    manager.channel_names[ch_idx]
+                    if ch_idx < len(manager.channel_names)
                     else f"Channel_{ch_idx}"
                 )
                 self.callbacks.signal_plate_view_update(
@@ -2879,7 +3663,7 @@ class MultiPointWorker:
             fov_position = (0.0, 0.0)
 
         # Determine output directory
-        output_dir = os.path.join(self.experiment_path, str(self.time_point), "downsampled")
+        output_dir = os.path.join(self.experiment_path, str(info.time_point), "downsampled")
 
         # Get channel info
         channel_idx = info.configuration_idx
@@ -2888,6 +3672,7 @@ class MultiPointWorker:
         channel_names = list(self.observation_state_names)
 
         return DownsampledViewJob(
+            time_point=info.time_point or 0,
             capture_info=info,
             capture_image=JobImage(image_array=image),
             well_id=region_id,
@@ -3161,7 +3946,9 @@ class MultiPointWorker:
                         continue
                     seen.add(preset_name)
                     try:
-                        state = repo.load_observation_preset(preset_name)
+                        state = self._observation_preset_cache.get(preset_name)
+                        if state is None:
+                            state = repo.load_observation_preset(preset_name)
                         if state is None:
                             continue
                         # Cache so _apply_observation_state can skip the YAML
@@ -3186,7 +3973,10 @@ class MultiPointWorker:
     def run_coordinate_acquisition(self, current_path):
         # Reset backpressure counters at acquisition start
         # IMPORTANT: Must be before any camera triggers
-        self._backpressure.reset()
+        ordered_visit = getattr(self, "_ordered_visit", None)
+        prewarm = ordered_visit is None or not self._ordered_prewarmed
+        if prewarm:
+            self._backpressure.reset()
 
         # Pre-warm every distinct observation state preset once BEFORE the
         # FOV loop. Absorbs the first-call one-off costs (most notably the
@@ -3194,16 +3984,22 @@ class MultiPointWorker:
         # set_camera_mode pays the first time it actually switches modes)
         # into a dedicated init timer instead of polluting the first FOV's
         # per-capture stats. Amortizes to ~zero over long runs.
-        self._prewarm_observation_states()
+        if not self.validation_mode and prewarm:
+            self._prewarm_observation_states()
 
         # Precompute FOV-shared postprocessing state (e.g. transfer functions)
         # before any hardware fires, so the first FOV's compute is a cache hit
         # and never stalls the first save/display.
-        self._prewarm_postprocess_routines()
+        if not self.validation_mode and prewarm:
+            self._prewarm_postprocess_routines()
+        if ordered_visit is not None:
+            self._ordered_prewarmed = True
 
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
+            if ordered_visit is not None and region_id != self._ordered_position[0]:
+                continue
             self.callbacks.signal_overall_progress(
                 OverallProgressUpdate(
                     current_region=region_index + 1,
@@ -3215,10 +4011,14 @@ class MultiPointWorker:
             self.num_fovs = len(coordinates)
             # Count imaged frames per position (cycles capture several frames per
             # state), not just distinct channels.
-            frames_per_pos = self._get_region_plan(region_id).frames_per_position
-            self.total_scans = self.num_fovs * self.NZ * frames_per_pos
+            if self.validation_mode:
+                self.total_scans = self.num_fovs
+            else:
+                self.total_scans = self.num_fovs * self._captured_frames_per_fov(self._get_region_plan(region_id))
 
             for fov, coordinate_mm in enumerate(coordinates):
+                if ordered_visit is not None and fov != self._ordered_position[1]:
+                    continue
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
                 with self._timing.get_timer("job result summaries"):
                     result = self._summarize_runner_outputs()
@@ -3235,8 +4035,46 @@ class MultiPointWorker:
                 else:
                     with self._timing.get_timer("move_to_coordinate"):
                         self.move_to_coordinate(coordinate_mm, region_id, fov)
-                with self._timing.get_timer("acquire_at_position"):
-                    self.acquire_at_position(region_id, current_path, fov)
+                # Absolute Z and piezo position before the capture, so a mid-z-stack
+                # wedge — which unwinds before move_z_back_after_stack() and leaves the
+                # stage (stage-Z stacks) or the piezo (use_piezo stacks) advanced by the
+                # relative stack moves — can be undone on recovery. Without this the next
+                # FOV images silently defocused: 2D-coord/AF-off runs only move X/Y, and
+                # every piezo stack re-seeds its base from the current self.piezo.position.
+                z_before_capture_mm = self.stage.get_pos().z_mm
+                z_piezo_before_um = self.piezo.position if self.use_piezo else None
+                try:
+                    with self._timing.get_timer("acquire_at_position"):
+                        self.acquire_at_position(region_id, current_path, fov)
+                except CameraTimeoutError as ce:
+                    if self.validation_mode:
+                        # This error came from the focus camera. Reopening the
+                        # main camera cannot recover it; finalize the run.
+                        raise
+                    # Camera wedged mid-capture in a native SDK call. Try to reopen the
+                    # camera and continue — losing at most this FOV — instead of losing
+                    # the rest of the run. If reinit is disabled, exhausted, or fails,
+                    # re-raise to run()'s handler for a clean abort + finalize.
+                    if not self._recover_wedged_camera(ce):
+                        raise
+                    if self.NZ > 1:
+                        # Undo any relative z-stack motion left in flight by the wedge —
+                        # the stage for stage-Z stacks, the piezo for use_piezo stacks
+                        # (the stage move is a harmless no-op in piezo mode, and vice versa).
+                        try:
+                            self.stage.move_z_to(z_before_capture_mm)
+                            if self.use_piezo and z_piezo_before_um is not None:
+                                self.piezo.move_to(z_piezo_before_um)
+                                self.z_piezo_um = z_piezo_before_um
+                        except Exception:
+                            self._log.exception(
+                                "Could not restore Z after camera recovery; the next FOV may be defocused."
+                            )
+                    self._log.warning(
+                        f"Abandoning region={region_id} fov={fov} at t={self.time_point} "
+                        f"after camera reinit; continuing with the next FOV."
+                    )
+                    continue
 
                 # Barrier: after every SaveZarrJob for this (t, region, fov)
                 # has been dispatched, queue a FlushAndStageUploadJob behind
@@ -3246,9 +4084,16 @@ class MultiPointWorker:
                 # hands the resulting shard paths to the UploadWorker.
                 if (
                     self._upload_target is not None
+                    and (ordered_visit is None or self._ordered_final_position)
                     and self._save_zarr_runner is not None
                     and self._zarr_writer_info is not None
                 ):
+                    # SaveZarrJobs are dispatched from the camera callback
+                    # thread, which acquire_at_position() does not wait on, so
+                    # this FOV's frames may not be queued yet even though it has
+                    # returned. The barrier only stages what precedes it in the
+                    # FIFO queue, so drain the callbacks before queueing it.
+                    self._wait_for_dispatched_frames(region_id, fov)
                     try:
                         # Dense -> one array per FOV (array_key=None); ragged ->
                         # one single-channel plate per imaged state, so flush each.
@@ -3277,13 +4122,154 @@ class MultiPointWorker:
                     self.handle_acquisition_abort(current_path)
                     return
 
+    def _camera_dropped_frame_count(self):
+        """Cumulative camera-dropped-frame count, or None if the camera doesn't track it."""
+        getter = getattr(self.camera, "get_dropped_frame_count", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def _report_timepoint_frame_drops(self, count_before):
+        """Aggregate the just-finished timepoint's camera frame drops into one loud line.
+
+        The per-gap ``[FRAME-DROP]`` warnings from the camera are easy to lose in the
+        stream; this correlates a total to the timepoint (the exact signal missing when
+        the 2026-07-02 run silently shed frames). Optionally aborts if a single
+        timepoint's drops reach CAMERA_DROP_ABORT_PER_TIMEPOINT. ``count_before`` is the
+        cumulative count captured before the timepoint, or None if unsupported.
+        """
+        if count_before is None:
+            return
+        count_after = self._camera_dropped_frame_count()
+        if count_after is None:
+            return
+        # A mid-timepoint reopen() resets the per-stream counter; if so, count_after is
+        # the post-reset total and is the best available estimate for this timepoint.
+        dropped = count_after - count_before if count_after >= count_before else count_after
+        if dropped <= 0:
+            return
+        self._log.warning(
+            f"[FRAME-DROP] timepoint {self.time_point}: camera dropped {dropped} frame(s) "
+            f"during this timepoint — escalating camera/USB frame-delivery trouble."
+        )
+        if CAMERA_DROP_ABORT_PER_TIMEPOINT > 0 and dropped >= CAMERA_DROP_ABORT_PER_TIMEPOINT:
+            self._log.error(
+                f"Camera dropped {dropped} frame(s) in timepoint {self.time_point}, at/above the "
+                f"abort threshold ({CAMERA_DROP_ABORT_PER_TIMEPOINT}); aborting and finalizing."
+            )
+            self.request_abort_fn()
+
+    def _recover_wedged_camera(self, err) -> bool:
+        """Try to reopen a camera that wedged mid-capture so acquisition can continue.
+
+        Returns True only if the camera was reopened and reconfigured (the caller then
+        skips the current FOV and resumes). On any failure — reinit disabled, budget
+        exhausted, the reopen itself wedging, or any other error — returns False and
+        the caller re-raises so run() does the P0 clean abort + finalize. Worst case is
+        therefore never worse than the abort-only behavior.
+        """
+        # Check the class, not the instance: see the comment on the
+        # _use_deferred_decode_callback assignment above for why — SimulatedCamera
+        # doesn't implement reopen() for real, but its __getattr__ shim would make
+        # instance-level hasattr() lie and say it does.
+        if MAX_CAMERA_REINIT_ATTEMPTS <= 0 or not hasattr(type(self.camera), "reopen"):
+            return False  # reinit disabled, or this camera can't reopen -> clean abort
+
+        self._camera_reinit_attempts += 1
+        if self._camera_reinit_attempts > MAX_CAMERA_REINIT_ATTEMPTS:
+            self._log.error(
+                f"Camera wedged again after {MAX_CAMERA_REINIT_ATTEMPTS} reinit attempt(s) this run; "
+                f"giving up and aborting the acquisition."
+            )
+            return False
+
+        self._log.error(
+            f"Camera wedged mid-capture ({err}). Attempting reinit "
+            f"{self._camera_reinit_attempts}/{MAX_CAMERA_REINIT_ATTEMPTS}..."
+        )
+        # The wedge may have left an illuminator on; drop it before recovering.
+        try:
+            self.liveController.obs_controller.turn_off_illumination()
+        except Exception:
+            self._log.warning("Could not turn off illumination during camera recovery", exc_info=True)
+
+        try:
+            with self._timing.get_timer("camera_reinit"):
+                self.camera.reopen()
+                # Re-apply the first observation state's camera_live snapshot the same
+                # way run() seeds the camera at startup, so post-reopen frames match the
+                # pre-wedge configuration (conversion-gain camera_mode in particular,
+                # which the base reopen does not restore).
+                self._seed_camera_for_first_observation_state()
+        except CameraTimeoutError as reopen_err:
+            self._log.error(f"Camera reinit itself wedged ({reopen_err}); aborting the acquisition.")
+            return False
+        except Exception:
+            self._log.exception("Camera reinit failed; aborting the acquisition.")
+            return False
+
+        # The fresh handle has no trigger in flight, and frame callbacks are preserved
+        # on the camera object. Reset worker-side readiness so the next FOV can capture,
+        # and force illumination to reassert on the next capture.
+        self._ready_for_next_trigger.set()
+        self._image_callback_idle.set()
+        self._last_illumination_config_name = None
+        self._log.info(
+            f"Camera reinit {self._camera_reinit_attempts} succeeded; resuming at the next FOV."
+        )
+        return True
+
+    def _captured_frames_per_fov(self, plan):
+        return sum(
+            self.NZ if event.acquire_z_stack else 1
+            for event in plan.events if not (event.is_wait or event.is_stimulus)
+        )
+
+    def _reverse_observation_order(self, region_id, fov):
+        """Alternate across region and timepoint boundaries, including single-tile regions."""
+        if not getattr(self, "snake_observation_states", False):
+            return False
+        ordinal = self.time_point * sum(len(coords) for coords in self.scan_region_fov_coords_mm.values()) + fov
+        for name, coords in self.scan_region_fov_coords_mm.items():
+            if str(name) == str(region_id):
+                break
+            ordinal += len(coords)
+        return bool(ordinal % 2)
+
     def acquire_at_position(self, region_id, current_path, fov):
         # Autofocus once at the FOV's nominal plane to establish the focal
         # (reference) plane BEFORE the z-stack is positioned around it. The
         # stacking mode then decides whether that plane becomes the bottom,
         # center, or top slice (see prepare_z_stack). Also records the AF event
         # (target vs. corrected Z) to autofocus_log.csv.
-        self._autofocus_and_record(region_id, fov, current_path)
+        ordered_visit = getattr(self, "_ordered_visit", None)
+        focus_key = (self.time_point, ordered_visit.position) if ordered_visit is not None else None
+        first_position_visit = ordered_visit is None or focus_key not in self._ordered_focus
+        if not first_position_visit:
+            stage_z, piezo_z = self._ordered_focus[focus_key]
+            self.stage.move_z_to(stage_z)
+            if self.use_piezo:
+                self.piezo.move_to(piezo_z)
+        else:
+            self._autofocus_and_record(region_id, fov, current_path)
+            if ordered_visit is not None:
+                self._ordered_focus[focus_key] = (
+                    self.stage.get_pos().z_mm, self.piezo.position if self.use_piezo else None
+                )
+
+        if getattr(self, "validation_mode", False):
+            pos = self.stage.get_pos()
+            self.update_coordinates_dataframe(region_id, 0, pos, fov)
+            self.callbacks.signal_current_fov(pos.x_mm, pos.y_mm)
+            self.callbacks.signal_region_progress(
+                RegionProgressUpdate(current_fov=fov + 1, region_fovs=len(self.scan_region_fov_coords_mm[region_id]))
+            )
+            self._timepoint_fov_count += 1
+            self.af_fov_count += 1
+            return
 
         if self.NZ > 1:
             self.prepare_z_stack()
@@ -3296,7 +4282,28 @@ class MultiPointWorker:
         # the middle plane for From Center. See _reference_z_level.
         ref_z_level = self._reference_z_level()
 
-        for z_level in range(self.NZ):
+        from control.models.acquisition_cycle import iter_acquisition_planes
+
+        region_plan = self._get_region_plan(region_id)
+        if not region_plan.events:
+            raise ValueError("No observation states selected for acquisition.")
+        frames_per_fov = self._captured_frames_per_fov(region_plan)
+        imaged_step = 0
+        current_z_level = 0  # prepare_z_stack positions the canonical first plane
+        recorded_z_levels = set()
+        planes = iter_acquisition_planes(
+            region_plan.events, self.NZ, ref_z_level,
+            snake=getattr(self, "snake_observation_states", False),
+            reverse=self._reverse_observation_order(region_id, fov),
+        )
+        if ordered_visit is not None:
+            planes = ordered_visit.planes
+        for z_level, plane_events in planes:
+            if self.abort_requested_fn():
+                break
+            if z_level != current_z_level:
+                self.move_z_for_stack(z_level - current_z_level)
+                current_z_level = z_level
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 
             acquire_pos = self.stage.get_pos()
@@ -3307,129 +4314,126 @@ class MultiPointWorker:
             # just a 1-frame-per-state plan, so this single path serves both. The
             # plan's ordered events preserve interleave / chain order; imaged
             # events capture a frame, stimulus events fire an NIDAQ pulse comb.
-            region_plan = self._get_region_plan(region_id)
-            # Captured (not just saved) frames per (FOV, z): postprocessed events
-            # are captured too, so include them so imaged_step stays aligned.
-            frames_per_pos = region_plan.captured_frames_per_position
-            if region_plan.events:
-                imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
-                for event in region_plan.events:
-                    if event.is_wait:
-                        # Timed delay between events — no frame, no AF, no progress
-                        # tick. Sleep in short slices so an abort interrupts it.
-                        with self._timing.get_timer("cycle_wait"):
-                            self._interruptible_sleep(event.wait_ms / 1000.0)
-                        continue
-                    # Reference-z-only step/sweep: capture a single frame at the
-                    # focus/reference plane and skip it at every other z-level.
-                    # Stimulus events are unaffected (they fire at every z as before).
-                    if (not event.acquire_z_stack) and (not event.is_stimulus) and (z_level != ref_z_level):
-                        continue
-                    preset_name = event.observation_state
+            for event in plane_events:
+                if self.abort_requested_fn():
+                    break
+                if event.is_wait:
+                    # Timed delay between events — no frame, no AF, no progress
+                    # tick. Sleep in short slices so an abort interrupts it.
+                    with self._timing.get_timer("cycle_wait"):
+                        self._interruptible_sleep(event.wait_ms / 1000.0)
+                    continue
+                preset_name = event.observation_state
+                try:
+                    with self._timing.get_timer("apply_observation_state"):
+                        config = self._apply_observation_state(preset_name)
+                except Exception as e:
+                    self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                    self.request_abort_fn()
+                    return
+                # Source-coded FPM darkfield frame: override the LED matrix to
+                # this multiplexed pattern (base state supplies exposure/gain/
+                # color; the matrix channel must be ON in that base state — this
+                # is enforced pre-flight in validate_acquisition_settings). The
+                # override switches the device to 'mux' mode, so the capture
+                # path's re-fire lights exactly this LED set. A False return
+                # means no SciMicroscopy array is available, which would
+                # silently capture the wrong pattern — abort instead.
+                if event.multiplexed_leds is not None:
+                    ok = False
                     try:
-                        with self._timing.get_timer("apply_observation_state"):
-                            config = self._apply_observation_state(preset_name)
+                        ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
+                            event.multiplexed_leds
+                        )
                     except Exception as e:
-                        self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                        self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
+                    if not ok:
+                        self._log.error(
+                            "FPM: could not light multiplexed darkfield pattern for base state %r "
+                            "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
+                            preset_name,
+                        )
                         self.request_abort_fn()
                         return
-                    # Source-coded FPM darkfield frame: override the LED matrix to
-                    # this multiplexed pattern (base state supplies exposure/gain/
-                    # color; the matrix channel must be ON in that base state — this
-                    # is enforced pre-flight in validate_acquisition_settings). The
-                    # override switches the device to 'mux' mode, so the capture
-                    # path's re-fire lights exactly this LED set. A False return
-                    # means no SciMicroscopy array is available, which would
-                    # silently capture the wrong pattern — abort instead.
-                    if event.multiplexed_leds is not None:
-                        ok = False
-                        try:
-                            ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
-                                event.multiplexed_leds
-                            )
-                        except Exception as e:
-                            self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
-                        if not ok:
-                            self._log.error(
-                                "FPM: could not light multiplexed darkfield pattern for base state %r "
-                                "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
-                                preset_name,
-                            )
-                            self.request_abort_fn()
-                            return
-                    if self.NZ == 1:  # TODO: handle z offset for z stack
-                        self.handle_z_offset(config, True)
+                if self.NZ == 1:  # TODO: handle z offset for z stack
+                    self.handle_z_offset(config, True)
 
-                    # (Autofocus now runs once per FOV in _autofocus_and_record,
-                    # before the z-stack is positioned — see acquire_at_position.)
+                # (Autofocus now runs once per FOV in _autofocus_and_record,
+                # before the z-stack is positioned — see acquire_at_position.)
 
-                    if event.is_stimulus or config.is_stimulus_only:
-                        with self._timing.get_timer("run_nidaq_stimulus"):
-                            self._run_nidaq_stimulus(config)
-                        if self.NZ == 1:
-                            self.handle_z_offset(config, False)
-                        continue  # no frame, no progress tick
-
-                    # Postprocessed frames are routed to the PostprocessJob runner
-                    # (raw not saved), so they carry no save layout — the group id
-                    # tags the frame for accumulation. A ref-z-only postprocessed
-                    # step still passes NZ frames? No: it is captured only at the
-                    # reference plane like any ref-z step (skip handled above), so
-                    # eff_z_index follows the same rule.
-                    if event.postprocess is not None:
-                        save_layout = None
-                        config_idx = 0
-                    else:
-                        save_layout = self._build_save_layout(region_plan, event)
-                        config_idx = save_layout.c_index
-                    # A reference-z-only frame lives at z=0 of its Z=1 array; a
-                    # normal frame at its stack level.
-                    eff_z_index = z_level if event.acquire_z_stack else 0
-                    with self._timing.get_timer("acquire_camera_image"):
-                        with self._timing.get_timer("acquire_camera_image_inner"):
-                            self.acquire_camera_image(
-                                config,
-                                file_ID,
-                                current_path,
-                                eff_z_index,
-                                region_id=region_id,
-                                fov=fov,
-                                config_idx=config_idx,
-                                filename_channel_label=preset_name,
-                                save_layout=save_layout,
-                                postprocess_group=event.postprocess_group,
-                            )
-
+                if event.is_stimulus or config.is_stimulus_only:
+                    with self._timing.get_timer("run_nidaq_stimulus"):
+                        self._run_nidaq_stimulus(config)
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
+                    continue  # no frame, no progress tick
 
-                    current_image = fov * self.NZ * frames_per_pos + z_level * frames_per_pos + imaged_step + 1
-                    imaged_step += 1
-                    self.callbacks.signal_region_progress(
-                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
+                # Postprocessed frames are routed to the PostprocessJob runner
+                # (raw not saved), so they carry no save layout — the group id
+                # tags the frame for accumulation. Reference-z-only inputs are
+                # scheduled only at the reference plane and use saved Z index 0.
+                if event.postprocess is not None:
+                    save_layout = None
+                    config_idx = 0
+                else:
+                    save_layout = self._build_save_layout(region_plan, event)
+                    config_idx = save_layout.c_index
+                # A reference-z-only frame lives at z=0 of its Z=1 array; a
+                # normal frame at its stack level.
+                eff_z_index = z_level if event.acquire_z_stack else 0
+                with self._timing.get_timer("acquire_camera_image"):
+                    with self._timing.get_timer("acquire_camera_image_inner"):
+                        self.acquire_camera_image(
+                            config,
+                            file_ID,
+                            current_path,
+                            eff_z_index,
+                            region_id=region_id,
+                            fov=fov,
+                            config_idx=config_idx,
+                            filename_channel_label=preset_name,
+                            save_layout=save_layout,
+                            postprocess_group=event.postprocess_group,
+                            state_frame_index=event.state_frame_index,
+                        )
+
+                if self.NZ == 1:
+                    self.handle_z_offset(config, False)
+
+                current_image = fov * frames_per_fov + imaged_step + 1
+                if ordered_visit is not None:
+                    self._ordered_frames_completed += 1
+                    current_image = self._ordered_frames_completed
+                imaged_step += 1
+                self.callbacks.signal_region_progress(
+                    RegionProgressUpdate(
+                        current_fov=current_image,
+                        region_fovs=self._ordered_frames_total if ordered_visit is not None else self.total_scans,
                     )
-            else:
-                raise ValueError("No observation states selected for acquisition.")
+                )
 
-            # updates coordinates df
-            self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+            # Advanced blocks may revisit a plane; keep one coordinate row per FOV/Z.
+            if z_level not in recorded_z_levels:
+                self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+                recorded_z_levels.add(z_level)
             self.callbacks.signal_current_fov(acquire_pos.x_mm, acquire_pos.y_mm)
 
             # check if the acquisition should be aborted
             if self.abort_requested_fn():
                 self.handle_acquisition_abort(current_path)
-
-            # update FOV counter
-            self.af_fov_count = self.af_fov_count + 1
-
-            if z_level < self.NZ - 1:
-                self.move_z_for_stack()
+                break
 
         if self.NZ > 1:
-            self.move_z_back_after_stack()
+            self.move_z_back_after_stack(current_z_level)
+
+        # Contrast-AF cadence counter: one increment per FOV visit, never per
+        # z-slice (inside the z loop the cadence period becomes NZ-dependent).
+        if first_position_visit:
+            self.af_fov_count += 1
 
         # Increment FOV counter for Slack notification stats
-        self._timepoint_fov_count += 1
+        if ordered_visit is None or self._ordered_final_position:
+            self._timepoint_fov_count += 1
 
     def _select_config(self, config):
         """Apply an ObservationState to hardware before capture."""
@@ -3468,13 +4472,27 @@ class MultiPointWorker:
                 if self._alignment_widget is not None and self._alignment_widget.has_offset:
                     x_mm, y_mm = self._alignment_widget.apply_offset(x_mm, y_mm)
 
-                self.stage.move_x_to(x_mm)
-                self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
-                self.stage.move_y_to(y_mm)
-                self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+                def _xy_move():
+                    self.stage.move_x_to(x_mm)
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_X / 1000)
+                    self.stage.move_y_to(y_mm)
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_Y / 1000)
+
+                # Bracket only the move into a region (its first FOV), same as
+                # the main acquisition loop -- intra-region steps are unchanged.
+                move_xy_with_z_retract(
+                    self.stage,
+                    x_mm,
+                    y_mm,
+                    retract=self.retract_z_between_regions and fov_idx == 0,
+                    z_target_mm=None,
+                    home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                    xy_move=_xy_move,
+                    log=self._log,
+                )
 
                 try:
-                    with self._timing.get_timer("af:seed_event"):
+                    with self._collect_af_validation(region_id, fov_idx, "seed"), self._timing.get_timer("af:seed_event"):
                         ok = self.laser_auto_focus_controller.move_to_target(0)
                     if ok:
                         self._fov_z_map[(region_id, fov_idx)] = self.stage.get_pos().z_mm
@@ -3482,6 +4500,8 @@ class MultiPointWorker:
                     else:
                         failed += 1
                         self._log.warning(f"Laser AF failed during seed at region={region_id} fov={fov_idx}")
+                except AFValidationRestoreError:
+                    raise
                 except Exception:
                     failed += 1
                     self._log.exception(f"Laser AF exception during seed at region={region_id} fov={fov_idx}")
@@ -3564,27 +4584,48 @@ class MultiPointWorker:
         # first capture can continue to run in parallel with motion — the
         # trigger-site _wait_for_move_settled() in acquire_camera_image is
         # the final gate.
+        # Reset per call so a prior FOV's status can't leak; the branches below set
+        # the real value (ok / stale / table / failed).
+        self._last_af_status = "skipped"
+        self._last_af_validation_warning = None
         if self.do_reflection_af or self.do_autofocus:
             self._wait_for_move_settled()
         if not self.do_reflection_af:
             # Contrast-based AF. Runs for any z-stacking mode: AF establishes the
             # focal/reference plane and acquire_at_position/prepare_z_stack then
-            # position the stack around it (bottom/center/top). Cadence-gated by
-            # NUMBER_OF_FOVS_PER_AF.
-            if (
-                (self.do_autofocus)
-                and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
-            ):
-                configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_channel_by_name(
-                    self.objectiveStore.current_objective, configuration_name_AF
+            # position the stack around it (bottom/center/top). The full sweep is
+            # cadence-gated by NUMBER_OF_FOVS_PER_AF; a focus map replaces the
+            # sweep with one interpolated Z move, cheap enough to run at every
+            # FOV so tilted samples track the map between cadence hits.
+            if self.do_autofocus:
+                use_map = (
+                    self.autofocusController.use_focus_map
+                    and len(self.autofocusController.focus_map_coords) >= 3
                 )
-                self._select_config(config_AF)
-                if (
-                    self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
-                ) or self.autofocusController.use_focus_map:
+                if use_map:
                     self.autofocusController.autofocus()
                     self.autofocusController.wait_till_autofocus_has_completed()
+                    # The map short-circuit is a bare move_z_to; give it the
+                    # same settle every other pre-capture Z move gets (with
+                    # NZ==1 no later stack move sleeps before the trigger).
+                    self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+                    self._last_af_status = "map"
+                elif self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0:
+                    configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
+                    config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
+                    if config_AF is None:
+                        available = [s.name for s in self.liveController.get_observation_states()]
+                        raise RuntimeError(
+                            f"Contrast autofocus channel {configuration_name_AF!r} "
+                            f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
+                            f"State, so autofocus cannot be configured. Available: {available}"
+                        )
+                    self._select_config(config_AF)
+                    # focus_map_override guards the degenerate case of a map
+                    # toggle left on with <3 points — force the real sweep.
+                    self.autofocusController.autofocus(focus_map_override=True)
+                    self.autofocusController.wait_till_autofocus_has_completed()
+                    self._last_af_status = "ok"
         else:
             # Laser-AF path. Decide between a full laser-AF "refresh" or a
             # table-only Z move, then run consistency checks where possible.
@@ -3601,7 +4642,13 @@ class MultiPointWorker:
                 self._region_refresh_count_this_entry = 0
                 self._fovs_since_refresh[region_id] = 0
 
-            counter_due = self._fovs_since_refresh.get(region_id, 0) >= self._laser_af_refresh_every_n_fovs
+            # The counter holds completed table FOVs since the last refresh, so
+            # the Nth FOV after a refresh sees N-1 — comparing against N would
+            # give a period of N+1 and, at N=1 (Legacy mode), alternate
+            # refresh/table instead of refreshing at every FOV.
+            counter_due = (
+                self._fovs_since_refresh.get(region_id, 0) >= self._laser_af_refresh_every_n_fovs - 1
+            )
             unseeded = (region_id, fov) not in self._fov_z_map
             is_refresh = new_region_entry or counter_due or unseeded
 
@@ -3619,49 +4666,54 @@ class MultiPointWorker:
                     self._last_region_id = region_id
                     return False
 
-                # Mid-region consistency check: if this is the 2nd+ refresh in
-                # the current region entry and we had table data for this FOV
-                # coming in, compare the fresh measurement to the table's
-                # prediction.
-                if (
-                    self._region_refresh_count_this_entry >= 1
-                    and prior_anchor_z is not None
-                    and prior_anchor_fov is not None
-                    and prior_fov_z is not None
-                    and (region_id, prior_anchor_fov) in self._fov_z_map
-                ):
-                    predicted_z = prior_anchor_z + (
-                        prior_fov_z - self._fov_z_map[(region_id, prior_anchor_fov)]
-                    )
-                    measured_z = self._region_anchor_z_current[region_id]
-                    diff_um = abs(predicted_z - measured_z) * 1000.0
-                    if diff_um > self._laser_af_consistency_threshold_um:
-                        self._log.warning(
-                            f"Laser-AF consistency: table predicted z={predicted_z:.4f} mm, "
-                            f"measured {measured_z:.4f} mm (diff={diff_um:.1f} µm) "
-                            f"at region={region_id} fov={fov}"
+                # Mid-region consistency check: if this is the 2nd+ live
+                # refresh in the current region entry and we had table data for
+                # this FOV coming in, compare the fresh measurement to the
+                # table's prediction. A "stale" return took no measurement —
+                # the anchor is unchanged, so comparing it to the prediction
+                # would only report the FOV's own shape offset. Stale returns
+                # also don't count as refreshes for the end-of-region check.
+                if self._last_af_status == "ok":
+                    if (
+                        self._region_refresh_count_this_entry >= 1
+                        and prior_anchor_z is not None
+                        and prior_anchor_fov is not None
+                        and prior_fov_z is not None
+                        and (region_id, prior_anchor_fov) in self._fov_z_map
+                    ):
+                        predicted_z = prior_anchor_z + (
+                            prior_fov_z - self._fov_z_map[(region_id, prior_anchor_fov)]
                         )
-                    else:
-                        self._log.debug(
-                            f"Laser-AF consistency OK: diff={diff_um:.1f} µm at region={region_id} fov={fov}"
-                        )
+                        measured_z = self._region_anchor_z_current[region_id]
+                        diff_um = abs(predicted_z - measured_z) * 1000.0
+                        if diff_um > self._laser_af_consistency_threshold_um:
+                            self._last_af_validation_warning = f"Table prediction differs by {diff_um:.1f} um"
+                            self._log.warning(
+                                f"Laser-AF consistency: table predicted z={predicted_z:.4f} mm, "
+                                f"measured {measured_z:.4f} mm (diff={diff_um:.1f} µm) "
+                                f"at region={region_id} fov={fov}"
+                            )
+                        else:
+                            self._log.debug(
+                                f"Laser-AF consistency OK: diff={diff_um:.1f} µm at region={region_id} fov={fov}"
+                            )
 
-                self._region_refresh_count_this_entry += 1
+                    self._region_refresh_count_this_entry += 1
             else:
-                # Already taken care of in initial move to pos
-                # with self._timing.get_timer("af:table_move"):
-                #     anchor_fov = self._region_anchor_fov[region_id]
-                #     delta = self._fov_z_map[(region_id, fov)] - self._fov_z_map[(region_id, anchor_fov)]
-                #     target_z = self._region_anchor_z_current[region_id] + delta
-                #     self.stage.move_z_to(target_z)
-                #     self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+                # This FOV's table Z was already applied by move_to_coordinate's
+                # proposal pre-move; no Z move needed here.
                 self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
+                # Table path: no live focus-camera measurement this FOV.
+                self._last_af_status = "table"
 
-                # TEMPORARY audit: measure laser-AF displacement at every
-                # non-anchor FOV without correcting, to gauge how accurate the
-                # table + anchor estimate remains vs a live measurement.
-                # Remove once the approach is validated.
-                # self._check_table_path_displacement(region_id, fov)
+                # Diagnostic audit (opt-in via the laser-AF settings dialog):
+                # before/after displacement around a full laser-AF correction at
+                # every table FOV, appended to table_path_audit.csv. Note it
+                # CORRECTS Z at audited FOVs (~300 ms each) — validation runs
+                # only, e.g. quantifying the table path's backlash-flank offset.
+                if self._laser_af_table_path_audit:
+                    if self._check_table_path_displacement(region_id, fov):
+                        self._last_af_status = "audit"
 
             self._last_region_id = region_id
 
@@ -3675,12 +4727,14 @@ class MultiPointWorker:
                 self._laser_af_check_last_fov_per_region
                 and is_last_fov_in_region
                 and self._region_refresh_count_this_entry == 1
+                # A successful refresh or audit already verified this FOV.
+                and self._last_af_status not in ("ok", "audit")
             ):
                 self._check_last_fov_displacement(region_id, fov)
         return True
 
-    # TEMPORARY: header for the per-FOV table-path audit CSV. Columns cover
-    # the before/after state around a full laser-AF correction so we can
+    # Header for the per-FOV table-path audit CSV (opt-in diagnostic). Columns
+    # cover the before/after state around a full laser-AF correction so we can
     # directly compare the table+anchor estimate to a live focus measurement.
     _TABLE_PATH_AUDIT_HEADER = [
         "timestamp",
@@ -3698,8 +4752,8 @@ class MultiPointWorker:
     ]
 
     def _check_table_path_displacement(self, region_id, fov):
-        """TEMPORARY: compare the table+anchor Z estimate against a full AF
-        correction at the same FOV.
+        """Opt-in diagnostic: compare the table+anchor Z estimate against a
+        full AF correction at the same FOV.
 
         Sequence at each non-anchor FOV:
           1. Measure displacement + cross-correlation at the table-predicted Z.
@@ -3708,11 +4762,16 @@ class MultiPointWorker:
           4. Append the before/after pair to
              `{experiment_path}/table_path_audit.csv` for offline analysis.
 
-        Remove once the approach is validated.
+        Enabled by the "table-path audit" checkbox in the laser-AF settings
+        dialog. `displacement_before_um` is the table path's true focus error
+        (drift + backlash flank) at the moment the FOV would have been imaged.
+
+        Returns True only when the corrective move_to_target succeeded (the
+        caller records af_status "audit" for corrected FOVs, "table" otherwise).
         """
         controller = self.laser_auto_focus_controller
         if controller is None:
-            return
+            return False
 
         # 1. Pre-correction audit — current stage is at the table-predicted Z.
         z_before = self.stage.get_pos().z_mm
@@ -3720,9 +4779,10 @@ class MultiPointWorker:
 
         # 2. Full laser-AF correction. Errors are caught so the audit
         #    continues even if the measurement path misfires on one FOV.
+        corrected = False
         try:
             with self._timing.get_timer("af:table_path_audit_full_af"):
-                controller.move_to_target(0)
+                corrected = bool(controller.move_to_target(0))
         except Exception:
             self._log.exception(
                 f"Table-path audit: move_to_target raised at region={region_id} fov={fov}"
@@ -3734,6 +4794,7 @@ class MultiPointWorker:
 
         # 4. Append row.
         self._append_table_path_audit_row(region_id, fov, z_before, before, z_after, after)
+        return corrected
 
     def _audit_laser_af_state(self, region_id, fov, phase):
         """Return {displacement_um, correlation, cc_ok} for the laser-AF
@@ -3840,9 +4901,16 @@ class MultiPointWorker:
         try:
             measured_ok = self.laser_auto_focus_controller.move_to_target(0)
         except Exception as e:
-            file_ID = f"{region_id}_focus_camera.bmp"
-            saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
-            iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
+            # Best-effort debug image — the per-timepoint folder may not exist
+            # (ZARR_V3 mode), and a raise here would skip the status/counter
+            # bookkeeping below.
+            try:
+                file_ID = f"{region_id}_focus_camera.bmp"
+                saving_path = os.path.join(self.base_path, self.experiment_ID, str(self.time_point), file_ID)
+                utils.ensure_directory_exists(os.path.dirname(saving_path))
+                iio.imwrite(saving_path, self.laser_auto_focus_controller.image)
+            except Exception:
+                self._log.exception("Failed to save laser-AF failure debug image")
             self._log.error(
                 f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed at region={region_id} fov={fov} !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
                 exc_info=e,
@@ -3863,10 +4931,16 @@ class MultiPointWorker:
             # anchor keeps both the fallback path and `move_to_coordinate`'s
             # non-blocking Z pre-move consistent.
             self._recompute_region_proposals(region_id, anchor_fov=fov)
+            self._last_af_status = "ok"
             return True
 
         # Refresh failed (exception caught above or move_to_target returned False).
         self._laser_af_failures += 1
+        # Saturate the counter so the next FOV re-attempts a live refresh
+        # instead of riding stale data for a full cadence interval (a
+        # region-entry failure would otherwise leave the counter at 0/1).
+        # Applies to both failure branches below.
+        self._fovs_since_refresh[region_id] = self._laser_af_refresh_every_n_fovs
 
         # If we have a prior anchor and this FOV is in the table, silently apply
         # the table offset relative to the stale anchor and continue. Better than
@@ -3876,17 +4950,23 @@ class MultiPointWorker:
             target_z = self._region_anchor_z_current[region_id] + delta
             self.stage.move_z_to(target_z)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
-            self._fovs_since_refresh[region_id] = self._fovs_since_refresh.get(region_id, 0) + 1
             self._log.warning(f"Laser-AF refresh failed at region={region_id} fov={fov}; using stale anchor + table offset")
+            # Live read failed; Z came from the stale anchor + table, not a measurement.
+            self._last_af_status = "stale"
             return True
 
         # No prior anchor and no table entry — can't set Z. Match legacy failure path.
+        self._last_af_status = "failed"
         return False
 
     # Columns for the per-acquisition autofocus log sidecar. position_index is
     # the FOV/position index; (x, y) disambiguate across regions. z_expected is
     # the pre-AF target Z; z_actual is the Z after correction (or after a failed
-    # AF). af_status is "ok" or "failed".
+    # AF). af_status is one of: "ok" (live measurement), "stale" (live read failed,
+    # fell back to stale anchor + table offset), "table" (no live read this FOV),
+    # "audit" (table FOV that got a full corrective AF via the table-path audit),
+    # "map" (contrast path: interpolated focus-map move, no sweep),
+    # "failed" (no Z set), "skipped" (AF enabled but not performed this FOV).
     _AUTOFOCUS_LOG_HEADER = [
         "position_index",
         "t_index",
@@ -3921,7 +5001,7 @@ class MultiPointWorker:
         if self.Nt > 1:
             self._z_pos_proposal[(region_id, fov)] = z_expected_mm
 
-        with self._timing.get_timer("perform_autofocus"):
+        with self._collect_af_validation(region_id, fov), self._timing.get_timer("perform_autofocus"):
             af_ok = self.perform_autofocus(region_id, fov)
         if not af_ok:
             self._log.error(
@@ -3941,16 +5021,82 @@ class MultiPointWorker:
                 self._log.warning(f"Failed to save laser-AF characterization image: {e}")
 
         pos_after = self.stage.get_pos()
+        # Contrast AF has no _recompute_region_proposals equivalent, so seed the
+        # next timepoint's proposal with the FOCUSED z here — the pre-AF cache
+        # above would freeze every FOV at its t=0 arrival z ("prefer the focused
+        # Z from the previous timepoint" is the proposal's contract). The laser
+        # branch re-seats its own proposals on refresh success.
+        if not self.do_reflection_af and self.Nt > 1 and self._last_af_status in ("ok", "map"):
+            self._z_pos_proposal[(region_id, fov)] = pos_after.z_mm
         self._record_autofocus_event(
             position_index=fov,
             x_mm=pos_after.x_mm,
             y_mm=pos_after.y_mm,
             z_expected_mm=z_expected_mm,
             z_actual_mm=pos_after.z_mm,
-            ok=bool(af_ok),
+            status=self._last_af_status,
         )
 
-    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, ok):
+    @contextlib.contextmanager
+    def _collect_af_validation(self, region_id, fov, phase="acquisition"):
+        collector = getattr(self, "_af_validator", None)
+        if collector is None:
+            yield
+            return
+        controller = self.laser_auto_focus_controller
+        with controller.collect_validation_event() as operations:
+            fatal_error = None
+            try:
+                yield
+            except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    fatal_error = str(exc)
+                raise
+            finally:
+                pos = self.stage.get_pos()
+                snapshot, snapshot_error, restore_error = None, None, None
+                if fatal_error is not None:
+                    snapshot_error = f"Snapshot skipped after fatal AF error: {fatal_error}"
+                elif operations:
+                    try:
+                        snapshot = controller.capture_validation_frame()
+                        if snapshot is None:
+                            snapshot_error = "Full-sensor frame unavailable; native AF evidence retained"
+                    except AFValidationRestoreError as exc:
+                        snapshot_error = str(exc)
+                        restore_error = exc
+                    except Exception as exc:
+                        snapshot_error = str(exc)
+                        self._log.exception("AF validation snapshot failed")
+                    except BaseException as exc:
+                        # Preserve the completed AF operation even when the
+                        # subsequent diagnostic capture hits a fatal SDK error.
+                        snapshot_error = f"Fatal snapshot error: {type(exc).__name__}: {exc}"
+                        restore_error = exc
+                metadata = {
+                    "timestamp": time.time(), "phase": phase, "time_point": self.time_point,
+                    "region_id": str(region_id), "fov": fov, "x_mm": pos.x_mm, "y_mm": pos.y_mm,
+                    "snapshot_z_mm": pos.z_mm, "snapshot_error": snapshot_error,
+                    "af_status": self._last_af_status if phase == "acquisition" else "seed",
+                    "warning": getattr(self, "_last_af_validation_warning", None) if phase == "acquisition" else None,
+                }
+                try:
+                    for operation in operations or [None]:
+                        row = dict(metadata)
+                        if operation is not None and operation.get("warning"):
+                            row["warning"] = operation["warning"]
+                        if operation is not None and operation["kind"] == "measurement":
+                            displacement = operation["displacement_um"]
+                            if displacement is not None and abs(displacement) > self._laser_af_consistency_threshold_um:
+                                row["warning"] = f"Measured displacement {displacement:.1f} um exceeds consistency threshold"
+                        collector.record(row, operation, snapshot)
+                except Exception:
+                    self._log.exception("Could not save AF validation evidence")
+                    self.request_abort_fn()
+                if restore_error is not None:
+                    raise restore_error
+
+    def _record_autofocus_event(self, position_index, x_mm, y_mm, z_expected_mm, z_actual_mm, status):
         """Append one AF row to ``{experiment_path}/autofocus_log.csv``.
 
         Best-effort: a logging failure must never interrupt the acquisition.
@@ -3973,7 +5119,7 @@ class MultiPointWorker:
                         f"{y_mm:.6f}",
                         f"{z_expected_mm:.6f}",
                         f"{z_actual_mm:.6f}",
-                        "ok" if ok else "failed",
+                        status,
                     ]
                 )
         except Exception as e:
@@ -4167,6 +5313,24 @@ class MultiPointWorker:
     def _frame_wait_timeout_s(self):
         return (self.camera.get_total_frame_time() / 1e3) + 10
 
+    def _describe_camera_trigger_routing(self) -> str:
+        """How software triggers reach the camera, for frame-timeout diagnostics.
+
+        Optional on the camera: not every driver in the tree implements it, and a
+        diagnostic string must never be the thing that raises.
+        """
+        describe = getattr(self.camera, "describe_trigger_routing", None)
+        if describe is None:
+            return "unknown"
+        try:
+            return describe()
+        except Exception:
+            return "unknown"
+
+    def _note_frame_timeout_abort(self) -> None:
+        """Record that the abort we are about to request is a never-arriving frame."""
+        self._aborted_on_frame_timeout = True
+
     def acquire_camera_image(
         self,
         config,
@@ -4180,6 +5344,7 @@ class MultiPointWorker:
         filename_channel_label: Optional[str] = None,
         save_layout=None,
         postprocess_group: Optional[str] = None,
+        state_frame_index: Optional[int] = None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -4223,7 +5388,11 @@ class MultiPointWorker:
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-                self._log.error("Frame callback never set _have_last_triggered_image callback! Aborting acquisition.")
+                self._log.error(
+                    "Frame callback never set _have_last_triggered_image callback! Aborting acquisition. "
+                    f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                )
+                self._note_frame_timeout_abort()
                 self.request_abort_fn()
                 return
 
@@ -4270,7 +5439,7 @@ class MultiPointWorker:
                 save_c_size=(save_layout.c_size if save_layout else None),
                 save_z_size=(save_layout.z_size if save_layout else None),
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
-                state_frame_index=(save_layout.state_frame_index if save_layout else None),
+                state_frame_index=(save_layout.state_frame_index if save_layout else state_frame_index),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
                 array_channel_names=(list(save_layout.channel_names) if save_layout else None),
                 array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
@@ -4329,7 +5498,11 @@ class MultiPointWorker:
                 with self._timing.get_timer("send_trigger"):
                     self.camera.send_trigger(illumination_time=camera_illumination_time)
                 self._capture_ts["post_trigger"] = time.perf_counter()
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: a wedged trigger raises CameraTimeoutError
+                # (a BaseException), and the armed NIDAQ DO pulse MUST still be released —
+                # otherwise it survives into recovery and the next waveform FOV re-arms
+                # against a stray pulse task.
                 if nidaq_pulse_cleanup is not None:
                     try:
                         nidaq_pulse_cleanup()
@@ -4359,7 +5532,13 @@ class MultiPointWorker:
                     # wrong.
                     non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
                     if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                        self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                        # A frame that never arrives is almost always a trigger that never
+                        # arrived, so name the route it was supposed to take.
+                        self._log.error(
+                            f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition. "
+                            f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                        )
+                        self._note_frame_timeout_abort()
                         self.request_abort_fn()
                         # Let this fall through so we still turn off illumination.  Let the caller actually break out
                         # of the acquisition.
@@ -4405,7 +5584,9 @@ class MultiPointWorker:
         # is intentionally excluded: it's populated on the decode thread AFTER
         # the wait returns, so reading it here is racy and meaningless on the
         # critical-path report. A separate decode timer (future) should own it.
-        cam_ts = getattr(self.camera, "_last_capture_ts", None) or {}
+        cam_ts = getattr(self.camera, "_last_capture_ts", None)
+        if not isinstance(cam_ts, dict):
+            cam_ts = {}
         for key in ("sdk_entry", "sdk_cleared"):
             if key in cam_ts:
                 ts[key] = cam_ts[key]
@@ -4444,38 +5625,42 @@ class MultiPointWorker:
             time.sleep(min(slice_s, remaining))
 
     def handle_acquisition_abort(self, current_path):
-        # Save coordinates.csv (skip for ZARR_V3 — the controller's root copy is canonical
-        # and the per-timepoint folder may not exist).
-        if self.file_saving_option != FileSavingOption.ZARR_V3:
-            self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+        # Save what we measured so far. Only the per-timepoint copy: the aborted
+        # scan still unwinds through run_single_time_point, which appends the
+        # complete set of rows to the root acquired_positions.csv once.
+        self._write_timepoint_coordinates_csv(current_path)
         self.microcontroller.enable_joystick(True)
 
         self._wait_for_outstanding_callback_images()
 
-    def move_z_for_stack(self):
+    def move_z_for_stack(self, steps=1):
         if self.use_piezo:
-            self.z_piezo_um += self.deltaZ * 1000
+            self.z_piezo_um += self.deltaZ * 1000 * steps
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
         else:
-            self.stage.move_z(self.deltaZ)
+            self.stage.move_z(self.deltaZ * steps)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
-    def move_z_back_after_stack(self):
+    def move_z_back_after_stack(self, z_level=None):
+        if z_level is None:
+            z_level = self.NZ - 1
         if self.use_piezo:
-            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * (self.NZ - 1)
+            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * z_level
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
+            if self.z_stacking_config == "FROM CENTER":
+                self.stage.move_z(self.deltaZ * round((self.NZ - 1) / 2))
         else:
             if self.z_stacking_config == "FROM CENTER":
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1) + self.deltaZ * round((self.NZ - 1) / 2)
+                rel_z_to_start = -self.deltaZ * z_level + self.deltaZ * round((self.NZ - 1) / 2)
             else:
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1)
+                rel_z_to_start = -self.deltaZ * z_level
 
             self.stage.move_z(rel_z_to_start)

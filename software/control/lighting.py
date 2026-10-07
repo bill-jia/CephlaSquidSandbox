@@ -2178,8 +2178,13 @@ class IlluminationController:
 
     # -- Cleanup -------------------------------------------------------------
 
-    def close(self) -> None:
-        """Shut down all devices."""
+    def shut_down(self) -> None:
+        """Shut down every composed device (turn channels off, release ports).
+
+        Each device is shut down in its own try/except so that one failing
+        device (e.g. a serial light source whose port already vanished) does
+        not leave the remaining devices powered on.
+        """
         for dev in self._devices:
             try:
                 dev.shut_down()

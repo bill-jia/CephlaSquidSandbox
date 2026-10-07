@@ -4,6 +4,7 @@ import faulthandler
 import multiprocessing
 import queue
 import os
+import re
 import sys
 import time
 import json
@@ -69,6 +70,9 @@ class AcquisitionInfo:
         physical_size_z_um: Z step size in micrometers (for OME-XML).
         physical_size_x_um: Pixel size in X in micrometers (for OME-XML).
         physical_size_y_um: Pixel size in Y in micrometers (for OME-XML).
+        fovs_per_region: region_id -> number of FOVs in that region. An OME-TIFF
+            holds one region and pre-allocates one series per FOV when the
+            region's first frame arrives, so the count has to be known up front.
     """
 
     total_time_points: int
@@ -80,6 +84,7 @@ class AcquisitionInfo:
     physical_size_z_um: Optional[float] = None
     physical_size_x_um: Optional[float] = None
     physical_size_y_um: Optional[float] = None
+    fovs_per_region: Dict[str, int] = field(default_factory=dict)
 
 
 from .downsampled_views import (
@@ -186,6 +191,22 @@ def _metadata_lock_path(metadata_path: str) -> str:
     return metadata_path + ".lock"
 
 
+# Saving modes whose per-frame timing rows are consolidated into one
+# ``{acquisition_root}/acquisition_times.csv``: the ones that write their images
+# to a root-level tree of their own rather than into ``{exp}/{timepoint}/``.
+_ROOT_ACQUISITION_TIMES_SAVING_OPTIONS = (
+    _def.FileSavingOption.ZARR_V3,
+    _def.FileSavingOption.OME_TIFF,
+)
+
+
+def acquisition_times_csv_root(info: "CaptureInfo") -> str:
+    """Directory the ``filename`` column of the timing CSV is relative to."""
+    if info.acquisition_root and info.file_saving_option in _ROOT_ACQUISITION_TIMES_SAVING_OPTIONS:
+        return info.acquisition_root
+    return info.save_directory
+
+
 def append_frame_acquisition_time_csv(
     info: "CaptureInfo",
     filename: str,
@@ -196,19 +217,23 @@ def append_frame_acquisition_time_csv(
     """Append one row to the per-frame acquisition time CSV.
 
     Layout:
-    - ``ZARR_V3``: single ``{acquisition_root}/acquisition_times.csv``
-      consolidating all timepoints. The CSV's ``time_point`` column distinguishes
-      rows. ZARR_V3 stores its image data in its own per-FOV trees, so the
-      per-timepoint folder is otherwise empty in the common case.
-    - All other modes: ``{save_directory}/frame_acquisition_times.csv``,
-      i.e. one CSV per timepoint folder alongside the TIFFs.
+    - ``ZARR_V3`` and ``OME_TIFF``: single
+      ``{acquisition_root}/acquisition_times.csv`` consolidating all timepoints.
+      The CSV's ``time_point`` column distinguishes rows. Neither mode writes
+      images into the per-timepoint folder (zarr uses its own per-FOV trees,
+      OME-TIFF one multi-series file per region under ``ome_tiff/``), so no
+      per-timepoint folder is created at all and ``filename`` is relative to the
+      acquisition root (e.g. ``ome_tiff/A1.ome.tiff``).
+    - ``INDIVIDUAL_IMAGES`` / ``MULTI_PAGE_TIFF``:
+      ``{save_directory}/frame_acquisition_times.csv``, i.e. one CSV per
+      timepoint folder alongside the TIFFs, with ``filename`` relative to it.
 
     Records wall-clock time when each frame was committed for saving
     (``CaptureInfo.capture_time``). Safe across multiprocessing save workers
     via :class:`filelock.FileLock`.
     """
     _log = squid.logging.get_logger("append_frame_acquisition_time_csv")
-    if info.file_saving_option == _def.FileSavingOption.ZARR_V3 and info.acquisition_root:
+    if info.acquisition_root and info.file_saving_option in _ROOT_ACQUISITION_TIMES_SAVING_OPTIONS:
         path = os.path.join(info.acquisition_root, "acquisition_times.csv")
     else:
         path = os.path.join(info.save_directory, "frame_acquisition_times.csv")
@@ -273,6 +298,76 @@ def _acquire_file_lock(lock_path: str, context: str = ""):
             f"Failed to acquire file lock '{lock_path}' within {FILE_LOCK_TIMEOUT_SECONDS} seconds{context_msg}. "
             f"Another process may be holding the lock."
         ) from exc
+
+
+# ── Filename-safe channel labels ────────────────────────────────────────────
+# On-disk filenames must stay ASCII-and-underscored: every image file saved on
+# this rig so far embeds its channel label with spaces already turned into
+# underscores, because every preset saved before the save_observation_preset()
+# display-name fix had its name overwritten by its sanitized filename stem.
+# Preserving that on-disk convention -- even though a freshly-named preset or
+# per-point state may now legitimately have spaces in its display name -- keeps
+# external analysis scripts, which expect underscored channel tokens in
+# filenames, working unchanged.
+#
+# control.core.observation_state_service.sanitize_preset_filename() looks like
+# the natural fit, but it validates against ``[\w\- ]+`` and raises ValueError
+# on anything else (a literal ".", "," or "/", for instance), while
+# ObservationState.name (control/models/observation_state.py) is a plain
+# ``str`` with no such restriction. A legally-named live/per-point state could
+# therefore crash a running acquisition if it were sanitized with that
+# stricter validator. This local helper only normalizes whitespace to "_"
+# (matching sanitize_preset_filename's mapping for names that WOULD pass its
+# validator) and strips path separators; it never raises.
+#
+# Metadata is NOT run through this: zarr/OME channel names, the
+# acquisition-times CSV "channel" column, record_frame_time()'s channel_name,
+# and the OME-TIFF sidecar all keep the display name verbatim.
+def _filename_label(label: str) -> str:
+    stripped = str(label).strip()
+    safe = re.sub(r"\s", "_", stripped)
+    safe = safe.replace("/", "_").replace("\\", "_")
+    return safe if safe else "unnamed"
+
+
+class _FilenameLabelDeduper:
+    """Guards against two differently-named channels silently sharing a filename.
+
+    ``_filename_label`` only maps whitespace to "_", so two distinct
+    observation-state (or postprocess output) names that differ solely in
+    space-vs-underscore -- e.g. "A B" and "A_B" -- sanitize to the identical
+    on-disk label. Undetected, the second channel's frames would land on top
+    of the first's files. Claims are process-local (this runs inside one
+    JobRunner subprocess, one per acquisition) and keyed by the *raw* label so
+    the same channel keeps a stable filename for the whole acquisition; a
+    later, different raw label that collides gets a numeric suffix.
+    """
+
+    _claims: ClassVar[Dict[str, str]] = {}
+
+    @classmethod
+    def label_for(cls, raw_label: str) -> str:
+        base = _filename_label(raw_label)
+        claimed_by = cls._claims.get(base)
+        if claimed_by is None or claimed_by == raw_label:
+            cls._claims[base] = raw_label
+            return base
+        suffix = 2
+        while True:
+            candidate = f"{base}_{suffix}"
+            claimed_by = cls._claims.get(candidate)
+            if claimed_by is None or claimed_by == raw_label:
+                cls._claims[candidate] = raw_label
+                return candidate
+            suffix += 1
+
+    @classmethod
+    def clear(cls) -> None:
+        """Reset claims. Production never needs this (one JobRunner process per
+        acquisition); tests call it between cases to avoid cross-test state
+        bleed, matching SaveOMETiffJob/DownsampledViewJob/PostprocessJob's
+        existing clear_*()/finalize_all_writers() reset pattern."""
+        cls._claims.clear()
 
 
 class SaveImageJob(Job):
@@ -344,7 +439,14 @@ class SaveImageJob(Job):
             # (cycles) by folding the frame suffix into the basename's channel
             # label. Kept out of info.filename_channel_label so the channel
             # identity used by zarr/CSV stays clean.
-            _base_label = info.filename_channel_label or info.observation_state.name
+            #
+            # The raw label carries the display name (e.g. "BF LED matrix
+            # full"), which may contain spaces now that save_observation_preset
+            # no longer overwrites it -- sanitize (and dedupe against any other
+            # channel that collides once sanitized) before it becomes part of
+            # the TIFF basename.
+            _raw_label = info.filename_channel_label or info.observation_state.name
+            _base_label = _FilenameLabelDeduper.label_for(_raw_label)
             _disambiguated = f"{_base_label}_{info.frame_suffix}" if info.frame_suffix else _base_label
             saved_image = utils_acquisition.save_image(
                 image=image,
@@ -366,9 +468,95 @@ class SaveImageJob(Job):
         return True
 
 
+class OmeRegionFile:
+    """Open handle to one per-region, multi-series OME-TIFF.
+
+    Lives for the whole acquisition inside the JobRunner subprocess: it keeps
+    the bookkeeping metadata in memory and at most one open memmap (the FOV
+    currently being filled), so a frame costs one memmap plane write instead of
+    reopening the file and rewriting the sidecar JSON under a lock per plane.
+
+    The sidecar (``{ome_tiff}/.{stem}.meta.json``) is flushed when the FOV
+    changes and at finalisation, i.e. at most once per FOV visit.
+    """
+
+    _log: ClassVar = squid.logging.get_logger("OmeRegionFile")
+
+    def __init__(self, output_path: str, metadata: Dict[str, Any]):
+        self.output_path = output_path
+        self.metadata = metadata
+        self.metadata_path, self.lock_path = ome_tiff_writer.sidecar_paths(output_path)
+        self.finalized = False
+        self._memmap: Optional[np.ndarray] = None
+        self._memmap_series: Optional[int] = None
+        self._sidecar_dirty = True
+
+    def memmap_for(self, series_index: int) -> np.ndarray:
+        """Memmap of series ``series_index``, switching FOVs as needed."""
+        if self._memmap is not None and self._memmap_series != series_index:
+            self.close_memmap()
+            # The FOV we just left is complete; persist its plane metadata.
+            self.flush_sidecar()
+        if self._memmap is None:
+            stack = tifffile.memmap(self.output_path, series=series_index, mode="r+")
+            expected = tuple(int(v) for v in self.metadata[ome_tiff_writer.SHAPE_KEY])
+            if tuple(stack.shape) != expected:
+                stack.shape = expected
+            self._memmap = stack
+            self._memmap_series = series_index
+        return self._memmap
+
+    def close_memmap(self) -> None:
+        if self._memmap is None:
+            return
+        try:
+            self._memmap.flush()
+        finally:
+            self._memmap = None
+            self._memmap_series = None
+
+    def mark_dirty(self) -> None:
+        self._sidecar_dirty = True
+
+    def flush_sidecar(self) -> None:
+        if not self._sidecar_dirty:
+            return
+        with _acquire_file_lock(self.lock_path, context=self.metadata_path):
+            ome_tiff_writer.write_metadata(self.metadata_path, self.metadata)
+        self._sidecar_dirty = False
+
+    def is_complete(self) -> bool:
+        return int(self.metadata.get(ome_tiff_writer.SAVED_COUNT_KEY, 0)) >= int(
+            self.metadata[ome_tiff_writer.EXPECTED_COUNT_KEY]
+        )
+
+    def finalize(self) -> None:
+        """Write the full per-Image OME-XML and drop the sidecar."""
+        if self.finalized:
+            return
+        self.close_memmap()
+        self.metadata[ome_tiff_writer.COMPLETED_KEY] = self.is_complete()
+        ome_tiff_writer.finalize_ome_xml(self.output_path, self.metadata)
+        self.finalized = True
+        self._remove_sidecar()
+
+    def _remove_sidecar(self) -> None:
+        for path in (self.metadata_path, self.lock_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                # Windows can still hold the lock handle briefly; best-effort.
+                pass
+
+
 @dataclass
 class SaveOMETiffJob(Job):
-    """Job for saving images to OME-TIFF format.
+    """Job for saving images into one multi-series OME-TIFF per region.
+
+    Series ``i`` of ``{exp}/ome_tiff/{region_id}[__{array_key}].ome.tiff`` is
+    FOV ``i`` of that region, axes TZCYX. Every series is pre-allocated when the
+    region's first frame arrives.
 
     The acquisition_info field is injected by JobRunner.dispatch() before the job runs.
     """
@@ -376,7 +564,41 @@ class SaveOMETiffJob(Job):
     _log: ClassVar = squid.logging.get_logger("SaveOMETiffJob")
     acquisition_info: Optional[AcquisitionInfo] = field(default=None)
 
-    def run(self) -> bool:
+    # Open region files keyed by output path.
+    # SAFETY: exactly one JobRunner subprocess handles SaveOMETiffJob (one runner
+    # per job class), and it runs jobs on a single thread, so this dict needs no
+    # locking. Do NOT run SaveOMETiffJob from a thread pool.
+    _region_files: ClassVar[Dict[str, "OmeRegionFile"]] = {}
+    # Output path of the region file the last frame went to, so moving to another
+    # region releases the previous file's memmap and flushes its sidecar.
+    _active_region_path: ClassVar[Optional[str]] = None
+
+    @classmethod
+    def finalize_all_writers(cls) -> bool:
+        """Finalise every region file this process touched.
+
+        Called from the JobRunner subprocess on its way out — on normal
+        completion AND on abort/shutdown — so per-plane OME-XML never depends on
+        an acquisition reaching its expected frame count.
+
+        Returns True if every file finalised successfully.
+        """
+        failed: List[str] = []
+        for path, region_file in list(cls._region_files.items()):
+            try:
+                region_file.finalize()
+                cls._log.info(f"Finalized OME-TIFF region file: {path}")
+            except Exception as e:
+                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}")
+                failed.append(path)
+        cls._region_files.clear()
+        cls._active_region_path = None
+        if failed:
+            cls._log.error(f"Failed to finalize {len(failed)} OME-TIFF region file(s): {failed}")
+            return False
+        return True
+
+    def run(self) -> "FrameWriteResult":
         if self.acquisition_info is None:
             raise ValueError(
                 "SaveOMETiffJob.run() requires acquisition_info but it is None. "
@@ -388,18 +610,30 @@ class SaveOMETiffJob(Job):
 
         image = self.image_array()
 
+        # Reported back to the worker once the plane is on disk, so the live
+        # viewer only reads a plane the memmap write has already covered.
+        info = self.capture_info
+        _t_written, _ = ome_tiff_writer.ome_plane_indices(info)
+        region_names = list((self.acquisition_info.fovs_per_region or {}).keys())
+        region_key = str(info.region_id)
+        result = FrameWriteResult(
+            fov=int(info.fov),
+            time_point=_t_written,
+            z_index=int(info.z_index),
+            channel_name=info.observation_state.name,
+            region_idx=region_names.index(region_key) if region_key in region_names else 0,
+        )
+
         # Simulated disk I/O mode - encode to buffer, throttle, discard
         if is_simulation_enabled():
-            # Build stack key from output path
-            ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, self.capture_info)
-            base_name = ome_tiff_writer.ome_base_name(self.capture_info)
-            stack_key = os.path.join(ome_folder, base_name)
+            # One simulated stack per REGION file, matching the real layout.
+            stack_key = ome_tiff_writer.ome_output_path(self.acquisition_info, self.capture_info)
 
-            # Determine 5D shape (T, Z, C, Y, X), preferring cycle self-describing dims
+            # Per-series 5D shape (T, Z, C, Y, X), preferring cycle self-describing dims
             _t_sim, _c_sim = ome_tiff_writer.ome_plane_indices(self.capture_info)
             shape = (
                 ome_tiff_writer._ome_t_size(self.acquisition_info, self.capture_info),
-                self.acquisition_info.total_z_levels,
+                ome_tiff_writer._ome_z_size(self.acquisition_info, self.capture_info),
                 ome_tiff_writer._ome_c_size(self.acquisition_info, self.capture_info),
                 image.shape[0],
                 image.shape[1],
@@ -409,6 +643,8 @@ class SaveOMETiffJob(Job):
                 image=image,
                 stack_key=stack_key,
                 shape=shape,
+                n_series=ome_tiff_writer.region_fov_count(self.acquisition_info, self.capture_info),
+                series_index=self.capture_info.fov,
                 time_point=_t_sim,
                 z_index=self.capture_info.z_index,
                 channel_index=_c_sim,
@@ -417,107 +653,102 @@ class SaveOMETiffJob(Job):
                 f"SaveOMETiffJob {self.job_id}: simulated write of {bytes_written} bytes "
                 f"(image shape={image.shape})"
             )
-            return True
+            return result
 
         self._save_ome_tiff(image, self.capture_info)
-        return True
+        return result
+
+    def _region_file(self, image: np.ndarray, info: CaptureInfo) -> "OmeRegionFile":
+        """The open handle for this frame's region, creating the file if needed."""
+        output_path = ome_tiff_writer.ome_output_path(self.acquisition_info, info)
+        previous_path = SaveOMETiffJob._active_region_path
+        if previous_path is not None and previous_path != output_path:
+            # Moved on to another region: release its memmap and persist its
+            # bookkeeping rather than holding one open handle per region.
+            previous = self._region_files.get(previous_path)
+            if previous is not None:
+                previous.close_memmap()
+                previous.flush_sidecar()
+        SaveOMETiffJob._active_region_path = output_path
+
+        region_file = self._region_files.get(output_path)
+        if region_file is not None:
+            return region_file
+
+        ome_tiff_writer.ensure_output_directory(os.path.dirname(output_path))
+        metadata_path, _ = ome_tiff_writer.sidecar_paths(output_path)
+        if not os.path.exists(output_path):
+            # First frame of this region: pre-allocate ALL of its FOV series so
+            # every later plane is just a memmap write into series `fov`.
+            n_series = ome_tiff_writer.region_fov_count(self.acquisition_info, info)
+            metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image, n_series)
+            ome_tiff_writer.create_multiseries_file(output_path, metadata)
+            self._log.info(
+                f"Created region OME-TIFF {output_path} with {n_series} series, "
+                f"shape={tuple(metadata[ome_tiff_writer.SHAPE_KEY])}"
+            )
+        else:
+            # The file is already there, so NEVER re-allocate over it. A sidecar
+            # means a previous process was mid-write (crash / restart); no sidecar
+            # means it was finalised and is being written to again.
+            metadata = ome_tiff_writer.load_metadata(metadata_path)
+            if metadata is None:
+                metadata = ome_tiff_writer.adopt_existing_file(
+                    output_path, self.acquisition_info, info, image
+                )
+                self._log.warning(f"Writing into an already finalized region OME-TIFF {output_path}")
+            else:
+                self._log.info(f"Resuming region OME-TIFF {output_path} from its sidecar")
+            expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
+            if expected_shape[-2:] != image.shape[-2:]:
+                raise ValueError("Image dimensions do not match existing OME memmap stack")
+
+        region_file = OmeRegionFile(output_path, metadata)
+        self._region_files[output_path] = region_file
+        return region_file
 
     def _save_ome_tiff(self, image: np.ndarray, info: CaptureInfo) -> None:
         # with reference to Talley's https://github.com/pymmcore-plus/pymmcore-plus/blob/main/src/pymmcore_plus/mda/handlers/_ome_tiff_writer.py and Christoph's https://forum.image.sc/t/how-to-create-an-image-series-ome-tiff-from-python/42730/7
         ome_tiff_writer.validate_capture_info(info, self.acquisition_info, image)
 
-        ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, info)
-        ome_tiff_writer.ensure_output_directory(ome_folder)
+        region_file = self._region_file(image, info)
+        metadata = region_file.metadata
+        shape = tuple(int(v) for v in metadata[ome_tiff_writer.SHAPE_KEY])
 
-        base_name = ome_tiff_writer.ome_base_name(info)
-        output_path = os.path.join(ome_folder, base_name + ".ome.tiff")
-        metadata_path = ome_tiff_writer.metadata_temp_path(self.acquisition_info, info, base_name)
-        lock_path = _metadata_lock_path(metadata_path)
+        target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
+        image_to_store = image if image.dtype == target_dtype else image.astype(target_dtype)
 
-        with _acquire_file_lock(lock_path, context=output_path):
-            metadata = ome_tiff_writer.load_metadata(metadata_path)
-            if metadata is None:
-                metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image)
-                target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                tifffile.imwrite(
-                    output_path,
-                    shape=tuple(metadata[ome_tiff_writer.SHAPE_KEY]),
-                    dtype=target_dtype,
-                    metadata=ome_tiff_writer.metadata_for_imwrite(metadata),
-                    ome=True,
-                )
-            else:
-                expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
-                if expected_shape[-2:] != image.shape[-2:]:
-                    raise ValueError("Image dimensions do not match existing OME memmap stack")
-                # acquisition_info is guaranteed non-None here (validated in run())
-                if not metadata.get(ome_tiff_writer.CHANNEL_NAMES_KEY) and self.acquisition_info.channel_names:
-                    metadata[ome_tiff_writer.CHANNEL_NAMES_KEY] = self.acquisition_info.channel_names
+        time_point, channel_index = ome_tiff_writer.ome_plane_indices(info)
+        z_index = int(info.z_index)
+        fov = int(info.fov)
+        ome_tiff_writer.validate_series_index(metadata, fov)
+        if not (0 <= time_point < shape[0]):
+            raise ValueError("Time point index out of range for OME stack")
+        if not (0 <= z_index < shape[1]):
+            raise ValueError("Z index out of range for OME stack")
+        if not (0 <= channel_index < shape[2]):
+            raise ValueError("Channel index out of range for OME stack")
 
-            target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
-            image_to_store = image if image.dtype == target_dtype else image.astype(target_dtype)
+        stack = region_file.memmap_for(fov)
+        stack[time_point, z_index, channel_index, :, :] = image_to_store
 
-            time_point, channel_index = ome_tiff_writer.ome_plane_indices(info)
-            z_index = int(info.z_index)
-            shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
-            if not (0 <= time_point < shape[0]):
-                raise ValueError("Time point index out of range for OME stack")
-            if not (0 <= z_index < shape[1]):
-                raise ValueError("Z index out of range for OME stack")
-            if not (0 <= channel_index < shape[2]):
-                raise ValueError("Channel index out of range for OME stack")
-
-            stack = tifffile.memmap(output_path, dtype=target_dtype, mode="r+")
-            if stack.shape != shape:
-                stack.shape = shape
-            try:
-                stack[time_point, z_index, channel_index, :, :] = image_to_store
-                stack.flush()
-            finally:
-                del stack
-
-            try:
-                _rel_ome = os.path.relpath(output_path, info.save_directory)
-            except ValueError:
-                _rel_ome = os.path.basename(output_path)
-            append_frame_acquisition_time_csv(info, _rel_ome.replace("\\", "/"))
-
-            metadata = ome_tiff_writer.update_plane_metadata(metadata, info)
-            index_key = f"{time_point}-{channel_index}-{z_index}"
-            if index_key not in metadata[ome_tiff_writer.WRITTEN_INDICES_KEY]:
-                metadata[ome_tiff_writer.WRITTEN_INDICES_KEY].append(index_key)
-                metadata[ome_tiff_writer.SAVED_COUNT_KEY] = len(metadata[ome_tiff_writer.WRITTEN_INDICES_KEY])
-
-            # Check if all images have been saved
-            is_complete = metadata[ome_tiff_writer.SAVED_COUNT_KEY] >= metadata[ome_tiff_writer.EXPECTED_COUNT_KEY]
-            if is_complete:
-                metadata[ome_tiff_writer.COMPLETED_KEY] = True
-
-            # Write metadata (includes completed flag if acquisition is done)
-            ome_tiff_writer.write_metadata(metadata_path, metadata)
-
-            if is_complete:
-                # Finalize OME-XML and clean up temporary files
-                with tifffile.TiffFile(output_path) as tif:
-                    current_xml = tif.ome_metadata
-                ome_xml = ome_tiff_writer.augment_ome_xml(current_xml, metadata)
-                tifffile.tiffcomment(output_path, ome_xml.encode("utf-8"))
-                if os.path.exists(metadata_path):
-                    os.remove(metadata_path)
-
-        # Clean up lock file after lock is released (only when acquisition completed).
-        # Race condition note: Between releasing the lock and this cleanup, another process
-        # could theoretically acquire the same lock path. However:
-        # 1. We only attempt removal if metadata_path is gone (acquisition completed)
-        # 2. If another process holds the lock, os.remove fails with OSError (caught below)
-        # 3. This is best-effort cleanup; stale locks are also cleaned by cleanup_stale_metadata_files
+        output_path = region_file.output_path
         try:
-            if not os.path.exists(metadata_path):
-                os.remove(lock_path)
-        except OSError:
-            pass  # Lock held by another process, already removed, or platform-specific issue
+            _rel_ome = os.path.relpath(output_path, acquisition_times_csv_root(info))
+        except ValueError:
+            _rel_ome = os.path.basename(output_path)
+        append_frame_acquisition_time_csv(info, _rel_ome.replace("\\", "/"))
+
+        ome_tiff_writer.update_plane_metadata(metadata, info)
+        region_file.mark_dirty()
+
+        if region_file.is_complete():
+            # Every plane of every FOV of this region has landed: finalize now
+            # instead of carrying the handle to the end of the run. The
+            # end-of-run hook (finalize_all_writers) covers everything else,
+            # including an aborted run.
+            region_file.finalize()
+            self._region_files.pop(output_path, None)
 
 
 @dataclass
@@ -683,8 +914,13 @@ class ZarrWriterInfo:
 
 
 @dataclass
-class ZarrWriteResult:
-    """Result from a SaveZarrJob, containing frame info for viewer notification."""
+class FrameWriteResult:
+    """One frame is on disk — the viewer may read it now.
+
+    Returned by every saving job whose write happens in the JobRunner subprocess
+    (:class:`SaveZarrJob`, :class:`SaveOMETiffJob`), so the live-view
+    notification is driven by the same result type regardless of saving mode.
+    """
 
     fov: int
     time_point: int
@@ -736,8 +972,8 @@ class SaveZarrJob(Job):
             cls._hcs_wells_written.clear()
 
     @classmethod
-    def finalize_all_writers(cls) -> bool:
-        """Finalize all active zarr writers.
+    def finalize_all_writers(cls, upload_target: Optional[UploadTarget] = None) -> bool:
+        """Finalize all active zarr writers, staging any final partial shards.
 
         Call at end of acquisition to ensure all data is written.
 
@@ -749,6 +985,15 @@ class SaveZarrJob(Job):
             if writer.is_initialized and not writer.is_finalized:
                 try:
                     writer.finalize()
+                    # Finalization may commit a short/aborted stack that was
+                    # intentionally withheld from earlier upload barriers.
+                    if upload_target is not None and upload_target.enabled:
+                        FlushAndStageUploadJob(
+                            time_point=-1,
+                            region_id="(finalize)",
+                            output_path=path,
+                            upload_target=upload_target,
+                        ).run()
                     cls._log.info(f"Finalized zarr writer: {path}")
                 except Exception as e:
                     cls._log.error(f"Error finalizing writer {path}: {e}")
@@ -810,7 +1055,7 @@ class SaveZarrJob(Job):
             self._hcs_wells_written.add(well_path)
             self._log.debug(f"Wrote HCS well metadata for {region_id}: {fov_count} fields")
 
-    def run(self) -> ZarrWriteResult:
+    def run(self) -> FrameWriteResult:
         if self.zarr_writer_info is None:
             raise ValueError(
                 "SaveZarrJob.run() requires zarr_writer_info but it is None. "
@@ -829,7 +1074,7 @@ class SaveZarrJob(Job):
         output_path = self.zarr_writer_info.get_output_path(region_id, fov, ak)
 
         region_names = list(self.zarr_writer_info.region_fov_counts.keys())
-        result = ZarrWriteResult(
+        result = FrameWriteResult(
             fov=fov,
             time_point=t,
             z_index=info.z_index,
@@ -864,7 +1109,7 @@ class SaveZarrJob(Job):
 
         self._save_zarr(image, info, output_path)
         try:
-            _rel_z = os.path.relpath(output_path, info.save_directory)
+            _rel_z = os.path.relpath(output_path, acquisition_times_csv_root(info))
         except ValueError:
             _rel_z = output_path
         append_frame_acquisition_time_csv(info, _rel_z.replace("\\", "/"))
@@ -937,6 +1182,7 @@ class SaveZarrJob(Job):
                 translation_um=translation_um,
                 manifest_path=manifest_path,
                 shard_per_z=_def.ZARR_SHARD_PER_Z,
+                chunk_separator=_def.ZARR_CHUNK_SEPARATOR,
                 squid_extras=squid_extras,
             )
             try:
@@ -975,20 +1221,28 @@ class BarrierResult:
     fov: int
     file_count: int
     submitted: bool  # False means upload disabled or writer missing — no UploadResult will ever arrive
+    manager_owned: bool = False
 
 
 @dataclass
 class FlushAndStageUploadJob:
     """Barrier job: flush one ``(t, fov)``'s zarr writes, then stage upload.
 
-    Runs in the ``JobRunner`` subprocess. Because the JobRunner pulls jobs
-    FIFO from a single queue, by the time this job runs every preceding
-    ``SaveZarrJob`` for ``(t, fov)`` has already been processed. We then call
-    ``writer.wait_for_pending()`` on the per-FOV ``ZarrWriter`` so all
-    outstanding TensorStore futures resolve, collect the resulting shard
-    paths via :meth:`ZarrWriter.drain_unstaged_shard_paths`, build local→remote
-    pairs, and push one :class:`UploadTask` onto the ``UploadWorker``'s input
-    queue. Network I/O happens in the upload worker, not here.
+    Runs in the ``JobRunner`` subprocess. The JobRunner pulls jobs FIFO from a
+    single queue, so every ``SaveZarrJob`` *already queued* for ``(t, fov)`` has
+    been processed by the time this job runs. Note that jobs are queued from the
+    camera callback thread, so the worker waits for those callbacks to drain
+    before dispatching this barrier — otherwise a frame can still be in flight
+    and land behind it. We then call ``writer.wait_for_pending()`` on the
+    per-FOV ``ZarrWriter`` so all outstanding TensorStore futures resolve,
+    collect the resulting shard paths via
+    :meth:`ZarrWriter.drain_unstaged_shard_paths`, build local→remote pairs, and
+    push one :class:`UploadTask` onto the ``UploadWorker``'s input queue.
+    Network I/O happens in the upload worker, not here.
+
+    A z-slice that is still missing channels is deliberately *not* committed by
+    that flush; it stages at a later barrier once complete. See
+    :meth:`ZarrWriter._flush_pending_z`.
 
     NOTE: this class does NOT inherit from :class:`Job` because the parent
     requires a real ``CaptureInfo``/``JobImage`` per-frame. The
@@ -1014,6 +1268,11 @@ class FlushAndStageUploadJob:
     # Set in each ``JobRunner`` subprocess by ``JobRunner.run()`` so the job
     # can reach the upload worker without pickling the queue per-job.
     _upload_input_queue: ClassVar[Optional[multiprocessing.Queue]] = None
+    # Shared submitted-tasks counter (UploadWorker.tasks_submitted_value),
+    # installed alongside the queue. Incremented BEFORE every put so the main
+    # process's outstanding arithmetic can never undercount a task that
+    # reached the worker.
+    _upload_tasks_submitted: ClassVar[Optional[multiprocessing.Value]] = None
 
     def run(self) -> BarrierResult:
         from uuid import uuid4
@@ -1096,20 +1355,6 @@ class FlushAndStageUploadJob:
         deletable = set(shard_paths)
         stable_read = set(metadata_paths)
 
-        if FlushAndStageUploadJob._upload_input_queue is None:
-            self._log.error(
-                "Upload enabled but UploadWorker queue not initialized in this "
-                "JobRunner subprocess — dropping task. Check JobRunner.run()."
-            )
-            return BarrierResult(
-                task_id=task_id,
-                time_point=self.time_point,
-                region_id=self.region_id,
-                fov=self.fov,
-                file_count=len(files),
-                submitted=False,
-            )
-
         task = UploadTask(
             task_id=task_id,
             time_point=self.time_point,
@@ -1119,6 +1364,72 @@ class FlushAndStageUploadJob:
             deletable_local_paths=deletable,
             stable_read_paths=stable_read,
         )
+        if self.upload_target.manager_owned:
+            # Submission is committed to the manager's SQLite inventory before
+            # this call returns.  Its local outbox survives a manager restart
+            # between writer completion and acknowledgement.
+            from control.core.upload_manager_client import UploadManagerClient
+
+            root = self.upload_target.local_base
+            manager_files = []
+            for local, _remote in task.files:
+                manager_files.append(
+                    {
+                        "relative_path": os.path.relpath(local, root).replace("\\", "/"),
+                        "size": os.path.getsize(local),
+                        # Mutable metadata is a new generation when its bytes
+                        # change; immutable shards retain their task generation.
+                        "generation": (
+                            f"metadata:{os.stat(local).st_mtime_ns}:{os.path.getsize(local)}"
+                            if local in stable_read else "1"
+                        ),
+                        "deletable": local in deletable,
+                        "stable_read": local in stable_read,
+                    }
+                )
+            try:
+                UploadManagerClient().submit_batch(
+                    self.upload_target.manager_dataset_id,
+                    task_id,
+                    manager_files,
+                    task_id=task_id,
+                )
+            except Exception:
+                self._log.exception("Could not durably submit upload task %s", task_id)
+                return BarrierResult(
+                    task_id=task_id,
+                    time_point=self.time_point,
+                    region_id=self.region_id,
+                    fov=self.fov,
+                    file_count=len(files),
+                    submitted=False,
+                    manager_owned=True,
+                )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+                manager_owned=True,
+            )
+        if FlushAndStageUploadJob._upload_input_queue is None:
+            self._log.error(
+                "Upload enabled but UploadWorker queue not initialized in this "
+                "JobRunner subprocess — dropping legacy task. Check JobRunner.run()."
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+            )
+        if FlushAndStageUploadJob._upload_tasks_submitted is not None:
+            with FlushAndStageUploadJob._upload_tasks_submitted.get_lock():
+                FlushAndStageUploadJob._upload_tasks_submitted.value += 1
         FlushAndStageUploadJob._upload_input_queue.put(task)
         self._log.debug(
             f"Staged upload task {task_id} for t={self.time_point} fov={self.fov} "
@@ -1202,8 +1513,9 @@ class PostprocessJob(Job):
     so their raw images are never written. This job accumulates them in a
     process-local ClassVar (the ``DownsampledViewJob`` pattern), and on the last
     expected frame runs the routine, writes each declared output as its own
-    single-channel plate via an inline ``SaveZarrJob`` (ZARR_V3) or a direct
-    float-safe TIFF write (INDIVIDUAL_IMAGES), and — for ZARR_V3 with upload
+    single-channel plate via an inline ``SaveZarrJob`` (ZARR_V3), its own keyed
+    per-region file via an inline ``SaveOMETiffJob`` (OME_TIFF), or a direct
+    float-safe TIFF write (INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF), and — for ZARR_V3 with upload
     enabled — runs the derived-plate upload barrier inline (so it deterministically
     follows the writes in this same subprocess, avoiding the cross-thread
     ordering race the worker-dispatched barrier would have).
@@ -1405,40 +1717,57 @@ class PostprocessJob(Job):
             dtype = frames[0]["image"].dtype
         return arr.astype(dtype, copy=False)
 
+    def _derived_capture_info(
+        self, out_key: str, spec: dict, zi: int, z_size: int, t_scan: int, capture_time: float
+    ) -> CaptureInfo:
+        """A fully self-describing CaptureInfo for one plane of a derived output.
+
+        The derived array is keyed by ``out_key`` and is single-channel with its
+        OWN (T, Z) extent — the routine may collapse an N-plane input to one
+        derived plane, so ``save_z_size`` must not be taken from the acquisition.
+
+        ``array_key`` becomes part of the zarr/OME-TIFF output path (see
+        ``ome_tiff_writer.ome_output_path`` / ``ZarrWriterInfo.get_output_path``),
+        so it goes through ``_filename_label``. ``filename_channel_label`` stays
+        the raw ``out_key``: it is only read for ``record_frame_time``'s
+        ``channel_name`` (metadata), never for a path.
+        """
+        info = self.capture_info
+        return CaptureInfo(
+            position=info.position,
+            z_index=zi,
+            capture_time=capture_time,
+            observation_state=info.observation_state,
+            save_directory=info.save_directory,
+            file_id=info.file_id,
+            region_id=info.region_id,
+            fov=info.fov,
+            configuration_idx=0,
+            time_point=info.time_point,
+            filename_channel_label=out_key,
+            array_key=_filename_label(out_key),
+            save_t_index=t_scan,
+            save_c_index=0,
+            save_t_size=int(self.ctx_meta.get("nt", 1)),
+            save_c_size=1,
+            save_z_size=z_size,
+            array_channel_names=[out_key],
+            array_channel_colors=[spec.get("channel_color", "#FFFFFF")],
+            array_channel_wavelengths=[spec.get("wavelength_nm")],
+            file_saving_option=info.file_saving_option
+            if info.file_saving_option is not None
+            else _def.FILE_SAVING_OPTION,
+            acquisition_root=info.acquisition_root,
+        )
+
     def _write_output(self, arr: np.ndarray, out_key: str, spec: dict, t_scan: int, capture_time: float) -> int:
         info = self.capture_info
         save_format = info.file_saving_option if info.file_saving_option is not None else _def.FILE_SAVING_OPTION
         z_size = int(spec["z_size"])
-        nt = int(self.ctx_meta.get("nt", 1))
-        wavelength = spec.get("wavelength_nm")
-        color = spec.get("channel_color", "#FFFFFF")
 
         if save_format == _def.FileSavingOption.ZARR_V3:
             for zi in range(z_size):
-                ci = CaptureInfo(
-                    position=info.position,
-                    z_index=zi,
-                    capture_time=capture_time,
-                    observation_state=info.observation_state,
-                    save_directory=info.save_directory,
-                    file_id=info.file_id,
-                    region_id=info.region_id,
-                    fov=info.fov,
-                    configuration_idx=0,
-                    time_point=info.time_point,
-                    filename_channel_label=out_key,
-                    array_key=out_key,
-                    save_t_index=t_scan,
-                    save_c_index=0,
-                    save_t_size=nt,
-                    save_c_size=1,
-                    save_z_size=z_size,
-                    array_channel_names=[out_key],
-                    array_channel_colors=[color],
-                    array_channel_wavelengths=[wavelength],
-                    file_saving_option=save_format,
-                    acquisition_root=info.acquisition_root,
-                )
+                ci = self._derived_capture_info(out_key, spec, zi, z_size, t_scan, capture_time)
                 sub = SaveZarrJob(
                     capture_info=ci,
                     capture_image=JobImage(image_array=arr[zi]),
@@ -1447,19 +1776,45 @@ class PostprocessJob(Job):
                 sub.run()
             return 1
 
-        # INDIVIDUAL_IMAGES: float-safe direct TIFF write (avoids save_image's
+        if save_format == _def.FileSavingOption.OME_TIFF:
+            # One keyed region file per output, ``{exp}/ome_tiff/{region}__{out_key}.ome.tiff``,
+            # written by an inline SaveOMETiffJob exactly as the zarr branch uses an
+            # inline SaveZarrJob. It is a different file from every raw one: a
+            # postprocessed step saves no raw frames, so no raw array_key equals an
+            # out_key, and a dense raw run has no array_key at all. The simulated-IO
+            # path and the timing-CSV row live inside that job, so both stay
+            # identical to raw OME-TIFF saving.
+            if self.acquisition_info is None:
+                raise ValueError(
+                    "PostprocessJob needs acquisition_info to write OME-TIFF outputs. "
+                    "It is injected by JobRunner.dispatch(); set it before calling run() directly."
+                )
+            for zi in range(z_size):
+                ci = self._derived_capture_info(out_key, spec, zi, z_size, t_scan, capture_time)
+                sub = SaveOMETiffJob(
+                    capture_info=ci,
+                    capture_image=JobImage(image_array=arr[zi]),
+                    acquisition_info=self.acquisition_info,
+                )
+                sub.run()
+            return 1
+
+        # INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF: float-safe direct TIFF write (avoids save_image's
         # uint/pseudo-color handling). One file per output (+ z suffix if 3D).
         from control.core.io_simulation import is_simulation_enabled
 
         if is_simulation_enabled():
             return 1
         pad = _def.FILE_ID_PADDING
+        fn_key = _filename_label(out_key)
         for zi in range(z_size):
             zsuffix = "" if z_size == 1 else f"_z{zi:03d}"
-            fname = f"{info.region_id}_{info.fov:0{pad}}_{out_key}{zsuffix}.tiff"
+            fname = f"{info.region_id}_{info.fov:0{pad}}_{fn_key}{zsuffix}.tiff"
             out_path = os.path.join(info.save_directory, fname)
             try:
                 tifffile.imwrite(out_path, arr[zi])
+                # ``channel=out_key`` (not fn_key): the CSV "channel" column is
+                # metadata and keeps the display name.
                 append_frame_acquisition_time_csv(info, fname, channel=out_key, channel_index=0)
             except Exception as e:
                 self._log.error(f"Failed to write postprocess output {out_path}: {e}")
@@ -1472,7 +1827,10 @@ class PostprocessJob(Job):
             return None
         if not (self.upload_target and self.upload_target.enabled):
             return None
-        output_path = self.zarr_writer_info.get_output_path(str(info.region_id), info.fov, out_key)
+        # Must match the array_key SaveZarrJob actually wrote under (set from
+        # this same out_key via _filename_label in _derived_capture_info), or
+        # the barrier stages the wrong (non-existent) path.
+        output_path = self.zarr_writer_info.get_output_path(str(info.region_id), info.fov, _filename_label(out_key))
         barrier = FlushAndStageUploadJob(
             time_point=info.time_point or 0,
             region_id=str(info.region_id),
@@ -1578,6 +1936,7 @@ class DownsampledViewResult:
     well_col: int
     well_images: Dict[int, np.ndarray]  # channel_idx -> downsampled image
     channel_names: List[str]
+    time_point: int = 0
 
 
 @dataclass
@@ -1603,6 +1962,7 @@ class DownsampledViewJob(Job):
 
     # All fields must have defaults because parent class Job has job_id with default
     well_id: str = ""
+    time_point: int = 0
     well_row: int = 0
     well_col: int = 0
     fov_index: int = 0
@@ -1623,11 +1983,11 @@ class DownsampledViewJob(Job):
     interpolation_method: Union[DownsamplingMethod, str] = DownsamplingMethod.INTER_AREA_FAST
     skip_saving: bool = False  # Skip TIFF file saving (just generate for display)
 
-    # Class-level accumulator storage keyed by well_id.
+    # Class-level accumulator storage keyed by output directory, timepoint and well.
     # Note: This runs inside JobRunner (a multiprocessing.Process), so each worker
     # process has its own copy of this class variable. It is process-local and
     # safe to mutate without cross-process synchronization.
-    _well_accumulators: ClassVar[Dict[str, WellTileAccumulator]] = {}
+    _well_accumulators: ClassVar[Dict[Tuple[str, int, str], WellTileAccumulator]] = {}
     # Track wells that encountered errors during processing
     _failed_wells: ClassVar[Dict[str, str]] = {}  # well_id -> error message
 
@@ -1675,9 +2035,10 @@ class DownsampledViewJob(Job):
 
         t_crop = time.perf_counter()
 
-        # Get or create accumulator for this well
-        if self.well_id not in self._well_accumulators:
-            self._well_accumulators[self.well_id] = WellTileAccumulator(
+        # T may be inside Pos/Z/C, so several timepoints can be incomplete together.
+        accumulator_key = (self.output_dir, self.time_point, self.well_id)
+        if accumulator_key not in self._well_accumulators:
+            self._well_accumulators[accumulator_key] = WellTileAccumulator(
                 well_id=self.well_id,
                 total_fovs=self.total_fovs_in_well,
                 total_channels=self.total_channels,
@@ -1687,7 +2048,7 @@ class DownsampledViewJob(Job):
                 z_projection_mode=self.z_projection_mode,
             )
 
-        accumulator = self._well_accumulators[self.well_id]
+        accumulator = self._well_accumulators[accumulator_key]
         accumulator.add_tile(
             cropped,
             self.fov_position_in_well,
@@ -1817,6 +2178,7 @@ class DownsampledViewJob(Job):
             )
 
             return DownsampledViewResult(
+                time_point=self.time_point,
                 well_id=self.well_id,
                 well_row=self.well_row,
                 well_col=self.well_col,
@@ -1831,7 +2193,7 @@ class DownsampledViewJob(Job):
             raise
         finally:
             # Ensure accumulator is always cleaned up after processing a complete well
-            self._well_accumulators.pop(self.well_id, None)
+            self._well_accumulators.pop(accumulator_key, None)
 
 
 # TODO: For Zarr with FULL_FRAME chunks, writes to different FOVs/regions are
@@ -1843,7 +2205,6 @@ class JobRunner(multiprocessing.Process):
     def __init__(
         self,
         acquisition_info: Optional[AcquisitionInfo] = None,
-        cleanup_stale_ome_files: bool = False,
         log_file_path: Optional[str] = None,
         # Backpressure shared values (from BackpressureController)
         bp_pending_jobs: Optional[multiprocessing.Value] = None,
@@ -1856,6 +2217,11 @@ class JobRunner(multiprocessing.Process):
         # owned by the main process; this subprocess only writes to it.
         upload_target: Optional[UploadTarget] = None,
         upload_input_queue: Optional[multiprocessing.Queue] = None,
+        # Shared counter (UploadWorker.tasks_submitted_value): incremented by
+        # every barrier in this subprocess right before it puts an UploadTask
+        # on ``upload_input_queue``, so the main process can compute
+        # outstanding uploads without depending on BarrierResult delivery.
+        upload_tasks_submitted: Optional[multiprocessing.Value] = None,
     ):
         super().__init__()
         # Daemon processes are terminated when the main process exits, ensuring
@@ -1868,6 +2234,7 @@ class JobRunner(multiprocessing.Process):
         self._zarr_writer_info = zarr_writer_info
         self._upload_target = upload_target
         self._upload_input_queue = upload_input_queue
+        self._upload_tasks_submitted = upload_tasks_submitted
         self._log_file_path = log_file_path  # Will be used in subprocess to set up file logging
 
         self._input_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -1882,13 +2249,6 @@ class JobRunner(multiprocessing.Process):
         self._bp_pending_jobs = bp_pending_jobs
         self._bp_pending_bytes = bp_pending_bytes
         self._bp_capacity_event = bp_capacity_event
-
-        # Clean up stale metadata files from previous crashed acquisitions
-        # Only run when explicitly requested (i.e., when OME-TIFF saving is being used)
-        if cleanup_stale_ome_files:
-            removed = ome_tiff_writer.cleanup_stale_metadata_files()
-            if removed:
-                self._log.info(f"Cleaned up {len(removed)} stale OME-TIFF metadata files")
 
     def dispatch(self, job: Job):
         # Inject acquisition_info into SaveOMETiffJob instances before serialization.
@@ -2015,7 +2375,14 @@ class JobRunner(multiprocessing.Process):
         """Check if the subprocess is ready without blocking."""
         return self._ready_event.is_set()
 
-    def shutdown(self, timeout_s=1.0):
+    def shutdown(self, timeout_s=1.0, close_output_queue: bool = True):
+        """Stop the subprocess: sentinel, join, last-resort terminate.
+
+        ``close_output_queue=False`` leaves the parent-side output queue open
+        and readable after the join — required when a background upload
+        drainer keeps consuming late BarrierResults from it. The caller that
+        passed False owns closing the queue when it is done.
+        """
         # Guard against double shutdown
         if self._shutdown_event is None:
             return
@@ -2037,6 +2404,7 @@ class JobRunner(multiprocessing.Process):
         # generous enough for finalize to complete (see
         # JOB_RUNNER_FINALIZE_TIMEOUT_S); reaching this branch means finalize
         # genuinely wedged.
+        terminated = False
         if self.is_alive():
             if getattr(_def, "ZARR_SHARD_PER_Z", False):
                 # Per-z sharding commits each z-slice during acquisition, so the
@@ -2062,14 +2430,23 @@ class JobRunner(multiprocessing.Process):
             )
             self.terminate()
             self.join(timeout=1.0)
-        # Clean up multiprocessing primitives to avoid semaphore leaks
+            terminated = True
+        # Clean up multiprocessing primitives to avoid semaphore leaks.
         self._input_queue.close()
-        self._input_queue.join_thread()
-        self._output_queue.close()
-        self._output_queue.join_thread()
+        if terminated:
+            # The consumer is dead; whatever the feeder still holds can never
+            # drain into the (possibly full) pipe, and join_thread() would
+            # block this thread forever. Abandon the buffered items — the
+            # subprocess that would have run them is gone either way.
+            self._input_queue.cancel_join_thread()
+        else:
+            self._input_queue.join_thread()
+        if close_output_queue:
+            self._output_queue.close()
+            self._output_queue.join_thread()
+            self._output_queue = None
         # Clear references to allow garbage collection of Event and Value semaphores
         self._input_queue = None
-        self._output_queue = None
         self._shutdown_event = None
         self._pending_count = None
 
@@ -2110,6 +2487,7 @@ class JobRunner(multiprocessing.Process):
         # ``UploadWorker``; we are only a producer here.
         if self._upload_input_queue is not None:
             FlushAndStageUploadJob._upload_input_queue = self._upload_input_queue
+            FlushAndStageUploadJob._upload_tasks_submitted = self._upload_tasks_submitted
             self._log.info("Upload input queue installed on FlushAndStageUploadJob")
 
         # PostprocessJob holds accumulated frame bytes across job completions, so
@@ -2120,15 +2498,41 @@ class JobRunner(multiprocessing.Process):
         # Signal to main process that we're ready to receive jobs
         self._ready_event.set()
 
-        while not self._shutdown_event.is_set():
+        # Loop exit is SENTINEL-driven, not event-driven: shutdown() sets the
+        # event and then enqueues a trailing ``None``. Jobs already queued sit
+        # AHEAD of that sentinel, so draining until we see it (or until the
+        # queue is empty with the event set — covers a lost sentinel) runs
+        # every dispatched job before finalize. The old
+        # ``while not shutdown_event`` form exited after the in-flight job and
+        # silently dropped the whole queued backlog: frames vanished,
+        # upload barriers never staged, and finalize stamped
+        # ``acquisition_complete`` over the truncated data.
+        while True:
             job = None
             try:
                 t_wait_start = time.perf_counter()
-                job = self._input_queue.get(timeout=self._input_timeout)
+                try:
+                    job = self._input_queue.get(timeout=self._input_timeout)
+                except queue.Empty:
+                    if self._shutdown_event.is_set():
+                        # Covers a lost sentinel — but only exit once nothing
+                        # is still owed. The pipe can be transiently empty
+                        # while the parent feeder is mid-pickle of a large
+                        # job; pending_count (incremented at dispatch, before
+                        # the put) is the authoritative "jobs still coming"
+                        # signal, so waiting on it cannot drop a queued job.
+                        with self._pending_count.get_lock():
+                            still_owed = self._pending_count.value > 0
+                        if not still_owed:
+                            break
+                    continue
                 t_got_job = time.perf_counter()
 
-                # None is a shutdown sentinel - skip processing and check shutdown flag
+                # None is the shutdown sentinel: everything dispatched before
+                # shutdown has now been processed.
                 if job is None:
+                    if self._shutdown_event.is_set():
+                        break
                     continue
 
                 self._log.debug(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
@@ -2224,11 +2628,21 @@ class JobRunner(multiprocessing.Process):
         # Finalize any zarr writers that are still open
         t_finalize_start = time.perf_counter()
         try:
-            success = SaveZarrJob.finalize_all_writers()
+            success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:
             self._log.error(f"Error finalizing zarr writers during shutdown: {e}")
+
+        # Write the per-Image Plane XML of every region OME-TIFF this runner
+        # touched and drop its sidecar. Runs on normal completion AND on
+        # abort/shutdown, so an aborted acquisition still leaves readable
+        # positions/timestamps instead of a bare pre-allocated stack.
+        try:
+            if not SaveOMETiffJob.finalize_all_writers():
+                self._log.error("OME-TIFF FINALIZATION INCOMPLETE - Some metadata may be missing")
+        except Exception as e:
+            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}")
         self._log.info(
             f"finalize_all_writers() completed in {time.perf_counter() - t_finalize_start:.1f}s"
         )
@@ -2260,18 +2674,28 @@ class JobRunner(multiprocessing.Process):
         log_memory("WORKER_SHUTDOWN", include_children=False)
         stop_worker_monitoring()
 
-        # Let the subprocess exit promptly even if JobResults remain buffered in
-        # the output queue's feeder thread. Data durability is guaranteed by
-        # finalize_all_writers() above (not by this status queue), and the parent
-        # has already drained the results it needs and tracks completion via the
-        # shared pending counter. Without this, an unflushed output item makes
-        # the feeder block at interpreter exit and the whole subprocess hangs
-        # until the parent's terminate() fires — the leading suspect for the
-        # observed 600s finalize wedge. The watchdog above confirms this (no
-        # dump => exit is now clean) or reveals a different teardown culprit.
+        # Output-queue exit policy depends on whether uploads are wired in.
+        #
+        # WITHOUT uploads: abandon buffered JobResults (cancel_join_thread) so
+        # an unread status item can never block interpreter exit — data
+        # durability comes from finalize_all_writers(), and nobody reads this
+        # queue after the parent's final drain (the old 600s teardown wedge).
+        #
+        # WITH uploads: the buffered items include BarrierResults, which the
+        # background upload drainer DOES keep reading after the parent's final
+        # drain — abandoning them silently corrupted the upload accounting
+        # (undercounted outstanding tasks → early worker teardown → false
+        # RAW_DATA_UPLOADED marker). Flush the feeder instead; the drainer
+        # polls this queue continuously, so the flush completes quickly. If
+        # the drainer died first, the parent's shutdown() join/terminate is
+        # the backstop.
         try:
-            self._output_queue.cancel_join_thread()
+            if self._upload_input_queue is not None:
+                self._output_queue.close()
+                self._output_queue.join_thread()
+            else:
+                self._output_queue.cancel_join_thread()
         except Exception as e:
-            self._log.debug(f"output_queue.cancel_join_thread on exit: {e}")
+            self._log.debug(f"output_queue flush/cancel on exit: {e}")
 
         self._log.info("Shutdown request received, exiting run (interpreter teardown begins).")

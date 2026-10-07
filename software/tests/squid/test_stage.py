@@ -64,4 +64,6 @@ def test_move_to_cached_or_default_uses_defaults_when_no_cache():
     pos = stage.get_pos()
     assert pos.x_mm == pytest.approx(_def.STARTUP_DEFAULT_STAGE_X_MM)
     assert pos.y_mm == pytest.approx(_def.STARTUP_DEFAULT_STAGE_Y_MM)
-    assert pos.z_mm == pytest.approx(_def.STARTUP_DEFAULT_STAGE_Z_MM)
+    assert pos.z_mm == pytest.approx(_def.OBJECTIVE_RETRACTED_POS_MM)
+    assert stage.is_z_retracted
+    assert stage.working_z_mm == pytest.approx(_def.STARTUP_DEFAULT_STAGE_Z_MM)

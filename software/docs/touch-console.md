@@ -196,3 +196,68 @@ silently time out on the former. The outcome comes back through a Qt signal.
 - [Running the software](running-the-software.md) — launchers and startup
 - [MCP integration](mcp_integration.md) — the control server the acquisition launcher reuses
 - [Configuration system](configuration-system.md) — profiles and observation states
+
+## Capturing both interfaces for review
+
+From `software/`, using the Squid Python environment:
+
+```powershell
+$env:QT_QPA_PLATFORM = "windows"
+python tools/screenshot_multipoint.py ../artifacts/touch-console-2026-10-07 --touch-console --populate 3 --enable-zt
+```
+
+This constructs one simulated microscope and both real GUI windows, starts a simulated
+live stream, and captures the console at its top, middle, and bottom scroll positions.
+It also captures the complete companion window with the Flexible and Wellplate tabs
+selected, plus the existing panel detail images. No physical microscope is required.
+The default profile may contain no observation or acquisition presets; the captures
+show those empty states rather than inventing presets.
+
+Use `--profile NAME` to select another existing profile, `--touch-width` and
+`--touch-height` for the bench dimensions (default 1280 by 800), and
+`--companion-width` and `--companion-height` for the requested companion dimensions
+(default 1920 by 1080). Qt minimum layout sizes can enlarge a window: the generated
+`capture_manifest.json` records actual image dimensions, logical window dimensions,
+and pixel ratios. These are whole-window Qt captures, including content extending
+beyond the desktop, rather than screenshots of a physical or virtual monitor.
+On Windows use the native backend above: the offscreen backend can render without
+fonts. The utility suppresses periodic observation-state persistence and multipoint
+configuration saves, and skips GUI close handlers that save simulated stage positions.
+
+The console omits the desktop image toolbar, whose minimum widths otherwise force
+the window wider than a 1280-pixel touchscreen. Its own status and zoom controls remain.
+Loading a console preset refreshes the companion camera, illumination, and confocal
+controls through the same callback used by the main menu. Updates to the companion's
+preset lists also refresh the console's channel buttons.
+
+## Touchscreen proposals from the October 7 captures
+
+The console fits 1280 by 800, but its long illumination list pushes focus, stage,
+objectives, and acquisition below the fold. The companion's current layout expands
+to 3302 by 1296 even when 1920 by 1080 is requested. Its small inputs, table rows,
+checkboxes, and densely packed panels need layout changes as well as larger fonts.
+
+Proposals for discussion, not implemented:
+
+1. Keep Live, Snap, XY/Z movement, and acquisition Stop/Abort permanently accessible.
+   Replace the long console column with large tabs for Imaging, Focus/Stage, and
+   Acquisition. Keep the image visible while changing tabs and support finger scrolling.
+2. Add an optional touch layout to the full GUI, reusing its existing widgets and
+   controllers. Use task pages for Locate, Channels, Positions, Z/Time, and Run/Review.
+   Move camera ROI, triggering, calibration, and detailed scan-order controls into
+   expandable settings panels. This should remove the current oversized minimum width.
+3. Use roughly 52-pixel touch targets consistently: large steppers and a numeric keypad
+   with units and limits, taller position rows, and buttons for reorder operations.
+   Provide an on-screen keyboard for names and a touch-friendly destination picker.
+4. Give plate selection more room: zoomable wells, explicit select-versus-move modes,
+   and large Add Current Position / Go To Selected actions. The present miniature map
+   is hard to target, while the separate well selector competes with live-image space.
+5. Make acquisition setup possible at the bench: choose channels, select wells or
+   positions, configure Z/time, inspect a summary, then run or save a preset. Keep
+   progress and Abort visible throughout; apply the existing acquisition lockout to
+   every touch page.
+
+Start with the persistent bench controls and one full acquisition workflow. Evaluate
+at 1280 by 800 and 1920 by 1080 before extending the layout to every settings dialog.
+The screenshots establish the layout baseline; they do not validate physical touch
+gestures, monitor placement, real camera performance, or a complete acquisition run.

@@ -3,7 +3,7 @@ Pydantic models for acquisition configuration.
 
 This package contains models for:
 - IlluminationChannelConfig: Hardware-level illumination channel definitions
-- ConfocalConfig: Optional confocal unit configuration
+- ConfocalDeviceSettings: Confocal unit settings nested under its device entry
 - CameraMappingsConfig: Camera to dichroic/filter wheel bindings (legacy)
 - CameraRegistryConfig: Camera name to serial number mapping
 - FilterWheelRegistryConfig: Filter wheel definitions
@@ -18,7 +18,6 @@ from control.models.illumination_config import (
     IlluminationChannel,
     IlluminationChannelConfig,
 )
-from control.models.confocal_config import ConfocalConfig
 from control.models.camera_config import (
     CameraHardwareInfo,
     CameraPropertyBindings,
@@ -69,6 +68,10 @@ from control.models.io_endpoint_config import (
     build_default_io_endpoint_config,
 )
 from control.models.machine_config import (
+    ConfocalDeviceSettings,
+    ConfocalEmissionWheel,
+    LaserAFCalibrationSettings,
+    LaserAFDeviceSettings,
     DeviceIOLine,
     DeviceChannel,
     DeviceConnection,
@@ -84,6 +87,8 @@ from control.models.machine_config import (
     WellplateCalibration,
     SoftwareConfig,
     MachineConfig,
+    SoftwareTriggerRouting,
+    resolve_software_trigger_routing,
     build_default_machine_config,
 )
 
@@ -93,7 +98,11 @@ __all__ = [
     "IlluminationChannel",
     "IlluminationChannelConfig",
     # Confocal
-    "ConfocalConfig",
+    "ConfocalDeviceSettings",
+    "ConfocalEmissionWheel",
+    # Laser autofocus (machine-level)
+    "LaserAFCalibrationSettings",
+    "LaserAFDeviceSettings",
     # Camera (legacy)
     "CameraHardwareInfo",
     "CameraPropertyBindings",
@@ -154,5 +163,7 @@ __all__ = [
     "WellplateCalibration",
     "SoftwareConfig",
     "MachineConfig",
+    "SoftwareTriggerRouting",
+    "resolve_software_trigger_routing",
     "build_default_machine_config",
 ]

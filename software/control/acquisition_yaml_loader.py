@@ -13,6 +13,13 @@ class AcquisitionYAMLData:
 
     widget_type: str  # "wellplate" or "flexible"
     xy_mode: str = "Select Wells"
+    skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
+    validation_mode: bool = False
+    snake_observation_states: bool = False
+    acquisition_order: Tuple[str, ...] = ("T", "Pos", "Z", "C")
+    # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
+    # None means the file predates the flag, and the GUI then leaves its checkbox alone.
+    retract_z_between_regions: Optional[bool] = None
 
     # Objective info
     objective_name: Optional[str] = None
@@ -40,14 +47,22 @@ class AcquisitionYAMLData:
     # Wellplate-specific
     scan_size_mm: Optional[float] = None
     overlap_percent: float = 10.0
+    tile_spacing: Dict = field(default_factory=dict)
     scan_shape: Optional[str] = None
     wellplate_regions: Optional[List[Dict]] = None  # [{name, center_mm, shape}, ...]
 
-    # Flexible-specific
+    # Tiling grid - written by both scan sections, read from whichever the file has
     nx: int = 1
     ny: int = 1
     delta_x_mm: float = 0.9
     delta_y_mm: float = 0.9
+    # Wellplate tiling method ("fraction" or "grid"); only wellplate_scan ever writes
+    # this. None means the file predates the field (or is a flexible_scan file), and
+    # the drop handler then leaves the radio button alone instead of guessing from
+    # nx*ny, which a pre-existing fraction-of-well file may carry stale values for.
+    tiling_method: Optional[str] = None
+
+    # Flexible-specific
     flexible_positions: Optional[List[Dict]] = None  # [{name, center_mm}, ...]
 
 
@@ -94,13 +109,10 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
     else:
         camera_binning = None
 
-    # Determine overlap_percent from the appropriate section
-    if wellplate_scan:
-        overlap = wellplate_scan.get("overlap_percent", 10.0)
-    elif flexible_scan:
-        overlap = flexible_scan.get("overlap_percent", 10.0)
-    else:
-        overlap = 10.0
+    # Both scan sections carry the same tiling keys (overlap, nx/ny, dx/dy); read them
+    # from whichever section this file has.
+    scan = wellplate_scan or flexible_scan
+    overlap = scan.get("overlap_percent", 10.0)
 
     # Get scan shape from first region if available
     scan_shape = None
@@ -111,6 +123,12 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
     return AcquisitionYAMLData(
         widget_type=widget_type,
         xy_mode=acq.get("xy_mode", "Select Wells"),
+        skip_saving=bool(acq.get("skip_saving", False)),
+        validation_mode=bool(acq.get("validation_mode", False)),
+        snake_observation_states=bool(acq.get("snake_observation_states", False)),
+        retract_z_between_regions=(
+            None if acq.get("retract_z_between_regions") is None else bool(acq["retract_z_between_regions"])
+        ),
         # Objective info
         objective_name=obj.get("name"),
         objective_magnification=obj.get("magnification"),
@@ -136,13 +154,18 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         # Wellplate-specific
         scan_size_mm=wellplate_scan.get("scan_size_mm"),
         overlap_percent=overlap,
+        tile_spacing=scan.get("tile_spacing", {}),
+        acquisition_order=tuple(acq.get("loop_order", ("T", "Pos", "Z", "C"))),
         scan_shape=scan_shape,
         wellplate_regions=wellplate_regions,
+        # Tiling grid (either section)
+        nx=scan.get("nx", 1),
+        ny=scan.get("ny", 1),
+        delta_x_mm=scan.get("delta_x_mm", 0.9),
+        delta_y_mm=scan.get("delta_y_mm", 0.9),
+        # Only wellplate_scan ever writes this (flexible has no tiling-method choice).
+        tiling_method=wellplate_scan.get("tiling_method"),
         # Flexible-specific
-        nx=flexible_scan.get("nx", 1),
-        ny=flexible_scan.get("ny", 1),
-        delta_x_mm=flexible_scan.get("delta_x_mm", 0.9),
-        delta_y_mm=flexible_scan.get("delta_y_mm", 0.9),
         flexible_positions=flexible_scan.get("positions"),
     )
 

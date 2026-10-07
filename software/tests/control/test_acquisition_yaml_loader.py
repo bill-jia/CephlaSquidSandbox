@@ -76,6 +76,61 @@ wellplate_scan:
         assert result.scan_shape == "Square"
         assert len(result.wellplate_regions) == 2
         assert result.wellplate_regions[0]["name"] == "C4"
+        # No grid keys in this file: the fraction-of-well method, not a 1xN grid.
+        assert (result.nx, result.ny) == (1, 1)
+
+    def test_parse_wellplate_yaml_with_a_tiling_grid(self, tmp_path):
+        """The Nx x Ny tiling method writes nx/ny into wellplate_scan; a drop of that
+        file has to put the panel back on the grid method, so the loader must read the
+        keys from the wellplate section as well as the flexible one."""
+        yaml_file = tmp_path / "wellplate_grid.yaml"
+        yaml_file.write_text(
+            """
+acquisition:
+  widget_type: wellplate
+  xy_mode: Select Wells
+wellplate_scan:
+  scan_size_mm: 2.1
+  overlap_percent: 20.0
+  nx: 2
+  ny: 3
+  regions:
+    - name: B2
+      center_mm: [38.31, 28.75, 1.2]
+      shape: Square
+"""
+        )
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert (result.nx, result.ny) == (2, 3)
+        assert result.overlap_percent == 20.0
+        # No tiling_method tag: a legacy file predating F6, or one written by a fraction
+        # run whose shared NX/NY spinboxes happened to hold stale grid values. The drop
+        # handler must not infer "grid" from nx*ny alone here.
+        assert result.tiling_method is None
+
+    def test_parse_wellplate_yaml_tiling_method_round_trips(self, tmp_path):
+        """The writer's explicit tiling_method tag (F6) survives a round trip, distinct
+        from guessing the method from nx*ny."""
+        yaml_file = tmp_path / "wellplate_tiling_method.yaml"
+        yaml_file.write_text(
+            """
+acquisition:
+  widget_type: wellplate
+wellplate_scan:
+  scan_size_mm: 2.1
+  overlap_percent: 20.0
+  tiling_method: grid
+  nx: 2
+  ny: 3
+"""
+        )
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert result.tiling_method == "grid"
+        assert (result.nx, result.ny) == (2, 3)
 
     def test_parse_flexible_yaml(self, tmp_path):
         """Test parsing a flexible acquisition YAML file."""
@@ -194,6 +249,23 @@ acquisition:
         assert result.contrast_af is False
         assert result.laser_af is False
         assert result.overlap_percent == 10.0
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ("  retract_z_between_regions: true", True),
+            ("  retract_z_between_regions: false", False),
+            ("", None),  # written before the flag existed: the GUI keeps its checkbox
+        ],
+    )
+    def test_parse_retract_z_between_regions(self, tmp_path, line, expected):
+        """The retract flag round-trips, and its absence is distinguishable from false."""
+        yaml_file = tmp_path / "test_retract.yaml"
+        yaml_file.write_text(f"acquisition:\n  widget_type: flexible\n{line}\n")
+
+        result = parse_acquisition_yaml(str(yaml_file))
+
+        assert result.retract_z_between_regions is expected
 
     def test_parse_empty_yaml_raises_error(self, tmp_path):
         """Test that empty YAML file raises ValueError."""
@@ -466,6 +538,7 @@ class TestAcquisitionYAMLDataclass:
         assert data.ny == 1
         assert data.delta_x_mm == 0.9
         assert data.delta_y_mm == 0.9
+        assert data.tiling_method is None
 
     def test_required_widget_type(self):
         """Test that widget_type is required."""

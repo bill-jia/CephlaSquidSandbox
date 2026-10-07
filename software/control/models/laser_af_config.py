@@ -35,7 +35,9 @@ class LaserAFConfig(BaseModel):
     x_reference: Optional[float] = Field(None, description="X reference position")
     has_reference: bool = Field(False, description="Whether a reference image exists")
     calibration_timestamp: str = Field("", description="Timestamp of last calibration")
-    pixel_to_um_calibration_distance: float = Field(6.0, description="Distance used for pixel-to-um calibration")
+    # The calibration sweep distance is NOT stored here: it is machine policy
+    # scaled by objective magnification, and lives in the machine config under
+    # devices.laser_af.config.calibration.
 
     # Detection parameters
     laser_af_range: float = Field(100.0, description="Autofocus search range in um")

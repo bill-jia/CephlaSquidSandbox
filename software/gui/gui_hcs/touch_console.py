@@ -570,6 +570,7 @@ class TouchConsoleWindow(QMainWindow):
                 self._objective_store,
                 self._gui.emission_filter_wheel,
                 preset_name=name,
+                on_success=getattr(self._gui, "_on_menu_observation_state_changed", None),
             )
         if loaded:
             self._rebuild_illumination_rows()

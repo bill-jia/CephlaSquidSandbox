@@ -25,7 +25,7 @@ from control.core.job_processing import (
     CaptureInfo,
     JobImage,
     SaveZarrJob,
-    ZarrWriteResult,
+    FrameWriteResult,
     ZarrWriterInfo,
 )
 from control.models.observation_state import CameraSettings, IlluminatorState, ObservationState
@@ -158,6 +158,7 @@ def _make_writer(
         translation_um=translation_um,
         manifest_path=manifest_path,
         shard_per_z=shard_per_z,
+        chunk_separator="/",  # Existing cases retain coverage of the legacy key encoding.
     )
     return ZarrWriter(cfg), out
 
@@ -640,7 +641,7 @@ class TestSaveZarrJob:
                     job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=img))
                     job.zarr_writer_info = info
                     result = job.run()
-                    assert isinstance(result, ZarrWriteResult)
+                    assert isinstance(result, FrameWriteResult)
                 SaveZarrJob.finalize_all_writers()
 
                 out = info.get_output_path("A1", 0)
@@ -673,3 +674,161 @@ class TestSaveZarrJob:
     def test_clear_writers_idempotent(self):
         SaveZarrJob.clear_writers()
         SaveZarrJob.clear_writers()
+
+
+class TestPartialZSliceCommit:
+    """A barrier must never commit a z-slice that is still missing channels.
+
+    Frame jobs are dispatched from the camera callback thread, so a barrier can
+    run between two channels of the same (t, z). Committing the slice there and
+    again when the late channel lands wrote the whole shard twice, and since
+    TensorStore omits chunks equal to the fill value the second write erased the
+    first channel — silently replacing captured frames with zeros.
+    """
+
+    def test_barrier_between_channels_keeps_both(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            try:
+                ch0 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+                ch1 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+
+                writer.write_frame(ch0, t=0, c=0, z=0)
+                # Barrier lands before the second channel's job is dispatched.
+                writer.wait_for_pending()
+                writer.write_frame(ch1, t=0, c=1, z=0)
+                writer.wait_for_pending()
+
+                data = writer._level_datasets[0][0, :, 0, :, :].read().result()
+                np.testing.assert_array_equal(data[0], ch0)
+                np.testing.assert_array_equal(data[1], ch1)
+            finally:
+                writer.finalize()
+
+    def test_incomplete_slice_not_staged_until_complete(self):
+        """An incomplete slice stages only once its last channel lands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            try:
+                plane = np.full((64, 64), 7, dtype=np.uint16)
+                writer.write_frame(plane, t=0, c=0, z=0)
+                writer.wait_for_pending()
+                assert writer.drain_unstaged_shard_paths() == []
+
+                writer.write_frame(plane, t=0, c=1, z=0)
+                writer.wait_for_pending()
+                assert writer.drain_unstaged_shard_paths() != []
+            finally:
+                writer.finalize()
+
+    def test_finalize_keeps_partial_slice(self):
+        """A FOV that ends mid-slice still keeps the channel it captured."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=2, z=1, y=64, x=64)
+            writer.initialize()
+            ch0 = np.random.randint(200, 4000, (64, 64), dtype=np.uint16)
+            writer.write_frame(ch0, t=0, c=0, z=0)
+            data = None
+            try:
+                writer.wait_for_pending()
+                writer.finalize()
+                data = writer._level_datasets[0][0, :, 0, :, :].read().result()
+            finally:
+                if data is not None:
+                    np.testing.assert_array_equal(data[0], ch0)
+                    assert not data[1].any()
+
+
+class TestTimestampFailureIsolation:
+    """A ``frame_times`` write must never be able to abort an acquisition.
+
+    Regression: timestamp futures shared ``_pending_futures`` with image
+    futures, so a transient PERMISSION_DENIED on ``frame_times/c/0/0/0``
+    (Windows rename-vs-open collision with the uploader) re-raised out of
+    ``wait_for_pending()`` and, with ``abort_on_failed_jobs=True``, killed a
+    282-timepoint run at t=264.
+    """
+
+    class _BoomFuture:
+        def done(self):
+            return True
+
+        def result(self):
+            raise PermissionError("ERROR_ACCESS_DENIED simulating the rename race")
+
+    def test_failed_timestamp_write_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=1, c=1, z=1, y=32, x=32)
+            writer.initialize()
+            try:
+                img = np.random.randint(0, 4000, (32, 32), dtype=np.uint16)
+                writer.write_frame(img, t=0, c=0, z=0)
+                # A timestamp write that fails the way the rig's did.
+                writer._pending_time_futures.append(self._BoomFuture())
+                writer.wait_for_pending()  # must not raise
+                assert writer._pending_time_futures == []
+                # The image itself is untouched.
+                data = writer._level_datasets[0][0, 0, 0, :, :].read().result()
+                np.testing.assert_array_equal(data, img)
+            finally:
+                writer.finalize()
+
+    def test_failed_image_write_still_raises(self):
+        """The isolation must not swallow real data loss."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=1, c=1, z=1, y=32, x=32)
+            writer.initialize()
+            try:
+                writer._pending_futures.append(self._BoomFuture())
+                with pytest.raises(PermissionError):
+                    writer.wait_for_pending()
+            finally:
+                writer._pending_futures.clear()
+                writer.finalize()
+
+    def test_timestamps_still_land_when_writes_succeed(self):
+        """Isolation must not turn into 'timestamps stop being written'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=1, c=1, z=1, y=32, x=32)
+            writer.initialize()
+            try:
+                stamp = 1785472737.5
+                writer.write_frame(np.zeros((32, 32), dtype=np.uint16) + 7, t=0, c=0, z=0)
+                writer.record_frame_time(0, 0, 0, stamp)
+                writer.wait_for_pending()
+                assert writer._pending_time_futures == []
+                got = writer._frame_times_dataset[0, 0, 0].read().result()
+                assert float(got) == pytest.approx(stamp)
+            finally:
+                writer.finalize()
+
+
+class TestMetadataPathsExcludeLiveFrameTimes:
+    """``metadata_paths`` feeds the per-barrier upload set. It must not include
+    the one file rewritten on every frame — the uploader's read handle blocks
+    TensorStore's rename onto it on Windows."""
+
+    def test_frame_times_chunk_excluded_but_zarr_jsons_present(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer, _ = _make_writer(tmpdir, t=2, c=1, z=1, y=32, x=32)
+            writer.initialize()
+            try:
+                writer.write_frame(np.zeros((32, 32), dtype=np.uint16), t=0, c=0, z=0)
+                writer.record_frame_time(0, 0, 0, 1785472737.5)
+                writer.wait_for_pending()
+
+                paths = writer.metadata_paths()
+                shard = writer._frame_times_shard_path()
+                assert os.path.isfile(shard), "the chunk should exist on disk"
+                assert shard not in paths, "per-frame-rewritten chunk must not be uploaded per barrier"
+
+                # Everything else that was there before must still be there.
+                assert writer._zarr_json_path() in paths
+                assert os.path.join(writer._frame_times_path(), "zarr.json") in paths
+                for level in range(len(writer._level_shapes)):
+                    assert writer._level_zarr_json_path(level) in paths
+                assert all(os.path.isfile(p) for p in paths)
+            finally:
+                writer.finalize()

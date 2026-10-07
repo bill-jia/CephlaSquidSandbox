@@ -13,6 +13,7 @@ from control.core.live_controller import LiveController
 from control.microcontroller import Microcontroller
 from control.NL5 import NL5
 from squid.abc import AbstractCamera, AbstractStage
+from squid.stage.utils import move_xy_with_z_retract
 
 
 class AutoFocusController:
@@ -38,9 +39,10 @@ class AutoFocusController:
         self._image_to_display_fn = image_to_display_fn
         self.nl5: Optional[NL5] = nl5
 
-        # Start with "Reasonable" defaults.
+        # Start with "Reasonable" defaults. deltaZ is stored in mm
+        # (set_deltaZ takes µm) — keep the constructor default in mm too.
         self.N: int = 10
-        self.deltaZ: float = 1.524
+        self.deltaZ: float = 0.001524
         self.crop_width = control._def.AF.CROP_WIDTH
         self.crop_height = control._def.AF.CROP_HEIGHT
         self.autofocus_in_progress = False
@@ -156,11 +158,15 @@ class AutoFocusController:
         self.focus_map_coords = []
         self.set_focus_map_use(False)
 
-    def gen_focus_map(self, coord1, coord2, coord3):
+    def gen_focus_map(self, coord1, coord2, coord3, retract_between_corners: bool = False):
         """
         Navigate to 3 coordinates and get your focus-map coordinates
         by autofocusing there and saving the z-values.
         :param coord1-3: Tuples of (x,y) values, coordinates in mm.
+        :param retract_between_corners: bracket each corner move with a Z
+            retract to the loading height (``MultiPointController.
+            retract_z_between_regions``); the caller owns that flag since this
+            controller has no acquisition-parameters access of its own.
         :raise: ValueError if coordinates are all on the same line
         """
         x1, y1 = coord1
@@ -174,8 +180,15 @@ class AutoFocusController:
 
         for coord in [coord1, coord2, coord3]:
             self._log.info(f"Navigating to coordinates ({coord[0]},{coord[1]}) to sample for focus map")
-            self.stage.move_x_to(coord[0])
-            self.stage.move_y_to(coord[1])
+            move_xy_with_z_retract(
+                self.stage,
+                coord[0],
+                coord[1],
+                retract=retract_between_corners,
+                z_target_mm=None,
+                home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                log=self._log,
+            )
 
             self._log.info("Autofocusing")
             self.autofocus(True)

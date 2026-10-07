@@ -3,8 +3,8 @@ Per-profile GUI state.
 
 Persisted to ``user_profiles/{profile}/gui_state.yaml`` on shutdown and
 restored on startup so the application reopens in the same configuration the
-user left it (window geometry, selected tab, last-used objective, last-active
-observation state, snap save directory, etc.).
+user left it (window geometry, selected tab, last-used objective, snap save
+directory, etc.).
 
 This is distinct from ObservationState (a single light-path snapshot) and from
 named observation presets (multiple saved light-paths). It captures *transient*
@@ -25,7 +25,6 @@ class GuiState(BaseModel):
 
     # Hardware selections
     last_active_objective: Optional[str] = None
-    last_active_observation_state_name: Optional[str] = None
 
     # Main window
     window_geometry_b64: Optional[str] = None

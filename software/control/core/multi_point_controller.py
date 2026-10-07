@@ -57,6 +57,7 @@ from control.microcontroller import Microcontroller
 from control.piezo import PiezoStage
 from control.core.config.repository import ConfigRepository
 from squid.abc import CameraFrame, AbstractCamera, AbstractStage
+from squid.stage.utils import move_xy_with_z_retract
 import squid.logging
 
 
@@ -213,6 +214,7 @@ def _save_cycle_manifest(experiment_path, params, repo, logger=None):
                     "wait_ms": ev.wait_ms,
                     "state_frame_index": ev.state_frame_index,
                     "cycle_event_index": ev.cycle_event_index,
+                    "acquisition_block_index": ev.acquisition_block_index,
                     # False => captured only at the reference/focus plane (single z).
                     "acquire_z_stack": ev.acquire_z_stack,
                     # Source-coded FPM: the exact LED indices lit for this frame,
@@ -364,8 +366,12 @@ def _save_unified_multipoint_acquisition_yaml(
             "widget_type": widget_type,
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
+            "validation_mode": params.validation_mode,
+            "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
+            "snake_observation_states": params.snake_observation_states,
+            "loop_order": list(params.acquisition_order or ("T", "Pos", "Z", "C")),
         },
         "objective": objective_info or {},
         "sample": {
@@ -396,6 +402,8 @@ def _save_unified_multipoint_acquisition_yaml(
         yaml_dict["wellplate_scan"] = {
             "scan_size_mm": scan_size_mm,
             "overlap_percent": overlap_percent,
+            "tiling_method": params.tiling_method,
+            "tile_spacing": params.tile_spacing,
             "nx": params.NX,
             "ny": params.NY,
             "delta_x_mm": params.deltaX,
@@ -414,6 +422,7 @@ def _save_unified_multipoint_acquisition_yaml(
         }
     else:  # flexible
         yaml_dict["flexible_scan"] = {
+            "tile_spacing": params.tile_spacing,
             "nx": params.NX,
             "ny": params.NY,
             "delta_x_mm": params.deltaX,
@@ -468,7 +477,8 @@ def _save_unified_multipoint_acquisition_yaml(
             f.write(
                 f"# Unified multipoint acquisition record (schema_version=2, experiment_id={params.experiment_ID}).\n"
                 f"# Layout, instrument manifest, and observation_states_used (selected presets only).\n"
-                f"# Per-frame wall-clock acquisition times: <timepoint>/frame_acquisition_times.csv (UTC + unix).\n\n"
+                f"# Per-frame wall-clock acquisition times (UTC + unix): acquisition_times.csv for\n"
+                f"# OME_TIFF/ZARR_V3, <timepoint>/frame_acquisition_times.csv for the per-frame TIFF modes.\n\n"
             )
             yaml.dump(unified, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     except (OSError, yaml.YAMLError) as exc:
@@ -538,6 +548,13 @@ class MultiPointController:
         self.deltaX = control._def.Acquisition.DX  # Spacing between positions in X (mm)
         self.NY = 1  # Number of positions in Y direction
         self.deltaY = control._def.Acquisition.DY  # Spacing between positions in Y (mm)
+        # Which wellplate tiling method NX/NY describe: "fraction" (of the well) or
+        # "grid" (an explicit Nx x Ny lattice). Written into acquisition.yaml so a
+        # dropped file can tell a real grid from the 1x1 a fraction-of-well run also
+        # emits, instead of the drop handler guessing from nx*ny alone (F6).
+        self.tiling_method = "fraction"
+        self.tile_spacing = {}
+        self.acquisition_order = None
         self.NZ = 1  # Number of Z positions (for Z-stacks)
         # TODO(imo): Switch all to consistent mm units
         self.deltaZ = control._def.Acquisition.DZ / 1000  # Z step size (mm, converted from um)
@@ -550,6 +567,7 @@ class MultiPointController:
         self.laser_af_refresh_every_n_fovs = control._def.LASER_AF_REFRESH_EVERY_N_FOVS
         self.laser_af_consistency_threshold_um = control._def.LASER_AF_CONSISTENCY_THRESHOLD_UM
         self.laser_af_check_last_fov_per_region = control._def.LASER_AF_CHECK_LAST_FOV_PER_REGION
+        self.laser_af_table_path_audit = control._def.LASER_AF_TABLE_PATH_AUDIT
         # Override laser-AF fast-mode defaults with whatever the user last
         # configured via the settings dialog. Load is widget-agnostic so the
         # values carry regardless of which multipoint tab is in use.
@@ -561,8 +579,11 @@ class MultiPointController:
         self.base_path = None
         self.use_fluidics = False
         self.skip_saving = False
+        self.validation_mode = False
+        self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
+        self.snake_observation_states = False
         # Live ZARR_V3 upload settings (off by default; configured per-acquisition).
         self.zarr_upload_enabled = False
         self.zarr_upload_remote_root = ""
@@ -585,6 +606,10 @@ class MultiPointController:
         # state) is used unchanged — so the old path stays an instant rollback.
         self.selected_cycle_names = []
         self.region_cycle_map = None
+        # Last cycle-resolution failure (postprocess collision, unknown routine, ...),
+        # or None. Set by set_selected_cycles so the GUI can surface it instead of
+        # letting a selection change raise.
+        self.plan_error = None
         self._frames_per_position = 1
         self.scanCoordinates = scan_coordinates
         self._log.debug(f"Initializing coordinates with scan coordinates: {self.scanCoordinates}, format: {self.scanCoordinates.format}")
@@ -740,6 +765,9 @@ class MultiPointController:
     def set_NY(self, N):
         self.NY = N
 
+    def set_tiling_method(self, method: str):
+        self.tiling_method = method
+
     def set_NZ(self, N):
         self.NZ = N
 
@@ -787,6 +815,12 @@ class MultiPointController:
         self.laser_af_check_last_fov_per_region = bool(flag)
         self._save_laser_af_settings_to_cache()
 
+    def set_laser_af_table_path_audit(self, flag: bool):
+        """Enable/disable the diagnostic before/after AF audit at table FOVs.
+        Corrects Z at audited FOVs (~300 ms each) — validation runs only."""
+        self.laser_af_table_path_audit = bool(flag)
+        self._save_laser_af_settings_to_cache()
+
     # Dedicated cache for laser-AF fast-mode settings. Lives outside the
     # wellplate-widget-specific multipoint_widget_config.yaml so that changes
     # made via the dialog from *any* multipoint widget (Flexible, Wellplate,
@@ -801,6 +835,7 @@ class MultiPointController:
                 "laser_af_refresh_every_n_fovs": self.laser_af_refresh_every_n_fovs,
                 "laser_af_consistency_threshold_um": self.laser_af_consistency_threshold_um,
                 "laser_af_check_last_fov_per_region": self.laser_af_check_last_fov_per_region,
+                "laser_af_table_path_audit": self.laser_af_table_path_audit,
             }
             with open(self._LASER_AF_SETTINGS_CACHE_PATH, "w") as f:
                 yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
@@ -832,6 +867,8 @@ class MultiPointController:
                 pass
         if "laser_af_check_last_fov_per_region" in data:
             self.laser_af_check_last_fov_per_region = bool(data["laser_af_check_last_fov_per_region"])
+        if "laser_af_table_path_audit" in data:
+            self.laser_af_table_path_audit = bool(data["laser_af_table_path_audit"])
 
     def set_manual_focus_map_flag(self, flag):
         self.use_manual_focus_map = flag
@@ -853,6 +890,18 @@ class MultiPointController:
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
 
+    def set_validation_mode(self, enabled: bool):
+        self.validation_mode = bool(enabled)
+
+    def set_retract_z_between_regions(self, retract_z_between_regions):
+        """Retract the objective to Z home for every XY move that enters a region.
+
+        Covers the first move of the run and the end-of-run return to the start
+        position, but not the steps across a region's own tile grid. Recorded in
+        acquisition.yaml via AcquisitionParameters.
+        """
+        self.retract_z_between_regions = bool(retract_z_between_regions)
+
     def set_file_saving_option(self, option):
         """Set the on-disk save format for the next acquisition.
 
@@ -864,6 +913,9 @@ class MultiPointController:
 
     def set_keep_illuminators_on_between_captures(self, keep_on: bool):
         self.keep_illuminators_on_between_captures = bool(keep_on)
+
+    def set_snake_observation_states(self, enabled: bool):
+        self.snake_observation_states = bool(enabled)
 
     def set_zarr_upload_target(
         self,
@@ -911,6 +963,7 @@ class MultiPointController:
         self.selected_configurations = []
         self.selected_observation_state_names = []
         self.selected_cycle_names = []
+        self.plan_error = None  # cycle-only failure; the flat path can't hit it
         for name in selected_configurations_name:
             if name in preset_set:
                 self.selected_observation_state_names.append(name)
@@ -936,7 +989,20 @@ class MultiPointController:
                 self._log.warning("Cycle '%s' not found, skipping", name)
         from control.models.acquisition_cycle import all_states_in_order
 
-        plan = self._resolve_plan(self.selected_cycle_names, None)
+        try:
+            plan = self._resolve_plan(self.selected_cycle_names, None)
+        except ValueError as e:
+            # A misconfigured chain (unknown routine, colliding postprocess output
+            # plates) must not escape here: this runs on every GUI selection change,
+            # where an exception would tear down the app mid-session. Record the
+            # problem, leave the derived counts empty, and let
+            # validate_acquisition_settings block the run with the same message.
+            self._log.error("Cannot resolve selected cycles: %s", e)
+            self.plan_error = str(e)
+            self.selected_observation_state_names = []
+            self._frames_per_position = 0
+            return
+        self.plan_error = None
         # Metadata/disk/image-count helpers read this; keep stimulus states in the
         # record. The zarr C axis (imaged-only) is taken from the plan separately.
         self.selected_observation_state_names = all_states_in_order(plan.events)
@@ -1558,6 +1624,7 @@ class MultiPointController:
             self.abort_acqusition_requested = False
 
             self.configuration_before_running_multipoint = self.liveController.obs_controller.current_observation_state
+            self._confocal_mode_before_multipoint = self.liveController.obs_controller._collect_confocal_mode()
 
             # Snapshot the live camera geometry/mode (binning, ROI, pixel_format,
             # camera_mode) so it can be restored after the run. The acquisition
@@ -1694,12 +1761,21 @@ class MultiPointController:
                     self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
 
                     # Generate and enable the AF map
-                    self.autofocusController.gen_focus_map(coord1, coord2, coord3)
+                    self.autofocusController.gen_focus_map(
+                        coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
+                    )
                     self.autofocusController.set_focus_map_use(True)
 
                     # Return to center position
-                    self.stage.move_x_to(x_center)
-                    self.stage.move_y_to(y_center)
+                    move_xy_with_z_retract(
+                        self.stage,
+                        x_center,
+                        y_center,
+                        retract=self.retract_z_between_regions,
+                        z_target_mm=None,
+                        home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                        log=self._log,
+                    )
 
                 except ValueError:
                     self._log.exception("Invalid coordinates for autofocus plane, aborting.")
@@ -1862,7 +1938,10 @@ class MultiPointController:
                     f"Unknown wellplate format '{self.scanCoordinates.format}', using default 96-well dimensions"
                 )
 
-        global_plan, region_plans = self._build_region_plans(scan_position_information.scan_region_names)
+        global_plan, region_plans = (
+            (None, {}) if self.validation_mode
+            else self._build_region_plans(scan_position_information.scan_region_names)
+        )
 
         return AcquisitionParameters(
             experiment_ID=self.experiment_ID,
@@ -1873,6 +1952,9 @@ class MultiPointController:
             deltaX=self.deltaX,
             NY=self.NY,
             deltaY=self.deltaY,
+            tiling_method=self.tiling_method,
+            tile_spacing=dict(self.tile_spacing),
+            acquisition_order=tuple(self.acquisition_order) if self.acquisition_order is not None else None,
             NZ=self.NZ,
             deltaZ=self.deltaZ,
             Nt=self.Nt,
@@ -1884,9 +1966,12 @@ class MultiPointController:
             z_stacking_config=self.z_stacking_config,
             z_range=self.z_range,
             use_fluidics=self.use_fluidics,
-            skip_saving=self.skip_saving,
+            skip_saving=self.skip_saving or self.validation_mode,
+            validation_mode=self.validation_mode,
+            retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
+            snake_observation_states=self.snake_observation_states,
             # Downsampled view generation parameters
             generate_downsampled_views=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES or control._def.DISPLAY_PLATE_VIEW,
             save_downsampled_well_images=control._def.SAVE_DOWNSAMPLED_WELL_IMAGES,
@@ -1908,10 +1993,20 @@ class MultiPointController:
             laser_af_refresh_every_n_fovs=self.laser_af_refresh_every_n_fovs,
             laser_af_consistency_threshold_um=self.laser_af_consistency_threshold_um,
             laser_af_check_last_fov_per_region=self.laser_af_check_last_fov_per_region,
-            zarr_upload_enabled=self.zarr_upload_enabled,
+            laser_af_table_path_audit=self.laser_af_table_path_audit,
+            zarr_upload_enabled=self.zarr_upload_enabled and not self.validation_mode,
             zarr_upload_remote_root=self.zarr_upload_remote_root,
             zarr_upload_delete_after_verify=self.zarr_upload_delete_after_verify,
+            estimated_total_disk_bytes=0 if self.validation_mode else self._estimated_disk_bytes_or_zero(),
         )
+
+    def _estimated_disk_bytes_or_zero(self) -> int:
+        """Best-effort total-size estimate for the run (0 if not computable)."""
+        try:
+            return int(self.get_estimated_acquisition_disk_storage())
+        except Exception:
+            self._log.debug("Could not estimate acquisition disk size", exc_info=True)
+            return 0
 
     def _on_acquisition_completed(self):
         self._log.debug("MultiPointController._on_acquisition_completed called")
@@ -1947,9 +2042,18 @@ class MultiPointController:
         # The Qt signal for signal_current_configuration is typed as Signal(ObservationState)
         # and will reject None.
         prior_config = self.configuration_before_running_multipoint
+        prior_mode = getattr(self, "_confocal_mode_before_multipoint", None)
         if prior_config is not None:
-            self.callbacks.signal_current_configuration(prior_config)
+            display_config = (
+                prior_config.model_copy(update={"confocal_mode": prior_mode})
+                if prior_mode is not None
+                else prior_config
+            )
+            self.callbacks.signal_current_configuration(display_config)
             self.liveController.obs_controller.apply_full_observation_state(prior_config)
+        if prior_mode is not None:
+            self.liveController.obs_controller.apply_confocal_mode(prior_mode)
+            self._confocal_mode_before_multipoint = None
 
         # Restore the live camera geometry/mode captured at acquisition start.
         # apply_full_observation_state above only restores exposure/gain/illumination,
@@ -2014,24 +2118,55 @@ class MultiPointController:
         if self.run_acquisition_current_fov:
             self.run_acquisition_current_fov = False
 
-        if self._start_position:
-            x_mm = self._start_position.x_mm
-            y_mm = self._start_position.y_mm
-            z_mm = self._start_position.z_mm
-            self._log.info(f"Moving back to start position: (x,y,z) [mm] = ({x_mm}, {y_mm}, {z_mm})")
-            self.stage.move_x_to(x_mm)
-            self.stage.move_y_to(y_mm)
-            self.stage.move_z_to(z_mm)
-            self._start_position = None
+        self._move_back_to_start_position()
 
         ending_pos = self.stage.get_pos()
         self.callbacks.signal_current_fov(ending_pos.x_mm, ending_pos.y_mm)
+
+    def _move_back_to_start_position(self) -> None:
+        """Return the stage to where the run started, if we recorded a start position.
+
+        With ``retract_z_between_regions`` on this travel gets the same bracket
+        the worker applies to inter-region moves: Z to
+        ``OBJECTIVE_RETRACTED_POS_MM`` (blocking) before XY, then Z down to the
+        recorded start Z. ``move_xy_with_z_retract`` skips the retract itself
+        when the stage is already at the start XY (e.g. a single-position run).
+        """
+        if not self._start_position:
+            return
+        x_mm = self._start_position.x_mm
+        y_mm = self._start_position.y_mm
+        z_mm = self._start_position.z_mm
+        self._log.info(f"Moving back to start position: (x,y,z) [mm] = ({x_mm}, {y_mm}, {z_mm})")
+        move_xy_with_z_retract(
+            self.stage,
+            x_mm,
+            y_mm,
+            retract=self.retract_z_between_regions,
+            z_target_mm=z_mm,
+            home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+            log=self._log,
+        )
+        self._start_position = None
 
     def request_abort_acquisition(self):
         self.abort_acqusition_requested = True
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        if getattr(self, "acquisition_order", None) is not None:
+            from control.models.acquisition_order import validate_order
+            try:
+                order = validate_order(self.acquisition_order)
+            except ValueError as exc:
+                self._log.error(str(exc))
+                return False
+            if self.use_fluidics and self.Nt > 1 and order[0] != "T":
+                self._log.error("Fluidics requires T as the outermost acquisition loop.")
+                return False
+        if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
+            self._log.error("AF validation requires laser autofocus and a valid reference.")
+            return False
         # Region names (user-editable on the Flexible tab) become folder names, image
         # filename prefixes and the "region" column of every sidecar. Catch anything
         # unsafe here rather than mid-run, and cover the headless/SiLA entry points
@@ -2057,6 +2192,10 @@ class MultiPointController:
                     "starting acquisition with laser AF enabled."
                 )
                 return False
+
+        # Validation never executes imaging/stimulus/postprocessing plans.
+        if self.validation_mode:
+            return True
 
         # When any selected observation state has timed illuminators (capture-
         # window or stimulus-only), the worker arms an NIDAQ pulse waveform.
@@ -2200,10 +2339,19 @@ class MultiPointController:
         if self.skip_saving:
             self._log.error("Online postprocessing is enabled but 'skip saving' is set — nothing would be written.")
             return False
-        allowed = (control._def.FileSavingOption.ZARR_V3, control._def.FileSavingOption.INDIVIDUAL_IMAGES)
+        # MULTI_PAGE_TIFF is the only mode left out: its shared-append writer
+        # cannot take a second writer process. The other three each give the
+        # derived outputs a file/tree of their own (ZARR_V3: a derived plate;
+        # OME_TIFF: a keyed per-region file; INDIVIDUAL_IMAGES: loose TIFFs in
+        # the timepoint folder).
+        allowed = (
+            control._def.FileSavingOption.ZARR_V3,
+            control._def.FileSavingOption.OME_TIFF,
+            control._def.FileSavingOption.INDIVIDUAL_IMAGES,
+        )
         if self.file_saving_option not in allowed:
             self._log.error(
-                "Online postprocessing supports only ZARR_V3 and INDIVIDUAL_IMAGES saving (current: %s).",
+                "Online postprocessing supports only ZARR_V3, OME_TIFF and INDIVIDUAL_IMAGES saving (current: %s).",
                 getattr(self.file_saving_option, "name", self.file_saving_option),
             )
             return False

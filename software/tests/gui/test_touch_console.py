@@ -191,7 +191,7 @@ class StubGui:
 @pytest.fixture
 def console(qapp):
     gui_stub = StubGui()
-    display = ImageDisplayWindow(None, None, show_LUT=False, autoLevels=True)
+    display = ImageDisplayWindow(None, None, show_LUT=False, autoLevels=True, show_status_bar=False)
     window = TouchConsoleWindow(gui_stub, display)
     yield window, gui_stub
     window.prepare_for_shutdown()
@@ -204,6 +204,31 @@ def console(qapp):
 
 
 class TestConstruction:
+    def test_console_fits_small_touchscreen(self, console, qapp):
+        window, _ = console
+        window.resize(1280, 800)
+        window.show()
+        qapp.processEvents()
+        assert window.width() == 1280
+        assert window.height() == 800
+
+    def test_preset_load_refreshes_companion_controls(self, console, monkeypatch):
+        window, gui_stub = console
+        from unittest.mock import Mock
+        import gui.widgets.observation_state_dialogs as dialogs
+
+        refresh = Mock()
+        gui_stub._on_menu_observation_state_changed = refresh
+
+        def load(*args, **kwargs):
+            assert kwargs["preset_name"] == "test preset"
+            kwargs["on_success"]()
+            return True
+
+        monkeypatch.setattr(dialogs, "run_load_observation_state", load)
+        window._on_preset_selected("test preset")
+        refresh.assert_called_once_with()
+
     def test_builds_a_button_per_preset(self, console):
         window, _ = console
         assert [b.text() for b in window._preset_buttons] == ["BF", "GFP", "mCherry"]

@@ -39,7 +39,6 @@ from control.models import (
     AcquisitionOutputConfig,
     CameraMappingsConfig,
     CameraRegistryConfig,
-    ConfocalConfig,
     FilterWheelDefinition,
     FilterWheelRegistryConfig,
     FilterWheelType,
@@ -51,6 +50,7 @@ from control.models import (
     MachineConfig,
     build_default_machine_config,
 )
+from control.models.machine_config import ConfocalDeviceSettings, LaserAFDeviceSettings
 from control.models.hardware_bindings import (
     FilterWheelReference,
     HardwareBindingsConfig,
@@ -79,7 +79,6 @@ class ConfigRepository:
         software/
         ├── machine_configs/
         │   ├── illumination_channel_config.yaml
-        │   ├── confocal_config.yaml (optional)
         │   ├── camera_mappings.yaml (legacy)
         │   ├── cameras.yaml (v1.1 - camera registry)
         │   └── filter_wheels.yaml (v1.1 - filter wheel registry)
@@ -305,10 +304,8 @@ class ConfigRepository:
         # Ensure default configs exist (lazy import to avoid circular dependency)
         try:
             from control.default_config_generator import ensure_default_configs
-            import control._def
 
-            include_confocal = getattr(control._def, "ENABLE_SPINNING_DISK_CONFOCAL", False)
-            if ensure_default_configs(self, profile, include_confocal=include_confocal):
+            if ensure_default_configs(self, profile):
                 logger.info(f"Generated default configs for profile '{profile}'")
         except ImportError as e:
             # Expected if running without full dependencies or in test environment
@@ -566,17 +563,19 @@ class ConfigRepository:
             self._machine_cache[cache_key] = loaded
         return self._machine_cache[cache_key]
 
-    def get_confocal_config(self) -> Optional[ConfocalConfig]:
-        """
-        Load confocal configuration (cached).
+    def get_confocal_settings(self) -> Optional[ConfocalDeviceSettings]:
+        """Settings of the enabled confocal device (``devices.xlight`` / ``devices.dragonfly``).
 
-        Returns None if confocal_config.yaml doesn't exist (system has no confocal).
+        Returns None when no confocal unit is enabled.
         """
-        cache_key = "confocal"
-        if cache_key not in self._machine_cache:
-            path = self.machine_configs_path / "confocal_config.yaml"
-            self._machine_cache[cache_key] = self._load_yaml(path, ConfocalConfig)
-        return self._machine_cache[cache_key]
+        return self.get_machine_config().get_confocal_settings()
+
+    def get_laser_af_settings(self) -> LaserAFDeviceSettings:
+        """Machine-level laser AF settings (``devices.laser_af.config``).
+
+        Model defaults when the device or the key is absent.
+        """
+        return self.get_machine_config().get_laser_af_settings()
 
     def get_camera_mappings(self) -> Optional[CameraMappingsConfig]:
         """Load camera mappings configuration (cached)."""
@@ -586,21 +585,11 @@ class ConfigRepository:
             self._machine_cache[cache_key] = self._load_yaml(path, CameraMappingsConfig)
         return self._machine_cache[cache_key]
 
-    def has_confocal(self) -> bool:
-        """Check if system has confocal hardware."""
-        return self.get_confocal_config() is not None
-
     def save_illumination_config(self, config: IlluminationChannelConfig) -> None:
         """Save illumination channel configuration and update cache."""
         path = self.machine_configs_path / "illumination_channel_config.yaml"
         self._save_yaml(path, config)
         self._machine_cache["illumination"] = config
-
-    def save_confocal_config(self, config: ConfocalConfig) -> None:
-        """Save confocal configuration and update cache."""
-        path = self.machine_configs_path / "confocal_config.yaml"
-        self._save_yaml(path, config)
-        self._machine_cache["confocal"] = config
 
     def save_camera_mappings(self, config: CameraMappingsConfig) -> None:
         """Save camera mappings configuration and update cache."""
@@ -663,12 +652,6 @@ class ConfigRepository:
             return registry.get_camera_names()
         return []
 
-    def get_filter_wheel_names(self) -> List[str]:
-        """Get list of available filter wheel names from registry."""
-        registry = self.get_filter_wheel_registry()
-        if registry:
-            return registry.get_wheel_names()
-        return []
 
     # ───────────────────────────────────────────────────────────────────────────
     # v1.1 Hardware Bindings and Filter Wheel Aggregation
@@ -705,7 +688,7 @@ class ConfigRepository:
 
         Returns a dict mapping source name to list of wheels:
         - "standalone": wheels from embedded ``machine_config.filter_wheel_registry`` or ``filter_wheels.yaml``
-        - "confocal": wheels from confocal_config.yaml
+        - "confocal": the emission wheel declared by the confocal device entry
 
         Each source has its own ID namespace (no global conflicts).
         """
@@ -716,12 +699,21 @@ class ConfigRepository:
         if registry and registry.filter_wheels:
             result[FILTER_WHEEL_SOURCE_STANDALONE] = list(registry.filter_wheels)
 
-        # Confocal wheels from confocal_config.yaml
-        confocal = self.get_confocal_config()
-        if confocal and confocal.filter_wheels:
-            result[FILTER_WHEEL_SOURCE_CONFOCAL] = list(confocal.filter_wheels)
+        # Confocal wheel from devices.xlight / devices.dragonfly
+        confocal = self.get_confocal_settings()
+        if confocal is not None:
+            wheel = confocal.build_emission_wheel_definition()
+            if wheel is not None:
+                result[FILTER_WHEEL_SOURCE_CONFOCAL] = [wheel]
 
         return result
+
+    def get_all_filter_wheel_names(self) -> List[str]:
+        """Names of every filter wheel, standalone and confocal, in source order."""
+        names: List[str] = []
+        for wheels in self.get_all_filter_wheels().values():
+            names.extend(w.name for w in wheels if w.name is not None)
+        return names
 
     def get_emission_wheels(self) -> Dict[str, List[FilterWheelDefinition]]:
         """
@@ -775,8 +767,8 @@ class ConfigRepository:
         )
         logger.warning(
             f"Filter wheel reference not found: {ref}. {available_info}. "
-            f"Check that hardware_bindings.yaml references match your "
-            f"filter_wheels.yaml or confocal.yaml."
+            f"Check that hardware_bindings references match your standalone "
+            f"filter wheel registry or the confocal device's emission_filter_wheel."
         )
         return None
 
@@ -914,9 +906,9 @@ class ConfigRepository:
 
         if location == "confocal_hw":
             if state.confocal_hardware_settings is None:
-                from control.default_config_generator import build_confocal_settings_from_config
+                from control.default_config_generator import build_confocal_settings
 
-                state.confocal_hardware_settings = build_confocal_settings_from_config(self.get_confocal_config())
+                state.confocal_hardware_settings = build_confocal_settings(self.get_confocal_settings())
             setattr(state.confocal_hardware_settings, field, value)
         elif location == "camera":
             if state.camera_settings is None:
@@ -927,24 +919,6 @@ class ConfigRepository:
             setattr(state.camera_settings, field, value)
 
         return True
-
-    def get_last_active_channel_name(self) -> Optional[str]:
-        """Read the channel name that was active when the app last shut down.
-
-        Sourced from ``gui_state.yaml`` (preferred) with a fallback to the
-        legacy ``last_active_channel.txt`` sidecar.
-        """
-        gui_state = self.get_gui_state()
-        if gui_state and gui_state.last_active_observation_state_name:
-            return gui_state.last_active_observation_state_name
-        try:
-            path = self._get_profile_path() / "channel_configs" / "last_active_channel.txt"
-            if path.exists():
-                name = path.read_text().strip()
-                return name if name else None
-        except Exception:
-            pass
-        return None
 
     # ═══════════════════════════════════════════════════════════════════════════
     # GUI STATE (per-profile)
@@ -1061,9 +1035,34 @@ class ConfigRepository:
     # OBSERVATION STATE (objective-free presets)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def _read_yaml_display_name(self, path: Path) -> Optional[str]:
+        """Read the ``name:`` field out of a preset/cycle YAML file, cheaply.
+
+        Returns None if the file is missing, unparsable, or has no usable
+        ``name`` field so callers can fall back to the file stem.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.load(f, Loader=_YamlSafeLoader)
+        except (OSError, yaml.YAMLError):
+            return None
+        if isinstance(data, dict):
+            candidate = data.get("name")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
     def list_observation_presets(self, profile: Optional[str] = None) -> List[str]:
         """
-        List saved Observation State preset names (without ``.yaml``) for a profile.
+        List saved Observation State preset *display names* for a profile.
+
+        Each preset's on-disk filename is a sanitized stem (spaces become
+        underscores, see ``sanitize_preset_filename``), but the name the user
+        gave it — and the name lookups like ``get_observation_state_by_name``
+        must match — is preserved verbatim in the file's ``name:`` field. This
+        lists that field (falling back to the file stem for a file that has
+        none), so a preset saved as "BF LED matrix full" is listed and
+        resolved under that exact name, not "BF_LED_matrix_full".
 
         Args:
             profile: Profile name (defaults to current profile)
@@ -1076,15 +1075,67 @@ class ConfigRepository:
             return []
         names: List[str] = []
         for p in sorted(presets_dir.glob("*.yaml")):
-            names.append(p.stem)
+            names.append(self._read_yaml_display_name(p) or p.stem)
         return names
+
+    def get_observation_states(self, profile: Optional[str] = None) -> List[ObservationState]:
+        """Every selectable Observation State, in the order the GUI lists them.
+
+        The saved presets *are* the channel namespace — the same set the
+        Observation State save/load dropdown shows. A profile with no presets
+        saved yet falls back to the single working state in ``general.yaml`` so
+        callers always have something to select.
+        """
+        states: List[ObservationState] = []
+        for name in self.list_observation_presets(profile):
+            state = self.load_observation_preset(name, profile)
+            if state is not None:
+                states.append(state)
+        if states:
+            return states
+        general = self.get_observation_state(profile)
+        return [general] if general is not None else []
+
+    def get_observation_state_by_name(
+        self, name: str, profile: Optional[str] = None
+    ) -> Optional[ObservationState]:
+        """Resolve a channel name to an Observation State.
+
+        Looks the name up among the saved presets. When a profile has no presets
+        at all, the working state in ``general.yaml`` is the only state there is,
+        so it answers every name — with a warning, since the caller asked for a
+        channel this profile has not actually defined.
+
+        Returns None when presets exist but none carries this name.
+        """
+        preset_names = self.list_observation_presets(profile)
+        if preset_names:
+            if name in preset_names:
+                return self.load_observation_preset(name, profile)
+            return None
+
+        general = self.get_observation_state(profile)
+        if general is None:
+            return None
+        logger.warning(
+            "No Observation State presets saved; resolving channel %r to the working "
+            "state %r from general.yaml. Save a preset named %r to select it explicitly.",
+            name,
+            general.name,
+            name,
+        )
+        return general
 
     def save_observation_preset(self, name: str, state: ObservationState, profile: Optional[str] = None) -> Path:
         """
         Save an Observation State preset under ``user_profiles/{profile}/observation_presets/``.
 
         Args:
-            name: Display name (sanitized to a file stem)
+            name: Display name. Only the *filename* is sanitized (spaces ->
+                underscores, see ``sanitize_preset_filename``); the name as
+                given is preserved verbatim in the saved state's ``name``
+                field so name-based lookups (e.g. the contrast-autofocus
+                channel) see exactly what the user typed.
             state: Objective-free Observation State
             profile: Profile name (defaults to current profile)
 
@@ -1096,8 +1147,9 @@ class ConfigRepository:
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
-        safe_name = sanitize_preset_filename(name)
-        state_to_save = state.model_copy(update={"name": safe_name})
+        sanitize_preset_filename(name)  # validate; raises on empty/disallowed characters
+        display_name = name.strip()
+        state_to_save = state.model_copy(update={"name": display_name})
         path = observation_preset_path(self, name, profile=profile)
         from control.core.observation_state_service import observation_state_to_yaml
 
@@ -1229,28 +1281,35 @@ class ConfigRepository:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def list_acquisition_cycles(self, profile: Optional[str] = None) -> List[str]:
-        """List saved acquisition-cycle names (without ``.yaml``) for a profile."""
+        """List saved acquisition-cycle *display names* for a profile.
+
+        Mirrors ``list_observation_presets``: the on-disk filename is a
+        sanitized stem, but the name the user gave the cycle (and the name
+        lookups must match) is preserved verbatim in the file's ``name:``
+        field. Falls back to the file stem for a file that has none.
+        """
         profile = profile or self._current_profile
         if profile is None:
             return []
         cycles_dir = self.user_profiles_path / profile / "cycles"
         if not cycles_dir.is_dir():
             return []
-        return [p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
+        return [self._read_yaml_display_name(p) or p.stem for p in sorted(cycles_dir.glob("*.yaml"))]
 
     def save_acquisition_cycle(self, name: str, cycle: "AcquisitionCycle", profile: Optional[str] = None) -> Path:
         """Save an acquisition cycle under ``user_profiles/{profile}/cycles/``.
 
-        The cycle's ``name`` is normalized to the sanitized file stem so the
-        on-disk name and the in-file name always match.
+        Only the *filename* is sanitized (spaces -> underscores); the name as
+        given is preserved verbatim in the saved cycle's ``name`` field so
+        name-based lookups see exactly what the user typed.
         """
         from control.core.observation_state_service import acquisition_cycle_path, sanitize_preset_filename
 
         profile = profile or self._current_profile
         if profile is None:
             raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
-        safe_name = sanitize_preset_filename(name)
-        cycle_to_save = cycle.model_copy(update={"name": safe_name})
+        sanitize_preset_filename(name)  # validate; raises on empty/disallowed characters
+        cycle_to_save = cycle.model_copy(update={"name": name.strip()})
         path = acquisition_cycle_path(self, name, profile=profile)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

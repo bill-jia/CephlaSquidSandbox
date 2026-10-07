@@ -429,7 +429,7 @@ class TrackingController(QObject):
             self.liveController.microscope.config_repo.save_acquisition_output(
                 output_dir=experiment_dir,
                 objective=self.objectiveStore.current_objective,
-                channels=self.selected_configurations,
+                observation_state_names=[c.name for c in self.selected_configurations],
                 confocal_mode=self.liveController.obs_controller.is_confocal_mode(),
             )
             current_objective = self.objectiveStore.current_objective
@@ -472,7 +472,7 @@ class TrackingController(QObject):
     def set_selected_configurations(self, selected_configurations_name):
         self.selected_configurations = []
         for configuration_name in selected_configurations_name:
-            config = self.liveController.get_channel_by_name(self.objectiveStore.current_objective, configuration_name)
+            config = self.liveController.get_observation_state_by_name(configuration_name)
             if config:
                 self.selected_configurations.append(config)
 
@@ -712,6 +712,7 @@ class ImageDisplayWindow(QMainWindow):
         window_title="",
         show_LUT=False,
         autoLevels=False,
+        show_status_bar=True,
     ):
         super().__init__()
         self._log = squid.logging.get_logger(self.__class__.__name__)
@@ -898,6 +899,7 @@ class ImageDisplayWindow(QMainWindow):
 
         # Add status bar at the bottom
         layout.addWidget(status_widget)
+        status_widget.setVisible(show_status_bar)
 
         self.widget.setLayout(layout)
         self.setCentralWidget(self.widget)

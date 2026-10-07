@@ -3,6 +3,7 @@ from .common import (
     check_observation_state_roi_consistency_with_dialog,
     check_ram_available_with_error_dialog,
     check_space_available_with_error_dialog,
+    check_streaming_target_with_dialog,
     check_system_load_and_pending_uploads_with_dialog,
     error_dialog,
     _load_last_remote_streaming_path,
@@ -11,6 +12,8 @@ from .common import (
 from .config_and_preferences import AcquisitionYAMLDropMixin
 from .hardware_panels import WellSelectionWidget
 from .laser_autofocus_settings import LaserAutofocusButton
+from .tile_spacing import TileSpacingWidget, spacing_parameters
+from .acquisition_order import AcquisitionOrderWidget
 from control.core.scan_coordinates import normalize_region_name, validate_region_name
 from control.models import LaserAFReference
 
@@ -1740,6 +1743,412 @@ _FILE_SAVING_FORMAT_TOOLTIPS = {
     "ZARR_V3": "OME-NGFF v0.5 zarr per FOV. Best for large timelapses and stitching pipelines.",
 }
 
+# Last entry of the save-format combo: "run the acquisition, write nothing". It is a
+# save *format* from the user's point of view, so it lives in the same dropdown rather
+# than in a separate checkbox (which was easy to leave ticked by accident).
+DRY_RUN_SAVE_FORMAT = "Don't save (dry run)"
+
+
+def _is_dry_run(combo: "QComboBox") -> bool:
+    """True when the save-format combo is on the dry-run entry."""
+    return combo.currentText() == DRY_RUN_SAVE_FORMAT
+
+
+def _uses_ordered_progress(widget):
+    controls = getattr(widget, "acquisition_order", None)
+    return controls is not None and not widget.checkbox_afValidation.isChecked() and (
+        controls.order() != ("T", "Pos", "Z", "C") or widget.checkbox_snakeObservationStates.isChecked()
+    )
+
+
+def _update_ordered_progress(widget, completed, total):
+    if not _uses_ordered_progress(widget):
+        return False
+    widget.progress_bar.setMaximum(total)
+    widget.progress_bar.setValue(completed)
+    if widget.acquisition_start_time is not None and completed > 0:
+        elapsed = max(0, time.time() - widget.acquisition_start_time)
+        widget.eta_seconds = max(0, total - completed) * elapsed / completed
+        widget.update_eta_display()
+        widget.eta_timer.start(1000)
+    return True
+
+
+def _make_acquisition_order(widget):
+    controls = AcquisitionOrderWidget()
+    def refresh(*_):
+        _refresh_acquisition_order(widget, controls)
+    widget._timelapse_checkbox.toggled.connect(refresh)
+    widget._zstack_checkbox.toggled.connect(refresh)
+    widget.list_configurations.itemChanged.connect(refresh)
+    widget.list_configurations.model().rowsInserted.connect(refresh)
+    widget.list_configurations.model().rowsRemoved.connect(refresh)
+    if hasattr(widget, "checkbox_xy"):
+        widget.checkbox_xy.toggled.connect(refresh)
+    refresh()
+    return controls
+
+
+def _refresh_acquisition_order(widget, controls=None):
+    controls = controls if controls is not None else getattr(widget, "acquisition_order", None)
+    if controls is None:
+        return
+    active = {"Pos"}
+    if widget._timelapse_checkbox.isChecked():
+        active.add("T")
+    if widget._zstack_checkbox.isChecked():
+        active.add("Z")
+    if _has_checked_items(widget.list_configurations):
+        active.add("C")
+    if hasattr(widget, "checkbox_xy") and not widget.checkbox_xy.isChecked():
+        active.discard("Pos")
+    controls.set_active(active)
+
+
+def _push_tiling_grid_to_controller(widget) -> None:
+    """Push the panel's Nx/Ny spinboxes into the shared controller.
+
+    NX/NY are metadata recorded in ``acquisition.yaml`` (the regions are already
+    tiled by the time a run starts); both ``entry_NX``/``entry_NY`` exist regardless
+    of the panel's tiling mode. One controller is shared by both multipoint tabs, so
+    without re-pushing at Start, a Flexible run after a Wellplate one (which sets NX/NY
+    to 1x1 for a fraction-of-well run) would record a stale ``nx: 1, ny: 1`` (F10).
+    """
+    widget.multipointController.set_NX(widget.entry_NX.value())
+    widget.multipointController.set_NY(widget.entry_NY.value())
+    widget.multipointController.tile_spacing = spacing_parameters(widget)
+    widget.multipointController.set_overlap_percent(widget.entry_overlap.value())
+
+
+def _push_save_format_to_controller(widget) -> None:
+    """Push the save-format combo's selection into the controller.
+
+    The dry-run entry is not a ``FileSavingOption``: it sets ``skip_saving`` and leaves
+    the last real format alone (nothing is written, so the format is moot). Any real
+    format clears ``skip_saving``.
+    """
+    dry_run = _is_dry_run(widget.combobox_fileSavingFormat)
+    widget.multipointController.set_skip_saving(dry_run)
+    if not dry_run:
+        widget.multipointController.set_file_saving_option(widget.combobox_fileSavingFormat.currentText())
+
+
+def _apply_save_format_from_yaml(widget, yaml_data) -> None:
+    """Restore the save-format combo from a dropped ``acquisition.yaml``.
+
+    Only the dry-run flag travels in the file (``acquisition.skip_saving``); the format
+    itself is not recorded, so a normal run just brings the combo back out of dry run.
+    """
+    validation_checkbox = getattr(widget, "checkbox_afValidation", None)
+    if validation_checkbox is not None:
+        validation_checkbox.setChecked(yaml_data.validation_mode)
+    combo = widget.combobox_fileSavingFormat
+    if yaml_data.skip_saving:
+        combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
+    elif _is_dry_run(combo):
+        current = getattr(widget.multipointController.file_saving_option, "name", "")
+        index = combo.findText(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+
+def _make_snake_observation_states_checkbox(controller) -> "QCheckBox":
+    checkbox = QCheckBox("Snake observation states")
+    checkbox.setChecked(bool(getattr(controller, "snake_observation_states", False)))
+    checkbox.setToolTip(
+        "Alternate acquisition order between FOVs. Simple mode reverses states and Z planes.\n"
+        "Advanced mode reverses selected cycles, preserving each cycle's complete internal order."
+    )
+    checkbox.toggled.connect(controller.set_snake_observation_states)
+    return checkbox
+
+
+def _make_retract_z_checkbox() -> "QCheckBox":
+    """The *Scan behaviour* checkbox that brackets XY travel with a Z retract.
+
+    Both multipoint tabs show it, and both start it checked because that is the
+    controller's default (``MultiPointController.retract_z_between_regions``). The
+    label is built from ``OBJECTIVE_RETRACTED_POS_MM`` so it cannot go stale.
+    """
+    height_um = int(control._def.OBJECTIVE_RETRACTED_POS_MM * 1000)
+    checkbox = QCheckBox(f"Retract Z to {height_um} \u00b5m for XY moves")
+    checkbox.setChecked(True)
+    checkbox.setToolTip(
+        "Before each XY move between regions (and when going to a position from this "
+        "table), raise Z to the retracted height, move, then lower Z back to the target."
+    )
+    return checkbox
+
+
+def _apply_retract_z_from_yaml(widget, yaml_data) -> None:
+    """Restore the retract-Z checkbox from a dropped ``acquisition.yaml``.
+
+    The key is optional: a file written before the flag existed leaves the checkbox
+    on whatever the user has set rather than silently turning the retract off.
+    """
+    if yaml_data.retract_z_between_regions is not None:
+        widget.checkbox_retractZBetweenRegions.setChecked(yaml_data.retract_z_between_regions)
+
+
+def _apply_tiling_method_from_yaml(widget, yaml_data) -> None:
+    """Restore the Wellplate tab's tiling-method radio from a dropped ``acquisition.yaml``.
+
+    ``tiling_method`` is optional: a file written before it existed (or a fraction-of-well
+    run, whose shared NX/NY spinboxes may hold stale grid values from an earlier Nx x Ny
+    session — F6) leaves the radio wherever it already is instead of guessing "grid" from
+    ``nx*ny > 1``. NX/NY are only pushed into the spinboxes when the method that ends up
+    selected — from the tag, or from what was already selected — is actually Nx x Ny.
+    """
+    if yaml_data.tiling_method == "grid":
+        widget.radio_tiling_grid.setChecked(True)
+    elif yaml_data.tiling_method == "fraction":
+        widget.radio_tiling_fraction.setChecked(True)
+
+    if widget.radio_tiling_grid.isChecked():
+        widget.entry_NX.setValue(yaml_data.nx)
+        widget.entry_NY.setValue(yaml_data.ny)
+
+
+def _make_section(title: str, header_extra=None) -> "tuple[QVBoxLayout, QVBoxLayout]":
+    """A bold section header with an indented content column under it.
+
+    Returns ``(section, content)``: add ``section`` to the parent layout, put the
+    group's widgets in ``content``. A bold QLabel rather than a QGroupBox — matching
+    the ``<b>Positions</b>`` header above the position table — so grouping the
+    acquisition options doesn't add another ring of frames to an already busy panel.
+
+    ``header_extra`` is an optional QHBoxLayout that becomes the title row, with the
+    bold label inserted at its left. The *Positions* section uses it so the
+    list-editing buttons stay on the title line instead of costing another row.
+    """
+    section = QVBoxLayout()
+    section.setContentsMargins(0, 0, 0, 0)
+    section.setSpacing(2)
+    label = QLabel(f"<b>{title}</b>")
+    if header_extra is None:
+        section.addWidget(label)
+    else:
+        header_extra.insertWidget(0, label)
+        section.addLayout(header_extra)
+    content = QVBoxLayout()
+    content.setContentsMargins(12, 0, 0, 0)
+    content.setSpacing(2)
+    section.addLayout(content)
+    return section, content
+
+
+def _make_checkable_section(title: str) -> "tuple[QVBoxLayout, QVBoxLayout, QCheckBox]":
+    """``_make_section`` whose bold title is a checkbox that enables the group.
+
+    Returns ``(section, content, checkbox)``. Used for *Z-stack* and *Time-lapse*,
+    where the header answers "does this run do a stack / a time series at all?" —
+    unchecked means Nz = 1 / Nt = 1 and the group's controls are greyed out.
+    """
+    section = QVBoxLayout()
+    section.setContentsMargins(0, 0, 0, 0)
+    section.setSpacing(2)
+    checkbox = QCheckBox(title)
+    font = checkbox.font()
+    font.setBold(True)
+    checkbox.setFont(font)
+    section.addWidget(checkbox)
+    content = QVBoxLayout()
+    content.setContentsMargins(12, 0, 0, 0)
+    content.setSpacing(2)
+    section.addLayout(content)
+    return section, content, checkbox
+
+
+_PARAMETER_BLOCK_NAME = "multipointParameterBlock"
+
+
+def _make_parameter_block() -> "tuple[QFrame, QVBoxLayout]":
+    """The single framed box that holds a panel's left column.
+
+    *Positions*, *Tiling per position*, *Z-stack* and *Time-lapse* are what the
+    stage does at every point of a run, so both multipoint panels stack those four
+    sections inside one box — identical between the two tabs, which is the whole
+    point of the shared builder. The border is set by stylesheet (scoped to this
+    frame by object name, so nested frames don't inherit it) because the native
+    ``StyledPanel`` frame has no radius control.
+    """
+    block = QFrame()
+    block.setObjectName(_PARAMETER_BLOCK_NAME)
+    block.setFrameStyle(QFrame.StyledPanel | QFrame.Plain)
+    block.setStyleSheet(f"QFrame#{_PARAMETER_BLOCK_NAME} {{ border: 1px solid palette(mid); border-radius: 3px; }}")
+    content = QVBoxLayout(block)
+    content.setContentsMargins(6, 6, 6, 6)
+    content.setSpacing(4)
+    return block, content
+
+
+def _make_row_widget() -> "tuple[QWidget, QHBoxLayout]":
+    """A horizontal row that can be shown or hidden as a unit (a layout cannot).
+
+    The Wellplate tab's tiling rows appear and disappear with the XY mode and the
+    tiling method, so each one needs a widget of its own to hide.
+    """
+    holder = QWidget()
+    row = QHBoxLayout(holder)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    return holder, row
+
+
+def _make_acquisition_body(widget, focus_section, saving_section, scan_section) -> "QHBoxLayout":
+    """The body of a multipoint panel: the parameter block beside the channels group.
+
+    Both panels are laid out the same way, so this is the one builder for it::
+
+        ┌ parameter block ┐  ┌ Channels  [mode ▾]      Per-Point  Edit Cycles ┐
+        │ (Positions …)   │  │ list_configurations (takes the spare height)   │
+        │                 │  ├──────────────────┬────────────────────────────┤
+        │                 │  │ Focus            │ Saving                     │
+        │                 │  │ Scan behaviour   │      [Acquire Current FOV] │
+        └─────────────────┘  └──────────────────┴──────[Start Acquisition ]──┘
+
+    The two top-level columns share the width 1:1, so the channel list is half the
+    panel wide instead of the panel's full width; the list is the only element with
+    vertical stretch, so it grows to match the parameter block's height and keeps
+    growing as the window gets taller, which puts *Start Acquisition* in the
+    panel's bottom-right corner at every size.
+
+    ``widget`` supplies ``parameter_block``, the Channels header widgets, the
+    ``list_configurations`` list and the two action buttons; the three option
+    sections are passed in because each panel fills them with its own controls.
+    """
+    channels_header = QHBoxLayout()
+    channels_header.addWidget(QLabel("<b>Channels</b>"))
+    channels_header.addWidget(widget.combobox_channel_mode)
+    channels_header.addStretch(1)
+    channels_header.addWidget(widget.btn_per_point_channels)
+    channels_header.addWidget(widget.btn_edit_cycles)
+
+    options_left = QVBoxLayout()
+    options_left.addLayout(focus_section)
+    options_left.addLayout(scan_section)
+    options_left.addStretch(1)
+
+    # Actions only: Start is the main verb, the single-FOV acquire is half its
+    # height so the two never get confused at a glance.
+    button_layout = QVBoxLayout()
+    for btn in (widget.btn_snap_images, widget.btn_startAcquisition):
+        btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+    button_layout.addWidget(widget.btn_snap_images, 1)
+    button_layout.addWidget(widget.btn_startAcquisition, 2)
+
+    options_right = QVBoxLayout()
+    options_right.addLayout(saving_section)
+    options_right.addStretch(1)
+    options_right.addLayout(button_layout)
+
+    options_columns = QHBoxLayout()
+    options_columns.addLayout(options_left, 1)
+    options_columns.addSpacing(12)
+    options_columns.addLayout(options_right, 1)
+
+    channels_group = QVBoxLayout()
+    channels_group.setSpacing(4)
+    channels_group.addLayout(channels_header)
+    channels_group.addWidget(widget.list_configurations, 1)
+    channels_group.addLayout(options_columns)
+
+    block_column = QVBoxLayout()
+    block_column.addWidget(widget.parameter_block)
+    block_column.addStretch(1)
+
+    body = QHBoxLayout()
+    body.addLayout(block_column, 1)
+    body.addSpacing(12)
+    body.addLayout(channels_group, 1)
+    return body
+
+
+def _collect_widgets(layout) -> list:
+    """Every widget under ``layout``, recursively.
+
+    The Z-stack / Time-lapse groups are enabled and disabled as a whole, and this
+    reads the membership list straight off the layout that was just built, so a row
+    added later cannot be forgotten by a hand-maintained list.
+    """
+    found = []
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        widget = item.widget()
+        if widget is not None:
+            found.append(widget)
+        child = item.layout()
+        if child is not None:
+            found.extend(_collect_widgets(child))
+    return found
+
+
+class _ZTimeGroupMixin:
+    """The *Z-stack* / *Time-lapse* header checkboxes, shared by both panels.
+
+    Unchecked means one plane / one timepoint: the group's controls are greyed out
+    (never hidden, and never stored-and-restored — what the user typed stays on
+    screen) and the controller is told ``NZ = 1`` / ``Nt = 1``. Checked pushes the
+    spinbox values. ``toggle_acquisition`` starts a run from the same effective
+    values.
+
+    Each panel supplies ``_zstack_checkbox`` / ``_timelapse_checkbox`` (the two tabs
+    name their checkboxes differently) plus ``_zstack_controls`` /
+    ``_timelapse_controls``, built by ``_collect_widgets``.
+    """
+
+    def _apply_zstack_enabled(self) -> None:
+        enabled = self._zstack_checkbox.isChecked()
+        # Disabling the group only greys its controls (including "Set Z-range" and the
+        # Z-min/Z-max rows, via _zstack_controls below) - it must not uncheck "Set
+        # Z-range" itself. That checkbox's own toggled signal drives
+        # toggle_z_range_controls, which overwrites entry_minZ/entry_maxZ with the
+        # current stage Z and collapses entry_NZ to 1; forcing it off here silently
+        # destroyed whatever Z-range the user had typed, contradicting this mixin's own
+        # "what the user typed stays on screen" contract (F7). Re-enabling the group
+        # leaves "Set Z-range" exactly as the user left it.
+        for widget in self._zstack_controls:
+            widget.setEnabled(enabled)
+        if enabled and self.checkbox_set_z_range.isChecked():
+            # In Set Z-range mode Nz is derived from the range, not typed.
+            self.entry_NZ.setEnabled(False)
+        self.multipointController.set_NZ(self._effective_NZ())
+        _refresh_acquisition_order(self)
+        # The image count just changed, so the estimate is refreshed from here rather
+        # than from a separate signal connection that could fire before the push.
+        _refresh_size_estimate(self)
+
+    def _apply_timelapse_enabled(self) -> None:
+        enabled = self._timelapse_checkbox.isChecked()
+        for widget in self._timelapse_controls:
+            widget.setEnabled(enabled)
+        self.multipointController.set_Nt(self._effective_Nt())
+        _refresh_acquisition_order(self)
+        _refresh_size_estimate(self)
+
+    def _effective_NZ(self) -> int:
+        """Planes this run will actually acquire (1 with the Z-stack group off)."""
+        return self.entry_NZ.value() if self._zstack_checkbox.isChecked() else 1
+
+    def _effective_Nt(self) -> int:
+        """Timepoints this run will actually acquire (1 with Time-lapse off)."""
+        return self.entry_Nt.value() if self._timelapse_checkbox.isChecked() else 1
+
+    def _compute_z_range(self, effective_NZ: int) -> tuple[float, float]:
+        """Z-stack span (min_mm, max_mm) to hand to ``set_z_range``, shared by both panels.
+
+        With "Set Z-range" checked, the Z-min/Z-max entries (um) are used directly.
+        Otherwise the span starts at the current stage position and grows by
+        ``entry_deltaZ`` (um) per plane -- both are converted to mm before being
+        combined with the stage's mm position, so the two modes agree on units.
+        """
+        if self.checkbox_set_z_range.isChecked():
+            minZ = self.entry_minZ.value() / 1000  # um -> mm
+            maxZ = self.entry_maxZ.value() / 1000  # um -> mm
+            return minZ, maxZ
+        z = self.stage.get_pos().z_mm
+        dz = self.entry_deltaZ.value()  # um
+        return z, z + dz / 1000 * (effective_NZ - 1)
+
 
 def _human_bytes(n: float) -> str:
     """Format a byte count as a short human-readable string (e.g. ``3.4 GB``)."""
@@ -1782,6 +2191,12 @@ def _format_acquisition_size_estimate(controller, has_selection, skip_saving, hi
     return f"{count_str} · {approx}{_human_bytes(disk_bytes)}"
 
 
+_SIZE_ESTIMATE_TOOLTIP = (
+    "Estimated image count and on-disk size for the current settings.\n"
+    "ZARR_V3 sizes are approximate (compression is data-dependent)."
+)
+
+
 def _refresh_size_estimate(widget) -> None:
     """Recompute and show the acquisition size estimate on ``widget.label_size_estimate``.
 
@@ -1793,9 +2208,23 @@ def _refresh_size_estimate(widget) -> None:
     label = getattr(widget, "label_size_estimate", None)
     if label is None:
         return
+    validation_checkbox = getattr(widget, "checkbox_afValidation", None)
+    if validation_checkbox is not None and validation_checkbox.isChecked():
+        label.setText("AF validation: diagnostics only; size depends on failures")
+        label.setToolTip("No channel images. AF frames and metadata are saved in af_validation.")
+        return
     widget._push_channel_selection_to_controller()
+    plan_error = getattr(widget.multipointController, "plan_error", None)
+    if plan_error:
+        # The selection is unrunnable (e.g. two postprocess groups fighting over one
+        # output plate). Say so here rather than showing a bogus "0 images" estimate;
+        # the full message is in the log and blocks Start Acquisition.
+        label.setText("Cycle configuration error — see log")
+        label.setToolTip(str(plan_error))
+        return
+    label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     has_selection = bool(_get_checked_names(widget.list_configurations))
-    skip_saving = widget.checkbox_skipSaving.isChecked() if hasattr(widget, "checkbox_skipSaving") else False
+    skip_saving = _is_dry_run(widget.combobox_fileSavingFormat)
     hint = (
         "Select a cycle to estimate size"
         if getattr(widget, "_channel_mode", "simple") == "advanced"
@@ -1804,21 +2233,29 @@ def _refresh_size_estimate(widget) -> None:
     label.setText(_format_acquisition_size_estimate(widget.multipointController, has_selection, skip_saving, hint))
 
 
-def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QComboBox, QLabel]":
-    """Build a compact ``Save format: [combo] ........ [size estimate]`` row.
+def _make_file_saving_format_row(initial_option=None) -> "tuple[QVBoxLayout, QComboBox, QLabel]":
+    """Build a ``Save format: [combo]`` row with the size estimate right-aligned below it.
 
     The combo only mirrors local UI state; the caller wires its
-    ``currentTextChanged`` signal to ``MultiPointController.set_file_saving_option``
-    so the choice flows through ``AcquisitionParameters`` to the worker
-    (mirroring how ``Skip Saving`` is plumbed). Compression / chunking knobs
-    live in Settings > Preferences. The trailing label shows a live image-count /
-    disk-size estimate (the caller keeps it updated via ``_refresh_size_estimate``).
+    ``currentTextChanged`` signal to ``_push_save_format_to_controller`` so the choice
+    flows through ``AcquisitionParameters`` to the worker. Its last entry is
+    ``DRY_RUN_SAVE_FORMAT``, which sets ``skip_saving`` instead of a format.
+    Compression / chunking knobs live in Settings > Preferences. The grey label under
+    the dropdown shows a live image-count / disk-size estimate (the caller keeps it
+    updated via ``_refresh_size_estimate``).
     """
     label = QLabel("Save format:")
     combo = QComboBox()
     for opt in FileSavingOption:
         combo.addItem(opt.name)
         combo.setItemData(combo.count() - 1, _FILE_SAVING_FORMAT_TOOLTIPS.get(opt.name, ""), Qt.ToolTipRole)
+    combo.addItem(DRY_RUN_SAVE_FORMAT)
+    combo.setItemData(
+        combo.count() - 1,
+        "Run the acquisition without writing any image files — for timing, "
+        "illumination and stage-path checks.",
+        Qt.ToolTipRole,
+    )
     if initial_option is None:
         initial_option = control._def.FILE_SAVING_OPTION
     try:
@@ -1837,29 +2274,34 @@ def _make_file_saving_format_row(initial_option=None) -> "tuple[QHBoxLayout, QCo
     combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
     estimate_label = QLabel("")
-    estimate_label.setToolTip(
-        "Estimated image count and on-disk size for the current settings.\n"
-        "ZARR_V3 sizes are approximate (compression is data-dependent)."
-    )
+    estimate_label.setToolTip(_SIZE_ESTIMATE_TOOLTIP)
     estimate_label.setStyleSheet("color: gray;")
+    estimate_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-    row = QHBoxLayout()
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(label)
-    row.addWidget(combo)
-    row.addStretch(1)
-    row.addWidget(estimate_label)
-    return row, combo, estimate_label
+    # The *Saving* group is half of the panel's right-hand group, so the estimate gets
+    # its own line under the dropdown instead of being squeezed beside it (at that
+    # width both the combo and the estimate text were clipped).
+    column = QVBoxLayout()
+    column.setContentsMargins(0, 0, 0, 0)
+    column.setSpacing(2)
+    format_row = QHBoxLayout()
+    format_row.setContentsMargins(0, 0, 0, 0)
+    format_row.addWidget(label)
+    format_row.addWidget(combo)
+    format_row.addStretch(1)
+    column.addLayout(format_row)
+    column.addWidget(estimate_label)
+    return column, combo, estimate_label
 
 
-def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict]":
-    """Build an inline ``Stream to network`` row for ZARR_V3 acquisitions.
+def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QVBoxLayout, dict]":
+    """Build a stacked ``Stream to network`` block for ZARR_V3 acquisitions.
 
-    The row contains:
-      - Enable checkbox (master switch)
+    Two lines, because the block sits in the *Saving* group at a quarter of the
+    panel's width and a single row clipped the path field:
+      - Enable checkbox (master switch) and "Delete after verify" (default on)
       - Path text field (UNC ``\\\\server\\share\\dir`` on Windows or
         ``/Volumes/share/dir`` POSIX after mount) + Browse button
-      - "Delete after verify" checkbox (default on)
 
     All four child widgets stay disabled until the enable checkbox is on.
     Edits push immediately to ``MultiPointController.set_zarr_upload_target``
@@ -1868,19 +2310,25 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     with the fallback disk-space dialog).
 
     Caller should:
-      1. Place the returned layout next to ``fileSavingFormatRow``.
+      1. Place the returned layout under ``fileSavingFormatRow``.
       2. Toggle the row's visibility based on the file-format combobox
          (only meaningful for ``ZARR_V3``).
     """
     enable_cb = QCheckBox("Stream to network")
     enable_cb.setToolTip(
         "Stream ZARR_V3 output to a mounted network share as the acquisition "
-        "runs. Each timepoint is sha256-verified on the remote before local "
-        "files are deleted. See Settings > Preferences for related tuning."
+        "runs. The selected folder is the PARENT: each acquisition mirrors "
+        "into its own subfolder named after the experiment, sidecars included. "
+        "Each shard is sha256-verified on the remote before local files "
+        "are deleted."
     )
 
     path_edit = QLineEdit()
-    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions")
+    path_edit.setPlaceholderText(r"\\server\share\my_acquisitions  (experiment subfolder is created inside)")
+    path_edit.setToolTip(
+        "Parent folder on the share. The experiment directory "
+        "({experiment_ID}) is created inside it, mirroring the local layout."
+    )
     last_path = _load_last_remote_streaming_path()
     if last_path:
         path_edit.setText(last_path)
@@ -1893,10 +2341,21 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     delete_cb.setChecked(True)
     delete_cb.setEnabled(False)
     delete_cb.setToolTip(
-        "After every shard of a timepoint is sha256-verified on the remote, "
-        "delete the local copies. Required to reclaim disk space during a "
+        "After a shard is sha256-verified on the remote, delete its local "
+        "copy. Required to reclaim disk space during a "
         "long acquisition; uncheck to keep local copies."
     )
+    show_btn = QPushButton("Show uploads")
+    show_btn.setToolTip("Open the persistent Upload Manager status window.")
+
+    def _show_uploads():
+        try:
+            from control.core.upload_manager_client import UploadManagerClient
+            UploadManagerClient().show_window()
+        except Exception as exc:
+            QMessageBox.warning(None, "Upload Manager", f"Could not open Upload Manager:\n{exc}")
+
+    show_btn.clicked.connect(_show_uploads)
 
     def _push_to_controller():
         if multi_point_controller is None:
@@ -1930,18 +2389,28 @@ def _make_zarr_streaming_row(multi_point_controller) -> "tuple[QHBoxLayout, dict
     path_edit.editingFinished.connect(_push_to_controller)
     delete_cb.toggled.connect(_push_to_controller)
 
-    row = QHBoxLayout()
+    row = QVBoxLayout()
     row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(enable_cb)
-    row.addWidget(path_edit, 1)
-    row.addWidget(browse_btn)
-    row.addWidget(delete_cb)
+    row.setSpacing(2)
+    toggles = QHBoxLayout()
+    toggles.setContentsMargins(0, 0, 0, 0)
+    toggles.addWidget(enable_cb)
+    toggles.addWidget(delete_cb)
+    toggles.addWidget(show_btn)
+    toggles.addStretch(1)
+    row.addLayout(toggles)
+    path_row = QHBoxLayout()
+    path_row.setContentsMargins(0, 0, 0, 0)
+    path_row.addWidget(path_edit, 1)
+    path_row.addWidget(browse_btn)
+    row.addLayout(path_row)
 
     widgets = {
         "enable_cb": enable_cb,
         "path_edit": path_edit,
         "browse_btn": browse_btn,
         "delete_cb": delete_cb,
+        "show_btn": show_btn,
         "_push": _push_to_controller,
     }
     return row, widgets
@@ -2836,7 +3305,21 @@ def _row_col_to_well_id(row, col):
     return f"{_index_to_row_label(row)}{col + 1}"
 
 
-class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
+class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, AcquisitionYAMLDropMixin, QFrame):
+
+    # Column layout of table_location_list. Every setItem()/item() call goes through
+    # these so the order can be changed in one place; the wide editable Region Name
+    # column is deliberately last.
+    _COL_X = 0
+    _COL_Y = 1
+    _COL_Z = 2
+    _COL_AF_REF = 3
+    _COL_NAME = 4
+    _COL_COUNT = 5
+
+    # An empty list is not an error: acquisition_in_place() silently acquires wherever
+    # the stage happens to be, so say so rather than just "no positions".
+    _NO_POSITIONS_HINT = "no positions — Start acquires the current field"
 
     signal_acquisition_started = Signal(bool)  # true = started, false = finished
     signal_acquisition_channels = Signal(list)  # list channels
@@ -2883,7 +3366,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # which drops the references it holds; the widget owns the position list, so
         # it owns the references too and re-applies them after each rebuild.
         self._region_laser_af_references = {}
-        self.use_overlap = USE_OVERLAP_FOR_FLEXIBLE
+        self.use_overlap = True  # All interactive pitch modes use the shared grid generator.
         self.add_components()
         self.setup_layout()
         self.setup_connections()
@@ -2910,15 +3393,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.lineEdit_experimentID.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lineEdit_experimentID.setFixedWidth(96)
 
-        self.label_position_count = QLabel("no positions")
+        self.label_position_count = QLabel(self._NO_POSITIONS_HINT)
         self.label_position_count.setStyleSheet("color: gray;")
 
         self.btn_add = QPushButton("Add")
         self.btn_add.setToolTip("Add the current stage position (also ';' or Ctrl+A)")
         self.btn_remove = QPushButton("Remove")
         self.btn_remove.setToolTip("Remove the selected position")
-        self.btn_next = QPushButton("Next")
-        self.btn_next.setToolTip("Select the next position and move the stage there")
+        self.btn_prev = QPushButton("Prev Pos")
+        self.btn_prev.setToolTip("Move the stage to the previous position (wraps to the last)")
+        self.btn_next = QPushButton("Next Pos")
+        self.btn_next.setToolTip("Move the stage to the next position (wraps to the first)")
         self.btn_clear = QPushButton("Clear")
         self.btn_clear.setToolTip("Remove every position")
 
@@ -2931,8 +3416,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # The "AF Ref" column is a read-only indicator of the per-region laser-AF focus
         # target (the spot x_reference, or "—").
         self.table_location_list = QTableWidget()
-        self.table_location_list.setColumnCount(5)
-        self.table_location_list.setHorizontalHeaderLabels(["x (mm)", "y (mm)", "z (μm)", "Region Name", "AF Ref"])
+        self.table_location_list.setColumnCount(self._COL_COUNT)
+        labels = [None] * self._COL_COUNT
+        labels[self._COL_X] = "x (mm)"
+        labels[self._COL_Y] = "y (mm)"
+        labels[self._COL_Z] = "z (μm)"
+        labels[self._COL_AF_REF] = "AF Ref"
+        labels[self._COL_NAME] = "Region Name"
+        self.table_location_list.setHorizontalHeaderLabels(labels)
         self.table_location_list.setToolTip(
             "Click a row to move there. Edit x/y/z to move a position, or the Region\n"
             "Name to rename it. Region names are written to coordinates.csv,\n"
@@ -2945,23 +3436,20 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.setAlternatingRowColors(True)
         self.table_location_list.verticalHeader().setDefaultSectionSize(22)
         header = self.table_location_list.horizontalHeader()
-        for col in (0, 1, 2, 4):  # numbers stay narrow...
+        for col in (self._COL_X, self._COL_Y, self._COL_Z, self._COL_AF_REF):  # numbers stay narrow...
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)  # ...the name takes the slack
+        header.setSectionResizeMode(self._COL_NAME, QHeaderView.Stretch)  # ...name takes the slack
         # ~5 rows visible, then scroll. The tab panel is clamped to its sizeHint by
         # MainWindow.resizeCurrentTab, so an unbounded table would push the rest of the
         # acquisition controls down by however tall QTableWidget felt like being.
         self.table_location_list.setMinimumHeight(120)
         self.table_location_list.setMaximumHeight(170)
 
-        self.btn_update_z = QPushButton("Update Z")
+        self.btn_update_z = QPushButton("Set Z from Stage")
         self.btn_update_z.setToolTip("Overwrite the selected position's Z with the current stage Z")
-        # Re-capture the laser-AF reference for the currently selected region.
-        # Hidden when the rig has no focus camera.
-        self.btn_update_ref = QPushButton("Update Ref")
-        self.btn_update_ref.setToolTip(
-            "Capture the current laser-AF reference (focus target) for the selected region."
-        )
+        # Re-capture the laser-AF reference for the currently selected region. Hidden
+        # when the rig has no focus camera, greyed out while laser AF is switched off.
+        self.btn_update_ref = QPushButton("Recapture AF Ref")
         self.btn_update_ref.setVisible(self._enable_laser_autofocus)
 
         self.entry_deltaX = QDoubleSpinBox()
@@ -3086,8 +3574,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             "Advanced: pick acquisition cycles (per-position sequences of states)."
         )
 
-        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
-        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_per_point_channels = QPushButton("Per-Point Channels")
+        self.btn_edit_cycles = QPushButton("Edit Cycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
@@ -3119,8 +3607,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
-        self.checkbox_skipSaving = QCheckBox("Skip Saving")
-        self.checkbox_skipSaving.setChecked(False)
+        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_afValidation.setToolTip(
+            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
+            "in the experiment's af_validation folder."
+        )
+        self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
@@ -3132,6 +3626,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
+        self.checkbox_snakeObservationStates = _make_snake_observation_states_checkbox(self.multipointController)
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -3149,6 +3644,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
         )
 
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
+        self.checkbox_moveStageOnClick = QCheckBox("Move stage on click")
+        self.checkbox_moveStageOnClick.setChecked(True)
+        self.checkbox_moveStageOnClick.setToolTip(
+            "Clicking a row drives the stage to that position. Uncheck to select rows without moving."
+        )
+
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
 
@@ -3161,8 +3664,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.entry_minZ.setValue(self.stage.get_pos().z_mm * 1000)  # Set to current position
         self.entry_minZ.setSuffix(" μm")
         # self.entry_minZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.set_minZ_button = QPushButton("Set")
+        # Same Set | Go To | label | value row as the wellplate tab.
+        self.set_minZ_button = QPushButton("Set Z-min")
         self.set_minZ_button.clicked.connect(self.set_z_min)
+
+        self.goto_minZ_button = QPushButton("Go To")
+        self.goto_minZ_button.clicked.connect(self.goto_z_min)
+        self.goto_minZ_button.setFixedWidth(50)
 
         self.entry_maxZ = QDoubleSpinBox()
         self.entry_maxZ.setKeyboardTracking(False)
@@ -3172,8 +3680,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.entry_maxZ.setValue(self.stage.get_pos().z_mm * 1000)  # Set to current position
         self.entry_maxZ.setSuffix(" μm")
         # self.entry_maxZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.set_maxZ_button = QPushButton("Set")
+        self.set_maxZ_button = QPushButton("Set Z-max")
         self.set_maxZ_button.clicked.connect(self.set_z_max)
+
+        self.goto_maxZ_button = QPushButton("Go To")
+        self.goto_maxZ_button.clicked.connect(self.goto_z_max)
+        self.goto_maxZ_button.setFixedWidth(50)
 
         self.combobox_z_stack = QComboBox()
         self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
@@ -3185,7 +3697,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # self.btn_startAcquisition.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         # Add snap images button
-        self.btn_snap_images = QPushButton("Snap Images")
+        self.btn_snap_images = QPushButton("Acquire\nCurrent FOV")
+        self.btn_snap_images.setToolTip(
+            "Acquire the checked channels once, one plane, at the current stage position, "
+            "using the Save format above. Does not add a position."
+        )
         self.btn_snap_images.clicked.connect(self.on_snap_images)
         self.btn_snap_images.setCheckable(False)
         self.btn_snap_images.setChecked(False)
@@ -3203,7 +3719,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.grid_line0.addWidget(QLabel("Saving Path"))
         self.grid_line0.addWidget(self.lineEdit_savingDir)
         self.grid_line0.addWidget(self.btn_setSavingDir)
-        self.grid_line0.addWidget(QLabel("ID"))
+        self.grid_line0.addWidget(QLabel("Experiment ID"))
+        self.lineEdit_experimentID.setPlaceholderText("optional name, prefixed to the folder")
+        self.lineEdit_experimentID.setMinimumWidth(260)
         self.grid_line0.addWidget(self.lineEdit_experimentID)
 
         # Positions block: a titled header carrying the list-editing buttons, the
@@ -3211,169 +3729,138 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # row / the list as a whole. The table used to be a separate pop-up window
         # behind an unlabelled "Edit" button, which made region naming undiscoverable.
         self.positions_header_layout = QHBoxLayout()
-        self.positions_header_layout.addWidget(QLabel("<b>Positions</b>"))
         self.positions_header_layout.addWidget(self.label_position_count)
         self.positions_header_layout.addStretch(1)
         self.positions_header_layout.addWidget(self.btn_add)
         self.positions_header_layout.addWidget(self.btn_remove)
         self.positions_header_layout.addWidget(self.btn_clear)
+        self.positions_header_layout.addWidget(self.btn_import_locations)
+        self.positions_header_layout.addWidget(self.btn_export_locations)
 
+        # The header edits the list as a whole; this row acts on the selected row.
         self.positions_actions_layout = QHBoxLayout()
+        self.positions_actions_layout.addWidget(self.btn_prev)
         self.positions_actions_layout.addWidget(self.btn_next)
         self.positions_actions_layout.addWidget(self.btn_update_z)
         self.positions_actions_layout.addWidget(self.btn_update_ref)
         self.positions_actions_layout.addStretch(1)
-        self.positions_actions_layout.addWidget(self.btn_import_locations)
-        self.positions_actions_layout.addWidget(self.btn_export_locations)
+        self.positions_actions_layout.addWidget(self.checkbox_moveStageOnClick)
 
-        self.grid_location_list = QVBoxLayout()
-        self.grid_location_list.addLayout(self.positions_header_layout)
-        self.grid_location_list.addWidget(self.table_location_list)
-        self.grid_location_list.addLayout(self.positions_actions_layout)
+        positions_section, positions_content = _make_section("Positions", self.positions_header_layout)
+        positions_content.addWidget(self.table_location_list)
+        positions_content.addLayout(self.positions_actions_layout)
 
-        # Create spacer items
-        EDGE_SPACING = 4  # Adjust this value as needed
-        edge_spacer = QSpacerItem(EDGE_SPACING, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        # ---- Acquisition options -------------------------------------------
+        # Left column, inside one framed box, says what the stage does at every
+        # point of the run: Positions, Tiling, Z-stack, Time-lapse — the same box,
+        # in the same order, as the Wellplate tab. Right column says how the run
+        # behaves (focus, saving, scan behaviour).
 
-        # Create first row layouts
-        if self.use_overlap:
-            xy_half = QHBoxLayout()
-            xy_half.addWidget(QLabel("Nx"))
-            xy_half.addWidget(self.entry_NX)
-            xy_half.addStretch(1)
-            xy_half.addWidget(QLabel("Ny"))
-            xy_half.addWidget(self.entry_NY)
-            xy_half.addSpacerItem(edge_spacer)
+        tiling_section, tiling_content = _make_section("Tiling per position")
+        tiling_grid_row, tiling_row = _make_row_widget()
+        tiling_row.addWidget(QLabel("Nx"))
+        tiling_row.addWidget(self.entry_NX)
+        tiling_row.addWidget(QLabel("Ny"))
+        tiling_row.addWidget(self.entry_NY)
+        self.tile_spacing = TileSpacingWidget(self.entry_overlap)
+        self.tile_spacing.layout().insertWidget(1, tiling_grid_row)
+        if not USE_OVERLAP_FOR_FLEXIBLE:
+            self.tile_spacing.restore(dict(
+                spacing_mode="distance", spacing_x=self.entry_deltaX.value(), spacing_y=self.entry_deltaY.value()
+            ))
+        tiling_content.insertWidget(0, self.tile_spacing)
+        self.tile_spacing.changed.connect(self.update_fov_positions)
 
-            overlap_half = QHBoxLayout()
-            overlap_half.addSpacerItem(edge_spacer)
-            overlap_half.addWidget(QLabel("FOV Overlap"), alignment=Qt.AlignRight)
-            overlap_half.addWidget(self.entry_overlap)
-        else:
-            # Create alternate first row layouts (dx, dy) instead of (overlap %)
-            x_half = QHBoxLayout()
-            x_half.addWidget(QLabel("dx"))
-            x_half.addWidget(self.entry_deltaX)
-            x_half.addStretch(1)
-            x_half.addWidget(QLabel("Nx"))
-            x_half.addWidget(self.entry_NX)
-            x_half.addSpacerItem(edge_spacer)
-
-            y_half = QHBoxLayout()
-            y_half.addSpacerItem(edge_spacer)
-            y_half.addWidget(QLabel("dy"))
-            y_half.addWidget(self.entry_deltaY)
-            y_half.addStretch(1)
-            y_half.addWidget(QLabel("Ny"))
-            y_half.addWidget(self.entry_NY)
-
-        # Create second row layouts
-        dz_half = QHBoxLayout()
-        dz_half.addWidget(QLabel("dz"))
-        dz_half.addWidget(self.entry_deltaZ)
-        dz_half.addStretch(1)
-        dz_half.addWidget(QLabel("Nz"))
-        dz_half.addWidget(self.entry_NZ)
-        dz_half.addSpacerItem(edge_spacer)
-
-        dt_half = QHBoxLayout()
-        dt_half.addSpacerItem(edge_spacer)
-        dt_half.addWidget(QLabel("dt"))
-        dt_half.addWidget(self.entry_dt)
-        dt_half.addStretch(1)
-        dt_half.addWidget(QLabel("Nt"))
-        dt_half.addWidget(self.entry_Nt)
-
-        self.grid_acquisition = QGridLayout()
-        # Add the layouts to grid_line1
-        if self.use_overlap:
-            self.grid_acquisition.addLayout(xy_half, 3, 0, 1, 4)
-            self.grid_acquisition.addLayout(overlap_half, 3, 4, 1, 4)
-        else:
-            self.grid_acquisition.addLayout(x_half, 3, 0, 1, 4)
-            self.grid_acquisition.addLayout(y_half, 3, 4, 1, 4)
-        self.grid_acquisition.addLayout(dz_half, 4, 0, 1, 4)
-        self.grid_acquisition.addLayout(dt_half, 4, 4, 1, 4)
-
-        self.z_min_layout = QHBoxLayout()
-        self.z_min_layout.addWidget(self.set_minZ_button)
-        self.z_min_layout.addWidget(QLabel("Z-min"), Qt.AlignRight)
-        self.z_min_layout.addWidget(self.entry_minZ)
-        self.z_min_layout.addSpacerItem(edge_spacer)
-
-        self.z_max_layout = QHBoxLayout()
-        self.z_max_layout.addSpacerItem(edge_spacer)
-        self.z_max_layout.addWidget(self.set_maxZ_button)
-        self.z_max_layout.addWidget(QLabel("Z-max"), Qt.AlignRight)
-        self.z_max_layout.addWidget(self.entry_maxZ)
-
-        self.grid_acquisition.addLayout(self.z_min_layout, 5, 0, 1, 4)  # hide this in toggle
-        self.grid_acquisition.addLayout(self.z_max_layout, 5, 4, 1, 4)  # hide this in toggle
-
-        grid_af = QVBoxLayout()
-        grid_af.addWidget(self.checkbox_withAutofocus)
-        # Laser AF has been promoted from a checkbox into a configuration button
-        # and lives in the right-hand button column (above Snap Images) instead.
-        # grid_af.addWidget(self.checkbox_genAFMap)  # we are not using auto-focus map for now
-        grid_af.addWidget(self.checkbox_useFocusMap)
+        # The header checkbox is the group's on/off switch: unchecked is a single
+        # plane, and the rows below are greyed out rather than hidden so the user can
+        # still read the stack they last set up. Default off on this tab.
+        zstack_section, zstack_content, self.checkbox_zstack = _make_checkable_section("Z-stack")
+        zstack_row = QHBoxLayout()
+        zstack_row.addWidget(QLabel("Nz"))
+        zstack_row.addWidget(self.entry_NZ)
+        zstack_row.addWidget(QLabel("dz"))
+        zstack_row.addWidget(self.entry_deltaZ)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        self.label_z_stack_from = QLabel("From")
+        zstack_row.addWidget(self.label_z_stack_from)
+        zstack_row.addWidget(self.combobox_z_stack, 1)
+        zstack_row.addWidget(self.checkbox_set_z_range)
+        zstack_content.addLayout(zstack_row)
         if HAS_OBJECTIVE_PIEZO:
-            grid_af.addWidget(self.checkbox_usePiezo)
+            zstack_content.addWidget(self.checkbox_usePiezo)
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
-        grid_af.addWidget(self.checkbox_set_z_range)
-        # Z-stack reference plane: with autofocus on, the AF plane becomes the
-        # bottom / center / top slice per this selection (see acquire_at_position).
-        z_stack_mode_row = QHBoxLayout()
-        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
-        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
-        grid_af.addLayout(z_stack_mode_row)
-        grid_af.addWidget(self.checkbox_skipSaving)
-        grid_af.addLayout(self.fileSavingFormatRow)
-        grid_af.addLayout(self.zarrStreamingRow)
-        grid_af.addWidget(self.checkbox_snakeScan)
-        grid_af.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
-        grid_af.addWidget(self.checkbox_showLiveDuringAcquisition)
 
-        grid_config = QHBoxLayout()
-        grid_config.addWidget(self.combobox_channel_mode, 0, Qt.AlignTop)
-        grid_config.addWidget(self.list_configurations)
-        grid_config.addWidget(self.btn_per_point_channels)
-        grid_config.addWidget(self.btn_edit_cycles)
-        grid_config.addSpacerItem(edge_spacer)
+        # Shown only in "Set Z-range" mode (toggle_z_range_controls walks both layouts
+        # by index, so they must stay the same length).
+        self.z_min_layout = QHBoxLayout()
+        self.z_min_layout.addWidget(self.set_minZ_button)
+        self.z_min_layout.addWidget(self.goto_minZ_button)
+        self.z_min_layout.addWidget(QLabel("Z-min"))
+        self.z_min_layout.addWidget(self.entry_minZ)
+        self.z_min_layout.addStretch(1)
 
-        # Button column (bottom-right). Laser AF button sits above Snap Images
-        # and is stretched to match the other two buttons' heights.
-        button_layout = QVBoxLayout()
-        for btn in (self.btn_snap_images, self.btn_startAcquisition):
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.z_max_layout = QHBoxLayout()
+        self.z_max_layout.addWidget(self.set_maxZ_button)
+        self.z_max_layout.addWidget(self.goto_maxZ_button)
+        self.z_max_layout.addWidget(QLabel("Z-max"))
+        self.z_max_layout.addWidget(self.entry_maxZ)
+        self.z_max_layout.addStretch(1)
+
+        zstack_content.addLayout(self.z_min_layout)
+        zstack_content.addLayout(self.z_max_layout)
+        self._zstack_controls = _collect_widgets(zstack_content)
+
+        timelapse_section, timelapse_content, self.checkbox_timelapse = _make_checkable_section("Time-lapse")
+        timelapse_row = QHBoxLayout()
+        timelapse_row.addWidget(QLabel("Nt"))
+        timelapse_row.addWidget(self.entry_Nt)
+        timelapse_row.addWidget(QLabel("dt"))
+        timelapse_row.addWidget(self.entry_dt)
+        timelapse_row.addStretch(1)
+        timelapse_content.addLayout(timelapse_row)
+        self._timelapse_controls = _collect_widgets(timelapse_content)
+
+        focus_section, focus_content = _make_section("Focus")
+        focus_content.addWidget(self.checkbox_withAutofocus)
+        # Laser AF is a settings *button* (it opens a dialog), but it is a focus
+        # setting like the two checkboxes around it, so it sits here at normal
+        # control height rather than in the actions column.
         if self._enable_laser_autofocus:
-            self.checkbox_withReflectionAutofocus.setSizePolicy(
-                QSizePolicy.Preferred, QSizePolicy.Expanding
-            )
-            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
-        button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 1)
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            focus_content.addLayout(laser_af_row)
+        # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
+        focus_content.addWidget(self.checkbox_useFocusMap)
 
-        grid_acquisition = QHBoxLayout()
-        grid_acquisition.addSpacerItem(edge_spacer)
-        grid_acquisition.addLayout(grid_af)
-        grid_acquisition.addLayout(button_layout)
+        saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_afValidation)
+        saving_content.addLayout(self.fileSavingFormatRow)
+        saving_content.addLayout(self.zarrStreamingRow)
 
-        self.grid_acquisition.addLayout(grid_config, 6, 0, 3, 4)
-        self.grid_acquisition.addLayout(grid_acquisition, 6, 4, 3, 4)
+        scan_section, scan_content = _make_section("Scan behaviour")
+        self.acquisition_order = _make_acquisition_order(self)
+        scan_content.addWidget(self.acquisition_order)
+        # Snake scan is a property of the whole scan path, not of one position's tile
+        # grid, and the Wellplate tab has always carried it here.
+        scan_content.addWidget(self.checkbox_snakeScan)
+        scan_content.addWidget(self.checkbox_snakeObservationStates)
+        scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+        scan_content.addWidget(self.checkbox_retractZBetweenRegions)
 
-        # Columns 0-3: Combined stretch factor = 4
-        # Columns 4-7: Combined stretch factor = 4
-        for i in range(4):
-            self.grid_acquisition.setColumnStretch(i, 1)
-            self.grid_acquisition.setColumnStretch(i + 4, 1)
+        self.parameter_block, block_content = _make_parameter_block()
+        block_content.addLayout(positions_section)
+        block_content.addLayout(tiling_section)
+        block_content.addLayout(zstack_section)
+        block_content.addLayout(timelapse_section)
 
-        self.grid_acquisition.setRowStretch(0, 0)  # Nx/Ny and overlap row
-        self.grid_acquisition.setRowStretch(1, 0)  # dz/Nz and dt/Nt row
-        self.grid_acquisition.setRowStretch(2, 0)  # Z-range row
-        self.grid_acquisition.setRowStretch(3, 1)  # Configuration/AF row - allow this to stretch
-        self.grid_acquisition.setRowStretch(4, 0)  # Last row
+        self.grid_acquisition = _make_acquisition_body(self, focus_section, saving_section, scan_section)
 
         # Row : Progress Bar
         self.row_progress_layout = QHBoxLayout()
@@ -3399,8 +3886,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.entry_dt.valueChanged.connect(self.multipointController.set_deltat)
         self.entry_NX.valueChanged.connect(self.multipointController.set_NX)
         self.entry_NY.valueChanged.connect(self.multipointController.set_NY)
-        self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
-        self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
+        # Nz/Nt go through the group checkboxes: with a group off the controller
+        # must keep seeing 1, whatever the (greyed-out) spinbox still reads.
+        self.entry_NZ.valueChanged.connect(lambda *_: self.multipointController.set_NZ(self._effective_NZ()))
+        self.entry_Nt.valueChanged.connect(lambda *_: self.multipointController.set_Nt(self._effective_Nt()))
+        self.checkbox_zstack.toggled.connect(lambda *_: self._apply_zstack_enabled())
+        self.checkbox_timelapse.toggled.connect(lambda *_: self._apply_timelapse_enabled())
         self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
@@ -3408,8 +3899,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
-        self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
-        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
+        # The last combo entry is "don't save" rather than a format, so the push goes
+        # through a helper that splits it into set_skip_saving / set_file_saving_option.
+        self.combobox_fileSavingFormat.currentTextChanged.connect(lambda *_: _push_save_format_to_controller(self))
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
@@ -3417,6 +3909,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.checkbox_showLiveDuringAcquisition.toggled.connect(
             self.multipointController.set_show_live_during_acquisition
         )
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
@@ -3435,7 +3928,6 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.entry_NZ.valueChanged,
             self.entry_Nt.valueChanged,
             self.combobox_fileSavingFormat.currentTextChanged,
-            self.checkbox_skipSaving.toggled,
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
@@ -3445,6 +3937,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
         self.btn_add.clicked.connect(self.add_location)
         self.btn_remove.clicked.connect(self.remove_location)
+        self.btn_prev.clicked.connect(self.prev)
         self.btn_next.clicked.connect(self.next)
         self.btn_clear.clicked.connect(self.clear)
         self.btn_export_locations.clicked.connect(self.export_location_list)
@@ -3457,22 +3950,38 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
         self.btn_update_z.clicked.connect(self.update_z)
         self.btn_update_ref.clicked.connect(self.update_reference)
+        if self._enable_laser_autofocus:
+            # "Recapture AF Ref" means nothing with laser AF off, so it follows the
+            # Laser AF button instead of popping an error dialog when clicked.
+            self.checkbox_withReflectionAutofocus.toggled.connect(self._sync_af_ref_button)
+        self._sync_af_ref_button()
 
         self.shortcut = QShortcut(QKeySequence(";"), self)
         self.shortcut.activated.connect(self.btn_add.click)
 
         self.toggle_z_range_controls(False)
         self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
+        self._apply_zstack_enabled()
+        self._apply_timelapse_enabled()
 
         _refresh_size_estimate(self)
 
     def setup_layout(self):
         self.grid = QVBoxLayout()
         self.grid.addLayout(self.grid_line0)
-        self.grid.addLayout(self.grid_location_list)
         self.grid.addLayout(self.grid_acquisition)
         self.grid.addLayout(self.row_progress_layout)
         self.setLayout(self.grid)
+
+    # _ZTimeGroupMixin works off these two, because the wellplate tab names the same
+    # pair of header checkboxes differently.
+    @property
+    def _zstack_checkbox(self):
+        return self.checkbox_zstack
+
+    @property
+    def _timelapse_checkbox(self):
+        return self.checkbox_timelapse
 
     def toggle_z_range_controls(self, state):
         is_visible = bool(state)
@@ -3547,6 +4056,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         z_value = self.stage.get_pos().z_mm * 1000  # Convert to μm
         self.entry_maxZ.setValue(z_value)
 
+    def goto_z_min(self):
+        # Z-only move: the retract-Z-for-XY-moves setting does not apply, there is
+        # nothing to travel across.
+        self.stage.move_z_to(self.entry_minZ.value() / 1000)  # Convert from μm to mm
+
+    def goto_z_max(self):
+        self.stage.move_z_to(self.entry_maxZ.value() / 1000)  # Convert from μm to mm
+
     def update_z_min(self, z_pos_um):
         if z_pos_um < self.entry_minZ.value():
             self.entry_minZ.setValue(z_pos_um)
@@ -3592,12 +4109,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def update_region_progress(self, current_fov, num_fovs):
         self._log.debug(f"Updating region progress for {current_fov=}, {num_fovs=}")
+        if _update_ordered_progress(self, current_fov, num_fovs):
+            return
         self.progress_bar.setMaximum(num_fovs)
         self.progress_bar.setValue(current_fov)
 
         if self.acquisition_start_time is not None and current_fov > 0:
             elapsed_time = time.time() - self.acquisition_start_time
-            Nt = self.entry_Nt.value()
+            Nt = self._effective_Nt()
             dt = self.entry_dt.value()
 
             # Calculate total processed FOVs and total FOVs
@@ -3626,14 +4145,16 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.current_region = current_region
         self.current_time_point = current_time_point
 
-        if self.current_region == 1 and self.current_time_point == 0:  # First region
+        if self.acquisition_start_time is None or (
+            not _uses_ordered_progress(self) and self.current_region == 1 and self.current_time_point == 0
+        ):
             self.acquisition_start_time = time.time()
             self.num_regions = num_regions
 
         progress_parts = []
         # Update timepoint progress if there are multiple timepoints and the timepoint has changed
-        if self.entry_Nt.value() > 1:
-            progress_parts.append(f"Time {current_time_point + 1}/{self.entry_Nt.value()}")
+        if self._effective_Nt() > 1:
+            progress_parts.append(f"Time {current_time_point + 1}/{self._effective_Nt()}")
 
         # Update region progress if there are multiple regions
         if num_regions > 1:
@@ -3643,7 +4164,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         progress_text = "  ".join(progress_parts)
         self.progress_label.setText(progress_text if progress_text else "Progress")
 
-        self.progress_bar.setValue(0)
+        if not _uses_ordered_progress(self):
+            self.progress_bar.setValue(0)
 
     def update_eta_display(self):
         if self.eta_seconds > 0:
@@ -3693,7 +4215,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -3742,9 +4264,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def _update_per_point_button_text(self):
         if self._region_obs_state_map is not None:
-            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+            self.btn_per_point_channels.setText("Per-Point Channels *")
         else:
-            self.btn_per_point_channels.setText("Per-Point\nChannels")
+            self.btn_per_point_channels.setText("Per-Point Channels")
 
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
@@ -3851,16 +4373,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # "every region has a reference" pre-flight check.
             self._restore_region_references()
 
-            if self.checkbox_set_z_range.isChecked():
-                # Set Z-range (convert from μm to mm)
-                minZ = self.entry_minZ.value() / 1000
-                maxZ = self.entry_maxZ.value() / 1000
-                self.multipointController.set_z_range(minZ, maxZ)
-            else:
-                z = self.stage.get_pos().z_mm
-                dz = self.entry_deltaZ.value()
-                Nz = self.entry_NZ.value()
-                self.multipointController.set_z_range(z, z + dz / 1000 * (Nz - 1))
+            # The Z-stack / Time-lapse header checkboxes decide whether this run is a
+            # stack / a time series at all; with a group off its spinbox is greyed out
+            # and the effective value is 1.
+            effective_NZ = self._effective_NZ()
+            effective_Nt = self._effective_Nt()
+
+            minZ, maxZ = self._compute_z_range(effective_NZ)
+            self.multipointController.set_z_range(minZ, maxZ)
 
             if self.checkbox_useFocusMap.isChecked():
                 self.focusMapWidget.fit_surface()
@@ -3870,10 +4390,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
             # Set acquisition parameters
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
-            self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_NZ(effective_NZ)
             self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
-            self.multipointController.set_Nt(self.entry_Nt.value())
+            self.multipointController.set_Nt(effective_Nt)
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
             self.multipointController.set_af_flag(self.checkbox_withAutofocus.isChecked())
             self.multipointController.set_reflection_af_flag(
@@ -3881,27 +4401,47 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
-            self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
+            self.multipointController.set_snake_observation_states(self.checkbox_snakeObservationStates.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("flexible")
+            _push_tiling_grid_to_controller(self)
+            self.multipointController.acquisition_order = self.acquisition_order.order()
             self._push_channel_selection_to_controller()
+            # Re-push THIS tab's visible save-format + streaming state. The
+            # flexible and wellplate tabs each have their own combo/row bound
+            # to the one controller, so without this the run would use the
+            # last edit made in ANY tab, not what this tab displays.
+            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
+            _push_save_format_to_controller(self)
+            # Same story for the retract flag: one controller, a checkbox per tab.
+            self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
+            self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if self.checkbox_skipSaving.isChecked():
+            # Probe the streaming target BEFORE the disk-space check: choosing
+            # "start without streaming" here disables the upload target, and
+            # the space check must then be evaluated against full local
+            # retention rather than the streaming per-timepoint discount.
+            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
+                self.btn_startAcquisition.setChecked(False)
+                return
+
+            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if not check_ram_available_with_error_dialog(
+            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self._log.error("Failed to start acquisition.  Not enough RAM available.")
@@ -3921,7 +4461,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
             # emit signals
             self.signal_acquisition_started.emit(True)
-            self.signal_acquisition_shape.emit(self.entry_NZ.value(), self.entry_deltaZ.value())
+            self.signal_acquisition_shape.emit(effective_NZ, self.entry_deltaZ.value())
 
             # Start coordinate-based acquisition
             self.multipointController.run_acquisition()
@@ -3945,14 +4485,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.table_location_list.selectRow(row)
             self.table_location_list.blockSignals(False)
 
-    @staticmethod
-    def _position_cells(x, y, z):
-        """The x / y / z cells for one position row (z displayed in μm)."""
-        return [
-            QTableWidgetItem(str(round(x, 3))),
-            QTableWidgetItem(str(round(y, 3))),
-            QTableWidgetItem(str(round(z * 1000, 1))),
-        ]
+    @classmethod
+    def _position_cells(cls, x, y, z):
+        """The x / y / z cells for one position row, keyed by column (z shown in μm)."""
+        return {
+            cls._COL_X: QTableWidgetItem(str(round(x, 3))),
+            cls._COL_Y: QTableWidgetItem(str(round(y, 3))),
+            cls._COL_Z: QTableWidgetItem(str(round(z * 1000, 1))),
+        }
 
     def _refresh_position_cells(self, row):
         """Re-render the x/y/z cells for ``row`` from location_list."""
@@ -3960,13 +4500,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             return
         x, y, z = self.location_list[row]
         self.table_location_list.blockSignals(True)
-        for col, item in enumerate(self._position_cells(x, y, z)):
+        for col, item in self._position_cells(x, y, z).items():
             self.table_location_list.setItem(row, col, item)
         self.table_location_list.blockSignals(False)
 
     def _update_position_count(self):
         n = len(self.location_ids)
-        self.label_position_count.setText("no positions" if n == 0 else f"({n})")
+        self.label_position_count.setText(self._NO_POSITIONS_HINT if n == 0 else f"({n})")
 
     def _next_region_id(self):
         """Return the smallest unused 'R{n}' region id.
@@ -3999,7 +4539,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             return
         row = ids.index(region_id)
         self.table_location_list.blockSignals(True)
-        self.table_location_list.setItem(row, 4, self._af_ref_item(reference))
+        self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(reference))
         self.table_location_list.blockSignals(False)
 
     def _store_region_reference(self, region_id, reference):
@@ -4045,13 +4585,24 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self._set_af_ref_cell_for_region(region_id, reference)
         return True
 
+    def _laser_af_is_on(self):
+        """True when this panel would actually run laser AF (and so can capture a ref)."""
+        return bool(self._enable_laser_autofocus and self.checkbox_withReflectionAutofocus.isChecked())
+
+    def _sync_af_ref_button(self, *_):
+        """Grey out "Recapture AF Ref", with a reason, while laser AF is off."""
+        enabled = self._laser_af_is_on()
+        self.btn_update_ref.setEnabled(enabled)
+        self.btn_update_ref.setToolTip(
+            "Capture the current laser-AF reference (focus target) for the selected position."
+            if enabled
+            else "Turn Laser AF on to capture a per-position laser-AF reference."
+        )
+
     def update_reference(self):
         """Re-capture the laser-AF reference for the currently selected region."""
         index = self._selected_row()
         if index < 0:
-            return
-        if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
-            error_dialog("Enable Reflection (Laser) AF before capturing a per-region reference.")
             return
         self._capture_region_reference(str(self.location_ids[index]))
 
@@ -4074,10 +4625,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, z)):
+            for col, item in self._position_cells(x, y, z).items():
                 self.table_location_list.setItem(row, col, item)
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(region_id))
-            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
+            self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(region_id))
+            self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(None))
 
             # Store actual values in region coordinates
             if self.use_overlap:
@@ -4088,7 +4639,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4163,7 +4714,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if count <= 0:
             self._log.error("Cannot move to next location, because there are no locations in the list")
             return
+        # _selected_row() is -1 with nothing selected, which lands on row 0.
         self.go_to((self._selected_row() + 1) % count)
+
+    def prev(self):
+        """Select the previous position (wrapping) and move the stage there."""
+        count = len(self.location_ids)
+        if count <= 0:
+            self._log.error("Cannot move to previous location, because there are no locations in the list")
+            return
+        row = self._selected_row()
+        # With nothing selected, "previous" means the end of the list.
+        self.go_to(count - 1 if row < 0 else (row - 1) % count)
 
     def clear(self):
         self.location_list = np.empty((0, 3), dtype=float)
@@ -4186,23 +4748,60 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.table_location_list.setRowCount(0)
         self._update_position_count()
 
+    # A table click within this of the stage's current XYZ is "already there" -
+    # e.g. the second click of a double-click-to-rename - so it only selects
+    # the row instead of re-issuing the same move (which, with the retract
+    # checkbox on, used to send the objective on a pointless round trip).
+    _GO_TO_POSITION_TOLERANCE_MM = 0.001  # 1 um
+
     def go_to(self, index):
         """Select position ``index`` and drive the stage to it."""
         if not 0 <= index < len(self.location_list):
             return
         x, y, z = self.location_list[index]
-        self.stage.move_x_to(x)
-        self.stage.move_y_to(y)
-        self.stage.move_z_to(z)
+        pos = self.stage.get_pos()
+        already_there = (
+            abs(pos.x_mm - x) < self._GO_TO_POSITION_TOLERANCE_MM
+            and abs(pos.y_mm - y) < self._GO_TO_POSITION_TOLERANCE_MM
+            and abs(pos.z_mm - z) < self._GO_TO_POSITION_TOLERANCE_MM
+        )
+        if not already_there:
+            self._move_stage_to_position(x, y, z)
         self._select_row(index)
 
+    def _move_stage_to_position(self, x, y, z):
+        """Drive the stage to a listed position, retracting Z first if asked to.
+
+        With *Retract Z ... for XY moves* on, the objective is raised to
+        ``OBJECTIVE_RETRACTED_POS_MM`` and the moves are serialised (Z up, XY, Z
+        down) so nothing travels across the sample at working height - the same
+        bracket the worker puts around inter-region moves (``move_xy_with_z_retract``
+        in ``squid/stage/utils.py``), which also skips the retract for a same-XY,
+        different-Z click (a plain Z move). The retract height goes to
+        ``move_z_to`` as-is: no raw->canonical conversion and no
+        ``INVERTED_OBJECTIVE`` flip.
+        """
+        move_xy_with_z_retract(
+            self.stage,
+            x,
+            y,
+            retract=self.checkbox_retractZBetweenRegions.isChecked(),
+            z_target_mm=z,
+            home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+        )
+
     def cell_was_clicked(self, row, column):
-        self.go_to(row)
+        # Prev/Next Pos always move - they are navigation. A click only selects
+        # unless the user asked for it to drive the stage too.
+        if self.checkbox_moveStageOnClick.isChecked():
+            self.go_to(row)
+        else:
+            self._select_row(row)
 
     def _set_name_cell(self, row, name):
         """Write the Region Name cell without re-entering ``cell_was_changed``."""
         self.table_location_list.blockSignals(True)
-        self.table_location_list.setItem(row, 3, QTableWidgetItem(str(name)))
+        self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(str(name)))
         self.table_location_list.blockSignals(False)
 
     def _rename_region_from_cell(self, row, old_id):
@@ -4215,7 +4814,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         the experiment folder, so anything that doesn't validate is bounced back to
         the previous name with an explanation instead of being silently accepted.
         """
-        new_id = normalize_region_name(self.table_location_list.item(row, 3).text())
+        new_id = normalize_region_name(self.table_location_list.item(row, self._COL_NAME).text())
         if new_id == old_id:
             self._set_name_cell(row, old_id)  # normalize a whitespace-only edit
             return
@@ -4267,13 +4866,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
 
     def cell_was_changed(self, row, column):
         # The "AF Ref" column is a read-only indicator; ignore changes to it.
-        if column >= 4:
+        if column == self._COL_AF_REF:
             return
 
         # Get region ID
         region_id = str(self.location_ids[row])
 
-        if column == 3:  # Region name; renaming must not move the stage.
+        if column == self._COL_NAME:  # Renaming must not move the stage.
             self._rename_region_from_cell(row, region_id)
             return
 
@@ -4284,7 +4883,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         # Handle the changed value
         val_edit = self.table_location_list.item(row, column).text()
 
-        if column < 2:  # X or Y coordinate changed
+        if column in (self._COL_X, self._COL_Y):
+            # _COL_X / _COL_Y double as the x/y columns of location_list.
             self.location_list[row, column] = float(val_edit)
             x, y, z = self.location_list[row]
 
@@ -4297,7 +4897,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4441,9 +5041,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     self.location_ids = np.append(self.location_ids, region_id)
                     table_row = self.table_location_list.rowCount()
                     self.table_location_list.insertRow(table_row)
-                    for col, item in enumerate(self._position_cells(x, y, z)):
+                    for col, item in self._position_cells(x, y, z).items():
                         self.table_location_list.setItem(table_row, col, item)
-                    self.table_location_list.setItem(table_row, 3, QTableWidgetItem(region_id))
+                    self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
                     if self.use_overlap:
                         self.scanCoordinates.add_flexible_region(
                             region_id,
@@ -4452,7 +5052,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                             z,
                             self.entry_NX.value(),
                             self.entry_NY.value(),
-                            overlap_percent=self.entry_overlap.value(),
+                            overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                         )
                     else:
                         self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4471,7 +5071,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
                     if reference is not None:
                         self._store_region_reference(region_id, reference)
-                    self.table_location_list.setItem(table_row, 4, self._af_ref_item(reference))
+                    self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
                 else:
                     self._log.warning("Duplicate values not added based on x and y.")
             self.table_location_list.blockSignals(False)
@@ -4480,6 +5080,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
+        self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
         self._push_channel_selection_to_controller()
@@ -4497,7 +5098,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.multipointController.set_z_range(z, z)
 
         # Start the acquisition process for the single FOV
-        self.multipointController.start_new_experiment("snapped images" + self.lineEdit_experimentID.text())
+        # start_new_experiment appends _<timestamp> and squashes spaces, so this lands as
+        # snap_<id>_<timestamp> (or snap_<timestamp> with no experiment ID). The old
+        # "snapped images" + id ran the two together with no separator.
+        experiment_id = self.lineEdit_experimentID.text().strip()
+        self.multipointController.start_new_experiment("snap_" + experiment_id if experiment_id else "snap")
         self.multipointController.run_acquisition(acquire_current_fov=True)
 
     def acquisition_is_finished(self):
@@ -4528,6 +5133,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self.lineEdit_experimentID.setEnabled(enabled)
         self.entry_NX.setEnabled(enabled)
         self.entry_NY.setEnabled(enabled)
+        self.tile_spacing.setEnabled(enabled)
+        self.acquisition_order.setEnabled(enabled)
         self.entry_deltaZ.setEnabled(enabled)
         self.entry_NZ.setEnabled(enabled)
         self.entry_dt.setEnabled(enabled)
@@ -4539,6 +5146,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.entry_overlap.setEnabled(enabled)
         self.list_configurations.setEnabled(enabled)
         self.btn_per_point_channels.setEnabled(enabled)
+        self.checkbox_snakeObservationStates.setEnabled(enabled)
         self.checkbox_genAFMap.setEnabled(enabled)
         self.checkbox_useFocusMap.setEnabled(enabled)
         self.checkbox_withAutofocus.setEnabled(enabled)
@@ -4546,6 +5154,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.checkbox_withReflectionAutofocus.setEnabled(enabled)
         self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
+        self.checkbox_zstack.setEnabled(enabled)
+        self.checkbox_timelapse.setEnabled(enabled)
         # The worker snapshots the position list at start, so editing it mid-run would
         # only desync the GUI from the data being written. Now that the table is always
         # on screen, lock the whole positions block rather than leaving it inviting.
@@ -4554,13 +5164,21 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.btn_add,
             self.btn_remove,
             self.btn_clear,
+            self.btn_prev,
             self.btn_next,
             self.btn_update_z,
             self.btn_update_ref,
             self.btn_import_locations,
             self.btn_export_locations,
+            self.checkbox_moveStageOnClick,
         ):
             btn.setEnabled(enabled)
+        if enabled:
+            # ...but "Recapture AF Ref" only comes back if laser AF is actually on, and
+            # the Z-stack / Time-lapse controls only if their header checkbox is on.
+            self._sync_af_ref_button()
+            self._apply_zstack_enabled()
+            self._apply_timelapse_enabled()
 
         if exclude_btn_startAcquisition is not True:
             self.btn_startAcquisition.setEnabled(enabled)
@@ -4617,6 +5235,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         if self._enable_laser_autofocus:
             widgets_to_block.append(self.checkbox_withReflectionAutofocus)
         widgets_to_block.append(self.checkbox_usePiezo)
+        widgets_to_block.extend([self.checkbox_zstack, self.checkbox_timelapse])
 
         # Add optional widgets if they exist
         if hasattr(self, "entry_deltaX"):
@@ -4638,8 +5257,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                 self.entry_deltaY.setValue(yaml_data.delta_y_mm)
             if hasattr(self, "entry_overlap") and self.use_overlap:
                 self.entry_overlap.setValue(yaml_data.overlap_percent)
+            self.tile_spacing.restore(yaml_data.tile_spacing)
+            self.acquisition_order.restore(yaml_data.acquisition_order)
 
-            # Z-stack settings
+            # Z-stack settings: more than one plane in the file means the group is on.
+            self.checkbox_zstack.setChecked(yaml_data.nz > 1)
             self.entry_NZ.setValue(yaml_data.nz)
             self.entry_deltaZ.setValue(yaml_data.delta_z_um)
 
@@ -4647,6 +5269,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             self.checkbox_usePiezo.setChecked(yaml_data.use_piezo)
 
             # Time series settings
+            self.checkbox_timelapse.setChecked(yaml_data.nt > 1)
             self.entry_Nt.setValue(yaml_data.nt)
             self.entry_dt.setValue(yaml_data.delta_t_s)
 
@@ -4663,6 +5286,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
 
+            # Saving (the dry-run entry of the save-format combo)
+            _apply_save_format_from_yaml(self, yaml_data)
+
+            # Scan behaviour
+            _apply_retract_z_from_yaml(self, yaml_data)
+            self.checkbox_snakeObservationStates.setChecked(yaml_data.snake_observation_states)
+
             # Load positions if present
             if yaml_data.flexible_positions:
                 self._load_positions(yaml_data.flexible_positions)
@@ -4671,6 +5301,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Unblock all signals
             for widget in widgets_to_block:
                 widget.blockSignals(False)
+
+            # The group checkboxes were set with signals blocked, so apply their
+            # greying and push the effective Nz/Nt to the controller.
+            self._apply_zstack_enabled()
+            self._apply_timelapse_enabled()
 
             # Update FOV positions to reflect new NX, NY, delta values
             self.update_fov_positions()
@@ -4713,11 +5348,11 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
             # Update UI - table
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, z)):
+            for col, item in self._position_cells(x, y, z).items():
                 self.table_location_list.setItem(row, col, item)
-            self.table_location_list.setItem(row, 3, QTableWidgetItem(name))
+            self.table_location_list.setItem(row, self._COL_NAME, QTableWidgetItem(name))
             self.table_location_list.setItem(
-                row, 4, self._af_ref_item(self._region_laser_af_references.get(name))
+                row, self._COL_AF_REF, self._af_ref_item(self._region_laser_af_references.get(name))
             )
 
             # Add to scan coordinates
@@ -4729,7 +5364,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
                     z,
                     self.entry_NX.value(),
                     self.entry_NY.value(),
-                    overlap_percent=self.entry_overlap.value(),
+                    overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
                 )
             else:
                 self.scanCoordinates.add_flexible_region_with_step_size(
@@ -4747,7 +5382,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, 
         self._update_position_count()
 
 
-class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin, QFrame):
+class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, AcquisitionYAMLDropMixin, QFrame):
 
     signal_acquisition_started = Signal(bool)
     signal_acquisition_channels = Signal(list)
@@ -4812,12 +5447,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         # Cache for loaded coordinates dataframe (restored when switching back to Load Coordinates mode)
         self.cached_loaded_coordinates_df = None
         self.cached_loaded_file_path = None
-
-        # Add state tracking for Z parameters
-        self.stored_z_params = {"dz": None, "nz": None, "z_min": None, "z_max": None, "z_mode": "From Bottom"}
-
-        # Add state tracking for Time parameters
-        self.stored_time_params = {"dt": None, "nt": None}
 
         # Add state tracking for XY mode parameters
         self.stored_xy_params = {
@@ -4921,16 +5550,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.entry_deltaZ.setSingleStep(0.1)
         self.entry_deltaZ.setValue(Acquisition.DZ)
         self.entry_deltaZ.setDecimals(3)
-        # self.entry_deltaZ.setEnabled(False)
         self.entry_deltaZ.setSuffix(" μm")
-        self.entry_deltaZ.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.entry_NZ = QSpinBox()
         self.entry_NZ.setMinimum(1)
         self.entry_NZ.setMaximum(2000)
         self.entry_NZ.setSingleStep(1)
         self.entry_NZ.setValue(1)
-        self.entry_NZ.setEnabled(False)
 
         self.entry_dt = QDoubleSpinBox()
         self.entry_dt.setKeyboardTracking(False)
@@ -4939,7 +5565,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.entry_dt.setSingleStep(1)
         self.entry_dt.setValue(0)
         self.entry_dt.setSuffix(" s")
-        self.entry_dt.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.entry_Nt = QSpinBox()
         self.entry_Nt.setMinimum(1)
@@ -4973,8 +5598,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self._region_obs_state_map = None
         # Stable channel_name -> palette index, persists across dialog opens for color continuity.
         self._channel_color_index = {}
-        self.btn_per_point_channels = QPushButton("Per-Point\nChannels")
-        self.btn_edit_cycles = QPushButton("Edit\nCycles")
+        self.btn_per_point_channels = QPushButton("Per-Point Channels")
+        self.btn_edit_cycles = QPushButton("Edit Cycles")
         self.btn_edit_cycles.setToolTip("Create and edit acquisition cycles (per-position sequences of observation states)")
         self.btn_edit_cycles.clicked.connect(lambda: _open_cycle_editor(self))
         self.btn_edit_cycles.setVisible(False)  # advanced-only; shown when mode switches
@@ -5022,8 +5647,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
-        self.checkbox_skipSaving = QCheckBox("Skip Saving")
-        self.checkbox_skipSaving.setChecked(False)
+        self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
+        self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_afValidation.setToolTip(
+            "Requires Laser AF. Walk positions and timepoints using the normal AF cadence. "
+            "Skip channel images, Z stacks, stimuli and fluidics. Save autofocus evidence "
+            "in the experiment's af_validation folder."
+        )
+        self.checkbox_afValidation.toggled.connect(lambda *_: _refresh_size_estimate(self))
 
         self.fileSavingFormatRow, self.combobox_fileSavingFormat, self.label_size_estimate = _make_file_saving_format_row(
             initial_option=getattr(self.multipointController, "file_saving_option", None)
@@ -5035,6 +5666,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.combobox_fileSavingFormat, self._zarr_streaming_widgets
         )
 
+        self.checkbox_snakeObservationStates = _make_snake_observation_states_checkbox(self.multipointController)
         self.checkbox_snakeScan = QCheckBox("Snake scan")
         self.checkbox_snakeScan.setChecked(FOV_PATTERN == "S-Pattern")
         self.checkbox_snakeScan.setToolTip(
@@ -5052,6 +5684,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             "only redraws the last captured frame once the scan finishes. Saves per-capture overhead."
         )
 
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
         self.btn_startAcquisition.setCheckable(True)
@@ -5067,295 +5701,253 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.eta_timer = QTimer()
 
         # Add snap images button
-        self.btn_snap_images = QPushButton("Snap Images")
+        self.btn_snap_images = QPushButton("Acquire\nCurrent FOV")
+        self.btn_snap_images.setToolTip(
+            "Acquire the checked channels once, one plane, at the current stage position, "
+            "using the Save format above. Does not add a position."
+        )
         self.btn_snap_images.clicked.connect(self.on_snap_images)
         self.btn_snap_images.setCheckable(False)
         self.btn_snap_images.setChecked(False)
 
-        # Add acquisition tabs with checkboxes and frames
-        # XY Tab
-        self.xy_frame = QFrame()
-
+        # ---- Left column: Positions / Tiling / Z-stack / Time-lapse ---------
+        # One framed box, built by the same helpers as the Flexible tab's, so what
+        # the stage does at every point of a run reads identically on both tabs.
+        # The coloured XY / Z / Time mini-tabs that used to sit above this are gone:
+        # the Z-stack and Time-lapse section headers are the enable checkboxes now,
+        # and the scan-shape controls live in the tiling group.
         self.checkbox_xy = QCheckBox("XY")
         self.checkbox_xy.setChecked(True)
 
         self.combobox_xy_mode = QComboBox()
         self.combobox_xy_mode.addItems(["Current Position", "Select Wells", "Manual", "Load Coordinates"])
-        self.combobox_xy_mode.setEnabled(True)  # Initially enabled since XY is checked
-        # disable manual mode on init (before mosaic is loaded) - identify the index of the manual mode by name
+        # Manual mode needs a loaded mosaic; enable_manual_ROI() lifts this.
         _manual_index = self.combobox_xy_mode.findText("Manual")
         self.combobox_xy_mode.model().item(_manual_index).setEnabled(False)
 
-        xy_layout = QHBoxLayout()
-        xy_layout.setContentsMargins(8, 4, 8, 4)
-        xy_layout.addWidget(self.checkbox_xy)
-        xy_layout.addWidget(self.combobox_xy_mode)
-        self.xy_frame.setLayout(xy_layout)
+        self.checkbox_set_z_range = QCheckBox("Set Z-range")
+        self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
 
-        # Z Tab
-        self.z_frame = QFrame()
+        self.entry_NX = QSpinBox()
+        self.entry_NX.setMinimum(1)
+        self.entry_NX.setMaximum(50)
+        self.entry_NX.setSingleStep(1)
+        self.entry_NX.setValue(1)
+        self.entry_NX.setKeyboardTracking(False)
 
-        self.checkbox_z = QCheckBox("Z")
-        self.checkbox_z.setChecked(False)
+        self.entry_NY = QSpinBox()
+        self.entry_NY.setMinimum(1)
+        self.entry_NY.setMaximum(50)
+        self.entry_NY.setSingleStep(1)
+        self.entry_NY.setValue(1)
+        self.entry_NY.setKeyboardTracking(False)
 
-        self.combobox_z_mode = QComboBox()
-        self.combobox_z_mode.addItems(["From Bottom", "Set Range"])
-        self.combobox_z_mode.setEnabled(False)  # Initially disabled since Z is unchecked
+        # One width for the counts and one for the step sizes, so the Nz / dz / Nt / dt
+        # rows line up down the box (the Flexible tab does the same).
+        max_num_width = max(
+            self.entry_NX.sizeHint().width(),
+            self.entry_NY.sizeHint().width(),
+            self.entry_NZ.sizeHint().width(),
+            self.entry_Nt.sizeHint().width(),
+        )
+        for entry in (self.entry_NX, self.entry_NY, self.entry_NZ, self.entry_Nt):
+            entry.setFixedWidth(max_num_width)
+        max_delta_width = max(self.entry_deltaZ.sizeHint().width(), self.entry_dt.sizeHint().width())
+        for entry in (self.entry_deltaZ, self.entry_dt):
+            entry.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            entry.setFixedWidth(max_delta_width)
 
-        z_layout = QHBoxLayout()
-        z_layout.setContentsMargins(8, 4, 8, 4)
-        z_layout.addWidget(self.checkbox_z)
-        z_layout.addWidget(self.combobox_z_mode)
-        self.z_frame.setLayout(z_layout)
+        self.scan_shape_label = QLabel("Shape")
+        self.scan_size_label = QLabel("Scan size")
+        self.coverage_label = QLabel("Coverage")
+        self.fov_overlap_label = QLabel("Overlap")
 
-        # Time Tab
-        self.time_frame = QFrame()
+        positions_section, positions_content = _make_section("Positions")
+        self.xy_mode_row, xy_mode_row = _make_row_widget()
+        xy_mode_row.addWidget(self.checkbox_xy)
+        xy_mode_row.addWidget(self.combobox_xy_mode)
+        xy_mode_row.addStretch(1)
+        positions_content.addWidget(self.xy_mode_row)
 
-        self.checkbox_time = QCheckBox("Time")
-        self.checkbox_time.setChecked(False)
+        # Saving the generated FOV list, and loading one from a file, are two takes on
+        # the same thing, so they share a row; the XY mode decides which is on screen
+        # (update_scan_control_ui).
+        self.coordinates_row, coordinates_row = _make_row_widget()
+        coordinates_row.addWidget(self.btn_save_scan_coordinates)
+        coordinates_row.addWidget(self.btn_load_scan_coordinates)
+        # The file path takes the slack when it is on screen; the trailing stretch keeps
+        # "Save Coordinates" at its natural width when it is the only thing in the row.
+        coordinates_row.addWidget(self.text_loaded_coordinates, 3)
+        coordinates_row.addStretch(1)
+        positions_content.addWidget(self.coordinates_row)
 
-        time_layout = QHBoxLayout()
-        time_layout.setContentsMargins(8, 4, 8, 4)
-        time_layout.addWidget(self.checkbox_time)
-        time_layout.addStretch()  # Fill horizontal space
-        self.time_frame.setLayout(time_layout)
+        tiling_section, tiling_content = _make_section("Tiling per position")
 
-        # Main layout
+        # Two ways to say how much of each well to cover: a scan area that is a
+        # fraction of the well, or the Flexible tab's explicit Nx x Ny grid centred
+        # on the well centre (on the stage position in Current Position mode).
+        self.radio_tiling_fraction = QRadioButton("Well area")
+        self.radio_tiling_grid = QRadioButton("Grid")
+        self.radio_tiling_fraction.setChecked(True)
+        self.radio_tiling_fraction.setToolTip(
+            "Cover a scan area of the given size in each well, tiled to fill the shape."
+        )
+        self.radio_tiling_grid.setToolTip(
+            "Image an explicit Nx × Ny block of FOVs centred on each well centre, whatever the well size."
+        )
+        self.tiling_method_group = QButtonGroup(self)
+        self.tiling_method_group.addButton(self.radio_tiling_fraction)
+        self.tiling_method_group.addButton(self.radio_tiling_grid)
+
+        self.tiling_method_row, method_row = _make_row_widget()
+        method_row.addWidget(self.radio_tiling_fraction)
+        method_row.addWidget(self.radio_tiling_grid)
+
+        self.tiling_fraction_row, fraction_row = _make_row_widget()
+        fraction_row.addWidget(self.scan_shape_label)
+        fraction_row.addWidget(self.combobox_shape)
+        fraction_row.addWidget(self.scan_size_label)
+        fraction_row.addWidget(self.entry_scan_size)
+        fraction_row.addWidget(self.coverage_label)
+        fraction_row.addWidget(self.entry_well_coverage)
+
+        self.tiling_grid_row, grid_row = _make_row_widget()
+        grid_row.addWidget(QLabel("Nx"))
+        grid_row.addWidget(self.entry_NX)
+        grid_row.addWidget(QLabel("Ny"))
+        grid_row.addWidget(self.entry_NY)
+
+        # Overlap applies to both methods (and to Manual mode's own shapes).
+        self.tiling_overlap_row, overlap_row = _make_row_widget()
+        self.tile_spacing = TileSpacingWidget(self.entry_overlap)
+        self.tile_spacing.layout().insertWidget(1, self.tiling_method_row)
+        self.tile_spacing.layout().insertWidget(2, self.tiling_fraction_row)
+        self.tile_spacing.layout().insertWidget(3, self.tiling_grid_row)
+        overlap_row.addWidget(self.tile_spacing)
+        self.tile_spacing.changed.connect(self._on_tile_spacing_changed)
+        tiling_content.insertWidget(0, self.tiling_overlap_row)
+
+        self.tiling_section_widget = QWidget()
+        self.tiling_section_widget.setLayout(tiling_section)
+
+        # The header checkbox is the group's on/off switch: unchecked is a single
+        # plane, and the rows below are greyed out rather than hidden so the user can
+        # still read the stack they last set up.
+        zstack_section, zstack_content, self.checkbox_z = _make_checkable_section("Z-stack")
+        zstack_row = QHBoxLayout()
+        zstack_row.addWidget(QLabel("Nz"))
+        zstack_row.addWidget(self.entry_NZ)
+        zstack_row.addWidget(QLabel("dz"))
+        zstack_row.addWidget(self.entry_deltaZ)
+        # Z-stack reference plane: with autofocus on, the AF plane becomes the
+        # bottom / center / top slice per this selection (see acquire_at_position).
+        self.label_z_stack_from = QLabel("From")
+        zstack_row.addWidget(self.label_z_stack_from)
+        zstack_row.addWidget(self.combobox_z_stack, 1)
+        zstack_row.addWidget(self.checkbox_set_z_range)
+        zstack_content.addLayout(zstack_row)
+        if HAS_OBJECTIVE_PIEZO:
+            zstack_content.addWidget(self.checkbox_usePiezo)
+            if IS_PIEZO_ONLY:
+                self.checkbox_usePiezo.setChecked(True)
+                self.checkbox_usePiezo.setVisible(False)
+
+        # Shown only in "Set Z-range" mode (toggle_z_range_controls hides the widgets
+        # of both layouts).
+        self.z_min_layout = QHBoxLayout()
+        self.z_min_layout.addWidget(self.set_minZ_button)
+        self.z_min_layout.addWidget(self.goto_minZ_button)
+        self.z_min_layout.addWidget(QLabel("Z-min"))
+        self.z_min_layout.addWidget(self.entry_minZ)
+        self.z_min_layout.addStretch(1)
+
+        self.z_max_layout = QHBoxLayout()
+        self.z_max_layout.addWidget(self.set_maxZ_button)
+        self.z_max_layout.addWidget(self.goto_maxZ_button)
+        self.z_max_layout.addWidget(QLabel("Z-max"))
+        self.z_max_layout.addWidget(self.entry_maxZ)
+        self.z_max_layout.addStretch(1)
+
+        zstack_content.addLayout(self.z_min_layout)
+        zstack_content.addLayout(self.z_max_layout)
+        self._zstack_controls = _collect_widgets(zstack_content)
+
+        timelapse_section, timelapse_content, self.checkbox_time = _make_checkable_section("Time-lapse")
+        timelapse_row = QHBoxLayout()
+        timelapse_row.addWidget(QLabel("Nt"))
+        timelapse_row.addWidget(self.entry_Nt)
+        timelapse_row.addWidget(QLabel("dt"))
+        timelapse_row.addWidget(self.entry_dt)
+        timelapse_row.addStretch(1)
+        timelapse_content.addLayout(timelapse_row)
+        self._timelapse_controls = _collect_widgets(timelapse_content)
+
+        self.parameter_block, block_content = _make_parameter_block()
+        block_content.addLayout(positions_section)
+        block_content.addWidget(self.tiling_section_widget)
+        block_content.addLayout(zstack_section)
+        block_content.addLayout(timelapse_section)
+
+        # ---- Right column: how the run behaves ------------------------------
+        focus_section, focus_content = _make_section("Focus")
+        focus_content.addWidget(self.checkbox_withAutofocus)
+        # Laser AF is a settings button (it opens a dialog) but it is a focus setting,
+        # so it sits here at normal control height, not in the actions column.
+        if self._enable_laser_autofocus:
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            focus_content.addLayout(laser_af_row)
+        # self.checkbox_genAFMap is not wired into the UI — focus maps are fit manually.
+        focus_content.addWidget(self.checkbox_useFocusMap)
+
+        saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_afValidation)
+        saving_content.addLayout(self.fileSavingFormatRow)
+        saving_content.addLayout(self.zarrStreamingRow)
+
+        scan_section, scan_content = _make_section("Scan behaviour")
+        self.acquisition_order = _make_acquisition_order(self)
+        self.acquisition_order.changed.connect(self.save_multipoint_widget_config_to_cache)
+        scan_content.addWidget(self.acquisition_order)
+        scan_content.addWidget(self.checkbox_snakeScan)
+        scan_content.addWidget(self.checkbox_snakeObservationStates)
+        scan_content.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
+        scan_content.addWidget(self.checkbox_showLiveDuringAcquisition)
+        scan_content.addWidget(self.checkbox_retractZBetweenRegions)
+
+        body_row = _make_acquisition_body(self, focus_section, saving_section, scan_section)
+
+        # ---- Main layout ----------------------------------------------------
         main_layout = QVBoxLayout()
         self.setLayout(main_layout)
 
-        #  Saving Path
         saving_path_layout = QHBoxLayout()
         saving_path_layout.addWidget(QLabel("Saving Path"))
         saving_path_layout.addWidget(self.lineEdit_savingDir)
         saving_path_layout.addWidget(self.btn_setSavingDir)
         main_layout.addLayout(saving_path_layout)
 
-        # Experiment ID
         row_1_layout = QHBoxLayout()
         row_1_layout.addWidget(QLabel("Experiment ID"))
+        self.lineEdit_experimentID.setPlaceholderText("optional name, prefixed to the folder")
         row_1_layout.addWidget(self.lineEdit_experimentID)
         main_layout.addLayout(row_1_layout)
 
-        # Acquisition tabs row
-        tabs_layout = QHBoxLayout()
-        tabs_layout.setSpacing(4)  # Small spacing between frames
-        tabs_layout.addWidget(self.xy_frame, 2)  # Give XY frame more space (weight 2)
-        tabs_layout.addWidget(self.z_frame, 1)  # Z frame gets weight 1
-        tabs_layout.addWidget(self.time_frame, 1)  # Time frame gets weight 1
-        main_layout.addLayout(tabs_layout)
+        main_layout.addLayout(body_row)
 
-        # Scan Shape, FOV overlap, and Save / Load Scan Coordinates
-        # Frame for orange background
-        self.xy_controls_frame = QFrame()
-
-        self.row_2_layout = QGridLayout()
-        self.row_2_layout.setContentsMargins(4, 2, 4, 2)
-        self.scan_shape_label = QLabel("Scan Shape")
-        self.scan_size_label = QLabel("Scan Size")
-        self.coverage_label = QLabel("Coverage")
-        self.fov_overlap_label = QLabel("FOV Overlap")
-
-        self.row_2_layout.addWidget(self.scan_shape_label, 0, 0)
-        self.row_2_layout.addWidget(self.combobox_shape, 0, 1)
-        self.row_2_layout.addWidget(self.scan_size_label, 0, 2)
-        self.row_2_layout.addWidget(self.entry_scan_size, 0, 3)
-        self.row_2_layout.addWidget(self.coverage_label, 0, 4)
-        self.row_2_layout.addWidget(self.entry_well_coverage, 0, 5)
-        self.row_2_layout.addWidget(self.fov_overlap_label, 1, 0)
-        self.row_2_layout.addWidget(self.entry_overlap, 1, 1)
-        self.row_2_layout.addWidget(self.btn_save_scan_coordinates, 1, 2, 1, 4)
-
-        self.xy_controls_frame.setLayout(self.row_2_layout)
-        main_layout.addWidget(self.xy_controls_frame)
-
-        # Frame for Load Coordinates UI (initially hidden)
-        self.load_coordinates_frame = QFrame()
-        load_coords_layout = QHBoxLayout()
-        load_coords_layout.setContentsMargins(4, 2, 4, 2)
-        load_coords_layout.addWidget(self.btn_load_scan_coordinates)
-        load_coords_layout.addWidget(self.text_loaded_coordinates)
-        self.load_coordinates_frame.setLayout(load_coords_layout)
-        self.load_coordinates_frame.setVisible(False)  # Initially hidden
-        main_layout.addWidget(self.load_coordinates_frame)
-
-        grid = QGridLayout()
-
-        # Z controls frame for dz/Nz (left half of row 1) with blue background
-        self.z_controls_dz_frame = QFrame()
-
-        self.dz_layout = QHBoxLayout()
-        self.dz_layout.setContentsMargins(4, 2, 4, 2)
-        self.dz_layout.addWidget(QLabel("dz"))
-        self.dz_layout.addWidget(self.entry_deltaZ)
-        self.dz_layout.addWidget(QLabel("Nz"))
-        self.dz_layout.addWidget(self.entry_NZ)
-
-        self.z_controls_dz_frame.setLayout(self.dz_layout)
-        grid.addWidget(self.z_controls_dz_frame, 0, 0)
-
-        # Time controls frame with green background
-        self.time_controls_frame = QFrame()
-
-        # dt and Nt
-        self.dt_layout = QHBoxLayout()
-        self.dt_layout.setContentsMargins(4, 2, 4, 2)
-        self.dt_layout.addWidget(QLabel("dt"))
-        self.dt_layout.addWidget(self.entry_dt)
-        self.dt_layout.addWidget(QLabel("Nt"))
-        self.dt_layout.addWidget(self.entry_Nt)
-
-        self.time_controls_frame.setLayout(self.dt_layout)
-        grid.addWidget(self.time_controls_frame, 0, 2)
-
-        # Create informational labels for when modes are not selected
-        self.z_not_selected_label = QLabel("Z stack not selected")
-        self.z_not_selected_label.setAlignment(Qt.AlignCenter)
-        self.z_not_selected_label.setStyleSheet(
-            """
-            QLabel {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 0px;
-                color: palette(text);
-            }
-        """
-        )
-        self.z_not_selected_label.setVisible(False)
-
-        self.time_not_selected_label = QLabel("Time lapse not selected")
-        self.time_not_selected_label.setAlignment(Qt.AlignCenter)
-        self.time_not_selected_label.setStyleSheet(
-            """
-            QLabel {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 0px;
-                color: palette(text);
-            }
-        """
-        )
-        self.time_not_selected_label.setVisible(False)
-
-        # Z controls frame for Z-min and Z-max (full row 2) with blue background
-        self.z_controls_range_frame = QFrame()
-        z_range_layout = QHBoxLayout()
-        z_range_layout.setContentsMargins(4, 2, 4, 2)
-
-        # Z-min
-        self.z_min_layout = QHBoxLayout()
-        self.z_min_layout.addWidget(self.entry_minZ)
-        self.z_min_layout.addWidget(self.set_minZ_button)
-        self.z_min_layout.addWidget(self.goto_minZ_button)
-        z_range_layout.addLayout(self.z_min_layout)
-
-        # Spacer to maintain original spacing between Z-min and Z-max
-        z_range_layout.addStretch()
-
-        # Z-max
-        self.z_max_layout = QHBoxLayout()
-        self.z_max_layout.addWidget(self.entry_maxZ)
-        self.z_max_layout.addWidget(self.set_maxZ_button)
-        self.z_max_layout.addWidget(self.goto_maxZ_button)
-        z_range_layout.addLayout(self.z_max_layout)
-
-        self.z_controls_range_frame.setLayout(z_range_layout)
-        self.z_controls_range_frame.setVisible(False)  # Initially hidden (shown when "Set Range" mode)
-        grid.addWidget(self.z_controls_range_frame, 1, 0, 1, 3)  # Span full row (columns 0, 1, 2)
-
-        # Configuration list + Per-Point Channels button (shares the cell so the
-        # button reclaims vertical space that would otherwise sit empty next to
-        # the Z-stack frames above).
-        config_cell = QVBoxLayout()
-        config_cell.setContentsMargins(0, 0, 0, 0)
-        config_cell.addWidget(self.combobox_channel_mode)
-        config_cell.addWidget(self.list_configurations)
-        config_cell.addWidget(self.btn_per_point_channels)
-        config_cell.addWidget(self.btn_edit_cycles)
-        grid.addLayout(config_cell, 2, 0)
-
-        # Options and Start button
-        options_layout = QVBoxLayout()
-        options_layout.addWidget(self.checkbox_withAutofocus)
-        # Laser AF has been promoted from a checkbox into a configuration button
-        # and lives in the right-hand button column (above Snap Images) instead.
-        # options_layout.addWidget(self.checkbox_genAFMap)  # We are not using AF map now
-        options_layout.addWidget(self.checkbox_useFocusMap)
-        if HAS_OBJECTIVE_PIEZO:
-            options_layout.addWidget(self.checkbox_usePiezo)
-            if IS_PIEZO_ONLY:
-                self.checkbox_usePiezo.setChecked(True)
-                self.checkbox_usePiezo.setVisible(False)
-        # Z-stack reference plane: with autofocus on, the AF plane becomes the
-        # bottom / center / top slice per this selection (see acquire_at_position).
-        z_stack_mode_row = QHBoxLayout()
-        z_stack_mode_row.addWidget(QLabel("Z-stack from:"))
-        z_stack_mode_row.addWidget(self.combobox_z_stack, 1)
-        options_layout.addLayout(z_stack_mode_row)
-        options_layout.addWidget(self.checkbox_skipSaving)
-        options_layout.addLayout(self.fileSavingFormatRow)
-        options_layout.addLayout(self.zarrStreamingRow)
-        options_layout.addWidget(self.checkbox_snakeScan)
-        options_layout.addWidget(self.checkbox_keepIlluminatorsOnBetweenCaptures)
-        options_layout.addWidget(self.checkbox_showLiveDuringAcquisition)
-
-        # Button column (bottom-right). Laser AF button sits above Snap Images
-        # and is stretched to match the other two buttons' heights.
-        button_layout = QVBoxLayout()
-        for btn in (self.btn_snap_images, self.btn_startAcquisition):
-            btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        if self._enable_laser_autofocus:
-            self.checkbox_withReflectionAutofocus.setSizePolicy(
-                QSizePolicy.Preferred, QSizePolicy.Expanding
-            )
-            button_layout.addWidget(self.checkbox_withReflectionAutofocus, 1)
-        button_layout.addWidget(self.btn_snap_images, 1)
-        button_layout.addWidget(self.btn_startAcquisition, 1)
-
-        bottom_right = QHBoxLayout()
-        bottom_right.addLayout(options_layout)
-        bottom_right.addSpacing(2)
-        bottom_right.addLayout(button_layout)
-
-        grid.addLayout(bottom_right, 2, 2)
-        spacer_widget = QWidget()
-        spacer_widget.setFixedWidth(2)
-        grid.addWidget(spacer_widget, 0, 1)
-
-        # Add informational labels to grid (initially hidden)
-        grid.addWidget(self.z_not_selected_label, 0, 0)
-        grid.addWidget(self.time_not_selected_label, 0, 2)
-
-        # Set column stretches
-        grid.setColumnStretch(0, 1)  # Middle spacer
-        grid.setColumnStretch(1, 0)  # Middle spacer
-        grid.setColumnStretch(2, 1)  # Middle spacer
-
-        main_layout.addLayout(grid)
-        # Row 5: Progress Bar
         row_progress_layout = QHBoxLayout()
         row_progress_layout.addWidget(self.progress_label)
         row_progress_layout.addWidget(self.progress_bar)
         row_progress_layout.addWidget(self.eta_label)
         main_layout.addLayout(row_progress_layout)
-        self.toggle_z_range_controls(False)  # Initially hide Z-range controls
 
-        # Initialize Z and Time controls visibility based on checkbox states
-        if not self.checkbox_z.isChecked():
-            self.hide_z_controls()
-        if not self.checkbox_time.isChecked():
-            self.hide_time_controls()
+        self.toggle_z_range_controls(False)  # Initially hide the Z-min/Z-max rows
 
-        # Update control visibility based on both states
-        self.update_control_visibility()
-
-        # Initialize scan controls visibility based on XY checkbox state
+        # Initialize scan controls visibility based on the XY checkbox and mode
         self.update_scan_control_ui()
-
-        # Update tab styles now that all frames are created
-        self.update_tab_styles()
 
         # Initialize previous XY mode tracking
         self._previous_xy_mode = self.combobox_xy_mode.currentText()
@@ -5364,10 +5956,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.btn_setSavingDir.clicked.connect(self.set_saving_dir)
         self.btn_startAcquisition.clicked.connect(self.toggle_acquisition)
         self.entry_deltaZ.valueChanged.connect(self.set_deltaZ)
-        self.entry_NZ.valueChanged.connect(self.multipointController.set_NZ)
+        # Nz/Nt go through the group checkboxes: with a group off the controller must
+        # keep seeing 1, whatever the (greyed-out) spinbox still reads.
+        self.entry_NZ.valueChanged.connect(lambda *_: self.multipointController.set_NZ(self._effective_NZ()))
         self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.entry_dt.valueChanged.connect(self.multipointController.set_deltat)
-        self.entry_Nt.valueChanged.connect(self.multipointController.set_Nt)
+        self.entry_Nt.valueChanged.connect(lambda *_: self.multipointController.set_Nt(self._effective_Nt()))
         self.entry_overlap.valueChanged.connect(self.update_coordinates)
         self.entry_overlap.valueChanged.connect(self.update_coverage_from_scan_size)
         self.entry_scan_size.valueChanged.connect(self.update_coordinates)
@@ -5381,8 +5975,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
         self.checkbox_useFocusMap.toggled.connect(self.multipointController.set_manual_focus_map_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
-        self.checkbox_skipSaving.toggled.connect(self.multipointController.set_skip_saving)
-        self.combobox_fileSavingFormat.currentTextChanged.connect(self.multipointController.set_file_saving_option)
+        # The last combo entry is "don't save" rather than a format, so the push goes
+        # through a helper that splits it into set_skip_saving / set_file_saving_option.
+        self.combobox_fileSavingFormat.currentTextChanged.connect(lambda *_: _push_save_format_to_controller(self))
         self.checkbox_snakeScan.toggled.connect(self._on_snake_toggled)
         self.checkbox_keepIlluminatorsOnBetweenCaptures.toggled.connect(
             self.multipointController.set_keep_illuminators_on_between_captures
@@ -5390,6 +5985,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_showLiveDuringAcquisition.toggled.connect(
             self.multipointController.set_show_live_during_acquisition
         )
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.list_configurations.itemChanged.connect(self._reset_per_point_channels_map)
         self.btn_per_point_channels.clicked.connect(self.open_per_point_channels_dialog)
@@ -5404,7 +6000,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.entry_NZ.valueChanged,
             self.entry_Nt.valueChanged,
             self.combobox_fileSavingFormat.currentTextChanged,
-            self.checkbox_skipSaving.toggled,
             self.list_configurations.itemChanged,
         ):
             _sig.connect(lambda *_: _refresh_size_estimate(self))
@@ -5421,24 +6016,33 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.btn_save_scan_coordinates.clicked.connect(self.on_save_or_clear_coordinates_clicked)
         self.btn_load_scan_coordinates.clicked.connect(self.on_load_coordinates_clicked)
 
-        # Connect acquisition tabs
+        # Connect the parameter block's own controls
         self.checkbox_xy.toggled.connect(self.on_xy_toggled)
         self.combobox_xy_mode.currentTextChanged.connect(self.on_xy_mode_changed)
         self.checkbox_z.toggled.connect(self.on_z_toggled)
-        self.combobox_z_mode.currentTextChanged.connect(self.on_z_mode_changed)
         self.checkbox_time.toggled.connect(self.on_time_toggled)
+        # Only one radio of the exclusive pair is connected: switching method fires
+        # toggled on both, and the handler is a full re-tile.
+        self.radio_tiling_fraction.toggled.connect(lambda *_: self._on_tiling_method_changed())
+        self.entry_NX.valueChanged.connect(self.update_coordinates)
+        self.entry_NY.valueChanged.connect(self.update_coordinates)
 
         # Load cached acquisition settings
         self.load_multipoint_widget_config_from_cache()
 
+        self._apply_zstack_enabled()
+        self._apply_timelapse_enabled()
         _refresh_size_estimate(self)
 
         # Connect settings saving to relevant value changes
         self.checkbox_xy.toggled.connect(self.save_multipoint_widget_config_to_cache)
         self.combobox_xy_mode.currentTextChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_z.toggled.connect(self.save_multipoint_widget_config_to_cache)
-        self.combobox_z_mode.currentTextChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.checkbox_set_z_range.toggled.connect(self.save_multipoint_widget_config_to_cache)
         self.checkbox_time.toggled.connect(self.save_multipoint_widget_config_to_cache)
+        self.radio_tiling_fraction.toggled.connect(self.save_multipoint_widget_config_to_cache)
+        self.entry_NX.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
+        self.entry_NY.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_overlap.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_scan_size.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
         self.entry_dt.valueChanged.connect(self.save_multipoint_widget_config_to_cache)
@@ -5450,6 +6054,16 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.checkbox_withAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.save_multipoint_widget_config_to_cache)
+
+    # _ZTimeGroupMixin works off these two, because the flexible tab names the same
+    # pair of header checkboxes differently.
+    @property
+    def _zstack_checkbox(self):
+        return self.checkbox_z
+
+    @property
+    def _timelapse_checkbox(self):
+        return self.checkbox_time
 
     def enable_manual_ROI(self):
         _manual_index = self.combobox_xy_mode.findText("Manual")
@@ -5471,9 +6085,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 "xy_enabled": self.checkbox_xy.isChecked(),
                 "xy_mode": self.combobox_xy_mode.currentText(),
                 "z_enabled": self.checkbox_z.isChecked(),
-                "z_mode": self.combobox_z_mode.currentText(),
+                "set_z_range": self.checkbox_set_z_range.isChecked(),
                 "time_enabled": self.checkbox_time.isChecked(),
+                "tiling_method": "fraction" if self.radio_tiling_fraction.isChecked() else "grid",
+                "nx": self.entry_NX.value(),
+                "ny": self.entry_NY.value(),
                 "fov_overlap": self.entry_overlap.value(),
+                "tile_spacing": spacing_parameters(self),
+                "loop_order": list(self.acquisition_order.order()) if hasattr(self, "acquisition_order") else ["T", "Pos", "Z", "C"],
                 "scan_size_mm": self.entry_scan_size.value(),
                 "dt": self.entry_dt.value(),
                 "nt": self.entry_Nt.value(),
@@ -5512,8 +6131,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.checkbox_xy.blockSignals(True)
             self.combobox_xy_mode.blockSignals(True)
             self.checkbox_z.blockSignals(True)
-            self.combobox_z_mode.blockSignals(True)
+            self.checkbox_set_z_range.blockSignals(True)
             self.checkbox_time.blockSignals(True)
+            self.radio_tiling_fraction.blockSignals(True)
+            self.radio_tiling_grid.blockSignals(True)
+            self.entry_NX.blockSignals(True)
+            self.entry_NY.blockSignals(True)
             self.entry_overlap.blockSignals(True)
             self.entry_scan_size.blockSignals(True)
             self.entry_dt.blockSignals(True)
@@ -5546,13 +6169,25 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 )
 
             self.checkbox_z.setChecked(settings.get("z_enabled", False))
-
-            z_mode = settings.get("z_mode", "From Bottom")
-            if z_mode in ["From Bottom", "Set Range"]:
-                self.combobox_z_mode.setCurrentText(z_mode)
+            # Caches written before the Set Z-range checkbox existed carry a "z_mode"
+            # string instead; there is nothing to migrate, so it is simply ignored.
+            self.checkbox_set_z_range.setChecked(bool(settings.get("set_z_range", False)))
 
             self.checkbox_time.setChecked(settings.get("time_enabled", False))
+
+            if settings.get("tiling_method") == "grid":
+                self.radio_tiling_grid.setChecked(True)
+            else:
+                self.radio_tiling_fraction.setChecked(True)
+            self.entry_NX.setValue(settings.get("nx", 1))
+            self.entry_NY.setValue(settings.get("ny", 1))
             self.entry_overlap.setValue(settings.get("fov_overlap", 10))
+            if hasattr(self, "tile_spacing"):
+                self.tile_spacing.restore(settings.get("tile_spacing", {}))
+                if spacing_parameters(self):
+                    self.radio_tiling_grid.setChecked(True)
+            if hasattr(self, "acquisition_order"):
+                self.acquisition_order.restore(settings.get("loop_order", ["T", "Pos", "Z", "C"]))
             cached_scan_size = settings.get("scan_size_mm")
             if cached_scan_size is not None:
                 self.entry_scan_size.setValue(cached_scan_size)
@@ -5592,8 +6227,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.checkbox_xy.blockSignals(False)
             self.combobox_xy_mode.blockSignals(False)
             self.checkbox_z.blockSignals(False)
-            self.combobox_z_mode.blockSignals(False)
+            self.checkbox_set_z_range.blockSignals(False)
             self.checkbox_time.blockSignals(False)
+            self.radio_tiling_fraction.blockSignals(False)
+            self.radio_tiling_grid.blockSignals(False)
+            self.entry_NX.blockSignals(False)
+            self.entry_NY.blockSignals(False)
             self.entry_overlap.blockSignals(False)
             self.entry_scan_size.blockSignals(False)
             self.entry_dt.blockSignals(False)
@@ -5607,23 +6246,15 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
             # Update UI state based on loaded settings
             self.update_scan_control_ui()
-            self.update_control_visibility()
-            self.update_tab_styles()  # Update tab visual styles based on checkbox states
 
             # Ensure XY mode combobox is properly enabled based on loaded XY state
             self.combobox_xy_mode.setEnabled(self.checkbox_xy.isChecked())
 
-            # Ensure Z controls and Z mode combobox are properly enabled based on loaded Z state
-            self.combobox_z_mode.setEnabled(self.checkbox_z.isChecked())
-            if self.checkbox_z.isChecked():
-                self.show_z_controls(True)
-                # Also ensure Z range controls are properly toggled based on loaded Z mode
-                if self.combobox_z_mode.currentText() == "Set Range":
-                    self.toggle_z_range_controls(True)
-
-            # Ensure Time controls are properly shown based on loaded Time state
-            if self.checkbox_time.isChecked():
-                self.show_time_controls(True)
+            # The two group checkboxes were restored with signals blocked, so apply
+            # their greying (and the Z-min/Z-max rows) by hand.
+            self.toggle_z_range_controls(self.checkbox_set_z_range.isChecked())
+            self._apply_zstack_enabled()
+            self._apply_timelapse_enabled()
 
             # Clear the cache loading flag
             self._loading_from_cache = False
@@ -5634,114 +6265,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self._log.warning(f"Failed to load acquisition settings from cache: {e}")
             # Clear the flag even on error
             self._loading_from_cache = False
-
-    def update_tab_styles(self):
-        """Update tab frame styles based on checkbox states"""
-        # Active tab styles (checked) - custom colors for each tab
-        xy_active_style = """
-            QFrame {
-                border: 1px solid #FF8C00;
-                border-radius: 2px;
-            }
-        """
-
-        # Orange background with opaque widget backgrounds to prevent color bleed
-        xy_controls_style = """
-            QFrame {
-                background-color: rgba(255, 140, 0, 0.15);
-            }
-            QFrame QComboBox, QFrame QSpinBox, QFrame QDoubleSpinBox {
-                background-color: white;
-                color: black;
-            }
-            QFrame QComboBox:disabled, QFrame QSpinBox:disabled, QFrame QDoubleSpinBox:disabled {
-                background-color: palette(button);
-                color: palette(disabled-text);
-            }
-            QFrame QComboBox QAbstractItemView {
-                background-color: white;
-                color: black;
-                selection-background-color: palette(highlight);
-                selection-color: palette(highlighted-text);
-            }
-            QFrame QPushButton {
-                background-color: #FFD9B3;
-            }
-            QFrame QLabel {
-                background-color: transparent;
-            }
-        """
-
-        z_active_style = """
-            QFrame {
-                border: 1px solid palette(highlight);
-                border-radius: 2px;
-            }
-        """
-
-        # Blue background for Z controls with opaque widget backgrounds
-        z_controls_style = """
-            QFrame {
-                background-color: rgba(0, 120, 215, 0.15);
-            }
-            QFrame QComboBox, QFrame QSpinBox, QFrame QDoubleSpinBox {
-                background-color: white;
-            }
-            QFrame QPushButton {
-                background-color: #C2D9FF;
-            }
-            QFrame QLabel {
-                background-color: transparent;
-            }
-        """
-
-        time_active_style = """
-            QFrame {
-                border: 1px solid #00A000;
-                border-radius: 2px;
-            }
-        """
-
-        # Green background for Time controls with opaque widget backgrounds
-        time_controls_style = """
-            QFrame {
-                background-color: rgba(0, 160, 0, 0.15);
-            }
-            QFrame QComboBox, QFrame QSpinBox, QFrame QDoubleSpinBox {
-                background-color: white;
-            }
-            QFrame QPushButton {
-                background-color: #C2FFC2;
-            }
-            QFrame QLabel {
-                background-color: transparent;
-            }
-        """
-
-        # Inactive tab style (unchecked) - uses default Qt inactive tab colors
-        inactive_style = """
-            QFrame {
-                border: 1px solid palette(mid);
-                border-radius: 2px;
-            }
-        """
-
-        # Apply styles based on checkbox states
-        self.xy_frame.setStyleSheet(xy_active_style if self.checkbox_xy.isChecked() else inactive_style)
-        if hasattr(self, "xy_controls_frame"):
-            self.xy_controls_frame.setStyleSheet(xy_controls_style if self.checkbox_xy.isChecked() else "")
-        if hasattr(self, "load_coordinates_frame"):
-            self.load_coordinates_frame.setStyleSheet(xy_controls_style if self.checkbox_xy.isChecked() else "")
-
-        self.z_frame.setStyleSheet(z_active_style if self.checkbox_z.isChecked() else inactive_style)
-        if hasattr(self, "z_controls_dz_frame"):
-            self.z_controls_dz_frame.setStyleSheet(z_controls_style if self.checkbox_z.isChecked() else "")
-        if hasattr(self, "z_controls_range_frame"):
-            self.z_controls_range_frame.setStyleSheet(z_controls_style if self.checkbox_z.isChecked() else "")
-
-        self.time_frame.setStyleSheet(time_active_style if self.checkbox_time.isChecked() else inactive_style)
-        if hasattr(self, "time_controls_frame"):
-            self.time_controls_frame.setStyleSheet(time_controls_style if self.checkbox_time.isChecked() else "")
 
     def on_xy_toggled(self, checked):
         """Handle XY checkbox toggle"""
@@ -5768,8 +6291,6 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 else:
                     # For non-Manual modes, always restore
                     self.combobox_xy_mode.setCurrentText(self._xy_mode_before_uncheck)
-
-        self.update_tab_styles()
 
         # Show/hide scan shape and coordinate controls
         self.update_scan_control_ui()
@@ -5830,70 +6351,59 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.signal_toggle_live_scan_grid.emit(False)  # disable live scan grid
 
     def update_scan_control_ui(self):
-        """Update scan control UI based on XY checkbox and mode selection"""
+        """Show the parameter-block rows that the current XY checkbox / mode allow.
+
+        With XY off the run is a single FOV at the current position, so nothing in
+        *Positions* past the checkbox and nothing in *Tiling* applies. Manual and
+        Load Coordinates bring their own FOV list: Manual still tiles each shape, so
+        it keeps the Overlap row, while Load Coordinates keeps nothing but the
+        file picker.
+        """
         xy_checked = self.checkbox_xy.isChecked()
         xy_mode = self.combobox_xy_mode.currentText()
+        loading_coordinates = xy_checked and xy_mode == "Load Coordinates"
 
-        # Handle Load Coordinates mode separately
-        if xy_checked and xy_mode == "Load Coordinates":
-            # Hide the two-line xy_controls_frame
-            self.xy_controls_frame.setVisible(False)
-            # Show the Load Coordinates frame
-            self.load_coordinates_frame.setVisible(True)
+        # Save-vs-load: one row, one of the two halves on screen.
+        self.coordinates_row.setVisible(xy_checked)
+        self.btn_save_scan_coordinates.setVisible(xy_checked and not loading_coordinates)
+        self.btn_load_scan_coordinates.setVisible(loading_coordinates)
+        self.text_loaded_coordinates.setVisible(loading_coordinates)
+
+        # Tiling: hidden wholesale when there is nothing to tile.
+        self.tiling_section_widget.setVisible(xy_checked and not loading_coordinates)
+        fraction_mode = self.radio_tiling_fraction.isChecked()
+        tiles_a_region = xy_checked and xy_mode in ("Current Position", "Select Wells")
+        self.tiling_method_row.setVisible(tiles_a_region and not bool(spacing_parameters(self)))
+        self.tiling_fraction_row.setVisible(tiles_a_region and fraction_mode)
+        self.tiling_grid_row.setVisible(tiles_a_region and not fraction_mode)
+        self.tile_spacing.mode.setVisible(tiles_a_region)
+        self.radio_tiling_fraction.setEnabled(not bool(spacing_parameters(self)))
+
+        if not xy_checked:
             return
 
-        # Show/hide the entire XY controls frame based on XY checkbox
-        self.xy_controls_frame.setVisible(xy_checked)
-        # Hide the Load Coordinates frame for all other modes
-        self.load_coordinates_frame.setVisible(False)
-
         # Handle coverage field based on XY mode
-        if xy_checked:
-            if xy_mode in ["Current Position", "Manual"]:
-                # For Current Position and Manual modes, coverage should be N/A and disabled
-                self.entry_well_coverage.blockSignals(True)
-                self.entry_well_coverage.setRange(0, 0)  # Allow 0 for N/A mode
-                self.entry_well_coverage.setValue(0)  # Set to 0 for N/A indicator
-                self.entry_well_coverage.setEnabled(False)
-                self.entry_well_coverage.setSuffix(" (N/A)")
-                self.entry_well_coverage.blockSignals(False)
-                if xy_mode == "Manual":
-                    # hide the row of scan shape, scan size and coverage
-                    self.scan_shape_label.setVisible(False)
-                    self.combobox_shape.setVisible(False)
-                    self.scan_size_label.setVisible(False)
-                    self.entry_scan_size.setVisible(False)
-                    self.coverage_label.setVisible(False)
-                    self.entry_well_coverage.setVisible(False)
-                elif xy_mode == "Current Position":
-                    # show the row of scan shape, scan size and coverage
-                    self.scan_shape_label.setVisible(True)
-                    self.combobox_shape.setVisible(True)
-                    self.scan_size_label.setVisible(True)
-                    self.entry_scan_size.setVisible(True)
-                    self.coverage_label.setVisible(True)
-                    self.entry_well_coverage.setVisible(True)
-            elif xy_mode == "Select Wells":
-                # For Select Wells mode, coverage is read-only (derived from scan_size, FOV, overlap)
-                self.entry_well_coverage.blockSignals(True)
-                self.entry_well_coverage.setRange(0, 999.99)  # Allow any display value
-                self.entry_well_coverage.setSuffix("%")
-                self.entry_well_coverage.setReadOnly(True)
-                self.entry_well_coverage.blockSignals(False)
+        if xy_mode in ["Current Position", "Manual"]:
+            # For Current Position and Manual modes, coverage should be N/A and disabled
+            self.entry_well_coverage.blockSignals(True)
+            self.entry_well_coverage.setRange(0, 0)  # Allow 0 for N/A mode
+            self.entry_well_coverage.setValue(0)  # Set to 0 for N/A indicator
+            self.entry_well_coverage.setEnabled(False)
+            self.entry_well_coverage.setSuffix(" (N/A)")
+            self.entry_well_coverage.blockSignals(False)
+        elif xy_mode == "Select Wells":
+            # For Select Wells mode, coverage is read-only (derived from scan_size, FOV, overlap)
+            self.entry_well_coverage.blockSignals(True)
+            self.entry_well_coverage.setRange(0, 999.99)  # Allow any display value
+            self.entry_well_coverage.setSuffix("%")
+            self.entry_well_coverage.setReadOnly(True)
+            self.entry_well_coverage.blockSignals(False)
 
-                # Derive coverage from current scan_size (scan_size is the source of truth)
-                self.update_coverage_from_scan_size()
+            # Derive coverage from current scan_size (scan_size is the source of truth)
+            self.update_coverage_from_scan_size()
 
-                # Coverage is always read-only but visually enabled for display
-                self.entry_well_coverage.setEnabled(True)
-
-                # show the row of scan shape, scan size and coverage
-                self.scan_shape_label.setVisible(True)
-                self.combobox_shape.setVisible(True)
-                self.scan_size_label.setVisible(True)
-                self.entry_scan_size.setVisible(True)
-                self.coverage_label.setVisible(True)
-                self.entry_well_coverage.setVisible(True)
+            # Coverage is always read-only but visually enabled for display
+            self.entry_well_coverage.setEnabled(True)
 
     def set_coordinates_to_current_position(self):
         """Set scan coordinates to current stage position (single FOV)"""
@@ -5917,48 +6427,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.scanCoordinates.add_region("current", x, y, scan_size_mm, overlap_percent, shape)
 
     def on_z_toggled(self, checked):
-        """Handle Z checkbox toggle"""
-        self.update_tab_styles()
-
-        # Enable/disable the Z mode dropdown
-        self.combobox_z_mode.setEnabled(checked)
-
-        if checked:
-            # Z Stack enabled - restore stored parameters and show controls
-            self.restore_z_parameters()
-            self.show_z_controls(True)
-        else:
-            # Z Stack disabled - store current parameters and hide controls
-            self.store_z_parameters()
-            self.hide_z_controls()
-
-        # Update visibility based on both Z and Time states
-        self.update_control_visibility()
-
+        """The *Z-stack* header checkbox: on means acquire a stack at every point."""
+        self._apply_zstack_enabled()
         self._log.debug(f"Z acquisition {'enabled' if checked else 'disabled'}")
 
-    def on_z_mode_changed(self, mode):
-        """Handle Z mode dropdown change"""
-        # Show/hide Z-min/Z-max controls based on mode
-        self.toggle_z_range_controls(mode == "Set Range")
-        self._log.debug(f"Z mode changed to: {mode}")
-
     def on_time_toggled(self, checked):
-        """Handle Time checkbox toggle"""
-        self.update_tab_styles()
-
-        if checked:
-            # Time lapse enabled - restore stored parameters and show controls
-            self.restore_time_parameters()
-            self.show_time_controls(True)
-        else:
-            # Time lapse disabled - store current parameters and hide controls
-            self.store_time_parameters()
-            self.hide_time_controls()
-
-        # Update visibility based on both Z and Time states
-        self.update_control_visibility()
-
+        """The *Time-lapse* header checkbox: on means repeat the scan over time."""
+        self._apply_timelapse_enabled()
         self._log.debug(f"Time acquisition {'enabled' if checked else 'disabled'}")
 
     def store_xy_mode_parameters(self, mode):
@@ -6010,138 +6485,15 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             # Coverage restoration for Select Wells mode is handled in update_scan_control_ui()
             # to avoid conflicts with range setting and UI state management
 
-    def store_z_parameters(self):
-        """Store current Z parameters before hiding controls"""
-        self.stored_z_params["dz"] = self.entry_deltaZ.value()
-        self.stored_z_params["nz"] = self.entry_NZ.value()
-        self.stored_z_params["z_min"] = self.entry_minZ.value()
-        self.stored_z_params["z_max"] = self.entry_maxZ.value()
-        self.stored_z_params["z_mode"] = self.combobox_z_mode.currentText()
-
-    def restore_z_parameters(self):
-        """Restore stored Z parameters when showing controls"""
-        if self.stored_z_params["dz"] is not None:
-            self.entry_deltaZ.setValue(self.stored_z_params["dz"])
-        if self.stored_z_params["nz"] is not None:
-            self.entry_NZ.setValue(self.stored_z_params["nz"])
-        if self.stored_z_params["z_min"] is not None:
-            self.entry_minZ.setValue(self.stored_z_params["z_min"])
-        if self.stored_z_params["z_max"] is not None:
-            self.entry_maxZ.setValue(self.stored_z_params["z_max"])
-        self.combobox_z_mode.setCurrentText(self.stored_z_params["z_mode"])
-
-    def hide_z_controls(self):
-        """Hide Z-related controls and set single-slice parameters"""
-        # Hide dz/Nz widgets
-        for i in range(self.dz_layout.count()):
-            widget = self.dz_layout.itemAt(i).widget()
-            if widget:
-                widget.setVisible(False)
-
-        # Hide Z-min/Z-max controls
-        for layout in (self.z_min_layout, self.z_max_layout):
-            for i in range(layout.count()):
-                widget = layout.itemAt(i).widget()
-                if widget:
-                    widget.setVisible(False)
-
-        # Set single-slice parameters
-        current_z = self.stage.get_pos().z_mm * 1000  # Convert to μm
-        self.entry_NZ.setValue(1)
-        self.entry_minZ.setValue(current_z)
-        self.entry_maxZ.setValue(current_z)
-        self.combobox_z_mode.blockSignals(True)
-        self.combobox_z_mode.setCurrentText("From Bottom")
-        self.combobox_z_mode.blockSignals(False)
-
-    def show_z_controls(self, visible):
-        """Show Z-related controls"""
-        # Show dz/Nz widgets
-        for i in range(self.dz_layout.count()):
-            widget = self.dz_layout.itemAt(i).widget()
-            if widget:
-                widget.setVisible(visible)
-
-        # Show/hide Z-min/Z-max based on dropdown selection AND visibility
-        # Only show range controls if Z is enabled (visible=True) AND mode is "Set Range"
-        show_range = visible and self.combobox_z_mode.currentText() == "Set Range"
-        self.toggle_z_range_controls(show_range)
-
-    def store_time_parameters(self):
-        """Store current Time parameters before hiding controls"""
-        self.stored_time_params["dt"] = self.entry_dt.value()
-        self.stored_time_params["nt"] = self.entry_Nt.value()
-
-    def restore_time_parameters(self):
-        """Restore stored Time parameters when showing controls"""
-        if self.stored_time_params["dt"] is not None:
-            self.entry_dt.setValue(self.stored_time_params["dt"])
-        if self.stored_time_params["nt"] is not None:
-            self.entry_Nt.setValue(self.stored_time_params["nt"])
-
-    def hide_time_controls(self):
-        """Hide Time-related controls and set single-timepoint parameters"""
-        # Hide dt/Nt widgets
-        for i in range(self.dt_layout.count()):
-            widget = self.dt_layout.itemAt(i).widget()
-            if widget:
-                widget.setVisible(False)
-
-        # Set single-timepoint parameters
-        self.entry_dt.setValue(0)
-        self.entry_Nt.setValue(1)
-
-    def show_time_controls(self, visible):
-        """Show Time-related controls"""
-        # Show dt/Nt widgets
-        for i in range(self.dt_layout.count()):
-            widget = self.dt_layout.itemAt(i).widget()
-            if widget:
-                widget.setVisible(visible)
-
-    def update_control_visibility(self):
-        """Update visibility of controls and informational labels based on Z and Time states"""
-        z_checked = self.checkbox_z.isChecked()
-        time_checked = self.checkbox_time.isChecked()
-
-        if time_checked and not z_checked:
-            # Time lapse selected but Z stack not - show "Z stack not selected" message
-            self.z_not_selected_label.setVisible(True)
-            self.time_not_selected_label.setVisible(False)
-            # Hide actual Z controls
-            for i in range(self.dz_layout.count()):
-                widget = self.dz_layout.itemAt(i).widget()
-                if widget:
-                    widget.setVisible(False)
-            # Show Time controls
-            self.show_time_controls(True)
-        elif z_checked and not time_checked:
-            # Z stack selected but Time lapse not - show "Time lapse not selected" message
-            self.time_not_selected_label.setVisible(True)
-            self.z_not_selected_label.setVisible(False)
-            # Hide actual Time controls
-            for i in range(self.dt_layout.count()):
-                widget = self.dt_layout.itemAt(i).widget()
-                if widget:
-                    widget.setVisible(False)
-            # Show Z controls
-            self.show_z_controls(True)
-        else:
-            # Both selected or both unselected - hide informational labels
-            self.z_not_selected_label.setVisible(False)
-            self.time_not_selected_label.setVisible(False)
-
-            # Show/hide actual controls based on individual states
-            self.show_z_controls(z_checked)
-            self.show_time_controls(time_checked)
-
     def update_region_progress(self, current_fov, num_fovs):
+        if _update_ordered_progress(self, current_fov, num_fovs):
+            return
         self.progress_bar.setMaximum(num_fovs)
         self.progress_bar.setValue(current_fov)
 
         if self.acquisition_start_time is not None and current_fov > 0:
             elapsed_time = time.time() - self.acquisition_start_time
-            Nt = self.entry_Nt.value()
+            Nt = self._effective_Nt()
             dt = self.entry_dt.value()
 
             # Calculate total processed FOVs and total FOVs
@@ -6167,14 +6519,16 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.current_region = current_region
         self.current_time_point = current_time_point
 
-        if self.current_region == 1 and self.current_time_point == 0:  # First region
+        if self.acquisition_start_time is None or (
+            not _uses_ordered_progress(self) and self.current_region == 1 and self.current_time_point == 0
+        ):
             self.acquisition_start_time = time.time()
             self.num_regions = num_regions
 
         progress_parts = []
         # Update timepoint progress if there are multiple timepoints and the timepoint has changed
-        if self.entry_Nt.value() > 1:
-            progress_parts.append(f"Time {current_time_point + 1}/{self.entry_Nt.value()}")
+        if self._effective_Nt() > 1:
+            progress_parts.append(f"Time {current_time_point + 1}/{self._effective_Nt()}")
 
         # Update region progress if there are multiple regions
         if num_regions > 1:
@@ -6183,7 +6537,8 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         # Set the progress label text, ensuring it's not empty
         progress_text = "  ".join(progress_parts)
         self.progress_label.setText(progress_text if progress_text else "Progress")
-        self.progress_bar.setValue(0)
+        if not _uses_ordered_progress(self):
+            self.progress_bar.setValue(0)
 
     def update_eta_display(self):
         if self.eta_seconds > 0:
@@ -6212,11 +6567,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.eta_timer.stop()
 
     def toggle_z_range_controls(self, is_visible):
-        # Show/hide the entire range frame (Z-min and Z-max)
-        if hasattr(self, "z_controls_range_frame"):
-            self.z_controls_range_frame.setVisible(is_visible)
+        is_visible = bool(is_visible)
 
-        # Also control individual widgets for compatibility
+        # The Z-min / Z-max rows only exist in Set Z-range mode.
         for layout in (self.z_min_layout, self.z_max_layout):
             for i in range(layout.count()):
                 widget = layout.itemAt(i).widget()
@@ -6460,6 +6813,53 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         self.scanCoordinates.set_snake_scan(enabled)
         self.update_coordinates()
 
+    def _tile_wells(self):
+        """Re-tile every selected well with the *Tiling per position* method in force.
+
+        The two methods produce the same region ids (the well id) and the generators
+        skip a well that already has a region, so a re-tile has to clear first -
+        otherwise nothing would change when a tiling parameter or the method itself
+        does.
+        """
+        if self.scanCoordinates.has_regions():
+            self.scanCoordinates.clear_regions()
+        if self.radio_tiling_grid.isChecked():
+            self.scanCoordinates.set_well_coordinates_grid(
+                self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value(), **spacing_parameters(self)
+            )
+        else:
+            self.scanCoordinates.set_well_coordinates(
+                self.entry_scan_size.value(), self.entry_overlap.value(), self.combobox_shape.currentText()
+            )
+
+    def _tile_live(self, x_mm, y_mm):
+        """Current Position counterpart of ``_tile_wells``: one region on the stage."""
+        if self.radio_tiling_grid.isChecked():
+            self.scanCoordinates.set_live_scan_coordinates_grid(
+                x_mm, y_mm, self.entry_NX.value(), self.entry_NY.value(), self.entry_overlap.value(),
+                **spacing_parameters(self),
+            )
+        else:
+            self.scanCoordinates.set_live_scan_coordinates(
+                x_mm,
+                y_mm,
+                self.entry_scan_size.value(),
+                self.entry_overlap.value(),
+                self.combobox_shape.currentText(),
+            )
+
+    def _on_tile_spacing_changed(self):
+        if spacing_parameters(self):
+            self.radio_tiling_grid.setChecked(True)
+        self._on_tiling_method_changed()
+        self.save_multipoint_widget_config_to_cache()
+
+    def _on_tiling_method_changed(self):
+        """Swap which tiling rows are on screen, then rebuild the regions with the
+        method now selected."""
+        self.update_scan_control_ui()
+        self.update_coordinates()
+
     def update_coordinates(self):
         if self.tab_widget and self.tab_widget.currentWidget() != self:
             return
@@ -6469,20 +6869,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.set_coordinates_to_current_position()
             return
 
-        scan_size_mm = self.entry_scan_size.value()
-        overlap_percent = self.entry_overlap.value()
-        shape = self.combobox_shape.currentText()
-
         if self.combobox_xy_mode.currentText() == "Manual":
-            self.scanCoordinates.set_manual_coordinates(self.shapes_mm, overlap_percent)
+            self.scanCoordinates.set_manual_coordinates(self.shapes_mm, self.entry_overlap.value())
 
         elif self.combobox_xy_mode.currentText() == "Current Position":
             pos = self.stage.get_pos()
-            self.scanCoordinates.set_live_scan_coordinates(pos.x_mm, pos.y_mm, scan_size_mm, overlap_percent, shape)
+            self._tile_live(pos.x_mm, pos.y_mm)
         else:
-            if self.scanCoordinates.has_regions():
-                self.scanCoordinates.clear_regions()
-            self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
+            self._tile_wells()
 
         _refresh_size_estimate(self)
 
@@ -6492,11 +6886,12 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         When the objective changes, the FOV size changes, which affects both the
         effective well size (for Circle shapes) and the coverage calculation.
         Scan_size stays constant; coverage is recalculated and coordinates are
-        updated to reflect the new tile positions.
+        updated to reflect the new tile positions. An Nx x Ny grid has no coverage
+        to recompute - it is just re-tiled at the new FOV size.
         """
         if self.tab_widget and self.tab_widget.currentWidget() != self:
             return
-        if self.combobox_xy_mode.currentText() == "Select Wells":
+        if self.combobox_xy_mode.currentText() == "Select Wells" and self.radio_tiling_fraction.isChecked():
             # Coverage is read-only, derived from scan_size and FOV
             self.update_coverage_from_scan_size()
         self.update_coordinates()
@@ -6514,10 +6909,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             return
 
         if selected:
-            scan_size_mm = self.entry_scan_size.value()
-            overlap_percent = self.entry_overlap.value()
-            shape = self.combobox_shape.currentText()
-            self.scanCoordinates.set_well_coordinates(scan_size_mm, overlap_percent, shape)
+            self._tile_wells()
         elif self.scanCoordinates.has_regions():
             self.scanCoordinates.clear_regions()
 
@@ -6540,10 +6932,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         position_changed = (x_mm != self._last_x_mm) or (y_mm != self._last_y_mm)
         if not position_changed or time.time() - self._last_update_time < 0.5:
             return
-        scan_size_mm = self.entry_scan_size.value()
-        overlap_percent = self.entry_overlap.value()
-        shape = self.combobox_shape.currentText()
-        self.scanCoordinates.set_live_scan_coordinates(x_mm, y_mm, scan_size_mm, overlap_percent, shape)
+        self._tile_live(x_mm, y_mm)
         self._last_update_time = time.time()
         self._last_x_mm = x_mm
         self._last_y_mm = y_mm
@@ -6567,17 +6956,15 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
             self.scanCoordinates.sort_coordinates()
 
-            if self.combobox_z_mode.currentText() == "Set Range":
-                # Set Z-range (convert from μm to mm)
-                minZ = self.entry_minZ.value() / 1000  # Convert from μm to mm
-                maxZ = self.entry_maxZ.value() / 1000  # Convert from μm to mm
-                self.multipointController.set_z_range(minZ, maxZ)
-                self._log.debug(f"Set z-range: ({minZ}, {maxZ})")
-            else:
-                z = self.stage.get_pos().z_mm
-                dz = self.entry_deltaZ.value()
-                Nz = self.entry_NZ.value()
-                self.multipointController.set_z_range(z, z + dz * (Nz - 1))
+            # The Z-stack / Time-lapse header checkboxes decide whether this run is a
+            # stack / a time series at all; with a group off its spinbox is greyed out
+            # and the effective value is 1.
+            effective_NZ = self._effective_NZ()
+            effective_Nt = self._effective_Nt()
+
+            minZ, maxZ = self._compute_z_range(effective_NZ)
+            self.multipointController.set_z_range(minZ, maxZ)
+            self._log.debug(f"Set z-range: ({minZ}, {maxZ})")
 
             if self.checkbox_useFocusMap.isChecked():
                 # Try to fit the surface
@@ -6593,10 +6980,10 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 self.multipointController.set_focus_map(None)
 
             self.multipointController.set_deltaZ(self.entry_deltaZ.value())
-            self.multipointController.set_NZ(self.entry_NZ.value())
+            self.multipointController.set_NZ(effective_NZ)
             self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             self.multipointController.set_deltat(self.entry_dt.value())
-            self.multipointController.set_Nt(self.entry_Nt.value())
+            self.multipointController.set_Nt(effective_Nt)
             self.multipointController.set_use_piezo(self.checkbox_usePiezo.isChecked())
             self.multipointController.set_af_flag(self.checkbox_withAutofocus.isChecked())
             self.multipointController.set_reflection_af_flag(
@@ -6604,30 +6991,53 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
             self.multipointController.set_use_fluidics(False)
-            self.multipointController.set_skip_saving(self.checkbox_skipSaving.isChecked())
+            self.multipointController.set_snake_observation_states(self.checkbox_snakeObservationStates.isChecked())
             self.multipointController.set_keep_illuminators_on_between_captures(
                 self.checkbox_keepIlluminatorsOnBetweenCaptures.isChecked()
             )
             self.multipointController.set_widget_type("wellplate")
+            self.multipointController.acquisition_order = self.acquisition_order.order()
             self.multipointController.set_scan_size(self.entry_scan_size.value())
             self.multipointController.set_overlap_percent(self.entry_overlap.value())
+            self.multipointController.tile_spacing = spacing_parameters(self) if self.radio_tiling_grid.isChecked() else {}
+            # NX/NY are metadata here (the regions are already tiled), but they are what
+            # the acquisition yaml records, so a fraction-of-well run must not claim a grid.
+            grid_tiling = self.radio_tiling_grid.isChecked()
+            self.multipointController.set_NX(self.entry_NX.value() if grid_tiling else 1)
+            self.multipointController.set_NY(self.entry_NY.value() if grid_tiling else 1)
+            self.multipointController.set_tiling_method("grid" if grid_tiling else "fraction")
             self.multipointController.set_xy_mode(self.combobox_xy_mode.currentText())
             self._push_channel_selection_to_controller()
+            # Re-push THIS tab's visible save-format + streaming state (the
+            # flexible tab shares the controller; last-edit-anywhere must not
+            # override what this tab displays at Start).
+            self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
+            _push_save_format_to_controller(self)
+            # Same story for the retract flag: one controller, a checkbox per tab.
+            self.multipointController.set_retract_z_between_regions(self.checkbox_retractZBetweenRegions.isChecked())
+            self._zarr_streaming_widgets["_push"]()
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
 
-            if not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
+            if not self.checkbox_afValidation.isChecked() and not check_observation_state_roi_consistency_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over mismatched observation-state ROIs.")
                 self.btn_startAcquisition.setChecked(False)
                 return
 
-            if self.checkbox_skipSaving.isChecked():
+            # Probe the streaming target BEFORE the disk-space check (see the
+            # flexible widget's start flow for the rationale).
+            if not self.checkbox_afValidation.isChecked() and not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self.btn_startAcquisition.setChecked(False)
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
+                return
+
+            if self.checkbox_afValidation.isChecked() or _is_dry_run(self.combobox_fileSavingFormat):
                 self._log.info("Skipping disk space check - image saving is disabled")
             elif not check_space_available_with_error_dialog(self.multipointController, self._log):
                 self.btn_startAcquisition.setChecked(False)
                 self._log.error("Failed to start acquisition.  Not enough disk space available.")
                 return
 
-            if not check_ram_available_with_error_dialog(
+            if not self.checkbox_afValidation.isChecked() and not check_ram_available_with_error_dialog(
                 self.multipointController, self._log, performance_mode=self.performance_mode
             ):
                 self.btn_startAcquisition.setChecked(False)
@@ -6640,7 +7050,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 return
 
             # Update UI to show acquisition is running
-            self._set_ui_acquisition_running(self.entry_NZ.value(), self.entry_deltaZ.value())
+            self._set_ui_acquisition_running(effective_NZ, self.entry_deltaZ.value())
 
             # Start acquisition
             self.multipointController.run_acquisition()
@@ -6731,19 +7141,18 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         if enabled:
             self.update_scan_control_ui()
 
-            # Restore mode dropdown states based on their respective checkboxes
+            # Restore the XY mode dropdown based on its checkbox
             self.combobox_xy_mode.setEnabled(self.checkbox_xy.isChecked())
-            self.combobox_z_mode.setEnabled(self.checkbox_z.isChecked())
-
-            # Restore Z controls based on Z mode
-            if self.checkbox_z.isChecked() and self.combobox_z_mode.currentText() == "Set Range":
-                # In Set Range mode, Nz should be disabled
-                self.entry_NZ.setEnabled(False)
 
             # Restore coverage based on XY mode
             if self.checkbox_xy.isChecked() and self.combobox_xy_mode.currentText() == "Current Position":
                 # In Current Position mode, coverage should be disabled (N/A)
                 self.entry_well_coverage.setEnabled(False)
+
+            # The blanket re-enable above also lit up the Z-stack / Time-lapse groups,
+            # whose header checkboxes may well be off.
+            self._apply_zstack_enabled()
+            self._apply_timelapse_enabled()
 
     def disable_the_start_acquisition_button(self):
         self.btn_startAcquisition.setEnabled(False)
@@ -6763,6 +7172,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.base_path_is_set = True
 
     def on_snap_images(self):
+        self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
         self._push_channel_selection_to_controller()
@@ -6779,7 +7189,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
         z = self.stage.get_pos().z_mm
         self.multipointController.set_z_range(z, z)
         # Start the acquisition process for the single FOV
-        self.multipointController.start_new_experiment("snapped images" + self.lineEdit_experimentID.text())
+        # start_new_experiment appends _<timestamp> and squashes spaces, so this lands as
+        # snap_<id>_<timestamp> (or snap_<timestamp> with no experiment ID). The old
+        # "snapped images" + id ran the two together with no separator.
+        experiment_id = self.lineEdit_experimentID.text().strip()
+        self.multipointController.start_new_experiment("snap_" + experiment_id if experiment_id else "snap")
         self.multipointController.run_acquisition(acquire_current_fov=True)
 
     def set_deltaZ(self, value):
@@ -6869,9 +7283,9 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
 
     def _update_per_point_button_text(self):
         if self._region_obs_state_map is not None:
-            self.btn_per_point_channels.setText("Per-Point\nChannels *")
+            self.btn_per_point_channels.setText("Per-Point Channels *")
         else:
-            self.btn_per_point_channels.setText("Per-Point\nChannels")
+            self.btn_per_point_channels.setText("Per-Point Channels")
 
     def open_per_point_channels_dialog(self):
         obs_names = _get_checked_names(self.list_configurations)
@@ -7119,8 +7533,11 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 self.checkbox_xy,
                 self.checkbox_z,
                 self.checkbox_time,
-                self.combobox_z_mode,
                 self.checkbox_usePiezo,
+                self.radio_tiling_fraction,
+                self.radio_tiling_grid,
+                self.entry_NX,
+                self.entry_NY,
             ]
         )
 
@@ -7133,13 +7550,14 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.entry_NZ.setValue(yaml_data.nz)
             self.entry_deltaZ.setValue(yaml_data.delta_z_um)
 
-            # Z mode - map YAML config to combobox text
-            z_mode_map = {
-                "FROM BOTTOM": "From Bottom",
-                "SET RANGE": "Set Range",
-            }
-            z_mode = z_mode_map.get(yaml_data.z_stacking_config, "From Bottom")
-            self.combobox_z_mode.setCurrentText(z_mode)
+            # z_stacking_config is the stack's *reference plane*, which is what
+            # combobox_z_stack selects (set_z_stacking_config takes its index). It used
+            # to be mapped onto the old From Bottom / Set Range dropdown, conflating
+            # the reference plane with the Z-range mode. The loader carries no explicit
+            # z range, so "Set Z-range" is left as the user has it.
+            z_stack_index = {"FROM BOTTOM": 0, "FROM CENTER": 1, "FROM TOP": 2}.get(yaml_data.z_stacking_config)
+            if z_stack_index is not None:
+                self.combobox_z_stack.setCurrentIndex(z_stack_index)
 
             # Piezo setting
             self.checkbox_usePiezo.setChecked(yaml_data.use_piezo)
@@ -7160,6 +7578,15 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
                 if index >= 0:
                     self.combobox_shape.setCurrentIndex(index)
 
+            # Tiling method (F6): see _apply_tiling_method_from_yaml.
+            _apply_tiling_method_from_yaml(self, yaml_data)
+            self.acquisition_order.restore(yaml_data.acquisition_order)
+            self.tile_spacing.restore(yaml_data.tile_spacing)
+            if spacing_parameters(self):
+                self.radio_tiling_grid.setChecked(True)
+                self.entry_NX.setValue(yaml_data.nx)
+                self.entry_NY.setValue(yaml_data.ny)
+
             # Channels
             if yaml_data.channel_names:
                 self.list_configurations.blockSignals(True)
@@ -7172,6 +7599,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             self.checkbox_withAutofocus.setChecked(yaml_data.contrast_af)
             if self._enable_laser_autofocus:
                 self.checkbox_withReflectionAutofocus.setChecked(yaml_data.laser_af)
+
+            # Saving (the dry-run entry of the save-format combo)
+            _apply_save_format_from_yaml(self, yaml_data)
+
+            # Scan behaviour
+            _apply_retract_z_from_yaml(self, yaml_data)
+            self.checkbox_snakeObservationStates.setChecked(yaml_data.snake_observation_states)
 
             # XY mode - set to Select Wells for wellplate YAML
             if yaml_data.xy_mode in ["Current Position", "Select Wells", "Manual", "Load Coordinates"]:
@@ -7189,14 +7623,16 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, AcquisitionYAMLDropMixin,
             for widget in widgets_to_block:
                 widget.blockSignals(False)
 
-            # Enable/disable mode dropdowns based on checkbox states
-            self.combobox_z_mode.setEnabled(self.checkbox_z.isChecked())
+            # Enable/disable the XY mode dropdown based on its checkbox
             self.combobox_xy_mode.setEnabled(self.checkbox_xy.isChecked())
+
+            # The group checkboxes were set with signals blocked, so apply their
+            # greying and push the effective Nz/Nt to the controller.
+            self._apply_zstack_enabled()
+            self._apply_timelapse_enabled()
 
             # Update all UI components based on checkbox states and mode selections
             self.update_scan_control_ui()
-            self.update_control_visibility()
-            self.update_tab_styles()
             self.update_coordinates()
 
     def _load_well_regions(self, regions):
@@ -7350,6 +7786,9 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         self.checkbox_usePiezo = QCheckBox("Piezo Z-Stack")
         self.checkbox_usePiezo.setChecked(MULTIPOINT_USE_PIEZO_FOR_ZSTACKS)
 
+        # Retract-Z-for-XY-moves checkbox (the other tabs' "Scan behaviour" group)
+        self.checkbox_retractZBetweenRegions = _make_retract_z_checkbox()
+
         # Start acquisition button
         self.btn_startAcquisition = QPushButton("Start\n Acquisition ")
         self.btn_startAcquisition.setStyleSheet("background-color: #C2C2FF")
@@ -7413,12 +7852,19 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         # Options layout
         options_layout = QVBoxLayout()
         if self._enable_laser_autofocus:
-            options_layout.addWidget(self.checkbox_withReflectionAutofocus)
+            # The button's text is only the state ("Off ▸"), so it needs its name beside it.
+            laser_af_row = QHBoxLayout()
+            laser_af_row.addWidget(QLabel("Laser AF"))
+            self.checkbox_withReflectionAutofocus.setMinimumWidth(150)
+            laser_af_row.addWidget(self.checkbox_withReflectionAutofocus)
+            laser_af_row.addStretch(1)
+            options_layout.addLayout(laser_af_row)
         if HAS_OBJECTIVE_PIEZO:
             options_layout.addWidget(self.checkbox_usePiezo)
             if IS_PIEZO_ONLY:
                 self.checkbox_usePiezo.setChecked(True)
                 self.checkbox_usePiezo.setVisible(False)
+        options_layout.addWidget(self.checkbox_retractZBetweenRegions)
 
         grid.addLayout(options_layout, 0, 2)
 
@@ -7460,6 +7906,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.toggled.connect(self.multipointController.set_reflection_af_flag)
         self.checkbox_usePiezo.toggled.connect(self.multipointController.set_use_piezo)
+        self.checkbox_retractZBetweenRegions.toggled.connect(self.multipointController.set_retract_z_between_regions)
         self.list_configurations.itemChanged.connect(self.emit_selected_channels)
         self.multipointController.acquisition_finished.connect(self.acquisition_is_finished)
         self.multipointController.data_writing_complete.connect(self._on_data_writing_complete)
@@ -7521,7 +7968,11 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_reflection_af_flag(
                 self.checkbox_withReflectionAutofocus.isChecked() if self._enable_laser_autofocus else False
             )
+            self.multipointController.set_retract_z_between_regions(
+                self.checkbox_retractZBetweenRegions.isChecked()
+            )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
+            self.multipointController.set_validation_mode(False)
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_cycles(
                 _get_checked_names(self.list_configurations)
@@ -7530,6 +7981,16 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
             self.multipointController.set_Nt(len(rounds))
             self.multipointController.fluidics.set_rounds(rounds)
             self.multipointController.start_new_experiment(self.lineEdit_experimentID.text())
+
+            # This widget has no streaming row: a target configured in another
+            # tab silently applies here, so at minimum probe it before starting.
+            if not check_streaming_target_with_dialog(self.multipointController, self._log):
+                self._log.info("Acquisition cancelled by user over unusable streaming target.")
+                self.is_current_acquisition_widget = False
+                self.setEnabled_all(True)
+                self.btn_startAcquisition.setText("Start\n Acquisition ")
+                self.btn_startAcquisition.setChecked(False)
+                return
 
             if not check_system_load_and_pending_uploads_with_dialog(self.multipointController, self._log):
                 self._log.info("Acquisition cancelled by user over system load / pending uploads.")
@@ -8351,7 +8812,6 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
         self.grid = QVBoxLayout()
         self.grid.addLayout(self.grid_line0)
         self.grid.addLayout(self.grid_template)
-        self.grid.addLayout(self.grid_location_list)
         self.grid.addLayout(self.grid_acquisition)
         self.grid.addLayout(self.row_progress_layout)
         self.setLayout(self.grid)
@@ -8411,17 +8871,17 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
 
             row = self.table_location_list.rowCount()
             self.table_location_list.insertRow(row)
-            for col, item in enumerate(self._position_cells(x, y, ref_z)):
+            for col, item in self._position_cells(x, y, ref_z).items():
                 self.table_location_list.setItem(row, col, item)
             # One template *region* covers every template point, so a row's name does
             # not key a region of its own — show the region it belongs to and make the
             # cell read-only, since renaming a single row here has no coherent meaning.
             name_item = QTableWidgetItem(str(self.region_id))
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
-            self.table_location_list.setItem(row, 3, name_item)
+            self.table_location_list.setItem(row, self._COL_NAME, name_item)
             # Template regions don't capture per-region laser-AF references; keep
             # the AF Ref column populated so it reads "—" rather than blank.
-            self.table_location_list.setItem(row, 4, self._af_ref_item(None))
+            self.table_location_list.setItem(row, self._COL_AF_REF, self._af_ref_item(None))
 
         self.scanCoordinates.add_template_region(
             ref_x, ref_y, ref_z, template_df["x_offset_mm"], template_df["y_offset_mm"], str(self.region_id)

@@ -262,6 +262,13 @@ class SimulatedCamera(AbstractCamera):
             return self._val
 
     def __getattr__(self, item):
+        # Never fabricate placeholders for private/dunder names: those are used by
+        # introspection (hasattr, getattr(..., default)) and internal bookkeeping
+        # attributes (e.g. "_last_capture_ts") that real cameras may or may not set.
+        # A truthy MissingAttribImpl there breaks `getattr(cam, "_x", None) or {}`
+        # and `hasattr(cam, "_x")` style checks used throughout the acquisition path.
+        if item.startswith("_"):
+            raise AttributeError(item)
         self._log.warning(f"Creating placeholder missing method: {item}")
         return self._missing_methods.get(item, SimulatedCamera.MissingAttribImpl(item))
 

@@ -24,7 +24,7 @@ from control.core.job_processing import (
     JobImage,
     SaveZarrJob,
     ZarrWriterInfo,
-    ZarrWriteResult,
+    FrameWriteResult,
 )
 from control.models.acquisition_cycle import (
     AcquisitionCycle,
@@ -107,7 +107,7 @@ def _run_plan(tmpdir, plan, Nt, channel_colors, channel_wavelengths):
             )
             job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=img))
             job.zarr_writer_info = info
-            assert isinstance(job.run(), ZarrWriteResult)
+            assert isinstance(job.run(), FrameWriteResult)
             pix += 1
     SaveZarrJob.finalize_all_writers()
     return info
@@ -222,7 +222,7 @@ def test_ragged_by_z_mode_makes_separate_single_z_array():
                     )
                     job = SaveZarrJob(capture_info=cap, capture_image=JobImage(image_array=np.full((32, 32), 123, np.uint16)))
                     job.zarr_writer_info = info
-                    assert isinstance(job.run(), ZarrWriteResult)
+                    assert isinstance(job.run(), FrameWriteResult)
             SaveZarrJob.finalize_all_writers()
 
             assert os.path.isdir(os.path.join(tmp, "GFP.ome.zarr"))
