@@ -290,16 +290,10 @@ class HighContentScreeningGui(QMainWindow):
         # Initialize Slack notifier
         self._setup_slack_notifier()
 
-        # Skip cached position restoration on restart (hardware position hasn't changed),
-        # except Z when using Xeryon (Z was retracted during cleanup).
+        # Leave Z retracted on restart while keeping the existing XY position.
         if self._skip_init:
-            if USE_XERYON and self.objective_changer:
-                stage_cfg = self.stage.get_config()
-                if cached_pos := squid.stage.utils.get_cached_position(stage_config=stage_cfg):
-                    safety_z_canonical_mm = stage_cfg.Z_AXIS.raw_to_canonical(int(Z_HOME_SAFETY_POINT) / 1000.0)
-                    target_z_mm = max(cached_pos.z_mm, safety_z_canonical_mm)
-                    self.log.info(f"Restoring cached Z position after Xeryon restart: {target_z_mm} mm (canonical)")
-                    self.stage.move_z_to(target_z_mm)
+            if self.stage.get_config() is not None:
+                squid.stage.utils.initialize_z_retraction(self.stage)
             else:
                 self.log.info("Skipping cached position restoration (--skip-init flag set)")
         elif self._skip_homing:
@@ -310,9 +304,13 @@ class HighContentScreeningGui(QMainWindow):
             # position (X offset +50 mm, etc.) and return to the cached or default workspace.
             squid.stage.utils.move_to_cached_or_default_startup_position(self.stage, self.stage.get_config())
 
+        elif self.stage.get_config() is not None:
+            squid.stage.utils.initialize_z_retraction(self.stage)
+
+        if self.stage.is_z_retracted:
             if ENABLE_WELLPLATE_MULTIPOINT:
-                self.wellplateMultiPointWidget.init_z()
-            self.flexibleMultiPointWidget.init_z()
+                self.wellplateMultiPointWidget.init_z(self.stage.working_z_mm)
+            self.flexibleMultiPointWidget.init_z(self.stage.working_z_mm)
 
         # Create the menu bar
         menubar = self.menuBar()
@@ -2882,7 +2880,10 @@ class HighContentScreeningGui(QMainWindow):
 
         # Cache position and settings
         try:
-            squid.stage.utils.cache_position(pos=self.stage.get_pos(), stage_config=self.stage.get_config())
+            pos = self.stage.get_pos()
+            if self.stage.is_z_retracted and self.stage.working_z_mm is not None:
+                pos = pos.model_copy(update={"z_mm": self.stage.working_z_mm})
+            squid.stage.utils.cache_position(pos=pos, stage_config=self.stage.get_config())
         except ValueError as e:
             # ValueError is expected when position is out of bounds
             self.log.error(f"Couldn't cache position while closing for {context}. Error: {e}")
@@ -3018,7 +3019,7 @@ class HighContentScreeningGui(QMainWindow):
         if not for_restart or USE_XERYON:
             z_retracted = False
             try:
-                self.stage.move_z_to(OBJECTIVE_RETRACTED_POS_MM)
+                squid.stage.utils.retract_z(self.stage)
                 z_retracted = True
             except Exception:
                 if for_restart:

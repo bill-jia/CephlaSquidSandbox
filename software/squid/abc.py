@@ -247,6 +247,25 @@ class AbstractStage(metaclass=abc.ABCMeta):
     def __init__(self, stage_config: StageConfig):
         self._config = stage_config
         self._log = squid.logging.get_logger(self.__class__.__name__)
+        # Canonical Z to return to after parking; position polling freezes it while retracted.
+        self.working_z_mm: Optional[float] = None
+        self.is_z_retracted = False
+        self._z_retraction_in_progress = False
+        self._retracted_z_mm: Optional[float] = None
+
+    def _update_z_position(self, z_mm: float):
+        """Track working Z, including joystick moves reported by position polling."""
+        if self._z_retraction_in_progress:
+            return
+        if self.is_z_retracted:
+            if z_mm == self._retracted_z_mm:
+                return
+            self.is_z_retracted = False
+        self.working_z_mm = z_mm
+
+    def _begin_z_move(self):
+        if not self._z_retraction_in_progress:
+            self.is_z_retracted = False
 
     @abc.abstractmethod
     def move_x(self, rel_mm: float, blocking: bool = True):

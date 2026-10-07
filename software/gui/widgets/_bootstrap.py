@@ -38,6 +38,7 @@ from squid.stage.utils import (
     move_to_scanning_position,
     move_z_axis_to_safety_position,
     move_xy_with_z_retract,
+    toggle_z_retraction,
 )
 from squid.config import CameraPixelFormat
 

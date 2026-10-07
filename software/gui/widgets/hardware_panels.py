@@ -2704,6 +2704,9 @@ class NavigationWidget(QFrame):
         self.label_Ypos.setNum(pos.y_mm)
         # NOTE: The z label is in um
         self.label_Zpos.setNum(pos.z_mm * 1000)
+        self.btn_toggle_z_retraction.setText(
+            "Return Z to Working Position" if self.stage.is_z_retracted else "Retract Z"
+        )
 
     def add_components(self):
         # Compact two-row layout: a read-out row (X/Y/Z positions with units) and a
@@ -2771,6 +2774,10 @@ class NavigationWidget(QFrame):
         self.entry_dZ.setToolTip("Z step size (μm)")
         self.btn_moveZ_forward = _make_arrow("▲", "Move Z up by the step size")
         self.btn_moveZ_backward = _make_arrow("▼", "Move Z down by the step size")
+        self.btn_toggle_z_retraction = QPushButton("Retract Z")
+        self.btn_toggle_z_retraction.setAutoDefault(False)
+        self.btn_toggle_z_retraction.setToolTip("Switch Z between the safe position and the saved working position")
+        self.btn_toggle_z_retraction.clicked.connect(lambda: toggle_z_retraction(self.stage))
 
         self.checkbox_clickToMove = QCheckBox("Click to Move")
         self.checkbox_clickToMove.setChecked(False)
@@ -2812,12 +2819,14 @@ class NavigationWidget(QFrame):
             self.entry_dZ.setVisible(False)
             self.btn_moveZ_forward.setVisible(False)
             self.btn_moveZ_backward.setVisible(False)
+            self.btn_toggle_z_retraction.setVisible(False)
 
         self.grid = QVBoxLayout()
         self.grid.setContentsMargins(6, 4, 6, 4)
         self.grid.setSpacing(3)
         self.grid.addLayout(readout_row)
         self.grid.addLayout(jog_row)
+        self.grid.addWidget(self.btn_toggle_z_retraction)
         self.set_click_to_move(ENABLE_CLICK_TO_MOVE_BY_DEFAULT)
         self.setLayout(self.grid)
 
@@ -2848,6 +2857,7 @@ class NavigationWidget(QFrame):
         self.btn_moveY_backward.setEnabled(enabled)
         self.btn_moveZ_forward.setEnabled(enabled)
         self.btn_moveZ_backward.setEnabled(enabled)
+        self.btn_toggle_z_retraction.setEnabled(enabled)
 
     def move_x_forward(self):
         self.stage.move_x(self.entry_dX.value())
@@ -3294,5 +3304,4 @@ class WellSelectionWidget(QTableWidget):
         }
         """
         self.setStyleSheet(style)
-
 

@@ -83,11 +83,9 @@ def clamp_pos_to_stage_limits(pos: Pos, stage_config: Optional[StageConfig]) -> 
 def move_to_cached_or_default_startup_position(
     stage: AbstractStage, stage_config: Optional[StageConfig] = None, cache_path: Optional[str] = None
 ) -> None:
-    """After XY homing, restore last cached XYZ if present; otherwise move to configured defaults.
+    """After homing, restore XY and remember working Z while leaving Z retracted.
 
-    Applies target X and Y first; Z (cached, safety, or default) only after both axes finish.
-
-    ``STARTUP_DEFAULT_STAGE_{X,Y,Z}_MM`` and ``Z_HOME_SAFETY_POINT`` are raw-frame
+    ``STARTUP_DEFAULT_STAGE_{X,Y,Z}_MM`` and ``OBJECTIVE_RETRACTED_POS_MM`` are raw-frame
     constants (physical, motor-direction) — we project them into canonical via
     ``AxisConfig.raw_to_canonical`` before handing them to the Stage API so the
     physical position is unchanged whether the rig runs with the default identity
@@ -98,23 +96,15 @@ def move_to_cached_or_default_startup_position(
         cache_path if cache_path is not None else _DEFAULT_CACHE_PATH,
         stage_config=cfg,
     )
-    safety_z_canonical_mm = cfg.Z_AXIS.raw_to_canonical(int(_def.Z_HOME_SAFETY_POINT) / 1000.0)
     if cached is not None:
         cached = clamp_pos_to_stage_limits(cached, cfg)
-        _log.info(f"Restoring cached position (canonical): ({cached.x_mm},{cached.y_mm},{cached.z_mm}) [mm]")
+        _log.info(f"Restoring cached XY ({cached.x_mm},{cached.y_mm}); remembering working Z {cached.z_mm} [mm]")
         stage.move_x_to(cached.x_mm)
         stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
         stage.move_y_to(cached.y_mm)
         stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
-        # Compare along the raw Z direction so "at or below" stays meaningful
-        # regardless of Z canonical sign.
         cached_z_raw = cfg.Z_AXIS.canonical_to_raw(cached.z_mm)
-        if int(_def.Z_HOME_SAFETY_POINT) / 1000.0 < cached_z_raw:
-            _log.info("XY at cached targets; moving Z to cached z.")
-            stage.move_z_to(cached.z_mm)
-        else:
-            _log.info("Cached z is at or below Z_HOME_SAFETY_POINT; moving Z to Z_HOME_SAFETY_POINT after XY.")
-            stage.move_z_to(safety_z_canonical_mm)
+        working_z_mm = cfg.Z_AXIS.raw_to_canonical(max(_def.OBJECTIVE_RETRACTED_POS_MM, cached_z_raw))
     else:
         default = Pos(
             x_mm=cfg.X_AXIS.raw_to_canonical(_def.STARTUP_DEFAULT_STAGE_X_MM),
@@ -131,8 +121,26 @@ def move_to_cached_or_default_startup_position(
         stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
         stage.move_y_to(default.y_mm)
         stage.wait_for_idle(_STARTUP_XY_IDLE_TIMEOUT_S)
-        _log.info("XY at default targets; moving Z to default z.")
-        stage.move_z_to(default.z_mm)
+        working_z_mm = default.z_mm
+    initialize_z_retraction(stage, working_z_mm)
+
+
+def initialize_z_retraction(stage: AbstractStage, working_z_mm: Optional[float] = None):
+    """Start in the safe state, remembering cached/default working Z without moving there."""
+    cfg = stage.get_config()
+    safety_z_raw_mm = _def.OBJECTIVE_RETRACTED_POS_MM
+    if working_z_mm is None:
+        cached = get_cached_position(stage_config=cfg)
+        if cached is not None:
+            working_z_mm = clamp_pos_to_stage_limits(cached, cfg).z_mm
+        else:
+            working_z_mm = clamp_pos_to_stage_limits(
+                Pos(x_mm=0, y_mm=0, z_mm=cfg.Z_AXIS.raw_to_canonical(_def.STARTUP_DEFAULT_STAGE_Z_MM), theta_rad=None),
+                cfg,
+            ).z_mm
+        working_z_mm = cfg.Z_AXIS.raw_to_canonical(max(safety_z_raw_mm, cfg.Z_AXIS.canonical_to_raw(working_z_mm)))
+    retract_z(stage, cfg.Z_AXIS.raw_to_canonical(safety_z_raw_mm))
+    stage.working_z_mm = working_z_mm
 
 
 """
@@ -189,8 +197,7 @@ def _move_to_loading_position_impl(stage: AbstractStage, is_wellplate: bool):
             y_neg_mm=-a_large_limit_mm,
         )
 
-        stage._scanning_position_z_mm = stage.get_pos().z_mm
-        stage.move_z_to(_def.OBJECTIVE_RETRACTED_POS_MM)
+        retract_z(stage)
         stage.wait_for_idle(_def.SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
 
         # TODO: These values should not be hardcoded as we have stages with different blocks
@@ -216,9 +223,7 @@ def _move_to_scanning_position_impl(stage: AbstractStage, is_wellplate: bool):
     if is_wellplate:
         stage.move_x_to(_def.SLIDE_POSITION.SCANNING_X_MM)
         stage.move_y_to(_def.SLIDE_POSITION.SCANNING_Y_MM)
-        if stage._scanning_position_z_mm is not None:
-            stage.move_z_to(stage._scanning_position_z_mm)
-        stage._scanning_position_z_mm = None
+        move_z_to_working_position(stage)
     else:
         stage.move_y_to(_def.SLIDE_POSITION.SCANNING_Y_MM)
         stage.move_x_to(_def.SLIDE_POSITION.SCANNING_X_MM)
@@ -281,8 +286,42 @@ def move_to_scanning_position(
 
 
 def move_z_axis_to_safety_position(stage: AbstractStage):
-    safety_z_raw_mm = int(_def.Z_HOME_SAFETY_POINT) / 1000.0
-    stage.move_z_to(stage.get_config().Z_AXIS.raw_to_canonical(safety_z_raw_mm))
+    retract_z(stage)
+
+
+def retract_z(stage: AbstractStage, retracted_z_mm: Optional[float] = None):
+    """Park Z without replacing the working position, even on repeated calls."""
+    pos = stage.get_pos()
+    if not getattr(stage, "is_z_retracted", False):
+        stage.working_z_mm = pos.z_mm
+    if retracted_z_mm is None:
+        cfg = stage.get_config()
+        retracted_z_mm = (
+            cfg.Z_AXIS.raw_to_canonical(_def.OBJECTIVE_RETRACTED_POS_MM) if cfg else _def.OBJECTIVE_RETRACTED_POS_MM
+        )
+    stage._z_retraction_in_progress = True
+    stage.is_z_retracted = False
+    try:
+        stage.move_z_to(retracted_z_mm)
+        stage._retracted_z_mm = stage.get_pos().z_mm
+        stage.is_z_retracted = True
+    finally:
+        stage._z_retraction_in_progress = False
+
+
+def move_z_to_working_position(stage: AbstractStage):
+    """Return from retraction to the most recently used working Z."""
+    if stage.working_z_mm is not None:
+        stage.move_z_to(stage.working_z_mm)
+        stage.is_z_retracted = False
+
+
+def toggle_z_retraction(stage: AbstractStage):
+    stage.get_pos()  # Detect joystick movement before deciding which state to enter.
+    if stage.is_z_retracted:
+        move_z_to_working_position(stage)
+    else:
+        retract_z(stage)
 
 
 # An XY move shorter than this is not worth bracketing with a Z retract: the
@@ -310,9 +349,9 @@ def move_xy_with_z_retract(
       given, this is just a plain ``move_z_to`` -- retracting first would only
       rack the objective up and back down for no reason.
     - Real travel and ``retract``: Z to ``home_z_mm`` (blocking), then the XY
-      leg, then Z down to ``z_target_mm`` (blocking) -- or back to whatever Z
-      the stage was at before the retract, when the caller has no target of
-      its own.
+      leg, then Z down to ``z_target_mm`` (blocking) -- or back to working Z
+      when the caller has no target of its own. Already retracted stages
+      retain their saved working Z throughout the XY move.
     - Real travel and not ``retract``: exactly the XY leg, then a ``move_z_to``
       to ``z_target_mm`` if one was given. Callers with their own non-retract
       Z/XY ordering (e.g. issuing a non-blocking Z move before the XY move)
@@ -346,12 +385,15 @@ def move_xy_with_z_retract(
             stage.move_z_to(z_target_mm)
         return
 
-    current_z_mm = pos.z_mm
+    current_z_mm = getattr(stage, "working_z_mm", None) if getattr(stage, "is_z_retracted", False) else pos.z_mm
+    if current_z_mm is None:
+        current_z_mm = pos.z_mm
     target_z_mm = z_target_mm if z_target_mm is not None else current_z_mm
     if log is not None:
         log.debug(f"Retracting z to {home_z_mm} [mm] before the XY move")
-    stage.move_z_to(home_z_mm)
+    retract_z(stage, home_z_mm)
     _do_xy_move()
     if log is not None:
         log.debug(f"Lowering z to target {target_z_mm} [mm] after the retracted XY move")
     stage.move_z_to(target_z_mm)
+    stage.is_z_retracted = False

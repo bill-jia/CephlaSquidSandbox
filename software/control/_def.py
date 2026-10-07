@@ -1155,14 +1155,13 @@ Z_HOME_SAFETY_MARGIN_UM = 100
 # safety point
 X_HOME_SAFETY_POINT = 0
 Y_HOME_SAFETY_POINT = 0
-Z_HOME_SAFETY_POINT = 100
+Z_HOME_SAFETY_POINT = OBJECTIVE_RETRACTED_POS_MM * 1000  # Legacy µm alias; homing uses the retraction position.
 
-# When the last stage position cache is missing or unreadable, move here after homing (mm).
+# Default workspace coordinates when the stage position cache is unavailable (mm).
+# Startup restores XY and remembers working Z while leaving Z retracted.
 STARTUP_DEFAULT_STAGE_X_MM = 30.0
 STARTUP_DEFAULT_STAGE_Y_MM = 15.0
-STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # 200 µm; kept above Z_HOME_SAFETY_POINT (0.1 mm) and the
-# z lower software limit (0.05 mm) so the post-homing restore moves *up* to it and never
-# triggers move_z_to's backlash dip into the lower limit (which could stall at the boundary).
+STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # Default working Z; startup does not move Z here.
 
 USE_XERYON = False
 XERYON_SERIAL_NUMBER = "95130303033351E02050"
