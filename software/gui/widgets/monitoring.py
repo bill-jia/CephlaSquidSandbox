@@ -461,13 +461,15 @@ class StopwatchWidget(QWidget):
 
 
 def _is_filter_wheel_enabled(config_repo=None) -> bool:
-    """True if ``emission_filter_wheel`` is enabled in MachineConfig."""
+    """True if a standalone or confocal emission filter wheel is enabled in MachineConfig."""
     from control.core.config.repository import ConfigRepository
 
     repo = config_repo or ConfigRepository()
     mc = repo.get_machine_config()
     d = mc.get_device("emission_filter_wheel")
-    return d is not None and d.enabled
+    if d is not None and d.enabled:
+        return True
+    return mc.get_confocal_device() is not None
 
 
 def _populate_filter_positions_for_combo(
@@ -486,11 +488,13 @@ def _populate_filter_positions_for_combo(
     """
     combo.clear()
 
-    registry = config_repo.get_filter_wheel_registry()
-    has_registry = registry and registry.filter_wheels
+    # Every wheel the machine knows about: the standalone registry plus the
+    # emission wheel declared by the confocal device entry.
+    known_wheels = [w for wheels in config_repo.get_all_filter_wheels().values() for w in wheels]
+    has_wheels = bool(known_wheels)
 
     # No filter wheel system at all
-    if not has_registry and not _is_filter_wheel_enabled():
+    if not has_wheels and not _is_filter_wheel_enabled(config_repo):
         combo.addItem("N/A", None)
         combo.setEnabled(False)
         return
@@ -499,16 +503,16 @@ def _populate_filter_positions_for_combo(
     wheel = None
     if channel_wheel and channel_wheel not in ("(None)", "auto"):
         # Explicit wheel name specified
-        wheel = registry.get_wheel_by_name(channel_wheel) if registry else None
-        if not wheel and registry:
+        wheel = next((w for w in known_wheels if w.name == channel_wheel), None)
+        if not wheel and has_wheels:
             logger.warning(f"Filter wheel '{channel_wheel}' not found in registry")
-    elif has_registry:
+    elif has_wheels:
         # Auto-select first wheel (works for both single and multi-wheel systems)
-        wheel = registry.get_first_wheel()
+        wheel = known_wheels[0]
 
     if not wheel:
         # No wheel resolved - check if we should show default positions or N/A
-        if has_registry or _is_filter_wheel_enabled():
+        if has_wheels or _is_filter_wheel_enabled(config_repo):
             # Filter wheel enabled but no registry - show default positions
             combo.setEnabled(True)
             for pos in range(1, 9):
@@ -680,7 +684,7 @@ class ObservationStateConfiguratorDialog(QDialog):
 
         # Determine column visibility
         camera_names = self.config_repo.get_camera_names()
-        wheel_names = self.config_repo.get_filter_wheel_names()
+        wheel_names = self.config_repo.get_all_filter_wheel_names()
         has_any_wheel = wheel_names or _is_filter_wheel_enabled(self.config_repo)
 
         if len(camera_names) <= 1:
@@ -739,7 +743,7 @@ class ObservationStateConfiguratorDialog(QDialog):
         # Filter wheel dropdown
         wheel_combo = QComboBox()
         wheel_combo.addItem("(None)")
-        wheel_names = self.config_repo.get_filter_wheel_names()
+        wheel_names = self.config_repo.get_all_filter_wheel_names()
         wheel_combo.addItems(wheel_names)
         wheel_combo.currentTextChanged.connect(lambda text, r=row: self._on_wheel_changed(r, text))
         self.table.setCellWidget(row, self.COL_FILTER_WHEEL, wheel_combo)
@@ -1063,7 +1067,7 @@ class AddObservationStateDialog(QDialog):
             self.camera_combo = None
 
         # Filter wheel dropdown (hidden if single wheel - 0 or 1 wheels)
-        wheel_names = self.config_repo.get_filter_wheel_names()
+        wheel_names = self.config_repo.get_all_filter_wheel_names()
         has_any_wheel = wheel_names or _is_filter_wheel_enabled(self.config_repo)
 
         # Show wheel dropdown only for multi-wheel systems

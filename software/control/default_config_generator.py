@@ -26,8 +26,7 @@ from control.models.illumination_config import (
     IlluminationChannelConfig,
     IlluminationType,
 )
-from control._def import XLIGHT_EMISSION_IRIS_DEFAULT, XLIGHT_ILLUMINATION_IRIS_DEFAULT
-from control.models.confocal_config import ConfocalConfig
+from control.models.machine_config import ConfocalDeviceSettings
 
 logger = logging.getLogger(__name__)
 
@@ -36,42 +35,25 @@ DEFAULT_EXPOSURE_TIME_MS = 20.0
 DEFAULT_GAIN_MODE = 10.0
 DEFAULT_ILLUMINATION_INTENSITY = 20.0
 DEFAULT_LED_ILLUMINATION_INTENSITY = 5.0  # Lower intensity for USB LED sources
-DEFAULT_Z_OFFSET_UM = 0.0
-
-# Confocal iris properties and their defaults from _def.py
-ALL_IRIS_DEFAULTS = {
-    "illumination_iris": float(XLIGHT_ILLUMINATION_IRIS_DEFAULT),
-    "emission_iris": float(XLIGHT_EMISSION_IRIS_DEFAULT),
-}
 
 
-def build_confocal_settings_from_config(
-    confocal_config: Optional[ConfocalConfig] = None,
+def build_confocal_settings(
+    device_settings: Optional[ConfocalDeviceSettings] = None,
 ) -> ConfocalSettings:
-    """Build ConfocalSettings with iris fields driven by confocal_config.yaml.
-
-    Resolution order:
-    1. Model registry: if confocal_config has a model field, use its objective_properties
-    2. Backwards compat: use objective_specific_properties string list
-    3. Fallback (no config): include all iris properties at default value
+    """Build ConfocalSettings seeded from the confocal device's iris defaults.
 
     Args:
-        confocal_config: Confocal hardware config (None = include all iris fields)
+        device_settings: Settings from ``devices.xlight.config`` (or
+            ``devices.dragonfly.config``).  None falls back to the model defaults.
 
     Returns:
-        ConfocalSettings with matching iris fields set to defaults
+        ConfocalSettings with both iris fields set.
     """
-    if confocal_config is not None:
-        # Try model registry first
-        model_def = confocal_config.get_model_def()
-        if model_def is not None:
-            return ConfocalSettings(**model_def.objective_properties)
-        # Backwards compat: use objective_specific_properties string list
-        iris_props = set(ALL_IRIS_DEFAULTS) & set(confocal_config.objective_specific_properties)
-        kwargs = {prop: ALL_IRIS_DEFAULTS[prop] for prop in iris_props}
-        return ConfocalSettings(**kwargs)
-    # No config: fallback to all iris properties
-    return ConfocalSettings(**ALL_IRIS_DEFAULTS)
+    device_settings = device_settings or ConfocalDeviceSettings()
+    return ConfocalSettings(
+        illumination_iris=float(device_settings.illumination_iris_default),
+        emission_iris=float(device_settings.emission_iris_default),
+    )
 
 
 def get_display_color_for_channel(channel: IlluminationChannel) -> str:
@@ -81,47 +63,9 @@ def get_display_color_for_channel(channel: IlluminationChannel) -> str:
     return DEFAULT_LED_COLOR
 
 
-def create_general_observation_state(
-    illumination_channel: IlluminationChannel,
-    include_confocal: bool = False,
-) -> ObservationState:
-    """
-    Create an ObservationState for general.yaml.
-
-    Args:
-        illumination_channel: The illumination channel to create from
-        include_confocal: Whether to include confocal settings
-
-    Returns:
-        ObservationState for general.yaml
-    """
-    display_color = get_display_color_for_channel(illumination_channel)
-
-    camera_settings = CameraSettings(
-        exposure_time_ms=DEFAULT_EXPOSURE_TIME_MS,
-        gain_mode=DEFAULT_GAIN_MODE,
-    )
-
-    illuminator_state = IlluminatorState(
-        illumination_channel=illumination_channel.name,
-        intensity=DEFAULT_ILLUMINATION_INTENSITY,
-        on=False,
-    )
-
-    return ObservationState(
-        version=3,
-        name=illumination_channel.name,
-        confocal_mode=False,
-        camera_settings=camera_settings,
-        illuminator_states=[illuminator_state],
-        z_offset_um=DEFAULT_Z_OFFSET_UM,
-        display_color=display_color,
-    )
-
-
 def generate_default_observation_state(
     illumination_config: IlluminationChannelConfig,
-    include_confocal: bool = False,
+    confocal_settings: Optional[ConfocalDeviceSettings] = None,
 ) -> ObservationState:
     """
     Generate a default ObservationState with all illumination channels.
@@ -131,7 +75,7 @@ def generate_default_observation_state(
 
     Args:
         illumination_config: Available illumination channels
-        include_confocal: Whether to include confocal settings
+        confocal_settings: Confocal device settings; None = no confocal block
 
     Returns:
         ObservationState with default settings for all channels
@@ -151,9 +95,7 @@ def generate_default_observation_state(
         if i == 0:
             display_color = get_display_color_for_channel(ill_channel)
 
-    confocal_hw = None
-    if include_confocal:
-        confocal_hw = build_confocal_settings_from_config(None)
+    confocal_hw = build_confocal_settings(confocal_settings) if confocal_settings is not None else None
 
     return ObservationState(
         version=3,
@@ -209,7 +151,6 @@ def has_legacy_configs_to_migrate(profile: str, base_path: Optional[Path] = None
 def ensure_default_configs(
     config_repo: ConfigRepository,
     profile: str,
-    include_confocal: bool = False,
 ) -> bool:
     """
     Ensure a profile has default configurations.
@@ -223,7 +164,6 @@ def ensure_default_configs(
     Args:
         config_repo: ConfigRepository instance
         profile: Profile name
-        include_confocal: Whether to include confocal-related settings
 
     Returns:
         True if configs were generated, False if they already existed or migration is pending
@@ -245,7 +185,9 @@ def ensure_default_configs(
         raise FileNotFoundError("illumination_channel_config.yaml is required to generate default configs")
 
     logger.info(f"Generating default configs for profile '{profile}'")
-    general_config = generate_default_observation_state(illumination_config, include_confocal=include_confocal)
+    general_config = generate_default_observation_state(
+        illumination_config, confocal_settings=config_repo.get_confocal_settings()
+    )
 
     config_repo.ensure_profile_directories(profile)
     config_repo.save_observation_state(profile, general_config)

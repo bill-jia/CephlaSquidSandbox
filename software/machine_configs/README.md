@@ -43,13 +43,18 @@ Defines all available illumination channels on this machine:
 - Controller port mappings (D1-D8 for lasers, USB for LED matrix)
 - Intensity calibration file references
 
-### `confocal_config.yaml` (Optional)
-Only create this file if the system has a confocal unit. Its presence indicates
-that confocal settings should be included in acquisition configs.
+### Confocal units (no separate file)
+A spinning-disk confocal unit is configured entirely under its own device entry
+in `machine_config.yaml` (`devices.xlight` or `devices.dragonfly`). An enabled
+entry is what marks the system as confocal.
 
-Defines:
-- Filter wheel slot to filter name mappings
-- Properties available for configuration (public vs objective-specific)
+Its `config:` block holds `sleep_time_for_wheel`, `validate_wheel_pos`, the iris
+defaults (`illumination_iris_default`, `emission_iris_default`) and the built-in
+`emission_filter_wheel` (`name` plus `positions`, whose length is the slot count
+the driver accepts). The wheel declared there is published under the `confocal`
+source for `hardware_bindings` references and the filter-position picker, so it
+must NOT be duplicated in `filter_wheels.yaml` / `filter_wheel_registry`.
+See `docs/configuration-system.md` for the full schema.
 
 ### `intensity_calibrations/` (Optional, user-generated)
 Contains CSV files mapping DAC percentage to optical power (mW) for each laser line.

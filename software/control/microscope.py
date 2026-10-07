@@ -27,7 +27,8 @@ from control.lighting import (
     ShutterControlMode,
 )
 from control.microcontroller import Microcontroller
-from control.models.machine_config import MachineConfig, DeviceEntry, IlluminationDeviceEntry
+from control.models.machine_config import ConfocalDeviceSettings, MachineConfig, DeviceEntry, IlluminationDeviceEntry
+from control.models.observation_state import CameraSettings
 from control.piezo import PiezoStage
 from control.serial_peripherals import SciMicroscopyLEDArray
 from squid.abc import CameraAcquisitionMode, AbstractCamera, AbstractStage, AbstractFilterWheelController, LightSource
@@ -43,7 +44,7 @@ import squid.filter_wheel_controller.utils
 import squid.logging
 import squid.stage.cephla
 import squid.stage.utils
-from control.nidaq import AbstractNIDAQ, NIDAQ, build_nidaq_config_from_io
+from control.nidaq import AbstractNIDAQ, NIDAQ, SimulatedNIDAQ, build_nidaq_config_from_io
 
 
 def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
@@ -59,11 +60,15 @@ def _should_simulate(global_simulated: bool, component_override: bool) -> bool:
         True if the component should be simulated, False otherwise.
 
     Behavior:
-        - Per-component SIMULATE_* is always respected.
-        - When --simulation is used, apply_simulation_mode_defaults(True) sets any
-          SIMULATE_* not specified in config to True, so unset components are simulated.
+        - Per-component SIMULATE_* is always respected, so one component can be
+          simulated against otherwise-real hardware.
+        - ``global_simulated`` forces simulation for every component. Honouring it
+          here matters for callers that construct a Microscope directly, such as
+          tests: ``apply_simulation_mode_defaults`` only runs on the --simulation
+          launch path, so without this a ``simulated=True`` build would open real
+          serial ports and cameras on a live rig.
     """
-    return bool(component_override)
+    return bool(component_override) or bool(global_simulated)
 
 
 class MicroscopeAddons:
@@ -105,19 +110,25 @@ class MicroscopeAddons:
             return d if d and d.enabled else None
 
         def _sim(name: str) -> bool:
+            # The global flag must win even when the device entry exists: a
+            # rig config leaves `simulate` unset (False), and returning that
+            # alone made a simulated=True build open the real serial devices.
             d = mc.get_device(name)
-            return d.simulate if d else simulated
+            return _should_simulate(simulated, bool(d.simulate) if d else False)
 
         # ── Spinning disk confocal ────────────────────────────────────────
         xlight = None
         xlight_entry = _dev("xlight")
         if xlight_entry:
-            if not _sim("xlight"):
-                sn = xlight_entry.connection.serial_number if xlight_entry.connection else ""
-                sleep_time = xlight_entry.config.get("sleep_time_for_wheel", 0.25)
-                xlight = serial_peripherals.XLight(sn, sleep_time)
-            else:
-                xlight = serial_peripherals.XLight_Simulation()
+            settings = ConfocalDeviceSettings.from_device_entry(xlight_entry)
+            sn = xlight_entry.connection.serial_number if xlight_entry.connection else ""
+            cls_ = serial_peripherals.XLight_Simulation if _sim("xlight") else serial_peripherals.XLight
+            xlight = cls_(
+                sn,
+                sleep_time_for_wheel=settings.sleep_time_for_wheel,
+                validate_wheel_pos=settings.validate_wheel_pos,
+                emission_filter_positions=settings.emission_filter_positions,
+            )
 
         dragonfly = None
         dragonfly_entry = _dev("dragonfly")
@@ -206,7 +217,12 @@ class MicroscopeAddons:
                 delay = led_entry.config.get("turn_on_delay", 0.03)
                 na = led_entry.config.get("default_na", 0.8)
                 default_color = tuple(led_entry.config.get("default_color", [1, 1, 1]))
-                sci_microscopy_led_array = serial_peripherals.SciMicroscopyLEDArray(
+                led_cls = (
+                    serial_peripherals.SciMicroscopyLEDArray_Simulation
+                    if _sim("led_matrix")
+                    else serial_peripherals.SciMicroscopyLEDArray
+                )
+                sci_microscopy_led_array = led_cls(
                     SN=sn,
                     array_distance=dist,
                     turn_on_delay=delay,
@@ -217,16 +233,28 @@ class MicroscopeAddons:
         # ── NI-DAQ ────────────────────────────────────────────────────────
         io_config = mc.collect_io_endpoints()
         # log.info(f"io_config: {io_config}")
+        # A simulated build still gets a DAQ object, built from the same IO
+        # endpoints. Without one the NIDAQ controller never registers, so every
+        # nidaq-routed endpoint (main_camera.trigger, frame_readout, the
+        # illumination shutters) stays unbound and simulation loses hardware
+        # trigger mode entirely. Only `enabled: false` means "no DAQ at all".
         nidaq = None
         nidaq_entry = _dev("nidaq")
-        if nidaq_entry and not _sim("nidaq"):
+        if nidaq_entry:
             device_name = nidaq_entry.config.get("device_name", "Dev1")
             nidaq_config = build_nidaq_config_from_io(
                 device_name=device_name,
                 base_config=nidaq_entry.config,
                 io_config=io_config,
             )
-            nidaq = NIDAQ(**nidaq_config)
+            nidaq_simulated = _should_simulate(simulated, _sim("nidaq"))
+            cls_ = SimulatedNIDAQ if nidaq_simulated else NIDAQ
+            log.info(
+                f"Building {'simulated ' if nidaq_simulated else ''}NI-DAQ "
+                f"'{device_name}' (ao={nidaq_config.get('ao_channels')}, "
+                f"do={nidaq_config.get('do_lines')}, di={nidaq_config.get('di_lines')})"
+            )
+            nidaq = cls_(**nidaq_config)
 
         # ── Hybrid serial+IO light sources ────────────────────────────────
         serial_devices: Dict[str, object] = {}
@@ -447,6 +475,64 @@ def _build_serial_device(
     )
 
 
+def _build_serial_light_source(
+    dev_entry: IlluminationDeviceEntry,
+    simulated: bool,
+) -> Optional["LightSource"]:
+    """Instantiate the serial ``LightSource`` driver for an illumination entry.
+
+    Addressing (serial number / port) comes from ``dev_entry.connection`` and
+    driver options from ``dev_entry.config``.
+
+    Returns ``None`` when ``simulated`` is True and the driver has no
+    simulation variant in this repo, so the caller can skip the device.
+    """
+    driver = dev_entry.driver
+    cfg = dev_entry.config or {}
+    sn = dev_entry.connection.serial_number if dev_entry.connection else None
+    port = dev_entry.connection.port if dev_entry.connection else None
+
+    if driver == "ldi":
+        mode_kwargs = {
+            "intensity_mode": str(cfg.get("intensity_mode", "PC")),
+            "shutter_mode": str(cfg.get("shutter_mode", "PC")),
+        }
+        if simulated:
+            return serial_peripherals.LDI_Simulation(SN=sn, **mode_kwargs)
+        if not sn:
+            raise ValueError(
+                f"Illumination device '{dev_entry.id}' (driver='ldi') needs "
+                f"connection.serial_number: the LDI is only addressable by its "
+                f"USB serial number"
+            )
+        return serial_peripherals.LDI(SN=sn, **mode_kwargs)
+
+    if driver == "coolled_pe400":
+        import control.serial_peripherals_coolled as _coolled_module
+
+        if simulated:
+            return _coolled_module.CoolLEDpE400_Simulation(SN=sn, port=port)
+        return _coolled_module.CoolLEDpE400(SN=sn, port=port)
+
+    if driver == "celesta":
+        # No CELESTA simulation class exists in control/celesta.py.
+        return None if simulated else control.celesta.CELESTA()
+
+    if driver == "andor_laser":
+        # No AndorLaser simulation class exists in control/illumination_andor.py.
+        if simulated:
+            return None
+        return control.illumination_andor.AndorLaser(
+            control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
+        )
+
+    if driver == "versalase":
+        # No VersaLase simulation class exists in control/serial_peripherals.py.
+        return None if simulated else serial_peripherals.VersaLase()
+
+    raise ValueError(f"Unknown serial illumination driver '{driver}'")
+
+
 def _build_led_matrix_device(
     dev_entry: IlluminationDeviceEntry,
     micro: Optional[Microcontroller],
@@ -533,24 +619,18 @@ def _build_illumination_controller(
                     devices.append(
                         _build_led_matrix_device(dev_entry, micro, sci_array, default_color=_lm_color)
                     )
-                elif driver == "coolled_pe400" and not simulated:
-                    import control.serial_peripherals_coolled as _coolled_module
-                    sn = dev_entry.connection.serial_number if dev_entry.connection else None
-                    port = dev_entry.connection.port if dev_entry.connection else None
-                    coolled_ls = _coolled_module.CoolLEDpE400(SN=sn, port=port)
-                    devices.append(_build_serial_device(dev_entry, coolled_ls, io_registry))
-                elif driver == "ldi" and not simulated:
-                    devices.append(_build_serial_device(dev_entry, serial_peripherals.LDI(), io_registry))
-                elif driver == "celesta" and not simulated:
-                    devices.append(_build_serial_device(dev_entry, control.celesta.CELESTA(), io_registry))
-                elif driver == "andor_laser" and not simulated:
-                    andor = control.illumination_andor.AndorLaser(
-                        control._def.ANDOR_LASER_VID, control._def.ANDOR_LASER_PID
-                    )
-                    devices.append(_build_serial_device(dev_entry, andor, io_registry))
-                elif driver == "versalase" and not simulated:
-                    versalase = serial_peripherals.VersaLase()
-                    devices.append(_build_serial_device(dev_entry, versalase, io_registry))
+                elif driver in ("coolled_pe400", "ldi", "celesta", "andor_laser", "versalase"):
+                    light_source = _build_serial_light_source(dev_entry, simulated)
+                    if light_source is None:
+                        # Simulated launch of a driver with no simulation class.
+                        squid.logging.get_logger("illumination").info(
+                            f"Skipping illumination device '{dev_entry.id}' "
+                            f"(driver='{driver}', simulated={simulated})"
+                        )
+                    else:
+                        devices.append(
+                            _build_serial_device(dev_entry, light_source, io_registry)
+                        )
                 else:
                     squid.logging.get_logger("illumination").info(
                         f"Skipping illumination device '{dev_entry.id}' "
@@ -558,7 +638,8 @@ def _build_illumination_controller(
                     )
             except Exception as exc:
                 squid.logging.get_logger("illumination").warning(
-                    f"Failed to build illumination device '{dev_entry.id}': {exc}"
+                    f"Failed to build illumination device '{dev_entry.id}' "
+                    f"(driver='{driver}'): {type(exc).__name__}: {exc}"
                 )
 
         if devices:
@@ -626,7 +707,19 @@ def _build_illumination_controller(
         return IlluminationController(devices_legacy)
 
     if _legacy_driver == "ldi" and not simulated:
-        ldi = serial_peripherals.LDI()
+        _ldi_cfg = (illum_entry.config or {}) if illum_entry else {}
+        _ldi_sn = illum_entry.connection.serial_number if (illum_entry and illum_entry.connection) else None
+        if not _ldi_sn:
+            raise ValueError(
+                "Legacy illumination device 'illumination' (driver='ldi') needs "
+                "connection.serial_number: the LDI is only addressable by its "
+                "USB serial number"
+            )
+        ldi = serial_peripherals.LDI(
+            SN=_ldi_sn,
+            intensity_mode=str(_ldi_cfg.get("intensity_mode", "PC")),
+            shutter_mode=str(_ldi_cfg.get("shutter_mode", "PC")),
+        )
         ldi.initialize()
         ch_map = {str(wl): key for wl, key in ldi.channel_mappings.items()} if hasattr(ldi, "channel_mappings") else {}
         return IlluminationController([
@@ -708,48 +801,63 @@ class Microscope:
         )
 
         # ── Camera trigger routing ────────────────────────────────────────
+        # The trigger functions are handed to the camera only when something
+        # actually drives the line. Passing an unconditional closure made
+        # "is there a hardware trigger?" always true, which is how a trigger
+        # endpoint pointing at a controller that never reaches the camera stayed
+        # invisible until a mid-acquisition frame timeout.
         cam_trigger_log = squid.logging.get_logger("camera hw functions")
         io_reg = addons.io_registry
         trigger_ep = io_reg.get("main_camera.trigger") if io_reg else None
+        nl5_drives_trigger = bool(addons.nl5 and control._def.NL5_USE_DOUT)
 
-        def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
-            if addons.nl5 and control._def.NL5_USE_DOUT:
-                addons.nl5.start_acquisition()
-            elif trigger_ep is not None:
-                illumination_time_us = int(1000.0 * illumination_time) if illumination_time else 0
-                cam_trigger_log.debug(
-                    f"Sending hw trigger via IO endpoint with illumination_time="
-                    f"{illumination_time_us if illumination_time else None} [us]"
-                )
-                trigger_ep.send_trigger(
-                    control_illumination=illumination_time is not None,
-                    illumination_on_time_us=illumination_time_us,
-                )
-            else:
-                illumination_time_us = 1000.0 * illumination_time if illumination_time else 0
-                cam_trigger_log.debug(
-                    f"Sending hw trigger (legacy) with illumination_time="
-                    f"{illumination_time_us if illumination_time else None} [us]"
-                )
-                low_level_devices.microcontroller.send_hardware_trigger(
-                    illumination_time is not None, illumination_time_us
-                )
-            return True
+        acquisition_camera_hw_trigger_fn = None
+        acquisition_camera_hw_strobe_delay_fn = None
 
-        def acquisition_camera_hw_strobe_delay_fn(strobe_delay_ms: float) -> bool:
-            strobe_delay_us = int(1000 * strobe_delay_ms)
-            cam_trigger_log.debug(f"Setting strobe delay to {strobe_delay_us} [us]")
-            if trigger_ep is not None:
+        if nl5_drives_trigger or trigger_ep is not None:
+
+            def acquisition_camera_hw_trigger_fn(illumination_time: Optional[float]) -> bool:
+                if nl5_drives_trigger:
+                    addons.nl5.start_acquisition()
+                else:
+                    illumination_time_us = int(1000.0 * illumination_time) if illumination_time else 0
+                    cam_trigger_log.debug(
+                        f"Sending hw trigger via IO endpoint with illumination_time="
+                        f"{illumination_time_us if illumination_time else None} [us]"
+                    )
+                    trigger_ep.send_trigger(
+                        control_illumination=illumination_time is not None,
+                        illumination_on_time_us=illumination_time_us,
+                    )
+                return True
+
+        if trigger_ep is not None:
+
+            def acquisition_camera_hw_strobe_delay_fn(strobe_delay_ms: float) -> bool:
+                strobe_delay_us = int(1000 * strobe_delay_ms)
+                cam_trigger_log.debug(f"Setting strobe delay to {strobe_delay_us} [us]")
                 trigger_ep.set_strobe_delay(strobe_delay_us)
                 trigger_ep.wait()
-            else:
-                low_level_devices.microcontroller.set_strobe_delay_us(strobe_delay_us)
-                low_level_devices.microcontroller.wait_till_operation_is_completed()
-            return True
+                return True
+
+        camera_config = squid.config.get_camera_config()
+        if trigger_ep is not None:
+            endpoint_desc = (
+                f"{trigger_ep.controller_type.value.lower()} {trigger_ep.endpoint.channel_id}"
+            )
+        elif nl5_drives_trigger:
+            endpoint_desc = "nl5 start_acquisition"
+        else:
+            endpoint_desc = "no trigger endpoint"
+        cam_trigger_log.info(
+            f"Main camera SW trigger routing: "
+            f"{camera_config.software_trigger_routing.value} via {endpoint_desc} "
+            f"(machine config declares: {camera_config.trigger_endpoint_description or 'none'})"
+        )
 
         camera_simulated = _should_simulate(simulated, control._def.SIMULATE_CAMERA)
         camera = squid.camera.utils.get_camera(
-            config=squid.config.get_camera_config(),
+            config=camera_config,
             simulated=camera_simulated,
             hw_trigger_fn=acquisition_camera_hw_trigger_fn,
             hw_set_strobe_delay_ms_fn=acquisition_camera_hw_strobe_delay_fn,
@@ -1001,7 +1109,8 @@ class Microscope:
         else:
             raise RuntimeError("No spinning disk hardware available")
 
-        self.live_controller.toggle_confocal_widefield(confocal)
+        # State only: the disk was already moved above.
+        self.obs_controller.toggle_confocal_widefield(confocal)
 
     def is_confocal_mode(self) -> bool:
         """Check if currently in confocal mode.
@@ -1066,21 +1175,21 @@ class Microscope:
 
         # turn on illumination and send trigger
         if using_software_trigger:
-            self.live_controller.turn_on_illumination()
+            self.obs_controller.turn_on_illumination()
             self._wait_for_microcontroller()
             self.camera.send_trigger()
         elif self.live_controller.trigger_mode == control._def.TriggerMode.HARDWARE:
             trigger_ep = self.addons.io_registry.get("main_camera.trigger") if self.addons.io_registry else None
+            if trigger_ep is None:
+                raise RuntimeError(
+                    "Hardware trigger mode needs a main_camera.trigger IO endpoint, but none "
+                    "is bound. Declare devices.main_camera.io.trigger on an enabled controller."
+                )
             illumination_time_us = int(self.camera.get_exposure_time() * 1000)
-            if trigger_ep is not None:
-                trigger_ep.send_trigger(
-                    control_illumination=True,
-                    illumination_on_time_us=illumination_time_us,
-                )
-            else:
-                self.low_level_drivers.microcontroller.send_hardware_trigger(
-                    control_illumination=True, illumination_on_time_us=illumination_time_us,
-                )
+            trigger_ep.send_trigger(
+                control_illumination=True,
+                illumination_on_time_us=illumination_time_us,
+            )
 
         try:
             # read a frame from camera
@@ -1092,7 +1201,7 @@ class Microscope:
         finally:
             # always turn off illumination when using software trigger
             if using_software_trigger:
-                self.live_controller.turn_off_illumination()
+                self.obs_controller.turn_off_illumination()
 
     def home_xyz(self) -> None:
         """Home the X, Y, and Z axes based on configuration settings.
@@ -1248,11 +1357,31 @@ class Microscope:
         except Exception as e:
             self._log.warning(f"Error stopping live view during close: {e}")
 
+        # Shut the light sources down before the microcontroller: the LED matrix
+        # illumination device talks to the MCU, and serial sources (LDI/CoolLED)
+        # otherwise stay lit with their ports open.
+        try:
+            self.illumination_controller.shut_down()
+        except Exception as e:
+            self._log.warning(f"Error shutting down illumination controller: {e}")
+
         if self.low_level_drivers.microcontroller:
             try:
                 self.low_level_drivers.microcontroller.close()
             except Exception as e:
                 self._log.warning(f"Error closing microcontroller: {e}")
+
+        if self.addons.xlight:
+            try:
+                self.addons.xlight.close()
+            except Exception as e:
+                self._log.warning(f"Error closing X-Light: {e}")
+
+        if self.addons.dragonfly:
+            try:
+                self.addons.dragonfly.close()
+            except Exception as e:
+                self._log.warning(f"Error closing Dragonfly: {e}")
 
         if self.addons.emission_filter_wheel:
             try:
@@ -1291,27 +1420,59 @@ class Microscope:
         """
         self.objective_store.set_current_objective(objective)
 
-    def set_illumination_intensity(self, channel: str, intensity: float) -> None:
-        """Set the illumination intensity for a channel.
+    def set_illumination_intensity(self, illumination_channel: str, intensity: float) -> None:
+        """Set the intensity of one illumination channel.
+
+        An *illumination channel* is a single light source line, e.g.
+        "Fluorescence 488 nm Ex" — not an Observation State. Contrast with
+        :meth:`set_exposure_time`, whose subject is the whole light path.
 
         Args:
-            channel: Name of the channel.
-            intensity: Illumination intensity value.
-            objective: Objective name. If None, uses current objective.
+            illumination_channel: Name of the light source line.
+            intensity: Illumination intensity, 0-100 %.
         """
-        self.illumination_controller.set_channel_intensity(channel, intensity)
+        self.illumination_controller.set_channel_intensity(illumination_channel, intensity)
 
-    def set_exposure_time(self, channel: str, exposure_time: float, objective: Optional[str] = None) -> None:
-        """Set the exposure time for a channel.
+    def set_exposure_time(self, observation_state: str, exposure_time: float) -> None:
+        """Set the exposure time recorded for a named Observation State.
+
+        The write lands on the state's ``camera_settings.exposure_time_ms`` --
+        ``ObservationState.exposure_time`` is a read-only view of it. When the
+        name belongs to a saved preset the preset file is rewritten, so the new
+        exposure survives a reload. The camera itself is only touched when that
+        state is the one currently applied; changing a channel the scope is not
+        looking through must not move live hardware.
+
+        An *Observation State* is the whole light path for one acquisition, the
+        thing this codebase also calls a channel. Contrast with
+        :meth:`set_illumination_intensity`, whose subject is a single light
+        source line.
 
         Args:
-            channel: Name of the channel.
+            observation_state: Name of the Observation State.
             exposure_time: Exposure time in milliseconds.
-            objective: Objective name. If None, uses current objective.
+
+        Raises:
+            ValueError: If no Observation State carries this name.
         """
-        if objective is None:
-            objective = self.objective_store.current_objective
-        channel_config = self.live_controller.get_observation_state_by_name(channel)
-        if channel_config:
-            channel_config.exposure_time = exposure_time
-            self.live_controller.set_microscope_mode(channel_config)
+        exposure_time = float(exposure_time)
+        repo = self.config_repo
+        state = repo.get_observation_state_by_name(observation_state)
+        if state is None:
+            available = [s.name for s in repo.get_observation_states()]
+            raise ValueError(
+                f"No Observation State named {observation_state!r}. Available: {available}"
+            )
+
+        if state.camera_settings is None:
+            state.camera_settings = CameraSettings(exposure_time_ms=exposure_time, gain_mode=state.analog_gain)
+        else:
+            state.camera_settings.exposure_time_ms = exposure_time
+
+        if observation_state in repo.list_observation_presets():
+            repo.save_observation_preset(observation_state, state)
+
+        active = self.obs_controller.current_observation_state
+        if active is not None and active.name == state.name:
+            # Updates the live state object + general.yaml and pushes to the camera.
+            self.obs_controller.set_exposure_time(exposure_time)

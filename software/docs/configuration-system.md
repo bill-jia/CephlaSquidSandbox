@@ -15,7 +15,6 @@ software/
 │   ├── cameras.yaml                      # Optional: camera registry
 │   ├── filter_wheels.yaml                # Optional: standalone filter wheels (ignored if embedded registry is non-empty)
 │   ├── hardware_bindings.yaml            # Optional: camera→wheel mappings (ignored if embedded in machine_config.yaml)
-│   ├── confocal_config.yaml              # Optional: confocal settings + wheels
 │   └── intensity_calibrations/           # Optional: power calibration CSVs
 │
 └── user_profiles/                      # User preferences (per profile)
@@ -213,43 +212,189 @@ filter_wheels:
 - **Emission filter wheels** (most common, 0-1 per system): Referenced by acquisition channels via `filter_wheel` and `filter_position` fields in user profile configs
 - **Excitation filter wheels** (rare): Referenced by illumination channels via `excitation_filter_wheel` and `excitation_filter_position` fields in machine config
 
-### confocal_config.yaml (Optional)
+### Confocal settings (`devices.xlight` / `devices.dragonfly`)
 
-Only create this file if the system has a confocal unit. Its presence indicates that confocal settings should be included in acquisition configs. Filter wheels built into the confocal unit are defined here (not in `filter_wheels.yaml`).
+Everything a spinning-disk confocal unit needs lives under its own device entry
+in `machine_config.yaml` — there is no separate confocal config file. The
+presence of an **enabled** `xlight` or `dragonfly` device is what marks the
+system as confocal.
 
-> **Note**: Filter wheels in this file are referenced with the `confocal` source prefix in `hardware_bindings.yaml` (e.g., `confocal.1`), while wheels in `filter_wheels.yaml` use the `standalone` source prefix.
+> **Note**: The wheel declared here is referenced with the `confocal` source
+> prefix in `hardware_bindings` (e.g., `confocal.1`), while wheels in
+> `filter_wheels.yaml` / `filter_wheel_registry` use the `standalone` prefix.
 
 ```yaml
-version: 1
-
-# Filter wheels built into the confocal unit
-filter_wheels:
-  - name: "Emission Wheel"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
-      2: "BP 525/50"
-      3: "BP 600/50"
-      4: "BP 700/75"
-      5: "LP 650"
-
-# Properties available for configuration
-public_properties:
-  - emission_filter_wheel_position
-
-objective_specific_properties:
-  - illumination_iris
-  - emission_iris
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    connection:
+      serial_number: "A9KI1SXRA"
+    config:
+      sleep_time_for_wheel: 0.25       # seconds to wait after a wheel move
+      validate_wheel_pos: false        # read the wheel back after each move
+      illumination_iris_default: 80    # seeds confocal_hardware_settings
+      emission_iris_default: 100
+      emission_filter_wheel:
+        name: "XLight emission wheel"  # optional; defaults to "Emission Wheel"
+        positions:
+          1: "Empty"
+          2: "BP 525/50"
+          3: "BP 600/50"
+          4: "BP 700/75"
+          5: "LP 650"
 ```
 
-**Fields:**
+**Fields (`ConfocalDeviceSettings`):**
 
-| Field | Description |
-|-------|-------------|
-| `filter_wheels` | List of filter wheel definitions (same format as `filter_wheels.yaml`) |
-| `public_properties` | Properties available in `general.yaml` |
-| `objective_specific_properties` | Properties only in objective-specific files |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sleep_time_for_wheel` | `0.25` | Seconds the driver waits after a wheel move |
+| `validate_wheel_pos` | `false` | Default for `XLight.set_emission_filter(validate=...)`: read the position back after each move |
+| `illumination_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.illumination_iris` |
+| `emission_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.emission_iris` |
+| `emission_filter_wheel.name` | `"Emission Wheel"` | Name shown in filter wheel dropdowns |
+| `emission_filter_wheel.positions` | `{}` | Slot number → filter name; `len(positions)` is the slot count the driver accepts (8 = X-Light V3, 5 = Cicero). Omitted → the driver falls back to 8 slots and no wheel is published to the UI. |
+
+Unknown keys in this block are rejected, so typos surface at startup.
+
+**How it is consumed:**
+- `MicroscopeAddons.build_from_global_config` passes `sleep_time_for_wheel`,
+  `validate_wheel_pos` and the slot count into `XLight` / `XLight_Simulation`.
+- `ConfigRepository.get_all_filter_wheels()` publishes the declared wheel under
+  the `"confocal"` source, so `hardware_bindings` refs like `confocal.1` and the
+  observation-state editor's filter-position picker both resolve it without a
+  duplicate `filter_wheel_registry` entry.
+- The iris defaults seed `confocal_hardware_settings` the first time an iris is
+  edited, and when default configs are generated for a new profile.
+
+**Redundant writes are skipped in the driver.**
+`ObservationStateController.apply_optical_path` writes the wheel slot and both
+irises on *every* observation-state apply, i.e. on every channel switch of a
+multi-channel acquisition. Each of those is slow on the wire —
+`sleep_time_for_wheel` per wheel move, a 2 s round trip per iris — and the usual
+rig runs one quad-band filter and one aperture for the whole run. `XLight`
+therefore caches what it last drove (`emission_wheel_pos`, `dichroic_wheel_pos`,
+`slider_position`, `illumination_iris`, `emission_iris`, plus `spinning_disk_pos`
+and `disk_motor_state`) and returns without touching serial when the request
+matches. The dichroic filter slider is the biggest win: its round trip is 5 s.
+The invariants:
+
+- The cache is the driver's, not the controller's, so the confocal panel (which
+  drives the same mechanisms) cannot make it stale.
+- It starts as `None` — "unknown" — so a mechanism the unit will not report
+  always writes, including a request for slot 1 or a fully closed iris.
+- `XLight.__init__` calls `seed_caches_from_hardware()`, which reads back every
+  mechanism the unit says it has (`rB`, `rC`, `rP`, `rJ`, `rV`, `rD`, `rN`).
+  This is what makes the skipping safe: a cache guessed as 0 on a unit whose
+  iris is physically at 100 makes "close the iris to 0" look redundant, so it is
+  silently dropped — the hardware stays open while the software believes it
+  closed. Each read is individually best-effort; one that fails logs a warning
+  and leaves that cache unknown rather than breaking startup.
+- It is cleared before the write and set only after the write returns, so a
+  command that raises leaves the position unknown and the next apply retries.
+- `validate_wheel_pos` is unchanged for the moves that do happen: a skipped move
+  reads nothing back because nothing moved. An `extraction=True` move is a
+  different command and is never skipped.
+- `XLight_Simulation` skips the same way; its cache starts at the simulated
+  unit's known state rather than `None`, because there it *is* the hardware.
+
+`Dragonfly` has no such cache: its `set_emission_filter` is port-keyed and its
+commands are ~0.1 s, so the confocal branch of `apply_optical_path` for a
+Dragonfly still writes every time.
+
+### Camera trigger routing (`devices.main_camera`)
+
+A camera declares the line that triggers it under `io.trigger`, and how a
+**software** trigger is delivered under `config.software_trigger_routing`:
+
+```yaml
+devices:
+  main_camera:
+    driver: tucsen
+    role: main
+    io:
+      trigger:                        # the line that actually fires the sensor.
+        controller: nidaq             # Used by Hardware trigger mode AND by
+        signal_type: digital          # Software trigger mode when
+        direction: output             # software_trigger_routing is hardware_line.
+        channel_id: "port0/line6"
+        display_name: "Main camera trigger"
+    config:
+      software_trigger_routing: hardware_line   # or: native
+```
+
+| Value | What `camera.send_trigger()` does |
+|-------|-----------------------------------|
+| `hardware_line` | The camera is programmed for hardware (Standard) trigger and every "software" trigger is a pulse on the `io.trigger` endpoint. Illumination stays software-controlled by the worker (LED steady-on across the exposure). |
+| `native` | The camera's own SDK software-trigger command (GenICam `TriggerSoftwarePulse` / `TUCCM_TRIGGER_SOFTWARE`). No IO endpoint is involved. |
+
+**Default** (resolved in one place,
+`control.models.machine_config.resolve_software_trigger_routing`):
+`hardware_line` when the camera declares an `io.trigger` endpoint, `native`
+otherwise. An explicit value always wins.
+
+**Validation.** `hardware_line` without an `io.trigger` endpoint is rejected when
+the machine config loads, and an unknown value is rejected by name. If the
+endpoint exists in the config but its controller is disabled or unavailable, the
+camera raises a `CameraError` the first time the acquisition mode is set —
+before a run starts — instead of timing out on a frame mid-acquisition.
+
+**Why it is explicit.** The Tucsen Aries' native software trigger does not
+reliably start exposures, so that rig must use `hardware_line`; the trigger line
+is then load-bearing for ordinary software-triggered acquisition, not just for
+Hardware trigger mode. Pointing `io.trigger` at a controller/channel that does
+not physically reach the camera produces no error anywhere — the triggers simply
+go nowhere — so the routing in effect and the endpoint it resolves to are logged
+at INFO during startup:
+
+```
+Main camera SW trigger routing: hardware_line via nidaq port0/line6 (machine config declares: nidaq port0/line6)
+```
+
+and the same description is printed in the "Timed out waiting … for a frame"
+error, so a misrouted line is legible rather than inferred.
+
+### Simulation (`--simulation`, `devices.<name>.simulate`)
+
+Two switches decide whether a device opens real hardware, and **either one is
+enough to simulate it** (`control.microscope._should_simulate`):
+
+| Switch | Scope |
+|--------|-------|
+| `--simulation` on the command line | every device |
+| `devices.<name>.simulate: true` | that device only |
+
+Per-device flags are what make mixed setups work — e.g. `main_camera.simulate:
+true` with a real `nidaq` drives the DAQ's trigger line for an external
+frame-grabbing application while Squid synthesizes its own frames. Never gate a
+device on the global flag alone.
+
+`enabled: false` is a different statement: the device does not exist on this rig
+and nothing is built for it, simulated or otherwise.
+
+**The NI-DAQ is simulated, not skipped.** An enabled `devices.nidaq` always
+produces an object — `SimulatedNIDAQ` when simulating, `NIDAQ` otherwise — built
+from the same IO endpoints either way, and logged at startup:
+
+```
+Building simulated NI-DAQ 'Dev1' (ao=['ao0'], do=[2, 6], di=[7])
+```
+
+That object is what registers the NIDAQ controller in the `IORegistry`, so with
+it every nidaq-routed endpoint binds in simulation: `main_camera.trigger` (so
+Hardware trigger mode and `software_trigger_routing: hardware_line` both work
+against the simulated camera), `main_camera.frame_readout`, and the illumination
+shutter/intensity lines. `SimulatedNIDAQ` records live AO/DO state and returns
+from `send_edge_pulse` immediately — no pulse-width sleep, and no readout-line
+diagnostic, since there is no DI line to sample.
+
+Waveform-driven and stimulus-only observation states also run in simulation
+(`SimulatedNIDAQ` arms, fires on `start_trigger`, and completes after the
+waveform's own duration). **Fast acquisition does not**: it is a DAQ-clocked
+pulse train the camera answers with frames, and a simulated DAQ emits no pulses,
+so the Fast Acquisition tab is left out when the DAQ is simulated and the reason
+is logged. With a real DAQ it stays available, simulated camera or not.
 
 ### hardware_bindings.yaml (Optional)
 
@@ -260,8 +405,8 @@ Maps cameras to their associated filter wheels using **source-qualified referenc
 **Source-Qualified References:**
 
 Filter wheels can come from two sources:
-- **`standalone`**: Defined in `filter_wheels.yaml`
-- **`confocal`**: Defined in `confocal_config.yaml`
+- **`standalone`**: Defined in `filter_wheels.yaml` (or the embedded `filter_wheel_registry`)
+- **`confocal`**: Derived from the confocal device entry's `config.emission_filter_wheel`
 
 References use the format `source.identifier` where identifier can be an ID or name:
 - `confocal.1` - confocal wheel with ID 1
@@ -375,7 +520,9 @@ pixel_to_um: 1.0
 x_reference: null
 has_reference: false
 calibration_timestamp: ""
-pixel_to_um_calibration_distance: 6.0
+# NOTE: the calibration sweep distance is NOT here. It is machine policy scaled
+# by objective magnification: devices.laser_af.config.calibration in the machine
+# config (see docs/laser-autofocus.md).
 
 # Detection parameters
 laser_af_range: 100.0
@@ -463,9 +610,9 @@ This file captures the exact settings used, including:
    - Re-run calibration if laser power changes
    - Store calibration CSVs in `machine_configs/intensity_calibrations/`
 
-3. **Confocal config presence matters**
-   - Create `confocal_config.yaml` only if confocal exists
-   - File presence enables confocal settings in acquisition configs
+3. **Confocal presence matters**
+   - Enable `devices.xlight` (or `devices.dragonfly`) only if a confocal unit exists
+   - An enabled confocal device is what enables confocal settings in acquisition configs
 
 ---
 

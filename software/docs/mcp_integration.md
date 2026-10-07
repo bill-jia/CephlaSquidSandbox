@@ -128,11 +128,11 @@ The `python_exec` command is disabled by default for security. To enable it:
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
-| `get_channels` | - | List available channels for current objective |
-| `set_channel` | `channel_name` | Set active imaging channel |
-| `set_exposure` | `exposure_ms`, `channel` | Set camera exposure |
-| `set_illumination_intensity` | `channel`, `intensity` | Set illumination (0-100%) |
-| `turn_on_illumination` | - | Turn on current channel illumination |
+| `get_observation_states` | - | List available Observation States (imaging channels) |
+| `set_observation_state` | `observation_state` | Apply a whole light path by name |
+| `set_exposure` | `exposure_ms`, `observation_state` | Set camera exposure |
+| `set_illumination_intensity` | `illumination_channel`, `intensity` | Set one light source line (0-100%) |
+| `turn_on_illumination` | - | Turn on the current illumination |
 | `turn_off_illumination` | - | Turn off all illumination |
 
 ### Objectives
@@ -198,8 +198,8 @@ microscope_get_position()
 # Move to a specific location
 microscope_move_to(x_mm=50.0, y_mm=25.0)
 
-# Set channel and acquire image
-microscope_set_channel(channel_name="Fluorescence 488 nm Ex")
+# Apply an Observation State and acquire an image
+microscope_set_observation_state(observation_state="GFP")
 microscope_set_exposure(exposure_ms=100)
 microscope_acquire_image(save_path="/path/to/image.tiff")
 ```
@@ -210,7 +210,7 @@ microscope_acquire_image(save_path="/path/to/image.tiff")
 # Scan wells A1-B2 with multiple fluorescence channels
 microscope_run_acquisition(
     wells="A1:B2",
-    channels=["Fluorescence 488 nm Ex", "Fluorescence 561 nm Ex"],
+    observation_states=["GFP", "mCherry"],
     nx=2,
     ny=2,
     wellplate_format="96 well plate",
@@ -290,6 +290,11 @@ The TCP protocol uses newline-delimited JSON:
 - Long acquisitions may exceed the default 30s timeout
 - Check `get_acquisition_status` for progress on running scans
 
-### "Channel not found"
-- Channel names are objective-specific
-- Use `get_channels` to list available channels for current objective
+### "No Observation State named ..."
+- An **Observation State** (imaging channel) is the whole light path: illumination,
+  exposure, gain, emission filter, confocal settings. Its name is a saved preset name.
+- An **illumination channel** is one light source line, e.g. "Fluorescence 488 nm Ex".
+  `set_illumination_intensity` takes one of these; everything else takes an
+  Observation State. The two are different namespaces.
+- Use `get_observation_states` to list what exists. Observation States are
+  objective-free — the same names apply at every objective.

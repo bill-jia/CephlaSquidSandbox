@@ -64,17 +64,18 @@ When simulated disk I/O is enabled:
 The feature works by intercepting image saving at the job level:
 
 - `SaveImageJob` - Single TIFF files
-- `SaveOMETiffJob` - OME-TIFF stacks (5D: TZCYX)
+- `SaveOMETiffJob` - one multi-series OME-TIFF per region (series = FOV, each 5D: TZCYX)
 - `DownsampledViewJob` - Plate view thumbnails (uses existing `skip_saving` flag)
 
 Each job checks `control._def.SIMULATED_DISK_IO_ENABLED` and, if true, encodes the image to a `BytesIO` buffer, throttles based on configured speed, then discards the buffer.
 
 ### OME-TIFF Stack Simulation
 
-For OME-TIFF stacks, the simulation tracks:
-- Stack initialization overhead (~4KB for OME-XML header)
-- Per-plane encoding and throttling
-- Stack finalization overhead (~8KB for OME-XML update)
+OME-TIFF writes one multi-series file per region (series = FOV), so one
+simulated stack covers the whole region file and tracks:
+- Region-file initialization overhead (~4KB of OME-XML header per FOV series)
+- Per-plane encoding and throttling, keyed by `(fov, t, z, c)`
+- Stack finalization overhead (~8KB for OME-XML update) once every FOV is full
 
 This provides realistic timing for multi-dimensional acquisitions.
 

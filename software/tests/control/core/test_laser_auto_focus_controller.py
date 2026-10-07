@@ -111,7 +111,6 @@ def make_controller(camera, stage, **config_updates):
         laser_af_averaging_n=3,
         displacement_success_window_um=1.0,
         min_spot_intensity=10.0,
-        pixel_to_um_calibration_distance=6.0,
     )
     updates.update(config_updates)
     controller.laser_af_properties = controller.laser_af_properties.model_copy(update=updates)

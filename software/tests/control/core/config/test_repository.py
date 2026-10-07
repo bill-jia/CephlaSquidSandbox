@@ -176,15 +176,46 @@ class TestConfigRepositoryMachineConfigs:
 
         assert config1 is config2  # Same object, from cache
 
-    def test_get_confocal_config_returns_none_when_missing(self, temp_dir):
-        """Test that missing confocal config returns None."""
+    def test_get_confocal_settings_returns_none_when_no_device(self, temp_dir):
+        """Test that a machine with no confocal device reports none."""
         (temp_dir / "machine_configs").mkdir()
         (temp_dir / "user_profiles" / "default" / "channel_configs").mkdir(parents=True)
 
         repo = ConfigRepository(base_path=temp_dir)
 
-        assert repo.get_confocal_config() is None
-        assert repo.has_confocal() is False
+        assert repo.get_confocal_settings() is None
+        assert repo.get_machine_config().get_confocal_device() is None
+
+    def test_get_confocal_settings_from_device_entry(self, temp_dir):
+        """Test that confocal settings come from devices.xlight.config."""
+        machine_configs = temp_dir / "machine_configs"
+        machine_configs.mkdir()
+        (temp_dir / "user_profiles" / "default" / "channel_configs").mkdir(parents=True)
+
+        (machine_configs / "machine_config.yaml").write_text(
+            """
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      sleep_time_for_wheel: 0.4
+      validate_wheel_pos: true
+      illumination_iris_default: 80
+      emission_iris_default: 60
+"""
+        )
+
+        repo = ConfigRepository(base_path=temp_dir)
+        settings = repo.get_confocal_settings()
+
+        assert repo.get_machine_config().get_confocal_device()[0] == "xlight"
+        assert settings is not None
+        assert settings.sleep_time_for_wheel == 0.4
+        assert settings.validate_wheel_pos is True
+        assert settings.illumination_iris_default == 80.0
+        assert settings.emission_iris_default == 60.0
 
 
 class TestConfigRepositoryProfileConfigs:
@@ -534,8 +565,8 @@ filter_wheels:
 
         assert registry1 is registry2
 
-    def test_get_filter_wheel_names(self, temp_dir):
-        """Test get_filter_wheel_names returns wheel names from registry."""
+    def test_get_all_filter_wheel_names(self, temp_dir):
+        """Test get_all_filter_wheel_names returns wheel names from registry."""
         machine_configs = temp_dir / "machine_configs"
         machine_configs.mkdir()
 
@@ -557,16 +588,16 @@ filter_wheels:
         )
 
         repo = ConfigRepository(base_path=temp_dir)
-        names = repo.get_filter_wheel_names()
+        names = repo.get_all_filter_wheel_names()
 
         assert names == ["Emission Wheel", "Excitation Wheel"]
 
-    def test_get_filter_wheel_names_returns_empty_when_no_registry(self, temp_dir):
-        """Test get_filter_wheel_names returns empty list when no registry."""
+    def test_get_all_filter_wheel_names_returns_empty_when_no_wheels(self, temp_dir):
+        """Test get_all_filter_wheel_names returns empty list when no wheels exist."""
         (temp_dir / "machine_configs").mkdir()
 
         repo = ConfigRepository(base_path=temp_dir)
-        names = repo.get_filter_wheel_names()
+        names = repo.get_all_filter_wheel_names()
 
         assert names == []
 
@@ -781,16 +812,19 @@ filter_wheels:
         machine_configs = temp_dir / "machine_configs"
         machine_configs.mkdir()
 
-        (machine_configs / "confocal_config.yaml").write_text(
+        (machine_configs / "machine_config.yaml").write_text(
             """
-version: 1
-filter_wheels:
-  - name: "Confocal Emission"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
-      2: "LP 500"
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      emission_filter_wheel:
+        name: "Confocal Emission"
+        positions:
+          1: "Empty"
+          2: "LP 500"
 """
         )
 
@@ -819,15 +853,18 @@ filter_wheels:
 """
         )
 
-        (machine_configs / "confocal_config.yaml").write_text(
+        (machine_configs / "machine_config.yaml").write_text(
             """
-version: 1
-filter_wheels:
-  - name: "Confocal Emission"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      emission_filter_wheel:
+        name: "Confocal Emission"
+        positions:
+          1: "Empty"
 """
         )
 
@@ -838,6 +875,91 @@ filter_wheels:
         assert FILTER_WHEEL_SOURCE_CONFOCAL in all_wheels
         assert len(all_wheels[FILTER_WHEEL_SOURCE_STANDALONE]) == 1
         assert len(all_wheels[FILTER_WHEEL_SOURCE_CONFOCAL]) == 1
+
+    def test_get_all_filter_wheels_skips_disabled_confocal(self, temp_dir):
+        """A disabled confocal device contributes no wheel."""
+        machine_configs = temp_dir / "machine_configs"
+        machine_configs.mkdir()
+
+        (machine_configs / "machine_config.yaml").write_text(
+            """
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: false
+    config:
+      emission_filter_wheel:
+        name: "Confocal Emission"
+        positions:
+          1: "Empty"
+"""
+        )
+
+        repo = ConfigRepository(base_path=temp_dir)
+
+        assert repo.get_confocal_settings() is None
+        assert FILTER_WHEEL_SOURCE_CONFOCAL not in repo.get_all_filter_wheels()
+
+    def test_get_all_filter_wheels_from_library_config(self, temp_dir):
+        """The X-Light library config yields its 8-slot emission wheel with no standalone registry."""
+        machine_configs = temp_dir / "machine_configs"
+        machine_configs.mkdir()
+
+        library = (
+            Path(__file__).resolve().parents[4]
+            / "machine_configs"
+            / "library"
+            / "machine_config_Squid+_LDI_XLight_TucsenAries6506.yaml"
+        )
+        shutil.copy(library, machine_configs / "machine_config.yaml")
+
+        repo = ConfigRepository(base_path=temp_dir)
+        all_wheels = repo.get_all_filter_wheels()
+
+        assert FILTER_WHEEL_SOURCE_STANDALONE not in all_wheels
+        wheels = all_wheels[FILTER_WHEEL_SOURCE_CONFOCAL]
+        assert len(wheels) == 1
+        assert wheels[0].name == "XLight emission wheel"
+        assert wheels[0].id == 1
+        assert wheels[0].type == FilterWheelType.EMISSION
+        assert len(wheels[0].positions) == 8
+        assert repo.get_all_filter_wheel_names() == ["XLight emission wheel"]
+
+        # hardware_bindings-style resolution still finds it under "confocal"
+        ref = FilterWheelReference(source=FILTER_WHEEL_SOURCE_CONFOCAL, id=1)
+        resolved = repo.resolve_wheel_reference(ref)
+        assert resolved is not None
+        assert resolved.name == "XLight emission wheel"
+
+        settings = repo.get_confocal_settings()
+        assert settings.emission_filter_positions == 8
+        assert settings.illumination_iris_default == 80.0
+
+    def test_iris_seeding_uses_device_defaults(self, repo_with_profile, temp_dir):
+        """Editing an iris seeds confocal_hardware_settings from devices.xlight.config."""
+        (temp_dir / "machine_configs" / "machine_config.yaml").write_text(
+            """
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      illumination_iris_default: 80
+      emission_iris_default: 60
+"""
+        )
+
+        state = repo_with_profile.get_observation_state()
+        assert state.confocal_hardware_settings is None
+
+        assert repo_with_profile.update_channel_setting("IlluminationIris", 42.0) is True
+
+        seeded = repo_with_profile.get_observation_state().confocal_hardware_settings
+        assert seeded.illumination_iris == 42.0
+        # The untouched iris keeps the device default, not a hard-coded 100.
+        assert seeded.emission_iris == 60.0
 
     def test_get_all_filter_wheels_empty(self, temp_dir):
         """Test aggregating filter wheels when none exist."""
@@ -945,15 +1067,18 @@ filter_wheels:
         machine_configs = temp_dir / "machine_configs"
         machine_configs.mkdir()
 
-        (machine_configs / "confocal_config.yaml").write_text(
+        (machine_configs / "machine_config.yaml").write_text(
             """
-version: 1
-filter_wheels:
-  - name: "Confocal Emission"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      emission_filter_wheel:
+        name: "Confocal Emission"
+        positions:
+          1: "Empty"
 """
         )
 
@@ -1185,15 +1310,18 @@ filter_wheels:
         machine_configs = temp_dir / "machine_configs"
         machine_configs.mkdir()
 
-        (machine_configs / "confocal_config.yaml").write_text(
+        (machine_configs / "machine_config.yaml").write_text(
             """
-version: 1
-filter_wheels:
-  - name: "Confocal Emission"
-    id: 1
-    type: emission
-    positions:
-      1: "Empty"
+version: 3.0
+devices:
+  xlight:
+    driver: xlight
+    enabled: true
+    config:
+      emission_filter_wheel:
+        name: "Confocal Emission"
+        positions:
+          1: "Empty"
 """
         )
 
@@ -1276,31 +1404,24 @@ class TestUpdateChannelSettingV3:
 
     def test_exposure_update(self, repo_v3):
         """ExposureTime updates general config camera_settings."""
-        result = repo_v3.update_channel_setting("488nm", "ExposureTime", 99.0)
+        result = repo_v3.update_channel_setting("ExposureTime", 99.0)
         assert result is True
         gen = repo_v3.get_general_config()
         assert gen.camera_settings.exposure_time_ms == 99.0
 
     def test_gain_update(self, repo_v3):
         """AnalogGain updates general config camera_settings."""
-        result = repo_v3.update_channel_setting("488nm", "AnalogGain", 8.0)
+        result = repo_v3.update_channel_setting("AnalogGain", 8.0)
         assert result is True
         gen = repo_v3.get_general_config()
         assert gen.camera_settings.gain_mode == 8.0
-
-    def test_illumination_intensity_updates_general(self, repo_v3):
-        """IlluminationIntensity updates general config illuminator_states."""
-        result = repo_v3.update_channel_setting("488nm", "IlluminationIntensity", 55.0)
-        assert result is True
-        gen = repo_v3.get_general_config()
-        assert gen.illuminator_states[0].intensity == 55.0
 
     def test_iris_creates_confocal_hardware_settings(self, repo_v3):
         """IlluminationIris creates confocal_hardware_settings when None."""
         gen = repo_v3.get_general_config()
         assert gen.confocal_hardware_settings is None
 
-        result = repo_v3.update_channel_setting("488nm", "IlluminationIris", 42.0)
+        result = repo_v3.update_channel_setting("IlluminationIris", 42.0)
         assert result is True
 
         gen = repo_v3.get_general_config()

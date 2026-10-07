@@ -468,7 +468,8 @@ def _save_unified_multipoint_acquisition_yaml(
             f.write(
                 f"# Unified multipoint acquisition record (schema_version=2, experiment_id={params.experiment_ID}).\n"
                 f"# Layout, instrument manifest, and observation_states_used (selected presets only).\n"
-                f"# Per-frame wall-clock acquisition times: <timepoint>/frame_acquisition_times.csv (UTC + unix).\n\n"
+                f"# Per-frame wall-clock acquisition times (UTC + unix): acquisition_times.csv for\n"
+                f"# OME_TIFF/ZARR_V3, <timepoint>/frame_acquisition_times.csv for the per-frame TIFF modes.\n\n"
             )
             yaml.dump(unified, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     except (OSError, yaml.YAMLError) as exc:
@@ -2227,10 +2228,19 @@ class MultiPointController:
         if self.skip_saving:
             self._log.error("Online postprocessing is enabled but 'skip saving' is set — nothing would be written.")
             return False
-        allowed = (control._def.FileSavingOption.ZARR_V3, control._def.FileSavingOption.INDIVIDUAL_IMAGES)
+        # MULTI_PAGE_TIFF is the only mode left out: its shared-append writer
+        # cannot take a second writer process. The other three each give the
+        # derived outputs a file/tree of their own (ZARR_V3: a derived plate;
+        # OME_TIFF: a keyed per-region file; INDIVIDUAL_IMAGES: loose TIFFs in
+        # the timepoint folder).
+        allowed = (
+            control._def.FileSavingOption.ZARR_V3,
+            control._def.FileSavingOption.OME_TIFF,
+            control._def.FileSavingOption.INDIVIDUAL_IMAGES,
+        )
         if self.file_saving_option not in allowed:
             self._log.error(
-                "Online postprocessing supports only ZARR_V3 and INDIVIDUAL_IMAGES saving (current: %s).",
+                "Online postprocessing supports only ZARR_V3, OME_TIFF and INDIVIDUAL_IMAGES saving (current: %s).",
                 getattr(self.file_saving_option, "name", self.file_saving_option),
             )
             return False

@@ -87,13 +87,6 @@ def apply_machine_config(mc: MachineConfig) -> None:
     control._def.ENABLE_SPINNING_DISK_CONFOCAL = xlight_enabled or dragonfly_enabled
     control._def.USE_DRAGONFLY = dragonfly_enabled
 
-    if xlight_enabled:
-        control._def.XLIGHT_SERIAL_NUMBER = _dev_connection("xlight", "serial_number", "")
-        xlight_cfg = mc.get_device("xlight").config if mc.get_device("xlight") else {}
-        control._def.XLIGHT_SLEEP_TIME_FOR_WHEEL = xlight_cfg.get(
-            "sleep_time_for_wheel", 0.25
-        )
-
     if dragonfly_enabled:
         control._def.DRAGONFLY_SERIAL_NUMBER = _dev_connection(
             "dragonfly", "serial_number", ""

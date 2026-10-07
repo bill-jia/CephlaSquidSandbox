@@ -212,6 +212,13 @@ class QtMultiPointController(MultiPointController, QObject):
     )  # fov_paths, channels, num_z, fov_labels, height, width
     ndviewer_notify_zarr_frame = Signal(int, int, int, str, int)  # t, fov_idx, z, channel, region_idx
     ndviewer_end_zarr_acquisition = Signal()
+    # NDViewer push-based API signals (OME-TIFF mode). One multi-series file per
+    # region, so a flat FOV is addressed by (region file, series index).
+    ndviewer_start_ome_tiff_acquisition = Signal(
+        list, list, list, int, int, list, int, int
+    )  # fov_files, fov_series, channels, num_z, num_t, fov_labels, height, width
+    ndviewer_notify_ome_tiff_frame = Signal(int, int, int, str)  # t, fov_idx, z, channel
+    ndviewer_end_ome_tiff_acquisition = Signal()
     # Fires at the start of each timepoint so napari views can flush per-timepoint caches.
     signal_new_time_point = Signal(int)  # time_point index
     # Internal plumbing: per-frame hot path is hit from the acquisition worker thread
@@ -251,7 +258,7 @@ class QtMultiPointController(MultiPointController, QObject):
                 signal_plate_view_update=self._signal_plate_view_update_fn,
                 signal_slack_timepoint_notification=self._signal_slack_timepoint_notification_fn,
                 signal_slack_acquisition_finished=self._signal_slack_acquisition_finished_fn,
-                signal_zarr_frame_written=self._signal_zarr_frame_written_fn,
+                signal_frame_written=self._signal_frame_written_fn,
                 signal_new_time_point=self._signal_new_time_point_fn,
                 signal_data_writing_complete=self._signal_data_writing_complete_fn,
             ),
@@ -337,15 +344,31 @@ class QtMultiPointController(MultiPointController, QObject):
             self.ndviewer_start_zarr_acquisition.emit(
                 fov_paths, channels, num_z, self._ndviewer_fov_labels, height, width
             )
+        elif parameters.file_saving_option == control._def.FileSavingOption.OME_TIFF:
+            # One multi-series file per region; a flat FOV is (region file, series).
+            self._ndviewer_mode = NDViewerMode.OME_TIFF
+            fov_files, fov_series = self._build_ome_tiff_fov_sources(parameters)
+            self.ndviewer_start_ome_tiff_acquisition.emit(
+                fov_files,
+                fov_series,
+                channels,
+                num_z,
+                int(parameters.Nt),
+                self._ndviewer_fov_labels,
+                height,
+                width,
+            )
         else:
             self._ndviewer_mode = NDViewerMode.TIFF
             self.ndviewer_start_acquisition.emit(channels, num_z, height, width, self._ndviewer_fov_labels)
 
     def _signal_acquisition_finished_fn(self):
-        # End zarr acquisition if active (before general acquisition_finished)
+        # End the push-mode acquisition if active (before general acquisition_finished)
         if self._ndviewer_mode == NDViewerMode.ZARR_5D:
             self.ndviewer_end_zarr_acquisition.emit()
             self._ndviewer_region_index_map = {}
+        elif self._ndviewer_mode == NDViewerMode.OME_TIFF:
+            self.ndviewer_end_ome_tiff_acquisition.emit()
         self._ndviewer_mode = NDViewerMode.INACTIVE
 
         # If live preview was suppressed during any part of the run, replay the
@@ -391,8 +414,9 @@ class QtMultiPointController(MultiPointController, QObject):
         if region_offset is None:
             return
         flat_fov_idx = region_offset + info.fov
-        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
-            # Zarr path notifies via signal_zarr_frame_written on subprocess completion.
+        if self._ndviewer_mode != NDViewerMode.TIFF:
+            # Only the per-frame-file modes have a path to register. ZARR_V3 and
+            # OME_TIFF write out of process and notify via signal_frame_written.
             return
         filepath = control.utils_acquisition.get_image_filepath(
             info.save_directory, info.file_id, info.observation_state.name, frame.frame.dtype
@@ -435,12 +459,10 @@ class QtMultiPointController(MultiPointController, QObject):
             return
         flat_fov_idx = region_offset + info.fov
 
-        if self._ndviewer_mode == NDViewerMode.ZARR_5D:
-            # Zarr mode: notification happens via signal_zarr_frame_written callback
-            # when the subprocess completes writing, not here (too early).
-            pass
-        else:
-            # TIFF mode: register with filepath (synchronous write, notification is correct here)
+        if self._ndviewer_mode == NDViewerMode.TIFF:
+            # One file per frame, written synchronously: registering its path here
+            # is correct. Every other mode writes in the JobRunner subprocess and
+            # notifies via signal_frame_written once the plane is on disk.
             filepath = control.utils_acquisition.get_image_filepath(
                 info.save_directory, info.file_id, info.observation_state.name, frame.frame.dtype
             )
@@ -487,12 +509,14 @@ class QtMultiPointController(MultiPointController, QObject):
     def _signal_new_time_point_fn(self, time_point: int):
         self.signal_new_time_point.emit(time_point)
 
-    def _signal_zarr_frame_written_fn(
+    def _signal_frame_written_fn(
         self, fov: int, time_point: int, z_index: int, channel_name: str, region_idx: int
     ):
-        """Called when subprocess completes writing a zarr frame.
+        """Called when the save subprocess reports a frame is on disk.
 
         This is the correct time to notify the viewer - after data is on disk.
+        Shared by every saving mode that writes out of process (ZARR_V3,
+        OME_TIFF); the mode decides which push API the notification goes to.
 
         Args:
             fov: Local FOV index within the region (not flat/global index)
@@ -501,17 +525,51 @@ class QtMultiPointController(MultiPointController, QObject):
             channel_name: Channel name string
             region_idx: Index of the region in scan order
         """
+        if self._ndviewer_mode not in (NDViewerMode.ZARR_5D, NDViewerMode.OME_TIFF):
+            return
+        # Compute flat FOV index from local FOV + region offset.
+        if region_idx < len(self._ndviewer_region_idx_offset):
+            flat_fov = self._ndviewer_region_idx_offset[region_idx] + fov
+        else:
+            flat_fov = fov
         if self._ndviewer_mode == NDViewerMode.ZARR_5D:
-            # 5D per-FOV: compute flat FOV index from local FOV + region offset.
-            if region_idx < len(self._ndviewer_region_idx_offset):
-                flat_fov = self._ndviewer_region_idx_offset[region_idx] + fov
-            else:
-                flat_fov = fov
             self.ndviewer_notify_zarr_frame.emit(time_point, flat_fov, z_index, channel_name, 0)
+        else:
+            self.ndviewer_notify_ome_tiff_frame.emit(time_point, flat_fov, z_index, channel_name)
 
     # -------------------------------------------------------------------------
-    # Helper methods for Zarr FOV path building
+    # Helper methods for FOV source building
     # -------------------------------------------------------------------------
+
+    def _build_ome_tiff_fov_sources(
+        self, parameters: AcquisitionParameters
+    ) -> Tuple[List[str], List[int]]:
+        """Per flat FOV, the region OME-TIFF it lands in and its series index.
+
+        OME_TIFF writes one multi-series file per region — series *i* is FOV *i*
+        of that region — so the viewer needs (file, series) rather than a path
+        per FOV. Paths come from ``utils_ome_tiff_writer.ome_region_file_path``,
+        the same helper the writer's ``ome_output_path`` is built on, so the two
+        cannot drift.
+
+        A ragged cycle run adds ``__{array_key}`` files next to the dense one;
+        those are discovered by the viewer at read time (the array keys are not
+        known here), and the dense path is what is announced up front.
+        """
+        from control.core.utils_ome_tiff_writer import ome_region_file_path
+
+        experiment_path = os.path.join(parameters.base_path, parameters.experiment_ID)
+        scan_info = parameters.scan_position_information
+        coords = scan_info.scan_region_fov_coords_mm
+
+        fov_files: List[str] = []
+        fov_series: List[int] = []
+        for region_name in scan_info.scan_region_names:
+            region_path = ome_region_file_path(experiment_path, region_name)
+            for fov in range(len(coords.get(region_name, []))):
+                fov_files.append(region_path)
+                fov_series.append(fov)
+        return fov_files, fov_series
 
     def _build_zarr_fov_paths(self, parameters: AcquisitionParameters) -> List[str]:
         """Build the per-FOV OME-NGFF zarr group paths for display.

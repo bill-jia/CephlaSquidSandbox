@@ -89,8 +89,8 @@ Postprocessed events are excluded from the dense/ragged decision and the raw
 
 | Layout | ZARR_V3 | OME-TIFF | INDIVIDUAL_IMAGES |
 |---|---|---|---|
-| **Dense** | one multichannel plate; frames fold into `T` (`T = Nt × frames/state`) | one `TZCYX` stack, `T` expanded | per-frame files |
-| **Ragged** | one **single-channel plate per (state, z-mode)**, each with its own `T` | one stack per state | per-frame files |
+| **Dense** | one multichannel plate; frames fold into `T` (`T = Nt × frames/state`) | one `{region}.ome.tiff`; per-FOV series of `TZCYX`, `T` expanded | per-frame files |
+| **Ragged** | one **single-channel plate per (state, z-mode)**, each with its own `T` | one `{region}__{state}.ome.tiff` per state | per-frame files |
 
 The ragged zarr store name depends on the xy layout — HCS puts each namespace at
 plate level, flexible regions insert an extra directory:

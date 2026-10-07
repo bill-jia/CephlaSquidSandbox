@@ -47,6 +47,9 @@ from control._def import *
 # Module-level logger for top-level functions
 _log = squid.logging.get_logger("microcontroller")
 
+# PJRC's USB vendor id, shared by every Teensy board.
+TEENSY_USB_VID = 0x16C0
+
 # Mapping of command type bytes to human-readable names for logging
 _CMD_NAMES = {
     CMD_SET.MOVE_X: "MOVE_X",
@@ -487,12 +490,17 @@ class MicrocontrollerSerial(AbstractCephlaMicroSerial):
         super().__init__()
         self._port = port
         self._baudrate = baudrate
+        # Bound before opening: a failed open must not turn __del__ into a
+        # second, misleading AttributeError traceback that hides the real one.
+        self._serial = None
         self._serial = serial.Serial(port, baudrate)
 
     def __del__(self):
         self.close()
 
     def close(self) -> None:
+        if getattr(self, "_serial", None) is None:
+            return None
         return self._serial.close()
 
     def reset_input_buffer(self) -> bool:
@@ -589,28 +597,34 @@ def get_microcontroller_serial_device(
     else:
         _log.info(f"Getting serial device for microcontroller {version=}")
         if version == "Arduino Due":
-            controller_ports = [
-                p.device for p in serial.tools.list_ports.comports() if "Arduino Due" == p.description
-            ]  # autodetect - based on Deepak's code
+            candidates = [p for p in serial.tools.list_ports.comports() if "Arduino Due" == p.description]
+        elif sn is not None:
+            candidates = [p for p in serial.tools.list_ports.comports() if sn == p.serial_number]
         else:
-            if sn is not None:
-                controller_ports = [p.device for p in serial.tools.list_ports.comports() if sn == p.serial_number]
+            if sys.platform == "win32":
+                # Windows labels every USB CDC device "Microsoft", so laser
+                # engines and other serial peripherals match this too.
+                candidates = [p for p in serial.tools.list_ports.comports() if p.manufacturer == "Microsoft"]
             else:
-                if sys.platform == "win32":
-                    controller_ports = [
-                        p.device for p in serial.tools.list_ports.comports() if p.manufacturer == "Microsoft"
-                    ]
-                else:
-                    controller_ports = [
-                        p.device for p in serial.tools.list_ports.comports() if p.manufacturer == "Teensyduino"
-                    ]
+                candidates = [p for p in serial.tools.list_ports.comports() if p.manufacturer == "Teensyduino"]
 
-        if not controller_ports:
+            # Narrow to the Teensy's own USB vendor id when that leaves anything,
+            # so a rig with other serial peripherals still resolves to one port.
+            by_vid = [p for p in candidates if p.vid == TEENSY_USB_VID]
+            if by_vid:
+                candidates = by_vid
+
+        if not candidates:
             raise IOError("no controller found for serial device")
-        if len(controller_ports) > 1:
-            _log.warning("multiple controller found - using the first")
+        if len(candidates) > 1:
+            found = ", ".join(f"{p.device} (SN={p.serial_number!r}, {p.description})" for p in candidates)
+            raise IOError(
+                f"Multiple microcontroller candidates found: {found}. Opening the wrong one would "
+                f"drive an unrelated device, so set devices.teensy.connection.serial_number in the "
+                f"machine config to name the right port."
+            )
 
-        return MicrocontrollerSerial(controller_ports[0], baudrate)
+        return MicrocontrollerSerial(candidates[0].device, baudrate)
 
 
 class Microcontroller:

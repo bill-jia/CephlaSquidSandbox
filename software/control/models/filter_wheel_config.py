@@ -23,7 +23,7 @@ class FilterWheelType(str, Enum):
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SHARED FILTER WHEEL VALIDATION HELPERS
-# Used by both FilterWheelRegistryConfig and ConfocalConfig
+# Used by FilterWheelRegistryConfig and by the confocal device's emission wheel
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -173,8 +173,8 @@ class FilterWheelRegistryConfig(BaseModel):
     Registry of available filter wheels (standalone, not part of confocal).
 
     This configuration defines standalone filter wheels in the system.
-    Filter wheels that are part of confocal hardware should be defined
-    in confocal_config.yaml instead.
+    A filter wheel built into a confocal unit is declared instead under that
+    device's ``config.emission_filter_wheel`` in machine_config.yaml.
 
     Location: machine_configs/filter_wheels.yaml
 

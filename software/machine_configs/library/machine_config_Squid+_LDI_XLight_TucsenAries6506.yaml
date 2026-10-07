@@ -27,6 +27,11 @@ devices:
 
   teensy:
     driver: teensy
+    connection:
+      # Legacy ini: controller_sn = "16821080".  Required on this rig: Windows
+      # labels every USB CDC device "Microsoft", so the LDI also matches the
+      # microcontroller port scan.
+      serial_number: "16821080"
     config:
       # Legacy ini: illumination_intensity_factor = 1.  Only affects DAC
       # ports, which nothing uses on this rig (lasers are serial-driven).
@@ -35,26 +40,40 @@ devices:
         refdiv: false
         channels: [false, false, false, false, false, false, false, true]
 
-  # No NI-DAQ on this rig.  Kept disabled so fast-acquisition / waveform
-  # features stay off and nothing tries to open Dev1.
   nidaq:
     driver: nidaq
-    enabled: false
+    enabled: true
     config:
       device_name: "Dev1"
+      sample_rate: 100000
+      samples_per_channel: 1000
+      ao_min_voltage: -10.0
+      ao_max_voltage: 10.0
+      ai_min_voltage: -10.0
+      ai_max_voltage: 10.0
+      ai_terminal_config: "RSE"
+      trigger_source: "SOFTWARE"
+      external_trigger_terminal: "/Dev1/PFI0"
+      trigger_edge: "RISING"
+      continuous: false
+      logic_family: "THREE_POINT_THREE_V"
 
   main_camera:
     driver: tucsen
     role: main
     io:
-      # Camera trigger from the Teensy (legacy Squid wiring).  Only used
-      # when the trigger mode is switched to Hardware -- see header note.
       trigger:
-        controller: teensy
+        controller: nidaq
         signal_type: digital
         direction: output
-        channel_id: "trigger:0"
-        display_name: "Main camera trigger (MCU)"
+        channel_id: "port0/line6"
+        display_name: "Main camera trigger"
+      frame_readout:
+        controller: nidaq
+        signal_type: digital
+        direction: input
+        channel_id: "port0/line7"
+        display_name: "Main camera frame readout"
     config:
       model: "ARIES-6506"
       pixel_size_um: 6.5
@@ -64,8 +83,6 @@ devices:
       crop: { width: 2400, height: 2400 }
       rotate_angle: 0
       flip: null
-      # Copied from the other Aries 6506 library configs; verify the
-      # stage/image orientation on this rig.
       reverse_x: true
       reverse_y: false
       temperature: 0
@@ -152,6 +169,27 @@ devices:
         display_name: "laser_af_gate_mcu"
     config:
       spot_detection_mode: dual_left
+      # Calibration sweep policy. The AF laser goes out and back through the
+      # objective, so the spot's lateral travel per um of defocus scales with
+      # magnification: distance_um is what works at reference_magnification and
+      # is rescaled by reference_magnification / current magnification, clamped
+      # at max_distance_um.  With distance_um 9.0 the sweep is 9 um at 20x,
+      # 18 um at 10x, 4.5 um at 40x, and 30 um (clamped) at 4x.
+      #
+      # 10x measured 0.55 px/um on 2026-09-17, so 18 um gives ~9.9 px against
+      # the 5.0 px floor.  A 6.0 base would leave 10x at ~6.6 px, which fits but
+      # with little headroom.  The sweep only affects the calibration
+      # measurement itself, not routine focusing, so a longer span buys a
+      # better-conditioned fit; set distance_um back to 6.0 to restore exactly
+      # the 20x sweep used before this was configurable.
+      calibration:
+        distance_um: 9.0
+        reference_magnification: 20
+        max_distance_um: 30.0
+        positions: 5
+        min_total_px: 5.0
+        min_r2: 0.90
+        simulation_px: 0.5
 
   piezo:
     driver: objective_piezo
@@ -193,12 +231,29 @@ devices:
       serial_number: "A9KI1SXRA"
     config:
       sleep_time_for_wheel: 0.25
-      # ---- Not yet read by control code (see docs/pending plan) ----
-      # Legacy ini keys carried over so nothing is lost:
-      validate_wheel_pos: false          # xlight_validate_wheel_pos
-      emission_filter_positions: 8       # XLIGHT_EMISSION_FILTER_POSITIONS (8 = V3, 5 = Cicero)
-      illumination_iris_default: 80      # XLIGHT_ILLUMINATION_IRIS_DEFAULT
-      emission_iris_default: 100         # XLIGHT_EMISSION_IRIS_DEFAULT
+      validate_wheel_pos: false          # read the wheel back after each move
+      # Seeds ObservationState.confocal_hardware_settings the first time an
+      # iris is edited in the GUI.
+      illumination_iris_default: 80
+      emission_iris_default: 100
+      # The unit's built-in emission wheel.  len(positions) is the slot count
+      # the driver accepts (8 = X-Light V3, 5 = Cicero), and these names fill
+      # the observation-state editor's filter-position picker.  The per-state
+      # "default" position is what ObservationStateController.apply_optical_path
+      # sends to xlight.set_emission_filter().  (The legacy ini's
+      # xlight_emission_filter_mapping was dead code -- positions came from
+      # per-channel filter_position in general.yaml, all = 1.)
+      emission_filter_wheel:
+        name: "XLight emission wheel"
+        positions:
+          1: "Quad"
+          2: "Position 2"
+          3: "Position 3"
+          4: "Position 4"
+          5: "Position 5"
+          6: "Position 6"
+          7: "Position 7"
+          8: "Position 8"
 
 illumination_channels_file: illumination_channel_config.yaml
 
@@ -254,41 +309,6 @@ illumination_devices:
       unified: true
       unified_channel_name: "LED matrix"
     channels: {}
-
-# ============================================================
-# FILTER WHEELS
-# The X-Light's built-in 8-position emission wheel.  Declared in the
-# standalone registry because the observation-state editor's
-# filter-position picker only reads this registry; the per-state
-# "default" position is what ObservationStateController.apply_optical_path
-# sends to xlight.set_emission_filter().  (The legacy ini's
-# xlight_emission_filter_mapping was dead code -- positions came from
-# per-channel filter_position in general.yaml, all = 1.)
-# ============================================================
-
-filter_wheel_registry:
-  version: 1.0
-  filter_wheels:
-    - name: "XLight emission wheel"
-      id: 1
-      type: emission
-      positions:
-        1: "Position 1"
-        2: "Position 2"
-        3: "Position 3"
-        4: "Position 4"
-        5: "Position 5"
-        6: "Position 6"
-        7: "Position 7"
-        8: "Position 8"
-
-# Confocal model.  NOT read from here yet: ConfigRepository only loads
-# machine_configs/confocal_config.yaml (a global file shared by every
-# library config).  Until the embedded form is supported (see plan), copy
-# this block to machine_configs/confocal_config.yaml on the X-Light rig.
-confocal:
-  version: 1
-  model: xlight_v3
 
 software:
   is_hcs: true

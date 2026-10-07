@@ -53,7 +53,10 @@ See [Downsampled Plate View](downsampled-plate-view.md) for more information abo
 
 ### Push-Based API (TIFF Mode)
 
-For TIFF/OME-TIFF formats, the NDViewer uses a push-based API for live acquisition viewing, eliminating filesystem polling:
+For the per-frame-file formats (`INDIVIDUAL_IMAGES`, and `MULTI_PAGE_TIFF` — see the caveat in
+[Multipoint Data Saving](multipoint-data-saving.md#live-viewing-ndviewer-per-saving-mode)), the
+NDViewer uses a push-based API for live acquisition viewing, eliminating filesystem polling.
+`OME_TIFF` has its own API (below) because it writes no per-frame file:
 
 ```
 Acquisition Start
@@ -112,7 +115,28 @@ end_zarr_acquisition()
      └── Zarr stores remain open for browsing
 ```
 
-The API automatically selects TIFF or Zarr mode based on the `FILE_SAVING_OPTION` setting.
+### Push-Based API (OME-TIFF Mode)
+
+`OME_TIFF` writes one multi-series file per region (series *i* = FOV *i*), so a flat FOV is
+addressed by (region file, series index) and there is no per-frame path to register:
+
+```
+start_ome_tiff_acquisition(fov_files, fov_series, channels, num_z, num_t, fov_labels, height, width)
+     │
+     ├── fov_files:  region OME-TIFF per flat FOV (repeats within a region)
+     ├── fov_series: series index inside that file
+     └── nothing is opened yet — the file appears with the region's first frame
+
+notify_ome_tiff_frame(t, fov_idx, z, channel)
+     │
+     ├── emitted only after SaveOMETiffJob reports the plane written
+     └── viewer maps the channel to its file/series and reads it via a memmap
+
+end_ome_tiff_acquisition()
+```
+
+The API automatically selects TIFF, OME-TIFF or Zarr mode based on the `FILE_SAVING_OPTION`
+setting (tracked as `NDViewerMode` in `qt_controllers.py`).
 
 **Zarr Acquisition Modes:**
 
@@ -201,6 +225,11 @@ multipointController.acquisition_finished.connect(ndviewerTab.end_acquisition)
 multipointController.ndviewer_start_zarr_acquisition.connect(ndviewerTab.start_zarr_acquisition)
 multipointController.ndviewer_notify_zarr_frame.connect(ndviewerTab.notify_zarr_frame)
 multipointController.ndviewer_end_zarr_acquisition.connect(ndviewerTab.end_zarr_acquisition)
+
+# OME-TIFF mode signals
+multipointController.ndviewer_start_ome_tiff_acquisition.connect(ndviewerTab.start_ome_tiff_acquisition)
+multipointController.ndviewer_notify_ome_tiff_frame.connect(ndviewerTab.notify_ome_tiff_frame)
+multipointController.ndviewer_end_ome_tiff_acquisition.connect(ndviewerTab.end_ome_tiff_acquisition)
 ```
 
 ### Key Classes

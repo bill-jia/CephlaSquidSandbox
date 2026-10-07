@@ -47,7 +47,7 @@ from squid.abc import AbstractCamera, CameraFrame, CameraFrameFormat
 from control._sdk_watchdog import CameraTimeoutError
 import squid.logging
 import control.core.job_processing
-from control.core.job_processing import ZarrWriteResult
+from control.core.job_processing import FrameWriteResult
 from control.core.job_processing import (
     CaptureInfo,
     SaveImageJob,
@@ -118,6 +118,20 @@ JOB_RUNNER_FINALIZE_TIMEOUT_S = 600
 # result-only window because the heartbeat tells a slow large file apart from a
 # stuck one; a wedged worker is force-terminated instead of waited out.
 UPLOAD_DRAINER_STALL_WINDOW_S = 120
+
+# The saving modes whose image files land in ``{exp}/{timepoint}/``. Everything
+# else (OME_TIFF, ZARR_V3) writes to its own root-level tree and keeps its
+# sidecars at the experiment root, so no per-timepoint folder is created.
+_PER_TIMEPOINT_FOLDER_SAVING_OPTIONS = (
+    FileSavingOption.INDIVIDUAL_IMAGES,
+    FileSavingOption.MULTI_PAGE_TIFF,
+)
+
+# Root-level CSV of MEASURED stage positions (one row per FOV *and* z level,
+# with a timestamp), accumulated across timepoints for the modes that have no
+# per-timepoint folder. Distinct from the controller's ``coordinates.csv``,
+# which records the PLANNED grid before the run starts.
+ACQUIRED_POSITIONS_FILENAME = "acquired_positions.csv"
 
 
 class SummarizeResult(NamedTuple):
@@ -1169,6 +1183,10 @@ class MultiPointWorker:
         self.callbacks: MultiPointControllerFunctions = callbacks
         self.abort_requested_fn: Callable[[], bool] = abort_requested_fn
         self.request_abort_fn: Callable[[], None] = request_abort_fn
+        # Set when an abort is requested because a triggered frame never arrived.
+        # The teardown path then knows the outstanding frame is never coming and
+        # must not burn another _frame_wait_timeout_s() waiting for it.
+        self._aborted_on_frame_timeout = False
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
 
@@ -1247,6 +1265,14 @@ class MultiPointWorker:
             physical_size_z_um=self._physical_size_z_um,
             physical_size_x_um=self._pixel_size_um,
             physical_size_y_um=self._pixel_size_um,
+            # One OME-TIFF per region holds one series per FOV, all pre-allocated
+            # on the region's first frame, so the save layer needs the counts.
+            fovs_per_region={
+                str(region_id): len(coords)
+                for region_id, coords in (
+                    acquisition_parameters.scan_position_information.scan_region_fov_coords_mm or {}
+                ).items()
+            },
         )
 
         self.time_point = 0
@@ -1374,6 +1400,8 @@ class MultiPointWorker:
         # Tracks whether the most recent run_single_time_point created a per-timepoint
         # folder (so we know whether to drop a per-timepoint .done marker into it).
         self._wrote_per_timepoint_folder = False
+        # Guards the once-per-timepoint append to the root acquired_positions.csv.
+        self._acquired_positions_appended = False
         job_classes = []
         use_ome_tiff = self.file_saving_option == FileSavingOption.OME_TIFF
         use_zarr_v3 = self.file_saving_option == FileSavingOption.ZARR_V3
@@ -1682,7 +1710,6 @@ class MultiPointWorker:
                     )
                     job_runner = control.core.job_processing.JobRunner(
                         self.acquisition_info,
-                        cleanup_stale_ome_files=use_ome_tiff,
                         log_file_path=log_file_path,
                         # Pass backpressure shared values for cross-process tracking
                         bp_pending_jobs=self._backpressure.pending_jobs_value,
@@ -2279,11 +2306,23 @@ class MultiPointWorker:
             self.callbacks.signal_acquisition_finished()
 
     def _wait_for_outstanding_callback_images(self):
-        # If there are outstanding frames, wait for them to come in.
-        self._log.info("Waiting for any outstanding frames.")
-        if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-            self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
+        # If there are outstanding frames, wait for them to come in.  Except when the
+        # abort was itself caused by a frame that never arrived: that frame is not
+        # late, it does not exist, and blocking another _frame_wait_timeout_s() on it
+        # only delays teardown.  The normal-completion path is untouched — the flag is
+        # only ever set by a frame-timeout abort.
+        if self._aborted_on_frame_timeout:
+            self._log.info(
+                "Skipping the outstanding-frame wait: the acquisition was aborted by a frame "
+                "timeout, so the triggered frame is never going to arrive."
+            )
+        else:
+            self._log.info("Waiting for any outstanding frames.")
+            if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
+                self._log.warning("Timed out waiting for the last outstanding frames at end of acquisition!")
 
+        # In-flight image callbacks are real work on frames that DID arrive, so this
+        # wait stands either way.
         if not self._image_callback_idle.wait(self._frame_wait_timeout_s()):
             self._log.warning("Timed out waiting for the last image to process!")
 
@@ -2539,10 +2578,12 @@ class MultiPointWorker:
             self.callbacks.signal_new_time_point(self.time_point)
 
             # For each time point, create a per-timepoint folder *only if* something
-            # actually lands in it. ZARR_V3 streams images to its own per-FOV trees and
-            # consolidates the per-frame timing CSV at the experiment root, so the
-            # timepoint folder is otherwise empty in the common case. We still create
-            # it when downsampled views or laser-AF characterization debug images need it.
+            # actually lands in it. OME_TIFF writes one multi-series file per region
+            # under ome_tiff/ and ZARR_V3 streams images to its own per-FOV trees; both
+            # consolidate their per-frame timing CSV and their measured positions at the
+            # experiment root, so the timepoint folder is otherwise empty. We still
+            # create it when downsampled views or laser-AF characterization debug images
+            # need it.
             with self._timing.get_timer("create_new_timepoint"):
                 if self.experiment_path:
                     utils.ensure_directory_exists(str(self.experiment_path))
@@ -2556,10 +2597,7 @@ class MultiPointWorker:
 
                 # Write acquisition metadata sidecar for individual TIFF saving modes.
                 # This makes per-timepoint folders self-describing without parsing filenames.
-                if (
-                    not self.skip_saving
-                    and self.file_saving_option in (FileSavingOption.INDIVIDUAL_IMAGES, FileSavingOption.MULTI_PAGE_TIFF)
-                ):
+                if not self.skip_saving and self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
                     metadata_path = os.path.join(current_path, "metadata.json")
                     if not os.path.exists(metadata_path):
                         sidecar = {
@@ -2602,13 +2640,10 @@ class MultiPointWorker:
                     # Clear plate view for next timepoint
                     self._downsampled_view_manager.clear()
 
-            # finished region scan. Skip the per-timepoint coordinates.csv for ZARR_V3,
-            # since the controller already wrote {exp}/coordinates.csv with the same data.
-            if self.file_saving_option != FileSavingOption.ZARR_V3:
-                with self._timing.get_timer("save_coordinates_csv"):
-                    self.coordinates_pd.to_csv(
-                        os.path.join(current_path, "coordinates.csv"), index=False, header=True
-                    )
+            # finished region scan - persist the positions we actually visited.
+            with self._timing.get_timer("save_coordinates_csv"):
+                self._write_timepoint_coordinates_csv(current_path)
+                self._append_acquired_positions_csv()
 
             # Send Slack timepoint notification via callback (allows main thread to capture screenshot)
             if self._slack_notifier is not None:
@@ -2657,19 +2692,17 @@ class MultiPointWorker:
     def _needs_per_timepoint_folder(self) -> bool:
         """True when something will write into ``{exp}/{timepoint}/``.
 
-        ZARR_V3 alone does not — its image data lives under ``plate.ome.zarr``
-        / ``zarr/`` and the per-frame CSV is consolidated at the experiment root.
-        We keep the folder when:
+        Only the per-frame TIFF modes put images there. OME_TIFF's image data
+        lives in ``ome_tiff/{region}.ome.tiff`` and ZARR_V3's under
+        ``plate.ome.zarr`` / ``zarr/``; both consolidate their per-frame timing
+        CSV and their measured positions at the experiment root. We keep the
+        folder when:
 
-        * skip_saving is off and we're using a TIFF mode (images land here)
+        * skip_saving is off and images land here (INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF)
         * downsampled views are enabled (``plate_<r>um.tiff`` lands here per timepoint)
         * laser-AF characterization mode is on (debug bmps land here)
         """
-        if self.skip_saving:
-            tiff_mode_writes = False
-        else:
-            tiff_mode_writes = self.file_saving_option != FileSavingOption.ZARR_V3
-        if tiff_mode_writes:
+        if not self.skip_saving and self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
             return True
         if self._generate_downsampled_views:
             return True
@@ -2692,6 +2725,7 @@ class MultiPointWorker:
 
     def initialize_coordinates_dataframe(self):
         self._coordinate_rows: list[dict] = []
+        self._acquired_positions_appended = False
 
     def update_coordinates_dataframe(self, region_id, z_level, pos: squid.abc.Pos, fov=None):
         row = {
@@ -2710,6 +2744,47 @@ class MultiPointWorker:
     @property
     def coordinates_pd(self) -> pd.DataFrame:
         return pd.DataFrame(self._coordinate_rows)
+
+    def _write_timepoint_coordinates_csv(self, current_path):
+        """Write ``{exp}/{timepoint}/coordinates.csv`` for the per-frame TIFF modes.
+
+        Only INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF have a per-timepoint folder to
+        put it in; the other modes accumulate the same measurements in the root
+        ``acquired_positions.csv`` instead.
+        """
+        if self.file_saving_option not in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
+            return
+        self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+
+    def _append_acquired_positions_csv(self):
+        """Append this timepoint's MEASURED positions to ``{exp}/acquired_positions.csv``.
+
+        For OME_TIFF / ZARR_V3 only — the modes without a per-timepoint folder.
+        One file for the whole run, header written once, with a leading
+        ``time_point`` column in front of the per-z measurement columns. This is
+        not a copy of the root ``coordinates.csv``: that one holds the PLANNED
+        region/x/y/z grid the controller writes before the run, this one holds
+        where the stage actually was, per z level, with a timestamp.
+        """
+        if self.file_saving_option in _PER_TIMEPOINT_FOLDER_SAVING_OPTIONS:
+            return
+        # An abort unwinds through here after the per-position writes have
+        # already run, so guard against appending the same rows twice.
+        if self._acquired_positions_appended:
+            return
+        df = self.coordinates_pd
+        if df.empty or not self.experiment_path:
+            return
+        df = df.copy()
+        df.insert(0, "time_point", self.time_point)
+        path = os.path.join(self.experiment_path, ACQUIRED_POSITIONS_FILENAME)
+        try:
+            write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+            df.to_csv(path, mode="a", index=False, header=write_header)
+        except OSError as e:
+            self._log.warning(f"Failed to append measured positions to {path}: {e}")
+        else:
+            self._acquired_positions_appended = True
 
     def move_to_coordinate(self, coordinate_mm, region_id, fov):
         curr_pos = self.stage.get_pos()
@@ -3026,10 +3101,10 @@ class MultiPointWorker:
             # Handle DownsampledViewResult - update plate view
             if isinstance(job_result.result, DownsampledViewResult) and job_result.result.well_images:
                 self._handle_downsampled_view_result(job_result.result)
-            # Handle ZarrWriteResult - notify viewer that frame is written
-            elif isinstance(job_result.result, ZarrWriteResult):
+            # Handle FrameWriteResult - notify viewer that frame is written
+            elif isinstance(job_result.result, FrameWriteResult):
                 r = job_result.result
-                self.callbacks.signal_zarr_frame_written(r.fov, r.time_point, r.z_index, r.channel_name, r.region_idx)
+                self.callbacks.signal_frame_written(r.fov, r.time_point, r.z_index, r.channel_name, r.region_idx)
             # Handle BarrierResult - the upload barrier has flushed this (t, fov)
             # and enqueued the upload task; track its task_id so we can match
             # the matching UploadResult later.
@@ -4241,9 +4316,14 @@ class MultiPointWorker:
                 and (self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0)
             ):
                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
-                config_AF = self.liveController.get_channel_by_name(
-                    self.objectiveStore.current_objective, configuration_name_AF
-                )
+                config_AF = self.liveController.get_observation_state_by_name(configuration_name_AF)
+                if config_AF is None:
+                    available = [s.name for s in self.liveController.get_observation_states()]
+                    raise RuntimeError(
+                        f"Contrast autofocus channel {configuration_name_AF!r} "
+                        f"(MULTIPOINT_AUTOFOCUS_CHANNEL) is not a defined Observation "
+                        f"State, so autofocus cannot be configured. Available: {available}"
+                    )
                 self._select_config(config_AF)
                 if (
                     self.af_fov_count % Acquisition.NUMBER_OF_FOVS_PER_AF == 0
@@ -4841,6 +4921,24 @@ class MultiPointWorker:
     def _frame_wait_timeout_s(self):
         return (self.camera.get_total_frame_time() / 1e3) + 10
 
+    def _describe_camera_trigger_routing(self) -> str:
+        """How software triggers reach the camera, for frame-timeout diagnostics.
+
+        Optional on the camera: not every driver in the tree implements it, and a
+        diagnostic string must never be the thing that raises.
+        """
+        describe = getattr(self.camera, "describe_trigger_routing", None)
+        if describe is None:
+            return "unknown"
+        try:
+            return describe()
+        except Exception:
+            return "unknown"
+
+    def _note_frame_timeout_abort(self) -> None:
+        """Record that the abort we are about to request is a never-arriving frame."""
+        self._aborted_on_frame_timeout = True
+
     def acquire_camera_image(
         self,
         config,
@@ -4897,7 +4995,11 @@ class MultiPointWorker:
         # This is some large timeout that we use just so as to not block forever
         with self._timing.get_timer("_ready_for_next_trigger.wait"):
             if not self._ready_for_next_trigger.wait(self._frame_wait_timeout_s()):
-                self._log.error("Frame callback never set _have_last_triggered_image callback! Aborting acquisition.")
+                self._log.error(
+                    "Frame callback never set _have_last_triggered_image callback! Aborting acquisition. "
+                    f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                )
+                self._note_frame_timeout_abort()
                 self.request_abort_fn()
                 return
 
@@ -5037,7 +5139,13 @@ class MultiPointWorker:
                     # wrong.
                     non_hw_frame_timeout = 5 * self.camera.get_total_frame_time() / 1e3 + 2
                     if not self._ready_for_next_trigger.wait(non_hw_frame_timeout):
-                        self._log.error(f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition.")
+                        # A frame that never arrives is almost always a trigger that never
+                        # arrived, so name the route it was supposed to take.
+                        self._log.error(
+                            f"Timed out waiting {non_hw_frame_timeout} [s] for a frame, aborting acquisition. "
+                            f"Camera trigger routing: {self._describe_camera_trigger_routing()}."
+                        )
+                        self._note_frame_timeout_abort()
                         self.request_abort_fn()
                         # Let this fall through so we still turn off illumination.  Let the caller actually break out
                         # of the acquisition.
@@ -5122,10 +5230,10 @@ class MultiPointWorker:
             time.sleep(min(slice_s, remaining))
 
     def handle_acquisition_abort(self, current_path):
-        # Save coordinates.csv (skip for ZARR_V3 — the controller's root copy is canonical
-        # and the per-timepoint folder may not exist).
-        if self.file_saving_option != FileSavingOption.ZARR_V3:
-            self.coordinates_pd.to_csv(os.path.join(current_path, "coordinates.csv"), index=False, header=True)
+        # Save what we measured so far. Only the per-timepoint copy: the aborted
+        # scan still unwinds through run_single_time_point, which appends the
+        # complete set of rows to the root acquired_positions.csv once.
+        self._write_timepoint_coordinates_csv(current_path)
         self.microcontroller.enable_joystick(True)
 
         self._wait_for_outstanding_callback_images()

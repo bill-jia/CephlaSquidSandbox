@@ -398,8 +398,19 @@ class AbstractNIDAQ(abc.ABC):
         """Stop constant live output. Override in hardware implementation."""
         pass
 
-    def send_edge_pulse(self, line: int, pulse_width_us: int = 1000) -> None:
-        """Fire a single digital pulse on a DO line. Override in hardware impl."""
+    def send_edge_pulse(
+        self,
+        line: int,
+        pulse_width_us: int = 1000,
+        readout_line: Optional[int] = None,
+        readout_window_ms: float = 200.0,
+    ) -> None:
+        """Fire a single digital pulse on a DO line. Override in hardware impl.
+
+        ``readout_line`` / ``readout_window_ms`` are the optional camera-readout
+        diagnostic (see :meth:`NIDAQ.send_edge_pulse`); every implementation must
+        accept them because ``NIDAQIOController.send_trigger`` always passes them.
+        """
         pass
 
     def release_tasks(self) -> None:
@@ -1553,8 +1564,10 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         
         self._lock = threading.Lock()
         self._completion_event = threading.Event()
-        self.configure(config)
-    
+        # NOTE: no configure() call here — AbstractNIDAQ.__init__ has already
+        # applied every key in ``config``, and configure() takes keyword
+        # arguments, so re-applying it raised TypeError on every construction.
+
     def configure(self, **config: Any) -> None:
         """Update the configuration."""
         with self._lock:
@@ -1666,11 +1679,24 @@ class SimulatedNIDAQ(AbstractNIDAQ):
         # but we keep the method for API symmetry.
         self._log.info("[SIM] stop_live_output called (no hardware tasks to stop)")
 
-    def send_edge_pulse(self, line: int, pulse_width_us: int = 1000) -> None:
-        """Log a simulated pulse — no hardware to toggle."""
+    def send_edge_pulse(
+        self,
+        line: int,
+        pulse_width_us: int = 1000,
+        readout_line: Optional[int] = None,
+        readout_window_ms: float = 200.0,
+    ) -> None:
+        """Log a simulated pulse — no hardware to toggle.
+
+        This sits on the per-frame trigger path (``main_camera.trigger`` ->
+        NIDAQIOController.send_trigger), so it must return immediately: no
+        pulse-width sleep, and no readout-diagnostic wait. There is no DI line
+        to sample in simulation, so the ``readout_*`` arguments are accepted and
+        ignored rather than reported as "camera did not respond".
+        """
         self._log.debug(
-            "[SIM] send_edge_pulse(line=%d, pulse_width_us=%d) — no hardware DO",
-            line, pulse_width_us,
+            "[SIM] send_edge_pulse(line=%d, pulse_width_us=%d, readout_line=%s) — no hardware DO",
+            line, pulse_width_us, readout_line,
         )
 
     def prepare_for_acquisition(self) -> None:

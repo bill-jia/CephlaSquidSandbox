@@ -89,21 +89,28 @@ def simulated_ome_tiff_write(
     image: np.ndarray,
     stack_key: str,
     shape: tuple,
+    n_series: int,
+    series_index: int,
     time_point: int,
     z_index: int,
     channel_index: int,
 ) -> int:
     """Simulate OME-TIFF write with init + plane write timing.
 
+    The real layout is one multi-series file per region (series i = FOV i), so
+    one simulated stack covers all ``n_series`` FOVs of the region.
+
     Tracks stack state to simulate:
-    - Initialization overhead on first plane
+    - Initialization overhead on the region's first plane (all series allocated)
     - Per-plane encoding
     - Finalization overhead when complete
 
     Args:
         image: Image array for this plane
-        stack_key: Unique identifier for this stack (e.g., output_path)
-        shape: Full 5D stack shape (T, Z, C, Y, X)
+        stack_key: Unique identifier for this region file (its output path)
+        shape: Per-series 5D shape (T, Z, C, Y, X)
+        n_series: Number of FOV series pre-allocated in the region file
+        series_index: FOV index (series) this plane belongs to
         time_point: Time point index
         z_index: Z slice index
         channel_index: Channel index
@@ -111,22 +118,26 @@ def simulated_ome_tiff_write(
     Returns:
         Bytes "written" for this operation
     """
-    # First plane for this stack - simulate initialization
+    # First plane for this region file - simulate initialization of every series
     is_first_plane = False
     with _simulated_ome_lock:
         if stack_key not in _simulated_ome_stacks:
-            expected_count = shape[0] * shape[1] * shape[2]  # T * Z * C
+            expected_count = max(1, int(n_series)) * shape[0] * shape[1] * shape[2]  # FOV * T * Z * C
             _simulated_ome_stacks[stack_key] = {
                 "shape": shape,
+                "n_series": int(n_series),
                 "written_planes": set(),
                 "expected_count": expected_count,
             }
             is_first_plane = True
-            log.debug(f"Initialized simulated OME stack: {stack_key}, expected planes: {expected_count}")
+            log.debug(
+                f"Initialized simulated OME region stack: {stack_key}, "
+                f"series={n_series}, expected planes: {expected_count}"
+            )
 
-    # Simulate metadata/header write overhead outside lock (~4KB for OME-XML header)
+    # Simulate metadata/header write overhead outside lock (~4KB of OME-XML header per series)
     if is_first_plane:
-        throttle_for_speed(4096, control._def.SIMULATED_DISK_IO_SPEED_MB_S)
+        throttle_for_speed(4096 * max(1, int(n_series)), control._def.SIMULATED_DISK_IO_SPEED_MB_S)
 
     # Simulate plane write with encoding
     buffer = BytesIO()
@@ -137,7 +148,7 @@ def simulated_ome_tiff_write(
     except Exception as e:
         log.error(
             f"Simulated OME-TIFF plane write failed: stack={stack_key}, "
-            f"plane=t{time_point}-z{z_index}-c{channel_index}, "
+            f"plane=fov{series_index}-t{time_point}-z{z_index}-c{channel_index}, "
             f"image shape={image.shape}, dtype={image.dtype}. Error: {e}"
         )
         raise
@@ -146,7 +157,7 @@ def simulated_ome_tiff_write(
     throttle_for_speed(bytes_written, control._def.SIMULATED_DISK_IO_SPEED_MB_S)
 
     # Track this plane and check completion (with lock for shared state access)
-    plane_key = f"{time_point}-{z_index}-{channel_index}"
+    plane_key = f"{series_index}-{time_point}-{z_index}-{channel_index}"
     is_complete = False
     with _simulated_ome_lock:
         stack_info = _simulated_ome_stacks[stack_key]

@@ -47,10 +47,13 @@ Lumencor SPECTRA, individual IO-routed lasers, LED matrices) under a single
 """
 
 import logging
+import math
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
+
+from control._def import SpotDetectionMode
 
 from control.models.io_endpoint_config import (
     IOControllerType,
@@ -59,7 +62,12 @@ from control.models.io_endpoint_config import (
     IOEndpointConfig,
     IOSignalType,
 )
-from control.models.filter_wheel_config import FilterWheelRegistryConfig
+from control.models.filter_wheel_config import (
+    FilterWheelDefinition,
+    FilterWheelRegistryConfig,
+    FilterWheelType,
+    apply_single_filter_wheel_defaults,
+)
 from control.models.hardware_bindings import HardwareBindingsConfig
 
 logger = logging.getLogger(__name__)
@@ -73,6 +81,71 @@ _DRIVER_TO_IO_CONTROLLER: Dict[str, IOControllerType] = {
 _SPECIAL_CONTROLLER_NAMES: Dict[str, IOControllerType] = {
     "serial": IOControllerType.SERIAL,
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Camera software-trigger routing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SoftwareTriggerRouting(str, Enum):
+    """How a SOFTWARE_TRIGGER request is actually delivered to a camera.
+
+    Declared per camera as ``devices.<camera>.config.software_trigger_routing``.
+
+    - ``hardware_line``: the camera is programmed for hardware (Standard) trigger
+      and every "software" trigger is a pulse on the camera's ``io.trigger``
+      endpoint.  Required on sensors whose native software-trigger command is
+      unreliable (Tucsen Aries), and the reason the trigger line must actually
+      reach the camera: if it is wired to a controller/channel that goes nowhere,
+      no exposure ever starts.
+    - ``native``: the camera's own SDK software-trigger command
+      (GenICam ``TriggerSoftwarePulse`` / ``TUCCM_TRIGGER_SOFTWARE``).  No IO
+      endpoint is involved.
+    """
+
+    HARDWARE_LINE = "hardware_line"
+    NATIVE = "native"
+
+
+def resolve_software_trigger_routing(
+    configured: Optional[Any], declares_trigger_endpoint: bool
+) -> SoftwareTriggerRouting:
+    """Resolve the effective software-trigger routing for one camera.
+
+    This is the single place the default is decided.  ``configured`` is the raw
+    ``config.software_trigger_routing`` value (``None`` when unset), and
+    ``declares_trigger_endpoint`` says whether the camera declares an
+    ``io.trigger`` line.
+
+    Default: ``hardware_line`` when a trigger endpoint is declared (the line
+    exists, so use it), otherwise ``native``.  An explicit value always wins,
+    but ``hardware_line`` without a trigger endpoint is a configuration error.
+    """
+    if configured is None:
+        return (
+            SoftwareTriggerRouting.HARDWARE_LINE
+            if declares_trigger_endpoint
+            else SoftwareTriggerRouting.NATIVE
+        )
+
+    if isinstance(configured, SoftwareTriggerRouting):
+        routing = configured
+    else:
+        try:
+            routing = SoftwareTriggerRouting(str(configured))
+        except ValueError:
+            raise ValueError(
+                f"Unknown software_trigger_routing {configured!r}; expected one of "
+                f"{[r.value for r in SoftwareTriggerRouting]}"
+            )
+
+    if routing is SoftwareTriggerRouting.HARDWARE_LINE and not declares_trigger_endpoint:
+        raise ValueError(
+            "software_trigger_routing: hardware_line requires the camera to declare "
+            "an io.trigger endpoint that physically reaches the camera"
+        )
+    return routing
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -196,6 +269,171 @@ class DeviceEntry(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Confocal unit settings (devices.xlight.config / devices.dragonfly.config)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Device names that carry a spinning-disk confocal unit, in lookup order.
+CONFOCAL_DEVICE_NAMES: Tuple[str, ...] = ("xlight", "dragonfly")
+
+# Slot count used when the confocal device declares no emission wheel
+# (8 = X-Light V3, 5 = Cicero).
+DEFAULT_EMISSION_FILTER_POSITIONS = 8
+
+
+class ConfocalEmissionWheel(BaseModel):
+    """The emission filter wheel built into a confocal unit.
+
+    Declared under ``devices.<confocal>.config.emission_filter_wheel``; the
+    number of slots the driver accepts is ``len(positions)``.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, description="User-friendly wheel name")
+    positions: Dict[int, str] = Field(default_factory=dict, description="Slot number -> filter name")
+
+    model_config = {"extra": "forbid"}
+
+
+class ConfocalDeviceSettings(BaseModel):
+    """Typed view of ``devices.xlight.config`` / ``devices.dragonfly.config``.
+
+    Everything the confocal unit needs lives on its own device entry: there is
+    no separate confocal config file.
+    """
+
+    sleep_time_for_wheel: float = Field(0.25, description="Seconds to wait after a wheel move")
+    validate_wheel_pos: bool = Field(False, description="Read back the wheel position after each move")
+    illumination_iris_default: float = Field(100.0, description="Default illumination iris (0-100)")
+    emission_iris_default: float = Field(100.0, description="Default emission iris (0-100)")
+    emission_filter_wheel: ConfocalEmissionWheel = Field(default_factory=ConfocalEmissionWheel)
+
+    model_config = {"extra": "forbid"}
+
+    @classmethod
+    def from_device_entry(cls, entry: Optional["DeviceEntry"]) -> "ConfocalDeviceSettings":
+        """Build settings from a confocal ``DeviceEntry`` (defaults when None)."""
+        if entry is None:
+            return cls()
+        return cls.model_validate(entry.config or {})
+
+    @property
+    def emission_filter_positions(self) -> int:
+        """Number of emission wheel slots the driver will accept."""
+        return len(self.emission_filter_wheel.positions) or DEFAULT_EMISSION_FILTER_POSITIONS
+
+    def build_emission_wheel_definition(self) -> Optional[FilterWheelDefinition]:
+        """Return the declared emission wheel as a ``FilterWheelDefinition``.
+
+        Returns None when the device declares no positions.
+        """
+        if not self.emission_filter_wheel.positions:
+            return None
+        raw = {
+            "name": self.emission_filter_wheel.name,
+            "id": 1,
+            "type": FilterWheelType.EMISSION.value,
+            "positions": dict(self.emission_filter_wheel.positions),
+        }
+        return FilterWheelDefinition.model_validate(apply_single_filter_wheel_defaults([raw])[0])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Laser autofocus settings (devices.laser_af.config)
+# ═════════════════════════════════════════════════════════════════════════════
+
+LASER_AF_DEVICE_NAME = "laser_af"
+
+
+class LaserAFCalibrationSettings(BaseModel):
+    """Policy for the pixel-to-um calibration sweep, from
+    ``devices.laser_af.config.calibration``.
+
+    The AF laser goes out through the objective, reflects off the sample
+    interface and comes back through it, so the spot's lateral travel per um of
+    defocus scales with the objective: halve the magnification and the spot
+    moves roughly half as far per um. A fixed sweep tuned at one objective is
+    therefore too short at a lower one — which is exactly how calibration failed
+    at 10x with a 6 um sweep tuned for 20x. ``effective_distance_um`` rescales
+    the sweep by ``reference_magnification / magnification`` so every objective
+    sees the same spot travel, and hence the same margin over ``min_total_px``.
+    """
+
+    distance_um: float = Field(
+        6.0,
+        gt=0,
+        description="Calibration sweep span (um) at reference_magnification; scaled for other objectives",
+    )
+    reference_magnification: float = Field(
+        20.0, gt=0, description="Objective magnification distance_um was tuned for"
+    )
+    max_distance_um: float = Field(
+        30.0,
+        gt=0,
+        description=(
+            "Upper clamp on the scaled sweep (um). Keeps a very low-magnification objective from "
+            "commanding an absurd z excursion that leaves the spot's linear region."
+        ),
+    )
+    positions: int = Field(5, ge=3, description="Number of z samples across the sweep")
+    min_total_px: float = Field(
+        5.0, gt=0, description="Minimum total spot travel (px) over the sweep for the fit to be accepted"
+    )
+    min_r2: float = Field(0.90, ge=0.0, le=1.0, description="Minimum R² of the linear x(z) fit")
+    simulation_px: float = Field(
+        0.5,
+        gt=0,
+        description=(
+            "Total spot travel (px) below which the image is assumed static (simulated camera); "
+            "the canned simulation scale is used instead of failing."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+    def effective_distance_um(self, magnification: Optional[float]) -> float:
+        """Sweep span to use for an objective of ``magnification``.
+
+        Falls back to the unscaled ``distance_um`` when the magnification is
+        unknown or not positive (no objective store, objective missing from
+        objectives.csv, malformed CSV row), and clamps the result to
+        ``max_distance_um``.
+        """
+        if magnification is None:
+            return self.distance_um
+        try:
+            magnification = float(magnification)
+        except (TypeError, ValueError):
+            return self.distance_um
+        if not math.isfinite(magnification) or magnification <= 0:
+            return self.distance_um
+        scaled = self.distance_um * self.reference_magnification / magnification
+        return min(scaled, self.max_distance_um)
+
+
+class LaserAFDeviceSettings(BaseModel):
+    """Typed view of ``devices.laser_af.config``.
+
+    Machine-level laser AF policy. Per-objective measurements (pixel_to_um, the
+    reference spot, the ROI) stay in the per-objective ``LaserAFConfig`` files;
+    everything here is a property of the instrument, not of one calibration.
+    """
+
+    spot_detection_mode: SpotDetectionMode = Field(
+        SpotDetectionMode.DUAL_RIGHT,
+        description="Default spot detection mode for objectives with no saved laser AF config",
+    )
+    calibration: LaserAFCalibrationSettings = Field(default_factory=LaserAFCalibrationSettings)
+
+    model_config = {"extra": "forbid"}
+
+    @classmethod
+    def from_device_entry(cls, entry: Optional["DeviceEntry"]) -> "LaserAFDeviceSettings":
+        """Build settings from the ``laser_af`` ``DeviceEntry`` (defaults when None)."""
+        if entry is None:
+            return cls()
+        return cls.model_validate(entry.config or {})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -425,6 +663,29 @@ class MachineConfig(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _validate_software_trigger_routing(self) -> "MachineConfig":
+        """Reject an unknown routing value, or ``hardware_line`` with no trigger line."""
+        for dev_name, dev in self.devices.items():
+            if "software_trigger_routing" not in dev.config:
+                continue
+            try:
+                resolve_software_trigger_routing(
+                    dev.config["software_trigger_routing"], "trigger" in dev.io
+                )
+            except ValueError as e:
+                raise ValueError(f"Device '{dev_name}': {e}")
+        return self
+
+    def get_software_trigger_routing(self, device_name: str) -> SoftwareTriggerRouting:
+        """Effective software-trigger routing for a camera device (see the resolver)."""
+        dev = self.devices.get(device_name)
+        if dev is None:
+            return SoftwareTriggerRouting.NATIVE
+        return resolve_software_trigger_routing(
+            dev.config.get("software_trigger_routing"), "trigger" in dev.io
+        )
+
     def validate_io_lines(self) -> List[str]:
         """Check for channel conflicts and missing controller references.
 
@@ -506,6 +767,28 @@ class MachineConfig(BaseModel):
             k: v for k, v in self.devices.items()
             if v.enabled and v.role == role
         }
+
+    def get_confocal_device(self) -> Optional[Tuple[str, DeviceEntry]]:
+        """Get the enabled spinning-disk confocal device as ``(name, entry)``.
+
+        Returns None when no confocal unit is enabled.
+        """
+        for name in CONFOCAL_DEVICE_NAMES:
+            entry = self.devices.get(name)
+            if entry is not None and entry.enabled:
+                return name, entry
+        return None
+
+    def get_confocal_settings(self) -> Optional[ConfocalDeviceSettings]:
+        """Typed settings for the enabled confocal device, or None."""
+        found = self.get_confocal_device()
+        if found is None:
+            return None
+        return ConfocalDeviceSettings.from_device_entry(found[1])
+
+    def get_laser_af_settings(self) -> LaserAFDeviceSettings:
+        """Typed ``devices.laser_af.config`` settings (model defaults when absent)."""
+        return LaserAFDeviceSettings.from_device_entry(self.devices.get(LASER_AF_DEVICE_NAME))
 
 
 def build_default_machine_config() -> MachineConfig:

@@ -69,6 +69,9 @@ class AcquisitionInfo:
         physical_size_z_um: Z step size in micrometers (for OME-XML).
         physical_size_x_um: Pixel size in X in micrometers (for OME-XML).
         physical_size_y_um: Pixel size in Y in micrometers (for OME-XML).
+        fovs_per_region: region_id -> number of FOVs in that region. An OME-TIFF
+            holds one region and pre-allocates one series per FOV when the
+            region's first frame arrives, so the count has to be known up front.
     """
 
     total_time_points: int
@@ -80,6 +83,7 @@ class AcquisitionInfo:
     physical_size_z_um: Optional[float] = None
     physical_size_x_um: Optional[float] = None
     physical_size_y_um: Optional[float] = None
+    fovs_per_region: Dict[str, int] = field(default_factory=dict)
 
 
 from .downsampled_views import (
@@ -186,6 +190,22 @@ def _metadata_lock_path(metadata_path: str) -> str:
     return metadata_path + ".lock"
 
 
+# Saving modes whose per-frame timing rows are consolidated into one
+# ``{acquisition_root}/acquisition_times.csv``: the ones that write their images
+# to a root-level tree of their own rather than into ``{exp}/{timepoint}/``.
+_ROOT_ACQUISITION_TIMES_SAVING_OPTIONS = (
+    _def.FileSavingOption.ZARR_V3,
+    _def.FileSavingOption.OME_TIFF,
+)
+
+
+def acquisition_times_csv_root(info: "CaptureInfo") -> str:
+    """Directory the ``filename`` column of the timing CSV is relative to."""
+    if info.acquisition_root and info.file_saving_option in _ROOT_ACQUISITION_TIMES_SAVING_OPTIONS:
+        return info.acquisition_root
+    return info.save_directory
+
+
 def append_frame_acquisition_time_csv(
     info: "CaptureInfo",
     filename: str,
@@ -196,19 +216,23 @@ def append_frame_acquisition_time_csv(
     """Append one row to the per-frame acquisition time CSV.
 
     Layout:
-    - ``ZARR_V3``: single ``{acquisition_root}/acquisition_times.csv``
-      consolidating all timepoints. The CSV's ``time_point`` column distinguishes
-      rows. ZARR_V3 stores its image data in its own per-FOV trees, so the
-      per-timepoint folder is otherwise empty in the common case.
-    - All other modes: ``{save_directory}/frame_acquisition_times.csv``,
-      i.e. one CSV per timepoint folder alongside the TIFFs.
+    - ``ZARR_V3`` and ``OME_TIFF``: single
+      ``{acquisition_root}/acquisition_times.csv`` consolidating all timepoints.
+      The CSV's ``time_point`` column distinguishes rows. Neither mode writes
+      images into the per-timepoint folder (zarr uses its own per-FOV trees,
+      OME-TIFF one multi-series file per region under ``ome_tiff/``), so no
+      per-timepoint folder is created at all and ``filename`` is relative to the
+      acquisition root (e.g. ``ome_tiff/A1.ome.tiff``).
+    - ``INDIVIDUAL_IMAGES`` / ``MULTI_PAGE_TIFF``:
+      ``{save_directory}/frame_acquisition_times.csv``, i.e. one CSV per
+      timepoint folder alongside the TIFFs, with ``filename`` relative to it.
 
     Records wall-clock time when each frame was committed for saving
     (``CaptureInfo.capture_time``). Safe across multiprocessing save workers
     via :class:`filelock.FileLock`.
     """
     _log = squid.logging.get_logger("append_frame_acquisition_time_csv")
-    if info.file_saving_option == _def.FileSavingOption.ZARR_V3 and info.acquisition_root:
+    if info.acquisition_root and info.file_saving_option in _ROOT_ACQUISITION_TIMES_SAVING_OPTIONS:
         path = os.path.join(info.acquisition_root, "acquisition_times.csv")
     else:
         path = os.path.join(info.save_directory, "frame_acquisition_times.csv")
@@ -366,9 +390,95 @@ class SaveImageJob(Job):
         return True
 
 
+class OmeRegionFile:
+    """Open handle to one per-region, multi-series OME-TIFF.
+
+    Lives for the whole acquisition inside the JobRunner subprocess: it keeps
+    the bookkeeping metadata in memory and at most one open memmap (the FOV
+    currently being filled), so a frame costs one memmap plane write instead of
+    reopening the file and rewriting the sidecar JSON under a lock per plane.
+
+    The sidecar (``{ome_tiff}/.{stem}.meta.json``) is flushed when the FOV
+    changes and at finalisation, i.e. at most once per FOV visit.
+    """
+
+    _log: ClassVar = squid.logging.get_logger("OmeRegionFile")
+
+    def __init__(self, output_path: str, metadata: Dict[str, Any]):
+        self.output_path = output_path
+        self.metadata = metadata
+        self.metadata_path, self.lock_path = ome_tiff_writer.sidecar_paths(output_path)
+        self.finalized = False
+        self._memmap: Optional[np.ndarray] = None
+        self._memmap_series: Optional[int] = None
+        self._sidecar_dirty = True
+
+    def memmap_for(self, series_index: int) -> np.ndarray:
+        """Memmap of series ``series_index``, switching FOVs as needed."""
+        if self._memmap is not None and self._memmap_series != series_index:
+            self.close_memmap()
+            # The FOV we just left is complete; persist its plane metadata.
+            self.flush_sidecar()
+        if self._memmap is None:
+            stack = tifffile.memmap(self.output_path, series=series_index, mode="r+")
+            expected = tuple(int(v) for v in self.metadata[ome_tiff_writer.SHAPE_KEY])
+            if tuple(stack.shape) != expected:
+                stack.shape = expected
+            self._memmap = stack
+            self._memmap_series = series_index
+        return self._memmap
+
+    def close_memmap(self) -> None:
+        if self._memmap is None:
+            return
+        try:
+            self._memmap.flush()
+        finally:
+            self._memmap = None
+            self._memmap_series = None
+
+    def mark_dirty(self) -> None:
+        self._sidecar_dirty = True
+
+    def flush_sidecar(self) -> None:
+        if not self._sidecar_dirty:
+            return
+        with _acquire_file_lock(self.lock_path, context=self.metadata_path):
+            ome_tiff_writer.write_metadata(self.metadata_path, self.metadata)
+        self._sidecar_dirty = False
+
+    def is_complete(self) -> bool:
+        return int(self.metadata.get(ome_tiff_writer.SAVED_COUNT_KEY, 0)) >= int(
+            self.metadata[ome_tiff_writer.EXPECTED_COUNT_KEY]
+        )
+
+    def finalize(self) -> None:
+        """Write the full per-Image OME-XML and drop the sidecar."""
+        if self.finalized:
+            return
+        self.close_memmap()
+        self.metadata[ome_tiff_writer.COMPLETED_KEY] = self.is_complete()
+        ome_tiff_writer.finalize_ome_xml(self.output_path, self.metadata)
+        self.finalized = True
+        self._remove_sidecar()
+
+    def _remove_sidecar(self) -> None:
+        for path in (self.metadata_path, self.lock_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                # Windows can still hold the lock handle briefly; best-effort.
+                pass
+
+
 @dataclass
 class SaveOMETiffJob(Job):
-    """Job for saving images to OME-TIFF format.
+    """Job for saving images into one multi-series OME-TIFF per region.
+
+    Series ``i`` of ``{exp}/ome_tiff/{region_id}[__{array_key}].ome.tiff`` is
+    FOV ``i`` of that region, axes TZCYX. Every series is pre-allocated when the
+    region's first frame arrives.
 
     The acquisition_info field is injected by JobRunner.dispatch() before the job runs.
     """
@@ -376,7 +486,41 @@ class SaveOMETiffJob(Job):
     _log: ClassVar = squid.logging.get_logger("SaveOMETiffJob")
     acquisition_info: Optional[AcquisitionInfo] = field(default=None)
 
-    def run(self) -> bool:
+    # Open region files keyed by output path.
+    # SAFETY: exactly one JobRunner subprocess handles SaveOMETiffJob (one runner
+    # per job class), and it runs jobs on a single thread, so this dict needs no
+    # locking. Do NOT run SaveOMETiffJob from a thread pool.
+    _region_files: ClassVar[Dict[str, "OmeRegionFile"]] = {}
+    # Output path of the region file the last frame went to, so moving to another
+    # region releases the previous file's memmap and flushes its sidecar.
+    _active_region_path: ClassVar[Optional[str]] = None
+
+    @classmethod
+    def finalize_all_writers(cls) -> bool:
+        """Finalise every region file this process touched.
+
+        Called from the JobRunner subprocess on its way out — on normal
+        completion AND on abort/shutdown — so per-plane OME-XML never depends on
+        an acquisition reaching its expected frame count.
+
+        Returns True if every file finalised successfully.
+        """
+        failed: List[str] = []
+        for path, region_file in list(cls._region_files.items()):
+            try:
+                region_file.finalize()
+                cls._log.info(f"Finalized OME-TIFF region file: {path}")
+            except Exception as e:
+                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}")
+                failed.append(path)
+        cls._region_files.clear()
+        cls._active_region_path = None
+        if failed:
+            cls._log.error(f"Failed to finalize {len(failed)} OME-TIFF region file(s): {failed}")
+            return False
+        return True
+
+    def run(self) -> "FrameWriteResult":
         if self.acquisition_info is None:
             raise ValueError(
                 "SaveOMETiffJob.run() requires acquisition_info but it is None. "
@@ -388,18 +532,30 @@ class SaveOMETiffJob(Job):
 
         image = self.image_array()
 
+        # Reported back to the worker once the plane is on disk, so the live
+        # viewer only reads a plane the memmap write has already covered.
+        info = self.capture_info
+        _t_written, _ = ome_tiff_writer.ome_plane_indices(info)
+        region_names = list((self.acquisition_info.fovs_per_region or {}).keys())
+        region_key = str(info.region_id)
+        result = FrameWriteResult(
+            fov=int(info.fov),
+            time_point=_t_written,
+            z_index=int(info.z_index),
+            channel_name=info.observation_state.name,
+            region_idx=region_names.index(region_key) if region_key in region_names else 0,
+        )
+
         # Simulated disk I/O mode - encode to buffer, throttle, discard
         if is_simulation_enabled():
-            # Build stack key from output path
-            ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, self.capture_info)
-            base_name = ome_tiff_writer.ome_base_name(self.capture_info)
-            stack_key = os.path.join(ome_folder, base_name)
+            # One simulated stack per REGION file, matching the real layout.
+            stack_key = ome_tiff_writer.ome_output_path(self.acquisition_info, self.capture_info)
 
-            # Determine 5D shape (T, Z, C, Y, X), preferring cycle self-describing dims
+            # Per-series 5D shape (T, Z, C, Y, X), preferring cycle self-describing dims
             _t_sim, _c_sim = ome_tiff_writer.ome_plane_indices(self.capture_info)
             shape = (
                 ome_tiff_writer._ome_t_size(self.acquisition_info, self.capture_info),
-                self.acquisition_info.total_z_levels,
+                ome_tiff_writer._ome_z_size(self.acquisition_info, self.capture_info),
                 ome_tiff_writer._ome_c_size(self.acquisition_info, self.capture_info),
                 image.shape[0],
                 image.shape[1],
@@ -409,6 +565,8 @@ class SaveOMETiffJob(Job):
                 image=image,
                 stack_key=stack_key,
                 shape=shape,
+                n_series=ome_tiff_writer.region_fov_count(self.acquisition_info, self.capture_info),
+                series_index=self.capture_info.fov,
                 time_point=_t_sim,
                 z_index=self.capture_info.z_index,
                 channel_index=_c_sim,
@@ -417,107 +575,102 @@ class SaveOMETiffJob(Job):
                 f"SaveOMETiffJob {self.job_id}: simulated write of {bytes_written} bytes "
                 f"(image shape={image.shape})"
             )
-            return True
+            return result
 
         self._save_ome_tiff(image, self.capture_info)
-        return True
+        return result
+
+    def _region_file(self, image: np.ndarray, info: CaptureInfo) -> "OmeRegionFile":
+        """The open handle for this frame's region, creating the file if needed."""
+        output_path = ome_tiff_writer.ome_output_path(self.acquisition_info, info)
+        previous_path = SaveOMETiffJob._active_region_path
+        if previous_path is not None and previous_path != output_path:
+            # Moved on to another region: release its memmap and persist its
+            # bookkeeping rather than holding one open handle per region.
+            previous = self._region_files.get(previous_path)
+            if previous is not None:
+                previous.close_memmap()
+                previous.flush_sidecar()
+        SaveOMETiffJob._active_region_path = output_path
+
+        region_file = self._region_files.get(output_path)
+        if region_file is not None:
+            return region_file
+
+        ome_tiff_writer.ensure_output_directory(os.path.dirname(output_path))
+        metadata_path, _ = ome_tiff_writer.sidecar_paths(output_path)
+        if not os.path.exists(output_path):
+            # First frame of this region: pre-allocate ALL of its FOV series so
+            # every later plane is just a memmap write into series `fov`.
+            n_series = ome_tiff_writer.region_fov_count(self.acquisition_info, info)
+            metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image, n_series)
+            ome_tiff_writer.create_multiseries_file(output_path, metadata)
+            self._log.info(
+                f"Created region OME-TIFF {output_path} with {n_series} series, "
+                f"shape={tuple(metadata[ome_tiff_writer.SHAPE_KEY])}"
+            )
+        else:
+            # The file is already there, so NEVER re-allocate over it. A sidecar
+            # means a previous process was mid-write (crash / restart); no sidecar
+            # means it was finalised and is being written to again.
+            metadata = ome_tiff_writer.load_metadata(metadata_path)
+            if metadata is None:
+                metadata = ome_tiff_writer.adopt_existing_file(
+                    output_path, self.acquisition_info, info, image
+                )
+                self._log.warning(f"Writing into an already finalized region OME-TIFF {output_path}")
+            else:
+                self._log.info(f"Resuming region OME-TIFF {output_path} from its sidecar")
+            expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
+            if expected_shape[-2:] != image.shape[-2:]:
+                raise ValueError("Image dimensions do not match existing OME memmap stack")
+
+        region_file = OmeRegionFile(output_path, metadata)
+        self._region_files[output_path] = region_file
+        return region_file
 
     def _save_ome_tiff(self, image: np.ndarray, info: CaptureInfo) -> None:
         # with reference to Talley's https://github.com/pymmcore-plus/pymmcore-plus/blob/main/src/pymmcore_plus/mda/handlers/_ome_tiff_writer.py and Christoph's https://forum.image.sc/t/how-to-create-an-image-series-ome-tiff-from-python/42730/7
         ome_tiff_writer.validate_capture_info(info, self.acquisition_info, image)
 
-        ome_folder = ome_tiff_writer.ome_output_folder(self.acquisition_info, info)
-        ome_tiff_writer.ensure_output_directory(ome_folder)
+        region_file = self._region_file(image, info)
+        metadata = region_file.metadata
+        shape = tuple(int(v) for v in metadata[ome_tiff_writer.SHAPE_KEY])
 
-        base_name = ome_tiff_writer.ome_base_name(info)
-        output_path = os.path.join(ome_folder, base_name + ".ome.tiff")
-        metadata_path = ome_tiff_writer.metadata_temp_path(self.acquisition_info, info, base_name)
-        lock_path = _metadata_lock_path(metadata_path)
+        target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
+        image_to_store = image if image.dtype == target_dtype else image.astype(target_dtype)
 
-        with _acquire_file_lock(lock_path, context=output_path):
-            metadata = ome_tiff_writer.load_metadata(metadata_path)
-            if metadata is None:
-                metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image)
-                target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                tifffile.imwrite(
-                    output_path,
-                    shape=tuple(metadata[ome_tiff_writer.SHAPE_KEY]),
-                    dtype=target_dtype,
-                    metadata=ome_tiff_writer.metadata_for_imwrite(metadata),
-                    ome=True,
-                )
-            else:
-                expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
-                if expected_shape[-2:] != image.shape[-2:]:
-                    raise ValueError("Image dimensions do not match existing OME memmap stack")
-                # acquisition_info is guaranteed non-None here (validated in run())
-                if not metadata.get(ome_tiff_writer.CHANNEL_NAMES_KEY) and self.acquisition_info.channel_names:
-                    metadata[ome_tiff_writer.CHANNEL_NAMES_KEY] = self.acquisition_info.channel_names
+        time_point, channel_index = ome_tiff_writer.ome_plane_indices(info)
+        z_index = int(info.z_index)
+        fov = int(info.fov)
+        ome_tiff_writer.validate_series_index(metadata, fov)
+        if not (0 <= time_point < shape[0]):
+            raise ValueError("Time point index out of range for OME stack")
+        if not (0 <= z_index < shape[1]):
+            raise ValueError("Z index out of range for OME stack")
+        if not (0 <= channel_index < shape[2]):
+            raise ValueError("Channel index out of range for OME stack")
 
-            target_dtype = np.dtype(metadata[ome_tiff_writer.DTYPE_KEY])
-            image_to_store = image if image.dtype == target_dtype else image.astype(target_dtype)
+        stack = region_file.memmap_for(fov)
+        stack[time_point, z_index, channel_index, :, :] = image_to_store
 
-            time_point, channel_index = ome_tiff_writer.ome_plane_indices(info)
-            z_index = int(info.z_index)
-            shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
-            if not (0 <= time_point < shape[0]):
-                raise ValueError("Time point index out of range for OME stack")
-            if not (0 <= z_index < shape[1]):
-                raise ValueError("Z index out of range for OME stack")
-            if not (0 <= channel_index < shape[2]):
-                raise ValueError("Channel index out of range for OME stack")
-
-            stack = tifffile.memmap(output_path, dtype=target_dtype, mode="r+")
-            if stack.shape != shape:
-                stack.shape = shape
-            try:
-                stack[time_point, z_index, channel_index, :, :] = image_to_store
-                stack.flush()
-            finally:
-                del stack
-
-            try:
-                _rel_ome = os.path.relpath(output_path, info.save_directory)
-            except ValueError:
-                _rel_ome = os.path.basename(output_path)
-            append_frame_acquisition_time_csv(info, _rel_ome.replace("\\", "/"))
-
-            metadata = ome_tiff_writer.update_plane_metadata(metadata, info)
-            index_key = f"{time_point}-{channel_index}-{z_index}"
-            if index_key not in metadata[ome_tiff_writer.WRITTEN_INDICES_KEY]:
-                metadata[ome_tiff_writer.WRITTEN_INDICES_KEY].append(index_key)
-                metadata[ome_tiff_writer.SAVED_COUNT_KEY] = len(metadata[ome_tiff_writer.WRITTEN_INDICES_KEY])
-
-            # Check if all images have been saved
-            is_complete = metadata[ome_tiff_writer.SAVED_COUNT_KEY] >= metadata[ome_tiff_writer.EXPECTED_COUNT_KEY]
-            if is_complete:
-                metadata[ome_tiff_writer.COMPLETED_KEY] = True
-
-            # Write metadata (includes completed flag if acquisition is done)
-            ome_tiff_writer.write_metadata(metadata_path, metadata)
-
-            if is_complete:
-                # Finalize OME-XML and clean up temporary files
-                with tifffile.TiffFile(output_path) as tif:
-                    current_xml = tif.ome_metadata
-                ome_xml = ome_tiff_writer.augment_ome_xml(current_xml, metadata)
-                tifffile.tiffcomment(output_path, ome_xml.encode("utf-8"))
-                if os.path.exists(metadata_path):
-                    os.remove(metadata_path)
-
-        # Clean up lock file after lock is released (only when acquisition completed).
-        # Race condition note: Between releasing the lock and this cleanup, another process
-        # could theoretically acquire the same lock path. However:
-        # 1. We only attempt removal if metadata_path is gone (acquisition completed)
-        # 2. If another process holds the lock, os.remove fails with OSError (caught below)
-        # 3. This is best-effort cleanup; stale locks are also cleaned by cleanup_stale_metadata_files
+        output_path = region_file.output_path
         try:
-            if not os.path.exists(metadata_path):
-                os.remove(lock_path)
-        except OSError:
-            pass  # Lock held by another process, already removed, or platform-specific issue
+            _rel_ome = os.path.relpath(output_path, acquisition_times_csv_root(info))
+        except ValueError:
+            _rel_ome = os.path.basename(output_path)
+        append_frame_acquisition_time_csv(info, _rel_ome.replace("\\", "/"))
+
+        ome_tiff_writer.update_plane_metadata(metadata, info)
+        region_file.mark_dirty()
+
+        if region_file.is_complete():
+            # Every plane of every FOV of this region has landed: finalize now
+            # instead of carrying the handle to the end of the run. The
+            # end-of-run hook (finalize_all_writers) covers everything else,
+            # including an aborted run.
+            region_file.finalize()
+            self._region_files.pop(output_path, None)
 
 
 @dataclass
@@ -683,8 +836,13 @@ class ZarrWriterInfo:
 
 
 @dataclass
-class ZarrWriteResult:
-    """Result from a SaveZarrJob, containing frame info for viewer notification."""
+class FrameWriteResult:
+    """One frame is on disk — the viewer may read it now.
+
+    Returned by every saving job whose write happens in the JobRunner subprocess
+    (:class:`SaveZarrJob`, :class:`SaveOMETiffJob`), so the live-view
+    notification is driven by the same result type regardless of saving mode.
+    """
 
     fov: int
     time_point: int
@@ -810,7 +968,7 @@ class SaveZarrJob(Job):
             self._hcs_wells_written.add(well_path)
             self._log.debug(f"Wrote HCS well metadata for {region_id}: {fov_count} fields")
 
-    def run(self) -> ZarrWriteResult:
+    def run(self) -> FrameWriteResult:
         if self.zarr_writer_info is None:
             raise ValueError(
                 "SaveZarrJob.run() requires zarr_writer_info but it is None. "
@@ -829,7 +987,7 @@ class SaveZarrJob(Job):
         output_path = self.zarr_writer_info.get_output_path(region_id, fov, ak)
 
         region_names = list(self.zarr_writer_info.region_fov_counts.keys())
-        result = ZarrWriteResult(
+        result = FrameWriteResult(
             fov=fov,
             time_point=t,
             z_index=info.z_index,
@@ -864,7 +1022,7 @@ class SaveZarrJob(Job):
 
         self._save_zarr(image, info, output_path)
         try:
-            _rel_z = os.path.relpath(output_path, info.save_directory)
+            _rel_z = os.path.relpath(output_path, acquisition_times_csv_root(info))
         except ValueError:
             _rel_z = output_path
         append_frame_acquisition_time_csv(info, _rel_z.replace("\\", "/"))
@@ -1217,8 +1375,9 @@ class PostprocessJob(Job):
     so their raw images are never written. This job accumulates them in a
     process-local ClassVar (the ``DownsampledViewJob`` pattern), and on the last
     expected frame runs the routine, writes each declared output as its own
-    single-channel plate via an inline ``SaveZarrJob`` (ZARR_V3) or a direct
-    float-safe TIFF write (INDIVIDUAL_IMAGES), and — for ZARR_V3 with upload
+    single-channel plate via an inline ``SaveZarrJob`` (ZARR_V3), its own keyed
+    per-region file via an inline ``SaveOMETiffJob`` (OME_TIFF), or a direct
+    float-safe TIFF write (INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF), and — for ZARR_V3 with upload
     enabled — runs the derived-plate upload barrier inline (so it deterministically
     follows the writes in this same subprocess, avoiding the cross-thread
     ordering race the worker-dispatched barrier would have).
@@ -1420,40 +1579,51 @@ class PostprocessJob(Job):
             dtype = frames[0]["image"].dtype
         return arr.astype(dtype, copy=False)
 
+    def _derived_capture_info(
+        self, out_key: str, spec: dict, zi: int, z_size: int, t_scan: int, capture_time: float
+    ) -> CaptureInfo:
+        """A fully self-describing CaptureInfo for one plane of a derived output.
+
+        The derived array is keyed by ``out_key`` and is single-channel with its
+        OWN (T, Z) extent — the routine may collapse an N-plane input to one
+        derived plane, so ``save_z_size`` must not be taken from the acquisition.
+        """
+        info = self.capture_info
+        return CaptureInfo(
+            position=info.position,
+            z_index=zi,
+            capture_time=capture_time,
+            observation_state=info.observation_state,
+            save_directory=info.save_directory,
+            file_id=info.file_id,
+            region_id=info.region_id,
+            fov=info.fov,
+            configuration_idx=0,
+            time_point=info.time_point,
+            filename_channel_label=out_key,
+            array_key=out_key,
+            save_t_index=t_scan,
+            save_c_index=0,
+            save_t_size=int(self.ctx_meta.get("nt", 1)),
+            save_c_size=1,
+            save_z_size=z_size,
+            array_channel_names=[out_key],
+            array_channel_colors=[spec.get("channel_color", "#FFFFFF")],
+            array_channel_wavelengths=[spec.get("wavelength_nm")],
+            file_saving_option=info.file_saving_option
+            if info.file_saving_option is not None
+            else _def.FILE_SAVING_OPTION,
+            acquisition_root=info.acquisition_root,
+        )
+
     def _write_output(self, arr: np.ndarray, out_key: str, spec: dict, t_scan: int, capture_time: float) -> int:
         info = self.capture_info
         save_format = info.file_saving_option if info.file_saving_option is not None else _def.FILE_SAVING_OPTION
         z_size = int(spec["z_size"])
-        nt = int(self.ctx_meta.get("nt", 1))
-        wavelength = spec.get("wavelength_nm")
-        color = spec.get("channel_color", "#FFFFFF")
 
         if save_format == _def.FileSavingOption.ZARR_V3:
             for zi in range(z_size):
-                ci = CaptureInfo(
-                    position=info.position,
-                    z_index=zi,
-                    capture_time=capture_time,
-                    observation_state=info.observation_state,
-                    save_directory=info.save_directory,
-                    file_id=info.file_id,
-                    region_id=info.region_id,
-                    fov=info.fov,
-                    configuration_idx=0,
-                    time_point=info.time_point,
-                    filename_channel_label=out_key,
-                    array_key=out_key,
-                    save_t_index=t_scan,
-                    save_c_index=0,
-                    save_t_size=nt,
-                    save_c_size=1,
-                    save_z_size=z_size,
-                    array_channel_names=[out_key],
-                    array_channel_colors=[color],
-                    array_channel_wavelengths=[wavelength],
-                    file_saving_option=save_format,
-                    acquisition_root=info.acquisition_root,
-                )
+                ci = self._derived_capture_info(out_key, spec, zi, z_size, t_scan, capture_time)
                 sub = SaveZarrJob(
                     capture_info=ci,
                     capture_image=JobImage(image_array=arr[zi]),
@@ -1462,7 +1632,30 @@ class PostprocessJob(Job):
                 sub.run()
             return 1
 
-        # INDIVIDUAL_IMAGES: float-safe direct TIFF write (avoids save_image's
+        if save_format == _def.FileSavingOption.OME_TIFF:
+            # One keyed region file per output, ``{exp}/ome_tiff/{region}__{out_key}.ome.tiff``,
+            # written by an inline SaveOMETiffJob exactly as the zarr branch uses an
+            # inline SaveZarrJob. It is a different file from every raw one: a
+            # postprocessed step saves no raw frames, so no raw array_key equals an
+            # out_key, and a dense raw run has no array_key at all. The simulated-IO
+            # path and the timing-CSV row live inside that job, so both stay
+            # identical to raw OME-TIFF saving.
+            if self.acquisition_info is None:
+                raise ValueError(
+                    "PostprocessJob needs acquisition_info to write OME-TIFF outputs. "
+                    "It is injected by JobRunner.dispatch(); set it before calling run() directly."
+                )
+            for zi in range(z_size):
+                ci = self._derived_capture_info(out_key, spec, zi, z_size, t_scan, capture_time)
+                sub = SaveOMETiffJob(
+                    capture_info=ci,
+                    capture_image=JobImage(image_array=arr[zi]),
+                    acquisition_info=self.acquisition_info,
+                )
+                sub.run()
+            return 1
+
+        # INDIVIDUAL_IMAGES / MULTI_PAGE_TIFF: float-safe direct TIFF write (avoids save_image's
         # uint/pseudo-color handling). One file per output (+ z suffix if 3D).
         from control.core.io_simulation import is_simulation_enabled
 
@@ -1858,7 +2051,6 @@ class JobRunner(multiprocessing.Process):
     def __init__(
         self,
         acquisition_info: Optional[AcquisitionInfo] = None,
-        cleanup_stale_ome_files: bool = False,
         log_file_path: Optional[str] = None,
         # Backpressure shared values (from BackpressureController)
         bp_pending_jobs: Optional[multiprocessing.Value] = None,
@@ -1903,13 +2095,6 @@ class JobRunner(multiprocessing.Process):
         self._bp_pending_jobs = bp_pending_jobs
         self._bp_pending_bytes = bp_pending_bytes
         self._bp_capacity_event = bp_capacity_event
-
-        # Clean up stale metadata files from previous crashed acquisitions
-        # Only run when explicitly requested (i.e., when OME-TIFF saving is being used)
-        if cleanup_stale_ome_files:
-            removed = ome_tiff_writer.cleanup_stale_metadata_files()
-            if removed:
-                self._log.info(f"Cleaned up {len(removed)} stale OME-TIFF metadata files")
 
     def dispatch(self, job: Job):
         # Inject acquisition_info into SaveOMETiffJob instances before serialization.
@@ -2294,6 +2479,16 @@ class JobRunner(multiprocessing.Process):
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:
             self._log.error(f"Error finalizing zarr writers during shutdown: {e}")
+
+        # Write the per-Image Plane XML of every region OME-TIFF this runner
+        # touched and drop its sidecar. Runs on normal completion AND on
+        # abort/shutdown, so an aborted acquisition still leaves readable
+        # positions/timestamps instead of a bare pre-allocated stack.
+        try:
+            if not SaveOMETiffJob.finalize_all_writers():
+                self._log.error("OME-TIFF FINALIZATION INCOMPLETE - Some metadata may be missing")
+        except Exception as e:
+            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}")
         self._log.info(
             f"finalize_all_writers() completed in {time.perf_counter() - t_finalize_start:.1f}s"
         )

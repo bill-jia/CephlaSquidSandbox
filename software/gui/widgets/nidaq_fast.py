@@ -75,8 +75,15 @@ class NIDAQWidget(QWidget):
             self._log.warning(f"Could not load IO endpoint config for NIDAQWidget: {e}", exc_info=True)
             self._io_endpoint_config = None
 
-        if self.is_simulation:
-            # Create a simulated NI DAQ so the widget always talks to an AbstractNIDAQ.
+        if ni_daq is not None:
+            # Simulated or not, the microscope's DAQ is the one wired to the
+            # machine config's IO endpoints — use it so the widget's channel
+            # lists match the lines the rest of the software drives.
+            self._ni_daq = ni_daq
+        elif self.is_simulation:
+            # No DAQ was built (e.g. nidaq disabled in the machine config) but
+            # the widget still has to talk to an AbstractNIDAQ; give it an empty
+            # simulated one.
             sim_config = {
                 "device_name": "Simulation",
                 "sample_rate_hz": 10000.0,
@@ -98,7 +105,7 @@ class NIDAQWidget(QWidget):
             }
             self._ni_daq = create_ni_daq(sim_config, simulation=True)
         else:
-            self._ni_daq = ni_daq
+            raise ValueError("NIDAQWidget needs an AbstractNIDAQ when not simulating")
         self._log.info(f"NIDAQWidget initialized with NI DAQ: {self._ni_daq}")
         self._waveforms = WaveformData()
         

@@ -50,10 +50,10 @@ from control.core.objective_store import ObjectiveStore
 from control.core.stream_handler import StreamHandler
 from control.lighting import LightSourceType, IntensityControlMode, ShutterControlMode, IlluminationController
 from control.microcontroller import Microcontroller
-from control.microscope import Microscope, _should_simulate
+from control.microscope import Microscope
 from control.models import ObservationState
 from control.models.gui_state import GuiState
-from control.nidaq import AbstractNIDAQ
+from control.nidaq import AbstractNIDAQ, SimulatedNIDAQ
 from squid.abc import AbstractCamera, AbstractStage
 import control._def
 import control.lighting
@@ -517,13 +517,18 @@ class HighContentScreeningGui(QMainWindow):
 
     def load_widgets(self, is_simulation=False):
         # Initialize all GUI widgets
-        if ENABLE_SPINNING_DISK_CONFOCAL:
-            # TODO: For user compatibility, when ENABLE_SPINNING_DISK_CONFOCAL is True, we use XLight/Cicero on default.
-            # This needs to be changed when we figure out better machine configuration structure.
-            if USE_DRAGONFLY:
-                self.spinningDiskConfocalWidget = widgets.DragonflyConfocalWidget(self.dragonfly)
-            else:
-                self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(self.xlight)
+        # Branch on the hardware that was actually built, not on a _def flag:
+        # `from control._def import *` above binds a COPY at import time, and the
+        # machine config is applied later (main_hcs imports the GUI before
+        # Microscope.build_from_global_config runs), so the flag reads stale False
+        # here and the panel would silently never be created. The addon is None
+        # unless its device entry is enabled, so presence is the same signal.
+        if self.dragonfly is not None:
+            self.spinningDiskConfocalWidget = widgets.DragonflyConfocalWidget(self.dragonfly)
+        elif self.xlight is not None:
+            self.spinningDiskConfocalWidget = widgets.SpinningDiskConfocalWidget(
+                self.xlight, config_repo=self.microscope.config_repo
+            )
         if ENABLE_NL5:
             import control.NL5Widget as NL5Widget
 
@@ -634,12 +639,25 @@ class HighContentScreeningGui(QMainWindow):
             and bool(getattr(mc.software.acquisition, "fast_acquisition", False))
         )
 
+        # Branch on the DAQ that was actually built, for the same reason the
+        # confocal panel does above: SIMULATE_NIDAQ here is the stale import-time
+        # copy, so a per-device `devices.nidaq.simulate: true` would read False.
+        nidaq_simulated = isinstance(self.nidaq, SimulatedNIDAQ)
+
         if nidaq_enabled:
-            nidaq_simulated = _should_simulate(is_simulation, SIMULATE_NIDAQ)
             self.niDAQWidget = widgets.NIDAQWidget(self.nidaq, is_simulation=nidaq_simulated)
 
-        # Fast acquisition widget
-        if fast_acq_enabled:
+        # Fast acquisition widget.  Fast acquisition is a DAQ-clocked pulse train
+        # that the camera answers with frames; a SimulatedNIDAQ emits no pulses
+        # and the simulated camera never sees one, so every run would sit there
+        # until the frame timeout.  Per-device flags decide, not the global one:
+        # "simulated camera, real DAQ" (external frame grabbing) keeps the tab.
+        if fast_acq_enabled and nidaq_simulated:
+            self.log.info(
+                "Fast Acquisition tab disabled: the NI-DAQ is simulated, so no "
+                "trigger pulses reach the camera and an acquisition could not complete."
+            )
+        elif fast_acq_enabled:
             self.fastAcquisitionWidget = widgets.FastAcquisitionWidget(
                 self.microscope,
                 ni_daq_widget=self.niDAQWidget if nidaq_enabled else None,
@@ -1083,6 +1101,11 @@ class HighContentScreeningGui(QMainWindow):
         stage_layout.addWidget(self.navigationWidget)
         if self.piezoWidget:
             stage_layout.addWidget(self.piezoWidget)
+        # Spinning-disk confocal controls live with the stage controls; they are
+        # laid out narrow-and-tall so they fit this 1/3-width column.
+        if self.spinningDiskConfocalWidget is not None:
+            stage_layout.addWidget(self.spinningDiskConfocalWidget)
+        stage_layout.addStretch(1)
         self.stageControlsWidget.setLayout(stage_layout)
 
         # RAM monitor widget (always create, visibility controlled by setting)
@@ -1299,6 +1322,14 @@ class HighContentScreeningGui(QMainWindow):
             self.multipointController.ndviewer_start_zarr_acquisition.connect(self.ndviewerTab.start_zarr_acquisition)
             self.multipointController.ndviewer_notify_zarr_frame.connect(self.ndviewerTab.notify_zarr_frame)
             self.multipointController.ndviewer_end_zarr_acquisition.connect(self.ndviewerTab.end_zarr_acquisition)
+            # OME-TIFF mode signals (one multi-series file per region)
+            self.multipointController.ndviewer_start_ome_tiff_acquisition.connect(
+                self.ndviewerTab.start_ome_tiff_acquisition
+            )
+            self.multipointController.ndviewer_notify_ome_tiff_frame.connect(self.ndviewerTab.notify_ome_tiff_frame)
+            self.multipointController.ndviewer_end_ome_tiff_acquisition.connect(
+                self.ndviewerTab.end_ome_tiff_acquisition
+            )
 
         self.recordTabWidget.currentChanged.connect(self.onTabChanged)
         if not self.live_only_mode:
@@ -1345,18 +1376,6 @@ class HighContentScreeningGui(QMainWindow):
             self.objectivesWidget.signal_objective_changed.connect(
                 self.wellplateMultiPointWidget.handle_objective_change
             )
-
-        # TBD: replace with ObservationState refreshing
-        # self.profileWidget.signal_profile_changed.connect(
-        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-        #         self.liveControlWidget.currentConfiguration.name
-        #     )
-        # )
-        # self.objectivesWidget.signal_objective_changed.connect(
-        #     lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-        #         self.liveControlWidget.currentConfiguration.name
-        #     )
-        # )
 
         if self.microscope.addons.camera_focus:
             self.log.info(f"laser autofocus controller: {self.laserAutofocusController}, camera: {self.camera_focus}, setting up connections")
@@ -1415,18 +1434,42 @@ class HighContentScreeningGui(QMainWindow):
                     self.piezoWidget.update_displacement_um_display
                 )
 
-        if ENABLE_SPINNING_DISK_CONFOCAL:
+        if self.spinningDiskConfocalWidget is not None:
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
                 self.microscope.obs_controller.toggle_confocal_widefield
             )
+            # Re-apply the current channel so its confocal overrides take effect.
+            # Re-applies the state object we already hold rather than looking it
+            # up by name, so an unsaved live state (one that is not in the preset
+            # namespace) still round-trips through a confocal toggle. No channel
+            # may be selected yet, so guard for None.
+            def _reselect_current_channel():
+                current = self.liveControlWidget.currentConfiguration
+                if current is None:
+                    return
+                try:
+                    self.microscope.obs_controller.apply_full_observation_state(current)
+                    self.liveControlWidget.update_ui_for_mode(current)
+                except Exception as e:
+                    self.log.warning(f"Could not re-apply channel after a confocal toggle: {e}")
+
             self.spinningDiskConfocalWidget.signal_toggle_confocal_widefield.connect(
-                lambda: self.liveControlWidget.select_new_microscope_mode_by_name(
-                    self.liveControlWidget.currentConfiguration.name
-                )
+                _reselect_current_channel
             )
-            # Update iris UI when channel changes
+        # Everything below is X-Light only: the Dragonfly panel has no irises,
+        # no dichroic and no filter slider, so it carries none of these signals.
+        if self.spinningDiskConfocalWidget is not None and hasattr(
+            self.spinningDiskConfocalWidget, "sync_from_observation_state"
+        ):
+            # Follow the light path: every path that applies an observation state
+            # has to refresh the panel, or it keeps showing whatever was last
+            # dialled in by hand. This one is the live channel switch; the
+            # preset/menu paths go through _on_observation_state_changed().
             self.liveControlWidget.signal_live_configuration.connect(
-                self.spinningDiskConfocalWidget.update_iris_from_config
+                self.spinningDiskConfocalWidget.sync_from_observation_state
+            )
+            self.multipointController.signal_current_configuration.connect(
+                self.spinningDiskConfocalWidget.sync_from_observation_state
             )
             # Save iris values to config when changed (persistence through LiveControlWidget)
             self.spinningDiskConfocalWidget.signal_illumination_iris_changed.connect(
@@ -1435,9 +1478,34 @@ class HighContentScreeningGui(QMainWindow):
             self.spinningDiskConfocalWidget.signal_emission_iris_changed.connect(
                 self.liveControlWidget.update_config_emission_iris
             )
-            # Sync iris UI from the initial channel config (signal wasn't connected during __init__)
+            # Emission wheel / dichroic / filter slider changes go through the
+            # observation state controller so they are recorded on (and saved
+            # with) the live observation state.
+            obs_controller = getattr(self.microscope, "obs_controller", None)
+            if obs_controller is not None:
+                self.spinningDiskConfocalWidget.signal_emission_filter_changed.connect(
+                    obs_controller.set_emission_filter_position
+                )
+                self.spinningDiskConfocalWidget.signal_dichroic_changed.connect(
+                    obs_controller.set_dichroic_position
+                )
+                # DirectConnection on purpose: the panel emits this from the
+                # worker thread it started for the 5 s slider move, and the slot
+                # must run there instead of being queued back onto the UI thread.
+                self.spinningDiskConfocalWidget.signal_filter_slider_changed.connect(
+                    obs_controller.set_filter_slider_position, Qt.DirectConnection
+                )
+            else:
+                self.log.warning(
+                    "No observation state controller available: emission filter, dichroic and filter "
+                    "slider changes from the confocal panel will not be applied."
+                )
+            # Sync from the initial state (the signals above weren't connected
+            # while the panel was being constructed).
             if self.liveControlWidget.currentConfiguration:
-                self.spinningDiskConfocalWidget.update_iris_from_config(self.liveControlWidget.currentConfiguration)
+                self.spinningDiskConfocalWidget.sync_from_observation_state(
+                    self.liveControlWidget.currentConfiguration
+                )
 
         # Connect to plot xyz data when coordinates are saved
         self.multipointController.signal_coordinates.connect(self.zPlotWidget.add_point)
@@ -2100,10 +2168,20 @@ class HighContentScreeningGui(QMainWindow):
         self._on_observation_state_changed()
 
     def _on_observation_state_changed(self):
-        """After Observation State save/load: refresh channel lists and sync Camera tab to hardware."""
+        """After Observation State save/load: refresh channel lists, Camera tab and confocal panel."""
         self._refresh_channel_lists()
         if self.cameraSettingWidget:
             self.cameraSettingWidget.sync_controls_from_hardware()
+        # The confocal panel is part of the light path a state carries (irises,
+        # emission wheel, dichroic, filter slider, confocal/widefield), so it has
+        # to follow a loaded state like the camera controls do. Display only —
+        # sync_from_observation_state blocks every change signal.
+        if self.spinningDiskConfocalWidget is not None and hasattr(
+            self.spinningDiskConfocalWidget, "sync_from_observation_state"
+        ):
+            obs_controller = getattr(self.microscope, "obs_controller", None)
+            state = obs_controller.current_observation_state if obs_controller else None
+            self.spinningDiskConfocalWidget.sync_from_observation_state(state)
 
     def onTabChanged(self, index):
         is_flexible_acquisition = (
@@ -2659,13 +2737,6 @@ class HighContentScreeningGui(QMainWindow):
 
         try:
             state.last_active_objective = self.objectiveStore.current_objective
-        except Exception:
-            pass
-
-        try:
-            obs = self.microscope.obs_controller.current_observation_state
-            if obs is not None and getattr(obs, "name", None):
-                state.last_active_observation_state_name = obs.name
         except Exception:
             pass
 
