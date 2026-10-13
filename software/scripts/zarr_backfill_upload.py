@@ -24,6 +24,9 @@ verification, and exponential-backoff retry are all identical to the live
 path. A JSON-lines manifest is appended at
 ``<experiment_dir>/upload_manifest_backfill.jsonl`` — kept separate from the
 live ``upload_manifest.jsonl`` so the two never collide.
+The manifest is opened in append mode (with flush/fsync per record), so
+history persists across runs. New records include ``remote_root`` and
+``task_id`` to bind each successful upload to its destination and task.
 
 Usage:
     python scripts/zarr_backfill_upload.py <experiment_dir> \
@@ -48,9 +51,81 @@ Usage:
                     any new data appearing or any upload completing
                     (default 600; 0 = wait indefinitely).
 
-``--delete-after-verify``  After all of a timepoint's shards verify on the
-                           remote, delete the local copies. Default: off
-                           (safe).
+``--delete-after-verify``  Delete local image shards as each upload task
+                           succeeds. Default: off.
+
+Deletion happens incrementally, per FOV/timepoint/store task, after all
+files in that task upload or resume and verify successfully. It does not wait for
+the entire experiment directory to finish, and it does not delete each
+file immediately after that individual file verifies. If a task fails,
+its local shards are retained, including files that individually uploaded
+successfully. Metadata and timestamp files are retained. This applies to
+both a one-time backfill and ``--follow`` mode.
+
+Manifest ``deletable`` criteria:
+  - The field is exactly ``local_path in task.deletable_local_paths``.
+    Backfill adds every discovered image shard in a FOV/timepoint task to
+    this whitelist, across all discovered pyramid levels. Discovery accepts
+    existing files with five numeric chunk coordinates, using either
+    slash-separated or dot-separated keys from the array metadata; it
+    excludes temporary/lock files. A timepoint is selected only when it
+    appears in every discovered level, and ``--in-progress`` additionally
+    excludes the highest such timepoint for that FOV/store. These are
+    discovery rules, not a check that every expected plane is present or
+    that no writer still has the file open.
+  - Shared ``zarr.json`` metadata, timestamp arrays/chunks, and experiment
+    sidecars are not whitelisted and therefore have ``deletable: false``.
+  - A manifest record is appended only after that individual file uploads
+    successfully or a historical upload is revalidated (see below). For a
+    new transfer, the temporary remote copy passes verification and is
+    renamed to the final remote path. By default, verification compares
+    the SHA-256 of the source bytes read during copying with a readback
+    hash of the temporary remote file. If ``UPLOAD_VERIFY_READBACK`` is
+    disabled, only remote size is checked; this does not change the
+    ``deletable`` field. Image-shard tasks do not request the extra
+    post-copy source rehash used for mutable metadata.
+  - ``deletable: true`` is independent of ``--delete-after-verify``. It
+    records eligibility, not that deletion occurred or that the whole
+    task succeeded. A successfully uploaded shard can have this flag even
+    when another file in its task fails. Actual backfill deletion requires
+    the flag's whitelist membership, successful upload of the entire
+    task, and ``--delete-after-verify``. Cleanup also requires a persisted
+    successful record with ``deletable: true``, a stored ``remote_root``
+    (when present) matching the current ``--remote``
+    argument, and a ``remote_path`` exactly matching the expected destination
+    string. Explicit roots are compared after absolute-path/separator and
+    platform case normalization (case-insensitive on Windows). Drive-letter
+    and UNC aliases are not resolved to one another.
+  - Historical records can authorize deletion, including legacy records
+    without ``remote_root``/``task_id``, provided the full expected remote
+    path matches exactly and both local and remote files still match the
+    recorded byte count and SHA-256. An explicit mismatched root is rejected
+    even if the remote path matches. Missing, malformed, or mismatched
+    records retain the local file. A failed manifest append prevents
+    deletion unless a valid historical record can authorize it. This guard
+    applies to backfill's normal, follow, and interrupted-drain cleanup.
+
+Existing remote files and restarting:
+  - Backfill loads prior successful image-shard records from its persistent
+    manifest. When the expected remote path matches exactly (and any stored
+    root matches), it checks the size and SHA-256 of BOTH current copies
+    against the record. A match skips copying and appends a fresh verified
+    record for the current task. This still reads the remote file; it saves
+    the write, not all network traffic. Resume always checks hashes, even
+    if readback verification for new transfers is disabled.
+  - An absent record, changed local content, missing/corrupt remote copy,
+    or different destination falls back to a normal upload. Each transfer
+    writes a temporary remote file, verifies it, then atomically replaces
+    the final remote file. Remote existence alone never authorizes deletion.
+  - Within one ``--follow`` session, an in-memory set suppresses repeated
+    submission of the same local path. The uploader also skips unchanged
+    ``zarr.json`` metadata previously verified by that worker. Neither
+    cache persists across restarts; persistent image-shard resume uses the
+    manifest instead. The metadata cache does not cover timestamps.
+  - Files already deleted locally after successful upload are naturally
+    absent from later discovery. The manifest is never truncated on restart;
+    an incomplete trailing record from cancellation is separated from the
+    next appended record so it cannot swallow a new successful entry.
 """
 
 from __future__ import annotations
@@ -73,13 +148,16 @@ if str(_SOFTWARE_DIR) not in sys.path:
     sys.path.insert(0, str(_SOFTWARE_DIR))
 
 import squid.logging  # noqa: E402
+from control.core.zarr_layout import array_chunk_path, chunk_separator, timepoint_shards
 
 from control.core.zarr_upload import (  # noqa: E402
     UploadTarget,
     UploadTask,
     UploadResult,
     UploadWorker,
+    VerifiedUploadManifest,
     local_to_remote_path,
+    verify_manifest_copy,
 )
 
 
@@ -215,6 +293,9 @@ def enumerate_levels(fov_group: Path) -> List[Path]:
 def shard_files_for_timepoint(level_dir: Path, time_point: int) -> List[Path]:
     """Every shard file belonging to ``time_point`` at this pyramid level.
 
+    Flat ``c.<t>...`` keys and legacy ``c/<t>/...`` keys are both supported;
+    the array metadata selects the encoding. Temporary/lock files are excluded.
+
     With zarr-v3 ``default`` chunk-key encoding the shard path *is* its grid
     coordinate, and the leading component is the ``t`` grid index — so the whole
     ``c/<t>/`` subtree belongs to exactly that timepoint (guaranteed by
@@ -224,32 +305,12 @@ def shard_files_for_timepoint(level_dir: Path, time_point: int) -> List[Path]:
     the default per-z layout, and anything else with the same ``t``-first
     ordering — instead of hardcoding one shape and silently missing the rest.
     """
-    tp_dir = level_dir / "c" / str(time_point)
-    if not tp_dir.is_dir():
-        return []
-    out: List[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(tp_dir):
-        for name in filenames:
-            out.append(Path(dirpath) / name)
-    return sorted(out)
+    return [path for _, path in timepoint_shards(level_dir, time_point)]
 
 
 def enumerate_timepoints_for_level(level_dir: Path) -> List[int]:
     """Timepoint indices for which at least one shard file exists at this level."""
-    c_dir = level_dir / "c"
-    if not c_dir.is_dir():
-        return []
-    tps: List[int] = []
-    for entry in sorted(c_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        try:
-            tp = int(entry.name)
-        except ValueError:
-            continue
-        if shard_files_for_timepoint(level_dir, tp):
-            tps.append(tp)
-    return tps
+    return sorted({tp for tp, _ in timepoint_shards(level_dir)})
 
 
 def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
@@ -314,6 +375,10 @@ def check_fov_layout(fov_group: Path) -> Tuple[bool, str]:
     cke = data.get("chunk_key_encoding", {}) or {}
     if cke.get("name") != "default":
         return False, f"unexpected chunk_key_encoding.name: {cke.get('name')!r}"
+    try:
+        chunk_separator(fov_group / "0")
+    except ValueError as e:
+        return False, str(e)
 
     if list(chunk_shape[1:]) == list(shape[1:]):
         kind = "one shard per FOV-timepoint"
@@ -436,9 +501,10 @@ def gather_metadata_files(fov_group: Path) -> List[Path]:
         ftj = ft / "zarr.json"
         if ftj.is_file():
             out.append(ftj)
-        ft_chunk = ft / "c" / "0" / "0" / "0"
-        if ft_chunk.is_file():
-            out.append(ft_chunk)
+        if ftj.is_file():
+            ft_chunk = array_chunk_path(ft, (0, 0, 0))
+            if ft_chunk.is_file():
+                out.append(ft_chunk)
     return out
 
 
@@ -617,16 +683,31 @@ def _drop_already_submitted(task: UploadTask, submitted_files: Set[str]) -> Opti
 def delete_verified_locals(
     result: UploadResult,
     log_,
+    deletion_manifest: VerifiedUploadManifest,
 ) -> int:
-    """Delete only the local files the worker tagged as safe-to-delete.
+    """Delete a successful task's shards only with matching persisted records.
 
-    Strictly uses ``result.deletable_uploaded_paths``: shared metadata
-    files (``zarr.json``, ``frame_times``) are never touched, even on a
-    completed dataset, so the local tree remains a self-consistent OME-NGFF
-    pointer to whatever data has not yet been pruned.
+    Historical records are allowed after revalidating both copies. Explicit
+    roots must match; legacy records must match the full expected remote path.
     """
+    try:
+        deletion_manifest.refresh()
+    except OSError as e:
+        log_.warning(f"Retaining local files: cannot read upload manifest: {e}")
+        return 0
+    if not result.success:
+        return 0
     deleted = 0
     for local_path in result.deletable_uploaded_paths:
+        target = deletion_manifest.target
+        expected = local_to_remote_path(local_path, target.local_base, target.remote_root)
+        record = deletion_manifest.get(expected)
+        if record is None:
+            log_.warning(f"Retaining {local_path}: no matching successful manifest record for current remote root")
+            continue
+        if record.get("task_id") != result.task_id and not verify_manifest_copy(record, local_path, expected):
+            log_.warning(f"Retaining {local_path}: historical upload no longer matches local/remote content")
+            continue
         try:
             if os.path.isfile(local_path):
                 os.remove(local_path)
@@ -639,6 +720,31 @@ def delete_verified_locals(
 # ---------------------------------------------------------------------------
 # Top-level orchestration
 # ---------------------------------------------------------------------------
+
+
+def _read_verified_bytes_since(manifest_path: str, offset: int) -> Tuple[int, int]:
+    """Read complete new manifest records and return (verified bytes, offset).
+
+    Keep an incomplete trailing line for the next poll while the worker is
+    appending. A prior run's records are excluded by the caller's initial
+    offset at the end of the existing manifest.
+    """
+    if not os.path.exists(manifest_path):
+        return 0, offset
+    verified_bytes = 0
+    with open(manifest_path, "rb") as manifest:
+        manifest.seek(offset)
+        while True:
+            line_start = manifest.tell()
+            line = manifest.readline()
+            if not line or not line.endswith(b"\n"):
+                return verified_bytes, line_start
+            try:
+                n_bytes = json.loads(line).get("bytes")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(n_bytes, int) and n_bytes >= 0:
+                verified_bytes += n_bytes
 
 
 def run_backfill(
@@ -747,7 +853,8 @@ def run_backfill(
         ))
 
     manifest_path = str(experiment_dir / "upload_manifest_backfill.jsonl")
-    worker = UploadWorker(target=target, manifest_path=manifest_path)
+    deletion_manifest = VerifiedUploadManifest(manifest_path, target)
+    worker = UploadWorker(target=target, manifest_path=manifest_path, resume_manifest=True)
     worker.start()
     log.info(f"UploadWorker started (pid={worker.pid}), manifest -> {manifest_path}")
 
@@ -755,6 +862,36 @@ def run_backfill(
     # sees the net effect of the run.
     initial_size = measure_local_size_bytes(experiment_dir)
     log.info(f"local archive at start: {_format_bytes(initial_size)}")
+
+    # The worker writes one manifest record per verified file, often well
+    # before its enclosing task finishes. Polling new records keeps the rate
+    # visible even when a large task has not produced a result yet.
+    rate_interval_s = 60.0
+    manifest_offset = os.path.getsize(manifest_path) if os.path.exists(manifest_path) else 0
+    last_rate_poll = time.monotonic()
+    verified_bytes_total = 0
+
+    def poll_upload_rate(*, force: bool = False) -> None:
+        nonlocal manifest_offset, last_rate_poll, verified_bytes_total
+        now = time.monotonic()
+        elapsed = now - last_rate_poll
+        if not force and elapsed < rate_interval_s:
+            return
+        try:
+            verified_bytes, manifest_offset = _read_verified_bytes_since(
+                manifest_path, manifest_offset
+            )
+        except OSError as e:
+            log.debug(f"Could not poll upload manifest: {e}")
+            return
+        verified_bytes_total += verified_bytes
+        if elapsed > 0:
+            log.info(
+                f"Verified upload rate: {_format_bytes(verified_bytes / elapsed)}/s "
+                f"({_format_bytes(verified_bytes)} in {elapsed:.0f}s, "
+                f"{_format_bytes(verified_bytes_total)} this run)"
+            )
+        last_rate_poll = now
 
     # Submit every task.
     for t in tasks:
@@ -774,9 +911,12 @@ def run_backfill(
     t_start = time.time()
     try:
         while received < expected_results:
+            poll_upload_rate()
             try:
-                result: UploadResult = worker.output_queue.get(timeout=60.0)
+                timeout = max(0.1, rate_interval_s - (time.monotonic() - last_rate_poll))
+                result: UploadResult = worker.output_queue.get(timeout=timeout)
             except queue.Empty:
+                poll_upload_rate()
                 elapsed = int(time.time() - t_start)
                 log.info(f"Waiting on uploads... ({received}/{expected_results} done, {elapsed}s elapsed)")
                 continue
@@ -787,8 +927,8 @@ def run_backfill(
                     f"Task {result.task_id} (t={result.time_point} region={result.region_id} "
                     f"fov={result.fov}) FAILED: {result.error}"
                 )
-            elif delete_after_verify:
-                deleted_local += delete_verified_locals(result, log)
+            if delete_after_verify:
+                deleted_local += delete_verified_locals(result, log, deletion_manifest)
             if received % 10 == 0 or received == expected_results:
                 log.info(f"Progress: {received}/{expected_results} task(s) processed")
     except (KeyboardInterrupt, SystemExit) as e:
@@ -815,8 +955,8 @@ def run_backfill(
                     received += 1
                     if not result.success:
                         failed_files += len(result.failed_paths)
-                    elif delete_after_verify:
-                        deleted_local += delete_verified_locals(result, log)
+                    if delete_after_verify:
+                        deleted_local += delete_verified_locals(result, log, deletion_manifest)
             except (KeyboardInterrupt, SystemExit):
                 log.warning("Second interrupt during drain; bringing worker down immediately.")
         # Mirror the follow-mode logic: don't sit on a 30 s graceful join
@@ -842,6 +982,8 @@ def run_backfill(
             worker.close()
         except Exception:
             pass
+
+        poll_upload_rate(force=True)
 
         # Final size report so the operator sees the net effect of the run.
         # Logs a running total every 5 s during the walk so the user can
@@ -881,6 +1023,87 @@ def run_backfill(
         write_upload_complete_marker(experiment_dir, remote_root, manifest_path)
 
     return failed_files
+
+
+def submit_backfill_to_manager(
+    experiment_dir: Path,
+    remote_root: str,
+    delete_after_verify: bool,
+    in_progress: bool,
+) -> int:
+    """Discover a backfill and durably enqueue it in the detached manager."""
+    from control.core.upload_manager import normalize_path
+    from control.core.upload_manager_client import UploadManagerClient
+
+    if not experiment_dir.is_dir():
+        log.error(f"Experiment directory not found: {experiment_dir}")
+        return 1
+    fov_groups = find_fov_groups(experiment_dir)
+    if not fov_groups or not _validate_all_layouts(fov_groups):
+        log.error(f"No supported OME-Zarr FOV groups found under {experiment_dir}")
+        return 2
+    target = UploadTarget(True, remote_root, str(experiment_dir), delete_after_verify)
+    tasks: List[UploadTask] = []
+    for group in fov_groups:
+        tasks.extend(build_tasks_for_fov(group, experiment_dir, target, in_progress))
+        metadata = build_metadata_task(group, experiment_dir, target, in_progress)
+        if metadata:
+            tasks.append(metadata)
+    if not in_progress:
+        metadata_paths = gather_hcs_plate_metadata(experiment_dir) + gather_experiment_root_files(experiment_dir)
+        if metadata_paths:
+            tasks.append(
+                UploadTask(
+                    task_id=str(uuid4()), time_point=-1, region_id="(metadata)", fov=-1,
+                    files=[(str(path), local_to_remote_path(str(path), target.local_base, target.remote_root)) for path in metadata_paths],
+                    stable_read_paths={str(path) for path in metadata_paths},
+                )
+            )
+    client = UploadManagerClient()
+    snapshot = client.get_status()
+    dataset_id = None
+    for row in snapshot["datasets"]:
+        if (normalize_path(row["local_root"]) == normalize_path(str(experiment_dir))
+                and normalize_path(row["remote_root"]) == normalize_path(remote_root)
+                and row["state"] != "complete"):
+            dataset_id = row["id"]
+            break
+    if dataset_id is None:
+        dataset_id = str(uuid4())
+        client.register_dataset(
+            dataset_id=dataset_id,
+            name=experiment_dir.name,
+            local_root=str(experiment_dir),
+            remote_root=remote_root,
+            delete_after_verify=delete_after_verify,
+            deletion_mode="whole_task",
+        )
+    submitted_files = 0
+    for task in tasks:
+        values = []
+        for local, _remote in task.files:
+            stat = os.stat(local)
+            values.append(
+                {
+                    "relative_path": os.path.relpath(local, experiment_dir).replace("\\", "/"),
+                    "size": stat.st_size,
+                    "generation": (
+                        f"metadata:{stat.st_mtime_ns}:{stat.st_size}"
+                        if local in task.stable_read_paths else "1"
+                    ),
+                    "deletable": local in task.deletable_local_paths,
+                    "stable_read": local in task.stable_read_paths,
+                }
+            )
+        result = client.submit_batch(dataset_id, task.task_id, values, task_id=task.task_id)
+        submitted_files += result["file_count"]
+    if not in_progress:
+        client.seal_dataset(dataset_id)
+    log.info(
+        f"Queued {submitted_files} file(s) in Upload Manager (dataset {dataset_id}). "
+        "Transfers continue after this command exits."
+    )
+    return 0
 
 
 def measure_local_size_bytes(
@@ -1022,7 +1245,8 @@ def run_backfill_follow(
     if initial_groups and not _validate_all_layouts(initial_groups):
         return 2
     manifest_path = str(experiment_dir / "upload_manifest_backfill.jsonl")
-    worker = UploadWorker(target=target, manifest_path=manifest_path)
+    deletion_manifest = VerifiedUploadManifest(manifest_path, target)
+    worker = UploadWorker(target=target, manifest_path=manifest_path, resume_manifest=True)
     worker.start()
     log.info(
         f"UploadWorker started (pid={worker.pid}), manifest -> {manifest_path}. "
@@ -1091,8 +1315,8 @@ def run_backfill_follow(
                     f"Task {result.task_id} (t={result.time_point} "
                     f"region={result.region_id} fov={result.fov}) FAILED: {result.error}"
                 )
-            elif delete_after_verify:
-                deleted_local += delete_verified_locals(result, log)
+            if delete_after_verify:
+                deleted_local += delete_verified_locals(result, log, deletion_manifest)
         return n
 
     def maybe_report_local_size() -> None:
@@ -1486,6 +1710,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "criterion). Set this if you want the script to give up "
                              "on a backlog after a known time regardless of progress.")
     parser.add_argument("--dry-run", action="store_true", help="List planned uploads and exit.")
+    parser.add_argument("--manager", action="store_true",
+                        help="Submit to the persistent Upload Manager and exit after durable acknowledgement.")
     args = parser.parse_args(argv)
 
     if args.follow:
@@ -1500,6 +1726,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_idle_s=args.max_idle,
             drain_stall_window_s=args.drain_stall_window,
             drain_timeout_s=args.drain_timeout,
+        )
+
+    if args.manager and not args.dry_run:
+        return submit_backfill_to_manager(
+            experiment_dir=args.experiment_dir.resolve(),
+            remote_root=args.remote,
+            delete_after_verify=args.delete_after_verify,
+            in_progress=args.in_progress,
         )
 
     return run_backfill(

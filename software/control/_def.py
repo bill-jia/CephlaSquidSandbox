@@ -1157,14 +1157,13 @@ Z_HOME_SAFETY_MARGIN_UM = 100
 # safety point
 X_HOME_SAFETY_POINT = 0
 Y_HOME_SAFETY_POINT = 0
-Z_HOME_SAFETY_POINT = 100
+Z_HOME_SAFETY_POINT = OBJECTIVE_RETRACTED_POS_MM * 1000  # Legacy µm alias; homing uses the retraction position.
 
-# When the last stage position cache is missing or unreadable, move here after homing (mm).
+# Default workspace coordinates when the stage position cache is unavailable (mm).
+# Startup restores XY and remembers working Z while leaving Z retracted.
 STARTUP_DEFAULT_STAGE_X_MM = 30.0
 STARTUP_DEFAULT_STAGE_Y_MM = 15.0
-STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # 200 µm; kept above Z_HOME_SAFETY_POINT (0.1 mm) and the
-# z lower software limit (0.05 mm) so the post-homing restore moves *up* to it and never
-# triggers move_z_to's backlash dip into the lower limit (which could stall at the boundary).
+STARTUP_DEFAULT_STAGE_Z_MM = 0.2  # Default working Z; startup does not move Z here.
 
 USE_XERYON = False
 XERYON_SERIAL_NUMBER = "95130303033351E02050"
@@ -1191,11 +1190,12 @@ ZARR_COMPRESSION = ZarrCompression.BALANCED
 #            z-slice once all its channels arrive, synchronously with the
 #            z-outer/channel-inner acquisition loop. No per-frame read-modify-
 #            write of a giant shard => ~30x faster writeback on deep stacks.
-#   False -> legacy one shard per FOV-timepoint (1, C, Z, Y, X), committed in
-#            one burst (fewest files, but must buffer the whole FOV).
-# Reads are identical either way (the inner chunk is one plane). Flip to False
-# for an instant rollback to the legacy layout.
-ZARR_SHARD_PER_Z = True
+#   False -> one shard per FOV-timepoint (1, C, Z, Y, X), buffered and committed
+#            once per level. Oversized/incomplete stacks use bounded disk spill.
+# Reads are identical either way (the inner chunk is one plane).
+ZARR_SHARD_PER_Z = False
+# Flat filenames avoid a directory for every coordinate. Use "/" for the old layout.
+ZARR_CHUNK_SEPARATOR = "."
 
 # Flexible (non-wellplate) multipoint saves as an OME-NGFF HCS plate.
 #   True (default) -> each scan region is mapped to a synthetic plate well, so a

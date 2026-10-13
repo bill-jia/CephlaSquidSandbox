@@ -12,15 +12,17 @@ Each FOV's group holds:
 - frame_times (optional): float64 array of shape (T, C, Z), unix timestamps.
 - zarr.json with OME-NGFF multiscales + omero + a _squid.manifest_path pointer.
 
-Chunks are always (1, 1, 1, Y, X); shards are always (1, C, Z, Y, X) regardless
-of compression. Pyramid levels are opened at initialize() and written inline
-on every write_frame() so finalize() does no heavy work.
+Chunks are always (1, 1, 1, Y, X). By default, one shard holds a complete
+(1, C, Z, Y, X) stack with a flat coordinate filename. Per-z sharding and
+slash-separated keys are also supported. Pyramids are written when a shard
+completes; finalize preserves any remaining partial stacks.
 """
 
 import asyncio
 import json
 import math
 import os
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +30,7 @@ import numpy as np
 
 import squid.logging
 from control._def import ZarrCompression
+from control.core.zarr_layout import chunk_key
 
 log = squid.logging.get_logger(__name__)
 
@@ -70,12 +73,13 @@ class ZarrAcquisitionConfig:
             experiment's ``acquisition.yaml``. Stored in ``_squid.manifest_path``.
         max_pyramid_levels: Maximum number of additional resolution levels.
         min_pyramid_dim_px: Stop generating levels once ``min(Y, X) < this``.
-        shard_per_z: When True (default), each shard is one z-slice
+        shard_per_z: When True, each shard is one z-slice
             ``(1, C, 1, Y, X)``, committed once that z is fully captured —
             synchronous with the z-outer/channel-inner acquisition loop, tiny
             buffer, no per-frame read-modify-write of a giant shard. When False,
-            the shard is the whole FOV timepoint ``(1, C, Z, Y, X)`` (the legacy
-            layout) and is committed in one burst. See :func:`_level_shard_shape`.
+            the shard is the whole FOV timepoint ``(1, C, Z, Y, X)`` (default)
+            and is committed in one burst. See :func:`_level_shard_shape`.
+        chunk_separator: Dot gives flat filenames; slash supports the old layout.
     """
 
     output_path: str
@@ -90,9 +94,10 @@ class ZarrAcquisitionConfig:
     compression: ZarrCompression = ZarrCompression.BALANCED
     translation_um: Tuple[float, float] = (0.0, 0.0)
     manifest_path: Optional[str] = None
-    max_pyramid_levels: int = 5
+    max_pyramid_levels: int = 0
     min_pyramid_dim_px: int = 128
-    shard_per_z: bool = True
+    shard_per_z: bool = False
+    chunk_separator: str = "."
     squid_extras: Dict[str, Any] = field(default_factory=dict)
     """Extra keys merged into the FOV group's ``_squid`` block (e.g. the
     originating region name and FOV index for a synthetic HCS plate)."""
@@ -298,17 +303,25 @@ def _compute_pyramid_shapes(y: int, x: int, max_levels: int, min_dim_px: int) ->
 class ZarrWriter:
     """Zarr v3 writer for OME-NGFF per-FOV output with streaming pyramid.
 
-    Opens level 0 + N pyramid levels at ``initialize()``. Each ``write_frame()``
-    cascades through ``cv2.pyrDown`` and submits async writes to every level.
-    All pending writes are awaited at ``finalize()``; pyramid generation does no
-    extra read/write work after acquisition.
+    Opens level 0 + N pyramid levels at ``initialize()``. Complete shards are
+    written once per level, with pyramids computed from buffered image planes.
+    Finalization flushes partial data and awaits every outstanding write.
     """
 
     # Maximum number of TensorStore write futures to accumulate before draining.
     MAX_PENDING_WRITES = 32
+    # Shared across writers in one saving process. Large/incomplete stacks spill
+    # to local shards without becoming eligible for upload until complete.
+    MAX_BUFFERED_STACK_BYTES = 256 * 1024**2
+    _stack_writers = weakref.WeakSet()
 
     def __init__(self, config: ZarrAcquisitionConfig):
         self._config = config
+        chunk_key((), config.chunk_separator)  # validate before creating files
+        self._pending_stacks: Dict[int, Dict[Tuple[int, int], np.ndarray]] = {}
+        self._stack_seen: Dict[int, set] = {}
+        self._buffered_stack_bytes = 0
+        self._stack_writers.add(self)
         self._level_datasets: List[Any] = []  # index = pyramid level, value = TensorStore
         self._level_shapes: List[Tuple[int, int]] = []  # (y, x) per level
         self._frame_times_dataset: Optional[Any] = None
@@ -325,7 +338,7 @@ class ZarrWriter:
         # Buffered planes for z-slices not yet committed, keyed by (t, z) ->
         # {c: image}. In shard-per-z mode a z-slice's channels accumulate here
         # until all C arrive, then the whole (1, C, 1, Y, X) shard is written
-        # once. Empty (unused) in legacy per-FOV mode.
+        # once. Whole-stack mode uses _pending_stacks instead.
         self._pending_z: Dict[Tuple[int, int], Dict[int, np.ndarray]] = {}
         # Shard grid cells written since the last upload barrier drained them,
         # as (t, z_grid) where z_grid is the z index (shard-per-z) or 0 (per-FOV).
@@ -387,11 +400,11 @@ class ZarrWriter:
         shard-per-z mode the z axis is one cell per slice so ``z_grid`` is the z
         index; in legacy per-FOV mode the shard spans all z so ``z_grid`` is 0.
         """
-        return os.path.join(self._level_path(level), "c", str(t), "0", str(z_grid), "0", "0")
+        return os.path.join(self._level_path(level), chunk_key((t, 0, z_grid, 0, 0), self._config.chunk_separator))
 
     def _frame_times_shard_path(self) -> str:
         """Single chunk file backing the ``frame_times`` (T, C, Z) array."""
-        return os.path.join(self._frame_times_path(), "c", "0", "0", "0")
+        return os.path.join(self._frame_times_path(), chunk_key((0, 0, 0), self._config.chunk_separator))
 
     def drain_unstaged_shard_paths(self) -> List[str]:
         """Shard files for every shard cell written since the last drain.
@@ -432,7 +445,10 @@ class ZarrWriter:
         return paths
 
     def metadata_paths(self) -> List[str]:
-        """Shared metadata files — **uploaded every barrier, never deleted**.
+        """Shared metadata candidates — queued every barrier, never deleted.
+
+        UploadWorker skips content already successfully uploaded, under a
+        per-destination lock. A failed transfer never suppresses the next try.
 
         All of these are written once at ``initialize()`` and rewritten only at
         ``finalize()`` (the group-level, per-level and ``frame_times``
@@ -483,7 +499,7 @@ class ZarrWriter:
         if compression_codec is not None:
             inner_codecs.append(compression_codec)
 
-        # Always shard: outer chunk = shard = (1, C, Z, Y, X), inner chunk = (1, 1, 1, Y, X).
+        # Outer chunk follows the shard mode; inner chunk is always one plane.
         codecs = [
             {
                 "name": "sharding_indexed",
@@ -504,7 +520,7 @@ class ZarrWriter:
             "metadata": {
                 "shape": list(shape),
                 "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(shard_shape)}},
-                "chunk_key_encoding": {"name": "default"},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": config.chunk_separator}},
                 "data_type": _dtype_to_zarr(config.dtype),
                 "codecs": codecs,
                 "fill_value": 0,
@@ -524,7 +540,7 @@ class ZarrWriter:
             "metadata": {
                 "shape": list(shape),
                 "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(shape)}},
-                "chunk_key_encoding": {"name": "default"},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": config.chunk_separator}},
                 "data_type": "float64",
                 "codecs": [
                     {"name": "bytes", "configuration": {"endian": "little"}},
@@ -691,12 +707,10 @@ class ZarrWriter:
     def write_frame(self, image: np.ndarray, t: int, c: int, z: int) -> None:
         """Hand one plane to the writer (level 0 + all pyramid levels).
 
-        In shard-per-z mode (default) the plane is buffered until its z-slice
+        In shard-per-z mode the plane is buffered until its z-slice
         has all channels, then the whole ``(1, C, 1, Y, X)`` shard is committed
-        once — no per-frame read-modify-write of a giant shard. In legacy
-        per-FOV mode each plane is written as an individual chunk and pyramids
-        cascade per frame. Pending futures are drained when the in-flight pool
-        exceeds MAX_PENDING_WRITES.
+        once. In per-FOV mode the complete stack is buffered and written once
+        per level. A bounded spill path handles unusually large/incomplete stacks.
         """
         if not self._initialized:
             raise RuntimeError("Writer not initialized. Call initialize() first.")
@@ -722,28 +736,68 @@ class ZarrWriter:
             if len(self._pending_z[(t, z)]) >= config.c_size:
                 self._commit_z(t, z)
         else:
-            # Legacy per-FOV shard: write each plane as its own chunk into the
-            # one big (1, C, Z, Y, X) shard and cascade pyramids per frame.
-            self._unstaged_shards.add((t, 0))
-            self._pending_futures.append(self._level_datasets[0][t, c, z, :, :].write(image))
-            if len(self._level_datasets) > 1:
-                try:
-                    import cv2
-                except ImportError:
-                    log.warning("cv2 not available, skipping pyramid generation for this frame")
-                else:
-                    current = image
-                    for level in range(1, len(self._level_datasets)):
-                        expected_y, expected_x = self._level_shapes[level]
-                        current = cv2.pyrDown(current)
-                        if current.shape != (expected_y, expected_x):
-                            current = cv2.resize(current, (expected_x, expected_y), interpolation=cv2.INTER_AREA)
-                        if current.dtype != config.dtype:
-                            current = current.astype(config.dtype)
-                        self._pending_futures.append(self._level_datasets[level][t, c, z, :, :].write(current))
+            planes = self._pending_stacks.setdefault(t, {})
+            previous = planes.get((c, z))
+            self._buffered_stack_bytes += image.nbytes - (previous.nbytes if previous is not None else 0)
+            planes[(c, z)] = image
+            self._stack_seen.setdefault(t, set()).add((c, z))
+            if len(self._stack_seen[t]) == config.c_size * config.z_size:
+                self._commit_stack(t)
+            # Bound retained images across every FOV/store in this process.
+            # Spill writes are awaited before releasing their buffers. They do
+            # not advertise incomplete shards to the uploader.
+            while sum(w._buffered_stack_bytes for w in self._stack_writers) > self.MAX_BUFFERED_STACK_BYTES:
+                victim = max(self._stack_writers, key=lambda w: w._buffered_stack_bytes)
+                victim._commit_stack(next(iter(victim._pending_stacks)), spill=True)
 
         if len(self._pending_futures) >= self.MAX_PENDING_WRITES:
             self._drain_completed_futures()
+
+    def _commit_stack(self, t: int, *, spill: bool = False, final: bool = False) -> None:
+        """Commit a complete stack once, or safely spill just the received planes.
+
+        Spilled/missing planes must not be replaced with zeros: they may already
+        exist on disk. Only a complete in-memory stack gets a whole-shard write.
+        Incomplete shards become uploadable only at finalization.
+        """
+        config = self._config
+        planes = self._pending_stacks.get(t, {})
+        expected = config.c_size * config.z_size
+        complete = len(self._stack_seen.get(t, ())) == expected
+        whole = len(planes) == expected and sum(p.nbytes for p in planes.values()) <= self.MAX_BUFFERED_STACK_BYTES
+        current = dict(planes)
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+        for level, (y, x) in enumerate(self._level_shapes):
+            if level:
+                if cv2 is None:
+                    log.warning("cv2 not available, skipping pyramid generation for stack")
+                    break
+                reduced = {}
+                for index, plane in current.items():
+                    down = cv2.pyrDown(plane)
+                    if down.shape != (y, x):
+                        down = cv2.resize(down, (x, y), interpolation=cv2.INTER_AREA)
+                    reduced[index] = down.astype(config.dtype, copy=False)
+                current = reduced
+            if whole:
+                stack = np.empty((config.c_size, config.z_size, y, x), dtype=config.dtype)
+                for (c, z), plane in current.items():
+                    stack[c, z] = plane
+                self._pending_futures.append(self._level_datasets[level][t, :, :, :, :].write(stack))
+            else:
+                for (c, z), plane in current.items():
+                    self._pending_futures.append(self._level_datasets[level][t, c, z, :, :].write(plane))
+            # Keep transient arrays/futures bounded too; preserve buffered
+            # planes and propagate errors instead of advertising failed data.
+            self._wait_for_image_writes()
+        self._buffered_stack_bytes -= sum(p.nbytes for p in planes.values())
+        self._pending_stacks.pop(t, None)
+        if (complete or final) and not spill:
+            self._unstaged_shards.add((t, 0))
+            self._stack_seen.pop(t, None)
 
     def _commit_z(self, t: int, z: int) -> None:
         """Write the ``(1, C, 1, Y, X)`` shard for z-slice ``(t, z)`` once.
@@ -819,6 +873,9 @@ class ZarrWriter:
         ``final=True`` (finalize) commits whatever is left, so a short or
         aborted FOV keeps the frames it did capture.
         """
+        for t in list(self._stack_seen):
+            if final or len(self._stack_seen[t]) == self._config.c_size * self._config.z_size:
+                self._commit_stack(t, final=final)
         for t, z in list(self._pending_z.keys()):
             if not final and len(self._pending_z[(t, z)]) < self._config.c_size:
                 continue
@@ -887,9 +944,8 @@ class ZarrWriter:
     def wait_for_pending(self, timeout_s: Optional[float] = None) -> int:
         """Block until all pending writes complete; re-raise the first error.
 
-        Commits any *complete* buffered z-slice first so it is on disk before
-        the barrier awaits the futures. Slices still missing channels stay
-        buffered — see :meth:`_flush_pending_z`.
+        Commits complete buffered stacks/slices before awaiting the futures.
+        Incomplete shards remain local until completion or finalization.
 
         Only **image** write failures propagate. Timestamp writes are awaited
         too (the caller needs them settled before uploading ``frame_times``)
@@ -898,6 +954,9 @@ class ZarrWriter:
         """
         self._flush_pending_z()
         self._wait_for_pending_time_futures()
+        return self._wait_for_image_writes()
+
+    def _wait_for_image_writes(self) -> int:
         if not self._pending_futures:
             return 0
         count = len(self._pending_futures)
@@ -936,8 +995,8 @@ class ZarrWriter:
     def finalize(self) -> None:
         """Flush pending writes and mark ``acquisition_complete=True``.
 
-        Pyramid is already populated incrementally, so this only awaits I/O
-        and updates the completion flag — no read-back, no extra compute.
+        Flush partial stacks/slices (including their pyramids), await I/O, and
+        update the completion flag. Final upload barriers stage these tails.
         """
         if self._finalized:
             log.warning("Writer already finalized")
@@ -949,14 +1008,7 @@ class ZarrWriter:
         self._flush_pending_z(final=True)
         self.wait_for_pending()
         if self._unstaged_shards:
-            # Upload staging never picked these cells up (their level-0 shard
-            # never appeared — all-fill frames, or writes that never landed).
-            # Purely informational for the streaming pipeline; the local
-            # dataset itself is complete.
-            log.info(
-                f"{len(self._unstaged_shards)} shard cell(s) were never staged "
-                f"for upload (no level-0 file): {sorted(self._unstaged_shards)[:10]}"
-            )
+            log.debug(f"{len(self._unstaged_shards)} shard cell(s) available for final upload staging")
         self._set_squid_flag("acquisition_complete", True)
         self._finalized = True
         self._cleanup_event_loop()
@@ -969,6 +1021,9 @@ class ZarrWriter:
             self._pending_futures.clear()
             self._pending_time_futures.clear()
             self._pending_z.clear()
+            self._pending_stacks.clear()
+            self._stack_seen.clear()
+            self._buffered_stack_bytes = 0
             self._set_squid_flag("acquisition_complete", False)
             self._set_squid_flag("aborted", True)
         finally:

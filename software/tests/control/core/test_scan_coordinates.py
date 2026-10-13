@@ -34,6 +34,48 @@ def _make_scan_coordinates(fov_w_mm: float = 1.0, fov_h_mm: float = 1.0) -> Scan
     return ScanCoordinates(objective_store, stage, camera)
 
 
+@pytest.mark.parametrize("mode, initial, rebuilt", [
+    ("distance", (2.0, 3.0), (2.0, 3.0)),
+    ("fov", (2.0, 1.5), (1.0, 0.75)),
+])
+@pytest.mark.parametrize("z", [None, 0.7])
+def test_spaced_grid_rebuild_preserves_pitch_units_and_z(mode, initial, rebuilt, z):
+    sc = _make_scan_coordinates(1.0, 0.5)
+    sc.add_flexible_region("spaced", 30, 30, z, 3, 2,
+                           spacing_mode=mode, spacing_x=2, spacing_y=3)
+    for expected in (initial, rebuilt):
+        coords = sc.region_fov_coordinates["spaced"]
+        xs = sorted(set(p[0] for p in coords))
+        ys = sorted(set(p[1] for p in coords))
+        assert len(coords) == 6
+        assert xs[1] - xs[0] == pytest.approx(expected[0])
+        assert ys[1] - ys[0] == pytest.approx(expected[1])
+        assert sum(xs) / len(xs) == pytest.approx(30)
+        assert sum(ys) / len(ys) == pytest.approx(30)
+        assert all(len(p) == (2 if z is None else 3) for p in coords)
+        if z is not None:
+            assert all(p[2] == z for p in coords)
+        sc.regenerate_for_fov(0.5, 0.25)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_spaced_grid_rejects_invalid_pitch(value):
+    sc = _make_scan_coordinates()
+    with pytest.raises(ValueError, match="spacing"):
+        sc.add_flexible_region("bad", 30, 30, None, 2, 2,
+                               spacing_mode="distance", spacing_x=value)
+
+
+def test_live_well_grid_forwards_spacing_without_z():
+    sc = _make_scan_coordinates(1.0, 0.5)
+    sc.set_live_scan_coordinates_grid(30, 30, 2, 2, 10,
+                                      spacing_mode="fov", spacing_x=3, spacing_y=2)
+    coords = sc.region_fov_coordinates["current"]
+    assert sorted(set(p[0] for p in coords)) == [28.5, 31.5]
+    assert sorted(set(p[1] for p in coords)) == [29.5, 30.5]
+    assert all(len(p) == 2 for p in coords)
+
+
 def test_regenerate_for_fov_retiles_regions():
     """regenerate_for_fov rebuilds flexible/well/manual grids for a new FOV.
 

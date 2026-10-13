@@ -23,7 +23,6 @@ class CephlaStage(AbstractStage):
         super().__init__(stage_config)
         self._microcontroller = microcontroller
         self._homing_done = False
-        self._scanning_position_z_mm = None
 
         # TODO(imo): configure theta here?  Do we ever have theta?
         self._configure_axis(_def.AXIS.X, stage_config.X_AXIS)
@@ -69,6 +68,7 @@ class CephlaStage(AbstractStage):
             )
 
     def move_z(self, rel_mm: float, blocking: bool = True):
+        self._begin_z_move()
         # From Hongquan, we want the z axis to rest on the "up" (wrt gravity) direction of gravity. So if we
         # are moving in the negative (down) z direction, we need to move past our mark a bit then
         # back up.  If we are already moving in the "up" position, we can move straight there.
@@ -100,6 +100,7 @@ class CephlaStage(AbstractStage):
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(final_rel_move_raw_mm, self.get_config().Z_AXIS.MAX_SPEED)
             )
+        self.get_pos()
 
     def move_x_to(self, abs_mm: float, blocking: bool = True):
         abs_mm_raw = self._config.X_AXIS.canonical_to_raw(abs_mm)
@@ -124,7 +125,16 @@ class CephlaStage(AbstractStage):
         # Backlash compensation and MIN_POSITION clamping operate in the raw frame.
         abs_mm_raw = self._config.Z_AXIS.canonical_to_raw(abs_mm)
         current_z_raw = self._config.Z_AXIS.canonical_to_raw(self.get_pos().z_mm)
-        need_clear_backlash = abs_mm_raw < current_z_raw
+        target_z_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(abs_mm_raw)
+        current_z_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(current_z_raw)
+        # Rounded motor positions can differ from the requested mm by a fraction
+        # of a step. Reissuing the same target must not introduce a backlash dip.
+        if target_z_usteps == current_z_usteps and not self._microcontroller.is_busy():
+            return
+        self._begin_z_move()
+        # Retraction is a direct safety move; do not overshoot and then raise the
+        # objective again to take up backlash. Working Z moves retain compensation.
+        need_clear_backlash = abs_mm_raw < current_z_raw and not self._z_retraction_in_progress
 
         # NOTE(imo): It seems really tricky to only clear backlash if via the blocking call?
         if blocking and need_clear_backlash:
@@ -142,11 +152,12 @@ class CephlaStage(AbstractStage):
                     )
                 )
 
-        self._microcontroller.move_z_to_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(abs_mm_raw))
+        self._microcontroller.move_z_to_usteps(target_z_usteps)
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(abs_mm - self.get_pos().z_mm, self.get_config().Z_AXIS.MAX_SPEED)
             )
+        self.get_pos()
 
     def get_pos(self) -> Pos:
         pos_usteps = self._microcontroller.get_pos()
@@ -154,6 +165,7 @@ class CephlaStage(AbstractStage):
         y_mm = self._config.Y_AXIS.raw_to_canonical(self._config.Y_AXIS.convert_to_real_units(pos_usteps[1]))
         z_mm = self._config.Z_AXIS.raw_to_canonical(self._config.Z_AXIS.convert_to_real_units(pos_usteps[2]))
         theta_rad = self._config.THETA_AXIS.convert_to_real_units(pos_usteps[3])
+        self._update_z_position(z_mm)
 
         return Pos(x_mm=x_mm, y_mm=y_mm, z_mm=z_mm, theta_rad=theta_rad)
 
@@ -161,6 +173,8 @@ class CephlaStage(AbstractStage):
         return StageStage(busy=self._microcontroller.is_busy())
 
     def home(self, x: bool, y: bool, z: bool, theta: bool, blocking: bool = True):
+        if z:
+            self._begin_z_move()
         # NOTE(imo): Arbitrarily use max speed / 5 for homing speed.  It'd be better to have it exactly!
         x_timeout = self._calc_move_timeout(
             self.get_config().X_AXIS.MAX_POSITION - self.get_config().X_AXIS.MIN_POSITION,
@@ -203,6 +217,8 @@ class CephlaStage(AbstractStage):
             self._microcontroller.wait_till_operation_is_completed(theta_timeout)
 
     def zero(self, x: bool, y: bool, z: bool, theta: bool, blocking: bool = True):
+        if z:
+            self._begin_z_move()
         if x:
             self._microcontroller.zero_x()
         if blocking:

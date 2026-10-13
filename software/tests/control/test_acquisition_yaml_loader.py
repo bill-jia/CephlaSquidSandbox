@@ -12,6 +12,22 @@ from control.acquisition_yaml_loader import (
 )
 
 
+def test_validation_and_order_settings_are_loaded_together(tmp_path):
+    path = tmp_path / "acquisition.yaml"
+    path.write_text(
+        "acquisition:\n"
+        "  validation_mode: true\n"
+        "  validation_with_imaging: true\n"
+        "  snake_observation_states: true\n"
+        "  loop_order: [C, Pos, T, Z]\n",
+        encoding="utf-8",
+    )
+    data = parse_acquisition_yaml(str(path))
+    assert data.validation_mode and data.validation_with_imaging
+    assert data.snake_observation_states
+    assert data.acquisition_order == ("C", "Pos", "T", "Z")
+
+
 class TestParseAcquisitionYAML:
     """Tests for parse_acquisition_yaml function."""
 

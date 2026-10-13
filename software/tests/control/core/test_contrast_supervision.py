@@ -291,7 +291,7 @@ def test_supervision_runs_before_channel_offset_and_counts_completed_fov_once(nz
         events.append(("supervision", stage.z)), setattr(stage, "z", 1.002))
     event = SimpleNamespace(is_wait=False, acquire_z_stack=True, is_stimulus=False,
                             observation_state="imaging", multiplexed_leds=None,
-                            postprocess=None, postprocess_group=None)
+                            postprocess=None, postprocess_group=None, state_frame_index=0)
     worker._get_region_plan = lambda region: SimpleNamespace(captured_frames_per_position=1,
                                                                events=[event])
     worker._apply_observation_state = lambda name: SimpleNamespace(is_stimulus_only=False)
@@ -302,10 +302,10 @@ def test_supervision_runs_before_channel_offset_and_counts_completed_fov_once(nz
                                       setattr(worker.piezo if use_piezo else stage,
                                               "position" if use_piezo else "z",
                                               98.0 if use_piezo else stage.z - 0.002))
-    worker.move_z_for_stack = lambda: setattr(worker.piezo if use_piezo else stage,
+    worker.move_z_for_stack = lambda delta_levels=1: setattr(worker.piezo if use_piezo else stage,
                                               "position" if use_piezo else "z",
                                               (worker.piezo.position + 4) if use_piezo else stage.z + 0.004)
-    worker.move_z_back_after_stack = lambda: setattr(worker.piezo if use_piezo else stage,
+    worker.move_z_back_after_stack = lambda last_z_level=None: setattr(worker.piezo if use_piezo else stage,
                                                      "position" if use_piezo else "z",
                                                      100.0 if use_piezo else 1.002)
     worker._reference_z_level = lambda: 0
@@ -591,7 +591,7 @@ def test_requested_baseline_verification_commits_before_normal_fov_imaging():
         score=80 if z_um in (999, 1001) else 100, brightness=100, noise=5, reason="good")
     event = SimpleNamespace(is_wait=False, acquire_z_stack=True, is_stimulus=False,
                             observation_state="imaging", multiplexed_leds=None,
-                            postprocess=None, postprocess_group=None)
+                            postprocess=None, postprocess_group=None, state_frame_index=0)
     worker._get_region_plan = lambda region: SimpleNamespace(events=[event], captured_frames_per_position=1)
     worker._apply_observation_state = lambda name: SimpleNamespace(is_stimulus_only=False)
     worker._reference_z_level = lambda: 0

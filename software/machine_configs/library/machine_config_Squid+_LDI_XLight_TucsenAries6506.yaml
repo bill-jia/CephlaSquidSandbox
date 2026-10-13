@@ -246,9 +246,9 @@ devices:
       emission_filter_wheel:
         name: "XLight emission wheel"
         positions:
-          1: "Quad"
-          2: "528/38 (GFP)"
-          3: "Position 3"
+          1: "446/523/600/677 (TagBFP/GFP/mCherry/Cy5)"
+          2: "525/45 (GFP)"
+          3: "457/50 (TagBFP/DAPI)"
           4: "Position 4"
           5: "Position 5"
           6: "Position 6"
@@ -319,6 +319,7 @@ software:
     use_napari_for_live_view: false
     use_napari_for_mosaic: true
   acquisition:
+    max_pending_jobs: 50  # Pause capture at this many unfinished jobs; increase to allow a larger backlog.
     image_format: tif
     scaling_factor: 0.85
     dx: 0.9

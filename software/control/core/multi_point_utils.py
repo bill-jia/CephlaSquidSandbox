@@ -81,6 +81,8 @@ class AcquisitionParameters:
     # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
     # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.
     tiling_method: str = "fraction"
+    tile_spacing: Dict = field(default_factory=dict)
+    acquisition_order: Optional[Tuple[str, ...]] = None
     # Bracket every XY move that enters a region with a retract to
     # OBJECTIVE_RETRACTED_POS_MM (Z home, blocking) and a return to the target
     # Z. Covers the first move of the run and the end-of-run return to the
@@ -91,6 +93,8 @@ class AcquisitionParameters:
     file_saving_option: FileSavingOption = FileSavingOption.INDIVIDUAL_IMAGES
     # Software trigger: if True, skip turn_off_illumination after each frame until channel changes
     keep_illuminators_on_between_captures: bool = False
+    # Alternate simple Z/event traversal or advanced atomic step/group order per FOV.
+    snake_observation_states: bool = False
 
     # Downsampled view generation parameters
     generate_downsampled_views: bool = False

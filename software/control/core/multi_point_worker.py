@@ -36,6 +36,8 @@ from control.microcontroller import Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
 from control.models.observation_state import ObservationState
+from control.models.acquisition_order import DEFAULT_ORDER, validate_order
+from control.core.ordered_acquisition import OrderedAcquisitionMixin
 from control.core.waveform_observation_state import (
     build_pulse_waveform_for_state,
     nidaq_lines_for_state,
@@ -622,13 +624,14 @@ class _BackgroundUploadDrainer:
             return
         from uuid import uuid4
         from control.core.zarr_upload import UploadTask, local_to_remote_path
+        from control.core.zarr_layout import array_chunk_path
 
         meta_files: List[str] = []
         for root, dirs, files in os.walk(self._experiment_path):
             if "zarr.json" in files:
                 meta_files.append(os.path.join(root, "zarr.json"))
-            if os.path.basename(root) == "frame_times":
-                chunk = os.path.join(root, "c", "0", "0", "0")
+            if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                chunk = str(array_chunk_path(root, (0, 0, 0)))
                 if os.path.isfile(chunk):
                     meta_files.append(chunk)
         if not meta_files:
@@ -1141,7 +1144,7 @@ class _BackgroundUploadDrainer:
         return clean
 
 
-class MultiPointWorker:
+class MultiPointWorker(OrderedAcquisitionMixin):
     def __init__(
         self,
         scope: Microscope,
@@ -1344,6 +1347,9 @@ class MultiPointWorker:
         )
         self.z_stacking_config = acquisition_parameters.z_stacking_config  # default 'from bottom'
         self.z_range = acquisition_parameters.z_range
+        self.snake_observation_states = acquisition_parameters.snake_observation_states
+        self.acquisition_order = validate_order(acquisition_parameters.acquisition_order or DEFAULT_ORDER)
+        self._explicit_acquisition_order = acquisition_parameters.acquisition_order is not None
 
         self.t_dpc = []
         self.t_inf = []
@@ -1653,10 +1659,9 @@ class MultiPointWorker:
             mode_str = "HCS plate hierarchy" if is_hcs else "per-FOV 5D (OME-NGFF compliant)"
             self._log.info(f"ZARR_V3 output: {mode_str}, base path: {self.experiment_path}")
 
-        # Live ZARR_V3 upload (per-acquisition setting). When enabled, spawn a
-        # dedicated UploadWorker process and wire its input queue into the
-        # SaveZarrJob runner. Acquisition continues even if the network is
-        # down — uploads queue, deletions defer.
+        # Live ZARR_V3 upload (per-acquisition setting). The detached Upload
+        # Manager owns transfer processes and durable queue state. This worker
+        # only gives writer subprocesses its dataset identity.
         self._upload_target: Optional[UploadTarget] = None
         self._upload_worker: Optional[UploadWorker] = None
         self._save_zarr_runner: Optional[JobRunner] = None
@@ -1697,17 +1702,23 @@ class MultiPointWorker:
                 remote_root=remote_experiment_root,
                 local_base=self.experiment_path,
                 delete_after_verify=acquisition_parameters.zarr_upload_delete_after_verify,
+                manager_owned=True,
             )
-            manifest_path = os.path.join(self.experiment_path, "upload_manifest.jsonl")
-            self._upload_worker = UploadWorker(
-                target=self._upload_target, manifest_path=manifest_path
+            from uuid import uuid4
+            from control.core.upload_manager_client import UploadManagerClient
+
+            dataset_id = str(uuid4())
+            UploadManagerClient().register_dataset(
+                dataset_id=dataset_id,
+                name=os.path.basename(os.path.normpath(self.experiment_path)),
+                local_root=self.experiment_path,
+                remote_root=remote_experiment_root,
+                delete_after_verify=self._upload_target.delete_after_verify,
+                deletion_mode="individual",
             )
-            self._upload_worker.start()
-            # Reachable by the app-close/atexit kill path from the moment it
-            # exists — NOT only once the end-of-run drainer takes ownership.
-            register_live_upload_worker(self._upload_worker)
+            self._upload_target.manager_dataset_id = dataset_id
             self._log.info(
-                f"Started UploadWorker (pid={self._upload_worker.pid}) "
+                f"Registered persistent upload dataset {dataset_id} "
                 f"-> {self._upload_target.remote_root}, "
                 f"delete_after_verify={self._upload_target.delete_after_verify}"
             )
@@ -2237,7 +2248,16 @@ class MultiPointWorker:
                 finally:
                     self.laser_auto_focus_controller._timing = saved_af_timing
 
-            while self.time_point < self.Nt:
+            ordered_run = (
+                self._explicit_acquisition_order and not self.validation_mode
+                and (self.acquisition_order != DEFAULT_ORDER or self.snake_observation_states)
+            )
+            if ordered_run:
+                self.run_ordered_acquisition()
+                if not self.abort_requested_fn():
+                    self.time_point = self.Nt
+
+            while not ordered_run and self.time_point < self.Nt:
                 # check if abort acquisition has been requested
                 if self.abort_requested_fn():
                     self._log.debug("In run, abort_acquisition_requested=True")
@@ -2532,6 +2552,64 @@ class MultiPointWorker:
             # The upload drainer waits on this before its "post-finalize"
             # metadata resync — only now is every zarr.json actually final.
             runners_exited_event.set()
+            if self._upload_target is not None and self._upload_target.manager_owned:
+                try:
+                    from control.core.upload_manager_client import UploadManagerClient
+                    from control.core.zarr_upload import collect_sidecar_files
+                    from control.core.zarr_layout import array_chunk_path
+                    from uuid import uuid4
+
+                    final_paths = set(
+                        collect_sidecar_files(
+                            self.experiment_path,
+                            {
+                                "upload_manifest.jsonl",
+                                "upload_manifest_backfill.jsonl",
+                                "RAW_DATA_UPLOADED.txt",
+                                "UPLOAD_INCOMPLETE.txt",
+                            },
+                        )
+                    )
+                    # Include every level of zarr hierarchy, including plate,
+                    # row, well, ragged, and derived-output metadata that is
+                    # outside any per-FOV writer's metadata_paths().
+                    for root, _dirs, files in os.walk(self.experiment_path):
+                        if "zarr.json" in files:
+                            final_paths.add(os.path.join(root, "zarr.json"))
+                        if os.path.basename(root) == "frame_times" and "zarr.json" in files:
+                            chunk = str(array_chunk_path(root, (0, 0, 0)))
+                            if os.path.isfile(chunk):
+                                final_paths.add(chunk)
+                    final_files = []
+                    for local_path in sorted(final_paths):
+                        stat = os.stat(local_path)
+                        final_files.append(
+                            {
+                                "relative_path": os.path.relpath(
+                                    local_path, self.experiment_path
+                                ).replace("\\", "/"),
+                                "size": stat.st_size,
+                                "generation": f"final:{stat.st_mtime_ns}:{stat.st_size}",
+                                "deletable": False,
+                                "stable_read": True,
+                            }
+                        )
+                    client = UploadManagerClient()
+                    if final_files:
+                        final_batch = f"final-sidecars-{uuid4()}"
+                        client.submit_batch(
+                            self._upload_target.manager_dataset_id,
+                            final_batch,
+                            final_files,
+                            task_id=final_batch,
+                        )
+                    seal_status = "aborted" if self.abort_requested_fn() else "complete"
+                    client.seal_dataset(
+                        self._upload_target.manager_dataset_id, seal_status
+                    )
+                    log.info("Persistent upload dataset sealed (%s).", seal_status)
+                except Exception:
+                    log.exception("Could not seal persistent upload dataset")
             try:
                 signal_writing_complete()
             except Exception as e:
@@ -2653,13 +2731,17 @@ class MultiPointWorker:
             # Restart the contrast-AF cadence at the first FOV each timepoint.
             # This repeats the same FOV selection; it does not rotate coverage.
             self.af_fov_count = 0
+            self._restore_ordered_timepoint()
             self.microcontroller.enable_joystick(False)
 
             self._log.info("multipoint acquisition - time point " + str(self.time_point + 1))
 
             # Notify listeners (napari views flush their per-timepoint caches on
             # this signal so peak RAM tracks a single timepoint, not the whole run).
-            self.callbacks.signal_new_time_point(self.time_point)
+            if (getattr(self, "_ordered_visit", None) is None
+                    or getattr(self, "_ordered_display_timepoint", None) != self.time_point):
+                self.callbacks.signal_new_time_point(self.time_point)
+                self._ordered_display_timepoint = self.time_point
 
             # For each time point, create a per-timepoint folder *only if* something
             # actually lands in it. OME_TIFF writes one multi-series file per region
@@ -2701,7 +2783,8 @@ class MultiPointWorker:
                             self._log.warning(f"Failed to write metadata sidecar: {e}")
             # create a dataframe to save coordinates
             with self._timing.get_timer("initialize_coordinates_dataframe"):
-                self.initialize_coordinates_dataframe()
+                if getattr(self, "_ordered_visit", None) is None:
+                    self.initialize_coordinates_dataframe()
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
@@ -2710,10 +2793,13 @@ class MultiPointWorker:
 
             with self._timing.get_timer("run_coordinate_acquisition"):
                 self.run_coordinate_acquisition(current_path)
+            if getattr(self, "_ordered_visit", None) is not None:
+                self._wait_for_outstanding_callback_images()
 
             # Save plate view for this timepoint
             with self._timing.get_timer("save_plate_view"):
-                if self._generate_downsampled_views and self._downsampled_view_manager is not None:
+                if (self._generate_downsampled_views and self._downsampled_view_manager is not None
+                        and getattr(self, "_ordered_final_timepoint", True)):
                     # Wait for pending downsampled view jobs to complete
                     self._wait_for_downsampled_view_jobs()
                     # Save plate view
@@ -2730,7 +2816,7 @@ class MultiPointWorker:
                 self._append_acquired_positions_csv()
 
             # Send Slack timepoint notification via callback (allows main thread to capture screenshot)
-            if self._slack_notifier is not None:
+            if self._slack_notifier is not None and getattr(self, "_ordered_final_timepoint", True):
                 try:
                     elapsed = time.time() - self.timestamp_acquisition_started
                     timepoint_duration = time.time() - self._timepoint_start_time
@@ -2755,7 +2841,8 @@ class MultiPointWorker:
             # Per-timepoint .done marker only when we actually have a per-timepoint folder.
             # Acquisition-level completion is marked separately at experiment root by the
             # controller in _restore_state_after_acquisition.
-            if self._wrote_per_timepoint_folder:
+            if (self._wrote_per_timepoint_folder and getattr(self, "_ordered_final_timepoint", True)
+                    and not self.abort_requested_fn()):
                 utils.create_done_file(current_path)
             self._log.debug(f"Single time point took: {time.time() - start} [s]")
         finally:
@@ -2810,8 +2897,15 @@ class MultiPointWorker:
     def initialize_coordinates_dataframe(self):
         self._coordinate_rows: list[dict] = []
         self._acquired_positions_appended = False
+        self._acquired_positions_row_count = 0
+        self._ordered_recorded_coordinates = set()
 
     def update_coordinates_dataframe(self, region_id, z_level, pos: squid.abc.Pos, fov=None):
+        if getattr(self, "_ordered_visit", None) is not None:
+            key = (region_id, fov, z_level)
+            if key in self._ordered_recorded_coordinates:
+                return
+            self._ordered_recorded_coordinates.add(key)
         row = {
             "region": region_id,
             "fov": fov,
@@ -2854,9 +2948,12 @@ class MultiPointWorker:
             return
         # An abort unwinds through here after the per-position writes have
         # already run, so guard against appending the same rows twice.
-        if self._acquired_positions_appended:
+        ordered = getattr(self, "_ordered_visit", None) is not None
+        if self._acquired_positions_appended and not ordered:
             return
         df = self.coordinates_pd
+        if ordered:
+            df = df.iloc[self._acquired_positions_row_count:]
         if df.empty or not self.experiment_path:
             return
         df = df.copy()
@@ -2869,6 +2966,7 @@ class MultiPointWorker:
             self._log.warning(f"Failed to append measured positions to {path}: {e}")
         else:
             self._acquired_positions_appended = True
+            self._acquired_positions_row_count = len(self._coordinate_rows)
 
     def move_to_coordinate(self, coordinate_mm, region_id, fov):
         curr_pos = self.stage.get_pos()
@@ -3180,7 +3278,10 @@ class MultiPointWorker:
         )
 
     def _prune_empty_shard_dirs(self, time_point: int) -> None:
-        """Remove ``<level_dir>/c/<t>`` if empty after batched delete.
+        """Prune old slash-layout directories after deleting verified files.
+
+        Flat-key arrays need no pruning: deletion already removed their shard
+        files directly, and the shared level directory must remain.
 
         Only descends into ``c/<t>`` and prunes upward to the level dir; never
         touches sibling timepoints' shard files or array metadata.
@@ -3273,6 +3374,10 @@ class MultiPointWorker:
         """Track an upload barrier: register its task_id (submitted) or account it
         as completed-non-uploading (no writer/shards) so the timepoint tally can
         still close. Shared by the raw-plate and derived-plate (postprocess) paths."""
+        if getattr(br, "manager_owned", False):
+            # The manager has acknowledged and now owns scheduling, progress,
+            # verification, and deletion for this task.
+            return
         if br.submitted:
             if br.task_id in self._upload_completed_task_ids:
                 # Its UploadResult already arrived and was consumed —
@@ -3348,10 +3453,13 @@ class MultiPointWorker:
         """Update plate view with completed well image."""
         t_start = time.perf_counter()
 
-        if self._downsampled_view_manager is None:
+        manager = self._downsampled_view_manager
+        if getattr(self, "_ordered_visit", None) is not None and result.time_point != self.time_point:
+            manager = self._ordered_time_states.get(result.time_point, {}).get("_downsampled_view_manager")
+        if manager is None:
             return
         try:
-            self._downsampled_view_manager.update_well(
+            manager.update_well(
                 result.well_row,
                 result.well_col,
                 result.well_images,
@@ -3364,10 +3472,10 @@ class MultiPointWorker:
             )
 
             # Emit plate view update for each channel
-            for ch_idx, plate_image in enumerate(self._downsampled_view_manager.plate_view):
+            for ch_idx, plate_image in enumerate(manager.plate_view):
                 channel_name = (
-                    self._downsampled_view_manager.channel_names[ch_idx]
-                    if ch_idx < len(self._downsampled_view_manager.channel_names)
+                    manager.channel_names[ch_idx]
+                    if ch_idx < len(manager.channel_names)
                     else f"Channel_{ch_idx}"
                 )
                 self.callbacks.signal_plate_view_update(
@@ -3607,7 +3715,7 @@ class MultiPointWorker:
             fov_position = (0.0, 0.0)
 
         # Determine output directory
-        output_dir = os.path.join(self.experiment_path, str(self.time_point), "downsampled")
+        output_dir = os.path.join(self.experiment_path, str(info.time_point), "downsampled")
 
         # Get channel info
         channel_idx = info.configuration_idx
@@ -3616,6 +3724,7 @@ class MultiPointWorker:
         channel_names = list(self.observation_state_names)
 
         return DownsampledViewJob(
+            time_point=info.time_point or 0,
             capture_info=info,
             capture_image=JobImage(image_array=image),
             well_id=region_id,
@@ -3916,7 +4025,10 @@ class MultiPointWorker:
     def run_coordinate_acquisition(self, current_path):
         # Reset backpressure counters at acquisition start
         # IMPORTANT: Must be before any camera triggers
-        self._backpressure.reset()
+        ordered_visit = getattr(self, "_ordered_visit", None)
+        prewarm = ordered_visit is None or not self._ordered_prewarmed
+        if prewarm:
+            self._backpressure.reset()
 
         # Pre-warm every distinct observation state preset once BEFORE the
         # FOV loop. Absorbs the first-call one-off costs (most notably the
@@ -3924,18 +4036,22 @@ class MultiPointWorker:
         # set_camera_mode pays the first time it actually switches modes)
         # into a dedicated init timer instead of polluting the first FOV's
         # per-capture stats. Amortizes to ~zero over long runs.
-        if not self.validation_only:
+        if not self.validation_only and prewarm:
             self._prewarm_observation_states()
 
         # Precompute FOV-shared postprocessing state (e.g. transfer functions)
         # before any hardware fires, so the first FOV's compute is a cache hit
         # and never stalls the first save/display.
-        if not self.validation_only:
+        if not self.validation_only and prewarm:
             self._prewarm_postprocess_routines()
+        if ordered_visit is not None:
+            self._ordered_prewarmed = True
 
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
+            if ordered_visit is not None and region_id != self._ordered_position[0]:
+                continue
             self.callbacks.signal_overall_progress(
                 OverallProgressUpdate(
                     current_region=region_index + 1,
@@ -3950,10 +4066,11 @@ class MultiPointWorker:
             if self.validation_only:
                 self.total_scans = self.num_fovs
             else:
-                frames_per_pos = self._get_region_plan(region_id).frames_per_position
-                self.total_scans = self.num_fovs * self.NZ * frames_per_pos
+                self.total_scans = self.num_fovs * self._captured_frames_per_fov(self._get_region_plan(region_id))
 
             for fov, coordinate_mm in enumerate(coordinates):
+                if ordered_visit is not None and fov != self._ordered_position[1]:
+                    continue
                 # Just so the job result queues don't get too big, check and print a summary of intermediate results here
                 with self._timing.get_timer("job result summaries"):
                     result = self._summarize_runner_outputs()
@@ -4019,6 +4136,7 @@ class MultiPointWorker:
                 # hands the resulting shard paths to the UploadWorker.
                 if (
                     self._upload_target is not None
+                    and (ordered_visit is None or self._ordered_final_position)
                     and self._save_zarr_runner is not None
                     and self._zarr_writer_info is not None
                 ):
@@ -4156,13 +4274,43 @@ class MultiPointWorker:
         )
         return True
 
+    def _captured_frames_per_fov(self, plan):
+        return sum(
+            self.NZ if event.acquire_z_stack else 1
+            for event in plan.events if not (event.is_wait or event.is_stimulus)
+        )
+
+    def _reverse_observation_order(self, region_id, fov):
+        """Alternate across region and timepoint boundaries, including single-tile regions."""
+        if not getattr(self, "snake_observation_states", False):
+            return False
+        ordinal = self.time_point * sum(len(coords) for coords in self.scan_region_fov_coords_mm.values()) + fov
+        for name, coords in self.scan_region_fov_coords_mm.items():
+            if str(name) == str(region_id):
+                break
+            ordinal += len(coords)
+        return bool(ordinal % 2)
+
     def acquire_at_position(self, region_id, current_path, fov):
         # Autofocus once at the FOV's nominal plane to establish the focal
         # (reference) plane BEFORE the z-stack is positioned around it. The
         # stacking mode then decides whether that plane becomes the bottom,
         # center, or top slice (see prepare_z_stack). Also records the AF event
         # (target vs. corrected Z) to autofocus_log.csv.
-        self._autofocus_and_record(region_id, fov, current_path)
+        ordered_visit = getattr(self, "_ordered_visit", None)
+        focus_key = (self.time_point, ordered_visit.position) if ordered_visit is not None else None
+        first_position_visit = ordered_visit is None or focus_key not in self._ordered_focus
+        if not first_position_visit:
+            stage_z, piezo_z = self._ordered_focus[focus_key]
+            self.stage.move_z_to(stage_z)
+            if self.use_piezo:
+                self.piezo.move_to(piezo_z)
+        else:
+            self._autofocus_and_record(region_id, fov, current_path)
+            if ordered_visit is not None:
+                self._ordered_focus[focus_key] = (
+                    self.stage.get_pos().z_mm, self.piezo.position if self.use_piezo else None
+                )
 
         if self.validation_only:
             pos = self.stage.get_pos()
@@ -4189,7 +4337,28 @@ class MultiPointWorker:
         # the middle plane for From Center. See _reference_z_level.
         ref_z_level = self._reference_z_level()
 
-        for z_level in range(self.NZ):
+        from control.models.acquisition_cycle import iter_acquisition_planes
+
+        region_plan = self._get_region_plan(region_id)
+        if not region_plan.events:
+            raise ValueError("No observation states selected for acquisition.")
+        frames_per_fov = self._captured_frames_per_fov(region_plan)
+        imaged_step = 0
+        current_z_level = 0  # prepare_z_stack positions the canonical first plane
+        recorded_z_levels = set()
+        planes = iter_acquisition_planes(
+            region_plan.events, self.NZ, ref_z_level,
+            snake=getattr(self, "snake_observation_states", False),
+            reverse=self._reverse_observation_order(region_id, fov),
+        )
+        if ordered_visit is not None:
+            planes = ordered_visit.planes
+        for z_level, plane_events in planes:
+            if self.abort_requested_fn():
+                break
+            if z_level != current_z_level:
+                self.move_z_for_stack(z_level - current_z_level)
+                current_z_level = z_level
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 
             acquire_pos = self.stage.get_pos()
@@ -4200,133 +4369,131 @@ class MultiPointWorker:
             # just a 1-frame-per-state plan, so this single path serves both. The
             # plan's ordered events preserve interleave / chain order; imaged
             # events capture a frame, stimulus events fire an NIDAQ pulse comb.
-            region_plan = self._get_region_plan(region_id)
-            # Captured (not just saved) frames per (FOV, z): postprocessed events
-            # are captured too, so include them so imaged_step stays aligned.
-            frames_per_pos = region_plan.captured_frames_per_position
-            if region_plan.events:
-                imaged_step = 0  # per-z imaged-frame counter (for progress + AF guard)
-                for event in region_plan.events:
-                    if event.is_wait:
-                        # Timed delay between events — no frame, no AF, no progress
-                        # tick. Sleep in short slices so an abort interrupts it.
-                        with self._timing.get_timer("cycle_wait"):
-                            self._interruptible_sleep(event.wait_ms / 1000.0)
-                        continue
-                    # Reference-z-only step/sweep: capture a single frame at the
-                    # focus/reference plane and skip it at every other z-level.
-                    # Stimulus events are unaffected (they fire at every z as before).
-                    if (not event.acquire_z_stack) and (not event.is_stimulus) and (z_level != ref_z_level):
-                        continue
-                    preset_name = event.observation_state
+            for event in plane_events:
+                if self.abort_requested_fn():
+                    break
+                if event.is_wait:
+                    # Timed delay between events — no frame, no AF, no progress
+                    # tick. Sleep in short slices so an abort interrupts it.
+                    with self._timing.get_timer("cycle_wait"):
+                        self._interruptible_sleep(event.wait_ms / 1000.0)
+                    continue
+                preset_name = event.observation_state
+                try:
+                    with self._timing.get_timer("apply_observation_state"):
+                        config = self._apply_observation_state(preset_name)
+                except Exception as e:
+                    self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                    self.request_abort_fn()
+                    return
+                # Source-coded FPM darkfield frame: override the LED matrix to
+                # this multiplexed pattern (base state supplies exposure/gain/
+                # color; the matrix channel must be ON in that base state — this
+                # is enforced pre-flight in validate_acquisition_settings). The
+                # override switches the device to 'mux' mode, so the capture
+                # path's re-fire lights exactly this LED set. A False return
+                # means no SciMicroscopy array is available, which would
+                # silently capture the wrong pattern — abort instead.
+                if event.multiplexed_leds is not None:
+                    ok = False
                     try:
-                        with self._timing.get_timer("apply_observation_state"):
-                            config = self._apply_observation_state(preset_name)
+                        ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
+                            event.multiplexed_leds
+                        )
                     except Exception as e:
-                        self._log.error("Failed to apply observation states %s: %s", preset_name, e, exc_info=True)
+                        self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
+                    if not ok:
+                        self._log.error(
+                            "FPM: could not light multiplexed darkfield pattern for base state %r "
+                            "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
+                            preset_name,
+                        )
                         self.request_abort_fn()
                         return
-                    # Source-coded FPM darkfield frame: override the LED matrix to
-                    # this multiplexed pattern (base state supplies exposure/gain/
-                    # color; the matrix channel must be ON in that base state — this
-                    # is enforced pre-flight in validate_acquisition_settings). The
-                    # override switches the device to 'mux' mode, so the capture
-                    # path's re-fire lights exactly this LED set. A False return
-                    # means no SciMicroscopy array is available, which would
-                    # silently capture the wrong pattern — abort instead.
-                    if event.multiplexed_leds is not None:
-                        ok = False
-                        try:
-                            ok = self.microscope.illumination_controller.set_led_matrix_multiplexed_indices(
-                                event.multiplexed_leds
-                            )
-                        except Exception as e:
-                            self._log.error("FPM: applying multiplexed LED set failed: %s", e, exc_info=True)
-                        if not ok:
-                            self._log.error(
-                                "FPM: could not light multiplexed darkfield pattern for base state %r "
-                                "(no SciMicroscopy LED array / unified matrix unavailable). Aborting.",
-                                preset_name,
-                            )
-                            self.request_abort_fn()
-                            return
-                    if self.NZ == 1:  # TODO: handle z offset for z stack
-                        self.handle_z_offset(config, True)
+                if self.NZ == 1:  # TODO: handle z offset for z stack
+                    self.handle_z_offset(config, True)
 
-                    # (Autofocus now runs once per FOV in _autofocus_and_record,
-                    # before the z-stack is positioned — see acquire_at_position.)
+                # (Autofocus now runs once per FOV in _autofocus_and_record,
+                # before the z-stack is positioned — see acquire_at_position.)
 
-                    if event.is_stimulus or config.is_stimulus_only:
-                        with self._timing.get_timer("run_nidaq_stimulus"):
-                            self._run_nidaq_stimulus(config)
-                        if self.NZ == 1:
-                            self.handle_z_offset(config, False)
-                        continue  # no frame, no progress tick
-
-                    # Postprocessed frames are routed to the PostprocessJob runner
-                    # (raw not saved), so they carry no save layout — the group id
-                    # tags the frame for accumulation. A ref-z-only postprocessed
-                    # step still passes NZ frames? No: it is captured only at the
-                    # reference plane like any ref-z step (skip handled above), so
-                    # eff_z_index follows the same rule.
-                    if event.postprocess is not None:
-                        save_layout = None
-                        config_idx = 0
-                    else:
-                        save_layout = self._build_save_layout(region_plan, event)
-                        config_idx = save_layout.c_index
-                    # A reference-z-only frame lives at z=0 of its Z=1 array; a
-                    # normal frame at its stack level.
-                    eff_z_index = z_level if event.acquire_z_stack else 0
-                    with self._timing.get_timer("acquire_camera_image"):
-                        with self._timing.get_timer("acquire_camera_image_inner"):
-                            self.acquire_camera_image(
-                                config,
-                                file_ID,
-                                current_path,
-                                eff_z_index,
-                                region_id=region_id,
-                                fov=fov,
-                                config_idx=config_idx,
-                                filename_channel_label=preset_name,
-                                save_layout=save_layout,
-                                postprocess_group=event.postprocess_group,
-                            )
-
+                if event.is_stimulus or config.is_stimulus_only:
+                    with self._timing.get_timer("run_nidaq_stimulus"):
+                        self._run_nidaq_stimulus(config)
                     if self.NZ == 1:
                         self.handle_z_offset(config, False)
+                    continue  # no frame, no progress tick
 
-                    current_image = fov * self.NZ * frames_per_pos + z_level * frames_per_pos + imaged_step + 1
-                    imaged_step += 1
-                    self.callbacks.signal_region_progress(
-                        RegionProgressUpdate(current_fov=current_image, region_fovs=self.total_scans)
+                # Postprocessed frames are routed to the PostprocessJob runner
+                # (raw not saved), so they carry no save layout — the group id
+                # tags the frame for accumulation. Reference-z-only inputs are
+                # scheduled only at the reference plane and use saved Z index 0.
+                if event.postprocess is not None:
+                    save_layout = None
+                    config_idx = 0
+                else:
+                    save_layout = self._build_save_layout(region_plan, event)
+                    config_idx = save_layout.c_index
+                # A reference-z-only frame lives at z=0 of its Z=1 array; a
+                # normal frame at its stack level.
+                eff_z_index = z_level if event.acquire_z_stack else 0
+                with self._timing.get_timer("acquire_camera_image"):
+                    with self._timing.get_timer("acquire_camera_image_inner"):
+                        self.acquire_camera_image(
+                            config,
+                            file_ID,
+                            current_path,
+                            eff_z_index,
+                            region_id=region_id,
+                            fov=fov,
+                            config_idx=config_idx,
+                            filename_channel_label=preset_name,
+                            save_layout=save_layout,
+                            postprocess_group=event.postprocess_group,
+                            state_frame_index=event.state_frame_index,
+                        )
+
+                if self.NZ == 1:
+                    self.handle_z_offset(config, False)
+
+                current_image = fov * frames_per_fov + imaged_step + 1
+                if ordered_visit is not None:
+                    self._ordered_frames_completed += 1
+                    current_image = self._ordered_frames_completed
+                imaged_step += 1
+                self.callbacks.signal_region_progress(
+                    RegionProgressUpdate(
+                        current_fov=current_image,
+                        region_fovs=self._ordered_frames_total if ordered_visit is not None else self.total_scans,
                     )
-            else:
-                raise ValueError("No observation states selected for acquisition.")
+                )
 
-            # updates coordinates df
-            self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+            # Advanced blocks may revisit a plane; keep one coordinate row per FOV/Z.
+            if z_level not in recorded_z_levels:
+                self.update_coordinates_dataframe(region_id, z_level, acquire_pos, fov)
+                recorded_z_levels.add(z_level)
             self.callbacks.signal_current_fov(acquire_pos.x_mm, acquire_pos.y_mm)
 
             # check if the acquisition should be aborted
             if self.abort_requested_fn():
                 self.handle_acquisition_abort(current_path)
-
-            if z_level < self.NZ - 1:
-                self.move_z_for_stack()
+                break
 
         if self.NZ > 1:
-            self.move_z_back_after_stack()
+            self.move_z_back_after_stack(current_z_level)
 
         # Contrast-AF cadence counter: one increment per FOV visit, never per
         # z-slice (inside the z loop the cadence period becomes NZ-dependent).
-        self.af_fov_count += 1
-        if self._supervision_policy.mode != "off":
-            self._supervision_cadence.complete()
-            self._supervision_region_completed_total[region_id] = self._supervision_region_completed_total.get(region_id, 0) + 1
+        if first_position_visit:
+            self.af_fov_count += 1
+            if self._supervision_policy.mode != "off":
+                self._supervision_cadence.complete()
+                self._supervision_region_completed_total[region_id] = (
+                    self._supervision_region_completed_total.get(region_id, 0) + 1
+                )
 
         # Increment FOV counter for Slack notification stats
-        self._timepoint_fov_count += 1
+        if ordered_visit is None or self._ordered_final_position:
+            self._timepoint_fov_count += 1
 
     def _select_config(self, config):
         """Apply an ObservationState to hardware before capture."""
@@ -6023,6 +6190,7 @@ class MultiPointWorker:
         filename_channel_label: Optional[str] = None,
         save_layout=None,
         postprocess_group: Optional[str] = None,
+        state_frame_index: Optional[int] = None,
     ):
         # When keeping illuminators on between captures, turn off the previous channel
         # before switching currentConfiguration (software trigger only).
@@ -6118,7 +6286,7 @@ class MultiPointWorker:
                 save_c_size=(save_layout.c_size if save_layout else None),
                 save_z_size=(save_layout.z_size if save_layout else None),
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
-                state_frame_index=(save_layout.state_frame_index if save_layout else None),
+                state_frame_index=(save_layout.state_frame_index if save_layout else state_frame_index),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
                 array_channel_names=(list(save_layout.channel_names) if save_layout else None),
                 array_channel_colors=(list(save_layout.channel_colors) if save_layout else None),
@@ -6312,30 +6480,34 @@ class MultiPointWorker:
 
         self._wait_for_outstanding_callback_images()
 
-    def move_z_for_stack(self):
+    def move_z_for_stack(self, steps=1):
         if self.use_piezo:
-            self.z_piezo_um += self.deltaZ * 1000
+            self.z_piezo_um += self.deltaZ * 1000 * steps
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
         else:
-            self.stage.move_z(self.deltaZ)
+            self.stage.move_z(self.deltaZ * steps)
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
-    def move_z_back_after_stack(self):
+    def move_z_back_after_stack(self, z_level=None):
+        if z_level is None:
+            z_level = self.NZ - 1
         if self.use_piezo:
-            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * (self.NZ - 1)
+            self.z_piezo_um = self.z_piezo_um - self.deltaZ * 1000 * z_level
             self.piezo.move_to(self.z_piezo_um)
             if (
                 self.liveController.trigger_mode == TriggerMode.SOFTWARE
             ):  # for hardware trigger, delay is in waiting for the last row to start exposure
                 self._sleep(MULTIPOINT_PIEZO_DELAY_MS / 1000)
+            if self.z_stacking_config == "FROM CENTER":
+                self.stage.move_z(self.deltaZ * round((self.NZ - 1) / 2))
         else:
             if self.z_stacking_config == "FROM CENTER":
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1) + self.deltaZ * round((self.NZ - 1) / 2)
+                rel_z_to_start = -self.deltaZ * z_level + self.deltaZ * round((self.NZ - 1) / 2)
             else:
-                rel_z_to_start = -self.deltaZ * (self.NZ - 1)
+                rel_z_to_start = -self.deltaZ * z_level
 
             self.stage.move_z(rel_z_to_start)

@@ -993,8 +993,8 @@ class SaveZarrJob(Job):
             cls._hcs_wells_written.clear()
 
     @classmethod
-    def finalize_all_writers(cls) -> bool:
-        """Finalize all active zarr writers.
+    def finalize_all_writers(cls, upload_target: Optional[UploadTarget] = None) -> bool:
+        """Finalize all active zarr writers, staging any final partial shards.
 
         Call at end of acquisition to ensure all data is written.
 
@@ -1006,6 +1006,15 @@ class SaveZarrJob(Job):
             if writer.is_initialized and not writer.is_finalized:
                 try:
                     writer.finalize()
+                    # Finalization may commit a short/aborted stack that was
+                    # intentionally withheld from earlier upload barriers.
+                    if upload_target is not None and upload_target.enabled:
+                        FlushAndStageUploadJob(
+                            time_point=-1,
+                            region_id="(finalize)",
+                            output_path=path,
+                            upload_target=upload_target,
+                        ).run()
                     cls._log.info(f"Finalized zarr writer: {path}")
                 except Exception as e:
                     cls._log.error(f"Error finalizing writer {path}: {e}")
@@ -1195,6 +1204,7 @@ class SaveZarrJob(Job):
                 translation_um=translation_um,
                 manifest_path=manifest_path,
                 shard_per_z=_def.ZARR_SHARD_PER_Z,
+                chunk_separator=_def.ZARR_CHUNK_SEPARATOR,
                 squid_extras=squid_extras,
             )
             try:
@@ -1233,6 +1243,7 @@ class BarrierResult:
     fov: int
     file_count: int
     submitted: bool  # False means upload disabled or writer missing — no UploadResult will ever arrive
+    manager_owned: bool = False
 
 
 @dataclass
@@ -1366,20 +1377,6 @@ class FlushAndStageUploadJob:
         deletable = set(shard_paths)
         stable_read = set(metadata_paths)
 
-        if FlushAndStageUploadJob._upload_input_queue is None:
-            self._log.error(
-                "Upload enabled but UploadWorker queue not initialized in this "
-                "JobRunner subprocess — dropping task. Check JobRunner.run()."
-            )
-            return BarrierResult(
-                task_id=task_id,
-                time_point=self.time_point,
-                region_id=self.region_id,
-                fov=self.fov,
-                file_count=len(files),
-                submitted=False,
-            )
-
         task = UploadTask(
             task_id=task_id,
             time_point=self.time_point,
@@ -1389,6 +1386,69 @@ class FlushAndStageUploadJob:
             deletable_local_paths=deletable,
             stable_read_paths=stable_read,
         )
+        if self.upload_target.manager_owned:
+            # Submission is committed to the manager's SQLite inventory before
+            # this call returns.  Its local outbox survives a manager restart
+            # between writer completion and acknowledgement.
+            from control.core.upload_manager_client import UploadManagerClient
+
+            root = self.upload_target.local_base
+            manager_files = []
+            for local, _remote in task.files:
+                manager_files.append(
+                    {
+                        "relative_path": os.path.relpath(local, root).replace("\\", "/"),
+                        "size": os.path.getsize(local),
+                        # Mutable metadata is a new generation when its bytes
+                        # change; immutable shards retain their task generation.
+                        "generation": (
+                            f"metadata:{os.stat(local).st_mtime_ns}:{os.path.getsize(local)}"
+                            if local in stable_read else "1"
+                        ),
+                        "deletable": local in deletable,
+                        "stable_read": local in stable_read,
+                    }
+                )
+            try:
+                UploadManagerClient().submit_batch(
+                    self.upload_target.manager_dataset_id,
+                    task_id,
+                    manager_files,
+                    task_id=task_id,
+                )
+            except Exception:
+                self._log.exception("Could not durably submit upload task %s", task_id)
+                return BarrierResult(
+                    task_id=task_id,
+                    time_point=self.time_point,
+                    region_id=self.region_id,
+                    fov=self.fov,
+                    file_count=len(files),
+                    submitted=False,
+                    manager_owned=True,
+                )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+                manager_owned=True,
+            )
+        if FlushAndStageUploadJob._upload_input_queue is None:
+            self._log.error(
+                "Upload enabled but UploadWorker queue not initialized in this "
+                "JobRunner subprocess — dropping legacy task. Check JobRunner.run()."
+            )
+            return BarrierResult(
+                task_id=task_id,
+                time_point=self.time_point,
+                region_id=self.region_id,
+                fov=self.fov,
+                file_count=len(files),
+                submitted=False,
+            )
         if FlushAndStageUploadJob._upload_tasks_submitted is not None:
             with FlushAndStageUploadJob._upload_tasks_submitted.get_lock():
                 FlushAndStageUploadJob._upload_tasks_submitted.value += 1
@@ -1899,6 +1959,7 @@ class DownsampledViewResult:
     well_col: int
     well_images: Dict[int, np.ndarray]  # channel_idx -> downsampled image
     channel_names: List[str]
+    time_point: int = 0
 
 
 @dataclass
@@ -1924,6 +1985,7 @@ class DownsampledViewJob(Job):
 
     # All fields must have defaults because parent class Job has job_id with default
     well_id: str = ""
+    time_point: int = 0
     well_row: int = 0
     well_col: int = 0
     fov_index: int = 0
@@ -1944,11 +2006,11 @@ class DownsampledViewJob(Job):
     interpolation_method: Union[DownsamplingMethod, str] = DownsamplingMethod.INTER_AREA_FAST
     skip_saving: bool = False  # Skip TIFF file saving (just generate for display)
 
-    # Class-level accumulator storage keyed by well_id.
+    # Class-level accumulator storage keyed by output directory, timepoint and well.
     # Note: This runs inside JobRunner (a multiprocessing.Process), so each worker
     # process has its own copy of this class variable. It is process-local and
     # safe to mutate without cross-process synchronization.
-    _well_accumulators: ClassVar[Dict[str, WellTileAccumulator]] = {}
+    _well_accumulators: ClassVar[Dict[Tuple[str, int, str], WellTileAccumulator]] = {}
     # Track wells that encountered errors during processing
     _failed_wells: ClassVar[Dict[str, str]] = {}  # well_id -> error message
 
@@ -1996,9 +2058,10 @@ class DownsampledViewJob(Job):
 
         t_crop = time.perf_counter()
 
-        # Get or create accumulator for this well
-        if self.well_id not in self._well_accumulators:
-            self._well_accumulators[self.well_id] = WellTileAccumulator(
+        # T may be inside Pos/Z/C, so several timepoints can be incomplete together.
+        accumulator_key = (self.output_dir, self.time_point, self.well_id)
+        if accumulator_key not in self._well_accumulators:
+            self._well_accumulators[accumulator_key] = WellTileAccumulator(
                 well_id=self.well_id,
                 total_fovs=self.total_fovs_in_well,
                 total_channels=self.total_channels,
@@ -2008,7 +2071,7 @@ class DownsampledViewJob(Job):
                 z_projection_mode=self.z_projection_mode,
             )
 
-        accumulator = self._well_accumulators[self.well_id]
+        accumulator = self._well_accumulators[accumulator_key]
         accumulator.add_tile(
             cropped,
             self.fov_position_in_well,
@@ -2138,6 +2201,7 @@ class DownsampledViewJob(Job):
             )
 
             return DownsampledViewResult(
+                time_point=self.time_point,
                 well_id=self.well_id,
                 well_row=self.well_row,
                 well_col=self.well_col,
@@ -2152,7 +2216,7 @@ class DownsampledViewJob(Job):
             raise
         finally:
             # Ensure accumulator is always cleaned up after processing a complete well
-            self._well_accumulators.pop(self.well_id, None)
+            self._well_accumulators.pop(accumulator_key, None)
 
 
 # TODO: For Zarr with FULL_FRAME chunks, writes to different FOVs/regions are
@@ -2587,7 +2651,7 @@ class JobRunner(multiprocessing.Process):
         # Finalize any zarr writers that are still open
         t_finalize_start = time.perf_counter()
         try:
-            success = SaveZarrJob.finalize_all_writers()
+            success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:

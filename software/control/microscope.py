@@ -1206,12 +1206,12 @@ class Microscope:
     def home_xyz(self) -> None:
         """Home the X, Y, and Z axes based on configuration settings.
 
-        Homes Z first if enabled, then moves Z to ``Z_HOME_SAFETY_POINT`` before any
+        Homes Z first if enabled, then retracts Z to ``OBJECTIVE_RETRACTED_POS_MM`` before any
         X/Y homing motion so the objective stays clear. Performs a coordinated X/Y
         homing sequence that avoids the plate clamp actuation post by moving Y first,
         homing X, moving X clear, then homing Y.
 
-        Note: ``Z_HOME_SAFETY_POINT`` and the 20 mm / 50 mm clamp-clearance
+        Note: ``OBJECTIVE_RETRACTED_POS_MM`` and the 20 mm / 50 mm clamp-clearance
         distances below are raw-frame (physical, motor-direction) values.  We
         translate them through ``AxisConfig.raw_to_canonical[_delta]`` so the
         physical motion is unchanged whether the rig runs with the default
@@ -1219,18 +1219,16 @@ class Microscope:
         """
         x_axis = self.stage.get_config().X_AXIS
         y_axis = self.stage.get_config().Y_AXIS
-        z_axis = self.stage.get_config().Z_AXIS
-
-        safety_z_raw_mm = int(control._def.Z_HOME_SAFETY_POINT) / 1000.0
-        safety_z_canonical_mm = z_axis.raw_to_canonical(safety_z_raw_mm)
 
         if control._def.HOMING_ENABLED_Z:
             self.stage.home(x=False, y=False, z=True, theta=False)
 
+        if control._def.HOMING_ENABLED_Z or (control._def.HOMING_ENABLED_X and control._def.HOMING_ENABLED_Y):
+            self._log.info(f"Retracting Z to {control._def.OBJECTIVE_RETRACTED_POS_MM} mm raw before X/Y homing.")
+            squid.stage.utils.retract_z(self.stage)
+
         # Home X and Y axes with safety movements
         if control._def.HOMING_ENABLED_X and control._def.HOMING_ENABLED_Y:
-            self._log.info(f"Moving Z to Z_HOME_SAFETY_POINT ({safety_z_raw_mm} mm raw) before X/Y homing.")
-            self.stage.move_z_to(safety_z_canonical_mm)
             # The plate clamp actuation post can get in the way of homing if we start with
             # the stage in "just the wrong" position.  Blindly moving the Y out 20, then home x
             # and move x over 20 , guarantees we'll clear the post for homing.  If we are <20mm
