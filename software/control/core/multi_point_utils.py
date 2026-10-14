@@ -21,6 +21,7 @@ class ScanPositionInformation:
     # Optional per-region laser-AF focus targets, keyed by region id. Regions
     # without an entry fall back to the controller's global reference.
     scan_region_laser_af_references: Dict[str, "LaserAFReference"] = field(default_factory=dict)
+    scan_region_z_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
     @staticmethod
     def from_scan_coordinates(scan_coordinates: ScanCoordinates):
@@ -31,6 +32,7 @@ class ScanPositionInformation:
             scan_region_laser_af_references=dict(
                 getattr(scan_coordinates, "region_laser_af_references", {})
             ),
+            scan_region_z_ranges=dict(getattr(scan_coordinates, "region_z_ranges", {})),
         )
 
 

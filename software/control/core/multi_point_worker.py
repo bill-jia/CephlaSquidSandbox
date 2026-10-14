@@ -1195,6 +1195,20 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self._aborted_on_frame_timeout = False
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
+        self._default_NZ = self.NZ
+        self._region_z_ranges = dict(acquisition_parameters.scan_position_information.scan_region_z_ranges)
+        if self._region_z_ranges:
+            self.deltaZ = (-1 if acquisition_parameters.z_stacking_config == "FROM TOP" else 1) * abs(self.deltaZ)
+        from control.models.region_z_stack import z_stack_count
+
+        self.NZ = max([self.NZ] + [z_stack_count(*bounds, self.deltaZ) for bounds in self._region_z_ranges.values()])
+        self._active_region_z_range = None
+        self._region_nominal_z = {
+            name: center[2] for name, center in zip(
+                acquisition_parameters.scan_position_information.scan_region_names,
+                acquisition_parameters.scan_position_information.scan_region_coords_mm,
+            ) if len(center) > 2
+        }
 
         self.Nt = acquisition_parameters.Nt
         self.dt = acquisition_parameters.deltat
@@ -1254,7 +1268,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         except Exception:
             self._pixel_size_um = None
         self._time_increment_s = self.dt if self.Nt > 1 and self.dt > 0 else None
-        self._physical_size_z_um = self.deltaZ if self.NZ > 1 else None
+        self._physical_size_z_um = abs(self.deltaZ) * 1000 if self.NZ > 1 else None
         self.timestamp_acquisition_started = acquisition_parameters.acquisition_start_time
         self.timestamp_prev_timepoint_started = None
 
@@ -2717,7 +2731,11 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                         sidecar = {
                             "channel_names": list(self.observation_state_names),
                             "num_time_points": self.Nt,
-                            "num_z_levels": self.NZ,
+                            "num_z_levels": max(self._region_nz(r) for r in self.scan_region_fov_coords_mm),
+                            "region_z_stacks": {
+                                str(r): {"z_range_mm": list(bounds), "nz": self._region_nz(r)}
+                                for r, bounds in getattr(self, "_region_z_ranges", {}).items()
+                            },
                             "num_channels": len(self.observation_state_names),
                             "pixel_size_um": self._pixel_size_um,
                             "z_step_um": self._physical_size_z_um,
@@ -2736,7 +2754,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                if self.NZ > 1 and not self.validation_mode:
+                if self.NZ > 1 and not self.validation_mode and not getattr(self, "_region_z_ranges", {}):
                     self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
@@ -3477,8 +3495,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             return None
         expected = 0
         for s in group.input_states.values():
-            expected += s.frames_per_visit * (self.NZ if s.acquire_z_stack else 1)
-        ctx_meta = self._postprocess_ctx_meta(group)
+            expected += s.frames_per_visit * ((info.stack_z_size or self._region_nz(info.region_id)) if s.acquire_z_stack else 1)
+        ctx_meta = self._postprocess_ctx_meta(group, nz=info.stack_z_size or self._region_nz(info.region_id))
         output_specs = [
             {
                 "name": o.name,
@@ -3517,10 +3535,11 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         except Exception:
             return None
 
-    def _postprocess_ctx_meta(self, group) -> dict:
+    def _postprocess_ctx_meta(self, group, nz=None) -> dict:
         """Run geometry + per-group state metadata handed to a routine's context.
         Shared by the per-FOV job and the pre-acquisition warmup so their cache
         keys match (first FOV is then a cache hit)."""
+        nz = self.NZ if nz is None else nz
         state_meta = {}
         for name in group.input_states:
             _color, wl = self._channel_display_meta(name)
@@ -3529,8 +3548,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             "pixel_size_um": self._pixel_size_um,
             # self.deltaZ is the mechanical z step in MILLIMETRES (stage units);
             # convert to micrometres for the routine geometry.
-            "dz_um": (self.deltaZ * 1000.0) if self.NZ > 1 else None,
-            "nz": self.NZ,
+            "dz_um": (self.deltaZ * 1000.0) if nz > 1 else None,
+            "nz": nz,
             "nt": self.Nt,
             "state_meta": state_meta,
             "yx_shape": self._postprocess_frame_shape(),
@@ -3691,7 +3710,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             output_dir=output_dir,
             channel_names=channel_names,
             z_index=info.z_index,
-            total_z_levels=self.NZ,
+            total_z_levels=info.save_z_size or info.stack_z_size or self._region_nz(info.region_id),
             z_projection_mode=self._downsampled_z_projection,
             interpolation_method=self._downsampled_interpolation_method,
             skip_saving=self.skip_saving
@@ -4000,6 +4019,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
             if ordered_visit is not None and region_id != self._ordered_position[0]:
                 continue
+            self._set_region_z_stack(region_id)
             self.callbacks.signal_overall_progress(
                 OverallProgressUpdate(
                     current_region=region_index + 1,
@@ -4222,9 +4242,43 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         )
         return True
 
-    def _captured_frames_per_fov(self, plan):
+    def _region_nz(self, region_id):
+        from control.models.region_z_stack import z_stack_count
+
+        bounds = getattr(self, "_region_z_ranges", {}).get(region_id)
+        return z_stack_count(*bounds, self.deltaZ) if bounds is not None else getattr(self, "_default_NZ", self.NZ)
+
+    def _region_reference_z_level(self, region_id):
+        nz = self._region_nz(region_id)
+        bounds = getattr(self, "_region_z_ranges", {}).get(region_id)
+        if bounds is not None and nz > 1:
+            coords = self.scan_region_fov_coords_mm[region_id]
+            reference = getattr(self, "_region_nominal_z", {}).get(
+                region_id, coords[0][2] if coords and len(coords[0]) > 2 else bounds[0]
+            )
+            start = bounds[1] if self.z_stacking_config == "FROM TOP" else bounds[0]
+            step = -abs(self.deltaZ) if self.z_stacking_config == "FROM TOP" else abs(self.deltaZ)
+            return max(0, min(nz - 1, int(round((reference - start) / step))))
+        return max(0, min(nz - 1, int(round((nz - 1) / 2)))) if self.z_stacking_config == "FROM CENTER" else 0
+
+    def _set_region_z_stack(self, region_id):
+        if not getattr(self, "_region_z_ranges", {}):
+            return
+        self.NZ = self._region_nz(region_id)
+        self._active_region_z_range = self._region_z_ranges.get(region_id)
+        self._active_region_reference = self._region_reference_z_level(region_id)
+        self.deltaZ = -abs(self.deltaZ) if self.z_stacking_config == "FROM TOP" else abs(self.deltaZ)
+        if self._active_region_z_range is None:
+            return
+        coords = self.scan_region_fov_coords_mm[region_id]
+        self._active_region_nominal_z = getattr(self, "_region_nominal_z", {}).get(
+            region_id, coords[0][2] if coords and len(coords[0]) > 2 else self._active_region_z_range[0]
+        )
+
+    def _captured_frames_per_fov(self, plan, nz=None):
+        nz = self.NZ if nz is None else nz
         return sum(
-            self.NZ if event.acquire_z_stack else 1
+            nz if event.acquire_z_stack else 1
             for event in plan.events if not (event.is_wait or event.is_stimulus)
         )
 
@@ -4240,6 +4294,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         return bool(ordinal % 2)
 
     def acquire_at_position(self, region_id, current_path, fov):
+        self._set_region_z_stack(region_id)
         # Autofocus once at the FOV's nominal plane to establish the focal
         # (reference) plane BEFORE the z-stack is positioned around it. The
         # stacking mode then decides whether that plane becomes the bottom,
@@ -4271,7 +4326,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self.af_fov_count += 1
             return
 
-        if self.NZ > 1:
+        if self.NZ > 1 or getattr(self, "_active_region_z_range", None) is not None:
             self.prepare_z_stack()
 
         if self.use_piezo:
@@ -4423,7 +4478,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self.handle_acquisition_abort(current_path)
                 break
 
-        if self.NZ > 1:
+        if self.NZ > 1 or getattr(self, "_active_region_z_range", None) is not None:
             self.move_z_back_after_stack(current_z_level)
 
         # Contrast-AF cadence counter: one increment per FOV visit, never per
@@ -5133,6 +5188,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         prepare_z_stack): the first acquired plane (z_level 0) for From Bottom and
         From Top, and the middle plane for From Center. Clamped to [0, NZ-1].
         """
+        if getattr(self, "_active_region_z_range", None) is not None:
+            return self._active_region_reference
         if self.NZ <= 1:
             return 0
         if self.z_stacking_config == "FROM CENTER":
@@ -5140,6 +5197,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         return 0
 
     def prepare_z_stack(self):
+        bounds = getattr(self, "_active_region_z_range", None)
+        if bounds is not None:
+            # Preserve the nominal/AF-corrected position independently of stack limits.
+            self._stack_reference_z_mm = self.stage.get_pos().z_mm
+            self._stack_reference_piezo_um = self.piezo.position if self.use_piezo else None
+            start = bounds[1] if self.z_stacking_config == "FROM TOP" else bounds[0]
+            # Carry the AF/focus-map correction into the region's stack offsets.
+            start += self._stack_reference_z_mm - self._active_region_nominal_z
+            self.stage.move_z_to(start)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+            return
         # Position the stage at the START slice of the stack, relative to the
         # focal plane established by _autofocus_and_record (which already ran).
         # FROM CENTER: step down half the stack so the AF plane is the center.
@@ -5438,6 +5506,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 save_t_size=(save_layout.t_size if save_layout else None),
                 save_c_size=(save_layout.c_size if save_layout else None),
                 save_z_size=(save_layout.z_size if save_layout else None),
+                stack_z_size=self.NZ,
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
                 state_frame_index=(save_layout.state_frame_index if save_layout else state_frame_index),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
@@ -5646,6 +5715,13 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
     def move_z_back_after_stack(self, z_level=None):
+        if getattr(self, "_active_region_z_range", None) is not None:
+            if self.use_piezo:
+                self.piezo.move_to(self._stack_reference_piezo_um)
+                self.z_piezo_um = self._stack_reference_piezo_um
+            self.stage.move_z_to(self._stack_reference_z_mm)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+            return
         if z_level is None:
             z_level = self.NZ - 1
         if self.use_piezo:

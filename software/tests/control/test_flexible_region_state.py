@@ -16,6 +16,7 @@ import pytest
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QSpinBox,
     QTableWidget,
@@ -36,6 +37,9 @@ class _RegionHarness:
     _COL_X = FlexibleMultiPointWidget._COL_X
     _COL_Y = FlexibleMultiPointWidget._COL_Y
     _COL_Z = FlexibleMultiPointWidget._COL_Z
+    _COL_Z_MIN = FlexibleMultiPointWidget._COL_Z_MIN
+    _COL_Z_MAX = FlexibleMultiPointWidget._COL_Z_MAX
+    _COL_NZ = FlexibleMultiPointWidget._COL_NZ
     _COL_AF_REF = FlexibleMultiPointWidget._COL_AF_REF
     _COL_NAME = FlexibleMultiPointWidget._COL_NAME
     _COL_COUNT = FlexibleMultiPointWidget._COL_COUNT
@@ -43,8 +47,14 @@ class _RegionHarness:
     _GO_TO_POSITION_TOLERANCE_MM = FlexibleMultiPointWidget._GO_TO_POSITION_TOLERANCE_MM
     _position_cells = staticmethod(FlexibleMultiPointWidget._position_cells)
     _refresh_position_cells = FlexibleMultiPointWidget._refresh_position_cells
+    _region_z_bounds = FlexibleMultiPointWidget._region_z_bounds
+    _write_region_z_cells = FlexibleMultiPointWidget._write_region_z_cells
+    _refresh_region_z_cells = FlexibleMultiPointWidget._refresh_region_z_cells
+    _edit_region_z_limit = FlexibleMultiPointWidget._edit_region_z_limit
+    _effective_NZ = FlexibleMultiPointWidget._effective_NZ
     _selected_row = FlexibleMultiPointWidget._selected_row
     _select_row = FlexibleMultiPointWidget._select_row
+    _sync_z_range_controls = FlexibleMultiPointWidget._sync_z_range_controls
     _set_name_cell = FlexibleMultiPointWidget._set_name_cell
     _rename_region_from_cell = FlexibleMultiPointWidget._rename_region_from_cell
     cell_was_changed = FlexibleMultiPointWidget.cell_was_changed
@@ -65,6 +75,7 @@ class _RegionHarness:
         self.location_list = np.array(coords, dtype=float)
         self._region_obs_state_map = None
         self._region_laser_af_references = {}
+        self._region_z_ranges = {}
         self._log = MagicMock()
         self.navigationViewer = MagicMock()
         self.focusMapWidget = MagicMock()
@@ -86,6 +97,15 @@ class _RegionHarness:
         self.entry_NX = SimpleNamespace(value=lambda: 2)
         self.entry_NY = SimpleNamespace(value=lambda: 2)
         self.entry_overlap = SimpleNamespace(value=lambda: 0)
+        self._zstack_checkbox = QCheckBox()
+        self._zstack_checkbox.setChecked(True)
+        self.entry_NZ = QSpinBox()
+        self.entry_NZ.setRange(1, 2000)
+        self.entry_NZ.setValue(3)
+        self.entry_deltaZ = QDoubleSpinBox()
+        self.entry_deltaZ.setValue(2.0)
+        self.combobox_z_stack = QComboBox()
+        self.combobox_z_stack.addItems(["FROM BOTTOM", "FROM CENTER", "FROM TOP"])
 
         self.table_location_list = QTableWidget(len(names), self._COL_COUNT)
         self.table_location_list.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -171,9 +191,10 @@ def test_go_to_retracts_z_before_the_xy_move(harness):
     """
     harness.go_to(1)
 
-    assert harness.stage.mock_calls == [
-        call.get_pos(),
-        call.get_pos(),
+    # Position readbacks and retract bookkeeping are implementation details; the
+    # safety contract is the order of the actual axis commands.
+    moves = [c for c in harness.stage.mock_calls if c[0].startswith("move_")]
+    assert moves == [
         call.move_z_to(control._def.OBJECTIVE_RETRACTED_POS_MM),
         call.move_x_to(20.0),
         call.move_y_to(20.0),
@@ -460,6 +481,7 @@ class _ZTimeHarness:
     _timelapse_checkbox = FlexibleMultiPointWidget._timelapse_checkbox
 
     def __init__(self):
+        self._region_z_ranges = {}
         self.multipointController = MagicMock()
         self.stage = MagicMock()
         self.stage.get_pos.return_value = SimpleNamespace(x_mm=0.0, y_mm=0.0, z_mm=0.0)

@@ -46,6 +46,7 @@ from control import utils
 import control._def
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
+from control.models.region_z_stack import z_stack_count
 from control.core.scan_coordinates import ScanCoordinates, validate_region_names
 from control.core.laser_auto_focus_controller import LaserAutofocusController
 from control.core.live_controller import LiveController
@@ -378,7 +379,8 @@ def _save_unified_multipoint_acquisition_yaml(
             "wellplate_format": wellplate_format,
         },
         "z_stack": {
-            "nz": params.NZ,
+            "nz": max([params.NZ] + [z_stack_count(*bounds, params.deltaZ)
+                                      for bounds in params.scan_position_information.scan_region_z_ranges.values()]),
             "delta_z_mm": params.deltaZ,
             "config": params.z_stacking_config,
             "z_range_mm": _serialize_for_yaml(params.z_range) if params.z_range else None,
@@ -432,6 +434,9 @@ def _save_unified_multipoint_acquisition_yaml(
                 {
                     "name": name,
                     "center_mm": _serialize_for_yaml(center),
+                    **({"z_range_mm": list(params.scan_position_information.scan_region_z_ranges[name]),
+                        "nz": z_stack_count(*params.scan_position_information.scan_region_z_ranges[name], params.deltaZ)}
+                       if name in params.scan_position_information.scan_region_z_ranges else {}),
                 }
                 for name, center in zip(
                     params.scan_position_information.scan_region_names,
@@ -1307,33 +1312,33 @@ class MultiPointController:
             # region has a list of coordinates that we capture at, and at each coordinate we need to
             # do a capture for each requested camera + lighting + other configuration selected.  So
             # total image count is:
-            coords_per_region = [
-                len(region_coords) for (region_id, region_coords) in self.scanCoordinates.region_fov_coordinates.items()
-            ]
-            all_regions_coord_count = sum(coords_per_region)
-
-            # Resolve the per-position plan so cycles (multiple frames per state), stimulus-only
-            # states (no camera frame), postprocessed steps (raw not saved), and per-step z-mode
-            # are all accounted for. frame_counts is keyed by (state, z-mode): a reference-z-only
-            # group carries the _refz suffix and is captured once (×1), full-z groups are ×NZ.
-            if self.selected_observation_state_names or self.selected_cycle_names:
-                plan = self._resolve_plan(self.selected_cycle_names, None)
-                planes_per_position = sum(
-                    count * (1 if key.endswith(REFZ_ARRAY_SUFFIX) else self.NZ)
-                    for key, count in plan.frame_counts.items()
-                )
-                non_merged_images = self.Nt * all_regions_coord_count * planes_per_position
-            else:
-                n_ch = len(self.selected_configurations)
-                non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
-            # When capturing merged images, we capture 1 per fov (where all the configurations are merged)
-            merged_images = self.Nt * self.NZ * all_regions_coord_count if control._def.MERGE_CHANNELS else 0
-
-            return non_merged_images + merged_images
+            total = 0
+            plan_cache = {}
+            for region_id, coords in self.scanCoordinates.region_fov_coordinates.items():
+                nz = self._region_nz(region_id)
+                if self.selected_observation_state_names or self.selected_cycle_names or self.region_cycle_map:
+                    cycles = (self.region_cycle_map or {}).get(region_id, self.selected_cycle_names)
+                    states = (self.region_observation_state_map or {}).get(region_id)
+                    key = (tuple(cycles), None if states is None else tuple(states))
+                    if key not in plan_cache:
+                        plan_cache[key] = self._resolve_plan(cycles, states)
+                    plan = plan_cache[key]
+                    planes = sum(count * (1 if key.endswith(REFZ_ARRAY_SUFFIX) else nz)
+                                 for key, count in plan.frame_counts.items())
+                else:
+                    planes = nz * len(self.selected_configurations)
+                if control._def.MERGE_CHANNELS:
+                    planes += nz
+                total += self.Nt * len(coords) * planes
+            return total
         except AttributeError:
             # We don't init all fields in __init__, so it's easy to get attribute errors.  We consider
             # this "not configured" and want it to be a ValueError.
             raise ValueError("Not properly configured for an acquisition, cannot calculate image count.")
+
+    def _region_nz(self, region_id):
+        bounds = getattr(self.scanCoordinates, "region_z_ranges", {}).get(region_id)
+        return z_stack_count(*bounds, self.deltaZ) if bounds is not None else self.NZ
 
     def get_acquisition_derived_image_count(self) -> int:
         """Number of derived output image planes written by online postprocessing.
@@ -2154,6 +2159,12 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        try:
+            for region_id in getattr(self.scanCoordinates, "region_z_ranges", {}):
+                self._region_nz(region_id)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._log.error(f"Invalid per-region Z range: {exc}")
+            return False
         if getattr(self, "acquisition_order", None) is not None:
             from control.models.acquisition_order import validate_order
             try:

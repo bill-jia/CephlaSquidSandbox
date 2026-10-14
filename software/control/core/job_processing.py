@@ -148,6 +148,8 @@ class CaptureInfo:
     # postprocess group (routed to the PostprocessJob runner) — its raw image is
     # NOT saved, and its save_* fields are None.
     postprocess_group: Optional[str] = None
+    # Immutable capture geometry: callbacks may run after the worker switches regions.
+    stack_z_size: Optional[int] = None
 
 
 @dataclass()

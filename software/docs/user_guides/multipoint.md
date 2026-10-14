@@ -480,8 +480,9 @@ the Wellplate tab (Steps 5–10 above). The difference is how you specify *where
 ### Building a position list
 
 The **Positions** table sits directly in the tab and is the position list: one row per
-position, in scan order, with the columns `x (mm)`, `y (mm)`, `z (μm)`, **Region Name**
-and a read‑only **AF Ref**. **Click a row to select it and drive the stage there**;
+position, in scan order, with the columns `x (mm)`, `y (mm)`, `z (μm)`, **Z min (μm)**,
+**Z max (μm)**, a read-only **Z count**, **AF Ref**, and **Region Name**.
+**Click a row to select it and drive the stage there**;
 double‑click any cell to edit it.
 
 **Move stage on click** (right‑hand end of the button row under the table, on by
@@ -504,6 +505,44 @@ Click‑to‑Move), then manage the list with the buttons around the table:
 
 The whole block is disabled while an acquisition is running: the worker takes its copy of
 the position list when the run starts, so edits made mid‑run would not reach the data.
+
+### Independent Z positions and stacks
+
+Each region has its own nominal **z (μm)** position. With **Z-stack** enabled, the
+table also shows that region's stack limits and calculated plane count. All regions
+use the same **dz** from the Z-stack controls, but their limits and counts can differ.
+
+Regions initially use the shared **Nz** and stacking mode around their stored Z
+position. Double-click **Z min** or **Z max** to override a region's limits. Clear
+either limit to return that region to the shared settings. **Z count** updates when
+you edit the limits or change the shared step. Only planes inside the requested
+range are acquired; a nonintegral remainder does not add a plane beyond a limit.
+
+With **Set Z-range** checked, the Z-min/Z-max fields show the selected position's
+limits. **Set Z-min** and **Set Z-max** copy the current stage Z into that position's
+corresponding limit. Typing into either field also edits only the selected position.
+Check **Set Z globally** on the same panel to apply subsequent limit changes to all
+positions. Changing the checkbox or selecting a different row does not rewrite any
+ranges. A global change preserves each position's other limit unless it must move
+to keep Z min at or below Z max. The shared default **Nz** stays unchanged; the
+region table shows each position's resulting count.
+
+Editing **z**, or using **Set Z from Stage**, shifts an overridden range by the same
+amount, preserving its offsets from the nominal position. Editing a range limit
+keeps the nominal position unchanged and does not itself issue a stage movement.
+Uncheck **Move stage on click** to select and edit rows without navigation moves.
+
+Every tile in a region uses its stack range. Autofocus or a focus map shifts the
+whole stack by its correction relative to the nominal region Z. A reference-plane-only
+cycle step uses the closest acquired plane to that nominal position. Disabling
+**Z-stack** acquires one plane at each nominal position and retains the overrides
+for when stacking is enabled again.
+
+Ranges survive region renaming and tile regeneration. CSV exports include
+`z_min (mm)`, `z_max (mm)`, `z_count`, the shared `delta_z_um`, stacking mode, and an
+override indicator; CSV import restores them. Older position CSVs still use the
+shared settings. Acquisition YAML records each region's resolved range and count,
+and loading it restores the region stacks.
 
 ### Naming regions
 
