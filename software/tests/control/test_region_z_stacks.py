@@ -14,6 +14,7 @@ from control.models.acquisition_cycle import RegionPlan, _index_events
 from control.models.acquisition_order import DEFAULT_ORDER, iter_ordered_visits
 from control.models.region_z_stack import default_z_range, z_stack_count
 from gui.widgets.multipoint import FlexibleMultiPointWidget
+from squid.config import DirectionSign, _default_stage_config
 from control.acquisition_yaml_loader import parse_acquisition_yaml
 from tests.control.test_flexible_region_state import harness
 from tests.control.test_multipoint_observation_snaking import _worker
@@ -205,6 +206,58 @@ def test_stage_z_initialization_does_not_replace_selected_range_fields(range_pan
     h.init_z(0.8)
     assert (h.entry_minZ.value(), h.entry_maxZ.value()) == (500, 504)
     assert h._region_z_ranges == {}
+
+
+@pytest.mark.parametrize("range_mode", [False, True])
+@pytest.mark.parametrize("stack_enabled", [False, True])
+def test_dz_enablement_follows_stack_group_independently_of_range_mode(range_panel, range_mode, stack_enabled):
+    h = range_panel
+    h._zstack_checkbox.setChecked(stack_enabled)
+    h.checkbox_set_z_range.setChecked(range_mode)
+    # A range-mode refresh must restore the right state, including after a
+    # previous group/acquisition disable, without requiring another group toggle.
+    h.entry_deltaZ.setEnabled(False)
+    h._sync_z_range_controls()
+    assert h.entry_deltaZ.isEnabled() == stack_enabled
+    assert h.entry_NZ.isEnabled() == (stack_enabled and not range_mode)
+
+
+@pytest.mark.parametrize("movement_sign", list(DirectionSign))
+@pytest.mark.parametrize("range_mode", [False, True])
+def test_dz_typing_and_arrows_with_either_motor_direction(range_panel, qtbot, movement_sign, range_mode):
+    h = range_panel
+    h.checkbox_set_z_range.setChecked(range_mode)
+    h.table_location_list.setCurrentCell(-1, -1)
+    h.checkbox_usePiezo = QCheckBox(parent=h.table_location_list)
+    config = _default_stage_config()
+    config.Z_AXIS.MOVEMENT_SIGN = movement_sign
+    config.Z_AXIS.SCREW_PITCH = 0.3
+    config.Z_AXIS.MICROSTEPS_PER_STEP = 16
+    h.stage.get_config.return_value = config
+    h.set_deltaZ = MethodType(FlexibleMultiPointWidget.set_deltaZ, h)
+    h.entry_deltaZ.setDecimals(3)
+    h.entry_deltaZ.setRange(0.001, 1000)
+    h.entry_deltaZ.setSingleStep(0.1)
+    h.entry_deltaZ.setKeyboardTracking(False)
+    h.entry_deltaZ.valueChanged.connect(h.set_deltaZ)
+    h._sync_z_range_controls()
+    qtbot.addWidget(h.entry_deltaZ)
+    h.entry_deltaZ.show()
+    h.entry_deltaZ.lineEdit().selectAll()
+    qtbot.keyClicks(h.entry_deltaZ.lineEdit(), "1.5")
+    qtbot.keyPress(h.entry_deltaZ.lineEdit(), Qt.Key_Return)
+    assert h.entry_deltaZ.value() == pytest.approx(1.5)
+    h.multipointController.set_deltaZ.assert_called_with(pytest.approx(1.5))
+    assert h.scanCoordinates.region_z_ranges["R0"] == pytest.approx((0.5, 0.503))
+    h.multipointController.set_deltaZ.reset_mock()
+    qtbot.keyPress(h.entry_deltaZ, Qt.Key_Up)
+    assert h.entry_deltaZ.value() == pytest.approx(1.594)
+    h.multipointController.set_deltaZ.assert_called_once_with(pytest.approx(1.59375))
+    qtbot.keyPress(h.entry_deltaZ, Qt.Key_Down)
+    assert h.entry_deltaZ.value() == pytest.approx(1.5)
+    h.entry_deltaZ.setValue(0.001)
+    assert h.entry_deltaZ.value() == pytest.approx(0.094)
+    h.multipointController.set_deltaZ.assert_called_with(pytest.approx(0.09375))
 
 
 def test_typing_range_fields_uses_selected_scope_and_shared_step_recomputes_counts(range_panel):

@@ -4031,8 +4031,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         globally = self.checkbox_set_z_globally.isChecked()
         if row < 0 and globally and len(self.location_ids):
             row = 0
-        enabled = (row >= 0 and self._zstack_checkbox.isChecked() and self.checkbox_set_z_range.isChecked()
-                   and not self.multipointController.acquisition_in_progress())
+        stack_enabled = self._zstack_checkbox.isChecked() and not self.multipointController.acquisition_in_progress()
+        range_mode = self.checkbox_set_z_range.isChecked()
+        # dz is shared by both stack modes and never requires a selected position.
+        # Restore its state even when a previous group/acquisition disabled it.
+        self.entry_deltaZ.setEnabled(stack_enabled)
+        self.entry_NZ.setEnabled(stack_enabled and not range_mode)
+        enabled = row >= 0 and stack_enabled and range_mode
         for widget in (self.set_minZ_button, self.set_maxZ_button, self.goto_minZ_button, self.goto_maxZ_button,
                        self.entry_minZ, self.entry_maxZ):
             widget.setEnabled(enabled)
@@ -4286,9 +4291,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         if self.checkbox_usePiezo.isChecked():
             deltaZ = value
         else:
-            mm_per_ustep = 1.0 / self.stage.get_config().Z_AXIS.convert_real_units_to_ustep(1.0)
+            axis = self.stage.get_config().Z_AXIS
+            # Stack spacing is a magnitude, independent of motor direction.
+            mm_per_ustep = abs(axis.SCREW_PITCH / (axis.MICROSTEPS_PER_STEP * axis.FULL_STEPS_PER_REV))
             deltaZ = max(1, round(value / 1000 / mm_per_ustep)) * mm_per_ustep * 1000
-        self.entry_deltaZ.setValue(deltaZ)
+        with QSignalBlocker(self.entry_deltaZ):
+            self.entry_deltaZ.setValue(deltaZ)
         self.multipointController.set_deltaZ(deltaZ)
         self._refresh_region_z_cells()
 
