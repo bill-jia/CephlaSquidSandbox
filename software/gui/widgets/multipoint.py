@@ -16,7 +16,7 @@ from .tile_spacing import TileSpacingWidget, spacing_parameters
 from .acquisition_order import AcquisitionOrderWidget
 from control.core.scan_coordinates import normalize_region_name, validate_region_name
 from control.models import LaserAFReference
-from control.models.region_z_stack import default_z_range, z_stack_count
+from control.models.region_z_stack import default_z_range, normalize_z_stacking_config, z_stack_count
 from qtpy.QtCore import QSignalBlocker
 
 
@@ -4892,6 +4892,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.location_ids = np.empty((0,), dtype=object)
         self._region_laser_af_references.clear()
         self._region_z_ranges.clear()
+        self._region_obs_state_map = None
+        if hasattr(self, "_update_per_point_button_text"):
+            self._update_per_point_button_text()
         self.table_location_list.setRowCount(0)
         self._update_position_count()
 
@@ -5108,7 +5111,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             return {}
         try:
             with open(sidecar_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                references = json.load(f)
+            if not isinstance(references, dict):
+                raise ValueError("Laser AF sidecar must contain a region-to-reference mapping.")
+            return references
         except Exception as e:
             self._log.error(f"Failed to read laser AF sidecar {sidecar_path}: {e}")
             return {}
@@ -5139,14 +5145,27 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # Export from the widget's durable store, not scanCoordinates: the latter
             # is empty whenever the regions have been cleared but not yet rebuilt.
             refs = self._region_laser_af_references
+            mode = normalize_z_stacking_config(self.combobox_z_stack.currentText())
             location_list_df = pd.DataFrame(self.location_list, columns=["x (mm)", "y (mm)", "z (mm)"])
             location_list_df["ID"] = self.location_ids
-            bounds = [self._region_z_bounds(row) for row in range(len(self.location_ids))]
+            # Save the configured ranges even while stacking is disabled, so the
+            # switch and the settings it temporarily hides both round-trip.
+            bounds = [
+                self._region_z_ranges.get(
+                    str(rid),
+                    default_z_range(
+                        float(self.location_list[row, 2]), self.entry_NZ.value(), self.entry_deltaZ.value() / 1000, mode
+                    ),
+                )
+                for row, rid in enumerate(self.location_ids)
+            ]
             location_list_df["z_min (mm)"] = [b[0] for b in bounds]
             location_list_df["z_max (mm)"] = [b[1] for b in bounds]
             location_list_df["z_count"] = [z_stack_count(*b, self.entry_deltaZ.value() / 1000) for b in bounds]
             location_list_df["delta_z_um"] = self.entry_deltaZ.value()
-            location_list_df["z_stacking_config"] = self.combobox_z_stack.currentText().upper()
+            location_list_df["z_stacking_config"] = mode
+            location_list_df["z_stack_enabled"] = self._zstack_checkbox.isChecked()
+            location_list_df["default_z_count"] = self.entry_NZ.value()
             location_list_df["z_range_override"] = [str(rid) in self._region_z_ranges for rid in self.location_ids]
             # Human-readable spot position per region; blank when no reference.
             location_list_df["laser_af_x_reference"] = [
@@ -5159,141 +5178,186 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
             # Full references (incl. the cross-correlation crop image) go to a
             # sidecar so the CSV stays readable but the export round-trips fully.
-            sidecar = {
-                str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs
-            }
-            if sidecar:
-                try:
-                    with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
-                        json.dump(sidecar, f)
-                except Exception as e:
-                    self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
+            sidecar = {str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs}
+            # Always replace the sidecar: an earlier export's references must not
+            # come back after the user clears AF targets and reuses a filename.
+            try:
+                with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f)
+            except Exception as e:
+                self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
+                error_dialog(f"Positions were saved, but laser AF references could not be saved: {e}")
 
     def import_location_list(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Import Location List", "", "CSV Files (*.csv);;All Files (*)")
         if file_path:
-            location_list_df = pd.read_csv(file_path)
-            location_list_df_relevant = None
             try:
-                location_list_df_relevant = location_list_df[["x (mm)", "y (mm)", "z (mm)"]].copy()
-            except KeyError:
-                self._log.error("Improperly formatted location list being imported")
+                # IDs are names: preserve leading zeros and names such as "NA".
+                location_list_df = pd.read_csv(file_path, dtype={"ID": str}, keep_default_na=False)
+                if location_list_df.empty:
+                    raise ValueError("The location list contains no positions.")
+                location_list_df_relevant = location_list_df[["x (mm)", "y (mm)", "z (mm)"]].astype(float)
+            except (OSError, ValueError, KeyError, pd.errors.ParserError) as exc:
+                error_dialog(f"Could not import positions: {exc}")
                 return
             if "ID" in location_list_df.columns:
                 location_list_df_relevant["ID"] = location_list_df["ID"].astype(str)
             else:
-                location_list_df_relevant["ID"] = "None"
+                location_list_df_relevant["ID"] = ""
             if "laser_af_x_reference" in location_list_df.columns:
                 location_list_df_relevant["laser_af_x_reference"] = location_list_df["laser_af_x_reference"]
             for column in ("z_min (mm)", "z_max (mm)", "z_range_override"):
                 if column in location_list_df.columns:
                     location_list_df_relevant[column] = location_list_df[column]
             # Validate the entire imported geometry before clearing any existing regions.
-            step = self.entry_deltaZ.value()
-            if "delta_z_um" in location_list_df.columns:
-                steps = location_list_df["delta_z_um"].dropna().unique()
-                if len(steps) != 1 or not math.isfinite(float(steps[0])) or float(steps[0]) < 0:
-                    error_dialog("Imported regions must share one finite, nonnegative Z step.")
-                    return
-                step = float(steps[0])
             try:
-                if not np.isfinite(location_list_df_relevant[["x (mm)", "y (mm)", "z (mm)"]].to_numpy(dtype=float)).all():
+                step = self.entry_deltaZ.value()
+                if "delta_z_um" in location_list_df.columns:
+                    steps = location_list_df["delta_z_um"].astype(float).unique()
+                    if len(steps) != 1 or not math.isfinite(steps[0]) or steps[0] < 0:
+                        raise ValueError("Imported regions must share one finite, nonnegative Z step.")
+                    step = float(steps[0])
+                    if not self.entry_deltaZ.minimum() <= step <= self.entry_deltaZ.maximum():
+                        raise ValueError("Imported Z step is outside the supported range.")
+                    if not math.isclose(step, round(step, self.entry_deltaZ.decimals()), abs_tol=1e-12):
+                        raise ValueError("Imported Z step has more precision than the Z step control supports.")
+                if not np.isfinite(
+                    location_list_df_relevant[["x (mm)", "y (mm)", "z (mm)"]].to_numpy(dtype=float)
+                ).all():
                     raise ValueError("Imported positions must be finite numbers.")
+                mode = normalize_z_stacking_config(self.combobox_z_stack.currentText())
+                if "z_stacking_config" in location_list_df.columns:
+                    modes = location_list_df["z_stacking_config"].map(normalize_z_stacking_config).unique()
+                    if len(modes) != 1:
+                        raise ValueError("Imported regions must share one Z stacking mode.")
+                    mode = modes[0]
+
+                # Spreadsheet edits can encode booleans as words or numbers. Do
+                # not silently discard ranges on an unrecognized override flag.
+                def parse_bool(value):
+                    value = str(value).strip().lower()
+                    if value in ("true", "1", "1.0"):
+                        return True
+                    if value in ("false", "0", "0.0"):
+                        return False
+                    raise ValueError(f"Invalid boolean value: {value!r}.")
+
+                if "z_range_override" in location_list_df.columns:
+                    location_list_df_relevant["z_range_override"] = location_list_df["z_range_override"].map(parse_bool)
+                default_count = self.entry_NZ.value()
+                stack_enabled = self._zstack_checkbox.isChecked()
                 if "z_min (mm)" in location_list_df.columns or "z_max (mm)" in location_list_df.columns:
                     if not {"z_min (mm)", "z_max (mm)"}.issubset(location_list_df.columns):
                         raise ValueError("Imported Z ranges need both Z min and Z max.")
                     for _, row in location_list_df.iterrows():
                         if z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000) > self.entry_NZ.maximum():
                             raise ValueError(f"A region can have at most {self.entry_NZ.maximum()} Z planes.")
-                if "z_stacking_config" in location_list_df.columns:
-                    modes = location_list_df["z_stacking_config"].dropna().unique()
-                    if len(modes) != 1 or modes[0] not in ("FROM BOTTOM", "FROM CENTER", "FROM TOP"):
-                        raise ValueError("Imported regions must share one Z stacking mode.")
-            except (ValueError, TypeError) as exc:
+                    defaults = location_list_df_relevant
+                    if "z_range_override" in defaults.columns:
+                        defaults = defaults[~defaults["z_range_override"]]
+                    if not defaults.empty:
+                        default_count = max(
+                            z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000)
+                            for _, row in defaults.iterrows()
+                        )
+                    stack_enabled = any(
+                        z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000) > 1
+                        for _, row in location_list_df.iterrows()
+                    )
+                if "default_z_count" in location_list_df.columns:
+                    counts = location_list_df["default_z_count"].astype(float).unique()
+                    if (
+                        len(counts) != 1
+                        or not math.isfinite(counts[0])
+                        or counts[0] != int(counts[0])
+                        or not self.entry_NZ.minimum() <= counts[0] <= self.entry_NZ.maximum()
+                    ):
+                        raise ValueError("Imported regions must share one supported default Z count.")
+                    default_count = int(counts[0])
+                if "z_stack_enabled" in location_list_df.columns:
+                    enabled = location_list_df["z_stack_enabled"].map(parse_bool).unique()
+                    if len(enabled) != 1:
+                        raise ValueError("Imported regions must share one Z stack enabled setting.")
+                    stack_enabled = bool(enabled[0])
+            except (ValueError, TypeError, OverflowError) as exc:
                 error_dialog(f"Invalid imported positions: {exc}")
                 return
-            self.entry_deltaZ.setValue(step)
-            if "z_stacking_config" in location_list_df.columns:
-                for index in range(self.combobox_z_stack.count()):
-                    if self.combobox_z_stack.itemText(index).upper() == modes[0]:
-                        self.combobox_z_stack.setCurrentIndex(index)
-                        break
-            if "z_min (mm)" in location_list_df.columns and not location_list_df.empty:
-                defaults = location_list_df
-                if "z_range_override" in defaults.columns:
-                    defaults = defaults[~defaults["z_range_override"].astype(str).str.lower().isin(["true", "1"])]
-                if not defaults.empty:
-                    self.entry_NZ.setValue(max(z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000)
-                                               for _, row in defaults.iterrows()))
-                self._zstack_checkbox.setChecked(any(z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000) > 1
-                                                    for _, row in location_list_df.iterrows()))
+            # Avoid edit callbacks quantizing the step or rebuilding old regions
+            # while the imported settings are only partially applied.
+            with QSignalBlocker(self.entry_deltaZ), QSignalBlocker(self.entry_NZ), QSignalBlocker(
+                self.combobox_z_stack
+            ):
+                self.entry_deltaZ.setValue(step)
+                self.entry_NZ.setValue(default_count)
+                self.combobox_z_stack.setCurrentIndex({"FROM BOTTOM": 0, "FROM CENTER": 1, "FROM TOP": 2}[mode])
+            self.multipointController.set_deltaZ(step)
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             # Full per-region references (incl. crops) ride in a sidecar next to
             # the CSV; the x_reference column is the human-readable fallback.
             sidecar_refs = self._load_laser_af_sidecar(file_path)
             # clear_only_location_list drops the widget's references; scanCoordinates
             # keeps its own copy until the regions below replace them.
+            signal_blocker = QSignalBlocker(self.table_location_list)
             self.clear_only_location_list()
             self.scanCoordinates.clear_regions()
 
-            self.table_location_list.blockSignals(True)
             for _, row in location_list_df_relevant.iterrows():
                 x = row["x (mm)"]
                 y = row["y (mm)"]
                 z = row["z (mm)"]
                 region_id = normalize_region_name(row["ID"])
-                # CSVs without an ID column give every row "None"; duplicate, missing
+                # CSVs without an ID column give every row a blank name; duplicate, missing
                 # or filesystem-unsafe ids would collapse into one scanCoordinates
                 # entry (or break the output paths). Fall back to a fresh unique id.
-                if region_id in ("None", "nan") or validate_region_name(region_id, self.location_ids) is not None:
+                if validate_region_name(region_id, self.location_ids) is not None:
                     replacement = self._next_region_id()
-                    if region_id not in ("None", "nan", ""):
+                    if region_id:
                         self._log.warning(f"Imported region name '{region_id}' is unusable; using '{replacement}'")
                     region_id = replacement
-                if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
-                    self.location_list = np.vstack((self.location_list, [[x, y, z]]))
-                    self.location_ids = np.append(self.location_ids, region_id)
-                    if "z_min (mm)" in row and "z_max (mm)" in row:
-                        override = str(row.get("z_range_override", True)).lower() in ("true", "1")
-                        if override:
-                            bounds = (float(row["z_min (mm)"]), float(row["z_max (mm)"]))
-                            z_stack_count(*bounds, self.entry_deltaZ.value() / 1000)
-                            self._region_z_ranges[region_id] = bounds
-                    table_row = self.table_location_list.rowCount()
-                    self.table_location_list.insertRow(table_row)
-                    for col, item in self._position_cells(x, y, z).items():
-                        self.table_location_list.setItem(table_row, col, item)
-                    self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
-                    if self.use_overlap:
-                        self.scanCoordinates.add_flexible_region(
-                            region_id,
-                            x,
-                            y,
-                            z,
-                            self.entry_NX.value(),
-                            self.entry_NY.value(),
-                            overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
-                        )
-                    else:
-                        self.scanCoordinates.add_flexible_region_with_step_size(
-                            region_id,
-                            x,
-                            y,
-                            z,
-                            self.entry_NX.value(),
-                            self.entry_NY.value(),
-                            self.entry_deltaX.value(),
-                            self.entry_deltaY.value(),
-                        )
-                    # Restore this region's laser-AF reference (sidecar by original
-                    # id, else the x_reference column). row["ID"] is the original
-                    # exported id even when region_id was reassigned above.
-                    reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
-                    if reference is not None:
-                        self._store_region_reference(region_id, reference)
-                    self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
+                # Distinct named regions may share XY (for example at different
+                # depths); importing an exported list must preserve every row.
+                self.location_list = np.vstack((self.location_list, [[x, y, z]]))
+                self.location_ids = np.append(self.location_ids, region_id)
+                if "z_min (mm)" in row and "z_max (mm)" in row:
+                    bounds = (float(row["z_min (mm)"]), float(row["z_max (mm)"]))
+                    default_bounds = default_z_range(z, default_count, step / 1000, mode)
+                    if row.get("z_range_override", True) or not np.allclose(bounds, default_bounds, rtol=0, atol=1e-12):
+                        self._region_z_ranges[region_id] = bounds
+                table_row = self.table_location_list.rowCount()
+                self.table_location_list.insertRow(table_row)
+                for col, item in self._position_cells(x, y, z).items():
+                    self.table_location_list.setItem(table_row, col, item)
+                self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
+                if self.use_overlap:
+                    self.scanCoordinates.add_flexible_region(
+                        region_id,
+                        x,
+                        y,
+                        z,
+                        self.entry_NX.value(),
+                        self.entry_NY.value(),
+                        overlap_percent=self.entry_overlap.value(),
+                        **spacing_parameters(self),
+                    )
                 else:
-                    self._log.warning("Duplicate values not added based on x and y.")
-            self.table_location_list.blockSignals(False)
+                    self.scanCoordinates.add_flexible_region_with_step_size(
+                        region_id,
+                        x,
+                        y,
+                        z,
+                        self.entry_NX.value(),
+                        self.entry_NY.value(),
+                        self.entry_deltaX.value(),
+                        self.entry_deltaY.value(),
+                    )
+                # Use the original name to find references even after renaming
+                # an unsafe or duplicate ID.
+                reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
+                if reference is not None:
+                    self._store_region_reference(region_id, reference)
+                self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
+            del signal_blocker
+            self._zstack_checkbox.setChecked(stack_enabled)
             self._select_row(0)
             self._update_position_count()
             self._refresh_region_z_cells()
@@ -5490,10 +5554,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.checkbox_zstack.setChecked(yaml_data.nz > 1)
             self.entry_NZ.setValue(yaml_data.nz)
             self.entry_deltaZ.setValue(yaml_data.delta_z_um)
-            for index in range(self.combobox_z_stack.count()):
-                if self.combobox_z_stack.itemText(index).upper() == yaml_data.z_stacking_config:
-                    self.combobox_z_stack.setCurrentIndex(index)
-                    break
+            mode = normalize_z_stacking_config(yaml_data.z_stacking_config)
+            self.combobox_z_stack.setCurrentIndex({"FROM BOTTOM": 0, "FROM CENTER": 1, "FROM TOP": 2}[mode])
 
             # Piezo setting
             self.checkbox_usePiezo.setChecked(yaml_data.use_piezo)
@@ -9139,5 +9201,3 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
     def clear(self):
         super().clear()
         self.region_id = 0
-
-

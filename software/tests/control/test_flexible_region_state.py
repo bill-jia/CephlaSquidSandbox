@@ -105,7 +105,7 @@ class _RegionHarness:
         self.entry_deltaZ = QDoubleSpinBox()
         self.entry_deltaZ.setValue(2.0)
         self.combobox_z_stack = QComboBox()
-        self.combobox_z_stack.addItems(["FROM BOTTOM", "FROM CENTER", "FROM TOP"])
+        self.combobox_z_stack.addItems(["From Bottom (Z-min)", "From Center", "From Top (Z-max)"])
 
         self.table_location_list = QTableWidget(len(names), self._COL_COUNT)
         self.table_location_list.setSelectionBehavior(QAbstractItemView.SelectRows)

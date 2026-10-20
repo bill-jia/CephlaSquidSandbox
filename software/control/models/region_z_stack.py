@@ -3,6 +3,15 @@
 import math
 
 
+def normalize_z_stacking_config(mode):
+    """Return the persisted mode, accepting labels written by older CSV exports."""
+    normalized = str(mode).strip().upper()
+    normalized = {"FROM BOTTOM (Z-MIN)": "FROM BOTTOM", "FROM TOP (Z-MAX)": "FROM TOP"}.get(normalized, normalized)
+    if normalized not in ("FROM BOTTOM", "FROM CENTER", "FROM TOP"):
+        raise ValueError(f"Unrecognized Z stacking mode: {mode!r}.")
+    return normalized
+
+
 def z_stack_count(z_min_mm, z_max_mm, step_mm):
     """Count inclusive planes inside the requested limits, without overshooting."""
     low, high, step = float(z_min_mm), float(z_max_mm), abs(float(step_mm))
@@ -17,6 +26,7 @@ def z_stack_count(z_min_mm, z_max_mm, step_mm):
 
 def default_z_range(reference_mm, nz, step_mm, mode):
     """Bounds around a region's nominal reference plane, matching stack traversal."""
+    mode = normalize_z_stacking_config(mode)
     step = abs(float(step_mm))
     span = step * (int(nz) - 1)
     if mode == "FROM TOP":
