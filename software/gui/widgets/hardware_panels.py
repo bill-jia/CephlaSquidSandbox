@@ -133,6 +133,11 @@ class LaserAutofocusSettingWidget(QWidget):
             settings_layout, "Displacement Success Window (μm):", "displacement_success_window_um", 0.1, 10.0, 2
         )
         self._add_spinbox(settings_layout, "Correlation Threshold:", "correlation_threshold", 0.1, 1.0, 2, 0.1)
+        self._add_spinbox(settings_layout, "Correlation Y Tolerance (pixels):", "correlation_y_tolerance_px", 0, 100, 0)
+        self.spinboxes["correlation_y_tolerance_px"].setToolTip(
+            "After fixed-crop correlation fails, retry within this Y shift while keeping X fixed. "
+            "0 disables the retry. The correlation threshold is unchanged."
+        )
         self._add_spinbox(settings_layout, "Laser AF Range (μm):", "laser_af_range", 1, 1000, 1)
         self.update_threshold_button = QPushButton("Apply without Re-initialization")
         settings_layout.addWidget(self.update_threshold_button)
@@ -348,6 +353,7 @@ class LaserAutofocusSettingWidget(QWidget):
             "displacement_success_window_um": self.spinboxes["displacement_success_window_um"].value(),
             "spot_crop_size": int(self.spinboxes["spot_crop_size"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
+            "correlation_y_tolerance_px": int(self.spinboxes["correlation_y_tolerance_px"].value()),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
             "spot_detection_mode": self.spot_mode_combo.currentData(),
             "y_window": int(self.spinboxes["y_window"].value()),
@@ -372,6 +378,7 @@ class LaserAutofocusSettingWidget(QWidget):
             "laser_af_averaging_n": int(self.spinboxes["laser_af_averaging_n"].value()),
             "displacement_success_window_um": self.spinboxes["displacement_success_window_um"].value(),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
+            "correlation_y_tolerance_px": int(self.spinboxes["correlation_y_tolerance_px"].value()),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
         }
         self.laserAutofocusController.update_threshold_properties(updates)

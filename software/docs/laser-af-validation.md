@@ -37,6 +37,14 @@ Compare `frame_z_mm` with `snapshot_z_mm`; event YAML also records individual
 displacement measurements and piezo positions. Rejected frames from earlier correction
 iterations remain available even if final verification succeeds.
 
+Verification tries the fixed reference crop first, then bounded Y-only
+registration when needed and when X displacement is within tolerance. The
+`correlation` field is the best verification score; `correlation_unregistered`
+records the original fixed-crop score. `y_registration_shift_px` records the
+selected retry shift (positive means the crop moved downward in camera pixels),
+or is blank if no retry ran. These fields are saved in both `events.csv` and
+event YAML. Registration keeps X fixed and uses the same correlation threshold.
+
 Only one previous success is held in memory. Routine successful snapshots are discarded
 after they cease to be that previous success; failures and warnings accumulate on disk.
 Full-sensor capture restores the actual focus-camera ROI, streaming state, and callback

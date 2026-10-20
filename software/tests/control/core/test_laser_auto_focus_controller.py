@@ -125,6 +125,140 @@ def apply_reference_at_current_position(controller):
     controller.apply_reference(reference)
 
 
+def test_verification_fast_path_does_not_register_y():
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    controller._register_spot_y = MagicMock(side_effect=AssertionError("fast path must not register"))
+    triggers = camera.trigger_count
+
+    ok, correlation = controller._verify_spot_alignment_with_laser_on()
+
+    assert ok and correlation > 0.99
+    controller._register_spot_y.assert_not_called()
+    assert camera.trigger_count - triggers == controller.laser_af_properties.laser_af_averaging_n
+
+
+@pytest.mark.parametrize("shift_y", [-20, -9, 9, 20])
+def test_verification_retries_y_on_the_same_frame(shift_y):
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    camera = FakeFocusCamera(render)
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    camera._render = lambda: np.roll(render(), shift_y, axis=0)
+    record = {}
+    controller._validation_update = lambda **values: record.update(values)
+    triggers = camera.trigger_count
+
+    ok, correlation = controller._verify_spot_alignment_with_laser_on()
+
+    assert ok and correlation > 0.99
+    assert record["correlation_unregistered"] < 0.9
+    assert record["y_registration_shift_px"] == shift_y
+    assert camera.trigger_count - triggers == controller.laser_af_properties.laser_af_averaging_n
+    assert stage.z_um == 0
+
+
+@pytest.mark.parametrize("tolerance,shift_y", [(0, 9), (20, 40), (20, -40)])
+def test_verification_y_retry_is_bounded_and_can_be_disabled(tolerance, shift_y):
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    camera = FakeFocusCamera(render)
+    controller = make_controller(camera, stage, correlation_y_tolerance_px=tolerance)
+    apply_reference_at_current_position(controller)
+    camera._render = lambda: np.roll(render(), shift_y, axis=0)
+
+    ok, correlation = controller._verify_spot_alignment_with_laser_on()
+
+    assert not ok and correlation < 0.9
+
+
+def test_y_retry_does_not_rescue_out_of_tolerance_x():
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    camera = FakeFocusCamera(render)
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    stage.z_um = 2.0  # 10 px in X, outside the 1 um displacement window.
+    camera._render = lambda: np.roll(render(), 9, axis=0)
+    controller._register_spot_y = MagicMock(side_effect=AssertionError("X failure must not register"))
+
+    ok, _ = controller._verify_spot_alignment_with_laser_on()
+
+    assert not ok
+    controller._register_spot_y.assert_not_called()
+
+
+def test_y_registration_never_translates_x():
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    camera = FakeFocusCamera(render)
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    image = np.roll(np.roll(render(), 20, axis=1), 9, axis=0)
+
+    correlation, shift = controller._register_spot_y(image, 718, 818, 78, 178)
+
+    assert correlation < 0.9
+    assert shift is None or abs(shift) <= 20
+
+
+@pytest.mark.parametrize(
+    "invalid", ["no_detection", "flat_reference", "flat_frame", "nonfinite_reference", "shape"]
+)
+def test_verification_does_not_register_invalid_evidence(invalid):
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    if invalid == "no_detection":
+        controller._get_laser_spot_centroid = MagicMock(return_value=None)
+    elif invalid == "flat_reference":
+        controller.reference_crop[:] = 1
+    elif invalid == "nonfinite_reference":
+        controller.reference_crop[0, 0] = np.nan
+    elif invalid == "shape":
+        controller.reference_crop = controller.reference_crop.reshape(50, 200)
+    elif invalid == "flat_frame":
+        controller.image = np.ones((IMAGE_H, IMAGE_W), dtype=np.uint8)
+        controller._get_laser_spot_centroid = MagicMock(return_value=(SPOT_X0, SPOT_Y))
+    controller._register_spot_y = MagicMock(side_effect=AssertionError("invalid evidence must not register"))
+
+    ok, correlation = controller._verify_spot_alignment_with_laser_on()
+
+    assert not ok and np.isnan(correlation)
+    controller._register_spot_y.assert_not_called()
+
+
+def test_y_registration_clips_search_to_camera_roi():
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    controller = make_controller(FakeFocusCamera(render), stage)
+    image = render()[75:185]  # Only 5 px of vertical margin on each side of the crop.
+    controller.reference_crop = controller._normalized_spot_crop(image, SPOT_X0)
+    shifted = np.roll(image, -4, axis=0)
+
+    correlation, shift = controller._register_spot_y(shifted, 718, 818, 5, 105)
+
+    assert correlation > 0.99 and shift == -4
+
+
+@pytest.mark.parametrize("shift_y,expected_ok", [(-9, True), (40, False)])
+def test_move_to_target_with_y_drift_keeps_or_rolls_back_correction(shift_y, expected_ok):
+    stage = FakeStage()
+    render = render_spot(stage, 0.2)
+    camera = FakeFocusCamera(render)
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    stage.z_um = 25
+    camera._render = lambda: np.roll(render(), shift_y, axis=0)
+
+    assert controller.move_to_target(0) is expected_ok
+    assert abs(stage.z_um - (0 if expected_ok else 25)) < 1
+
+
 def test_af_laser_toggle_without_endpoint_uses_microcontroller():
     # Regression: with no IO endpoint these used to recurse infinitely.
     stage = FakeStage()

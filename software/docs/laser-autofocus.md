@@ -31,8 +31,19 @@ defines displacement zero. Focusing is then: measure the spot, convert
    scale (`configured · commanded/measured-response`) so the operator knows
    what to recalibrate to.
 4. Cross-correlation verify: the spot image around `x_reference` is compared
-   with the reference crop (`correlation_threshold`). Failure rolls z back.
-   A NaN correlation (blank crop) counts as failure.
+   with the reference crop (`correlation_threshold`). If this fixed crop fails,
+   and the detected X displacement is within the success window, retry on the
+   same frame with bounded **Y-only registration**. X stays fixed and the
+   correlation threshold is unchanged. Failure rolls z back. Missing spots,
+   flat/non-finite crops, and mismatched crop shapes fail verification.
+
+The per-objective `correlation_y_tolerance_px` defaults to 20 pixels in either
+direction; 0 disables the retry. It is also available as **Correlation Y
+Tolerance (pixels)** in the laser-AF settings, applied without reinitialization.
+Only complete crops inside the camera ROI are considered. A successful fixed
+crop skips registration entirely; the retry adds no camera capture or Z move.
+Validation records the fixed correlation as `correlation_unregistered` and the
+selected shift as `y_registration_shift_px` (blank when no retry ran).
 
 The AF laser is held on across the whole loop (one on/off pair instead of one
 per measurement — each MCU toggle costs ~10 ms).

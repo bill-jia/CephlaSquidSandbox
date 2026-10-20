@@ -15,7 +15,7 @@ EVENT_COLUMNS = (
     "kind", "af_attempted", "af_success", "af_status", "failure_reason", "warning",
     "z_before_mm", "z_after_mm", "piezo_before_um", "piezo_after_um", "frame_z_mm", "snapshot_z_mm",
     "displacement_um", "correlation", "reference_id", "snapshot_captured", "snapshot_error",
-    "rejected_count",
+    "rejected_count", "correlation_unregistered", "y_registration_shift_px",
 )
 
 
@@ -75,6 +75,7 @@ class AFValidationCollector:
                 "timestamp", "kind", "failure_reason", "z_before_mm", "z_after_mm",
                 "piezo_before_um", "piezo_after_um", "displacement_um", "correlation",
                 "frame_z_mm", "frame_piezo_um", "measurements",
+                "correlation_unregistered", "y_registration_shift_px",
             )})
             meta.update(af_attempted=True, af_success=operation["success"], reference_id=self._reference(operation))
         else:

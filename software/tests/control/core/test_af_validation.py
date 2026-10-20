@@ -175,6 +175,25 @@ def test_collector_keeps_region_reference_comparisons_separate(tmp_path):
     assert len(list((tmp_path / "references").iterdir())) == 1
 
 
+def test_collector_records_fixed_correlation_and_y_registration(tmp_path):
+    controller, stage, camera = controller_fixture()
+    render = camera._render
+    camera._render = lambda: np.roll(render(), -9, axis=0)
+    with controller.collect_validation_event() as records:
+        assert controller.move_to_target(0)
+    record = records[0]
+    assert record["correlation_unregistered"] < 0.9
+    assert record["correlation"] > 0.99
+    assert record["y_registration_shift_px"] == -9
+
+    collector = AFValidationCollector(tmp_path)
+    collector.record(metadata(), record)
+    event = rows(tmp_path)[0]
+    assert float(event["correlation_unregistered"]) < 0.9
+    assert float(event["correlation"]) > 0.99
+    assert event["y_registration_shift_px"] == "-9"
+
+
 def make_worker(tmp_path):
     controller, stage, camera = controller_fixture()
     worker = MultiPointWorker.__new__(MultiPointWorker)
@@ -271,6 +290,7 @@ def test_worker_records_restore_failure_then_aborts(tmp_path):
 
 def test_preflight_requires_laser_af():
     controller = MultiPointController.__new__(MultiPointController)
+    controller.scanCoordinates = SimpleNamespace(region_z_ranges={})
     controller.validation_mode = True
     controller.do_reflection_af = False
     controller._log = MagicMock()
