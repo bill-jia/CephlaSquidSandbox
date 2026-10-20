@@ -149,6 +149,14 @@ and treat whatever follows `__` in the filename as the array key.
    `TimeIncrement`. The FOV count comes from `AcquisitionInfo.fovs_per_region`
    (built from the scan coordinates), and the BigTIFF flag is computed up front
    from the total size of all series (a classic TIFF cannot be upgraded later).
+   On Windows, new files are marked sparse before this pass. The full planned
+   TIFF offsets and dimensions exist immediately, but unwritten pixel ranges
+   read as zeros without occupying disk space. Disk space is allocated as frames
+   arrive, avoiding full-timelapse allocation stalls on the first frame of each
+   region (including online postprocessing outputs). Unsupported destinations
+   fall back to ordinary allocation with a warning. Sparse files do not reserve
+   the experiment's eventual disk capacity; the destination still needs enough
+   free space for the completed run. Existing acquisition files are not converted.
 2. Each frame writes its plane through `tifffile.memmap(path, series=fov, mode="r+")`:
    `stack[t, z, c, :, :] = image`. The runner keeps the open memmap and the
    bookkeeping in memory for the FOV it is filling, so a frame costs one plane
