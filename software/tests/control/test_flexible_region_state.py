@@ -398,6 +398,57 @@ def _ref(x):
     return SimpleNamespace(x_reference=x, z_reference=None)
 
 
+@pytest.mark.parametrize("region_capture", [True, False])
+@pytest.mark.parametrize("was_live", [True, False])
+@pytest.mark.parametrize("outcome", ["success", "no_spot", "exception"])
+def test_reference_capture_uses_dark_frames_and_restores_live(region_capture, was_live, outcome):
+    # A reference made under live illumination can disagree with the dark AF
+    # frames acquired during multipoint even at the same spot X position.
+    live = SimpleNamespace(is_live=was_live)
+    live.stop_live = MagicMock(side_effect=lambda: setattr(live, "is_live", False))
+    live.start_live = MagicMock(side_effect=lambda: setattr(live, "is_live", True))
+    reference = _ref(769.0)
+
+    def capture():
+        assert not live.is_live, "Reference must be captured with imaging live stopped"
+        if outcome == "exception":
+            raise RuntimeError("focus camera failed")
+        if region_capture:
+            return reference if outcome == "success" else None
+        return outcome == "success"
+
+    af = SimpleNamespace(capture_reference=capture, set_reference=capture)
+    widget = SimpleNamespace(
+        _enable_laser_autofocus=True,
+        checkbox_withReflectionAutofocus=SimpleNamespace(isChecked=lambda: True),
+        multipointController=SimpleNamespace(liveController=live, laserAutoFocusController=af),
+        _store_region_reference=MagicMock(),
+        _set_af_ref_cell_for_region=MagicMock(),
+    )
+
+    def run():
+        if region_capture:
+            return FlexibleMultiPointWidget._capture_region_reference(widget, "R0", warn_on_failure=False)
+        return FlexibleMultiPointWidget._reset_reflection_af_reference(widget)
+
+    with patch("gui.widgets.multipoint.error_dialog"):
+        if outcome == "exception":
+            with pytest.raises(RuntimeError, match="focus camera failed"):
+                run()
+        else:
+            result = run()
+            if region_capture:
+                assert result is (outcome == "success")
+
+    assert live.is_live is was_live
+    assert live.stop_live.call_count == int(was_live)
+    assert live.start_live.call_count == int(was_live)
+    if region_capture and outcome == "success":
+        widget._store_region_reference.assert_called_once_with("R0", reference)
+    else:
+        widget._store_region_reference.assert_not_called()
+
+
 def test_references_survive_a_tile_rebuild(harness):
     """Changing Nx/Ny/overlap (or the objective) rebuilds every region through
     clear_regions, which drops scanCoordinates' copy of the laser-AF targets."""

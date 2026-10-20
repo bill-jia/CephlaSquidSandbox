@@ -146,6 +146,46 @@ failures fall back to the per-region z table (see
 (`LaserAFReference`); the per-objective YAML cache stores the absolute-sensor
 x and adjusts on load.
 
+Flexible Multipoint pauses main-camera live imaging while capturing a region's
+reference (including when adding a location), and resumes it afterward. Its
+global reference reset does the same. This matches the laser-AF panel's Set
+Reference behavior: a reference captured with imaging illumination on can
+contain leaked light that is absent during acquisition, causing correlation
+rejection even when the spot's X position is correct. References captured before
+this fix need to be recaptured with live imaging stopped.
+
+For a persistent correlation failure, preserve the failing references and run
+an AF validation acquisition first (`docs/laser-af-validation.md`). Compare the
+saved native AF frame and reference crop, plus the displacement measurements
+before rollback. Validation skips channel imaging and preset prewarming, so a
+passing validation run followed by a failing imaging run suggests a difference
+in illumination or optical state that also needs investigation.
+
+### Imaging-light contamination reproduced on 20x (2026-10-19)
+
+Two validation runs over the same two 7x7 regions used the same calibration,
+detection settings, 0.9 correlation threshold, and enabled inter-region Z
+retraction. Changing reference capture from imaging off to imaging on changed
+the result from 98/98 successful corrections to 0/98. Correlations were
+0.980–1.000 with imaging-off references, versus 0.771–0.809 with imaging-on
+references. Every failed event was `verify_failed`; final measured displacement
+was within the configured ±1 µm window, and no detection frames were rejected.
+
+The saved imaging-on reference crops contain prominent bands and a changed
+spot profile. The verification frames contain the clean spot seen in the
+imaging-off references. This establishes reference contamination as the cause
+of these failures; it does not identify the optical component admitting the
+unwanted light. Keep the correlation threshold and Z retraction enabled.
+After restarting with the reference-capture fix, recapture all affected region
+references and verify a short normal imaging acquisition as well.
+
+Evidence: `debug_laser_af_2026-10-19_09-43-58.105972` and
+`debug_laser_af_reacpture_ref_imaging_on_2026-10-19_09-48-53.794292`, under
+`C:/Microscope_Data/Bill/20261017_FUCCI_QPM_timelapse/`; see each run's
+`af_validation/events.csv`, `references/`, and native frames. Failed-event
+full-sensor snapshots were taken after rollback; use the native frame for the
+actual verification position.
+
 ## Failure modes this design was hardened against (2026-07 incident)
 
 One acquisition session showed every multipoint AF event failing while live

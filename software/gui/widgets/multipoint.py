@@ -4125,11 +4125,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
     def _reset_reflection_af_reference(self):
         if not self._enable_laser_autofocus:
             return
-        if (
-            self.checkbox_withReflectionAutofocus.isChecked()
-            and not self.multipointController.laserAutoFocusController.set_reference()
-        ):
-            error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
+        if self.checkbox_withReflectionAutofocus.isChecked():
+            live = self.multipointController.liveController
+            was_live = live.is_live
+            if was_live:
+                live.stop_live()
+            try:
+                success = self.multipointController.laserAutoFocusController.set_reference()
+            finally:
+                if was_live:
+                    live.start_live()
+            if not success:
+                error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
 
     def update_z(self):
         index = self._selected_row()
@@ -4697,7 +4704,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         """
         if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
             return False
-        reference = self.multipointController.laserAutoFocusController.capture_reference()
+        # Match the global Set Reference path: imaging illumination must be off
+        # when capturing the crop that acquisition will later verify in the dark.
+        # Live light leaking into the focus camera can otherwise change the crop
+        # without noticeably changing the measured spot X position.
+        live = self.multipointController.liveController
+        was_live = live.is_live
+        if was_live:
+            live.stop_live()
+        try:
+            reference = self.multipointController.laserAutoFocusController.capture_reference()
+        finally:
+            if was_live:
+                live.start_live()
         if reference is None:
             if warn_on_failure:
                 error_dialog(
