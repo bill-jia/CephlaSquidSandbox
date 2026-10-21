@@ -1,4 +1,5 @@
 from ._bootstrap import *
+from control.core.acquisition_preview import AcquisitionPreview
 
 class FocusMapWidget(QFrame):
     """Widget for managing focus map points and surface fitting"""
@@ -1559,6 +1560,9 @@ class NapariMultiChannelWidget(QWidget):
         # Per-channel config cache so recreated layers remember user adjustments
         # (colormap, gamma, etc.) across clearAllLayers.
         self._layer_config_cache: dict = {}
+        self.preview = AcquisitionPreview()
+        self._preview_enabled = True
+        self._preview_acquiring = False
 
         # Initialize a napari Viewer without showing its standalone window.
         self.initNapariViewer()
@@ -1567,12 +1571,82 @@ class NapariMultiChannelWidget(QWidget):
         self.viewer = napari.Viewer(show=False)
         if self.grid_enabled:
             self.viewer.grid.enabled = True
-        self.viewer.dims.axis_labels = ["Z-axis", "Y-axis", "X-axis"]
+        self.viewer.dims.axis_labels = ["Y-axis", "X-axis"]
         self.viewerWidget = self.viewer.window._qt_window
         self.layout = QVBoxLayout()
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Update:"))
+        self.preview_mode = QComboBox()
+        self.preview_mode.addItem("Per Z (hold channels)", "z")
+        self.preview_mode.addItem("Per position", "position")
+        controls.addWidget(self.preview_mode)
+        controls.addWidget(QLabel("Position Z:"))
+        self.preview_z_choice = QComboBox()
+        self.preview_z_choice.addItem("Middle", "middle")
+        self.preview_z_choice.addItem("Last", "last")
+        self.preview_z_choice.setEnabled(False)
+        controls.addWidget(self.preview_z_choice)
+        controls.addStretch()
+        self.layout.addLayout(controls)
+        self.preview_status = QLabel("Waiting for acquisition")
+        self.layout.addWidget(self.preview_status)
         self.layout.addWidget(self.viewerWidget)
         self.setLayout(self.layout)
         self.customizeViewer()
+        self.preview_mode.currentIndexChanged.connect(self._changePreviewMode)
+        self.preview_z_choice.currentIndexChanged.connect(self._changePreviewMode)
+
+    def _changePreviewMode(self, _index):
+        self.preview.mode = self.preview_mode.currentData()
+        self.preview.z_choice = self.preview_z_choice.currentData()
+        self.preview_z_choice.setEnabled(self.preview.mode == "position")
+        if self._preview_enabled or not self._preview_acquiring:
+            self._renderPreview()
+
+    def resetAcquisitionPreview(self):
+        self.preview.reset()
+        self._preview_acquiring = True
+        self.clearAllLayers()
+        self.preview_status.setText("Waiting for acquisition")
+
+    def finishAcquisitionPreview(self):
+        self._preview_acquiring = False
+        self._renderPreview()
+
+    def setPreviewEnabled(self, enabled):
+        self._preview_enabled = enabled
+        if enabled:
+            self._renderPreview()
+
+    def handlePreviewEvent(self, event):
+        if self.preview.accept(event) and (self._preview_enabled or not self._preview_acquiring):
+            self._renderPreview()
+
+    def _renderPreview(self):
+        snapshot = self.preview.snapshot()
+        if snapshot is None:
+            if len(self.viewer.layers):
+                self.clearAllLayers()
+            self.preview_status.setText("Waiting for a complete position")
+            return
+        magnification = str(int(self.objectiveStore.get_current_objective_info()["magnification"]))
+        images = {f"{magnification}x {name}": image for name, image in snapshot.images.items()}
+        # All changes happen in one GUI event; no partially replaced FOV is painted.
+        for layer in list(self.viewer.layers):
+            if layer.name not in images:
+                self._layer_config_cache[layer.name] = _snapshot_image_layer(layer)
+                self.viewer.layers.remove(layer)
+        for name, image in images.items():
+            if name not in self.viewer.layers or self.viewer.layers[name].data is not image:
+                self.updateLayers(image, 0, 0, 0, name)
+        _, timepoint, region, fov = snapshot.key
+        state = "complete" if snapshot.complete else "acquiring"
+        text = f"T {timepoint + 1} | {region} | Position {fov + 1} | {state}"
+        if snapshot.errors:
+            text += " | Processing failed: " + "; ".join(snapshot.errors)
+        if self.preview.dropped_positions:
+            text += f" | Skipped {self.preview.dropped_positions} pending previews (processing backlog)"
+        self.preview_status.setText(text)
 
     def customizeViewer(self):
         # # Hide the status bar (which includes the activity button)
@@ -1623,33 +1697,18 @@ class NapariMultiChannelWidget(QWidget):
         return Colormap(colors=[c0, c1], controls=[0, 1], name=channel_info["name"])
 
     def initLayers(self, image_height, image_width, image_dtype):
-        """Initializes the full canvas for each channel based on the acquisition parameters."""
-        if self.acquisition_initialized:
-            for layer in list(self.viewer.layers):
-                if layer.name not in self.channels:
-                    self.viewer.layers.remove(layer)
-        else:
-            self.viewer.layers.clear()
-            self.acquisition_initialized = True
-            if self.dtype != np.dtype(image_dtype) and not USE_NAPARI_FOR_LIVE_VIEW:
-                self.contrastManager.scale_contrast_limits(image_dtype)
-
+        """Remember capture geometry without clearing other channels."""
         self.image_width = image_width
         self.image_height = image_height
         self.dtype = np.dtype(image_dtype)
+        if self.contrastManager.acquisition_dtype is None:
+            self.contrastManager.acquisition_dtype = self.dtype
         self.layers_initialized = True
         self.update_layer_count = 0
 
     def updateLayers(self, image, x, y, k, channel_name):
-        """Updates the appropriate slice of the canvas with the new image data."""
+        """Replace one retained 2D channel preview, independent of Z extent."""
         rgb = len(image.shape) == 3
-
-        # Check if the layer exists and has a different dtype
-        if self.dtype != np.dtype(image.dtype):  # or self.viewer.layers[channel_name].data.dtype != image.dtype:
-            # Remove the existing layer
-            self.layers_initialized = False
-            self.acquisition_initialized = False
-
         if not self.layers_initialized:
             self.initLayers(image.shape[0], image.shape[1], image.dtype)
 
@@ -1657,7 +1716,6 @@ class NapariMultiChannelWidget(QWidget):
             self.channels.add(channel_name)
             if rgb:
                 color = None  # RGB images do not need a colormap
-                canvas = np.zeros((self.Nz, self.image_height, self.image_width, 3), dtype=self.dtype)
             else:
                 channel_info = CHANNEL_COLORS_MAP.get(
                     self.extractWavelength(channel_name), {"hex": 0xFFFFFF, "name": "gray"}
@@ -1666,18 +1724,16 @@ class NapariMultiChannelWidget(QWidget):
                     color = AVAILABLE_COLORMAPS[channel_info["name"]]
                 else:
                     color = self.generateColormap(channel_info)
-                canvas = np.zeros((self.Nz, self.image_height, self.image_width), dtype=self.dtype)
-
-            limits = self.getContrastLimits(self.dtype)
+            limits = self.contrastManager.get_limits(channel_name)
             layer = self.viewer.add_image(
-                canvas,
+                image,
                 name=channel_name,
                 visible=True,
                 rgb=rgb,
                 colormap=color,
                 contrast_limits=limits,
                 blending="additive",
-                scale=(self.dz_um, self.pixel_size_um, self.pixel_size_um),
+                scale=(self.pixel_size_um, self.pixel_size_um),
             )
 
             # print(f"multi channel - dz_um:{self.dz_um}, pixel_y_um:{self.pixel_size_um}, pixel_x_um:{self.pixel_size_um}")
@@ -1697,14 +1753,8 @@ class NapariMultiChannelWidget(QWidget):
                 layer.refresh()
 
         layer = self.viewer.layers[channel_name]
-        layer.data[k] = image
+        layer.data = image
         layer.contrast_limits = self.contrastManager.get_limits(channel_name)
-        self.update_layer_count += 1
-        if self.update_layer_count % len(self.channels) == 0:
-            if self.Nz > 1:
-                self.viewer.dims.set_point(0, k * self.dz_um)
-            for layer in self.viewer.layers:
-                layer.refresh()
 
     def signalContrastLimits(self, event):
         layer = event.source
@@ -1723,9 +1773,7 @@ class NapariMultiChannelWidget(QWidget):
         self.viewer.window.activate()
 
     def clearAllLayers(self):
-        """Remove all napari layers and reset state. Called between timepoints
-        to flush napari's per-layer caches (thumbnails, vispy textures) so RAM
-        tracks a single-timepoint high-water mark instead of accumulating."""
+        """Clear preview layers at acquisition start, retaining user settings."""
         # Snapshot per-layer user adjustments so they carry across the flush.
         for layer in self.viewer.layers:
             if hasattr(layer, "colormap"):
@@ -1734,6 +1782,7 @@ class NapariMultiChannelWidget(QWidget):
         self.acquisition_initialized = False
         self.layers_initialized = False
         self.update_layer_count = 0
+        self.viewer_scale_initialized = False
         gc.collect()
 
 
@@ -2508,5 +2557,3 @@ class NapariPlateViewWidget(QWidget):
     def activate(self):
         """Activate the viewer window."""
         self.viewer.window.activate()
-
-

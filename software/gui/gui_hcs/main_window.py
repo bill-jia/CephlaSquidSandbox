@@ -25,7 +25,6 @@ import numpy as np
 import serial
 
 
-
 # qt libraries
 from qtpy.QtCore import *
 from qtpy.QtWidgets import *
@@ -87,7 +86,6 @@ import control.core.core as core
 import control.microcontroller as microcontroller
 import control.serial_peripherals as serial_peripherals
 import control.core_displacement_measurement as core_displacement_measurement
-
 
 
 if USE_JUPYTER_CONSOLE:
@@ -531,7 +529,6 @@ class HighContentScreeningGui(QMainWindow):
             import control.NL5Widget as NL5Widget
 
             self.nl5Wdiget = NL5Widget.NL5Widget(self.nl5)
-        
 
         if CAMERA_TYPE in ["Toupcam", "Tucsen", "Kinetix"]:
             self.cameraSettingWidget = widgets.CameraSettingsWidget(
@@ -1592,12 +1589,22 @@ class HighContentScreeningGui(QMainWindow):
         if not self.live_only_mode:
             # Setup multichannel widget connections
             self.napari_connections["napariMultiChannelWidget"] = [
-                (self.multipointController.napari_layers_init, self.napariMultiChannelWidget.initLayers),
-                (self.multipointController.napari_layers_update, self.napariMultiChannelWidget.updateLayers),
-                # Flush layer caches at each new timepoint so RAM doesn't creep across the run.
                 (
-                    self.multipointController.signal_new_time_point,
-                    lambda _tp: self.napariMultiChannelWidget.clearAllLayers(),
+                    self.multipointController.acquisition_preview,
+                    self.napariMultiChannelWidget.handlePreviewEvent,
+                    Qt.QueuedConnection,
+                ),
+                (
+                    self.multipointController.signal_acquisition_start,
+                    self.napariMultiChannelWidget.resetAcquisitionPreview,
+                ),
+                (
+                    self.multipointController.acquisition_finished,
+                    self.napariMultiChannelWidget.finishAcquisitionPreview,
+                ),
+                (
+                    self.multipointController.acquisition_preview_enabled,
+                    self.napariMultiChannelWidget.setPreviewEnabled,
                 ),
             ]
 

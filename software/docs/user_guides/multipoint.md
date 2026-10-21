@@ -676,6 +676,20 @@ channel configuration.
   bar, and a live ETA.
 - **Multichannel Acquisition** and **Mosaic View** tabs show captured frames as they
   arrive (unless *Show live preview during acquisition* is off).
+  In **Multichannel Acquisition**, use **Update** to choose:
+  - **Per Z (hold channels)**: each arriving frame replaces its channel's preview.
+    Channels without a new frame retain their last image within that position.
+  - **Per position**: keep the previous completed position visible until all raw
+    frames and online processing groups for the next position finish, then replace
+    the displayed channels together. **Position Z** selects each channel's middle
+    or last (highest indexed) Z plane, including processed outputs with their own
+    Z counts. Single-plane channels appear in both choices. For even Z counts,
+    Middle selects index `Nz // 2`. This choice is independent of scan direction.
+  The status row identifies the displayed timepoint, region, and position, and
+  reports processing failures. Delayed results never overwrite a newer position.
+  Preview memory retains at most eight pending positions; a processing backlog
+  beyond this skips older previews and reports the count. Saved data is unaffected.
+  These are 2D monitoring previews; use **NDViewer** to browse acquired Z stacks.
 - **Plate View** tab (when enabled): a real‑time downsampled overview of the whole plate
   for well‑based runs without Z‑stacking. Double‑click any FOV to inspect it in the
   **NDViewer**. See [downsampled-plate-view.md](downsampled-plate-view.md) and

@@ -3042,8 +3042,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self._pending_move_settle = False
         self._pending_move_stabilization_s = 0.0
 
-
-
     def move_to_z_level(self, z_mm, blocking=True):
         self._log.debug("moving z")
         self.stage.move_z_to(z_mm, blocking=blocking)
@@ -3372,7 +3370,18 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         the derived image flows through the same signal_new_image path as raw
         frames. Best-effort — display must never break the acquisition.
         """
+        from control.core.acquisition_preview import PreviewProcessed
+
         src = pr.source_capture_info
+        self.callbacks.signal_acquisition_preview(
+            PreviewProcessed(
+                (str(self.experiment_path), pr.time_point, str(pr.region_id), pr.fov),
+                pr.group_key,
+                pr.display_images,
+                pr.display_images_last or pr.display_images,
+                pr.error,
+            )
+        )
         if src is None or not pr.display_images:
             return
         import dataclasses
@@ -3380,10 +3389,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         from squid.config import CameraPixelFormat
 
         for out_key, image in pr.display_images.items():
-            # The live display shares one image size + integer dtype across all
-            # channels; a preview that doesn't match the current raw-frame size
-            # would thrash the viewer (re-init every frame). Skip mismatches —
-            # the output is still saved to its plate.
+            # Legacy live/mosaic paths require the raw frame's shape. Structured
+            # multichannel previews above support each output's native shape.
             if self._last_raw_display_shape is not None and image.shape[:2] != self._last_raw_display_shape:
                 self._log.debug(
                     "Skipping live display of %s: shape %s != live frame %s",
@@ -4343,6 +4350,16 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         if not region_plan.events:
             raise ValueError("No observation states selected for acquisition.")
         frames_per_fov = self._captured_frames_per_fov(region_plan)
+        from control.core.acquisition_preview import PreviewStarted, PreviewCaptured
+
+        preview_key = (str(getattr(self, "experiment_path", "")), self.time_point, str(region_id), fov)
+        self.callbacks.signal_acquisition_preview(
+            PreviewStarted(
+                preview_key,
+                frames_per_fov,
+                tuple(region_plan.postprocess_groups) if not getattr(self, "skip_saving", False) else (),
+            )
+        )
         imaged_step = 0
         current_z_level = 0  # prepare_z_stack positions the canonical first plane
         recorded_z_levels = set()
@@ -4489,6 +4506,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # Increment FOV counter for Slack notification stats
         if ordered_visit is None or self._ordered_final_position:
             self._timepoint_fov_count += 1
+            if not self.abort_requested_fn():
+                self.callbacks.signal_acquisition_preview(PreviewCaptured(preview_key))
 
     def _select_config(self, config):
         """Apply an ObservationState to hardware before capture."""
@@ -5349,9 +5368,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                                 return
                         else:
                             try:
-                                # NOTE(imo): We don't have any way of people using results, so for now just
-                                # grab and ignore it.
                                 result = job.run()
+                                if isinstance(result, PostprocessResult):
+                                    self._emit_postprocess_display(result)
                             except Exception:
                                 self._log.exception("Failed to execute job, abandoning acquisition!")
                                 self.request_abort_fn()
@@ -5370,6 +5389,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     # so a postprocess output preview is only safe to display when
                     # it matches this (see _emit_postprocess_display).
                     self._last_raw_display_shape = image.shape[:2]
+                    from control.core.acquisition_preview import PreviewFrame, position_key
+
+                    self.callbacks.signal_acquisition_preview(
+                        PreviewFrame(
+                            position_key(info),
+                            info.observation_state.name,
+                            image,
+                            info.z_index,
+                            info.save_z_size or info.stack_z_size or 1,
+                        )
+                    )
                     self.callbacks.signal_new_image(camera_frame, info)
 
         finally:

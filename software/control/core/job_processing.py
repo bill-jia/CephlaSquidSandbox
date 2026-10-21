@@ -1501,6 +1501,7 @@ class PostprocessResult:
     outputs_written: int
     barrier_results: List[BarrierResult] = field(default_factory=list)
     display_images: Dict[str, np.ndarray] = field(default_factory=dict)  # output_key -> small preview
+    display_images_last: Dict[str, np.ndarray] = field(default_factory=dict)
     # The last input frame's CaptureInfo — lets the main process synthesize a
     # CameraFrame/CaptureInfo pair for the live-display signal (position, region…).
     source_capture_info: Optional[CaptureInfo] = None
@@ -1612,25 +1613,36 @@ class PostprocessJob(Job):
                 region_id=str(info.region_id),
                 fov=info.fov,
                 outputs_written=0,
+                source_capture_info=info,
                 error=str(e),
             )
 
         barrier_results: List[BarrierResult] = []
         display_images: Dict[str, np.ndarray] = {}
+        display_images_last: Dict[str, np.ndarray] = {}
+        errors = []
         written = 0
         last_capture_time = acc["frames"][-1]["capture_time"]
         for spec in self.output_specs:
             out_key = f"{self.label}_{spec['name']}"
-            arr = outputs.get(spec["name"])
-            if arr is None:
-                self._log.error(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
-                continue
-            arr = self._coerce_output(arr, spec, acc["frames"])
-            written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
-            barrier = self._maybe_barrier(out_key)
-            if barrier is not None:
-                barrier_results.append(barrier)
-            display_images[out_key] = self._prepare_display_image(arr)
+            try:
+                arr = outputs.get(spec["name"])
+                if arr is None:
+                    raise ValueError(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
+                arr = self._coerce_output(arr, spec, acc["frames"])
+                written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
+                barrier = self._maybe_barrier(out_key)
+                if barrier is not None:
+                    barrier_results.append(barrier)
+                display_images[out_key] = self._prepare_display_image(arr)
+                display_images_last[out_key] = (
+                    self._prepare_display_image(arr, z_choice="last") if arr.ndim == 3 else display_images[out_key]
+                )
+            except Exception as e:
+                # Return a keyed failure so the preview can settle this group;
+                # an unkeyed JobResult exception would leave it pending forever.
+                self._log.exception("Postprocess output %s failed", out_key)
+                errors.append(f"{out_key}: {e}")
 
         return PostprocessResult(
             group_key=self.group_key,
@@ -1640,7 +1652,9 @@ class PostprocessJob(Job):
             outputs_written=written,
             barrier_results=barrier_results,
             display_images=display_images,
+            display_images_last=display_images_last,
             source_capture_info=info,
+            error="; ".join(errors) if errors else None,
         )
 
     @classmethod
@@ -1842,17 +1856,14 @@ class PostprocessJob(Job):
         )
         return barrier.run()
 
-    def _prepare_display_image(self, arr: np.ndarray) -> np.ndarray:
+    def _prepare_display_image(self, arr: np.ndarray, z_choice: str = "middle") -> np.ndarray:
         """Produce a display-safe preview plane for the live viewer.
 
-        The live napari/contrast display assumes a single integer dtype and one
-        image size shared across all channels (it re-inits the whole canvas when
-        either changes). So a float output must be normalized to the raw camera
-        dtype (uint16) and kept at its native resolution (which, for image-in →
-        image-out routines, matches the camera frame) — otherwise it thrashes the
-        viewer every frame. Integer outputs pass through unchanged.
+        Legacy live/mosaic displays require integer data, so float outputs are
+        normalized to uint16 at native resolution. Z selection uses each output's
+        own extent, independently of the input stack or other output channels.
         """
-        plane = arr[arr.shape[0] // 2] if arr.ndim == 3 else arr
+        plane = arr[-1 if z_choice == "last" else arr.shape[0] // 2] if arr.ndim == 3 else arr
         if np.issubdtype(plane.dtype, np.integer):
             return np.ascontiguousarray(plane.astype(np.uint16, copy=False))
         finite = plane[np.isfinite(plane)]

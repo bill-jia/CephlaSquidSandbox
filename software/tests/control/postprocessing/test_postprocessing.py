@@ -577,6 +577,7 @@ def test_image_count_zmode_aware_and_derived_count():
     mpc.selected_cycle_names = ["c"]
     mpc.selected_observation_state_names = []
     mpc.region_cycle_map = None
+    mpc.region_observation_state_map = {}
     mpc.scanCoordinates = SimpleNamespace(region_fov_coordinates={"R0": [0]})  # 1 FOV
     mpc._resolve_plan = lambda names, region: plan
 
@@ -610,6 +611,9 @@ def test_prepare_display_image_is_display_safe():
     # A 3D (Z,Y,X) output previews its center plane.
     vol = np.zeros((3, 20, 20), np.float32)
     assert job._prepare_display_image(vol).shape == (20, 20)
+    vol = np.stack([np.full((4, 4), z, np.uint16) for z in range(4)])
+    assert np.all(job._prepare_display_image(vol) == 2)
+    assert np.all(job._prepare_display_image(vol, z_choice="last") == 3)
 
 
 def test_postprocess_job_partial_group_returns_none_and_holds_bytes():

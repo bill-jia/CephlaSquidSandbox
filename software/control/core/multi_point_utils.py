@@ -220,3 +220,5 @@ class MultiPointControllerFunctions:
     # the point at which it is safe to move/copy the dataset. Used by the GUI to
     # keep the progress bar up as "Finalizing..." until writeback truly completes.
     signal_data_writing_complete: Callable[[], None] = lambda *a, **kw: None
+    # Structured preview events; independent of saving and legacy mosaic updates.
+    signal_acquisition_preview: Callable[[object], None] = lambda *a, **kw: None
