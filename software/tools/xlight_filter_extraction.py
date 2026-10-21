@@ -1,4 +1,4 @@
-"""Small operator UI for moving the X-Light emission wheel to extraction.
+"""Small operator UI for moving X-Light emission and dichroic wheels to extraction.
 
 Run from the ``software`` directory with::
 
@@ -80,12 +80,19 @@ class XLightExtractionWindow(QWidget):
         for slot, name in sorted(self.positions.items()):
             self.position_combo.addItem(f"{slot}: {name}", slot)
 
+        self.dichroic_combo = QComboBox()
+        for slot in range(1, 4):
+            self.dichroic_combo.addItem(str(slot), slot)
+
         details = QFormLayout()
         details.addRow("X-Light serial number:", QLabel(self.serial_number))
         details.addRow("Emission filter:", self.position_combo)
+        details.addRow("Dichroic mirror:", self.dichroic_combo)
 
-        self.move_button = QPushButton("Move to extraction position")
+        self.move_button = QPushButton("Move emission filter to extraction position")
         self.move_button.clicked.connect(self.move_selected_filter)
+        self.dichroic_move_button = QPushButton("Move dichroic mirror to extraction position")
+        self.dichroic_move_button.clicked.connect(self.move_selected_dichroic)
 
         self.status_label = QLabel("Ready")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -93,6 +100,7 @@ class XLightExtractionWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(details)
         layout.addWidget(self.move_button)
+        layout.addWidget(self.dichroic_move_button)
         layout.addWidget(self.status_label)
 
     def connect_xlight(self) -> XLight:
@@ -105,9 +113,6 @@ class XLightExtractionWindow(QWidget):
                 validate_wheel_pos=self.validate,
                 emission_filter_positions=len(self.positions),
             )
-            if not self.xlight.has_emission_filters_wheel:
-                self.disconnect_xlight()
-                raise RuntimeError("The connected X-Light does not report an emission filter wheel")
         return self.xlight
 
     def disconnect_xlight(self) -> None:
@@ -127,19 +132,35 @@ class XLightExtractionWindow(QWidget):
             serial_connection.close()
 
     def move_selected_filter(self) -> None:
-        slot = int(self.position_combo.currentData())
+        self.move_to_extraction(int(self.position_combo.currentData()))
+
+    def move_selected_dichroic(self) -> None:
+        self.move_to_extraction(int(self.dichroic_combo.currentData()), dichroic=True)
+
+    def move_to_extraction(self, slot: int, *, dichroic: bool = False) -> None:
+        component = "Dichroic mirror" if dichroic else "Emission filter"
         self.move_button.setEnabled(False)
+        self.dichroic_move_button.setEnabled(False)
         try:
             xlight = self.connect_xlight()
-            self.status_label.setText(f"Moving filter {slot} to extraction position...")
+            has_wheel = xlight.has_dichroic_filters_wheel if dichroic else xlight.has_emission_filters_wheel
+            if not has_wheel:
+                self.disconnect_xlight()
+                wheel = "a dichroic" if dichroic else "an emission filter"
+                raise RuntimeError(f"The connected X-Light does not report {wheel} wheel")
+            self.status_label.setText(f"Moving {component.lower()} {slot} to extraction position...")
             QApplication.processEvents()
-            xlight.set_emission_filter(slot, extraction=True, validate=True)
-            self.status_label.setText(f"Filter {slot} is at its extraction position")
+            if dichroic:
+                xlight.set_dichroic(slot, extraction=True)
+            else:
+                xlight.set_emission_filter(slot, extraction=True, validate=True)
+            self.status_label.setText(f"{component} {slot} is at its extraction position")
         except Exception as exc:
             self.status_label.setText("Move failed")
             QMessageBox.critical(self, "X-Light error", str(exc))
         finally:
             self.move_button.setEnabled(True)
+            self.dichroic_move_button.setEnabled(True)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         try:
