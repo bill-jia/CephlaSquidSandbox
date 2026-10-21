@@ -250,6 +250,11 @@ def write_plate_metadata(
     if squid_attributes:
         plate_metadata["_squid"] = dict(squid_attributes)
     _write_group_metadata(plate_path, plate_metadata, "plate")
+    # Explicit row groups are required for hierarchy traversal/consolidation.
+    for row in rows:
+        row_path = os.path.join(plate_path, row)
+        if not os.path.exists(os.path.join(row_path, "zarr.json")):
+            _write_group_metadata(row_path, {}, "plate row")
 
 
 def write_well_metadata(

@@ -327,6 +327,36 @@ class TestMetadataResync:
 
 
 class TestResyncWaitsForFinalize:
+    def test_slow_consolidation_cannot_be_overtaken_by_runner_timeout(self, tmp_path, monkeypatch):
+        from itertools import count
+        from unittest.mock import Mock
+
+        ready = threading.Event()
+        stopped = threading.Event()
+        stopped.set()
+        drainer = _drainer(tmp_path, runners_done=ready, writers_stopped_event=stopped)
+        drainer._log = Mock()
+        # Simulate a consolidation that finishes after the runner timeout.
+        ticks = count(start=0, step=10000)
+        monkeypatch.setattr("control.core.multi_point_worker.time.time", lambda: next(ticks))
+        monkeypatch.setattr(ready, "wait", lambda timeout: ready.set())
+        drainer._wait_for_runners_to_exit("test")
+        assert ready.is_set(), "returned before consolidation finished"
+        drainer._log.error.assert_not_called()
+
+    def test_runner_timeout_still_applies_before_writers_stop(self, tmp_path, monkeypatch):
+        from itertools import count
+        from unittest.mock import Mock
+
+        ready = threading.Event()
+        drainer = _drainer(tmp_path, runners_done=ready, writers_stopped_event=threading.Event())
+        drainer._log = Mock()
+        ticks = count(start=0, step=10000)
+        monkeypatch.setattr("control.core.multi_point_worker.time.time", lambda: next(ticks))
+        drainer._wait_for_runners_to_exit("test")
+        assert not ready.is_set()
+        drainer._log.error.assert_called_once()
+
     def test_wait_returns_only_once_runners_are_done(self, tmp_path):
         """The drain is handed off while finalize_all_writers() is still
         running in the subprocesses. Resyncing then would ship a pre-finalize
@@ -371,3 +401,81 @@ class TestResyncWaitsForFinalize:
         time.sleep(0.2)
         d._stop_requested.set()
         assert finished.wait(timeout=15.0), "wait ignored the stop request"
+
+
+@pytest.mark.parametrize("manager_owned", [False, True])
+def test_consolidation_precedes_completion_and_final_upload(tmp_path, monkeypatch, manager_owned):
+    """Exercise the completion hook with both legacy and persistent uploads."""
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from control.core.job_processing import SaveZarrJob
+    from control.core.multi_point_worker import MultiPointWorker
+    from control.core.upload_manager_client import UploadManagerClient
+
+    events = []
+    store = tmp_path / "plate.ome.zarr"
+    field = store / "A/1/0"
+    field.mkdir(parents=True)
+    root_metadata = {"zarr_format": 3, "node_type": "group", "attributes": {}}
+    (store / "zarr.json").write_text(json.dumps(root_metadata))
+
+    def shutdown(*args, **kwargs):
+        metadata = dict(root_metadata, attributes={"_squid": {"acquisition_complete": True}})
+        (field / "zarr.json").write_text(json.dumps(metadata))
+        events.append("finalize")
+
+    def assert_index():
+        index = json.loads((store / "zarr.json").read_text())["consolidated_metadata"]["metadata"]
+        assert index["A/1/0"]["attributes"]["_squid"]["acquisition_complete"] is True
+
+    def complete():
+        assert_index()
+        events.append("complete")
+
+    def submit(_client, _dataset, _batch, files, **kwargs):
+        assert_index()
+        assert any(item["relative_path"] == "plate.ome.zarr/zarr.json" for item in files)
+        events.append("upload")
+
+    # Synchronous thread stand-ins retain the shutdown/join/completion ordering.
+    class Thread:
+        def __init__(self, target, args=(), kwargs=None, **unused):
+            self.run = lambda: target(*args, **(kwargs or {}))
+
+        def start(self):
+            self.run()
+
+        def join(self):
+            pass
+
+    monkeypatch.setattr("control.core.multi_point_worker.threading.Thread", Thread)
+    monkeypatch.setattr(UploadManagerClient, "submit_batch", submit)
+    monkeypatch.setattr(UploadManagerClient, "seal_dataset", lambda *args: events.append("seal"))
+    runner = SimpleNamespace(has_pending=lambda: False, has_upload_pipeline=lambda: False, shutdown=shutdown)
+
+    def spawn_drainer(**kwargs):
+        assert kwargs["runners_done_event"].is_set()
+        assert kwargs["writers_stopped_event"].is_set()
+        assert_index()
+        events.append("drainer")
+
+    worker = SimpleNamespace(
+        _job_runners=[(SaveZarrJob, runner)],
+        _log=Mock(),
+        _zarr_writer_info=object(),
+        _upload_target=UploadTarget(enabled=True, manager_owned=manager_owned),
+        experiment_path=str(tmp_path),
+        callbacks=SimpleNamespace(signal_data_writing_complete=complete),
+        abort_requested_fn=lambda: False,
+        _summarize_runner_outputs=lambda **kwargs: None,
+        _spawn_background_upload_drainer=spawn_drainer,
+        _backpressure=SimpleNamespace(close=lambda: None),
+    )
+    MultiPointWorker._finish_jobs(worker)
+    assert events == (
+        ["finalize", "upload", "seal", "complete", "drainer"]
+        if manager_owned
+        else ["finalize", "complete", "drainer"]
+    )

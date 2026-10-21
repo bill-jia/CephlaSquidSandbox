@@ -367,6 +367,7 @@ class _BackgroundUploadDrainer:
         experiment_path: Optional[str],
         runner_output_queues: Optional[List] = None,
         runners_done_event: Optional[threading.Event] = None,
+        writers_stopped_event: Optional[threading.Event] = None,
         stall_window_s: float = 120.0,
         failed_deletions: int = 0,
     ):
@@ -392,6 +393,7 @@ class _BackgroundUploadDrainer:
         # during the up-to-600s background finalize; we consume them here.
         self._runner_queues: List = list(runner_output_queues or [])
         self._runners_done = runners_done_event
+        self._writers_stopped = writers_stopped_event
         self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
@@ -831,6 +833,8 @@ class _BackgroundUploadDrainer:
         Late BarrierResults are consumed from the runner output queues here —
         the main process's last drain happened before the background shutdown,
         so without this the tasks those barriers staged would be untracked.
+        Once writers have stopped, metadata consolidation may take longer than
+        the runner timeout. Wait for its completion before the final resync.
         """
         if self._runners_done is None:
             return
@@ -840,7 +844,7 @@ class _BackgroundUploadDrainer:
             self._drain_runner_barrier_results()
             self._drain_available_results()
             now = time.time()
-            if now > deadline:
+            if now > deadline and not (self._writers_stopped is not None and self._writers_stopped.is_set()):
                 self._log.error(
                     f"[{tag}] JobRunners did not finish within "
                     f"{int(JOB_RUNNER_FINALIZE_TIMEOUT_S + 60)}s; proceeding with "
@@ -2485,6 +2489,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # closing the queues when it finishes.
         upload_runner_queues = []
         runners_exited_event = threading.Event()
+        writers_stopped_event = threading.Event()
         shutdown_threads = []
         for job_class, job_runner in active_runners:
             keep_queue_open = job_runner.has_upload_pipeline()
@@ -2511,6 +2516,19 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         def _announce_writeback_complete(threads):
             for th in threads:
                 th.join()
+            writers_stopped_event.set()
+            # All raw/derived writers must finish before taking a plate-wide
+            # snapshot. Publish it before either upload path resyncs metadata
+            # and before declaring the local acquisition safe to copy.
+            if self._zarr_writer_info is not None:
+                try:
+                    from control.core.zarr_metadata import consolidate_acquisition_metadata
+
+                    failures = consolidate_acquisition_metadata(self.experiment_path)
+                    if failures:
+                        log.error("Zarr metadata consolidation failed for %s", failures)
+                except Exception:
+                    log.exception("Could not consolidate acquisition metadata")
             # The upload drainer waits on this before its "post-finalize"
             # metadata resync — only now is every zarr.json actually final.
             runners_exited_event.set()
@@ -2598,6 +2616,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S,
             runner_output_queues=upload_runner_queues,
             runners_done_event=runners_exited_event,
+            writers_stopped_event=writers_stopped_event,
         )
 
         # Release backpressure resources now that all jobs are complete
@@ -2611,6 +2630,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         stall_window_s: float,
         runner_output_queues: Optional[List] = None,
         runners_done_event: Optional[threading.Event] = None,
+        writers_stopped_event: Optional[threading.Event] = None,
     ) -> None:
         """Detach the UploadWorker drain to a background thread.
 
@@ -2646,6 +2666,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             experiment_path=self.experiment_path,
             runner_output_queues=runner_output_queues,
             runners_done_event=runners_done_event,
+            writers_stopped_event=writers_stopped_event,
             stall_window_s=stall_window_s,
             failed_deletions=self._upload_failed_deletions,
         )

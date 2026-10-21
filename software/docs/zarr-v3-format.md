@@ -46,6 +46,42 @@ shard spans all channels and the full `Y`,`X`, only `t` and `z` vary:
 Any external tool that enumerates shards by path must handle the `{z}` axis —
 see [Known gaps](#known-gaps-and-limitations).
 
+## Consolidated metadata
+
+After all saving processes finish and field metadata is finalized, acquisition
+writeback creates an inline `consolidated_metadata` index in each independent
+store's root `zarr.json`. This runs before the data-writing-complete signal and
+the final upload metadata resync, including ragged and derived stores. The
+index contains the full metadata of every field and resolution level; fields
+may have different shapes or channel lists. Image chunks are not read.
+
+The metadata-only implementation in `control/core/zarr_metadata.py` writes the
+Zarr-Python 3 representation without requiring an upgrade from Zarr 2 in the
+microscope's TensorStore environment. Explicit row-group metadata makes HCS
+hierarchies traversable, including when consolidation is unavailable.
+
+For an existing, completed acquisition (or a single `.ome.zarr` store), run:
+
+```sh
+python software/scripts/zarr_consolidate_metadata.py /path/to/acquisition
+```
+
+Stop all writers first and regenerate consolidation after any metadata edits.
+If the acquisition was already uploaded, resync the updated metadata to the
+remote copy. Consolidation failures are logged; the original per-node metadata
+remains available.
+
+Zarr-Python 3 readers should open the **store root** with
+`zarr.open_group(path, mode="r", use_consolidated=None)` and access children
+through that group. This uses the index when available and falls back for old
+archives. Export planning should filter `ome.plate.wells` and
+`ome.well.images` before opening selected image groups or arrays, and retain
+each selected field's own shape and channel metadata. Active acquisition
+viewers should continue reading live metadata without consolidation.
+
+Zarr-Python describes v3 consolidation as experimental; see its
+[consolidated metadata documentation](https://zarr.readthedocs.io/en/latest/user-guide/consolidated_metadata/).
+
 ## Store inventory
 
 A single acquisition can produce **more than one** zarr store. Which stores

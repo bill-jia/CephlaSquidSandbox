@@ -526,6 +526,8 @@ class TestHCSMetadata:
             assert plate["columns"] == [{"name": "1"}, {"name": "2"}, {"name": "3"}]
             paths = [w["path"] for w in plate["wells"]]
             assert paths == ["A/1", "A/2", "B/3"]
+            for row in ("A", "B"):
+                assert _read_zarr_json(os.path.join(plate_path, row))["node_type"] == "group"
 
     def test_well_metadata(self):
         from control.core.zarr_writer import write_well_metadata
