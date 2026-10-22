@@ -447,6 +447,7 @@ class TucsenCamera(AbstractCamera):
         self._frame_lock = threading.Lock()
         self._current_frame: Optional[CameraFrame] = None
         self._last_trigger_timestamp = 0
+        self._last_trigger_frame_id: Optional[int] = None
         self._trigger_sent = threading.Event()
         self._is_streaming = threading.Event()
 
@@ -830,6 +831,11 @@ class TucsenCamera(AbstractCamera):
         # both SDK-callback and thread-poll paths since both fire
         # _frame_arrived_callbacks keyed by frame_id.
         self._next_frame_id = 1
+        # IDs belong to this streaming session. Keeping the previous session's
+        # cached frame can make its ID collide with the first triggered frame.
+        with self._frame_lock:
+            self._current_frame = None
+        self._last_trigger_frame_id = None
         if use_sdk_callback:
             self._install_trigger_buffer_callback()
             self._start_decode_thread()
@@ -898,7 +904,11 @@ class TucsenCamera(AbstractCamera):
         Called from start_streaming when entering SDK-callback mode.
         """
         if self._decode_thread is not None and self._decode_thread.is_alive():
+            if self._decode_thread_stop.is_set():
+                raise CameraError("Previous Tucsen decoder is still stopping; cannot restart frame delivery yet.")
             return
+        if self._decode_thread is not None:
+            self._stop_decode_thread()
         self._decode_thread_stop.clear()
         self._decode_thread = threading.Thread(
             target=self._decode_loop,
@@ -922,7 +932,9 @@ class TucsenCamera(AbstractCamera):
             pass
         self._decode_thread.join(timeout=drain_timeout_s)
         if self._decode_thread.is_alive():
-            self._log.warning("Tucsen decode thread refused to exit within %.1fs", drain_timeout_s)
+            # Keep the reference and stop flag. Dropping it would allow another
+            # decoder to start while this one can still publish an old frame.
+            raise CameraError(f"Tucsen decode thread refused to exit within {drain_timeout_s:.1f}s")
         self._decode_thread = None
         # Discard any items still queued — they were for frames whose
         # acquisition is already over.
@@ -1229,6 +1241,11 @@ class TucsenCamera(AbstractCamera):
         # (transitioning out of callback mode). See start_streaming.
         self._trigger_sent.clear()
         self._is_streaming.clear()
+        # Cap_Stop prevents new SDK callbacks, but a previously queued frame can
+        # still be decoding. Finish/stop that worker before IDs are reset by the
+        # next start_streaming. Clear streaming first so even a decoder timeout
+        # leaves the capture state accurate. SDK callback refs remain alive.
+        self._stop_decode_thread()
         self._log.info("TUCam Camera streaming stopped")
 
     def get_is_streaming(self):
@@ -1591,23 +1608,41 @@ class TucsenCamera(AbstractCamera):
             self._log.error("Cannot read camera frame when not streaming.")
             return None
 
-        if not self._read_thread_running.is_set():
+        trigger_mode = self._capture_mode_genicam if self._model_properties.is_genicam else self._trigger_attr.nTgrMode
+        if self._uses_sdk_buffer_callback(trigger_mode):
+            # Aries triggered delivery intentionally has NO WaitForFrame read
+            # thread. The SDK callback queues bytes to the decoder, which writes
+            # the same _current_frame cache used by the polling path below.
+            if self._trigger_cb_obj is None or self._decode_thread is None or not self._decode_thread.is_alive():
+                self._log.error("Cannot read camera frame: trigger callback/decoder is not running.")
+                return None
+        elif not self._read_thread_running.wait(timeout=self._read_thread_wait_period_s):
+            # start_streaming starts this thread asynchronously. Let it set its
+            # ready flag instead of reporting a fatal error during normal startup.
             self._log.error("Fatal camera error: read thread not running!")
             return None
 
         starting_id = self.get_frame_id()
+        if self.get_acquisition_mode() != CameraAcquisitionMode.CONTINUOUS and self._last_trigger_frame_id is not None:
+            # Snapshot at trigger time, not read time: decode may already have
+            # completed between send_trigger and this call. Waiting for another
+            # ID in that case would discard the requested frame and time out.
+            starting_id = self._last_trigger_frame_id
         timeout_s = (1.04 * self.get_total_frame_time() + 1000) / 1000.0
         timeout_time_s = time.time() + timeout_s
-        while self.get_frame_id() == starting_id:
+        while True:
+            if not self.get_is_streaming():
+                return None
+            with self._frame_lock:
+                frame = self._current_frame
+                if frame is not None and frame.frame_id > starting_id:
+                    return frame
             if time.time() > timeout_time_s:
                 self._log.warning(
                     f"Timed out after waiting {timeout_s=}[s] for frame ({starting_id=}), total_frame_time={self.get_total_frame_time()}."
                 )
                 return None
             time.sleep(0.001)
-
-        with self._frame_lock:
-            return self._current_frame
 
     def get_frame_id(self) -> int:
         with self._frame_lock:
@@ -2535,6 +2570,10 @@ class TucsenCamera(AbstractCamera):
             raise CameraError(
                 f"Requested trigger too early (last trigger was {time.time() - self._last_trigger_timestamp} [s] ago), refusing."
             )
+        # The previous frame may have reached the SDK but still be decoding.
+        # Include its assigned ID so a blocking read waits for THIS trigger's
+        # frame, not for an older item that happens to finish decoding afterward.
+        self._last_trigger_frame_id = max(self.get_frame_id(), self._next_frame_id - 1)
         # Virtualized SW trigger -> fire the hardware trigger line; camera is actually in hw mode.
         # self._log.info(f"Sending trigger with {self._acquisition_mode} (virtualize = {self._virt_sw_trigger})")
         if self._acquisition_mode == CameraAcquisitionMode.SOFTWARE_TRIGGER and self._virt_sw_trigger:

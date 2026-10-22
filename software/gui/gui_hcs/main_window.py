@@ -97,6 +97,8 @@ if RUN_FLUIDICS:
 from control.slack_notifier import SlackNotifier, TimepointStats, AcquisitionStats
 from gui.widgets.integrations import SlackSettingsDialog, load_slack_settings_from_cache
 from gui.widgets.multipoint import TemplateMultiPointWidget
+from gui.widgets.spinning_disk_alignment import SpinningDiskAlignmentDialog
+from gui.widgets.sample_incidence_alignment import SampleIncidenceAlignmentDialog
 
 from .qt_controllers import MovementUpdater, QtAutoFocusController, QtMultiPointController
 
@@ -368,9 +370,20 @@ class HighContentScreeningGui(QMainWindow):
             filter_wheel_config_action.triggered.connect(self.openFilterWheelConfigEditor)
             advanced_menu.addAction(filter_wheel_config_action)
 
-        # Tools menu (only populated when the focus camera is present for now)
+        tools_menu = menubar.addMenu("Tools")
+        self.spinningDiskAlignmentDialog = None
+        spinning_disk_action = QAction("Spinning Disk alignment...", self)
+        spinning_disk_action.setMenuRole(QAction.NoRole)
+        spinning_disk_action.triggered.connect(self.openSpinningDiskAlignmentDialog)
+        tools_menu.addAction(spinning_disk_action)
+
+        self.sampleIncidenceAlignmentDialog = None
+        sample_alignment_action = QAction("Sample flatness and laser incidence alignment...", self)
+        sample_alignment_action.setMenuRole(QAction.NoRole)
+        sample_alignment_action.triggered.connect(self.openSampleIncidenceAlignmentDialog)
+        tools_menu.addAction(sample_alignment_action)
+
         if self.microscope.addons.camera_focus and getattr(self, "focusCameraDialog", None) is not None:
-            tools_menu = menubar.addMenu("Tools")
             focus_camera_action = QAction("Focus Camera / Laser AF Setup...", self)
             focus_camera_action.setMenuRole(QAction.NoRole)
             focus_camera_action.triggered.connect(self.openFocusCameraDialog)
@@ -817,6 +830,9 @@ class HighContentScreeningGui(QMainWindow):
 
     def _is_acquisition_in_progress(self) -> bool:
         """True if any acquisition (multipoint or fast) is currently running."""
+        calibration = getattr(self, "sampleIncidenceAlignmentDialog", None)
+        if calibration is not None and calibration.running:
+            return True
         if self.multipointController is not None:
             try:
                 if self.multipointController.acquisition_in_progress():
@@ -972,6 +988,24 @@ class HighContentScreeningGui(QMainWindow):
         dialog_layout.setContentsMargins(0, 0, 0, 0)
         dialog_layout.addWidget(focus_dockArea)
         self.focusCameraDialog.resize(1000, 700)
+
+    def openSampleIncidenceAlignmentDialog(self):
+        if self.sampleIncidenceAlignmentDialog is None:
+            self.sampleIncidenceAlignmentDialog = SampleIncidenceAlignmentDialog(
+                self.microscope, self.laserAutofocusController,
+                is_busy=lambda: self._is_acquisition_in_progress() or self.autofocusController.autofocus_in_progress,
+                parent=self,
+            )
+        self.sampleIncidenceAlignmentDialog.show()
+        self.sampleIncidenceAlignmentDialog.raise_()
+        self.sampleIncidenceAlignmentDialog.activateWindow()
+
+    def openSpinningDiskAlignmentDialog(self):
+        if self.spinningDiskAlignmentDialog is None:
+            self.spinningDiskAlignmentDialog = SpinningDiskAlignmentDialog(self.camera, parent=self)
+        self.spinningDiskAlignmentDialog.show()
+        self.spinningDiskAlignmentDialog.raise_()
+        self.spinningDiskAlignmentDialog.activateWindow()
 
     def openFocusCameraDialog(self):
         """Show (or re-show) the focus-camera live view popup."""
@@ -2885,6 +2919,11 @@ class HighContentScreeningGui(QMainWindow):
         """
         context = "restart" if for_restart else "shutdown"
 
+        calibration = getattr(self, "sampleIncidenceAlignmentDialog", None)
+        if calibration is not None:
+            calibration.stop_and_wait()
+            calibration.close()
+
         # Cache position and settings
         try:
             pos = self.stage.get_pos()
@@ -3001,6 +3040,8 @@ class HighContentScreeningGui(QMainWindow):
 
         # Stop live view and close camera
         try:
+            if getattr(self, "spinningDiskAlignmentDialog", None) is not None:
+                self.spinningDiskAlignmentDialog.close()
             self.liveController.stop_live()
             self.camera.stop_streaming()
             self.camera.close()
@@ -3092,6 +3133,11 @@ class HighContentScreeningGui(QMainWindow):
         self._cleanup_common(for_restart=True)
 
     def closeEvent(self, event):
+        calibration = getattr(self, "sampleIncidenceAlignmentDialog", None)
+        if calibration is not None and calibration.running:
+            calibration.request_stop()
+            event.ignore()
+            return
         # Background streaming uploads do not survive app exit: closing
         # force-terminates their workers and the backlog must be recovered
         # with the backfill script. Surface that BEFORE the generic exit
