@@ -2,17 +2,17 @@
 
 ## This fork's firmware integration
 
-The controller sources are imported from upstream firmware **1.4**, commit
-`5faaad47ea33b9f18a10ff3860a62f79479da79e`. This brings in failed-move reporting,
-absolute W/W2 positioning, the illumination strobe channel-switch fix, and the
-filter-wheel post-home range fix. The client changes are limited to compatibility,
-error handling, and simulation; this fork's stage configuration and imaging
-features are retained.
+The controller sources are imported from upstream firmware **1.5**, commit
+`da109c5a0c7727d6d57962e5e454b359b6de47dd`. This includes the 1.2–1.4 move,
+filter-wheel, and illumination fixes plus per-axis TMC2660/TMC2240 driver
+auto-detection. The client compatibility fixes preserve this fork's stage
+configuration, illumination routing, and imaging features.
 
-Firmware 1.5's TMC2240 driver detection is deliberately deferred for existing
-TMC2660 controllers. Do not use this 1.4 image on a TMC2240 controller. FastLED
-3.10.3 and PacketSerial 1.4.0 are pinned following upstream #725: later FastLED
-patches can print ASCII on the binary status link.
+The initial 1.4 integration assumed TMC2660 hardware. USB version reporting alone
+does not verify the motor driver type or motor power. Use 1.5 when the controller
+may have TMC2240 drivers; unidentified axes reject motion instead of being driven
+with an assumed driver configuration. FastLED 3.10.3 and PacketSerial 1.4.0 remain
+pinned following upstream #725 to avoid ASCII logging on the binary status link.
 
 The updated Squid W/W2 wheel client requires firmware >= 1.2, including when
 hardware initialization is skipped. Flash the new controller firmware before
@@ -79,7 +79,7 @@ pio run -d firmware/joystick -e teensyLC -t upload
 ```
 
 The joystick firmware is unchanged by this integration and does not need to be
-reflashed for controller firmware 1.4. Uploading it requires USB access to the
+reflashed for controller firmware 1.5. Uploading it requires USB access to the
 joystick's own Teensy LC, rather than the controller's Teensy 4.1 USB port.
 
 The controller defaults to `teensy41` for ordinary builds and uploads. The
@@ -167,10 +167,34 @@ If you prefer Arduino IDE:
 ## Controller
 
 The main motion controller firmware for Teensy 4.1. Handles:
-- XYZ stage motion control (TMC4361A + TMC2660 drivers)
+- XYZ stage motion control (TMC4361A + TMC2660 or TMC2240 drivers)
 - Illumination control (lasers and LED matrix)
 - Camera triggering
 - Serial communication with host software
+
+### Driver identification and firmware 1.5 limits
+
+Each stage axis is identified at boot as TMC2660, TMC2240, or unknown. An unknown
+axis rejects host moves, homing, and PID activation; panel-driven motion is also
+blocked. `INITIALIZE` retries unidentified XYZ axes. W/W2 are probed on each wheel
+initialization. Firmware 1.5 also refuses unencodable motor-current requests and
+reports `CMD_EXECUTION_ERROR`; the client surfaces that error instead of waiting
+for a completion that cannot arrive.
+
+The [upstream 1.5 release notes](https://github.com/Cephla-Lab/Squid/releases/tag/firmware-v1.5)
+record these remaining limits:
+
+- TMC2240's boot-time StallGuard configuration can inhibit X/Y until `INITIALIZE`.
+- TMC2240 chopper settings can cause an audible 13–15 kHz whine during motion.
+- The TMC2660 cold-boot probe was bench-verified, but warm re-probing with a
+  populated TMC2660 W/W2 slot was not. Test repeated wheel initialization on such
+  instruments before deployment. XLight's separately controlled wheels do not
+  use these W/W2 driver slots.
+
+Keep `TMC_PROBE_REPORT` disabled in an application image. Its ASCII diagnostic
+lines share the binary status port and can corrupt the host's position parsing.
+A reported version of 1.5 confirms the application is running, but motor motion,
+limits, homing, and illumination still require instrument validation.
 
 ### Configuration
 

@@ -304,7 +304,7 @@ class FirmwareSimSerial(AbstractCephlaMicroSerial):
         # BIT_POS_SWITCH may not be in constants_protocol.h; default to bit position 1
         button_state |= (1 if self.switch else 0) << self.fw.get("BIT_POS_SWITCH", 1)
 
-        reserved = 0x14  # Firmware 1.4 in response byte 22
+        reserved = 0x15  # Firmware 1.5 in response byte 22
 
         # Struct format ">BBiiiiBi" byte breakdown:
         #   B: cmd_id       (1 byte)

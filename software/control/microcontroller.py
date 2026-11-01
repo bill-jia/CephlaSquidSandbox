@@ -215,12 +215,13 @@ class SimSerial(AbstractCephlaMicroSerial):
     # v1.0: multi-port illumination support
     # v1.1: serial watchdog for illumination auto-shutoff
     # v1.4: failed-move reporting, absolute wheels, strobe and wheel-home fixes
+    # v1.5: per-axis TMC2660/TMC2240 driver identification
     FIRMWARE_VERSION_MAJOR = 1
-    FIRMWARE_VERSION_MINOR = 4
+    FIRMWARE_VERSION_MINOR = 5
 
     @staticmethod
     def response_bytes_for(
-        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 4)
+        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 5)
     ) -> bytes:
         """
         - byte 0: command ID (1 byte)

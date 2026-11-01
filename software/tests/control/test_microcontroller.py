@@ -345,7 +345,7 @@ def test_absolute_wheel_moves_and_homing_in_simulators(simulator):
     serial = simulator()
     micro = Microcontroller(serial, reset_and_initialize=False)
     try:
-        assert micro.firmware_version == (1, 4)
+        assert micro.firmware_version == (1, 5)
         micro.move_w_to_usteps(345)
         micro.wait_till_operation_is_completed()
         micro.move_w2_to_usteps(-678)
