@@ -128,6 +128,7 @@ class MicroscopeAddons:
                 sleep_time_for_wheel=settings.sleep_time_for_wheel,
                 validate_wheel_pos=settings.validate_wheel_pos,
                 emission_filter_positions=settings.emission_filter_positions,
+                excitation_filter_positions=settings.excitation_filter_positions,
             )
 
         dragonfly = None

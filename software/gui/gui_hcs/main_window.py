@@ -1507,13 +1507,16 @@ class HighContentScreeningGui(QMainWindow):
             self.spinningDiskConfocalWidget.signal_emission_iris_changed.connect(
                 self.liveControlWidget.update_config_emission_iris
             )
-            # Emission wheel / dichroic / filter slider changes go through the
+            # Filter wheel / dichroic / filter slider changes go through the
             # observation state controller so they are recorded on (and saved
             # with) the live observation state.
             obs_controller = getattr(self.microscope, "obs_controller", None)
             if obs_controller is not None:
                 self.spinningDiskConfocalWidget.signal_emission_filter_changed.connect(
                     obs_controller.set_emission_filter_position
+                )
+                self.spinningDiskConfocalWidget.signal_excitation_filter_changed.connect(
+                    obs_controller.set_excitation_filter_position
                 )
                 self.spinningDiskConfocalWidget.signal_dichroic_changed.connect(
                     obs_controller.set_dichroic_position
@@ -1526,7 +1529,7 @@ class HighContentScreeningGui(QMainWindow):
                 )
             else:
                 self.log.warning(
-                    "No observation state controller available: emission filter, dichroic and filter "
+                    "No observation state controller available: emission/excitation filters, dichroic and filter "
                     "slider changes from the confocal panel will not be applied."
                 )
             # Sync from the initial state (the signals above weren't connected

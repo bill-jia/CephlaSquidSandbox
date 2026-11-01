@@ -281,19 +281,24 @@ CONFOCAL_DEVICE_NAMES: Tuple[str, ...] = ("xlight", "dragonfly")
 # Slot count used when the confocal device declares no emission wheel
 # (8 = X-Light V3, 5 = Cicero).
 DEFAULT_EMISSION_FILTER_POSITIONS = 8
+DEFAULT_EXCITATION_FILTER_POSITIONS = 4
 
 
-class ConfocalEmissionWheel(BaseModel):
-    """The emission filter wheel built into a confocal unit.
+class ConfocalFilterWheel(BaseModel):
+    """A filter wheel built into a confocal unit.
 
-    Declared under ``devices.<confocal>.config.emission_filter_wheel``; the
-    number of slots the driver accepts is ``len(positions)``.
+    Declared under ``devices.<confocal>.config.emission_filter_wheel`` or
+    ``excitation_filter_wheel``; the slot count is ``len(positions)``.
     """
 
     name: Optional[str] = Field(None, min_length=1, description="User-friendly wheel name")
     positions: Dict[int, str] = Field(default_factory=dict, description="Slot number -> filter name")
 
     model_config = {"extra": "forbid"}
+
+
+class ConfocalEmissionWheel(ConfocalFilterWheel):
+    """The emission filter wheel built into a confocal unit."""
 
 
 class ConfocalDeviceSettings(BaseModel):
@@ -308,6 +313,7 @@ class ConfocalDeviceSettings(BaseModel):
     illumination_iris_default: float = Field(100.0, description="Default illumination iris (0-100)")
     emission_iris_default: float = Field(100.0, description="Default emission iris (0-100)")
     emission_filter_wheel: ConfocalEmissionWheel = Field(default_factory=ConfocalEmissionWheel)
+    excitation_filter_wheel: ConfocalFilterWheel = Field(default_factory=ConfocalFilterWheel)
 
     model_config = {"extra": "forbid"}
 
@@ -322,6 +328,23 @@ class ConfocalDeviceSettings(BaseModel):
     def emission_filter_positions(self) -> int:
         """Number of emission wheel slots the driver will accept."""
         return len(self.emission_filter_wheel.positions) or DEFAULT_EMISSION_FILTER_POSITIONS
+
+    @property
+    def excitation_filter_positions(self) -> int:
+        """Number of excitation wheel slots the driver will accept (X-Light V3: 4)."""
+        return len(self.excitation_filter_wheel.positions) or DEFAULT_EXCITATION_FILTER_POSITIONS
+
+    def build_excitation_wheel_definition(self) -> Optional[FilterWheelDefinition]:
+        """Return the declared excitation wheel, using ID 2 within the confocal source."""
+        if not self.excitation_filter_wheel.positions:
+            return None
+        raw = {
+            "name": self.excitation_filter_wheel.name,
+            "id": 2,
+            "type": FilterWheelType.EXCITATION.value,
+            "positions": dict(self.excitation_filter_wheel.positions),
+        }
+        return FilterWheelDefinition.model_validate(apply_single_filter_wheel_defaults([raw])[0])
 
     def build_emission_wheel_definition(self) -> Optional[FilterWheelDefinition]:
         """Return the declared emission wheel as a ``FilterWheelDefinition``.

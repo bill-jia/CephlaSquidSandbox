@@ -58,8 +58,8 @@ class ConfocalSettings(BaseModel):
     loading one must not invent a position and drive the mechanism to it — that
     would move a dichroic or a 5-second slider on every old preset load.
 
-    Note: emission filter *wheel* selection lives on
-    ``ObservationState.emission_filter_positions``, not here.
+    Filter wheel selection lives on ``ObservationState.emission_filter_positions``
+    and ``ObservationState.excitation_filter_positions``, not here.
     """
 
     illumination_iris: Optional[float] = Field(
@@ -312,6 +312,10 @@ class ObservationState(BaseModel):
     emission_filter_positions: Dict[str, Union[str, int]] = Field(
         default_factory=dict,
         description="Emission filter wheel id → slot name or index",
+    )
+    excitation_filter_positions: Dict[str, Union[str, int]] = Field(
+        default_factory=dict,
+        description="Excitation filter wheel id → slot name or index",
     )
     z_offset_um: float = Field(0.0, description="Z offset in micrometers")
     confocal_hardware_settings: Optional[ConfocalSettings] = Field(

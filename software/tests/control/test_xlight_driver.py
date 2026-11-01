@@ -65,6 +65,59 @@ def make_xlight(monkeypatch, idc_response=FakeSerialDevice.idc_response, **kwarg
     return xlight, fake
 
 
+@pytest.mark.parametrize("validate", [False, True])
+def test_excitation_move_uses_a_command_and_skips_repeat(monkeypatch, validate):
+    xlight, fake = make_xlight(monkeypatch, validate_wheel_pos=validate)
+    assert xlight.set_excitation_filter(3) == 3
+    assert xlight.set_excitation_filter(3) == 3
+    assert fake.calls == [("check" if validate else "write", "A3\r")]
+    assert xlight.set_excitation_filter(3, extraction=True) == 3
+    assert fake.commands[-1] == "A3m\r"
+
+
+@pytest.mark.parametrize("position", [0, 5, -1, "invalid"])
+def test_excitation_rejects_invalid_slots_in_real_and_simulated_driver(monkeypatch, position):
+    xlight, fake = make_xlight(monkeypatch)
+    for driver in (xlight, sp.XLight_Simulation()):
+        with pytest.raises(ValueError, match="must be 1-4"):
+            driver.set_excitation_filter(position)
+    assert fake.commands == []
+
+
+def test_excitation_configured_slot_count_and_validate_override(monkeypatch):
+    settings = ConfocalDeviceSettings.model_validate(
+        {"excitation_filter_wheel": {"positions": {1: "Open", 2: "Cleanup"}}}
+    )
+    xlight, fake = make_xlight(monkeypatch, excitation_filter_positions=settings.excitation_filter_positions)
+    assert xlight.set_excitation_filter(2, validate=True) == 2
+    assert fake.calls == [("check", "A2\r")]
+    with pytest.raises(ValueError, match="must be 1-2"):
+        xlight.set_excitation_filter(3)
+
+
+def test_failed_excitation_move_clears_cache_and_retries(monkeypatch):
+    xlight, fake = make_xlight(monkeypatch)
+    xlight.set_excitation_filter(2)
+    with monkeypatch.context() as patch:
+
+        def fail(command):
+            raise OSError("wheel move failed")
+
+        patch.setattr(xlight.serial_connection, "write", fail)
+        with pytest.raises(OSError):
+            xlight.set_excitation_filter(3)
+    assert xlight.excitation_wheel_pos is None
+    xlight.set_excitation_filter(2)
+    assert fake.commands == ["A2\r", "A2\r"]
+
+
+def test_unit_without_excitation_wheel_never_sends_a_command(monkeypatch):
+    xlight, fake = make_xlight(monkeypatch, idc_response="0000000F")
+    assert xlight.set_excitation_filter(2) == -1
+    assert xlight.get_excitation_filter() is None
+    assert fake.commands == []
+
+
 class TestEmissionFilterSlotCount:
     """set_emission_filter validates against the instance's slot count."""
 

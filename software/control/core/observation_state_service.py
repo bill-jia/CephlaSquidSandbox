@@ -72,6 +72,26 @@ def confocal_emission_filter_position(xlight: Optional[Any]) -> Optional[int]:
         return None
 
 
+def collect_excitation_filter_positions(xlight: Optional[Any]) -> Dict[str, Union[str, int]]:
+    """Read the X-Light excitation wheel, preferring its last-known position.
+
+    Like the emission wheel, only query serial when the driver's cache is unset.
+    Units without an excitation wheel and failed reads yield an empty mapping.
+    """
+    if xlight is None or not getattr(xlight, "has_excitation_filters_wheel", False):
+        return {}
+    position = getattr(xlight, "excitation_wheel_pos", None)
+    if position is None:
+        try:
+            position = xlight.get_excitation_filter()
+        except Exception:
+            return {}
+    try:
+        return {"default": int(position)}
+    except (TypeError, ValueError):
+        return {}
+
+
 def collect_emission_filter_positions(
     emission_filter_wheel: Optional[Any],
     xlight: Optional[Any] = None,
@@ -349,6 +369,7 @@ def observation_state_to_yaml(
         cam_state["camera_settings"] = camera_settings_dict
     cam_state["z_offset_um"] = state.z_offset_um
     cam_state["emission_filter_positions"] = dict(state.emission_filter_positions or {})
+    cam_state["excitation_filter_positions"] = dict(state.excitation_filter_positions or {})
     if camera_live_dict is not None:
         cam_state["camera_live"] = camera_live_dict
 

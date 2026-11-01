@@ -526,7 +526,6 @@ class ObservationStateController:
                 with self._time("obs:ip:set_channel_state"):
                     ic.set_channel_state(ist.illumination_channel, True)
 
-
             if self.microscope.addons.nl5 and NL5_USE_DOUT:
                 with self._time("obs:ip:get_illumination_config"):
                     illum_config = self.config_repo.get_illumination_config()
@@ -569,6 +568,14 @@ class ObservationStateController:
                         )
             except Exception as e:
                 self._log.warning("Not setting emission filter position: %s", e)
+            xlight = self.microscope.addons.xlight
+            excitation_position = self._current_state.excitation_filter_positions.get("default")
+            if excitation_position is not None and getattr(xlight, "has_excitation_filters_wheel", False):
+                try:
+                    with self._time("obs:op:xlight_set_excitation_filter"):
+                        xlight.set_excitation_filter(excitation_position, extraction=False)
+                except Exception as e:
+                    self._log.warning("Not setting excitation filter position: %s", e)
             hw_settings = self._current_state.confocal_hardware_settings
             if hw_settings is not None:
                 xlight = self.microscope.addons.xlight
@@ -654,6 +661,22 @@ class ObservationStateController:
                 wheel.set_filter_wheel_position({1: slot})
         except Exception as e:
             self._log.warning("Not setting emission filter position: %s", e)
+
+    def set_excitation_filter_position(self, position: int) -> None:
+        """Record a panel excitation wheel selection on the live state and apply it."""
+        try:
+            slot = int(position)
+        except (TypeError, ValueError):
+            self._log.warning("Ignoring invalid excitation filter position: %r", position)
+            return
+        if self._current_state is not None:
+            self._current_state.excitation_filter_positions["default"] = slot
+        xlight = getattr(getattr(self.microscope, "addons", None), "xlight", None)
+        if xlight is not None and getattr(xlight, "has_excitation_filters_wheel", False):
+            try:
+                xlight.set_excitation_filter(slot, extraction=False)
+            except Exception as e:
+                self._log.warning("Not setting excitation filter position: %s", e)
 
     def _confocal_settings_for_write(self) -> Optional[ConfocalSettings]:
         """The live state's ConfocalSettings, created empty if it has none yet.
@@ -912,6 +935,7 @@ class ObservationStateController:
         self,
         *,
         emission_filter_positions: Optional[Dict[str, Union[str, int]]] = None,
+        excitation_filter_positions: Optional[Dict[str, Union[str, int]]] = None,
     ) -> ObservationState:
         """Build ObservationState from current hardware + logical state."""
         saved = self.get_observation_state()
@@ -927,6 +951,16 @@ class ObservationStateController:
         camera_live = self._collect_camera_live_snapshot()
 
         base = saved or ObservationState()
+        # Collect here so every snapshot path (snap, recording, fast and multipoint
+        # acquisition, presets and the periodic state cache) carries excitation.
+        if excitation_filter_positions is None:
+            from control.core.observation_state_service import collect_excitation_filter_positions
+
+            xlight = getattr(getattr(self.microscope, "addons", None), "xlight", None)
+            excitation_filter_positions = collect_excitation_filter_positions(xlight)
+            if not excitation_filter_positions:
+                previous = self._current_state or base
+                excitation_filter_positions = dict(previous.excitation_filter_positions)
         return ObservationState(
             name=base.name,
             confocal_mode=self._collect_confocal_mode(),
@@ -937,6 +971,7 @@ class ObservationStateController:
             display_color=base.display_color,
             channel_groups=base.channel_groups,
             emission_filter_positions=dict(emission_filter_positions or {}),
+            excitation_filter_positions=dict(excitation_filter_positions or {}),
             camera_live=camera_live,
             enable_channel_auto_filter_switching=self.enable_channel_auto_filter_switching,
         )

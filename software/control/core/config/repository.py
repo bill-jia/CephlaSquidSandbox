@@ -652,7 +652,6 @@ class ConfigRepository:
             return registry.get_camera_names()
         return []
 
-
     # ───────────────────────────────────────────────────────────────────────────
     # v1.1 Hardware Bindings and Filter Wheel Aggregation
     # ───────────────────────────────────────────────────────────────────────────
@@ -688,10 +687,11 @@ class ConfigRepository:
 
         Returns a dict mapping source name to list of wheels:
         - "standalone": wheels from embedded ``machine_config.filter_wheel_registry`` or ``filter_wheels.yaml``
-        - "confocal": the emission wheel declared by the confocal device entry
+        - "confocal": the emission and excitation wheels declared by the confocal device entry
 
         Each source has its own ID namespace (no global conflicts).
         """
+
         result: Dict[str, List[FilterWheelDefinition]] = {}
 
         # Standalone wheels from filter_wheels.yaml
@@ -705,6 +705,9 @@ class ConfigRepository:
             wheel = confocal.build_emission_wheel_definition()
             if wheel is not None:
                 result[FILTER_WHEEL_SOURCE_CONFOCAL] = [wheel]
+            excitation = confocal.build_excitation_wheel_definition()
+            if excitation is not None:
+                result.setdefault(FILTER_WHEEL_SOURCE_CONFOCAL, []).append(excitation)
 
         return result
 
@@ -1228,6 +1231,9 @@ class ConfigRepository:
             emission_filter_positions = cam_state.get("emission_filter_positions") or {}
             if not isinstance(emission_filter_positions, dict):
                 emission_filter_positions = {}
+            excitation_filter_positions = cam_state.get("excitation_filter_positions") or {}
+            if not isinstance(excitation_filter_positions, dict):
+                excitation_filter_positions = {}
 
             enable_auto_filter = data.get("enable_channel_auto_filter_switching")
             enable_auto_filter = bool(enable_auto_filter) if enable_auto_filter is not None else None
@@ -1264,6 +1270,7 @@ class ConfigRepository:
                 camera_live=camera_live,
                 illuminator_states=illuminator_states,
                 emission_filter_positions=dict(emission_filter_positions),
+                excitation_filter_positions=dict(excitation_filter_positions),
                 z_offset_um=z_offset_um,
                 confocal_hardware_settings=confocal_hw,
                 display_color=display_color,

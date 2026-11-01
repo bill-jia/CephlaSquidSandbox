@@ -191,6 +191,7 @@ def set_xlight_confocal_mode(xlight, confocal: bool) -> None:
 
 
 class XLight_Simulation:
+
     def __init__(
         self,
         SN=None,
@@ -198,11 +199,13 @@ class XLight_Simulation:
         validate_wheel_pos=False,
         emission_filter_positions=8,
         disable_emission_filter_wheel=False,
+        excitation_filter_positions=4,
     ):
         self.sleep_time_for_wheel = sleep_time_for_wheel
         self.validate_wheel_pos = validate_wheel_pos
         self.emission_filter_positions = emission_filter_positions
         self.disable_emission_filter_wheel = disable_emission_filter_wheel
+        self.excitation_filter_positions = excitation_filter_positions
 
         self.has_spinning_disk_motor = True
         self.has_spinning_disk_slider = True
@@ -217,6 +220,7 @@ class XLight_Simulation:
         # The simulated unit *is* the hardware, so its state is known from the
         # start; on the real driver these are None until a move or a read-back.
         self.emission_wheel_pos = 1
+        self.excitation_wheel_pos = 1
         self.dichroic_wheel_pos = 1
         self.disk_motor_state = False
         self.spinning_disk_pos = 0
@@ -238,6 +242,22 @@ class XLight_Simulation:
 
     def get_emission_filter(self):
         return self.emission_wheel_pos
+
+    def set_excitation_filter(self, position, extraction=False, validate=None):
+        if not self.has_excitation_filters_wheel:
+            return -1
+        if str(position) not in [str(i + 1) for i in range(self.excitation_filter_positions)]:
+            raise ValueError(
+                f"Invalid excitation filter position {position}, must be 1-{self.excitation_filter_positions}"
+            )
+        position = int(position)
+        if not extraction and self.excitation_wheel_pos == position:
+            return self.excitation_wheel_pos
+        self.excitation_wheel_pos = position
+        return position
+
+    def get_excitation_filter(self):
+        return self.excitation_wheel_pos
 
     def set_dichroic(self, position, extraction=False):
         if str(position) not in ["1", "2", "3", "4", "5"]:
@@ -320,6 +340,7 @@ class XLight:
         validate_wheel_pos=False,
         emission_filter_positions=8,
         disable_emission_filter_wheel=False,
+        excitation_filter_positions=4,
     ):
         self.log = squid.logging.get_logger(self.__class__.__name__)
 
@@ -336,10 +357,12 @@ class XLight:
         self.validate_wheel_pos = validate_wheel_pos
         self.emission_filter_positions = emission_filter_positions
         self.disable_emission_filter_wheel = disable_emission_filter_wheel
+        self.excitation_filter_positions = excitation_filter_positions
         # Last position this driver is known to have put the hardware in, used to
         # skip redundant (and slow) serial writes. None means "unknown": nothing
         # has been written or read back yet, so the next request always writes.
         self.emission_wheel_pos = None
+        self.excitation_wheel_pos = None
         self.dichroic_wheel_pos = None
         self.slider_position = None
         self.illumination_iris = None
@@ -379,8 +402,12 @@ class XLight:
         breaking startup.
         """
         for capable, name, reader in (
-            (self.has_emission_filters_wheel and not self.disable_emission_filter_wheel,
-             "emission filter wheel", self.get_emission_filter),
+            (
+                self.has_emission_filters_wheel and not self.disable_emission_filter_wheel,
+                "emission filter wheel",
+                self.get_emission_filter,
+            ),
+            (self.has_excitation_filters_wheel, "excitation filter wheel", self.get_excitation_filter),
             (self.has_dichroic_filters_wheel, "dichroic wheel", self.get_dichroic),
             (self.has_dichroic_filter_slider, "dichroic filter slider", self.get_filter_slider),
             (self.has_illumination_iris_diaphragm, "illumination iris", self.get_illumination_iris),
@@ -499,6 +526,43 @@ class XLight:
         current_pos = self.serial_connection.write_and_check("rB\r", "rB", read_delay=self.sleep_time_for_wheel)
         self.emission_wheel_pos = int(current_pos[2])
         return self.emission_wheel_pos
+
+    def set_excitation_filter(self, position, extraction=False, validate=None):
+        """Move the excitation wheel using the X-Light V3 A command.
+
+        Follow the emission wheel's validation, readback and write-skipping rules.
+        """
+        if not self.has_excitation_filters_wheel:
+            return -1
+        if str(position) not in [str(i + 1) for i in range(self.excitation_filter_positions)]:
+            raise ValueError(
+                f"Invalid excitation filter position {position}, must be 1-{self.excitation_filter_positions}"
+            )
+        position = int(position)
+        if not extraction and self.excitation_wheel_pos == position:
+            return self.excitation_wheel_pos
+        if validate is None:
+            validate = self.validate_wheel_pos
+        command = "A" + str(position) + ("m" if extraction else "") + "\r"
+        # A failed move must leave the position unknown so the next call retries.
+        self.excitation_wheel_pos = None
+        if validate:
+            current_pos = self.serial_connection.write_and_check(
+                command, "A" + str(position), print_response=True, read_delay=self.sleep_time_for_wheel
+            )
+            self.excitation_wheel_pos = int(current_pos[1:])
+        else:
+            self.serial_connection.write(command)
+            time.sleep(self.sleep_time_for_wheel)
+            self.excitation_wheel_pos = position
+        return self.excitation_wheel_pos
+
+    def get_excitation_filter(self):
+        if not self.has_excitation_filters_wheel:
+            return None
+        current_pos = self.serial_connection.write_and_check("rA\r", "rA", read_delay=self.sleep_time_for_wheel)
+        self.excitation_wheel_pos = int(current_pos[2:])
+        return self.excitation_wheel_pos
 
     def set_dichroic(self, position, extraction=False):
         if str(position) not in ["1", "2", "3", "4", "5"]:

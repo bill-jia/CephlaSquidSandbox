@@ -246,14 +246,25 @@ devices:
       emission_filter_wheel:
         name: "XLight emission wheel"
         positions:
-          1: "446/523/600/677 (TagBFP/GFP/mCherry/Cy5)"
+          1: "Chroma LDI Penta (TagBFP/GFP/mCherry/Cy5/NIR)"
           2: "525/45 (GFP)"
           3: "457/50 (TagBFP/DAPI)"
-          4: "Position 4"
+          4: "Semrock 446/523/600/677 (TagBFP/GFP/mCherry/Cy5)"
           5: "Position 5"
           6: "Position 6"
           7: "Position 7"
           8: "Position 8"
+      # Built-in four-position excitation wheel. Labels populate the confocal
+      # panel; the selected slot is saved in ObservationState and acquisition
+      # metadata as excitation_filter_positions["default"]. Replace these labels
+      # with the installed filter names.
+      excitation_filter_wheel:
+        name: "XLight excitation wheel"
+        positions:
+          1: "ZT405/470/555/640/730x (Chroma LDI Penta)"
+          2: "Position 2"
+          3: "Position 3"
+          4: "Position 4"
 
 illumination_channels_file: illumination_channel_config.yaml
 
