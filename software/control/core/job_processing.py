@@ -2560,7 +2560,9 @@ class JobRunner(multiprocessing.Process):
                 result = job.run()
                 t_run_end = time.perf_counter()
 
-                # Only queue non-None results (DownsampledViewJob returns None for intermediate FOVs)
+                # Accumulating jobs legitimately produce no output until their
+                # group is complete (postprocess Z stacks, downsampled FOVs).
+                # None is normal completion, not a failed or dropped frame.
                 if result is not None:
                     self._log.debug(
                         f"Job {job.job_id} returned in {(t_run_end - t_run_start)*1000:.1f}ms. "
@@ -2569,8 +2571,11 @@ class JobRunner(multiprocessing.Process):
                     self._output_queue.put_nowait(JobResult(job_id=job.job_id, result=result, exception=None))
                     self._log.debug(f"Result for {job.job_id} is on output queue.")
                 else:
-                    self._log.warning(
-                        f"Job {job.job_id} returned None in {(t_run_end - t_run_start)*1000:.1f}ms, not queuing."
+                    self._log.debug(
+                        "%s job %s completed in %.1fms without an output result; no result queued.",
+                        type(job).__name__,
+                        job.job_id,
+                        (t_run_end - t_run_start) * 1000,
                     )
             except queue.Empty:
                 pass
