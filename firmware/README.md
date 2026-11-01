@@ -58,7 +58,7 @@ pip install platformio
 brew install platformio
 ```
 
-`pio run -t upload` flashes the board with the [Teensy Loader](https://www.pjrc.com/teensy/loader.html) application, which PlatformIO bundles in its Teensy platform tools (`tool-teensy`) — there is no separate uploader to install. During upload the Teensy Loader window opens, the board is automatically rebooted into the bootloader, and the firmware is flashed.
+`pio run -e teensy41 -t upload` flashes the controller with the [Teensy Loader](https://www.pjrc.com/teensy/loader.html) application, which PlatformIO bundles in its Teensy platform tools (`tool-teensy`) — there is no separate uploader to install. During upload the Teensy Loader window opens and attempts to reboot the board into the bootloader. If it asks for manual program mode, briefly press and release the Program button on the controller's Teensy board, then let the loader finish programming and rebooting it.
 
 > **Note:** The Teensy Loader is a graphical application, so uploading normally requires a desktop (display) environment. On platforms where the GUI app is unavailable (e.g. Linux ARM), PlatformIO automatically falls back to the command-line loader (`teensy_loader_cli`).
 
@@ -66,15 +66,25 @@ On Linux, install the [PJRC udev rules](https://www.pjrc.com/teensy/00-teensy.ru
 
 ### Quick Start
 
+Run these commands from the repository root. Controller and joystick are
+separate PlatformIO projects; `-e` selects an environment within the project
+specified by `-d`.
+
 ```bash
 # Build and upload controller firmware
-cd firmware/controller
-pio run -t upload
+pio run -d firmware/controller -e teensy41 -t upload
 
 # Build and upload joystick firmware
-cd firmware/joystick
-pio run -t upload
+pio run -d firmware/joystick -e teensyLC -t upload
 ```
+
+The joystick firmware is unchanged by this integration and does not need to be
+reflashed for controller firmware 1.4. Uploading it requires USB access to the
+joystick's own Teensy LC, rather than the controller's Teensy 4.1 USB port.
+
+The controller defaults to `teensy41` for ordinary builds and uploads. The
+`native` environment is only for `pio test -e native`; building it with `pio run`
+has no application entry point and fails with a missing `main`/`WinMain` error.
 
 **Important:** Before uploading, verify only one Teensy is connected:
 ```bash
