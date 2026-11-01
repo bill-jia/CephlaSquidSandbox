@@ -1,5 +1,6 @@
 import struct
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -76,9 +77,14 @@ class TestSetWatchdogTimeout:
 class TestHeartbeat:
     def test_sends_correct_command_id(self, mcu):
         """HEARTBEAT should use command ID 42."""
-        mcu.send_heartbeat()
-        mcu.wait_till_operation_is_completed()
-        assert mcu.last_command[1] == CMD_SET.HEARTBEAT
+        previous = mcu.last_command
+        with patch.object(mcu._serial, "write", wraps=mcu._serial.write) as write:
+            mcu.send_heartbeat()
+        packet = write.call_args.args[0]
+        assert packet[1] == CMD_SET.HEARTBEAT
+        assert packet[0] == previous[0]
+        assert packet[-1] == mcu.crc_calculator.calculate_checksum(packet[:-1])
+        assert mcu.last_command is previous
 
     def test_start_and_stop(self, mcu):
         """Heartbeat thread should start and stop cleanly."""
@@ -105,10 +111,16 @@ class TestHeartbeat:
 
     def test_heartbeat_sends_periodically(self, mcu):
         """Heartbeat should send multiple commands over time."""
-        mcu.start_heartbeat(interval_s=0.05)
-        time.sleep(0.2)
-        mcu.stop_heartbeat()
-        assert mcu.last_command[1] == CMD_SET.HEARTBEAT
+        previous = mcu.last_command
+        with patch.object(mcu._serial, "write", wraps=mcu._serial.write) as write:
+            mcu.start_heartbeat(interval_s=0.02)
+            deadline = time.monotonic() + 2
+            while write.call_count < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            mcu.stop_heartbeat()
+        assert write.call_count >= 2
+        assert all(call.args[0][1] == CMD_SET.HEARTBEAT for call in write.call_args_list)
+        assert mcu.last_command is previous
 
     def test_stop_heartbeat_when_never_started(self, mcu):
         """stop_heartbeat() should be safe when no heartbeat was started."""
@@ -125,8 +137,9 @@ class TestHeartbeat:
 
 
 class TestFirmwareVersionForWatchdog:
-    def test_version_detected_as_1_1(self, mcu):
-        """SimSerial should report firmware version 1.1."""
+
+    def test_version_detected_as_1_4(self, mcu):
+        """SimSerial should report firmware version 1.4."""
         mcu.turn_off_all_ports()
         mcu.wait_till_operation_is_completed()
-        assert mcu.firmware_version == (1, 1)
+        assert mcu.firmware_version == (1, 4)

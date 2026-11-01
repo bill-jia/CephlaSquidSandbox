@@ -1042,7 +1042,6 @@ class Microscope:
             raise ValueError(f"Invalid trigger mode: {control._def.DEFAULT_TRIGGER_MODE}")
         self.camera.set_acquisition_mode(acq_mode)
 
-
         # Configure focus camera if available
         if self.addons.camera_focus:
             # Focus camera typically uses 8-bit format for faster processing
@@ -1341,8 +1340,8 @@ class Microscope:
         """
         try:
             self.low_level_drivers.microcontroller.wait_till_operation_is_completed(timeout)
-        except TimeoutError as e:
-            self._log.error(error_message or "Microcontroller operation timed out!")
+        except (TimeoutError, control.microcontroller.CommandAborted) as e:
+            self._log.error(error_message or "Microcontroller operation failed!")
             raise e
 
     def close(self) -> None:

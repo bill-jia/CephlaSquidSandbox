@@ -14,7 +14,7 @@ import control._def
 from control.core.config import ConfigRepository
 from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
-from control.microcontroller import Microcontroller
+from control.microcontroller import CommandAborted, Microcontroller
 from control.piezo import PiezoStage
 from control.models import LaserAFConfig, LaserAFReference
 from control.models.machine_config import LaserAFCalibrationSettings, LaserAFDeviceSettings
@@ -238,10 +238,10 @@ class LaserAutofocusController(QObject):
                         self.microcontroller.turn_off_AF_laser()
                         self.microcontroller.wait_till_operation_is_completed()
                     return
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     if attempt:
-                        self._validation_update(warning="AF laser shutdown timed out twice")
-                        self._log.error("AF laser shutdown timed out twice; laser state is unknown.")
+                        self._validation_update(warning="AF laser shutdown failed twice")
+                        self._log.error("AF laser shutdown failed twice; laser state is unknown.")
                         raise
                     self._log.warning("AF laser shutdown timed out; retrying once.")
                     time.sleep(0.05)
@@ -418,7 +418,7 @@ class LaserAutofocusController(QObject):
         """
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser before pixel to um calibration, cannot continue!")
             return False
 
@@ -455,7 +455,7 @@ class LaserAutofocusController(QObject):
         finally:
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception(
                     "Error turning off AF laser after spot calibration acquisition.  Continuing in unknown state"
                 )
@@ -568,10 +568,12 @@ class LaserAutofocusController(QObject):
         with self._validation_operation("measurement"), self._time("af:measure_displacement"):
             try:
                 self.turn_on_AF_laser()
-            except TimeoutError:
-                self._log.exception("Turning on AF laser timed out, failed to measure displacement.")
+            except (TimeoutError, CommandAborted) as exc:
+                self._log.exception("Turning on AF laser failed; cannot measure displacement.")
                 self.signal_displacement_um.emit(float("nan"))
-                self._validation_update(failure_reason="laser_on_timeout")
+                self._validation_update(
+                    failure_reason="laser_on_rejected" if isinstance(exc, CommandAborted) else "laser_on_timeout"
+                )
                 return float("nan")
 
             try:
@@ -581,9 +583,9 @@ class LaserAutofocusController(QObject):
             finally:
                 try:
                     self.turn_off_AF_laser()
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     self._log.exception(
-                        "Turning off AF laser timed out!  We got a displacement but laser may still be on."
+                        "Turning off AF laser failed! We got a displacement but laser may still be on."
                     )
                     # Continue with the measurement, but we're essentially in an unknown / weird state here.
 
@@ -644,9 +646,10 @@ class LaserAutofocusController(QObject):
 
             try:
                 self.turn_on_AF_laser()
-            except TimeoutError:
-                self._log.exception("Turning on AF laser timed out, cannot move to target.")
-                return self._validation_result(False, "laser_on_timeout")
+            except (TimeoutError, CommandAborted) as exc:
+                self._log.exception("Turning on AF laser failed; cannot move to target.")
+                reason = "laser_on_rejected" if isinstance(exc, CommandAborted) else "laser_on_timeout"
+                return self._validation_result(False, reason)
 
             total_moved_um = 0.0
             try:
@@ -735,7 +738,7 @@ class LaserAutofocusController(QObject):
             finally:
                 try:
                     self.turn_off_AF_laser()
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     self._log.exception("Failed to turn off AF laser after move_to_target, laser in unknown state!")
 
     def _move_z(self, um_to_move: float) -> None:
@@ -781,7 +784,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser for reference capture!")
             return None
 
@@ -792,7 +795,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_off_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn off AF laser after capturing reference, laser is in an unknown state!")
             # Continue on since we got our reading, but the system is potentially in a weird state!
 
@@ -886,7 +889,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser for verifying spot alignment.")
             return failure_return_value
 
@@ -895,7 +898,7 @@ class LaserAutofocusController(QObject):
         finally:
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception("Failed to turn off AF laser after verifying spot alignment, laser in unknown state!")
                 # Continue on because we got a reading, but the system is in a potentially weird and unknown state here.
 
@@ -1306,7 +1309,7 @@ class LaserAutofocusController(QObject):
         # turn on the laser
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on laser AF laser before get_image, cannot get image.")
             return None
 
@@ -1330,5 +1333,5 @@ class LaserAutofocusController(QObject):
             # turn off the laser
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception("Failed to turn off AF laser after get_image!")

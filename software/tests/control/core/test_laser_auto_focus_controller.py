@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from control.core.laser_auto_focus_controller import LASER_AF_TRIGGER_ATTEMPTS, LaserAutofocusController
+from control.microcontroller import CommandAborted
 
 IMAGE_H, IMAGE_W = 256, 1536
 SPOT_X0 = 768.0
@@ -123,6 +124,38 @@ def apply_reference_at_current_position(controller):
     reference = controller.capture_reference()
     assert reference is not None
     controller.apply_reference(reference)
+
+
+def test_firmware_rejection_before_af_capture_returns_no_image():
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    controller = make_controller(camera, stage)
+    controller.turn_on_AF_laser = MagicMock(side_effect=CommandAborted(1, "firmware rejected laser command"))
+    assert controller.get_image() is None
+    assert camera.trigger_count == 0
+
+
+def test_af_diagnostics_distinguish_rejection_from_timeout():
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    controller = make_controller(camera, stage)
+    controller.turn_on_AF_laser = MagicMock(side_effect=CommandAborted(1, "firmware rejected laser command"))
+    controller._validation_update = MagicMock()
+    assert np.isnan(controller.measure_displacement())
+    controller._validation_update.assert_any_call(failure_reason="laser_on_rejected")
+
+
+def test_rejected_af_z_move_propagates_and_turns_laser_off():
+    stage = FakeStage()
+    camera = FakeFocusCamera(render_spot(stage, 0.2))
+    controller = make_controller(camera, stage)
+    apply_reference_at_current_position(controller)
+    stage.z_um = 20
+    stage.move_z = MagicMock(side_effect=CommandAborted(1, "firmware rejected Z move", recoverable=True))
+    controller.turn_off_AF_laser = MagicMock()
+    with pytest.raises(CommandAborted, match="rejected Z"):
+        controller.move_to_target(0)
+    controller.turn_off_AF_laser.assert_called_once()
 
 
 def test_verification_fast_path_does_not_register_y():

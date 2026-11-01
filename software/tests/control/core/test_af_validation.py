@@ -12,6 +12,7 @@ from control.core.af_validation_collector import AFValidationCollector
 from control.core.laser_auto_focus_controller import AFValidationRestoreError
 from control.core.multi_point_controller import MultiPointController
 from control.core.multi_point_worker import MultiPointWorker
+from control.microcontroller import CommandAborted
 from tests.control.core.test_laser_auto_focus_controller import (
     FakeFocusCamera, FakeStage, apply_reference_at_current_position, make_controller, render_spot,
 )
@@ -260,6 +261,24 @@ def test_validation_walk_uses_real_af_cadence_without_images_stacks_or_stimuli(t
     worker.acquire_camera_image.assert_not_called()
     worker._run_nidaq_stimulus.assert_not_called()
     worker.request_abort_fn.assert_not_called()
+
+
+def test_firmware_rejection_aborts_acquisition_without_capturing(tmp_path):
+    worker = MagicMock()
+    worker.validation_mode = False
+    worker.laser_auto_focus_controller = None
+    worker.scan_region_fov_coords_mm = {"R0": [(0, 0)]}
+    worker._slack_notifier = None
+    # Applying the first optical state can reject a filter-wheel move.
+    worker._seed_camera_for_first_observation_state.side_effect = CommandAborted(
+        1, "firmware rejected filter move", recoverable=True
+    )
+    MultiPointWorker.run(worker)
+    worker.request_abort_fn.assert_called_once()
+    worker.acquire_camera_image.assert_not_called()
+    worker._run_nidaq_stimulus.assert_not_called()
+    worker._finish_jobs.assert_called_once()
+    worker.callbacks.signal_acquisition_finished.assert_called_once()
 
 
 def test_single_fov_success_avoids_duplicate_measurement(tmp_path):

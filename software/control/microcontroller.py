@@ -72,6 +72,7 @@ _CMD_NAMES = {
     CMD_SET.SET_DAC80508_REFDIV_GAIN: "SET_DAC80508_REFDIV_GAIN",
     CMD_SET.SET_ILLUMINATION_INTENSITY_FACTOR: "SET_ILLUMINATION_INTENSITY_FACTOR",
     CMD_SET.MOVETO_W: "MOVETO_W",
+    CMD_SET.MOVETO_W2: "MOVETO_W2",
     CMD_SET.SET_LIM_SWITCH_POLARITY: "SET_LIM_SWITCH_POLARITY",
     CMD_SET.CONFIGURE_STEPPER_DRIVER: "CONFIGURE_STEPPER_DRIVER",
     CMD_SET.SET_MAX_VELOCITY_ACCELERATION: "SET_MAX_VELOCITY_ACCELERATION",
@@ -132,9 +133,11 @@ class CommandAborted(RuntimeError):
     This does mean that if you don't check for command completion, you may miss these errors!
     """
 
-    def __init__(self, command_id, reason):
+    def __init__(self, command_id, reason, recoverable: bool = False):
         super().__init__(reason)
         self.command_id = command_id
+        # Only an explicit rejection before motion is safe to resend.
+        self.recoverable = recoverable
 
 
 # NOTE(imo): We'll want to pull this out into a common serial impl shared with serial_peripheral.py at some point, but
@@ -211,12 +214,13 @@ class SimSerial(AbstractCephlaMicroSerial):
     # Simulated firmware version
     # v1.0: multi-port illumination support
     # v1.1: serial watchdog for illumination auto-shutoff
+    # v1.4: failed-move reporting, absolute wheels, strobe and wheel-home fixes
     FIRMWARE_VERSION_MAJOR = 1
-    FIRMWARE_VERSION_MINOR = 1
+    FIRMWARE_VERSION_MINOR = 4
 
     @staticmethod
     def response_bytes_for(
-        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 1)
+        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 4)
     ) -> bytes:
         """
         - byte 0: command ID (1 byte)
@@ -259,6 +263,7 @@ class SimSerial(AbstractCephlaMicroSerial):
         self.w2 = 0
         self.joystick_button = False
         self.switch = False
+        self.execution_status = CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
 
         # Multi-port illumination state for simulation
         self.port_is_on = [False] * SimSerial.NUM_ILLUMINATION_PORTS
@@ -283,6 +288,8 @@ class SimSerial(AbstractCephlaMicroSerial):
         # CMD_SET handlers here.  Prefer this over adding checks for simulated mode in
         # the Microcontroller!
         command_byte = write_bytes[1]
+        if command_byte != CMD_SET.HEARTBEAT:
+            self.execution_status = CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
         # If this is a position related command, these are our position bytes.
         position_bytes = write_bytes[2:6]
         if command_byte == CMD_SET.MOVE_X:
@@ -303,6 +310,10 @@ class SimSerial(AbstractCephlaMicroSerial):
             self.y = self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.MOVETO_Z:
             self.z = self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVETO_W:
+            self.w = self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVETO_W2:
+            self.w2 = self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.HOME_OR_ZERO:
             axis = write_bytes[2]
             # NOTE: write_bytes[3] might indicate that we only want to "ZERO", but
@@ -388,7 +399,7 @@ class SimSerial(AbstractCephlaMicroSerial):
         self.response_buffer.extend(
             SimSerial.response_bytes_for(
                 write_bytes[0],
-                CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS,
+                self.execution_status,
                 self.x,
                 self.y,
                 self.z,
@@ -700,12 +711,12 @@ class Microcontroller:
         self.z_pos = 0
         self.w_pos = 0      # W axis (if present, typically for additional positioning)
         self.theta_pos = 0   # Theta axis (rotation)
-        
+
         # Input state tracking (from status packets)
         self.button_and_switch_state = 0    # Bitfield of button/switch states
         self.joystick_button_pressed = 0    # Joystick button state
         self.switch_state = 0              # Limit switch states
-        
+
         # Joystick event handling
         # Can register callbacks for joystick button presses
         self.joystick_listener_events_enabled = False  # Enable/disable joystick events
@@ -723,7 +734,7 @@ class Microcontroller:
         self._heartbeat_stop_event = threading.Event()
 
         # Lock to serialize all outgoing serial commands (heartbeat thread + main thread)
-        self._cmd_lock = threading.Lock()
+        self._cmd_lock = threading.RLock()
 
         # Command tracking for error handling
         self.last_command = None
@@ -1076,10 +1087,18 @@ class Microcontroller:
         self.send_command(cmd)
 
     def send_heartbeat(self) -> None:
-        """Send a no-op heartbeat command to reset the firmware watchdog timer."""
-        cmd = bytearray(self.tx_buffer_length)
-        cmd[1] = CMD_SET.HEARTBEAT
-        self.send_command(cmd)
+        """Keep the watchdog alive without replacing the tracked operation.
+
+        Firmware 1.2+ retains execution status across HEARTBEAT but echoes its
+        command ID. Reuse the application command's ID so a pending error or
+        completion still belongs to that operation, even during long moves.
+        """
+        with self._cmd_lock:
+            cmd = bytearray(self.tx_buffer_length)
+            cmd[0] = self._cmd_id
+            cmd[1] = CMD_SET.HEARTBEAT
+            cmd[-1] = self.crc_calculator.calculate_checksum(cmd[:-1])
+            self._serial.write(cmd, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
 
     def start_heartbeat(self, interval_s: float = None) -> None:
         """Start a daemon thread that sends periodic heartbeat commands.
@@ -1239,6 +1258,18 @@ class Microcontroller:
 
     def move_w2_usteps(self, usteps):
         self._move_axis_usteps(usteps, CMD_SET.MOVE_W2)
+
+    def _move_filter_wheel_to_usteps(self, usteps, command_code):
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = command_code
+        cmd[2:6] = self._int_to_payload(usteps, 4).to_bytes(4, "big")
+        self.send_command(cmd)
+
+    def move_w_to_usteps(self, usteps):
+        self._move_filter_wheel_to_usteps(usteps, CMD_SET.MOVETO_W)
+
+    def move_w2_to_usteps(self, usteps):
+        self._move_filter_wheel_to_usteps(usteps, CMD_SET.MOVETO_W2)
 
     def set_off_set_velocity_x(self, off_set_velocity):
         # off_set_velocity is in mm/s
@@ -1628,11 +1659,14 @@ class Microcontroller:
 
             self._warn_if_reads_stale()
 
-    def abort_current_command(self, reason):
+    def abort_current_command(self, reason, recoverable: bool = False):
         cmd_type = self.last_command[1] if self.last_command is not None else -1
         cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
-        self.log.error(f"[MCU] !!! Command {self._cmd_id} ({cmd_name}) ABORTED: {reason}")
-        self.last_command_aborted_error = CommandAborted(reason=reason, command_id=self._cmd_id)
+        log = self.log.warning if recoverable else self.log.error
+        log(f"[MCU] !!! Command {self._cmd_id} ({cmd_name}) ABORTED: {reason}")
+        self.last_command_aborted_error = CommandAborted(
+            reason=reason, command_id=self._cmd_id, recoverable=recoverable
+        )
         self.mcu_cmd_execution_in_progress = False
 
     def acknowledge_aborted_command(self):
@@ -1725,52 +1759,76 @@ class Microcontroller:
                 - byte 23: CRC (1 byte)
                 """
                 self._last_successful_read_time = time.time()
-                self._cmd_id_mcu = msg[0]
-                self._cmd_execution_status = msg[1]
-                if (self._cmd_id_mcu == self._cmd_id) and (
-                    self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
-                ):
-                    if self.mcu_cmd_execution_in_progress:
-                        self.mcu_cmd_execution_in_progress = False
-                        elapsed_ms = (time.time() - self.last_command_send_timestamp) * 1000
-                        cmd_type = self.last_command[1] if self.last_command is not None else -1
-                        cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
-                        self.log.debug(
-                            f"[MCU] <<< command {self._cmd_id} ({cmd_name}) complete (took {elapsed_ms:.1f}ms)"
+                with self._cmd_lock:
+                    self._cmd_id_mcu = msg[0]
+                    self._cmd_execution_status = msg[1]
+                    if (self._cmd_id_mcu == self._cmd_id) and (
+                        self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
+                    ):
+                        if self.mcu_cmd_execution_in_progress:
+                            self.mcu_cmd_execution_in_progress = False
+                            elapsed_ms = (time.time() - self.last_command_send_timestamp) * 1000
+                            cmd_type = self.last_command[1] if self.last_command is not None else -1
+                            cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
+                            self.log.debug(
+                                f"[MCU] <<< command {self._cmd_id} ({cmd_name}) complete (took {elapsed_ms:.1f}ms)"
+                            )
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu != self._cmd_id
+                        and time.time() - self.last_command_send_timestamp > self.LAST_COMMAND_ACK_TIMEOUT
+                        and self.last_command is not None
+                    ):
+                        if self.retry > self.MAX_RETRY_COUNT:
+                            self.abort_current_command(
+                                reason=f"Command timed out without an ack after {self.LAST_COMMAND_ACK_TIMEOUT} [s], and {self.retry} retries"
+                            )
+                        else:
+                            self.log.debug(
+                                f"[MCU] !!! command timed out without ack after {self.LAST_COMMAND_ACK_TIMEOUT}s, resending command"
+                            )
+                            self.resend_last_command()
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_CHECKSUM_ERROR
+                    ):
+                        if self.retry > self.MAX_RETRY_COUNT:
+                            self.abort_current_command(reason=f"Checksum error and 10 retries for {self._cmd_id}")
+                        else:
+                            self.log.error("[MCU] !!! checksum error, resending command")
+                            self.resend_last_command()
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu == self._cmd_id
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_EXECUTION_ERROR
+                    ):
+                        # Only rejected moves are safe for a bounded resend. Other
+                        # errors (e.g. configuration failures) require attention.
+                        motion_commands = (
+                            CMD_SET.MOVE_X,
+                            CMD_SET.MOVE_Y,
+                            CMD_SET.MOVE_Z,
+                            CMD_SET.MOVE_W,
+                            CMD_SET.MOVE_W2,
+                            CMD_SET.MOVETO_X,
+                            CMD_SET.MOVETO_Y,
+                            CMD_SET.MOVETO_Z,
+                            CMD_SET.MOVETO_W,
+                            CMD_SET.MOVETO_W2,
                         )
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_id_mcu != self._cmd_id
-                    and time.time() - self.last_command_send_timestamp > self.LAST_COMMAND_ACK_TIMEOUT
-                    and self.last_command is not None
-                ):
-                    if self.retry > self.MAX_RETRY_COUNT:
                         self.abort_current_command(
-                            reason=f"Command timed out without an ack after {self.LAST_COMMAND_ACK_TIMEOUT} [s], and {self.retry} retries"
+                            reason="firmware reported CMD_EXECUTION_ERROR",
+                            recoverable=self.last_command is not None and self.last_command[1] in motion_commands,
                         )
-                    else:
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu != self._cmd_id
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
+                    ):
+                        # Log when we receive an ACK for a different command than we're waiting for
                         self.log.debug(
-                            f"[MCU] !!! command timed out without ack after {self.LAST_COMMAND_ACK_TIMEOUT}s, resending command"
+                            f"[MCU] !!! received ack for command {self._cmd_id_mcu}, but waiting for command {self._cmd_id}"
                         )
-                        self.resend_last_command()
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_CHECKSUM_ERROR
-                ):
-                    if self.retry > self.MAX_RETRY_COUNT:
-                        self.abort_current_command(reason=f"Checksum error and 10 retries for {self._cmd_id}")
-                    else:
-                        self.log.error("[MCU] !!! checksum error, resending command")
-                        self.resend_last_command()
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_id_mcu != self._cmd_id
-                    and self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
-                ):
-                    # Log when we receive an ACK for a different command than we're waiting for
-                    self.log.debug(
-                        f"[MCU] !!! received ack for command {self._cmd_id_mcu}, but waiting for command {self._cmd_id}"
-                    )
 
                 self.x_pos = self._payload_to_int(
                     msg[2:6], MicrocontrollerDef.N_BYTES_POS

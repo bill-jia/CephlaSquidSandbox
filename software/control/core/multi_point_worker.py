@@ -31,7 +31,7 @@ from control.core.multi_point_utils import (
     PlateViewUpdate,
 )
 from control.core.objective_store import ObjectiveStore
-from control.microcontroller import Microcontroller
+from control.microcontroller import CommandAborted, Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
 from control.models.observation_state import ObservationState
@@ -2298,6 +2298,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 f"Camera SDK wedged during acquisition ({ce}); aborting and finalizing. "
                 f"Frames captured so far are saved; restart the app to recover the camera."
             )
+            self.request_abort_fn()
+        except CommandAborted as exc:
+            self._log.error("Firmware rejected an operation during acquisition; aborting acquisition: %s", exc)
             self.request_abort_fn()
         except TimeoutError as te:
             origin = None
