@@ -1,5 +1,40 @@
 # Firmware
 
+## This fork's firmware integration
+
+The controller sources are imported from upstream firmware **1.4**, commit
+`5faaad47ea33b9f18a10ff3860a62f79479da79e`. This brings in failed-move reporting,
+absolute W/W2 positioning, the illumination strobe channel-switch fix, and the
+filter-wheel post-home range fix. The client changes are limited to compatibility,
+error handling, and simulation; this fork's stage configuration and imaging
+features are retained.
+
+Firmware 1.5's TMC2240 driver detection is deliberately deferred for existing
+TMC2660 controllers. Do not use this 1.4 image on a TMC2240 controller. FastLED
+3.10.3 and PacketSerial 1.4.0 are pinned following upstream #725: later FastLED
+patches can print ASCII on the binary status link.
+
+The updated Squid W/W2 wheel client requires firmware >= 1.2, including when
+hardware initialization is skipped. Flash the new controller firmware before
+starting that client with a Squid wheel enabled. Other wheel backends (including
+XLight's built-in wheels) are unaffected. A failed wheel home remains an error;
+the client does not continue acquisition while claiming a known wheel position.
+
+Before deploying on an instrument:
+
+1. Save its current working firmware image and client revision for rollback.
+2. Run `pio test -e native` and `pio run -e teensy41` in `firmware/controller`.
+3. Verify XYZ direction, travel scaling, homing, limits, and commanded current.
+4. Verify every configured W/W2 slot after repeated homes and initialization.
+5. Test rejected moves and heartbeat traffic during long moves; the client must
+   report rejection promptly without treating a keepalive as move completion.
+6. Switch MCU-controlled illumination channels during hardware-triggered live
+   capture at exposure times below and above 30 ms; the previous port must go low.
+7. Verify autofocus, acquisition abort/finalization, and illumination shutdown.
+
+Building does not flash a controller. Upload only after identifying the intended
+board, following the instructions below.
+
 ## Directory Structure
 
 ```
@@ -22,6 +57,12 @@ pip install platformio
 # Or using Homebrew (macOS)
 brew install platformio
 ```
+
+`pio run -t upload` flashes the board with the [Teensy Loader](https://www.pjrc.com/teensy/loader.html) application, which PlatformIO bundles in its Teensy platform tools (`tool-teensy`) — there is no separate uploader to install. During upload the Teensy Loader window opens, the board is automatically rebooted into the bootloader, and the firmware is flashed.
+
+> **Note:** The Teensy Loader is a graphical application, so uploading normally requires a desktop (display) environment. On platforms where the GUI app is unavailable (e.g. Linux ARM), PlatformIO automatically falls back to the command-line loader (`teensy_loader_cli`).
+
+On Linux, install the [PJRC udev rules](https://www.pjrc.com/teensy/00-teensy.rules) into `/etc/udev/rules.d/` so non-root users can flash. A copy ships with PlatformIO at `~/.platformio/packages/tool-teensy/00-teensy.rules`.
 
 ### Quick Start
 
