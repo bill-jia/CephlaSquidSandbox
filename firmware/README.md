@@ -2,11 +2,21 @@
 
 ## This fork's firmware integration
 
-The controller sources are imported from upstream firmware **1.5**, commit
+The controller is **1.5.1**, based on upstream firmware **1.5**, commit
 `da109c5a0c7727d6d57962e5e454b359b6de47dd`. This includes the 1.2–1.4 move,
 filter-wheel, and illumination fixes plus per-axis TMC2660/TMC2240 driver
 auto-detection. The client compatibility fixes preserve this fork's stage
 configuration, illumination routing, and imaging features.
+
+Patch 1.5.1 adds passive, CRC-protected diagnostics in the three reserved status
+bytes without changing packet length or the major/minor version byte. It reports
+the patch version through telemetry. The client automatically records recent
+commands/status and dumps them on a failed wait; see
+[MCU diagnostics](../software/docs/mcu-diagnostics.md) for activation checks,
+the telemetry layout and interpretation. The client version tool reports 1.5.1.
+The revised 1.5.1 image uses telemetry schema 2 for timing maxima per snapshot
+interval; the client also accepts the earlier schema 1 since-boot values. Verify
+schema 2 in the startup telemetry log after flashing the revised image.
 
 The initial 1.4 integration assumed TMC2660 hardware. USB version reporting alone
 does not verify the motor driver type or motor power. Use 1.5 when the controller

@@ -1,4 +1,5 @@
 #include "stage_commands.h"
+#include "../diagnostics.h"
 
 #include "../tmc/drivers/stepper_driver.h"   // DRIVER_UNKNOWN, tmc_driver_ready
 
@@ -92,14 +93,19 @@ void callback_move_z()
     // Before focusPosition is touched: do_focus_control() re-issues
     // moveTo(z, focusPosition) every loop, so a rejected move that had already
     // written focusPosition would be carried out anyway on the next pass.
-    if (!axis_driver_ready(z)) return;
+    if (!axis_driver_ready(z)) {
+        diagnostics_z_move_result(-32766); // driver unidentified; move not issued
+        return;
+    }
     long relative_position = int32_t(uint32_t(buffer_rx[2]) << 24 | uint32_t(buffer_rx[3]) << 16 | uint32_t(buffer_rx[4]) << 8 | uint32_t(buffer_rx[5]));
     long current_position = tmc4361A_currentPosition(&tmc4361[z]);
     Z_direction = sgn(relative_position);
     Z_commanded_target_position = ( relative_position > 0 ? min(current_position + relative_position, Z_POS_LIMIT) : max(current_position + relative_position, Z_NEG_LIMIT) );
     focusPosition = Z_commanded_target_position;
     mcu_cmd_execution_in_progress = true;
-    if ( tmc4361A_moveTo(&tmc4361[z], Z_commanded_target_position) == 0)
+    const int16_t move_result = tmc4361A_moveTo(&tmc4361[z], Z_commanded_target_position);
+    diagnostics_z_move_result(move_result);
+    if (move_result == 0)
     {
         Z_commanded_movement_in_progress = true;
     }
@@ -191,12 +197,17 @@ void callback_move_to_y()
 
 void callback_move_to_z()
 {
-    if (!axis_driver_ready(z)) return;
+    if (!axis_driver_ready(z)) {
+        diagnostics_z_move_result(-32766);
+        return;
+    }
     long absolute_position = int32_t(uint32_t(buffer_rx[2]) << 24 | uint32_t(buffer_rx[3]) << 16 | uint32_t(buffer_rx[4]) << 8 | uint32_t(buffer_rx[5]));
     Z_direction = sgn(absolute_position - tmc4361A_currentPosition(&tmc4361[z]));
     Z_commanded_target_position = absolute_position;
     mcu_cmd_execution_in_progress = true;
-    if (tmc4361A_moveTo(&tmc4361[z], Z_commanded_target_position) == 0)
+    const int16_t move_result = tmc4361A_moveTo(&tmc4361[z], Z_commanded_target_position);
+    diagnostics_z_move_result(move_result);
+    if (move_result == 0)
     {
         focusPosition = absolute_position;
         Z_commanded_movement_in_progress = true;

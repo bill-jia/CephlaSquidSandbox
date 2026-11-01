@@ -1014,7 +1014,7 @@ class LEDMatrixIlluminationDevice(IlluminationDevice):
         source_code = int(spec["source_code"])
         mcu_name = str(spec.get("matrix_channel_name", "BF LED matrix full"))
         # [LED-DBG] temporary trace; flip serial_peripherals._LED_DBG = False to silence
-        logger.info(
+        logger.debug(
             f"[LED-DBG] LEDMatrix._apply_unified_intensity mode_key='{self._active_mode_key}' "
             f"source_code={source_code} mcu_name='{mcu_name}' intensity_pct={intensity} "
             f"spec_na={spec.get('na')} annulus={spec.get('annulus')} half={spec.get('half')} "

@@ -3,7 +3,8 @@
 Close Squid/serial monitors first, then run:
     python software/tools/read_firmware_version.py COM9
 
-This checks three consecutive CRC-valid 24-byte status packets. It does not
+This checks three consecutive CRC-valid 24-byte status packets, including the
+patch version in telemetry when present. It does not
 construct a Microcontroller, reset the board, initialize drivers, or move axes.
 """
 
@@ -31,13 +32,20 @@ def read_version(connection, timeout=5.0):
             packets = [data[offset : offset + 24] for offset in (0, 24, 48)]
             if all(
                 packet[1] <= 4
-                and packet[19:22] == b"\x00\x00\x00"
+                and (packet[19:22] == b"\x00\x00\x00" or 160 <= packet[19] < 192)
                 and packet[22] >> 4 > 0
                 and crc8(packet[:23]) == packet[23]
                 for packet in packets
             ) and len({packet[22] for packet in packets}) == 1:
                 version = packets[0][22]
-                return version >> 4, version & 0x0F
+                for packet in packets:
+                    if packet[19] == 160 and packet[20] in (1, 2):
+                        return version >> 4, version & 0x0F, packet[21]
+                if all(packet[19:22] == b"\x00\x00\x00" for packet in packets):
+                    return version >> 4, version & 0x0F
+                # Valid paged telemetry, but wait for its version header.
+                del data[:24]
+                continue
             del data[0]
     raise TimeoutError("No confirmed version in status packets. Check the controller port and close other serial clients.")
 
@@ -54,8 +62,8 @@ def main():
     connection.port = args.port
     try:
         connection.open()
-        major, minor = read_version(connection)
-        print(f"{args.port}: running firmware {major}.{minor} (3 consecutive CRC-valid status packets)")
+        version = ".".join(map(str, read_version(connection)))
+        print(f"{args.port}: running firmware {version} (3 consecutive CRC-valid status packets)")
     except (serial.SerialException, TimeoutError) as exc:
         parser.exit(1, f"Could not read firmware version: {exc}\n")
     finally:

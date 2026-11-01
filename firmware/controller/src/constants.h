@@ -23,6 +23,11 @@
 //               codes, packet layout and the host contract are untouched
 #define FIRMWARE_VERSION_MAJOR 1
 #define FIRMWARE_VERSION_MINOR 5
+// 1.5.1: passive paged diagnostics in status bytes 19..21. Byte 22 retains
+// major/minor compatibility; the patch is advertised in telemetry page 0.
+// Telemetry schema 2 reports timing maxima per snapshot interval.
+#define FIRMWARE_VERSION_PATCH 1
+#define FIRMWARE_VERSION_STRING "1.5.1"
 
 #include "def/def_v1.h"
 

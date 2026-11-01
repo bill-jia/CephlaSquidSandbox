@@ -1,4 +1,5 @@
 #include "serial_communication.h"
+#include "diagnostics.h"
 
 void process_serial_message()
 {
@@ -13,6 +14,7 @@ void process_serial_message()
       uint8_t checksum = crc8ccitt(buffer_rx, CMD_LENGTH - 1);
       if (checksum != buffer_rx[CMD_LENGTH - 1])
       {
+        diagnostics_command(false);
         checksum_error = true;
         // empty the serial buffer because byte-level out-of-sync can also cause this error
         while (SerialUSB.available())
@@ -25,6 +27,7 @@ void process_serial_message()
       }
       // Reset watchdog timer on every valid serial message
       last_serial_message_time = millis();
+      diagnostics_command(true);
 
       // Default the status to success; callbacks call mark_move_failed()
       // on the failure path to override it before the next status broadcast.
@@ -87,10 +90,8 @@ void send_position_update()
     buffer_tx[18] &= ~ (1 << BIT_POS_JOYSTICK_BUTTON); // clear the joystick button bit
     buffer_tx[18] = buffer_tx[18] | joystick_button_pressed << BIT_POS_JOYSTICK_BUTTON;
 
-    // Clear reserved bytes to avoid stale data affecting the checksum
-    buffer_tx[19] = 0;
-    buffer_tx[20] = 0;
-    buffer_tx[21] = 0;
+    // Passive telemetry uses only the former reserved bytes. CRC covers it.
+    diagnostics_status(buffer_tx);
 
     // Firmware version in byte 22: high nibble = major, low nibble = minor
     buffer_tx[22] = (FIRMWARE_VERSION_MAJOR << 4) | (FIRMWARE_VERSION_MINOR & 0x0F);

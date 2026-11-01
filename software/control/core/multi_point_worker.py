@@ -2314,7 +2314,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self._log.error(f"Operation timed out during acquisition at {origin[0]}() (multi_point_worker.py:{origin[1]}), aborting acquisition!")
             else:
                 self._log.error(f"Operation timed out during acquisition, aborting acquisition!")
-            self._log.error(te)
+            self._log.error(te, exc_info=True)
             self.request_abort_fn()
         # except Exception as e:
         #     self._log.exception(e)
@@ -4398,7 +4398,16 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             if self.abort_requested_fn():
                 break
             if z_level != current_z_level:
-                self.move_z_for_stack(z_level - current_z_level)
+                context = dict(timepoint=self.time_point, region=str(region_id), fov=fov,
+                               from_plane=current_z_level, to_plane=z_level, delta_z_mm=self.deltaZ)
+                record = getattr(getattr(self, "microcontroller", None), "record_diagnostic_event", None)
+                if record is not None:
+                    record("stack_z_move", **context)
+                try:
+                    self.move_z_for_stack(z_level - current_z_level)
+                except Exception:
+                    self._log.exception("Z stack move failed: %s", context)
+                    raise
                 current_z_level = z_level
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 

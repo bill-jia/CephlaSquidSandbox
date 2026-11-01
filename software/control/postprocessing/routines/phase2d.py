@@ -110,7 +110,6 @@ class Phase2DRoutine(PostprocessRoutine):
 
     def _build_settings(self, o: dict):
         from waveorder.api import phase
-        print(o)
         return phase.Settings(
             transfer_function=phase.TransferFunctionSettings(
                 wavelength_illumination=o["wavelength_um"],

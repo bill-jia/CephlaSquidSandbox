@@ -1,6 +1,7 @@
 #include "src/init.h"
 #include "src/operations.h"
 #include "src/serial_communication.h"
+#include "src/diagnostics.h"
 
 #include "src/def/def_v1.h"
 
@@ -15,6 +16,7 @@ void setup() {
 }
 
 void loop() {
+  diagnostics_loop_tick();
 
   // Illumination safety interlock - turn off all TTL ports if interlock is triggered
   if (!INTERLOCK_OK())
