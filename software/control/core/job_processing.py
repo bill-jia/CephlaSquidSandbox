@@ -997,9 +997,9 @@ class SaveZarrJob(Job):
                             output_path=path,
                             upload_target=upload_target,
                         ).run()
-                    cls._log.info(f"Finalized zarr writer: {path}")
+                    cls._log.debug(f"Finalized zarr writer: {path}")
                 except Exception as e:
-                    cls._log.error(f"Error finalizing writer {path}: {e}")
+                    cls._log.error(f"Error finalizing writer {path}: {e}", exc_info=True)
                     failed_paths.append(path)
         cls._zarr_writers.clear()
         if failed_paths:
@@ -1198,7 +1198,7 @@ class SaveZarrJob(Job):
             if zwi.is_hcs:
                 self._write_hcs_metadata_if_needed(region_id, fov, ak)
             mode_str = "HCS" if zwi.is_hcs else "per-FOV"
-            self._log.info(f"Initialized zarr writer ({mode_str}): {output_path}")
+            self._log.debug(f"Initialized zarr writer ({mode_str}): {output_path}")
 
         writer = self._zarr_writers[writer_key]
         z = info.z_index

@@ -572,7 +572,7 @@ class ZarrWriter:
                 config.y_size, config.x_size, config.max_pyramid_levels, config.min_pyramid_dim_px
             )
 
-            log.info(
+            log.debug(
                 f"Initializing Zarr v3 dataset: {self._group_dir()} "
                 f"levels={len(self._level_shapes)} (sizes={self._level_shapes}) "
                 f"compression={config.compression.value}"
@@ -603,8 +603,9 @@ class ZarrWriter:
             self._write_group_metadata()
 
             self._initialized = True
-            log.info("Zarr v3 dataset initialized successfully")
+            log.debug("Zarr v3 dataset initialized successfully")
         except Exception:
+            log.error("Failed to initialize Zarr dataset at %s", self._group_dir(), exc_info=True)
             self._cleanup_event_loop()
             raise
 
@@ -1007,7 +1008,7 @@ class ZarrWriter:
             log.warning("Writer already finalized")
             return
 
-        log.info("Finalizing Zarr v3 dataset...")
+        log.debug("Finalizing Zarr v3 dataset...")
         # No more frames are coming, so commit partial slices too — this is the
         # only place they may be written.
         self._flush_pending_z(final=True)
@@ -1017,7 +1018,7 @@ class ZarrWriter:
         self._set_squid_flag("acquisition_complete", True)
         self._finalized = True
         self._cleanup_event_loop()
-        log.info(f"Zarr v3 dataset finalized: {self._group_dir()}")
+        log.debug(f"Zarr v3 dataset finalized: {self._group_dir()}")
 
     def abort(self) -> None:
         """Abort and clean up; mark ``aborted=True`` in metadata."""
