@@ -2,7 +2,6 @@ import atexit
 import csv
 import contextlib
 import json
-import logging
 import os
 import queue
 import threading
@@ -2323,15 +2322,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
-            # Timing collection and report emission are gated by TimingManager's
-            # class-level switch (SQUID_TIMING_REPORT=1 env var). When disabled,
-            # get_timer() returns a null context manager so every `with ...`
-            # site across the worker/obs_controller/laser_af path is a no-op,
-            # and get_report() returns a short "disabled" line. When enabled,
-            # the full report surfaces at INFO.
-            _timing_level = logging.INFO if utils.TimingManager.is_enabled() else logging.DEBUG
-            self._log.log(_timing_level, self._timing.get_report())
-            self._log.log(_timing_level, self._timing.get_report(sort=True))
+            # Emit one report, sorted by total time, only when timing was requested.
+            if utils.TimingManager.is_enabled():
+                self._log.info(self._timing.get_report(sort=True))
             # Detach the timing manager from the obs controller so live-mode
             # calls from widgets don't keep writing into the acquisition's
             # timing report.
@@ -3067,7 +3060,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self._pending_move_stabilization_s = 0.0
 
     def move_to_z_level(self, z_mm, blocking=True):
-        self._log.debug("moving z")
         self.stage.move_z_to(z_mm, blocking=blocking)
         self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
@@ -5353,7 +5345,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self._capture_ts["ic_event_set"] = time.perf_counter()
         try:
             with self._timing.get_timer("_image_callback"):
-                self._log.debug(f"In Image callback for frame_id={camera_frame.frame_id}")
                 if not info:
                     self._log.error("In image callback, no current capture info! Something is wrong. Aborting.")
                     self.request_abort_fn()
@@ -5647,8 +5638,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         try:
             with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
                 if self.liveController.trigger_mode == TriggerMode.HARDWARE:
-                    # Per-capture, so keep at debug to avoid log-format overhead on the hot path.
-                    self._log.debug("Waiting %.3f [s] for exposure to complete", self.camera.get_total_frame_time() / 1e3)
                     exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
                     # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
                     # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
