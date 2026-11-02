@@ -276,6 +276,33 @@ file's location. Preserve both when sharing a failure. The tool
 summarizes these records for a short representative hardware check; see the
 [short-run procedure](../mcu-diagnostics.md#periodic-health-summaries-and-short-run-timing-report).
 
+## November 1 short run and client follow-up
+
+The single-timepoint acquisition from 15:41:31 to 15:48:43 completed with firmware
+1.5.1 schema 2. Its reporting windows showed reception gaps up to 578 ms and a
+queued serial buffer of 1,272 bytes (53 packets), while received firmware
+telemetry reported status-generation gaps no larger than 18 ms and loop gaps
+around 9.4 ms. No command retries, failed MCU waits or CRC errors were recorded.
+These observations favor client scheduling/processing or USB/OS buffering as
+the source of those delays, but do not establish the original crash's cause or
+separate GIL contention, native-driver blocking and transport delays.
+
+The client follow-up replaces byte-at-a-time serial reads with bounded batch
+reads and ordered packet parsing, including retained partial packets. A separate
+monitor captures stacks and recent history for delays of at least 200 ms, at
+most once every 30 seconds. Captures are stored in
+`mcu_diagnostics/stalls-<recorder-id>.jsonl`, with concise main-log references.
+Recovered-gap captures describe the stack after recovery and may miss the causal
+call. See [short-stall capture](../mcu-diagnostics.md#capturing-shorter-reader-stalls).
+
+The client regression run passed 218 tests with one existing skip. Batching
+tests verified that 100 queued packets require one read and retain wire order;
+the monitor test captured a blocked reader callback without querying serial.
+This verifies implementation behavior, not an improvement in instrument latency.
+Compare another equivalent short acquisition before attributing the delays to
+the old reader. Firmware and motion timeout settings were unchanged by this
+client follow-up.
+
 ## Next acquisition
 
 Use the updated client and controller 1.5.1, and confirm an INFO log entry saying
