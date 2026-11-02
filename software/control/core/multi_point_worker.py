@@ -2769,7 +2769,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     plate_resolution = int(self._downsampled_plate_resolution_um)
                     plate_view_path = os.path.join(current_path, "downsampled", f"plate_{plate_resolution}um.tiff")
                     self.save_plate_view(plate_view_path)
-                    self._log.info(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
+                    self._log.debug(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
                     # Clear plate view for next timepoint
                     self._downsampled_view_manager.clear()
 

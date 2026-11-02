@@ -217,7 +217,7 @@ class FastAcquisitionWriter(threading.Thread):
                 try:
                     self._finalize_after_raw_closed()
                 except Exception as e:
-                    self._log.error(f"Post-process after raw capture failed: {e}", exc_info=True)
+                    self._log.error(f"Post-process of {self._raw_file_path} to {self._file_format} failed: {e}", exc_info=True)
 
             self._running = False
             self._frame_timestamps_ms = np.array(self._frame_timestamps_ms)
@@ -400,7 +400,7 @@ class FastAcquisitionWriter(threading.Thread):
             os.remove(raw_path)
             self._log.debug(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
         except OSError as e:
-            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
+            self._log.warning(f"Could not delete raw file {raw_path}: {e}", exc_info=True)
 
     # --- Per-format incremental appenders (shared by the raw and direct-encode paths) ---
     # Each returns (append, close, describe): append(plane, frame_id, timestamp) writes one
@@ -514,12 +514,12 @@ class FastAcquisitionWriter(threading.Thread):
                     self._frames_converted = n
             finished = True
         except Exception as e:
-            self._log.error(f"Failed to encode {self._file_format} from raw: {e}", exc_info=True)
+            self._log.error(f"Failed to encode {self._file_format} from {raw_path} after {n} frames: {e}", exc_info=True)
         finally:
             try:
                 close()
             except Exception as e:
-                self._log.warning(f"Error closing {self._file_format} output: {e}", exc_info=True)
+                self._log.warning(f"Error closing {self._file_format} output in {self._output_path}: {e}", exc_info=True)
 
         if not finished or n == 0:
             if n == 0:
@@ -530,7 +530,7 @@ class FastAcquisitionWriter(threading.Thread):
             os.remove(raw_path)
             self._log.debug(f"Deleted raw file {raw_path} after {self._file_format} conversion")
         except OSError as e:
-            self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
+            self._log.warning(f"Could not delete raw file {raw_path}: {e}", exc_info=True)
 
     def _run_direct_encode(self) -> None:
         """Direct-encode: decode the RAM ring straight into the output file (bigtiff/zarr/
@@ -569,12 +569,12 @@ class FastAcquisitionWriter(threading.Thread):
                 self._frames_converted = n
             finished = True
         except Exception as e:
-            self._log.error(f"Direct encode to {self._file_format} failed: {e}", exc_info=True)
+            self._log.error(f"Direct encode to {self._file_format} in {self._output_path} failed after {n} frames: {e}", exc_info=True)
         finally:
             try:
                 close()
             except Exception as e:
-                self._log.warning(f"Error closing {self._file_format} output: {e}", exc_info=True)
+                self._log.warning(f"Error closing {self._file_format} output in {self._output_path}: {e}", exc_info=True)
         if finished and n > 0:
             self._log.debug(f"Wrote {describe(n)} directly from RAM (skipped raw round-trip)")
         elif n == 0:

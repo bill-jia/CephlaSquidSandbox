@@ -1053,13 +1053,23 @@ class FastAcquisitionController:
                 f.attrs['frame_counter_dio_line'] = self._frame_counter_dio_line
                 f.attrs['num_frames_detected'] = len(self._frame_sample_indices)
 
-            self._log.info(f"Saved DAQ data to {h5_path}")
+            self._log.debug(f"Saved DAQ data to {h5_path}")
 
         except ImportError:
             # Fallback to NumPy format
             np_path = os.path.join(waveforms_dir, "frame_sync_map.npy")
-            np.save(np_path, np.array(self._frame_sample_indices))
-            self._log.info(f"Saved frame sync map to {np_path} (HDF5 not available)")
+            try:
+                np.save(np_path, np.array(self._frame_sample_indices))
+            except Exception:
+                self._log.error("Failed to save frame sync map to %s", np_path, exc_info=True)
+                raise
+            self._log.warning(
+                "HDF5 unavailable; saved only frame sync indices to %s. DAQ waveforms were not saved.", np_path
+            )
+
+        except Exception:
+            self._log.error("Failed to save DAQ data in %s", waveforms_dir, exc_info=True)
+            raise
 
     def _build_nidaq_snapshot(self) -> Optional[NIDAQConfigSnapshot]:
         """Build a NIDAQConfigSnapshot from ``self._ni_daq`` for HDF5 sidecar attrs.
@@ -1194,7 +1204,7 @@ class FastAcquisitionController:
         metadata_path = os.path.join(self._output_path, "metadata.json")
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        self._log.info(f"Saved metadata to {metadata_path}")
+        self._log.debug(f"Saved metadata to {metadata_path}")
         self._save_acquisition_metadata_yaml_sidecar(metadata)
 
     def _save_acquisition_metadata_yaml_sidecar(self, metadata_json: dict) -> None:
@@ -1239,7 +1249,7 @@ class FastAcquisitionController:
                 observation_state=obs_state,
             )
             out = repo.save_acquisition_metadata(self._output_path, am)
-            self._log.info("Saved acquisition metadata YAML to %s", out)
+            self._log.debug("Saved acquisition metadata YAML to %s", out)
         except Exception as e:
             self._log.warning("Could not save acquisition_metadata.yaml for fast acquisition: %s", e, exc_info=True)
 

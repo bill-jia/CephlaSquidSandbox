@@ -590,9 +590,9 @@ class SaveOMETiffJob(Job):
         for path, region_file in list(cls._region_files.items()):
             try:
                 region_file.finalize()
-                cls._log.info(f"Finalized OME-TIFF region file: {path}")
+                cls._log.debug(f"Finalized OME-TIFF region file: {path}")
             except Exception as e:
-                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}")
+                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}", exc_info=True)
                 failed.append(path)
         cls._region_files.clear()
         cls._active_region_path = None
@@ -686,7 +686,7 @@ class SaveOMETiffJob(Job):
             n_series = ome_tiff_writer.region_fov_count(self.acquisition_info, info)
             metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image, n_series)
             ome_tiff_writer.create_multiseries_file(output_path, metadata)
-            self._log.info(
+            self._log.debug(
                 f"Created region OME-TIFF {output_path} with {n_series} series, "
                 f"shape={tuple(metadata[ome_tiff_writer.SHAPE_KEY])}"
             )
@@ -701,7 +701,7 @@ class SaveOMETiffJob(Job):
                 )
                 self._log.warning(f"Writing into an already finalized region OME-TIFF {output_path}")
             else:
-                self._log.info(f"Resuming region OME-TIFF {output_path} from its sidecar")
+                self._log.debug(f"Resuming region OME-TIFF {output_path} from its sidecar")
             expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
             if expected_shape[-2:] != image.shape[-2:]:
                 raise ValueError("Image dimensions do not match existing OME memmap stack")
@@ -2682,7 +2682,7 @@ class JobRunner(multiprocessing.Process):
             if not success:
                 self._log.error("OME-TIFF FINALIZATION INCOMPLETE - Some metadata may be missing")
         except Exception as e:
-            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}")
+            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}", exc_info=True)
         self._log.info(
             f"finalize_all_writers() completed in {time.perf_counter() - t_finalize_start:.1f}s"
         )

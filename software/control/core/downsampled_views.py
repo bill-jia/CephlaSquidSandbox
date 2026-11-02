@@ -488,7 +488,7 @@ class DownsampledViewManager:
                 "Channel": {"Name": self.channel_names[: self.num_channels]},
             },
         )
-        self._log.info(f"Saved plate view to {path} with {self.num_channels} channels")
+        self._log.debug(f"Saved plate view to {path} with {self.num_channels} channels")
 
     def get_plate_view(self) -> np.ndarray:
         """Get a copy of the plate view array.
