@@ -303,6 +303,35 @@ Compare another equivalent short acquisition before attributing the delays to
 the old reader. Firmware and motion timeout settings were unchanged by this
 client follow-up.
 
+## Preview-layer follow-up
+
+The subsequent 72-FOV run (16:08:04 to 16:14:44) still showed reception gaps up
+to 500 ms, with no failed waits, retries or CRC errors. Seven of eight stall
+captures after acquisition startup caught the GUI constructing Napari preview
+layers, graphics objects or thumbnails. In four captures, the acquisition thread
+was waiting for Z completion. These samples make preview-related host scheduling
+or GIL pressure a stronger hypothesis, but do not establish causation.
+
+The shorter 18-FOV run (16:17:06 to 16:19:24) had just one startup stall warning;
+subsequent reporting windows had reception gaps no larger than 156 ms. Its
+startup capture found the GUI in the explicit `gc.collect()` inside
+`NapariMultiChannelWidget.clearAllLayers()`. The smaller run is not a controlled
+preview-on/off comparison.
+
+The preview renderer previously removed channels absent from each new position's
+initially empty snapshot, then recreated their Napari layers as frames arrived.
+It now hides and reuses those layers, restoring each user's visibility preference
+only after fresh data is installed. Compatible layers also survive acquisition
+reset, which no longer clears them or forces garbage collection. Grayscale/RGB
+interpretation changes recreate only the affected layer, and channels left over
+from older acquisitions are released at completion. Redraw frequency, thread
+placement, capture and saving behavior are unchanged.
+
+All 19 preview model, widget and event tests passed, including real Napari layer
+identity, stale-image hiding, user settings, acquisition restart, mixed geometry,
+RGB replacement and disabled-preview replay. Instrument timing still needs to
+be compared with the same acquisition workload and live preview enabled.
+
 ## Next acquisition
 
 Use the updated client and controller 1.5.1, and confirm an INFO log entry saying

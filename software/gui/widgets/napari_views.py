@@ -1560,6 +1560,11 @@ class NapariMultiChannelWidget(QWidget):
         # Per-channel config cache so recreated layers remember user adjustments
         # (colormap, gamma, etc.) across clearAllLayers.
         self._layer_config_cache: dict = {}
+        # A layer's temporary absence from a position is separate from the
+        # user's visibility preference. Keep its graphics objects for reuse.
+        self._preview_hidden_layers = {}
+        self._preview_used_layers = set()
+        self._changing_preview_visibility = False
         self.preview = AcquisitionPreview()
         self._preview_enabled = True
         self._preview_acquiring = False
@@ -1569,6 +1574,7 @@ class NapariMultiChannelWidget(QWidget):
 
     def initNapariViewer(self):
         self.viewer = napari.Viewer(show=False)
+        self.viewer.layers.events.removed.connect(self._onPreviewLayerRemoved)
         if self.grid_enabled:
             self.viewer.grid.enabled = True
         self.viewer.dims.axis_labels = ["Y-axis", "X-axis"]
@@ -1606,12 +1612,22 @@ class NapariMultiChannelWidget(QWidget):
     def resetAcquisitionPreview(self):
         self.preview.reset()
         self._preview_acquiring = True
-        self.clearAllLayers()
+        self._preview_used_layers.clear()
+        for layer in self.viewer.layers:
+            self._hidePreviewLayer(layer)
+        self.acquisition_initialized = False
+        self.layers_initialized = False
+        self.update_layer_count = 0
         self.preview_status.setText("Waiting for acquisition")
 
     def finishAcquisitionPreview(self):
         self._preview_acquiring = False
         self._renderPreview()
+        # Keep this acquisition's channels, but release channels left over from
+        # older configurations so successive acquisitions don't grow the cache.
+        for layer in list(self.viewer.layers):
+            if layer not in self._preview_used_layers:
+                self._removePreviewLayer(layer)
 
     def setPreviewEnabled(self, enabled):
         self._preview_enabled = enabled
@@ -1625,8 +1641,8 @@ class NapariMultiChannelWidget(QWidget):
     def _renderPreview(self):
         snapshot = self.preview.snapshot()
         if snapshot is None:
-            if len(self.viewer.layers):
-                self.clearAllLayers()
+            for layer in self.viewer.layers:
+                self._hidePreviewLayer(layer)
             self.preview_status.setText("Waiting for a complete position")
             return
         magnification = str(int(self.objectiveStore.get_current_objective_info()["magnification"]))
@@ -1634,11 +1650,12 @@ class NapariMultiChannelWidget(QWidget):
         # All changes happen in one GUI event; no partially replaced FOV is painted.
         for layer in list(self.viewer.layers):
             if layer.name not in images:
-                self._layer_config_cache[layer.name] = _snapshot_image_layer(layer)
-                self.viewer.layers.remove(layer)
+                self._hidePreviewLayer(layer)
         for name, image in images.items():
             if name not in self.viewer.layers or self.viewer.layers[name].data is not image:
                 self.updateLayers(image, 0, 0, 0, name)
+            else:
+                self._showPreviewLayer(self.viewer.layers[name])
         _, timepoint, region, fov = snapshot.key
         state = "complete" if snapshot.complete else "acquiring"
         text = f"T {timepoint + 1} | {region} | Position {fov + 1} | {state}"
@@ -1647,6 +1664,47 @@ class NapariMultiChannelWidget(QWidget):
         if self.preview.dropped_positions:
             text += f" | Skipped {self.preview.dropped_positions} pending previews (processing backlog)"
         self.preview_status.setText(text)
+
+    def _setPreviewVisibility(self, layer, visible):
+        self._changing_preview_visibility = True
+        try:
+            layer.visible = visible
+        finally:
+            self._changing_preview_visibility = False
+
+    def _hidePreviewLayer(self, layer):
+        if layer not in self._preview_hidden_layers:
+            self._preview_hidden_layers[layer] = layer.visible
+        self._setPreviewVisibility(layer, False)
+
+    def _showPreviewLayer(self, layer):
+        self._preview_used_layers.add(layer)
+        if layer in self._preview_hidden_layers:
+            self._setPreviewVisibility(layer, self._preview_hidden_layers.pop(layer))
+
+    def _onPreviewVisibilityChanged(self, event):
+        layer = event.source
+        if not self._changing_preview_visibility and layer in self._preview_hidden_layers:
+            # Remember checkbox changes, but never reveal a previous position's
+            # pixels while this channel is waiting for its first fresh frame.
+            self._preview_hidden_layers[layer] = layer.visible
+            self._setPreviewVisibility(layer, False)
+
+    def _cachePreviewLayer(self, layer):
+        cfg = _snapshot_image_layer(layer)
+        if layer in self._preview_hidden_layers:
+            cfg["visible"] = self._preview_hidden_layers[layer]
+        self._layer_config_cache[layer.name] = cfg
+
+    def _removePreviewLayer(self, layer):
+        self._cachePreviewLayer(layer)
+        self.viewer.layers.remove(layer)
+
+    def _onPreviewLayerRemoved(self, event):
+        layer = event.value
+        self._preview_hidden_layers.pop(layer, None)
+        self._preview_used_layers.discard(layer)
+        layer.events.visible.disconnect(self._onPreviewVisibilityChanged)
 
     def customizeViewer(self):
         # # Hide the status bar (which includes the activity button)
@@ -1712,6 +1770,11 @@ class NapariMultiChannelWidget(QWidget):
         if not self.layers_initialized:
             self.initLayers(image.shape[0], image.shape[1], image.dtype)
 
+        if channel_name in self.viewer.layers and self.viewer.layers[channel_name].rgb != rgb:
+            # Napari fixes RGB interpretation at creation; recreate only when
+            # a channel genuinely changes between grayscale and RGB.
+            self._removePreviewLayer(self.viewer.layers[channel_name])
+
         if channel_name not in self.viewer.layers:
             self.channels.add(channel_name)
             if rgb:
@@ -1745,16 +1808,21 @@ class NapariMultiChannelWidget(QWidget):
             cached_cfg = self._layer_config_cache.get(channel_name)
             if cached_cfg:
                 _restore_image_layer(layer, cached_cfg)
-
-            if not self.viewer_scale_initialized:
-                self.resetView()
-                self.viewer_scale_initialized = True
-            else:
-                layer.refresh()
+            layer.events.visible.connect(self._onPreviewVisibilityChanged)
 
         layer = self.viewer.layers[channel_name]
-        layer.data = image
-        layer.contrast_limits = self.contrastManager.get_limits(channel_name)
+        if layer.data is not image:
+            layer.data = image
+        scale = (self.pixel_size_um, self.pixel_size_um)
+        if not np.array_equal(layer.scale, scale):
+            layer.scale = scale
+        limits = self.contrastManager.get_limits(channel_name)
+        if tuple(layer.contrast_limits) != tuple(limits):
+            layer.contrast_limits = limits
+        self._showPreviewLayer(layer)
+        if not self.viewer_scale_initialized:
+            self.resetView()
+            self.viewer_scale_initialized = True
 
     def signalContrastLimits(self, event):
         layer = event.source
@@ -1773,17 +1841,16 @@ class NapariMultiChannelWidget(QWidget):
         self.viewer.window.activate()
 
     def clearAllLayers(self):
-        """Clear preview layers at acquisition start, retaining user settings."""
+        """Explicitly discard preview layers, retaining user settings."""
         # Snapshot per-layer user adjustments so they carry across the flush.
         for layer in self.viewer.layers:
             if hasattr(layer, "colormap"):
-                self._layer_config_cache[layer.name] = _snapshot_image_layer(layer)
+                self._cachePreviewLayer(layer)
         self.viewer.layers.clear()
         self.acquisition_initialized = False
         self.layers_initialized = False
         self.update_layer_count = 0
         self.viewer_scale_initialized = False
-        gc.collect()
 
 
 class NapariMosaicDisplayWidget(QWidget):

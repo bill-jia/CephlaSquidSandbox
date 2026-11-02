@@ -53,7 +53,9 @@ def test_position_commit_includes_processed_planes_of_different_size(widget):
     w.handlePreviewEvent(PreviewFrame(second, "other", image(99), 0, 1))
     assert "20x derived" in w.viewer.layers  # holds across timepoints/regions
     w.handlePreviewEvent(PreviewCaptured(second))
-    assert [layer.name for layer in w.viewer.layers] == ["20x other"]
+    assert [layer.name for layer in w.viewer.layers if layer.visible] == ["20x other"]
+    assert w.viewer.layers["20x derived"] is derived
+    assert not derived.visible
     assert "B1" in w.preview_status.text()
 
 
@@ -103,3 +105,100 @@ def test_controller_callback_queues_preview_from_background_thread(widget, qtbot
     assert widget.viewer.layers["20x raw"].data[0, 0] == 42
     controller.set_show_live_during_acquisition(False)
     assert not widget._preview_enabled
+
+
+def test_reuses_layers_across_positions_without_showing_stale_pixels(widget):
+    w = widget
+    created = []
+
+    def inserted(event):
+        created.append(event.value)
+
+    w.viewer.layers.events.inserted.connect(inserted)
+    first, second = ("run", 0, "A1", 0), ("run", 0, "A1", 1)
+    w.handlePreviewEvent(PreviewStarted(first, 2))
+    w.handlePreviewEvent(PreviewFrame(first, "raw", image(4), 0, 1))
+    w.handlePreviewEvent(PreviewFrame(first, "reference", image(8), 0, 1))
+    raw, reference = w.viewer.layers["20x raw"], w.viewer.layers["20x reference"]
+    raw.gamma, raw.opacity, raw.contrast_limits = 1.6, 0.4, (1, 99)
+    raw.colormap = "red"
+    reference.visible = False  # User choice, distinct from temporary hiding.
+    w.handlePreviewEvent(PreviewCaptured(first))
+    w.handlePreviewEvent(PreviewStarted(second, 2))
+    assert not any(layer.visible for layer in w.viewer.layers)
+    raw.visible = True  # Even a manual toggle cannot expose previous-position data.
+    assert not raw.visible
+    w.handlePreviewEvent(PreviewFrame(second, "raw", image(12), 0, 1))
+    assert w.viewer.layers["20x raw"] is raw and raw.visible
+    assert raw.data[0, 0] == 12
+    assert (raw.gamma, raw.opacity, tuple(raw.contrast_limits), raw.colormap.name) == (1.6, 0.4, (1, 99), "red")
+    assert not reference.visible
+    w.handlePreviewEvent(PreviewFrame(second, "reference", image(16), 0, 1))
+    assert w.viewer.layers["20x reference"] is reference
+    assert reference.data[0, 0] == 16 and not reference.visible
+    assert len(created) == 2
+
+
+def test_restart_reuses_layers_updates_geometry_and_prunes_unused_channels(widget, monkeypatch):
+    w = widget
+    first, second = ("first-run", 0, "A1", 0), ("second-run", 0, "A1", 0)
+    w.handlePreviewEvent(PreviewStarted(first, 2))
+    for channel in ("raw", "unused"):
+        w.handlePreviewEvent(PreviewFrame(first, channel, image(4), 0, 1))
+    w.handlePreviewEvent(PreviewCaptured(first))
+    w.finishAcquisitionPreview()
+    raw = w.viewer.layers["20x raw"]
+    raw.gamma = 1.7
+
+    def forbidden():
+        raise AssertionError("Acquisition reset must not force garbage collection")
+
+    # Check only the reset itself; third-party viewer teardown may collect.
+    with monkeypatch.context() as scoped:
+        scoped.setattr("gui.widgets.napari_views.gc.collect", forbidden)
+        w.resetAcquisitionPreview()
+    assert w.viewer.layers["20x raw"] is raw and not raw.visible
+    w.objectiveStore.get_pixel_size_factor = lambda: 2
+    w.initLayersShape(3, 1)
+    w.handlePreviewEvent(PreviewStarted(second, 1))
+    w.handlePreviewEvent(PreviewFrame(second, "raw", image(0.5, (4, 6), np.float32), 0, 1))
+    w.handlePreviewEvent(PreviewCaptured(second))
+    w.finishAcquisitionPreview()
+    assert list(w.viewer.layers) == [raw]
+    assert raw.data.shape == (4, 6) and raw.data.dtype == np.float32
+    assert tuple(raw.scale) == (1, 1)
+    assert raw.gamma == 1.7 and raw.visible
+
+
+def test_recreates_only_incompatible_rgb_layers_and_preserves_settings(widget):
+    w = widget
+    first, second = ("run", 0, "A1", 0), ("run", 0, "A1", 1)
+    w.handlePreviewEvent(PreviewStarted(first, 1))
+    w.handlePreviewEvent(PreviewFrame(first, "raw", image(4), 0, 1))
+    old = w.viewer.layers["20x raw"]
+    old.gamma = 1.7
+    w.handlePreviewEvent(PreviewStarted(second, 1))
+    w.handlePreviewEvent(PreviewFrame(second, "raw", image(8, (8, 8, 3), np.uint8), 0, 1))
+    new = w.viewer.layers["20x raw"]
+    assert new is not old and new.rgb and new.visible and new.gamma == 1.7
+    assert len(w.viewer.layers) == 1
+    assert old not in w._preview_hidden_layers and old not in w._preview_used_layers
+
+
+def test_user_removal_and_explicit_clear_release_hidden_layer_references(widget):
+    w = widget
+    key = ("run", 0, "A1", 0)
+    w.handlePreviewEvent(PreviewStarted(key, 1))
+    w.handlePreviewEvent(PreviewFrame(key, "raw", image(4), 0, 1))
+    layer = w.viewer.layers["20x raw"]
+    w.resetAcquisitionPreview()
+    w.viewer.layers.remove(layer)
+    assert not w._preview_hidden_layers and not w._preview_used_layers
+    w.handlePreviewEvent(PreviewStarted(key, 1))
+    w.handlePreviewEvent(PreviewFrame(key, "raw", image(8), 0, 1))
+    layer = w.viewer.layers["20x raw"]
+    layer.visible = False
+    w.resetAcquisitionPreview()
+    w.clearAllLayers()
+    assert not w.viewer.layers and not w._preview_hidden_layers
+    assert w._layer_config_cache["20x raw"]["visible"] is False
