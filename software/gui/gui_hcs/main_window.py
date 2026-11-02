@@ -339,7 +339,12 @@ class HighContentScreeningGui(QMainWindow):
         acq_channel_config_action.triggered.connect(self.openObservationStateConfigEditor)
         settings_menu.addAction(acq_channel_config_action)
 
-        save_observation_state_action = QAction("Save Observation State Preset...", self)
+        save_changes_action = QAction("Save Changes to Selected Observation State...", self)
+        save_changes_action.setMenuRole(QAction.NoRole)
+        save_changes_action.triggered.connect(lambda: self.observationStateWidget._on_save())
+        settings_menu.addAction(save_changes_action)
+
+        save_observation_state_action = QAction("Save Observation State As...", self)
         save_observation_state_action.setMenuRole(QAction.NoRole)
         save_observation_state_action.triggered.connect(self.saveObservationStatePreset)
         settings_menu.addAction(save_observation_state_action)
@@ -348,6 +353,11 @@ class HighContentScreeningGui(QMainWindow):
         load_observation_state_action.setMenuRole(QAction.NoRole)
         load_observation_state_action.triggered.connect(self.loadObservationStatePreset)
         settings_menu.addAction(load_observation_state_action)
+
+        delete_observation_state_action = QAction("Delete Selected Observation State...", self)
+        delete_observation_state_action.setMenuRole(QAction.NoRole)
+        delete_observation_state_action.triggered.connect(lambda: self.observationStateWidget._on_delete())
+        settings_menu.addAction(delete_observation_state_action)
 
         # Advanced submenu
         advanced_menu = settings_menu.addMenu("Advanced")
@@ -2148,16 +2158,7 @@ class HighContentScreeningGui(QMainWindow):
 
     def saveObservationStatePreset(self):
         """Save current imaging state (Observation State) as a named profile preset."""
-        from gui.widgets.observation_state_dialogs import run_save_observation_state_dialog
-
-        run_save_observation_state_dialog(
-            self,
-            self.microscope.config_repo,
-            self.liveController,
-            self.objectiveStore,
-            self.emission_filter_wheel,
-            on_success=self._on_menu_observation_state_changed,
-        )
+        self.observationStateWidget._on_save_as()
 
     def loadObservationStatePreset(self):
         """Load a saved Observation State preset into general.yaml and live hardware."""
@@ -2170,7 +2171,7 @@ class HighContentScreeningGui(QMainWindow):
             self.objectiveStore,
             self.emission_filter_wheel,
             preset_name=None,
-            on_success=self._on_menu_observation_state_changed,
+            on_loaded=self.observationStateWidget._after_named_success,
         )
 
     def openAdvancedChannelMapping(self):

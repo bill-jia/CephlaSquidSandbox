@@ -1174,6 +1174,17 @@ class ConfigRepository:
             raise
         return path
 
+    def delete_observation_preset(self, name: str, profile: Optional[str] = None) -> None:
+        """Delete a saved preset from the current (or specified) profile."""
+        from control.core.observation_state_service import observation_preset_path
+
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
+        if name not in self.list_observation_presets(profile):
+            raise ValueError(f"Preset '{name}' was not found.")
+        observation_preset_path(self, name, profile=profile).unlink()
+
     def load_observation_preset(self, name: str, profile: Optional[str] = None) -> Optional[ObservationState]:
         """
         Load a named Observation State preset from the profile.

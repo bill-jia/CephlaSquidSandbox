@@ -937,6 +937,8 @@ class CycleEditorDialog(QDialog):
         super().__init__(parent)
         self.microscope = microscope
         self.repo = microscope.config_repo
+        self._loaded_cycle_name = None
+        self._saved_snapshot = None
         self.setWindowTitle("Edit Acquisition Cycles")
 
         layout = QHBoxLayout(self)
@@ -945,23 +947,28 @@ class CycleEditorDialog(QDialog):
         left = QVBoxLayout()
         left.addWidget(QLabel("Saved cycles"))
         self.list_existing = QListWidget()
-        self.list_existing.itemClicked.connect(lambda it: self._load_cycle(it.text()))
+        self.list_existing.setToolTip("Select a cycle to edit its steps and repeats")
+        self.list_existing.currentItemChanged.connect(self._on_cycle_selected)
         left.addWidget(self.list_existing)
         row = QHBoxLayout()
-        btn_new = QPushButton("New")
-        btn_new.clicked.connect(self._new_cycle)
-        btn_del = QPushButton("Delete")
-        btn_del.clicked.connect(self._delete_selected_cycle)
-        row.addWidget(btn_new)
-        row.addWidget(btn_del)
+        self.btn_new_cycle = QPushButton("New Cycle")
+        self.btn_new_cycle.clicked.connect(self._new_cycle)
+        self.btn_delete_cycle = QPushButton("Delete…")
+        self.btn_delete_cycle.setToolTip("Delete the selected saved cycle")
+        self.btn_delete_cycle.clicked.connect(self._delete_selected_cycle)
+        row.addWidget(self.btn_new_cycle)
+        row.addWidget(self.btn_delete_cycle)
         left.addLayout(row)
         layout.addLayout(left, 1)
 
         # ── Right: editor ──
         right = QVBoxLayout()
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
+        name_row.addWidget(QLabel("Editing:"))
         self.edit_name = QLineEdit()
+        self.edit_name.setReadOnly(True)
+        self.edit_name.setPlaceholderText("New cycle — use Save As…")
+        self.edit_name.setToolTip("Save Changes updates this cycle. Save As creates a separate cycle.")
         name_row.addWidget(self.edit_name)
         name_row.addWidget(QLabel("Repeat:"))
         self.spin_repeat = QSpinBox()
@@ -996,18 +1003,30 @@ class CycleEditorDialog(QDialog):
         right.addLayout(tools)
 
         save_row = QHBoxLayout()
+        self.label_cycle_status = QLabel()
+        save_row.addWidget(self.label_cycle_status)
         save_row.addStretch()
-        btn_save = QPushButton("Save")
-        btn_save.clicked.connect(self._save_cycle)
+        self.btn_save_cycle = QPushButton("Save Changes")
+        self.btn_save_cycle.setToolTip("Replace the cycle being edited with these steps and repeats")
+        self.btn_save_cycle.clicked.connect(self._save_cycle)
+        self.btn_save_cycle_as = QPushButton("Save As…")
+        self.btn_save_cycle_as.setToolTip("Save these steps and repeats as a new cycle with a different name")
+        self.btn_save_cycle_as.clicked.connect(self._save_cycle_as)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
-        save_row.addWidget(btn_save)
+        for button in (
+            self.btn_new_cycle, self.btn_delete_cycle, self.btn_save_cycle, self.btn_save_cycle_as, btn_close
+        ):
+            button.setAutoDefault(False)
+        save_row.addWidget(self.btn_save_cycle)
+        save_row.addWidget(self.btn_save_cycle_as)
         save_row.addWidget(btn_close)
         right.addLayout(save_row)
         layout.addLayout(right, 2)
 
         self.resize(720, 420)
         self._refresh_existing()
+        self._new_cycle()
 
     # ── preset combo helper ──
     def _preset_names(self):
@@ -1532,12 +1551,56 @@ class CycleEditorDialog(QDialog):
 
     # ── persistence ──
     def _refresh_existing(self):
-        self.list_existing.clear()
-        for name in _multipoint_cycle_display_names(self.microscope):
-            self.list_existing.addItem(name)
+        with QSignalBlocker(self.list_existing):
+            self.list_existing.clear()
+            for name in _multipoint_cycle_display_names(self.microscope):
+                self.list_existing.addItem(name)
+            matches = self.list_existing.findItems(self._loaded_cycle_name or "", Qt.MatchExactly)
+            if matches:
+                self.list_existing.setCurrentItem(matches[0])
+        self._update_cycle_actions()
+
+    def _update_cycle_actions(self):
+        has_profile = bool(self.repo.current_profile)
+        self.btn_save_cycle.setEnabled(has_profile and self._loaded_cycle_name is not None)
+        self.btn_save_cycle_as.setEnabled(has_profile)
+        self.btn_delete_cycle.setEnabled(has_profile and self.list_existing.currentItem() is not None)
+
+    def _on_cycle_selected(self, current, _previous):
+        if current is not None and not self._load_cycle(current.text()):
+            # A cancelled switch must leave the library pointing at the draft's owner.
+            self._refresh_existing()
+        self._update_cycle_actions()
+
+    def _snapshot(self):
+        return (self.spin_repeat.value(), self._read_tree())
+
+    def _confirm_leave_cycle(self):
+        if self._saved_snapshot is None or self._snapshot() == self._saved_snapshot:
+            return True
+        choice = QMessageBox.question(
+            self,
+            "Unsaved cycle changes",
+            f"Save changes to '{self._loaded_cycle_name or 'New cycle'}' before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if choice == QMessageBox.Save:
+            return self._save_cycle(confirm=False) if self._loaded_cycle_name else self._save_cycle_as()
+        return choice == QMessageBox.Discard
+
+    def done(self, result):
+        if self._confirm_leave_cycle():
+            super().done(result)
 
     def _new_cycle(self):
+        if not self._confirm_leave_cycle():
+            return
         self._load_model("", 1, [])
+        self._loaded_cycle_name = None
+        self._saved_snapshot = self._snapshot()
+        self.label_cycle_status.setText("Unsaved cycle")
+        self._refresh_existing()
 
     @staticmethod
     def _leaf_to_dict(item):
@@ -1595,9 +1658,14 @@ class CycleEditorDialog(QDialog):
     def _load_cycle(self, name):
         from control.models.acquisition_cycle import CycleGroup
 
+        if name == self._loaded_cycle_name:
+            return True
+        if not self._confirm_leave_cycle():
+            return False
         cyc = self.repo.load_acquisition_cycle(name)
         if cyc is None:
-            return
+            QMessageBox.warning(self, "Load failed", f"Could not load cycle '{name}'.")
+            return False
         model = []
         for item in cyc.items:
             if isinstance(item, CycleGroup):
@@ -1612,18 +1680,41 @@ class CycleEditorDialog(QDialog):
             else:
                 model.append(self._leaf_to_dict(item))
         self._load_model(cyc.name, cyc.repeat, model)
+        self._loaded_cycle_name = name
+        self._saved_snapshot = self._snapshot()
+        self.label_cycle_status.setText(f"Loaded '{name}'")
+        self._refresh_existing()
+        return True
 
     def _delete_selected_cycle(self):
         item = self.list_existing.currentItem()
         if item is None:
             return
         name = item.text()
-        if QMessageBox.question(self, "Delete cycle", f"Delete cycle '{name}'?") != QMessageBox.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "Delete cycle",
+                f"Delete the saved cycle '{name}'? This cannot be undone.\n\n"
+                "The steps in the editor will be kept as an unsaved cycle. "
+                "Acquisitions using this cycle will need another cycle selected.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            != QMessageBox.Yes
+        ):
             return
         try:
-            self.repo.delete_acquisition_cycle(name)
+            if not self.repo.delete_acquisition_cycle(name):
+                raise ValueError(f"Cycle '{name}' was not found.")
         except Exception as e:
             QMessageBox.warning(self, "Delete failed", str(e))
+            return
+        self._loaded_cycle_name = None
+        self.edit_name.clear()
+        # The retained draft must be saved under a new name before closing.
+        self._saved_snapshot = (1, [])
+        self.label_cycle_status.setText("Deleted saved cycle; draft kept")
         self._refresh_existing()
 
     @staticmethod
@@ -1687,13 +1778,55 @@ class CycleEditorDialog(QDialog):
             )
         return None
 
-    def _save_cycle(self):
+    def _save_cycle(self, *, confirm=True):
+        name = self._loaded_cycle_name
+        if not name or name not in self.repo.list_acquisition_cycles():
+            QMessageBox.warning(self, "Save cycle", "Select an existing cycle, or use Save As to create one.")
+            return False
+        if confirm and (
+            QMessageBox.question(
+                self,
+                "Save cycle changes",
+                f"Replace the saved steps and repeats for '{name}' with the current edits?",
+                QMessageBox.Save | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            != QMessageBox.Save
+        ):
+            return False
+        return self._write_cycle(name)
+
+    def _save_cycle_as(self):
+        from control.core.observation_state_service import acquisition_cycle_path
+
+        if not self.repo.current_profile:
+            QMessageBox.warning(self, "Save cycle", "Load a user profile before saving a cycle.")
+            return False
+        suggestion = f"{self._loaded_cycle_name} copy" if self._loaded_cycle_name else ""
+        while True:
+            name, ok = QInputDialog.getText(self, "Save Cycle As", "New cycle name:", text=suggestion)
+            if not ok:
+                return False
+            name = name.strip()
+            suggestion = name
+            try:
+                path = acquisition_cycle_path(self.repo, name)
+            except ValueError as e:
+                QMessageBox.warning(self, "Save cycle", str(e))
+                continue
+            if name in self.repo.list_acquisition_cycles() or path.exists():
+                QMessageBox.warning(
+                    self,
+                    "Cycle already exists",
+                    "That name is already in use. Choose another name, or select the existing "
+                    "cycle and use Save Changes to replace it.",
+                )
+                continue
+            return self._write_cycle(name)
+
+    def _build_cycle(self, name):
         from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, PostprocessSpec
 
-        name = self.edit_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Save cycle", "Enter a cycle name.")
-            return
         model = self._read_tree()
         items = []
         for entry in model:
@@ -1720,14 +1853,23 @@ class CycleEditorDialog(QDialog):
         if not items:
             QMessageBox.warning(self, "Save cycle", "Add at least one step.")
             return
-        cycle = AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+        return AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+
+    def _write_cycle(self, name):
         try:
+            cycle = self._build_cycle(name)
+            if cycle is None:
+                return False
             self.repo.save_acquisition_cycle(name, cycle)
         except Exception as e:
             QMessageBox.warning(self, "Save failed", str(e))
-            return
+            return False
+        self._loaded_cycle_name = name
+        self.edit_name.setText(name)
+        self._saved_snapshot = self._snapshot()
         self._refresh_existing()
-        QMessageBox.information(self, "Saved", f"Cycle '{name}' saved.")
+        self.label_cycle_status.setText(f"Saved '{name}'")
+        return True
 
 
 def _open_cycle_editor(widget) -> None:
