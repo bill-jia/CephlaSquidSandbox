@@ -26,6 +26,7 @@ import squid.abc
 import squid.logging
 from control.models.observation_state import ObservationState
 from control.core import utils_ome_tiff_writer as ome_tiff_writer
+from control.core.pipeline_diagnostics import WorkerDiagnostics, diagnostic_job, stage as diagnostic_stage
 from control.core.memory_profiler import (
     start_worker_monitoring,
     stop_worker_monitoring,
@@ -1303,7 +1304,8 @@ class FlushAndStageUploadJob:
         # Drain every outstanding TensorStore future tied to this writer. After
         # this returns, every shard file for this FOV is fully on disk and
         # safe to read for upload.
-        writer.wait_for_pending()
+        with diagnostic_stage("zarr_flush"):
+            writer.wait_for_pending()
 
         if not (self.upload_target and self.upload_target.enabled):
             return BarrierResult(
@@ -1390,12 +1392,13 @@ class FlushAndStageUploadJob:
                     }
                 )
             try:
-                UploadManagerClient().submit_batch(
-                    self.upload_target.manager_dataset_id,
-                    task_id,
-                    manager_files,
-                    task_id=task_id,
-                )
+                with diagnostic_stage("upload_submit"):
+                    UploadManagerClient().submit_batch(
+                        self.upload_target.manager_dataset_id,
+                        task_id,
+                        manager_files,
+                        task_id=task_id,
+                    )
             except Exception:
                 self._log.exception("Could not durably submit upload task %s", task_id)
                 return BarrierResult(
@@ -1604,7 +1607,8 @@ class PostprocessJob(Job):
 
         t_scan = info.time_point or 0
         try:
-            outputs = self._compute(acc["frames"])
+            with diagnostic_stage("reconstruction"):
+                outputs = self._compute(acc["frames"])
         except Exception as e:
             self._log.exception(f"Postprocess group {self.group_key} failed for t={t_scan} fov={info.fov}")
             return PostprocessResult(
@@ -1630,14 +1634,16 @@ class PostprocessJob(Job):
                 if arr is None:
                     raise ValueError(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
                 arr = self._coerce_output(arr, spec, acc["frames"])
-                written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
+                with diagnostic_stage("derived_write"):
+                    written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
                 barrier = self._maybe_barrier(out_key)
                 if barrier is not None:
                     barrier_results.append(barrier)
-                display_images[out_key] = self._prepare_display_image(arr)
-                display_images_last[out_key] = (
-                    self._prepare_display_image(arr, z_choice="last") if arr.ndim == 3 else display_images[out_key]
-                )
+                with diagnostic_stage("preview_prepare"):
+                    display_images[out_key] = self._prepare_display_image(arr)
+                    display_images_last[out_key] = (
+                        self._prepare_display_image(arr, z_choice="last") if arr.ndim == 3 else display_images[out_key]
+                    )
             except Exception as e:
                 # Return a keyed failure so the preview can settle this group;
                 # an unkeyed JobResult exception would leave it pending forever.
@@ -2262,8 +2268,18 @@ class JobRunner(multiprocessing.Process):
         self._bp_pending_jobs = bp_pending_jobs
         self._bp_pending_bytes = bp_pending_bytes
         self._bp_capacity_event = bp_capacity_event
+        self._pipeline_diagnostics = WorkerDiagnostics()
 
     def dispatch(self, job: Job):
+        with self._pipeline_diagnostics.dispatch_lock:
+            self._pipeline_diagnostics.dispatched(job)
+            try:
+                return self._dispatch(job)
+            except BaseException:
+                self._pipeline_diagnostics.rollback()
+                raise
+
+    def _dispatch(self, job: Job):
         # Inject acquisition_info into SaveOMETiffJob instances before serialization.
         # The job object is pickled when placed in the queue, so injection must happen here.
         if isinstance(job, SaveOMETiffJob):
@@ -2559,7 +2575,8 @@ class JobRunner(multiprocessing.Process):
                     set_worker_operation(job.__class__.__name__)
 
                 t_run_start = time.perf_counter()
-                result = job.run()
+                with diagnostic_job(self._pipeline_diagnostics, job):
+                    result = job.run()
                 t_run_end = time.perf_counter()
 
                 # Accumulating jobs legitimately produce no output until their
@@ -2648,7 +2665,8 @@ class JobRunner(multiprocessing.Process):
         # Finalize any zarr writers that are still open
         t_finalize_start = time.perf_counter()
         try:
-            success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
+            with self._pipeline_diagnostics.stage("finalize"):
+                success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:
@@ -2659,7 +2677,9 @@ class JobRunner(multiprocessing.Process):
         # abort/shutdown, so an aborted acquisition still leaves readable
         # positions/timestamps instead of a bare pre-allocated stack.
         try:
-            if not SaveOMETiffJob.finalize_all_writers():
+            with self._pipeline_diagnostics.stage("finalize"):
+                success = SaveOMETiffJob.finalize_all_writers()
+            if not success:
                 self._log.error("OME-TIFF FINALIZATION INCOMPLETE - Some metadata may be missing")
         except Exception as e:
             self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}")

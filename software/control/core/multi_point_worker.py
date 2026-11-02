@@ -2193,36 +2193,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 except Exception as e:
                     self._log.warning(f"Failed to send Slack acquisition start notification: {e}")
 
-            # Pre-acquisition laser-AF seed scan. Populates `_fov_z_map` so later
-            # timepoints use the table-and-anchor path in perform_autofocus rather
-            # than a full laser AF at every FOV. Lazy mode skips this and seeds
-            # on first visit during normal acquisition instead.
-            if (
-                self.do_reflection_af
-                and self._laser_af_seed_mode == "scan"
-                and self.laser_auto_focus_controller is not None
-            ):
-                # Suppress laser-AF sub-timers (af:*) during the one-time seed
-                # scan so they reflect only per-FOV acquisition costs. The outer
-                # laser_af_seed_scan bucket still captures the full seed-scan
-                # wall time for a complete breakdown. Matches the
-                # obs_controller._timing=None pattern used by prewarm.
-                saved_af_timing = self.laser_auto_focus_controller._timing
-                self.laser_auto_focus_controller._timing = None
-                try:
-                    with self._timing.get_timer("laser_af_seed_scan"):
-                        self._seed_fov_z_map()
-                finally:
-                    self.laser_auto_focus_controller._timing = saved_af_timing
-
-            if (
-                self.do_reflection_af
-                and self._laser_af_refresh_every_n_fovs == 1
-                and self.laser_auto_focus_controller is not None
-            ):
-                with self._timing.get_timer("laser_af_entry_initialization"):
-                    self._initialize_legacy_region_entries()
-
             ordered_run = (
                 self._explicit_acquisition_order and not self.validation_mode
                 and (self.acquisition_order != DEFAULT_ORDER or self.snake_observation_states)
@@ -2414,6 +2384,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             )
 
     def _finish_jobs(self, timeout_s=10):
+        self._report_pipeline_health("capture_finished")
         # Drain and summarize all currently available job results before waiting for completion
         self._summarize_runner_outputs(drain_all=True)
 
@@ -2520,6 +2491,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         def _announce_writeback_complete(threads):
             for th in threads:
                 th.join()
+            self._report_pipeline_health("writers_stopped")
             writers_stopped_event.set()
             # All raw/derived writers must finish before taking a plate-wide
             # snapshot. Publish it before either upload path resyncs metadata
@@ -4052,6 +4024,11 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         if ordered_visit is not None:
             self._ordered_prewarmed = True
 
+        # Focus preparation is once per run and last, after both warmups.
+        self._initialize_acquisition_focus_once()
+        if self.abort_requested_fn():
+            return
+
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
@@ -4554,6 +4531,28 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self.callbacks.signal_current_configuration(config)
         self.liveController.obs_controller.apply_full_observation_state(config)
         self.wait_till_operation_is_completed()
+
+    def _initialize_acquisition_focus_once(self):
+        """Run focus preparation after warmups, immediately before the FOV loop."""
+        if getattr(self, "_acquisition_focus_initialized", False) or self.abort_requested_fn():
+            return
+        if self.do_reflection_af and self.laser_auto_focus_controller is not None:
+            # Preset warmup can change illumination. AF needs a clean reflection.
+            self.liveController.obs_controller.turn_off_illumination()
+            af = self.laser_auto_focus_controller
+            saved_timing = af._timing
+            af._timing = None
+            try:
+                if self._laser_af_refresh_every_n_fovs == 1:
+                    with self._timing.get_timer("laser_af_entry_initialization"):
+                        self._initialize_legacy_region_entries()
+                elif self._laser_af_seed_mode == "scan":
+                    with self._timing.get_timer("laser_af_seed_scan"):
+                        self._seed_fov_z_map()
+            finally:
+                af._timing = saved_timing
+        if not self.abort_requested_fn():
+            self._acquisition_focus_initialized = True
 
     def _initialize_legacy_region_entries(self):
         """Establish entry Z once, walking from each focused center to its first tile.
@@ -5577,14 +5576,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self.request_abort_fn()
                 return
 
+        self._report_pipeline_health()
         # Backpressure check AFTER previous frame dispatched, BEFORE next trigger
         # This is when we know the previous image's jobs have been dispatched (and counters incremented)
         if self._backpressure.should_throttle():
+            self._report_pipeline_health("throttle")
             with self._timing.get_timer("backpressure.wait_for_capacity"):
                 got_capacity = self._backpressure.wait_for_capacity()
+                self._report_pipeline_health("throttle_released" if got_capacity else "throttle_timeout")
                 if not got_capacity:
                     self._log.error(
-                        f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
+                        f"Backpressure timeout - processing/writing cannot keep up. Stats: {self._backpressure.get_stats()}"
                     )
 
         # The prior-frame `_ready_for_next_trigger.wait` above already guarantees
@@ -5812,6 +5814,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self.microcontroller.enable_joystick(True)
 
         self._wait_for_outstanding_callback_images()
+
+    def _report_pipeline_health(self, reason="periodic"):
+        # Observations must never interrupt capture or change throttle decisions.
+        try:
+            from control.core.pipeline_diagnostics import PipelineReporter
+            reporter = getattr(self, "_pipeline_reporter", None)
+            if reporter is None:
+                reporter = self._pipeline_reporter = PipelineReporter(self._log, str(self.experiment_path))
+            reporter.report(self._job_runners, reason)
+        except Exception:
+            self._log.exception("[PIPELINE] Could not report worker diagnostics")
 
     def move_z_for_stack(self, steps=1):
         if self.use_piezo:

@@ -29,6 +29,7 @@ from control.core.zarr_upload import (
     verify_manifest_copy,
 )
 import squid.logging
+from control.core.pipeline_diagnostics import DetailWriter, elapsed
 
 
 PROTOCOL_VERSION = 1
@@ -95,6 +96,7 @@ class TransferResult:
     error: Optional[str]
     transferred_bytes: int
     elapsed_s: float
+    timings: dict = field(default_factory=dict)
 
 
 def _transfer_process(payload: dict, result_queue: multiprocessing.Queue) -> None:
@@ -104,6 +106,7 @@ def _transfer_process(payload: dict, result_queue: multiprocessing.Queue) -> Non
     started = time.monotonic()
     rate_limit = float(payload.get("rate_limit_bps") or 0)
     moved = 0
+    timings = {}
 
     def throttle(chunk_bytes: int) -> None:
         nonlocal moved
@@ -112,17 +115,20 @@ def _transfer_process(payload: dict, result_queue: multiprocessing.Queue) -> Non
         moved += chunk_bytes
         delay = moved / rate_limit - (time.monotonic() - started)
         if delay > 0:
-            time.sleep(delay)
+            with elapsed(timings, "rate_limit_sleep"):
+                time.sleep(delay)
 
     log = squid.logging.get_logger("UploadManagerTransfer")
     historical = payload.get("historical_checksum")
     historical_size = payload.get("historical_size")
-    if historical and historical_size is not None and verify_manifest_copy(
-        {"sha256": historical, "bytes": historical_size},
-        payload["local_path"],
-        payload["remote_path"],
-        throttle,
-    ):
+    verified_history = False
+    if historical and historical_size is not None:
+        with elapsed(timings, "historical_verification"):
+            verified_history = verify_manifest_copy(
+                {"sha256": historical, "bytes": historical_size},
+                payload["local_path"], payload["remote_path"], throttle,
+            )
+    if verified_history:
         ok, digest, size, error, transferred = True, historical, historical_size, None, 0
     else:
         ok, digest, size, error = upload_one_file(
@@ -131,6 +137,7 @@ def _transfer_process(payload: dict, result_queue: multiprocessing.Queue) -> Non
             log=log,
             stable_read=bool(payload["stable_read"]),
             heartbeat=throttle,
+            timings=timings,
         )
         transferred = int(size or 0) if ok else 0
     result_queue.put(
@@ -143,6 +150,7 @@ def _transfer_process(payload: dict, result_queue: multiprocessing.Queue) -> Non
                 error=error,
                 transferred_bytes=transferred,
                 elapsed_s=time.monotonic() - started,
+                timings=timings,
             )
         )
     )
@@ -402,6 +410,30 @@ class UploadStore:
                     ("draining" if d["sealed"] else "receiving", item),
                 )
             return cur.rowcount
+
+    def diagnostic_backlog(self) -> dict:
+        """Read local inventory only; no remote probing or queue state changes."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT d.id AS dataset_id, d.state AS dataset_state, f.state AS file_state,
+                          COUNT(*) AS files, SUM(f.size) AS bytes,
+                          SUM(CASE WHEN f.state='pending' AND f.retry_after_epoch<=?
+                                   AND d.state NOT IN ('paused','complete','needs_attention')
+                                   THEN 1 ELSE 0 END) AS ready_files,
+                          SUM(CASE WHEN f.state='pending' AND f.retry_after_epoch>?
+                                   THEN 1 ELSE 0 END) AS retry_wait_files
+                   FROM files f JOIN datasets d ON d.id=f.dataset_id
+                   WHERE f.state IN ('pending','uploading','failed','delete_pending')
+                      OR (f.state='verified' AND f.deletable=1 AND d.delete_after_verify=1)
+                   GROUP BY d.id, d.state, f.state""",
+                (time.time(), time.time()),
+            ).fetchall()
+        rows = [dict(row) for row in rows]
+        pending = [row for row in rows if row["file_state"] == "pending"]
+        return dict(pending_files=sum(row["files"] for row in pending),
+                    pending_bytes=sum(row["bytes"] for row in pending),
+                    ready_files=sum(row["ready_files"] for row in rows),
+                    retry_wait_files=sum(row["retry_wait_files"] for row in rows), groups=rows)
 
     def claim_next(self, excluded_datasets: Sequence[str] = ()) -> Optional[dict]:
         """Fairly claim one file, rotating by the dataset's last event time."""
@@ -766,6 +798,11 @@ class UploadManagerEngine:
         self._results = self._ctx.Queue()
         self._active: Dict[int, multiprocessing.Process] = {}
         self._log = squid.logging.get_logger("UploadManager")
+        self._diagnostic_writer = None
+        self._transfer_started = {}
+        self._diagnostic_last = time.monotonic()
+        self._diagnostic_totals = dict(completed=0, failed=0, verified_bytes=0, deleted_bytes=0)
+        self._diagnostic_stages = {}
 
     def tick(self) -> None:
         self._collect_results()
@@ -777,6 +814,7 @@ class UploadManagerEngine:
             if self.rate_limit_bps:
                 item["rate_limit_bps"] = self.rate_limit_bps / self.max_lanes
             process = self._ctx.Process(target=_transfer_process, args=(item, self._results), daemon=True)
+            self._transfer_started[int(item["id"])] = time.monotonic()
             process.start()
             self._active[int(item["id"])] = process
             self._log.info(
@@ -784,6 +822,7 @@ class UploadManagerEngine:
                 item["id"], item["dataset_id"], item["local_path"], item["remote_path"],
             )
         self._delete_verified_files()
+        self._report_diagnostics()
 
     def stop(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
@@ -795,7 +834,9 @@ class UploadManagerEngine:
                 process.terminate()
             process.join(timeout=1)
         self._active.clear()
+        self._transfer_started.clear()
         self.store.recover_interrupted_work()
+        self._report_diagnostics(force=True)
         try:
             self._results.close()
             self._results.cancel_join_thread()
@@ -809,6 +850,9 @@ class UploadManagerEngine:
             except queue.Empty:
                 return
             result = TransferResult(**raw)
+            collected_at = time.monotonic()
+            launched_at = self._transfer_started.pop(result.file_id, None)
+            observed_s = collected_at - launched_at if launched_at is not None else None
             process = self._active.pop(result.file_id, None)
             if process is not None:
                 process.join(timeout=1)
@@ -826,6 +870,13 @@ class UploadManagerEngine:
                     },
                 )
             self.store.record_transfer(result)
+            self._record_diagnostics(dict(kind="transfer", file_id=result.file_id, dataset_id=row["dataset_id"],
+                                          path=row["relative_path"], ok=result.ok, error=result.error,
+                                          verified_bytes=result.size if result.ok else 0,
+                                          copied_bytes=result.transferred_bytes, worker_elapsed_s=result.elapsed_s,
+                                          observed_elapsed_s=observed_s,
+                                          outside_worker_s=max(0, observed_s-result.elapsed_s) if observed_s is not None else None,
+                                          result_bookkeeping_s=time.monotonic()-collected_at, stages=result.timings))
             if result.ok:
                 self._log.info(
                     "Verified file_id=%s bytes=%s transferred_bytes=%s path=%s",
@@ -848,14 +899,18 @@ class UploadManagerEngine:
                 continue
             process.join(timeout=0)
             self._active.pop(file_id, None)
+            self._transfer_started.pop(file_id, None)
             self._log.error("Transfer process exited unexpectedly for file_id=%s", file_id)
             self.store.record_transfer(TransferResult(file_id, False, None, None, "transfer process exited", 0, 0.0))
+            self._record_diagnostics(dict(kind="transfer", file_id=file_id, ok=False,
+                                          error="transfer process exited", verified_bytes=0, stages={}))
 
     def _delete_verified_files(self) -> None:
         for item in self.store.eligible_deletions():
             if not self.store.begin_delete(item["id"]):
                 continue
             error = None
+            delete_started = time.monotonic()
             try:
                 # The exact destination is immutable in the dataset record.  A
                 # mismatched destination can therefore never authorize this unlink.
@@ -867,6 +922,9 @@ class UploadManagerEngine:
             except OSError as exc:
                 error = str(exc)
             self.store.finish_delete(item["id"], error)
+            self._record_diagnostics(dict(kind="delete", file_id=item["id"], dataset_id=item["dataset_id"],
+                                          ok=error is None, error=error, bytes=item["size"],
+                                          elapsed_s=time.monotonic()-delete_started))
             if error:
                 self._log.error(
                     "Delete failed file_id=%s path=%s error=%s",
@@ -877,6 +935,61 @@ class UploadManagerEngine:
                     "Deleted verified local file file_id=%s path=%s",
                     item["id"], item["local_path"],
                 )
+
+
+    def _record_diagnostics(self, record):
+        try:
+            if self._diagnostic_writer is None:
+                self._diagnostic_writer = DetailWriter("uploads", self._log, self.store.path.parent)
+            self._diagnostic_writer.write(record)
+            if record["kind"] == "transfer":
+                self._diagnostic_totals["completed"] += 1
+                self._diagnostic_totals["failed"] += int(not record["ok"])
+                self._diagnostic_totals["verified_bytes"] += record.get("verified_bytes") or 0
+                for name, row in record["stages"].items():
+                    self._diagnostic_stages[name] = self._diagnostic_stages.get(name, 0) + row["total_s"]
+                for name in ("outside_worker_s", "result_bookkeeping_s"):
+                    self._diagnostic_stages[name] = self._diagnostic_stages.get(name, 0) + (record.get(name) or 0)
+            elif record["ok"]:
+                self._diagnostic_totals["deleted_bytes"] += record["bytes"]
+            if record["kind"] == "delete":
+                self._diagnostic_stages["delete_and_bookkeeping"] = (
+                    self._diagnostic_stages.get("delete_and_bookkeeping", 0) + record["elapsed_s"]
+                )
+        except Exception:
+            self._log.exception("[PIPELINE] Upload diagnostic recording failed")
+
+    def _report_diagnostics(self, force=False):
+        now = time.monotonic()
+        if not force and now-self._diagnostic_last < 60:
+            return
+        try:
+            totals = self._diagnostic_totals
+            window = now-self._diagnostic_last
+            backlog = self.store.diagnostic_backlog()
+            record = dict(kind="upload_summary", window_s=window, totals=totals.copy(),
+                          backlog=backlog,
+                          stage_total_s=self._diagnostic_stages.copy(), active=len(self._active),
+                          max_lanes=self.max_lanes, rate_limit_bps=self.rate_limit_bps,
+                          oldest_active_s=max((now-t for t in self._transfer_started.values()), default=0))
+            if self._diagnostic_writer is None:
+                self._diagnostic_writer = DetailWriter("uploads", self._log, self.store.path.parent)
+            self._diagnostic_writer.write(record)
+            slowest = max(self._diagnostic_stages, key=self._diagnostic_stages.get, default="none")
+            self._log.info("[PIPELINE] Uploads: %d finished (%d failed), %.1f MB verified (%.2f MB/s), "
+                           "%.1f MB deleted; active=%d/%d, oldest active=%.1fs; pending=%d/%.1f MB "
+                           "(ready=%d, retry wait=%d); largest stage=%s %.2fs",
+                           totals["completed"], totals["failed"], totals["verified_bytes"]/1e6,
+                           totals["verified_bytes"]/1e6/max(window, 0.001), totals["deleted_bytes"]/1e6,
+                           len(self._active), self.max_lanes, record["oldest_active_s"],
+                           backlog["pending_files"], backlog["pending_bytes"]/1e6,
+                           backlog["ready_files"], backlog["retry_wait_files"],
+                           slowest, self._diagnostic_stages.get(slowest, 0))
+            self._diagnostic_totals = dict(completed=0, failed=0, verified_bytes=0, deleted_bytes=0)
+            self._diagnostic_stages = {}
+            self._diagnostic_last = now
+        except Exception:
+            self._log.exception("[PIPELINE] Upload diagnostic summary failed")
 
 
 class ManagerInstanceLock:

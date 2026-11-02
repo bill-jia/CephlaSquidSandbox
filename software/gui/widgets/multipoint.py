@@ -5140,7 +5140,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             return None
 
     def export_location_list(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Export Location List", "", "CSV Files (*.csv);;All Files (*)")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Location List", self.microscope.config_repo.default_saving_path(),
+            "CSV Files (*.csv);;All Files (*)",
+        )
         if file_path:
             # Export from the widget's durable store, not scanCoordinates: the latter
             # is empty whenever the regions have been cleared but not yet rebuilt.
@@ -5189,7 +5192,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                 error_dialog(f"Positions were saved, but laser AF references could not be saved: {e}")
 
     def import_location_list(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Import Location List", "", "CSV Files (*.csv);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Location List", self.microscope.config_repo.default_saving_path(),
+            "CSV Files (*.csv);;All Files (*)",
+        )
         if file_path:
             try:
                 # IDs are names: preserve leading zeros and names such as "NA".

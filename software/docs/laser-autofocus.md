@@ -235,3 +235,9 @@ still receives live AF; successful measurements update that tile's positioning
 estimate independently of fast-mode spatial offsets. Unvisited intra-region tiles
 start from the preceding corrected Z. Estimates are scoped to this acquisition
 worker, so a new acquisition initializes again. Fast mode is unchanged.
+
+Both legacy entry initialization and fast-mode seed scanning run once, after
+observation-state and postprocessing warmups, immediately before the first
+position loop. Imaging illumination is turned off before this pass. Initialization
+is included in the first timepoint's elapsed duration and can therefore consume
+its requested time interval. Per-tile runtime AF remains unchanged.

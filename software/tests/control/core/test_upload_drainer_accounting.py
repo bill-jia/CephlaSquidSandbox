@@ -470,6 +470,7 @@ def test_consolidation_precedes_completion_and_final_upload(tmp_path, monkeypatc
         callbacks=SimpleNamespace(signal_data_writing_complete=complete),
         abort_requested_fn=lambda: False,
         _summarize_runner_outputs=lambda **kwargs: None,
+        _report_pipeline_health=Mock(),
         _spawn_background_upload_drainer=spawn_drainer,
         _backpressure=SimpleNamespace(close=lambda: None),
     )

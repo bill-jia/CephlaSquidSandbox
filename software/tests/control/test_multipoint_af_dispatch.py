@@ -89,3 +89,25 @@ def test_legacy_entry_walk_uses_actual_first_tile_and_carries_focus(first):
     with pytest.raises(RuntimeError, match="verify center"):
         worker._initialize_legacy_region_entries()
     assert not worker._z_pos_proposal
+
+
+@pytest.mark.parametrize("cadence,seed,expected", [(1, "lazy", "entry"), (10, "scan", "scan"), (10, "lazy", None)])
+def test_focus_preparation_runs_once_and_restores_timing(cadence, seed, expected):
+    from contextlib import nullcontext
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker.abort_requested_fn = lambda: False
+    worker.do_reflection_af = True
+    marker = object()
+    worker.laser_auto_focus_controller = SimpleNamespace(_timing=marker)
+    worker.liveController = SimpleNamespace(obs_controller=SimpleNamespace(turn_off_illumination=MagicMock()))
+    worker._timing = SimpleNamespace(get_timer=lambda name: nullcontext())
+    worker._laser_af_refresh_every_n_fovs = cadence
+    worker._laser_af_seed_mode = seed
+    worker._initialize_legacy_region_entries = MagicMock()
+    worker._seed_fov_z_map = MagicMock()
+    worker._initialize_acquisition_focus_once()
+    worker._initialize_acquisition_focus_once()
+    assert worker._initialize_legacy_region_entries.call_count == (expected == "entry")
+    assert worker._seed_fov_z_map.call_count == (expected == "scan")
+    assert worker.laser_auto_focus_controller._timing is marker
+    worker.liveController.obs_controller.turn_off_illumination.assert_called_once()
