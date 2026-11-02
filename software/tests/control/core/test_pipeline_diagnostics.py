@@ -194,11 +194,11 @@ def test_upload_detail_summary_and_blocked_backlog(tmp_path):
     store.submit_batch("test", "batch", [SubmittedFile(name, 7, deletable=True) for name in ("first", "retry", "ready")])
     engine = UploadManagerEngine(store)
     # Execute the same child entry point synchronously with a local result queue.
-    engine._results.close()
-    engine._results = queue.Queue()
+    results = queue.Queue()
+    engine._worker_results[Mock(exitcode=None)] = results
     try:
         item = store.claim_next()
-        _transfer_process(item, engine._results)
+        _transfer_process(item, results)
         engine._collect_results()
         engine._delete_verified_files()
         with store._db:

@@ -160,6 +160,22 @@ class DatasetOwnershipError(RuntimeError):
     pass
 
 
+def _transfer_worker(input_queue, result_queue) -> None:
+    """Keep the interpreter warm across files, with one in-flight file per lane."""
+    while True:
+        payload = input_queue.get()
+        if payload is None:
+            return
+        try:
+            _transfer_process(payload, result_queue)
+        except Exception as exc:
+            # Unexpected file-specific errors must not silently strand a claim.
+            result_queue.put(asdict(TransferResult(
+                int(payload["id"]), False, None, None,
+                f"{type(exc).__name__}: {exc}", 0, 0.0,
+            )))
+
+
 class UploadStore:
     """The manager's single-writer durable inventory.
 
@@ -795,8 +811,11 @@ class UploadManagerEngine:
         self.max_lanes = max(1, int(max_lanes))
         self.rate_limit_bps = max(0.0, float(rate_limit_bps))
         self._ctx = multiprocessing.get_context("spawn")
-        self._results = self._ctx.Queue()
         self._active: Dict[int, multiprocessing.Process] = {}
+        self._workers = {}  # process -> input queue; idle processes remain alive
+        self._worker_results = {}  # isolate IPC if a blocked lane must be killed
+        self._stopping = False
+        self._stopped = False
         self._log = squid.logging.get_logger("UploadManager")
         self._diagnostic_writer = None
         self._transfer_started = {}
@@ -805,18 +824,34 @@ class UploadManagerEngine:
         self._diagnostic_stages = {}
 
     def tick(self) -> None:
+        if self._stopped:
+            return
         self._collect_results()
         self._reconcile_dead_processes()
-        while len(self._active) < self.max_lanes:
+        while not self._stopping and len(self._active) < self.max_lanes:
+            process = next((p for p in self._workers if p not in self._active.values()), None)
+            if process is None:
+                inputs = self._ctx.Queue()
+                results = self._ctx.Queue()
+                process = self._ctx.Process(target=_transfer_worker, args=(inputs, results), daemon=True)
+                try:
+                    process.start()
+                except Exception:
+                    inputs.close()
+                    inputs.cancel_join_thread()
+                    results.close()
+                    results.cancel_join_thread()
+                    raise
+                self._workers[process] = inputs
+                self._worker_results[process] = results
             item = self.store.claim_next()
             if item is None:
                 break
             if self.rate_limit_bps:
                 item["rate_limit_bps"] = self.rate_limit_bps / self.max_lanes
-            process = self._ctx.Process(target=_transfer_process, args=(item, self._results), daemon=True)
             self._transfer_started[int(item["id"])] = time.monotonic()
-            process.start()
             self._active[int(item["id"])] = process
+            self._workers[process].put(item)
             self._log.info(
                 "Started transfer file_id=%s dataset=%s %s -> %s",
                 item["id"], item["dataset_id"], item["local_path"], item["remote_path"],
@@ -825,37 +860,60 @@ class UploadManagerEngine:
         self._report_diagnostics()
 
     def stop(self, timeout: float = 5.0) -> None:
+        if self._stopped:
+            return
+        self._stopping = True
         deadline = time.monotonic() + timeout
         while self._active and time.monotonic() < deadline:
             self.tick()
             time.sleep(0.05)
-        for process in self._active.values():
+        # Stop accepting new files; let idle workers exit and bound the wait for
+        # any lane blocked in SMB. Unfinished claims are recovered below.
+        for inputs in self._workers.values():
+            inputs.put(None)
+        for process in self._workers:
+            process.join(timeout=max(0, deadline - time.monotonic()))
             if process.is_alive():
                 process.terminate()
             process.join(timeout=1)
+        self._collect_results()
+        for channel in (*self._workers.values(), *self._worker_results.values()):
+            channel.close()
+            channel.cancel_join_thread()
+        self._workers.clear()
+        self._worker_results.clear()
         self._active.clear()
         self._transfer_started.clear()
         self.store.recover_interrupted_work()
         self._report_diagnostics(force=True)
-        try:
-            self._results.close()
-            self._results.cancel_join_thread()
-        except (OSError, ValueError):
-            pass
+        self._stopped = True
+
+    def _next_result(self):
+        # A killed process can leave a partial queue message behind. Discard
+        # that lane's channel and retry its durable claim instead of reading a
+        # potentially corrupt pipe or affecting the other lanes.
+        channels = [
+            channel for process, channel in self._worker_results.items()
+            if process.exitcode in (None, 0)
+        ]
+        for channel in channels:
+            try:
+                return channel.get_nowait()
+            except queue.Empty:
+                continue
+        raise queue.Empty
 
     def _collect_results(self) -> None:
         while True:
             try:
-                raw = self._results.get_nowait()
+                raw = self._next_result()
             except queue.Empty:
                 return
             result = TransferResult(**raw)
             collected_at = time.monotonic()
             launched_at = self._transfer_started.pop(result.file_id, None)
             observed_s = collected_at - launched_at if launched_at is not None else None
-            process = self._active.pop(result.file_id, None)
-            if process is not None:
-                process.join(timeout=1)
+            self._active.pop(result.file_id, None)
             row = self.store.file_row(result.file_id)
             if result.ok:
                 dataset = self.store.dataset_status(row["dataset_id"])
@@ -889,15 +947,21 @@ class UploadManagerEngine:
                 )
 
     def _reconcile_dead_processes(self) -> None:
-        for file_id, process in list(self._active.items()):
+        for process, inputs in list(self._workers.items()):
             if process.is_alive() or process.exitcode is None:
                 continue
-            # A clean child always enqueues a result before returning.  The
-            # queue feeder can publish it just after the process exits, so let
-            # the next tick collect it instead of creating a false failure.
-            if process.exitcode == 0:
-                continue
             process.join(timeout=0)
+            # A normally exiting process flushes its result feeder before exit.
+            self._collect_results()
+            del self._workers[process]
+            inputs.close()
+            inputs.cancel_join_thread()
+            results = self._worker_results.pop(process)
+            results.close()
+            results.cancel_join_thread()
+            file_id = next((fid for fid, p in self._active.items() if p is process), None)
+            if file_id is None:
+                continue
             self._active.pop(file_id, None)
             self._transfer_started.pop(file_id, None)
             self._log.error("Transfer process exited unexpectedly for file_id=%s", file_id)

@@ -222,11 +222,19 @@ def main(argv=None) -> int:
     def update_manager():
         try:
             engine.tick()
-            window.refresh()
         except Exception:
             log.exception("Upload Manager update failed")
 
-    timer = QTimer(); timer.timeout.connect(update_manager); timer.start(1000)
+    def refresh_window():
+        try:
+            window.refresh()
+        except Exception:
+            log.exception("Upload Manager window refresh failed")
+
+    # Refill persistent transfer lanes promptly, independently of the slower
+    # status display. No new Python process is needed for each file.
+    timer = QTimer(); timer.timeout.connect(update_manager); timer.start(20)
+    display_timer = QTimer(); display_timer.timeout.connect(refresh_window); display_timer.start(1000)
     window.refresh()
     if not args.hidden: window.show()
     log.info("Upload Manager ready for acquisition requests")
@@ -234,6 +242,7 @@ def main(argv=None) -> int:
         return app.exec_()
     finally:
         log.info("Upload Manager stopping")
+        timer.stop(); display_timer.stop()
         server.close(); engine.stop(); store.close(); lock.release()
         if log_handler is not None:
             squid.logging.remove_handler(log_handler)

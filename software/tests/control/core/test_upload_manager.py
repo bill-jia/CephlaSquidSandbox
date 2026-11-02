@@ -198,3 +198,93 @@ def test_restart_repairs_completed_database_from_first_manager_release(tmp_path)
     assert status["state"] == "draining"
     assert status["file_count"] == 1
     assert repaired.claim_next()["deletable"] == 1
+
+
+@pytest.mark.parametrize("max_lanes", [1, 2])
+def test_persistent_lane_reuses_process_across_batches(tmp_path, max_lanes):
+    store = make_store(tmp_path)
+    local, remote = register(store, tmp_path)
+    engine = UploadManagerEngine(store, max_lanes=max_lanes)
+    workers = None
+    try:
+        for batch in range(3):
+            names = [f"batch-{batch}-{i}.bin" for i in range(4)]
+            for name in names:
+                (local / name).write_bytes(name.encode())
+            store.submit_batch("dataset", str(batch), [SubmittedFile(n, len(n), deletable=True) for n in names])
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                engine.tick()
+                assert len(engine._workers) == max_lanes
+                current = set(engine._workers)
+                if workers is None:
+                    workers = current
+                assert current == workers and all(p.is_alive() for p in current)
+                assert len(engine._active) <= max_lanes
+                if all(not (local / n).exists() for n in names):
+                    break
+                time.sleep(0.02)
+            for name in names:
+                assert (remote / name).read_bytes() == name.encode()
+                assert not (local / name).exists()
+            assert not engine._active
+        store.seal_dataset("dataset")
+        assert store.dataset_status("dataset")["state"] == "complete"
+    finally:
+        engine.stop()
+        store.close()
+    assert all(not p.is_alive() for p in workers)
+
+
+def test_dead_persistent_lane_is_replaced_and_claim_is_recoverable(tmp_path):
+    store = make_store(tmp_path)
+    local, remote = register(store, tmp_path)
+    engine = UploadManagerEngine(store, max_lanes=1)
+    try:
+        # Start a lane, then kill it before its first transfer can complete.
+        (local / "first.bin").write_bytes(b"first")
+        store.submit_batch("dataset", "first", [SubmittedFile("first.bin", 5, deletable=True)])
+        engine.tick()
+        victim = next(iter(engine._workers))
+        victim.terminate()
+        victim.join(5)
+        engine.tick()
+        assert victim not in engine._workers
+        assert (local / "first.bin").exists()
+        assert store.file_row(1)["state"] in ("pending", "failed")
+        assert len(engine._workers) == 1
+        # Permit the normal retry immediately, then verify the replacement lane.
+        with store._db:
+            store._db.execute("UPDATE files SET state='pending',retry_after_epoch=0 WHERE id=1")
+        deadline = time.monotonic() + 15
+        while (local / "first.bin").exists() and time.monotonic() < deadline:
+            engine.tick()
+            time.sleep(0.02)
+        assert (remote / "first.bin").read_bytes() == b"first"
+        assert not (local / "first.bin").exists()
+    finally:
+        engine.stop()
+        store.close()
+
+
+def test_stop_does_not_claim_more_files_and_requeues_interrupted_transfer(tmp_path):
+    store = make_store(tmp_path)
+    local, _ = register(store, tmp_path)
+    for name in ("first.bin", "second.bin"):
+        (local / name).write_bytes(b"content")
+    store.submit_batch("dataset", "batch", [SubmittedFile(n, 7, deletable=True) for n in ("first.bin", "second.bin")])
+    engine = UploadManagerEngine(store, max_lanes=1)
+    try:
+        engine.tick()
+        workers = list(engine._workers)
+        engine.stop(timeout=0)
+        assert all(not p.is_alive() for p in workers)
+        assert store.file_row(1)["state"] == "pending"
+        assert store.file_row(2)["state"] == "pending"
+        assert store.file_row(2)["attempts"] == 0
+        assert (local / "first.bin").exists()
+        assert (local / "second.bin").exists()
+        engine.tick()
+        assert not engine._workers
+    finally:
+        store.close()
