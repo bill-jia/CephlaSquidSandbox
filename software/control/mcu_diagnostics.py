@@ -177,6 +177,7 @@ class MCUDiagnostics:
         self._health_max_backlog = 0
         self._health_fw_maxima = {}
         self._pending_command = None
+        self._stall_gaps = deque(maxlen=32)
 
     def event(self, kind, **fields):
         now = time.monotonic()
@@ -208,7 +209,9 @@ class MCUDiagnostics:
             self.max_reader_gap_s = max(self.max_reader_gap_s, gap)
             self._health_max_reader_gap = max(self._health_max_reader_gap, gap)
             if gap > 0.1:
-                self.events.append(dict(t=now, kind="reader_gap", seconds=gap, previous_phase=self.reader_phase))
+                event = dict(t=now, kind="reader_gap", seconds=gap, previous_phase=self.reader_phase)
+                self.events.append(event)
+                self._stall_gaps.append(event)
                 self.counts["reader_gap"] += 1
             self.reader_tick = now
             self.reader_phase = phase
@@ -227,6 +230,8 @@ class MCUDiagnostics:
             self.max_rx_gap_s = max(self.max_rx_gap_s, gap or 0)
             if gap is not None:
                 self._health_rx_gaps.observe(gap)
+                if gap > 0.1:
+                    self._stall_gaps.append(dict(t=now, kind="rx_gap", seconds=gap))
             self.counts["rx"] += 1
             if not crc_valid:
                 self.counts["legacy_zero_crc_accepted"] += 1
@@ -261,6 +266,29 @@ class MCUDiagnostics:
             maxima["max_status_gap_ms"] = max(maxima["max_status_gap_ms"], result["max_status_gap_ms_saturated"])
             self.counts["telemetry"] += 1
             return result if self.counts["telemetry"] == 1 else None
+
+    def stall_evidence(self, threshold_s, after):
+        """Cheap cached observations, without resetting minute aggregates.
+
+        Completed gaps let the monitor observe a stall even if it could not run
+        until the reader recovered. Such stacks describe recovery, not the past.
+        """
+        now = time.monotonic()
+        with self._lock:
+            phase_age = now - self.reader_tick
+            rx_age = now - (self.last_rx if self.last_rx is not None else self.started)
+            gaps = [gap for gap in self._stall_gaps if gap["t"] > after and gap["seconds"] >= threshold_s]
+            ongoing = phase_age >= threshold_s or rx_age >= threshold_s
+            if not ongoing and not gaps:
+                return None
+            return {
+                "observed_monotonic_s": now, "threshold_s": threshold_s,
+                "ongoing_at_observation": ongoing,
+                "reader_phase": self.reader_phase, "reader_phase_age_s": phase_age,
+                "last_rx_age_s": None if self.last_rx is None else rx_age,
+                "no_rx_since_start_s": rx_age if self.last_rx is None else None,
+                "last_buffer_bytes": self.backlog, "recent_gaps": gaps,
+            }
 
     def health_summary(self):
         """Take/reset minute aggregates; preserve the flight-recorder histories.

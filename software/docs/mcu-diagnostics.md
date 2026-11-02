@@ -12,6 +12,13 @@ A separate monitor also writes a plain-language INFO-level `[MCU-HEALTH]` summar
 60 seconds and on normal controller close. The existing timeout and retry policy
 is unchanged.
 
+The client reads available serial data in batches, then parses every status
+packet in wire order. It retains partial packets across reads and preserves
+CRC resynchronization, legacy zero-CRC compatibility, command completion and
+the existing serial-overflow reset policy. This reduces OS read/query overhead;
+it does not establish the cause of the original timeout. Buffer observations
+can now include bytes already read into the client's bounded parsing buffer.
+
 At startup the log confirms that the recorder is enabled and reports the serial
 port and major/minor firmware version. With 1.5.1, expect a second INFO record:
 
@@ -36,6 +43,37 @@ Build `firmware/controller` using the instructions in `firmware/README.md`, then
 upload the controller image before collecting firmware diagnostics. The joystick
 image is unchanged. Leave `DEBUG_MODE` and `TMC_PROBE_REPORT` off: ASCII output
 must not be mixed into the binary status stream.
+
+## Capturing shorter reader stalls
+
+The independent diagnostic monitor checks cached reader timing every 50 ms.
+At a reader phase or accepted-packet gap of at least **200 ms**, it captures
+thread stacks, command state, recent packet/event histories and firmware
+telemetry, at most **once every 30 seconds** per controller. Checks perform no
+serial IO and do not acquire the command lock. The threshold is diagnostic;
+motion timeouts and retry behavior are unchanged.
+
+The main log gets a concise `[MCU-DIAG] Reader delay ...` warning giving the
+observed phase, cached buffer size and full file path. Detailed snapshots are
+saved to `mcu_diagnostics\stalls-<recorder-id>.jsonl` alongside the health file.
+Each JSON line is one self-contained capture. Preserve these files for diagnosis;
+they are retained across restarts and can grow during repeated stalls. If file
+writing fails, the snapshot falls back to the main log.
+
+`ongoing_at_observation=true` means the reader phase or packet silence still
+exceeded the threshold when inspected. A `recovered` warning means a completed
+gap was observed after the reader resumed; `recent_gaps` preserves its timing
+and, for reader-phase gaps, the previous phase. The accompanying stacks describe
+the time of capture, not necessarily the cause of an already-recovered stall.
+Cooldown-suppressed recovered gaps are not replayed later. A continuing stall
+can be sampled again after 30 seconds. Health aggregates still count gaps during
+the cooldown; full failed-wait dumps remain independent of it.
+
+The monitor is a Python thread, so it cannot capture while the whole process or
+GIL is blocked. When execution resumes, completed-gap evidence may survive but
+the causal stack may already be gone. Cached buffer size is the last observation,
+not a new query of the USB/serial driver. Disk writing happens on the monitor,
+not on the reader; a slow disk can delay subsequent diagnostic checks.
 
 ## Reading a failure
 

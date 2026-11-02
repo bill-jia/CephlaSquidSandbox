@@ -13,11 +13,6 @@ from tools.read_firmware_version import read_version
 from tools.report_mcu_health import read_health, render_report
 
 
-@pytest.fixture(autouse=True)
-def isolate_health_files(monkeypatch, tmp_path):
-    monkeypatch.setattr(squid.logging, "get_current_log_file_path", lambda: str(tmp_path / "main_hcs.log"))
-
-
 def telemetry_packets(sequence=7, schema=2):
     words = [0] * 32
     words[0], words[1], words[31] = (schema << 8) | 1, sequence, sequence
@@ -402,3 +397,85 @@ def test_health_summary_does_not_call_missing_data_healthy():
     assert "last packet never" in text
     assert "telemetry not received" in text
     assert "reader unknown" in text
+
+
+def test_stall_evidence_distinguishes_ongoing_and_recovered_gaps(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("control.mcu_diagnostics.time.monotonic", lambda: now[0])
+    recorder = MCUDiagnostics()
+    recorder.reader_poll("external_callback", 120)
+    recorder.received(bytearray(24), False, 0, 0)
+    now[0] = 0.1
+    assert recorder.stall_evidence(0.2, 0) is None
+    now[0] = 0.3
+    evidence = recorder.stall_evidence(0.2, 0.1)
+    assert evidence["ongoing_at_observation"]
+    assert evidence["reader_phase"] == "external_callback"
+    assert evidence["last_buffer_bytes"] == 120
+    recorder.reader_poll("serial_poll")
+    recorder.received(bytearray(24), False, 0, 0)
+    evidence = recorder.stall_evidence(0.2, 0.1)
+    assert not evidence["ongoing_at_observation"]
+    assert {gap["kind"] for gap in evidence["recent_gaps"]} == {"reader_gap", "rx_gap"}
+    assert evidence["recent_gaps"][0]["previous_phase"] == "external_callback"
+    assert recorder.stall_evidence(0.2, 0.3) is None
+    assert recorder.health_summary()["rx_gap"]["max_ms"] == 300
+
+
+def test_stall_monitor_captures_blocked_callback_and_limits_frequency(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(Microcontroller, "DIAGNOSTIC_STALL_THRESHOLD_S", 0.05)
+    monkeypatch.setattr(Microcontroller, "DIAGNOSTIC_STALL_POLL_S", 0.01)
+    monkeypatch.setattr(Microcontroller, "DIAGNOSTIC_STALL_COOLDOWN_S", 60)
+    micro = Microcontroller(SimSerial(), reset_and_initialize=False)
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_callback(controller):
+        entered.set()
+        release.wait(3)
+
+    try:
+        micro.set_callback(blocked_callback)
+        micro.send_heartbeat()  # SimSerial produces responses only to commands.
+        assert entered.wait(2)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Stall capture must not query serial")
+
+        monkeypatch.setattr(micro._serial, "bytes_available", forbidden)
+        monkeypatch.setattr(micro._serial, "write", forbidden)
+        deadline = time.monotonic() + 2
+        while not any("Reader delay" in r.message for r in caplog.records) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert any("Reader delay" in r.message for r in caplog.records)
+        time.sleep(0.15)
+        path = next((tmp_path / "mcu_diagnostics").glob("stalls-*.jsonl"))
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["evidence"]["ongoing_at_observation"]
+        assert row["evidence"]["reader_phase"] == "external_callback"
+        assert any(frame["function"] == "blocked_callback"
+                   for thread in row["threads"] for frame in thread["frames_innermost_first"])
+        assert row["rx"] and row["events"]
+        assert not any("reader stall details {" in r.message for r in caplog.records)
+    finally:
+        micro.terminate_reading_received_packet_thread = True
+        release.set()
+        micro.close()
+
+
+def test_stall_file_failure_keeps_snapshot_in_main_log(tmp_path, caplog):
+    now = MCUDiagnostics()
+    snapshot = now.snapshot()
+    snapshot["evidence"] = {
+        "reader_phase_age_s": 0.3, "last_rx_age_s": None, "no_rx_since_start_s": 0.3,
+        "recent_gaps": [], "ongoing_at_observation": True, "reader_phase": "starting",
+        "last_buffer_bytes": 0,
+    }
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    HealthRecordWriter(blocked, now.recorder_id).write_stall(snapshot, squid.logging.get_logger("test-stall"))
+    assert any("Cannot write stall file" in r.message for r in caplog.records)
+    logged = next(r.message.split("reader stall details ")[1] for r in caplog.records
+                  if "reader stall details {" in r.message)
+    assert json.loads(logged) == snapshot

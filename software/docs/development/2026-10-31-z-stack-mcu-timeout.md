@@ -276,6 +276,62 @@ file's location. Preserve both when sharing a failure. The tool
 summarizes these records for a short representative hardware check; see the
 [short-run procedure](../mcu-diagnostics.md#periodic-health-summaries-and-short-run-timing-report).
 
+## November 1 short run and client follow-up
+
+The single-timepoint acquisition from 15:41:31 to 15:48:43 completed with firmware
+1.5.1 schema 2. Its reporting windows showed reception gaps up to 578 ms and a
+queued serial buffer of 1,272 bytes (53 packets), while received firmware
+telemetry reported status-generation gaps no larger than 18 ms and loop gaps
+around 9.4 ms. No command retries, failed MCU waits or CRC errors were recorded.
+These observations favor client scheduling/processing or USB/OS buffering as
+the source of those delays, but do not establish the original crash's cause or
+separate GIL contention, native-driver blocking and transport delays.
+
+The client follow-up replaces byte-at-a-time serial reads with bounded batch
+reads and ordered packet parsing, including retained partial packets. A separate
+monitor captures stacks and recent history for delays of at least 200 ms, at
+most once every 30 seconds. Captures are stored in
+`mcu_diagnostics/stalls-<recorder-id>.jsonl`, with concise main-log references.
+Recovered-gap captures describe the stack after recovery and may miss the causal
+call. See [short-stall capture](../mcu-diagnostics.md#capturing-shorter-reader-stalls).
+
+The client regression run passed 218 tests with one existing skip. Batching
+tests verified that 100 queued packets require one read and retain wire order;
+the monitor test captured a blocked reader callback without querying serial.
+This verifies implementation behavior, not an improvement in instrument latency.
+Compare another equivalent short acquisition before attributing the delays to
+the old reader. Firmware and motion timeout settings were unchanged by this
+client follow-up.
+
+## Preview-layer follow-up
+
+The subsequent 72-FOV run (16:08:04 to 16:14:44) still showed reception gaps up
+to 500 ms, with no failed waits, retries or CRC errors. Seven of eight stall
+captures after acquisition startup caught the GUI constructing Napari preview
+layers, graphics objects or thumbnails. In four captures, the acquisition thread
+was waiting for Z completion. These samples make preview-related host scheduling
+or GIL pressure a stronger hypothesis, but do not establish causation.
+
+The shorter 18-FOV run (16:17:06 to 16:19:24) had just one startup stall warning;
+subsequent reporting windows had reception gaps no larger than 156 ms. Its
+startup capture found the GUI in the explicit `gc.collect()` inside
+`NapariMultiChannelWidget.clearAllLayers()`. The smaller run is not a controlled
+preview-on/off comparison.
+
+The preview renderer previously removed channels absent from each new position's
+initially empty snapshot, then recreated their Napari layers as frames arrived.
+It now hides and reuses those layers, restoring each user's visibility preference
+only after fresh data is installed. Compatible layers also survive acquisition
+reset, which no longer clears them or forces garbage collection. Grayscale/RGB
+interpretation changes recreate only the affected layer, and channels left over
+from older acquisitions are released at completion. Redraw frequency, thread
+placement, capture and saving behavior are unchanged.
+
+All 19 preview model, widget and event tests passed, including real Napari layer
+identity, stale-image hiding, user settings, acquisition restart, mixed geometry,
+RGB replacement and disabled-preview replay. Instrument timing still needs to
+be compared with the same acquisition workload and live preview enabled.
+
 ## Next acquisition
 
 Use the updated client and controller 1.5.1, and confirm an INFO log entry saying

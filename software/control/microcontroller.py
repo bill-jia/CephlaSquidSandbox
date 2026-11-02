@@ -554,10 +554,13 @@ class MicrocontrollerSerial(AbstractCephlaMicroSerial):
                 raise
 
     def bytes_available(self) -> int:
-        if not self.is_open():
+        if not self._serial.is_open:
             return 0
-
-        return self._serial.in_waiting
+        try:
+            # is_open() also queries in_waiting; avoid doing the OS query twice.
+            return self._serial.in_waiting
+        except OSError:
+            return 0
 
     def is_open(self) -> bool:
         try:
@@ -671,6 +674,9 @@ class Microcontroller:
     # STALE_READ_TIMEOUT = 0.1  # Warn if no status packets received for this long
     STALE_READ_TIMEOUT = 0.3 # Increased to 300ms to reduce false positives on slow systems or during heavy load
     DIAGNOSTIC_HEALTH_INTERVAL_S = 60.0
+    DIAGNOSTIC_STALL_THRESHOLD_S = 0.2
+    DIAGNOSTIC_STALL_POLL_S = 0.05
+    DIAGNOSTIC_STALL_COOLDOWN_S = 30.0
 
     def __init__(self, serial_device: AbstractCephlaMicroSerial, reset_and_initialize=True):
         """
@@ -794,16 +800,39 @@ class Microcontroller:
         directory = Path(main_log).parent if main_log else squid.logging.get_default_log_directory()
         writer = HealthRecordWriter(directory, self.diagnostics.recorder_id)
         self.log.info("[MCU-DIAG] health details: %s", json.dumps(str(writer.path)))
+        self.log.info(
+            "[MCU-DIAG] Reader stall capture enabled: threshold %.0f ms, cooldown %.0f s; details: %s",
+            self.DIAGNOSTIC_STALL_THRESHOLD_S * 1000, self.DIAGNOSTIC_STALL_COOLDOWN_S, writer.stall_path,
+        )
 
         def monitor():
+            next_health = time.monotonic() + self.DIAGNOSTIC_HEALTH_INTERVAL_S
+            next_capture = 0.0
+            checked_through = time.monotonic()
             while True:
-                stopping = self._diagnostic_health_stop.wait(self.DIAGNOSTIC_HEALTH_INTERVAL_S)
+                delay = min(self.DIAGNOSTIC_STALL_POLL_S, max(0, next_health - time.monotonic()))
+                stopping = self._diagnostic_health_stop.wait(delay)
                 try:
-                    summary = self.diagnostics.health_summary()
-                    summary.update(state=self._diagnostic_state(), final=stopping)
-                    writer.write(summary, self.log)
+                    now = time.monotonic()
+                    if not stopping and now >= next_capture:
+                        evidence = self.diagnostics.stall_evidence(self.DIAGNOSTIC_STALL_THRESHOLD_S, checked_through)
+                        if evidence is not None:
+                            next_capture = now + self.DIAGNOSTIC_STALL_COOLDOWN_S
+                            self.diagnostics.event("stall_capture", evidence=evidence)
+                            snapshot = self.diagnostics.snapshot()
+                            snapshot.update(kind="reader_stall", unix_s=time.time(), evidence=evidence,
+                                            state=self._diagnostic_state(), threads_captured_monotonic_s=time.monotonic())
+                            snapshot["threads"] = capture_thread_stacks()
+                            writer.write_stall(snapshot, self.log)
+                    # Don't replay recovered stalls suppressed by the cooldown.
+                    checked_through = now
+                    if stopping or now >= next_health:
+                        summary = self.diagnostics.health_summary()
+                        summary.update(state=self._diagnostic_state(), final=stopping)
+                        writer.write(summary, self.log)
+                        next_health = time.monotonic() + self.DIAGNOSTIC_HEALTH_INTERVAL_S
                 except Exception:
-                    self.log.exception("[MCU-DIAG] Health summary failed")
+                    self.log.exception("[MCU-DIAG] Diagnostic monitor failed")
                 if stopping:
                     return
 
@@ -1801,34 +1830,63 @@ class Microcontroller:
                 self.log.warning("resend requested with no last_command, something is wrong!")
                 self.abort_current_command("Resend last requested with no last command")
 
+    def _read_status_packet(self, pending, crc_calculator):
+        """Read available bytes once, then consume packets in wire order.
+
+        A short read or a partial packet is retained for the next iteration.
+        Never request more bytes than were reported available. The existing
+        legacy zero-CRC compatibility and overflow reset policy are preserved.
+        """
+        if len(pending) < self.rx_buffer_length:
+            self.diagnostics.reader_poll("serial_poll")
+            backlog = self._serial.bytes_available()
+            self.diagnostics.reader_poll("buffer_check", backlog + len(pending))
+            if backlog >= BUFFER_SIZE_LIMIT:
+                reset_ok = self._serial.reset_input_buffer()
+                discarded = backlog + len(pending)
+                if reset_ok:
+                    pending.clear()
+                self.diagnostics.event("buffer_reset", bytes_discarded=discarded, success=reset_ok)
+                return None
+            if backlog:
+                self.diagnostics.reader_poll("serial_read")
+                pending.extend(self._serial.read(min(backlog, BUFFER_SIZE_LIMIT - len(pending))))
+
+        self.diagnostics.reader_poll("packet_parse", len(pending))
+        consumed = 0
+        while len(pending) - consumed >= self.rx_buffer_length:
+            msg = pending[consumed:consumed + self.rx_buffer_length]
+            checksum = crc_calculator.calculate_checksum(msg[:-1])
+            if checksum == msg[-1] or msg[-1] == 0:
+                del pending[:consumed + self.rx_buffer_length]
+                return msg
+            self.diagnostics.event("crc_failure", raw=bytes(msg).hex(), expected=checksum)
+            self.log.warning("Bad checksum %s for packet '%s', tossing first byte", checksum, list(msg))
+            consumed += 1
+        if consumed:
+            del pending[:consumed]
+        return None
+
     def read_received_packet(self):
         crc_calculator = CrcCalculator(Crc8.CCITT, table_based=True)
+        pending = bytearray()
         last_watchdog_fail_report = time.time()
         watchdog_fail_report_period = 5.0
 
         while not self.terminate_reading_received_packet_thread:
             try:
-                self.diagnostics.reader_poll("serial_poll")
-                # If anything hangs, we may fall way behind reading the serial buffer.  In that case, toss everything
-                # in the read buffer and start over.  This should always be safe to do because the micro sends updates
-                # periodically without prompting, and so we'll always get more updates on the current micro state.
-                backlog = self._serial.bytes_available()
-                self.diagnostics.reader_poll("buffer_check", backlog)
-                if backlog >= BUFFER_SIZE_LIMIT:
-                    reset_ok = self._serial.reset_input_buffer()
-                    self.diagnostics.event("buffer_reset", bytes_discarded=backlog, success=reset_ok)
-                    continue
-
-                # If we don't at least have enough bytes for a full packet (rx_buffer_length), there's no reason to
-                # waste our time looking for a valid message.  So wait here until we have at least that many bytes.
-                if self._serial.bytes_available() < self.rx_buffer_length:
+                msg = self._read_status_packet(pending, crc_calculator)
+                if msg is None:
                     if time.time() - last_watchdog_fail_report > watchdog_fail_report_period:
                         last_watchdog_fail_report = time.time()
                         self._warn_if_reads_stale()
                     # Sleep a negligible amount of time just to give other threads time to run.  Otherwise,
                     # we run the rise of spinning forever here and not letting progress happen elsewhere.
+                    self.diagnostics.reader_poll("waiting_for_packet")
                     time.sleep(0.0001)
+                    self.diagnostics.reader_poll("serial_open_check")
                     if not self._serial.is_open():
+                        pending.clear()
                         self.diagnostics.event("reconnect_start")
                         connected = self._serial.reconnect(attempts=Microcontroller.MAX_RECONNECT_COUNT)
                         self.diagnostics.event("reconnect_end", success=connected)
@@ -1836,35 +1894,6 @@ class Microcontroller:
                             self.log.error(
                                 "In read loop, serial device failed to reconnect.  Microcontroller is defunct!"
                             )
-                    continue
-
-                # This helper reads bytes in the order received by serial, and checks that packet-sized chunks
-                # have valid checksums.  IF the first packet size chunk does not have a valid checksum, it tosses
-                # the first byte and keeps going until it either finds a valid checksum packet or runs out of bytes.
-                def get_msg_with_good_checksum():
-                    maybe_msg = []
-                    while self._serial.bytes_available() > 0:
-                        maybe_msg.append(ord(self._serial.read()))
-                        if len(maybe_msg) < self.rx_buffer_length:
-                            continue
-
-                        checksum = crc_calculator.calculate_checksum(maybe_msg[:-1])
-                        # NOTE(imo): Before April 2025, we didn't send the crc from the micro.  This is
-                        # here to support firmware that still sends 0 as the checksum.  This means for
-                        # the firmware that does support checksums, we can get fooled by zeros!
-                        if checksum == maybe_msg[-1] or maybe_msg[-1] == 0:
-                            return maybe_msg
-                        else:
-                            self.diagnostics.event("crc_failure", raw=bytes(maybe_msg).hex(), expected=checksum)
-                            self.log.warning(f"Bad checksum {checksum} for packet '{maybe_msg}, tossing first byte'")
-                            maybe_msg.pop(0)
-                    return None
-
-                self.diagnostics.reader_poll("packet_read")
-                msg = get_msg_with_good_checksum()
-
-                if msg is None:
-                    self.log.warning("Back checksums found, skipping.")
                     continue
 
                 # parse the message

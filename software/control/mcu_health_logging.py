@@ -39,6 +39,7 @@ class HealthRecordWriter:
 
     def __init__(self, directory, recorder_id):
         self.path = Path(directory).resolve() / "mcu_diagnostics" / f"health-{recorder_id}.jsonl"
+        self.stall_path = self.path.with_name(f"stalls-{recorder_id}.jsonl")
         self._failed = False
 
     def write(self, summary, logger):
@@ -59,3 +60,27 @@ class HealthRecordWriter:
             self._failed = True
             logger.info("[MCU-DIAG] health %s", payload)
         logger.info("%s", format_health(summary))
+
+    def write_stall(self, snapshot, logger):
+        """Keep large early-stall histories/stacks out of the normal log."""
+        payload = json.dumps(snapshot, default=str)
+        try:
+            self.stall_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.stall_path.open("a", encoding="utf-8") as stream:
+                stream.write(payload + "\n")
+            location = str(self.stall_path)
+        except OSError as exc:
+            logger.warning("[MCU-DIAG] Cannot write stall file %s: %s", self.stall_path, exc)
+            logger.info("[MCU-DIAG] reader stall details %s", payload)
+            location = "main log (detailed file writing failed)"
+        evidence = snapshot["evidence"]
+        longest = max(
+            [evidence["reader_phase_age_s"], evidence["last_rx_age_s"] or 0,
+             evidence["no_rx_since_start_s"] or 0]
+            + [gap["seconds"] for gap in evidence["recent_gaps"]]
+        )
+        logger.warning(
+            "[MCU-DIAG] Reader delay %.0f ms (%s); observed phase=%s, cached buffer=%s bytes; details: %s",
+            longest * 1000, "ongoing" if evidence["ongoing_at_observation"] else "recovered",
+            evidence["reader_phase"], evidence["last_buffer_bytes"], location,
+        )

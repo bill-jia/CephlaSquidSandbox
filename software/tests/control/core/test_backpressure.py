@@ -639,7 +639,10 @@ class TestDownsampledViewJobBackpressure:
             runner.dispatch(job)
 
             assert controller.get_pending_mb() > 0
-            time.sleep(0.5)
+            # Windows spawn/imports can exceed a fixed half-second sleep.
+            deadline = time.monotonic() + 10.0
+            while runner.has_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
             # Both job count AND bytes decrement immediately when job completes
             assert controller.get_pending_jobs() == 0
@@ -830,7 +833,9 @@ class TestDownsampledViewJobImmediateByteRelease:
             # Dispatch 3 FOVs of a 10-FOV well (incomplete)
             for fov_idx in range(3):
                 runner.dispatch(make_downsampled_view_job(fov_index=fov_idx, total_fovs=10, size_bytes=100000))
-            time.sleep(0.5)
+            deadline = time.monotonic() + 10.0
+            while runner.has_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
             # With immediate byte release, bytes should already be 0
             # (jobs completed, bytes released, even though well is incomplete)
@@ -859,7 +864,9 @@ class TestDownsampledViewJobImmediateByteRelease:
                     )
                     runner.dispatch(job)
 
-            time.sleep(0.5)
+            deadline = time.monotonic() + 10.0
+            while runner.has_pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
             # With immediate byte release, all bytes should be released
             # even though wells are incomplete
@@ -889,7 +896,7 @@ class TestDownsampledViewJobImmediateByteRelease:
         runner.start()
 
         try:
-            time.sleep(0.5)
+            assert runner.wait_ready(timeout_s=10.0)
 
             # Simulate a z-stack acquisition: 4 FOVs × 2 z-levels × 2 channels = 16 images
             jobs_dispatched = 0
