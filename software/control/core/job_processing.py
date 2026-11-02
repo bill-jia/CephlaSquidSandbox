@@ -2468,15 +2468,13 @@ class JobRunner(multiprocessing.Process):
 
         # Configure logging in subprocess - the squid.logging module sets up console logging
         # on import, but we need to ensure it's properly initialized in this process.
-        # Default to INFO for stdout in the worker, and allow overriding via
+        # Default to INFO for both stdout and the worker file, and allow overriding via
         # the SQUID_WORKER_LOG_LEVEL environment variable (e.g. "DEBUG").
-        stdout_level = logging.INFO
-        env_level = os.environ.get("SQUID_WORKER_LOG_LEVEL")
-        if env_level:
-            env_level_upper = env_level.upper()
-            if hasattr(logging, env_level_upper):
-                stdout_level = getattr(logging, env_level_upper)
-        squid.logging.set_stdout_log_level(stdout_level)
+        env_level = os.environ.get("SQUID_WORKER_LOG_LEVEL", "INFO").strip().upper()
+        worker_level = logging.getLevelName(env_level)
+        if not isinstance(worker_level, int):
+            worker_level = logging.INFO
+        squid.logging.set_stdout_log_level(worker_level)
 
         # Set up file logging if a log file path was provided
         # Use a separate file for the worker to avoid multiprocess file write conflicts
@@ -2484,7 +2482,7 @@ class JobRunner(multiprocessing.Process):
         if self._log_file_path:
             base, ext = os.path.splitext(self._log_file_path)
             worker_log_path = f"{base}_worker{ext}"
-            squid.logging.add_file_handler(worker_log_path, replace_existing=True, level=logging.DEBUG)
+            squid.logging.add_file_handler(worker_log_path, replace_existing=True, level=worker_level)
 
         self._log = squid.logging.get_logger(self.__class__.__name__)
         worker_log_msg = f", worker_log={worker_log_path}" if worker_log_path else ""
@@ -2548,7 +2546,11 @@ class JobRunner(multiprocessing.Process):
                         break
                     continue
 
-                self._log.debug(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
+                self._log.debug(
+                    "Running job %s (waited %.1fms for input)...",
+                    job.job_id,
+                    (t_got_job - t_wait_start) * 1000,
+                )
 
                 # Set operation context for memory tracking
                 if isinstance(job, DownsampledViewJob):
@@ -2564,12 +2566,12 @@ class JobRunner(multiprocessing.Process):
                 # group is complete (postprocess Z stacks, downsampled FOVs).
                 # None is normal completion, not a failed or dropped frame.
                 if result is not None:
-                    self._log.debug(
-                        f"Job {job.job_id} returned in {(t_run_end - t_run_start)*1000:.1f}ms. "
-                        f"Sending result to output queue."
-                    )
                     self._output_queue.put_nowait(JobResult(job_id=job.job_id, result=result, exception=None))
-                    self._log.debug(f"Result for {job.job_id} is on output queue.")
+                    self._log.debug(
+                        "Job %s completed in %.1fms; result queued.",
+                        job.job_id,
+                        (t_run_end - t_run_start) * 1000,
+                    )
                 else:
                     self._log.debug(
                         "%s job %s completed in %.1fms without an output result; no result queued.",
