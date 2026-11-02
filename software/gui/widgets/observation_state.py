@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from qtpy.QtWidgets import QComboBox, QGroupBox, QHBoxLayout, QPushButton, QVBoxLayout
+from qtpy.QtWidgets import QComboBox, QGroupBox, QHBoxLayout, QPushButton, QSizePolicy
 
 from control.core.config.repository import ConfigRepository
 from control.core.live_controller import LiveController
@@ -38,10 +38,8 @@ class ObservationStateWidget(QGroupBox):
         self._emission_filter_wheel = emission_filter_wheel
         self._on_state_changed = on_state_changed
 
-        layout = QVBoxLayout(self)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        layout.addLayout(row)
+        row = QHBoxLayout(self)
+        row.setSpacing(4)
 
         self._combo_presets = QComboBox()
         self._combo_presets.setMinimumWidth(140)
@@ -66,12 +64,9 @@ class ObservationStateWidget(QGroupBox):
         self._btn_delete.clicked.connect(self._on_delete)
 
         row.addWidget(self._combo_presets, stretch=1)
-        row.addWidget(self._btn_load)
-        row.addWidget(self._btn_delete)
-        actions = QHBoxLayout()
-        actions.addWidget(self._btn_save)
-        actions.addWidget(self._btn_save_as)
-        layout.addLayout(actions)
+        for button in (self._btn_load, self._btn_save, self._btn_save_as, self._btn_delete):
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            row.addWidget(button)
         self._combo_presets.currentIndexChanged.connect(self._update_actions)
         self.refresh_presets()
 
