@@ -2215,6 +2215,14 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 finally:
                     self.laser_auto_focus_controller._timing = saved_af_timing
 
+            if (
+                self.do_reflection_af
+                and self._laser_af_refresh_every_n_fovs == 1
+                and self.laser_auto_focus_controller is not None
+            ):
+                with self._timing.get_timer("laser_af_entry_initialization"):
+                    self._initialize_legacy_region_entries()
+
             ordered_run = (
                 self._explicit_acquisition_order and not self.validation_mode
                 and (self.acquisition_order != DEFAULT_ORDER or self.snake_observation_states)
@@ -2975,6 +2983,13 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         z_target_mm = None
         if (self.do_reflection_af or self.do_autofocus) and (region_id, fov) in self._z_pos_proposal:
             z_target_mm = self._z_pos_proposal[(region_id, fov)]
+        elif (
+            self.do_reflection_af
+            and getattr(self, "_laser_af_refresh_every_n_fovs", None) == 1
+            and fov >= 0
+            and getattr(self, "_last_move_region_id", None) == region_id
+        ):
+            z_target_mm = curr_pos.z_mm
         elif len(coordinate_mm) == 3:
             if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
                 self._log.warning(
@@ -4540,6 +4555,47 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self.liveController.obs_controller.apply_full_observation_state(config)
         self.wait_till_operation_is_completed()
 
+    def _initialize_legacy_region_entries(self):
+        """Establish entry Z once, walking from each focused center to its first tile.
+
+        Keep the optical reference fixed. Only verified Z estimates are cached;
+        acquisition still measures every FOV. Coordinates are the finalized path,
+        so the first tile can lie in any corner.
+        """
+        centers = dict(zip(self.scan_region_names, self.scan_region_coords_mm))
+        for region_id, coords in self.scan_region_fov_coords_mm.items():
+            if self.abort_requested_fn():
+                return
+            if not coords:
+                continue
+            center = centers[region_id]
+            z = center[2] if len(center) > 2 else coords[0][2] if len(coords[0]) > 2 else None
+            if z is None:
+                raise RuntimeError(f"No focused center Z for laser-AF region {region_id}")
+            self._apply_region_laser_af_reference(region_id)
+            self.move_to_coordinate((center[0], center[1], z), region_id, -1)
+            if not self.laser_auto_focus_controller.move_to_target(0):
+                raise RuntimeError(f"Laser AF could not verify center of region {region_id}")
+            # Bound each axis step by the smallest grid spacing, capped at
+            # 0.5 mm for sparse or single-tile regions.
+            spacings = [0.5]
+            for axis in (0, 1):
+                values = sorted(set(c[axis] for c in coords))
+                spacings.extend(b - a for a, b in zip(values, values[1:]) if b - a > 1e-6)
+            step = min(spacings)
+            dx, dy = coords[0][0] - center[0], coords[0][1] - center[1]
+            count = int(np.ceil(max(abs(dx), abs(dy)) / step))
+            for i in range(1, count + 1):
+                if self.abort_requested_fn():
+                    return
+                target = (center[0] + dx * i / count, center[1] + dy * i / count,
+                          self.stage.get_pos().z_mm)
+                self.move_to_coordinate(target, region_id, -1)
+                if not self.laser_auto_focus_controller.move_to_target(0):
+                    raise RuntimeError(f"Laser AF entry initialization failed in region {region_id}, step {i}/{count}")
+            self._z_pos_proposal[(region_id, 0)] = self.stage.get_pos().z_mm
+            self._log.info(f"Initialized laser-AF entry for region {region_id} at {coords[0][:2]}")
+
     def _seed_fov_z_map(self):
         """Visit every (region, fov) and record its absolute Z via laser AF.
 
@@ -5029,7 +5085,10 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             # static seed values — but re-parameterizing them against the live
             # anchor keeps both the fallback path and `move_to_coordinate`'s
             # non-blocking Z pre-move consistent.
-            self._recompute_region_proposals(region_id, anchor_fov=fov)
+            if self._laser_af_refresh_every_n_fovs == 1:
+                self._z_pos_proposal[(region_id, fov)] = measured_z
+            else:
+                self._recompute_region_proposals(region_id, anchor_fov=fov)
             self._last_af_status = "ok"
             return True
 

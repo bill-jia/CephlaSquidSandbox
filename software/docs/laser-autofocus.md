@@ -220,3 +220,18 @@ One acquisition session showed every multipoint AF event failing while live
    saved/restored around the centroid loop.
 7. NaN cross-correlation passing the verify (nan < threshold is False) →
    explicit finite check.
+
+### Legacy region-entry initialization
+
+Every FOV mode now performs a one-time pass before acquisition: verify each
+region center at its nominal focused Z, then walk to the actual first tile in
+that region's finalized coordinate order. Each axis step is at most the smaller
+of the grid spacing and 0.5 mm, with live laser correction after every step.
+The optical reference remains unchanged. A failed correction stops initialization
+rather than caching an unverified Z. Abort requests are checked between steps.
+
+The verified first-tile Z is used for direct entry during acquisition. Every tile
+still receives live AF; successful measurements update that tile's positioning
+estimate independently of fast-mode spatial offsets. Unvisited intra-region tiles
+start from the preceding corrected Z. Estimates are scoped to this acquisition
+worker, so a new acquisition initializes again. Fast mode is unchanged.

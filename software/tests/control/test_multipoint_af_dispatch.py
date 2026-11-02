@@ -59,3 +59,33 @@ def test_missing_autofocus_observation_state_reports_configuration_error():
         worker.perform_autofocus("region", 0)
 
     worker.autofocusController.autofocus.assert_not_called()
+
+
+@pytest.mark.parametrize("first", [(1, 1, 2), (-1, 1, 2), (1, -1, 2), (-1, -1, 2)])
+def test_legacy_entry_walk_uses_actual_first_tile_and_carries_focus(first):
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker.scan_region_names = ["r"]
+    worker.scan_region_coords_mm = [(0, 0, 2)]
+    worker.scan_region_fov_coords_mm = {"r": [first]}
+    worker.abort_requested_fn = lambda: False
+    worker._apply_region_laser_af_reference = MagicMock()
+    worker.move_to_coordinate = MagicMock()
+    worker.stage = SimpleNamespace(get_pos=lambda: SimpleNamespace(z_mm=2.1))
+    worker.laser_auto_focus_controller = SimpleNamespace(move_to_target=MagicMock(return_value=True))
+    worker._z_pos_proposal = {}
+    worker._log = MagicMock()
+
+    worker._initialize_legacy_region_entries()
+
+    moves = worker.move_to_coordinate.call_args_list
+    assert moves[0].args[0] == (0, 0, 2)
+    assert moves[1].args[0] == (first[0] / 2, first[1] / 2, 2.1)
+    assert moves[-1].args[0] == (first[0], first[1], 2.1)
+    assert worker.laser_auto_focus_controller.move_to_target.call_count == 3
+    assert worker._z_pos_proposal == {("r", 0): 2.1}
+
+    worker._z_pos_proposal.clear()
+    worker.laser_auto_focus_controller.move_to_target.return_value = False
+    with pytest.raises(RuntimeError, match="verify center"):
+        worker._initialize_legacy_region_entries()
+    assert not worker._z_pos_proposal
