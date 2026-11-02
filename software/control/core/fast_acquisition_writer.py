@@ -130,7 +130,7 @@ class FastAcquisitionWriter(threading.Thread):
             self._defer_writes_until_stop and self._file_format in ("bigtiff", "zarr", "hdf5")
         )
 
-        self._log.info(
+        self._log.debug(
             f"Initialized writer: format={self._file_format}, output={output_path}, "
             f"direct_encode={self._direct_encode}"
         )
@@ -138,12 +138,12 @@ class FastAcquisitionWriter(threading.Thread):
     def run(self) -> None:
         self._running = True
         self._start_time = time.time()
-        self._log.info("Frame writer thread started")
+        self._log.debug("Frame writer thread started")
 
         try:
             self._jsonl_file = open(self._jsonl_path, "w", encoding="utf-8")
         except Exception as e:
-            self._log.error(f"Failed to open frame metadata jsonl: {e}", exc_info=True)
+            self._log.error(f"Failed to open frame metadata {self._jsonl_path}: {e}", exc_info=True)
             self._stop_event.set()
 
         # frames.raw is only the intermediate for the raw round-trip path. Direct-encode
@@ -151,9 +151,9 @@ class FastAcquisitionWriter(threading.Thread):
         if not self._direct_encode:
             try:
                 self._raw_file = open(self._raw_file_path, "wb")
-                self._log.info(f"Opened raw frame file at {self._raw_file_path}")
+                self._log.debug(f"Opened raw frame file at {self._raw_file_path}")
             except Exception as e:
-                self._log.error(f"Failed to open raw frame file: {e}", exc_info=True)
+                self._log.error(f"Failed to open raw frame file {self._raw_file_path}: {e}", exc_info=True)
                 self._stop_event.set()
 
         try:
@@ -162,7 +162,7 @@ class FastAcquisitionWriter(threading.Thread):
                 # Hold: leave every frame in the RAM ring while capture runs so the burst
                 # window issues no disk writes (no NVMe DMA to contend with camera capture
                 # DMA). The whole capture fits in the ring.
-                self._log.info("Writer holding frames in RAM until capture completes (deferred disk writes)")
+                self._log.debug("Writer holding frames in RAM until capture completes (deferred disk writes)")
                 while not self._stop_event.is_set():
                     time.sleep(0.005)
             else:
@@ -193,24 +193,24 @@ class FastAcquisitionWriter(threading.Thread):
                     self._consume_frame(frame_data)
                     drained += 1
                 if drained:
-                    self._log.info(f"Drained {drained} buffered frames after stop")
+                    self._log.debug(f"Drained {drained} buffered frames after stop")
 
         except Exception as e:
-            self._log.error(f"Error in writer thread: {e}", exc_info=True)
+            self._log.error(f"Acquisition writer failed for {self._output_path} after {self._frames_written} frames: {e}", exc_info=True)
         finally:
             # Cleanup
             try:
                 if self._raw_file is not None:
                     self._raw_file.close()
-                    self._log.info(f"Closed raw frame file {self._raw_file_path}")
+                    self._log.debug(f"Closed raw frame file {self._raw_file_path}")
             except Exception as e:
-                self._log.warning(f"Error closing raw frame file: {e}", exc_info=True)
+                self._log.warning(f"Error closing raw frame file {self._raw_file_path}: {e}", exc_info=True)
 
             try:
                 if self._jsonl_file is not None:
                     self._jsonl_file.close()
             except Exception as e:
-                self._log.warning(f"Error closing jsonl: {e}", exc_info=True)
+                self._log.warning(f"Error closing frame metadata {self._jsonl_path}: {e}", exc_info=True)
 
             # Raw round-trip path converts raw -> encoded here; direct-encode is already done.
             if not self._direct_encode:
@@ -221,8 +221,12 @@ class FastAcquisitionWriter(threading.Thread):
 
             self._running = False
             self._frame_timestamps_ms = np.array(self._frame_timestamps_ms)
-            np.save(os.path.join(self._output_path, "frame_timestamps_ms.npy"), self._frame_timestamps_ms)
-            self._log.info("Frame writer thread stopped")
+            timestamps_path = os.path.join(self._output_path, "frame_timestamps_ms.npy")
+            try:
+                np.save(timestamps_path, self._frame_timestamps_ms)
+            except Exception as e:
+                self._log.error(f"Failed to save frame timestamps to {timestamps_path}: {e}", exc_info=True)
+            self._log.debug("Frame writer thread stopped")
 
     def stop(self, wait: bool = True) -> None:
         """
@@ -230,7 +234,7 @@ class FastAcquisitionWriter(threading.Thread):
         the thread exits (raw files closed and optional TIFF/Zarr/HDF5 conversion done).
         When ``wait`` is False, return immediately while conversion may still run in the background.
         """
-        self._log.info("Stopping frame writer thread...")
+        self._log.debug("Stopping frame writer thread...")
         self._stop_event.set()
         if wait:
             self.join()
@@ -266,7 +270,7 @@ class FastAcquisitionWriter(threading.Thread):
         if self._file_format == "raw":
             return
         self._conversion_in_progress = True
-        self._log.info(
+        self._log.debug(
             f"Starting frame conversion to output format ({self._file_format}); "
             "this may take a while for large captures"
         )
@@ -345,7 +349,7 @@ class FastAcquisitionWriter(threading.Thread):
         n_files = (len(records) + frames_per_file - 1) // frames_per_file
         multi = n_files > 1
         if multi:
-            self._log.info(
+            self._log.debug(
                 f"Decoded TIFF stack (~{len(records) * bytes_per_frame / 1024**3:.1f} GiB) exceeds the "
                 f"4 GiB TIFF limit; splitting {len(records)} frames into {n_files} files "
                 f"of up to {frames_per_file} frames each"
@@ -381,7 +385,7 @@ class FastAcquisitionWriter(threading.Thread):
                     # ndarray is rejected); the list also avoids an np.stack copy.
                     iio.mimwrite(stack_path, planes, format="tiff")
                     written.append(stack_path)
-                    self._log.info(
+                    self._log.debug(
                         f"Wrote 3D TIFF stack ({len(planes)} frames, {h}x{w}) to {stack_path}"
                         + (f" [{file_idx + 1}/{n_files}]" if multi else "")
                     )
@@ -394,7 +398,7 @@ class FastAcquisitionWriter(threading.Thread):
             return
         try:
             os.remove(raw_path)
-            self._log.info(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
+            self._log.debug(f"Deleted raw file {raw_path} after TIFF conversion ({len(written)} file(s))")
         except OSError as e:
             self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
 
@@ -521,10 +525,10 @@ class FastAcquisitionWriter(threading.Thread):
             if n == 0:
                 self._log.warning(f"No frames decoded for {self._file_format}")
             return  # leave raw in place for recovery on a hard failure
-        self._log.info(f"Wrote {describe(n)} from raw")
+        self._log.debug(f"Wrote {describe(n)} from raw")
         try:
             os.remove(raw_path)
-            self._log.info(f"Deleted raw file {raw_path} after {self._file_format} conversion")
+            self._log.debug(f"Deleted raw file {raw_path} after {self._file_format} conversion")
         except OSError as e:
             self._log.warning(f"Could not delete raw file: {e}", exc_info=True)
 
@@ -572,7 +576,7 @@ class FastAcquisitionWriter(threading.Thread):
             except Exception as e:
                 self._log.warning(f"Error closing {self._file_format} output: {e}", exc_info=True)
         if finished and n > 0:
-            self._log.info(f"Wrote {describe(n)} directly from RAM (skipped raw round-trip)")
+            self._log.debug(f"Wrote {describe(n)} directly from RAM (skipped raw round-trip)")
         elif n == 0:
             self._log.warning(f"No frames to encode for {self._file_format}")
 
@@ -643,8 +647,6 @@ class FastAcquisitionWriter(threading.Thread):
                 # Keep only last 100 write times for statistics
                 if len(self._write_times) > 100:
                     self._write_times.pop(0)
-        else:
-            self._log.error(f"Failed to write frame {frame_id}")
 
     def _write_frame(
         self, frame_bytes: bytes, frame_id: int, timestamp: float, metadata: dict
@@ -662,9 +664,15 @@ class FastAcquisitionWriter(threading.Thread):
                 if self._jsonl_file is not None:
                     self._jsonl_file.flush()
                 self._frames_since_flush = 0
-            return n == len(frame_bytes)
+            if n != len(frame_bytes):
+                self._log.error(
+                    f"Short write for frame {frame_id} to {self._raw_file_path}: "
+                    f"wrote {n} of {len(frame_bytes)} bytes"
+                )
+                return False
+            return True
         except Exception as e:
-            self._log.error(f"Error writing frame {frame_id}: {e}")
+            self._log.error(f"Error writing frame {frame_id} to {self._raw_file_path}: {e}", exc_info=True)
             return False
 
     def get_write_statistics(self) -> Dict[str, float]:

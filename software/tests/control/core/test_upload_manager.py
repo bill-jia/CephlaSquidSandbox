@@ -2,6 +2,8 @@ import os
 import time
 import hashlib
 import json
+import sqlite3
+import threading
 
 import pytest
 import squid.logging
@@ -286,5 +288,219 @@ def test_stop_does_not_claim_more_files_and_requeues_interrupted_transfer(tmp_pa
         assert (local / "second.bin").exists()
         engine.tick()
         assert not engine._workers
+    finally:
+        store.close()
+
+
+def test_batched_status_matches_individual_status_and_uses_bounded_queries(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    try:
+        for i in range(3):
+            root = tmp_path / str(i)
+            root.mkdir()
+            register(store, root, dataset_id=str(i))
+        store.submit_batch("0", "batch", [SubmittedFile("a", 100, deletable=True), SubmittedFile("meta", 20)])
+        item = store.claim_next()
+        store.record_transfer(TransferResult(item["id"], True, "a" * 64, 100, None, 100, 0.1))
+        store.submit_batch("1", "batch", [SubmittedFile("b", 30, deletable=True)])
+        store.seal_dataset("1")
+        with store._db:
+            store._db.execute("UPDATE datasets SET state='paused' WHERE id='1'")
+        expected = {str(i): store.dataset_status(str(i)) for i in range(3)}
+        queries = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            reader = connect(*args, **kwargs)
+            reader.set_trace_callback(queries.append)
+            return reader
+
+        monkeypatch.setattr(sqlite3, "connect", traced_connect)
+        snapshot = store.status()
+        actual = {row["id"]: row for row in snapshot["datasets"]}
+        # Free-space probes vary as other processes write; counters must match.
+        for row in (*actual.values(), *expected.values()):
+            row.pop("source_free_bytes")
+        assert actual == expected
+        assert snapshot["backlog_bytes"] == 50
+        assert len([q for q in queries if q.startswith("SELECT")]) == 3
+        rate_plan = store._db.execute(
+            "EXPLAIN QUERY PLAN SELECT dataset_id,SUM(bytes) FROM events "
+            "WHERE kind='verified' AND created_utc>=? GROUP BY dataset_id", ("2026-01-01",)
+        ).fetchall()
+        assert any("SEARCH" in row[3] and "events_recent_rate" in row[3] for row in rate_plan)
+        fairness_plan = store._db.execute(
+            "EXPLAIN QUERY PLAN SELECT MAX(id) FROM events WHERE dataset_id=? AND kind='transfer_started'", ("0",)
+        ).fetchall()
+        assert any("SEARCH" in row[3] and "events_dataset_kind_id" in row[3] for row in fairness_plan)
+    finally:
+        store.close()
+
+
+def test_background_scheduler_progresses_while_status_snapshot_is_blocked(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    local, remote = register(store, tmp_path)
+    names = [f"{i}.bin" for i in range(6)]
+    for name in names:
+        (local / name).write_bytes(b"content")
+    store.submit_batch("dataset", "batch", [SubmittedFile(n, 7, deletable=True) for n in names])
+    blocked = threading.Event()
+    release = threading.Event()
+    errors, snapshots = [], []
+    connect = sqlite3.connect
+
+    def slow_reader(*args, **kwargs):
+        reader = connect(*args, **kwargs)
+        if "mode=ro" in str(args[0]):
+            def trace(query):
+                if query.startswith("SELECT dataset_id,"):
+                    # The first SELECT already established a WAL read snapshot.
+                    blocked.set()
+                    release.wait(20)
+            reader.set_trace_callback(trace)
+        return reader
+
+    monkeypatch.setattr(sqlite3, "connect", slow_reader)
+
+    def refresh():
+        try:
+            snapshots.append(store.status())
+        except Exception as exc:
+            errors.append(exc)
+
+    refresh_thread = threading.Thread(target=refresh)
+    engine = UploadManagerEngine(store, max_lanes=2)
+    try:
+        refresh_thread.start()
+        assert blocked.wait(5)
+        engine.start()
+        deadline = time.monotonic() + 15
+        # No manual tick calls or Qt event processing: background scheduling
+        # must keep refilling both lanes despite the stalled status reader.
+        while any((local / n).exists() for n in names) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not release.is_set()
+        assert all(not (local / n).exists() for n in names)
+        assert all((remote / n).read_bytes() == b"content" for n in names)
+    finally:
+        release.set()
+        refresh_thread.join(5)
+        engine.stop()
+    try:
+        assert not refresh_thread.is_alive()
+        assert not engine._scheduler_thread.is_alive()
+        assert not errors
+        assert snapshots[0]["datasets"][0]["verified_bytes"] == 0  # consistent old snapshot
+        assert store.status()["datasets"][0]["verified_bytes"] == 42
+    finally:
+        store.close()
+
+
+def test_recent_view_caches_finished_rows_and_history_retains_old_acquisitions(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    try:
+        for name in ("old-complete", "old-active", "recent-complete"):
+            root = tmp_path / name
+            root.mkdir()
+            register(store, root, dataset_id=name)
+        with store._db:
+            store._db.execute("UPDATE datasets SET created_utc='2000-01-01',sealed_utc='2000-01-01' WHERE id LIKE 'old-%'")
+            store._db.execute("UPDATE datasets SET state='complete',sealed=1 WHERE id IN ('old-complete','recent-complete')")
+        store.sync_history()
+        records = [json.loads(line) for line in store.history_path.read_text().splitlines()]
+        assert {r["dataset"]["id"] for r in records} == {"old-complete", "old-active", "recent-complete"}
+        snapshot = store.status()
+        assert {r["id"] for r in snapshot["datasets"]} == {"old-active", "recent-complete"}
+        assert snapshot["active_count"] == 1
+        queries = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            reader = connect(*args, **kwargs)
+            reader.set_trace_callback(queries.append)
+            return reader
+
+        monkeypatch.setattr(sqlite3, "connect", traced_connect)
+        store.status()
+        aggregates = [q for q in queries if "FROM files" in q]
+        assert len(aggregates) == 1
+        assert "old-active" in aggregates[0]
+        assert "recent-complete" not in aggregates[0]
+        assert "old-complete" not in aggregates[0]
+        before = store.history_path.read_bytes()
+        store.sync_history()
+        assert store.history_path.read_bytes() == before
+    finally:
+        store.close()
+    reopened = make_store(tmp_path)
+    try:
+        assert reopened.history_path.read_bytes() == before
+    finally:
+        reopened.close()
+
+
+def test_cancel_inflight_upload_preserves_files_and_survives_restart(tmp_path):
+    store = make_store(tmp_path)
+    local, remote = register(store, tmp_path)
+    for name in ("first.bin", "second.bin"):
+        (local / name).write_bytes(b"keep locally")
+    (remote / "existing.bin").write_bytes(b"keep remotely")
+    store.submit_batch("dataset", "batch", [SubmittedFile(n, 12, deletable=True) for n in ("first.bin", "second.bin")])
+    engine = UploadManagerEngine(store, max_lanes=1)
+    try:
+        engine.tick()
+        worker = next(iter(engine._workers))
+        result = engine.cancel_dataset_async("dataset")
+        engine.tick()
+        assert result.result(timeout=1)["cancelled"]
+        assert not worker.is_alive()
+        assert store.dataset_info("dataset")["state"] == "cancelled"
+        assert store.status()["active_count"] == 0
+        assert not store.eligible_deletions()
+        assert store.claim_next() is None
+        assert all((local / n).read_bytes() == b"keep locally" for n in ("first.bin", "second.bin"))
+        assert (remote / "existing.bin").read_bytes() == b"keep remotely"
+        # Late producer submissions are acknowledged as cancelled, avoiding an
+        # acquisition error or an endlessly replayed producer outbox.
+        assert store.submit_batch("dataset", "late", [SubmittedFile("later.bin", 50)])["cancelled"]
+        store.seal_dataset("dataset")
+        store.pause("dataset")
+        store.resume("dataset")
+        store.retry_failed("dataset")
+        assert store.dataset_info("dataset")["state"] == "cancelled"
+    finally:
+        engine.stop()
+        store.close()
+    reopened = make_store(tmp_path)
+    try:
+        assert reopened.dataset_info("dataset")["state"] == "cancelled"
+        assert reopened.claim_next() is None
+        assert reopened.recovered_shards == 0
+        history = [json.loads(l) for l in reopened.history_path.read_text().splitlines()]
+        assert history[-1]["dataset"]["state"] == "cancelled"
+        assert history[-1]["totals"]["deleted_bytes"] == 0
+    finally:
+        reopened.close()
+
+
+def test_history_export_failure_does_not_advance_marker(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    register(store, tmp_path)
+    try:
+        import builtins
+        original = builtins.open
+
+        def failing_open(path, *args, **kwargs):
+            if str(path) == str(store.history_path):
+                raise OSError("history disk unavailable")
+            return original(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "open", failing_open)
+            with pytest.raises(OSError, match="history disk unavailable"):
+                store.sync_history()
+        assert store._db.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == 0
+        store.sync_history()
+        assert json.loads(store.history_path.read_text())["dataset"]["id"] == "dataset"
     finally:
         store.close()

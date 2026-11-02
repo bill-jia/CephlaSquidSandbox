@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import time
 import hashlib
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,10 +35,21 @@ from control.core.pipeline_diagnostics import DetailWriter, elapsed
 
 PROTOCOL_VERSION = 1
 APPLICATION_VERSION = "1"
-FILE_STATES = ("pending", "uploading", "verified", "delete_pending", "deleted", "failed")
+FILE_STATES = ("pending", "uploading", "verified", "delete_pending", "deleted", "failed", "cancelled")
 DATASET_STATES = (
-    "receiving", "draining", "waiting_for_share", "paused", "needs_attention", "complete"
+    "receiving", "draining", "waiting_for_share", "paused", "needs_attention", "complete", "cancelled"
 )
+HISTORY_DAYS = 7
+TERMINAL_STATES = ("complete", "cancelled")
+
+_FILE_TOTALS = """COUNT(*) file_count, COALESCE(SUM(size),0) total_bytes,
+    COALESCE(SUM(CASE WHEN state IN ('verified','delete_pending','deleted') THEN size ELSE 0 END),0) verified_bytes,
+    COALESCE(SUM(CASE WHEN deletable=1 THEN size ELSE 0 END),0) deletable_bytes,
+    COALESCE(SUM(CASE WHEN state='deleted' THEN size ELSE 0 END),0) deleted_bytes,
+    COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0) failed_files,
+    COALESCE(SUM(CASE WHEN state IN ('pending','uploading') THEN size ELSE 0 END),0) backlog_bytes"""
+_EMPTY_TOTALS = dict(file_count=0, total_bytes=0, verified_bytes=0, deletable_bytes=0,
+                     deleted_bytes=0, failed_files=0, backlog_bytes=0)
 
 
 def utc_now() -> str:
@@ -191,9 +203,12 @@ class UploadStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._lock = threading.RLock()
+        self._status_lock = threading.Lock()
+        self._terminal_status = {}
         self._create_schema()
         self.recover_interrupted_work()
         self.recovered_shards = self.reconcile_sealed_datasets()
+        self.sync_history()
 
     def close(self) -> None:
         with self._lock:
@@ -269,6 +284,11 @@ class UploadStore:
                     size INTEGER NOT NULL,
                     PRIMARY KEY(dataset_id, remote_path)
                 );
+                CREATE INDEX IF NOT EXISTS events_recent_rate ON events(kind, created_utc, dataset_id, bytes);
+                CREATE INDEX IF NOT EXISTS events_dataset_kind_id ON events(dataset_id, kind, id);
+                CREATE TABLE IF NOT EXISTS history_snapshots (
+                    dataset_id TEXT PRIMARY KEY, signature TEXT NOT NULL
+                );
                 """
             )
             dataset_columns = {row[1] for row in self._db.execute("PRAGMA table_info(datasets)")}
@@ -333,6 +353,11 @@ class UploadStore:
         values = [SubmittedFile.from_value(item) for item in files]
         with self._lock, self._db:
             dataset = self._dataset(dataset_id)
+            if dataset["state"] == "cancelled":
+                # A producer may still be acquiring. Acknowledge cancellation
+                # without queueing/deleting its later files or retaining outbox
+                # entries that would resurrect this upload after a restart.
+                return {"accepted": False, "cancelled": True, "file_count": 0}
             prior = self._db.execute(
                 "SELECT task_id FROM batches WHERE dataset_id=? AND submission_id=?",
                 (dataset_id, submission_id),
@@ -373,7 +398,8 @@ class UploadStore:
         if status not in ("complete", "aborted", "needs_attention"):
             raise ValueError("invalid seal status")
         with self._lock, self._db:
-            self._dataset(dataset_id)
+            if self._dataset(dataset_id)["state"] == "cancelled":
+                return self.dataset_status(dataset_id)
             recovered = self._inventory_unsubmitted_zarr_shards(dataset_id)
             state = "needs_attention" if status == "needs_attention" else "draining"
             self._db.execute(
@@ -395,21 +421,24 @@ class UploadStore:
     def pause(self, dataset_id: Optional[str] = None) -> None:
         with self._lock, self._db:
             if dataset_id:
-                self._dataset(dataset_id)
+                if self._dataset(dataset_id)["state"] in TERMINAL_STATES:
+                    return
                 self._db.execute("UPDATE datasets SET state='paused' WHERE id=?", (dataset_id,))
             else:
-                self._db.execute("UPDATE datasets SET state='paused' WHERE state != 'complete'")
+                self._db.execute("UPDATE datasets SET state='paused' WHERE state NOT IN ('complete','cancelled')")
 
     def resume(self, dataset_id: Optional[str] = None) -> None:
         with self._lock, self._db:
             where, args = (("id=?", (dataset_id,)) if dataset_id else ("state='paused'", ()))
-            rows = self._db.execute(f"SELECT id,sealed FROM datasets WHERE {where}", args).fetchall()
+            rows = self._db.execute(f"SELECT id,sealed FROM datasets WHERE ({where}) AND state NOT IN ('complete','cancelled')", args).fetchall()
             for row in rows:
                 state = "draining" if row["sealed"] else "receiving"
                 self._db.execute("UPDATE datasets SET state=? WHERE id=?", (state, row["id"]))
 
     def retry_failed(self, dataset_id: Optional[str] = None) -> int:
         with self._lock, self._db:
+            if dataset_id and self._dataset(dataset_id)["state"] in TERMINAL_STATES:
+                return 0
             if dataset_id:
                 cur = self._db.execute(
                     "UPDATE files SET state='pending',error=NULL,retry_after_epoch=0 WHERE state='failed' AND dataset_id=?",
@@ -439,8 +468,8 @@ class UploadStore:
                           SUM(CASE WHEN f.state='pending' AND f.retry_after_epoch>?
                                    THEN 1 ELSE 0 END) AS retry_wait_files
                    FROM files f JOIN datasets d ON d.id=f.dataset_id
-                   WHERE f.state IN ('pending','uploading','failed','delete_pending')
-                      OR (f.state='verified' AND f.deletable=1 AND d.delete_after_verify=1)
+                   WHERE d.state!='cancelled' AND (f.state IN ('pending','uploading','failed','delete_pending')
+                      OR (f.state='verified' AND f.deletable=1 AND d.delete_after_verify=1))
                    GROUP BY d.id, d.state, f.state""",
                 (time.time(), time.time()),
             ).fetchall()
@@ -467,7 +496,7 @@ class UploadStore:
                    LEFT JOIN legacy_history h ON h.dataset_id=f.dataset_id
                                              AND h.relative_path=f.relative_path
                    WHERE f.state='pending' AND f.retry_after_epoch<=? 
-                     AND d.state NOT IN ('paused','complete','needs_attention')"""
+                     AND d.state NOT IN ('paused','complete','needs_attention','cancelled')"""
                 + excluded_sql
                 + " ORDER BY COALESCE((SELECT MAX(e.id) FROM events e WHERE e.dataset_id=d.id AND e.kind='transfer_started'),0), f.id LIMIT 1",
                 [time.time(), *args],
@@ -489,6 +518,8 @@ class UploadStore:
     def record_transfer(self, result: TransferResult) -> None:
         with self._lock, self._db:
             row = self._file(result.file_id)
+            if self._dataset(row["dataset_id"])["state"] == "cancelled":
+                return
             if result.ok:
                 now = utc_now()
                 self._db.execute(
@@ -521,7 +552,7 @@ class UploadStore:
             rows = self._db.execute(
                 """SELECT f.*,d.local_root,d.remote_root,d.deletion_mode
                    FROM files f JOIN datasets d ON d.id=f.dataset_id
-                   WHERE f.state='verified' AND f.deletable=1 AND d.delete_after_verify=1"""
+                   WHERE f.state='verified' AND f.deletable=1 AND d.delete_after_verify=1 AND d.state!='cancelled'"""
             ).fetchall()
             eligible = []
             for row in rows:
@@ -601,7 +632,9 @@ class UploadStore:
         with self._lock, self._db:
             total = 0
             rows = self._db.execute(
-                "SELECT id FROM datasets WHERE sealed=1 AND delete_after_verify=1"
+                "SELECT id FROM datasets WHERE sealed=1 AND delete_after_verify=1 AND state!='cancelled' "
+                "AND (state!='complete' OR COALESCE(sealed_utc,created_utc)>=?)",
+                (datetime.fromtimestamp(time.time() - HISTORY_DAYS * 86400, timezone.utc).isoformat(),),
             ).fetchall()
             for row in rows:
                 inserted = self._inventory_unsubmitted_zarr_shards(row["id"])
@@ -660,40 +693,143 @@ class UploadStore:
         with self._lock:
             d = dict(self._dataset(dataset_id))
             totals = self._db.execute(
-                """SELECT COUNT(*) file_count, COALESCE(SUM(size),0) total_bytes,
-                   COALESCE(SUM(CASE WHEN state IN ('verified','delete_pending','deleted') THEN size ELSE 0 END),0) verified_bytes,
-                   COALESCE(SUM(CASE WHEN deletable=1 THEN size ELSE 0 END),0) deletable_bytes,
-                   COALESCE(SUM(CASE WHEN state='deleted' THEN size ELSE 0 END),0) deleted_bytes,
-                   COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0) failed_files,
-                   COALESCE(SUM(CASE WHEN state IN ('pending','uploading') THEN size ELSE 0 END),0) backlog_bytes
-                   FROM files WHERE dataset_id=?""",
+                f"SELECT {_FILE_TOTALS} FROM files WHERE dataset_id=?",
                 (dataset_id,),
             ).fetchone()
             d.update(dict(totals))
-            d["uploaded_percent"] = (100.0 * d["verified_bytes"] / d["total_bytes"]) if d["total_bytes"] else 0.0
-            d["deleted_percent"] = (100.0 * d["deleted_bytes"] / d["deletable_bytes"]) if d["deletable_bytes"] else None
             rate = self._recent_rate(dataset_id)
-            d["upload_rate_bps"] = rate
-            d["eta_seconds"] = (d["backlog_bytes"] / rate) if d["sealed"] and rate > 0 and d["backlog_bytes"] else None
-            if d["state"] in ("paused", "waiting_for_share", "needs_attention"):
-                d["eta_seconds"] = None
-            try:
-                d["source_free_bytes"] = shutil.disk_usage(d["local_root"]).free
-            except OSError:
-                d["source_free_bytes"] = None
-            return d
+        return self._finish_status(d, rate)
+
+    @staticmethod
+    def _finish_status(d: dict, rate: float) -> dict:
+        d["uploaded_percent"] = (100.0 * d["verified_bytes"] / d["total_bytes"]) if d["total_bytes"] else 0.0
+        d["deleted_percent"] = (100.0 * d["deleted_bytes"] / d["deletable_bytes"]) if d["deletable_bytes"] else None
+        d["upload_rate_bps"] = rate
+        d["eta_seconds"] = (d["backlog_bytes"] / rate) if d["sealed"] and rate > 0 and d["backlog_bytes"] else None
+        if d["state"] in ("paused", "waiting_for_share", "needs_attention"):
+            d["eta_seconds"] = None
+        try:
+            d["source_free_bytes"] = shutil.disk_usage(d["local_root"]).free
+        except OSError:
+            d["source_free_bytes"] = None
+        return d
 
     def status(self) -> dict:
+        with self._status_lock:
+            return self._status_snapshot()
+
+    def _status_snapshot(self) -> dict:
+        # WAL permits a consistent read-only snapshot without holding the writer
+        # lock. Slow status queries/disk probes must not stall transfer scheduling.
+        reader = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        reader.row_factory = sqlite3.Row
+        try:
+            reader.execute("BEGIN")
+            recent = datetime.fromtimestamp(time.time() - HISTORY_DAYS * 86400, timezone.utc).isoformat()
+            rows = [dict(r) for r in reader.execute(
+                "SELECT * FROM datasets WHERE state NOT IN ('complete','cancelled') "
+                "OR COALESCE(sealed_utc,created_utc)>=? ORDER BY created_utc DESC", (recent,)
+            )]
+            wanted = [r["id"] for r in rows if r["state"] not in TERMINAL_STATES
+                      or self._terminal_status.get(r["id"], (None,))[0] != r]
+            placeholders = ",".join("?" for _ in wanted)
+            totals = {r["dataset_id"]: dict(r) for r in reader.execute(
+                f"SELECT dataset_id, {_FILE_TOTALS} FROM files WHERE dataset_id IN ({placeholders}) GROUP BY dataset_id",
+                wanted,
+            )} if wanted else {}
+            cutoff = datetime.fromtimestamp(time.time() - 30, timezone.utc).isoformat()
+            active = [r["id"] for r in rows if r["state"] not in TERMINAL_STATES]
+            rates = dict(reader.execute(
+                "SELECT dataset_id,SUM(bytes)/30.0 FROM events WHERE kind='verified' AND created_utc>=? "
+                f"AND dataset_id IN ({','.join('?' for _ in active)}) GROUP BY dataset_id",
+                (cutoff, *active),
+            )) if active else {}
+        finally:
+            reader.close()
+        for i, row in enumerate(rows):
+            if row["id"] not in wanted:
+                rows[i] = dict(self._terminal_status[row["id"]][1])
+                continue
+            identity = dict(row)
+            row.update({k: totals.get(row["id"], _EMPTY_TOTALS)[k] for k in _EMPTY_TOTALS})
+            self._finish_status(row, rates.get(row["id"], 0.0))
+            if row["state"] in TERMINAL_STATES:
+                row["source_free_bytes"] = None
+                self._terminal_status[row["id"]] = (identity, dict(row))
+        visible = {r["id"] for r in rows}
+        self._terminal_status = {k: v for k, v in self._terminal_status.items() if k in visible}
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "application_version": APPLICATION_VERSION,
+            "datasets": rows,
+            "active_count": sum(row["state"] not in TERMINAL_STATES for row in rows),
+            "backlog_bytes": sum(row["backlog_bytes"] for row in rows),
+        }
+
+    @property
+    def history_path(self) -> Path:
+        return self.path.parent / "acquisition_history.jsonl"
+
+    def sync_history(self) -> None:
+        """Append lifecycle snapshots, including existing history on first run.
+
+        SQLite remains the recovery authority. The export marker is committed
+        after the fsynced log record: a crash can duplicate a snapshot, never
+        acknowledge an unwritten record. Progress is not logged every refresh.
+        """
+        with self._lock, self._db:
+            if not self.history_path.exists():
+                self._db.execute("DELETE FROM history_snapshots")
+            previous = dict(self._db.execute("SELECT dataset_id,signature FROM history_snapshots"))
+            for row in self._db.execute("SELECT * FROM datasets ORDER BY created_utc").fetchall():
+                d = dict(row)
+                signature = json.dumps([d[k] for k in (
+                    "id", "name", "local_root", "remote_root", "state", "sealed", "seal_status",
+                    "delete_after_verify", "deletion_mode",
+                )])
+                if previous.get(d["id"]) == signature:
+                    continue
+                record = dict(format=1, recorded_utc=utc_now(), dataset=d)
+                if d["state"] in TERMINAL_STATES:
+                    record["totals"] = dict(self._db.execute(
+                        f"SELECT {_FILE_TOTALS} FROM files WHERE dataset_id=?", (d["id"],)
+                    ).fetchone())
+                # Unlike best-effort transfer manifests, this export must not
+                # advance its marker unless the append succeeds durably.
+                with open(self.history_path, "ab+") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    if stream.tell():
+                        stream.seek(-1, os.SEEK_END)
+                        if stream.read(1) != b"\n":
+                            stream.write(b"\n")
+                    stream.write((json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self._db.execute("INSERT OR REPLACE INTO history_snapshots VALUES(?,?)", (d["id"], signature))
+
+    def cancel_dataset(self, dataset_id: str) -> None:
+        """Scheduler-only cancellation; preserve local and remote files."""
+        with self._lock, self._db:
+            if self._dataset(dataset_id)["state"] in TERMINAL_STATES:
+                return
+            self._db.execute(
+                "UPDATE datasets SET state='cancelled',sealed=1,seal_status='cancelled',sealed_utc=? WHERE id=?",
+                (utc_now(), dataset_id),
+            )
+            self._db.execute(
+                "UPDATE files SET state='verified' WHERE dataset_id=? AND state='delete_pending'",
+                (dataset_id,),
+            )
+            self._db.execute(
+                "UPDATE files SET state='cancelled' WHERE dataset_id=? AND state IN ('pending','uploading','failed')",
+                (dataset_id,),
+            )
+            self._event(dataset_id, None, "upload_cancelled", detail="User cancelled upload; files retained")
+
+    def dataset_info(self, dataset_id: str) -> dict:
+        """Dataset identity/paths without calculating UI progress aggregates."""
         with self._lock:
-            ids = [r[0] for r in self._db.execute("SELECT id FROM datasets ORDER BY created_utc DESC")]
-            rows = [self.dataset_status(dataset_id) for dataset_id in ids]
-            return {
-                "protocol_version": PROTOCOL_VERSION,
-                "application_version": APPLICATION_VERSION,
-                "datasets": rows,
-                "active_count": sum(row["state"] != "complete" for row in rows),
-                "backlog_bytes": sum(row["backlog_bytes"] for row in rows),
-            }
+            return dict(self._dataset(dataset_id))
 
     def file_row(self, file_id: int) -> dict:
         with self._lock:
@@ -770,7 +906,7 @@ class UploadStore:
 
     def _update_dataset_state(self, dataset_id: str) -> None:
         d = self._dataset(dataset_id)
-        if d["state"] in ("paused", "needs_attention"):
+        if d["state"] in ("paused", "needs_attention", "cancelled"):
             return
         counts = self._db.execute(
             """SELECT
@@ -816,6 +952,11 @@ class UploadManagerEngine:
         self._worker_results = {}  # isolate IPC if a blocked lane must be killed
         self._stopping = False
         self._stopped = False
+        self._scheduler_thread = None
+        self._shutdown_event = threading.Event()
+        self._shutdown_timeout = 5.0
+        self._commands = queue.Queue()
+        self._history_next = 0.0
         self._log = squid.logging.get_logger("UploadManager")
         self._diagnostic_writer = None
         self._transfer_started = {}
@@ -823,9 +964,28 @@ class UploadManagerEngine:
         self._diagnostic_totals = dict(completed=0, failed=0, verified_bytes=0, deleted_bytes=0)
         self._diagnostic_stages = {}
 
+    def start(self) -> None:
+        """Schedule transfers independently of Qt's UI/IPC event loop."""
+        if self._scheduler_thread is not None or self._stopped:
+            raise RuntimeError("Upload scheduler has already been started or stopped")
+        self._scheduler_thread = threading.Thread(target=self._run_scheduler, name="Upload scheduler", daemon=True)
+        self._scheduler_thread.start()
+
+    def _run_scheduler(self) -> None:
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    self.tick()
+                except Exception:
+                    self._log.exception("Upload scheduler update failed")
+                self._shutdown_event.wait(0.02)
+        finally:
+            self._stop_workers(self._shutdown_timeout)
+
     def tick(self) -> None:
         if self._stopped:
             return
+        self._process_commands()
         self._collect_results()
         self._reconcile_dead_processes()
         while not self._stopping and len(self._active) < self.max_lanes:
@@ -858,11 +1018,62 @@ class UploadManagerEngine:
             )
         self._delete_verified_files()
         self._report_diagnostics()
+        if time.monotonic() >= self._history_next:
+            self.store.sync_history()
+            self._history_next = time.monotonic() + 1
+
+    def cancel_dataset_async(self, dataset_id: str) -> Future:
+        result = Future()
+        if self._stopping or self._stopped or self._shutdown_event.is_set():
+            result.set_exception(RuntimeError("Upload manager is stopping"))
+        else:
+            self._commands.put((dataset_id, result))
+        return result
+
+    def _process_commands(self) -> None:
+        while True:
+            try:
+                dataset_id, result = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                # Persist first so a crash during process termination cannot
+                # resurrect this upload on recovery.
+                self.store.cancel_dataset(dataset_id)
+                for file_id, process in list(self._active.items()):
+                    if self.store.file_row(file_id)["dataset_id"] != dataset_id:
+                        continue
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        raise RuntimeError("Transfer worker did not stop")
+                    for channels in (self._workers, self._worker_results):
+                        channel = channels.pop(process)
+                        channel.close()
+                        channel.cancel_join_thread()
+                    self._active.pop(file_id)
+                    self._transfer_started.pop(file_id, None)
+                self.store.sync_history()
+                result.set_result({"cancelled": True})
+            except Exception as exc:
+                result.set_exception(exc)
 
     def stop(self, timeout: float = 5.0) -> None:
+        if self._scheduler_thread is not None:
+            self._shutdown_timeout = timeout
+            self._shutdown_event.set()
+            self._scheduler_thread.join(timeout=max(0, timeout) + self.max_lanes + 5)
+            if self._scheduler_thread.is_alive():
+                raise RuntimeError("Upload scheduler did not stop; its store must remain open")
+            return
+        self._stop_workers(timeout)
+
+    def _stop_workers(self, timeout: float = 5.0) -> None:
         if self._stopped:
             return
         self._stopping = True
+        self._process_commands()
         deadline = time.monotonic() + timeout
         while self._active and time.monotonic() < deadline:
             self.tick()
@@ -885,6 +1096,7 @@ class UploadManagerEngine:
         self._active.clear()
         self._transfer_started.clear()
         self.store.recover_interrupted_work()
+        self.store.sync_history()
         self._report_diagnostics(force=True)
         self._stopped = True
 
@@ -915,8 +1127,10 @@ class UploadManagerEngine:
             observed_s = collected_at - launched_at if launched_at is not None else None
             self._active.pop(result.file_id, None)
             row = self.store.file_row(result.file_id)
+            if self.store.dataset_info(row["dataset_id"])["state"] == "cancelled":
+                continue
             if result.ok:
-                dataset = self.store.dataset_status(row["dataset_id"])
+                dataset = self.store.dataset_info(row["dataset_id"])
                 manifest_path = os.path.join(dataset["local_root"], "upload_manifest.jsonl")
                 append_manifest_record(
                     manifest_path,

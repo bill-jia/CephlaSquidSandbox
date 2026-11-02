@@ -21,6 +21,7 @@ from control.core.upload_manager import (  # noqa: E402
     handle_request,
 )
 from control.core.upload_manager_client import server_name  # noqa: E402
+from control.core.upload_manager_view import StatusPoller  # noqa: E402
 import squid.logging  # noqa: E402
 
 
@@ -104,20 +105,37 @@ def main(argv=None) -> int:
                 ("Pause", lambda: self._selected_action("pause")),
                 ("Resume", lambda: self._selected_action("resume")),
                 ("Retry failed", lambda: self._selected_action("retry_failed")),
+                ("Cancel upload", self._cancel_upload),
                 ("Open local folder", lambda: self._open_folder("local_root")),
                 ("Open remote folder", lambda: self._open_folder("remote_root")),
                 ("View log", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))),
+                ("View history", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(store.history_path)))),
             ):
                 button = QPushButton(label); button.clicked.connect(callback); controls.addWidget(button)
             controls.addStretch(1); layout.addLayout(controls)
             self.footer = QLabel(""); layout.addWidget(self.footer)
             self.setCentralWidget(root)
             self.rows = []
+            self.status_poller = StatusPoller(store.status)
+            self.cancellations = {}
             self.table.itemSelectionChanged.connect(self._show_details)
 
         def refresh(self):
-            snapshot = store.status(); self.rows = snapshot["datasets"]
-            self.table.setRowCount(len(self.rows))
+            for dataset_id, future in list(self.cancellations.items()):
+                if future.done():
+                    del self.cancellations[dataset_id]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        QMessageBox.warning(self, "Cancel upload failed", str(exc))
+            snapshot = self.status_poller.poll(self.isVisible() and not self.isMinimized())
+            if snapshot is None:
+                return
+            selected = self.selected()
+            selected_id = selected["id"] if selected else None
+            self.rows = snapshot["datasets"]
+            if self.table.rowCount() != len(self.rows):
+                self.table.setRowCount(len(self.rows))
             for row_index, row in enumerate(self.rows):
                 deleted = "Disabled" if not row["delete_after_verify"] else f"{(row['deleted_percent'] or 0):.1f}%"
                 rate = f"{row['upload_rate_bps'] / 1e6:.1f} MB/s"
@@ -137,7 +155,13 @@ def main(argv=None) -> int:
                 values = [f"{row['name']}\n{created}", display_state, uploaded, deleted,
                           rate, eta, row["local_root"], row["remote_root"]]
                 for column, value in enumerate(values):
-                    self.table.setItem(row_index, column, QTableWidgetItem(str(value)))
+                    item = self.table.item(row_index, column)
+                    if item is None:
+                        self.table.setItem(row_index, column, QTableWidgetItem(str(value)))
+                    elif item.text() != str(value):
+                        item.setText(str(value))
+                if row["id"] == selected_id and self.table.currentRow() != row_index:
+                    self.table.selectRow(row_index)
             free = [row["source_free_bytes"] for row in self.rows if row["source_free_bytes"] is not None]
             free_text = f" · source free {min(free) / 1e9:.1f} GB" if free else ""
             self.footer.setText(f"{snapshot['active_count']} active acquisition(s) · {snapshot['backlog_bytes'] / 1e9:.2f} GB queued{free_text}")
@@ -164,6 +188,22 @@ def main(argv=None) -> int:
             if row:
                 handle_request(store, {"protocol_version": 1, "method": method, "params": {"dataset_id": row["id"]}})
                 self.refresh()
+
+        def _cancel_upload(self):
+            row = self.selected()
+            if not row or row["state"] in ("complete", "cancelled") or row["id"] in self.cancellations:
+                return
+            answer = QMessageBox.question(
+                self, "Cancel upload",
+                f"Cancel uploads for {row['name']}?\n\n"
+                "Transfers will stop and this acquisition will leave the active upload queue. "
+                "Existing local and NAS files will be retained. Image acquisition will continue, "
+                "and future files from this acquisition will remain local. "
+                "The cancellation will remain in history.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self.cancellations[row["id"]] = engine.cancel_dataset_async(row["id"])
 
         def _open_folder(self, key):
             row = self.selected()
@@ -219,30 +259,24 @@ def main(argv=None) -> int:
             socket.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")); socket.flush()
 
     server.newConnection.connect(accept_connections)
-    def update_manager():
-        try:
-            engine.tick()
-        except Exception:
-            log.exception("Upload Manager update failed")
-
     def refresh_window():
         try:
             window.refresh()
         except Exception:
             log.exception("Upload Manager window refresh failed")
 
-    # Refill persistent transfer lanes promptly, independently of the slower
-    # status display. No new Python process is needed for each file.
-    timer = QTimer(); timer.timeout.connect(update_manager); timer.start(20)
-    display_timer = QTimer(); display_timer.timeout.connect(refresh_window); display_timer.start(1000)
-    window.refresh()
-    if not args.hidden: window.show()
-    log.info("Upload Manager ready for acquisition requests")
+    # Transfer scheduling owns a background thread. UI refreshes use separate
+    # read-only WAL snapshots, so neither Qt nor a status read holds up refills.
+    engine.start()
+    display_timer = QTimer(); display_timer.timeout.connect(refresh_window); display_timer.start(100)
     try:
+        window.refresh()
+        if not args.hidden: window.show()
+        log.info("Upload Manager ready for acquisition requests")
         return app.exec_()
     finally:
         log.info("Upload Manager stopping")
-        timer.stop(); display_timer.stop()
+        display_timer.stop()
         server.close(); engine.stop(); store.close(); lock.release()
         if log_handler is not None:
             squid.logging.remove_handler(log_handler)
