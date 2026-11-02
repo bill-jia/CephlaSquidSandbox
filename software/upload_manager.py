@@ -229,6 +229,7 @@ def main(argv=None) -> int:
     timer = QTimer(); timer.timeout.connect(update_manager); timer.start(1000)
     window.refresh()
     if not args.hidden: window.show()
+    log.info("Upload Manager ready for acquisition requests")
     try:
         return app.exec_()
     finally:

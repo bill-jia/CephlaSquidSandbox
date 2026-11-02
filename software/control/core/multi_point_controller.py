@@ -1579,6 +1579,18 @@ class MultiPointController:
 
         thread_started = False
         try:
+            upload_manager_ready = None
+            if (
+                self.file_saving_option == control._def.FileSavingOption.ZARR_V3
+                and self.zarr_upload_enabled
+                and self.zarr_upload_remote_root
+                and not self.validation_mode
+            ):
+                from control.core.upload_manager_client import UploadManagerClient
+
+                self._log.info("Starting Upload Manager connection while preparing acquisition")
+                upload_manager_ready = UploadManagerClient().ensure_ready_async()
+
             self._log.info("start multipoint")
             self._start_position = self.stage.get_pos()
 
@@ -1695,6 +1707,16 @@ class MultiPointController:
             # We need callbacks, because we trigger and then use callbacks for image processing.  This
             # lets us do overlapping triggering (soon).
             self.camera.enable_callbacks(True)
+
+            # Independent setup above overlaps manager startup/recovery. Do not
+            # generate an autofocus map (or start imaging without one) until the
+            # manager has answered. Dataset registration remains mandatory in
+            # the worker before image production starts.
+            if upload_manager_ready is not None:
+                if not upload_manager_ready.done():
+                    self._log.info("Waiting for Upload Manager before autofocus/acquisition")
+                upload_manager_ready.result()
+                self._log.info("Upload Manager ready; continuing acquisition startup")
 
             # run the acquisition
             self.timestamp_acquisition_started = time.time()
