@@ -16,16 +16,8 @@ class SetupComplete(Exception):
 
 
 @pytest.mark.parametrize("generate_map", [False, True])
-@pytest.mark.parametrize("manager_fails", [False, True])
-def test_setup_overlaps_startup_but_focus_and_acquisition_wait(monkeypatch, tmp_path, generate_map, manager_fails):
-    gate_reached = Event()
-
-    class Readiness(Future):
-        def result(self, timeout=None):
-            gate_reached.set()
-            return super().result(timeout=5)
-
-    ready = Readiness()
+def test_controller_builds_parameters_without_waiting_or_generating_focus(monkeypatch, tmp_path, generate_map):
+    ready = Future()
     start = MagicMock(return_value=ready)
     monkeypatch.setattr(UploadManagerClient, "ensure_ready_async", start)
     monkeypatch.setattr(control._def, "ENABLE_MEMORY_PROFILING", False)
@@ -54,41 +46,11 @@ def test_setup_overlaps_startup_but_focus_and_acquisition_wait(monkeypatch, tmp_
         start.assert_called_once(),
         pytest.fail("setup waited for manager") if ready.done() else None,
     )
-    errors = []
-
-    def run():
-        try:
-            MultiPointController.run_acquisition(controller)
-        except Exception as exc:
-            errors.append(exc)
-
-    thread = Thread(target=run, daemon=True)
-    thread.start()
-    try:
-        assert gate_reached.wait(5), errors
-        assert (tmp_path / "run" / "coordinates.csv").is_file()
-        controller.camera.stop_streaming.assert_called_once()
-        controller.camera.enable_callbacks.assert_called_once_with(True)
-        controller.autofocusController.gen_focus_map.assert_not_called()
-        controller.build_params.assert_not_called()
-        if manager_fails:
-            ready.set_exception(UploadManagerUnavailable("unavailable"))
-        else:
-            ready.set_result(None)
-        thread.join(5)
-        assert not thread.is_alive()
-        assert len(errors) == 1
-        if manager_fails:
-            assert isinstance(errors[0], UploadManagerUnavailable)
-            controller.autofocusController.gen_focus_map.assert_not_called()
-            controller.build_params.assert_not_called()
-        else:
-            assert isinstance(errors[0], SetupComplete)
-            if generate_map:
-                controller.autofocusController.gen_focus_map.assert_called_once()
-            else:
-                controller.build_params.assert_called_once()
-    finally:
-        if not ready.done():
-            ready.set_result(None)
-        thread.join(5)
+    with pytest.raises(SetupComplete):
+        MultiPointController.run_acquisition(controller)
+    assert not ready.done()
+    assert (tmp_path / "run" / "coordinates.csv").is_file()
+    controller.camera.stop_streaming.assert_called_once()
+    controller.camera.enable_callbacks.assert_called_once_with(True)
+    controller.build_params.assert_called_once()
+    controller.autofocusController.gen_focus_map.assert_not_called()

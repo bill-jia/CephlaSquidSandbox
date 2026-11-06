@@ -242,6 +242,8 @@ def make_worker(tmp_path):
 
 def test_validation_walk_uses_real_af_cadence_without_images_stacks_or_stimuli(tmp_path):
     worker, controller, stage = make_worker(tmp_path)
+    # This fixture exercises per-FOV validation after startup focus preparation.
+    worker._acquisition_focus_initialized = True
     worker._backpressure = MagicMock()
     worker._prewarm_observation_states = MagicMock(side_effect=AssertionError("no camera prewarm"))
     worker._prewarm_postprocess_routines = MagicMock(side_effect=AssertionError("no postprocessing prewarm"))

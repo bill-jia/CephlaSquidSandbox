@@ -1708,16 +1708,6 @@ class MultiPointController:
             # lets us do overlapping triggering (soon).
             self.camera.enable_callbacks(True)
 
-            # Independent setup above overlaps manager startup/recovery. Do not
-            # generate an autofocus map (or start imaging without one) until the
-            # manager has answered. Dataset registration remains mandatory in
-            # the worker before image production starts.
-            if upload_manager_ready is not None:
-                if not upload_manager_ready.done():
-                    self._log.info("Waiting for Upload Manager before autofocus/acquisition")
-                upload_manager_ready.result()
-                self._log.info("Upload Manager ready; continuing acquisition startup")
-
             # run the acquisition
             self.timestamp_acquisition_started = time.time()
             if self.focus_map:
@@ -1732,81 +1722,11 @@ class MultiPointController:
                         region_fov_coords[i] = (x, y, z)
                         self.scanCoordinates.update_fov_z_level(region_id, i, z)
 
-            elif self.gen_focus_map and not self.do_reflection_af:
-                self._log.info("Generating autofocus plane for multipoint grid")
-                bounds = self.scanCoordinates.get_scan_bounds()
-                if not bounds:
-                    return
-                x_min, x_max = bounds["x"]
-                y_min, y_max = bounds["y"]
-
-                # Calculate scan dimensions and center
-                x_span = abs(x_max - x_min)
-                y_span = abs(y_max - y_min)
-                x_center = (x_max + x_min) / 2
-                y_center = (y_max + y_min) / 2
-
-                # Determine grid size based on scan dimensions
-                if x_span < self.deltaX:
-                    fmap_Nx = 2
-                    fmap_dx = self.deltaX  # Force deltaX spacing for small scans
-                else:
-                    fmap_Nx = min(4, max(2, int(x_span / self.deltaX) + 1))
-                    fmap_dx = max(self.deltaX, x_span / (fmap_Nx - 1))
-
-                if y_span < self.deltaY:
-                    fmap_Ny = 2
-                    fmap_dy = self.deltaY  # Force deltaY spacing for small scans
-                else:
-                    fmap_Ny = min(4, max(2, int(y_span / self.deltaY) + 1))
-                    fmap_dy = max(self.deltaY, y_span / (fmap_Ny - 1))
-
-                # Calculate starting corner position (top-left of the AF map grid)
-                starting_x_mm = x_center - (fmap_Nx - 1) * fmap_dx / 2
-                starting_y_mm = y_center - (fmap_Ny - 1) * fmap_dy / 2
-                # TODO(sm): af map should be a grid mapped to a surface, instead of just corners mapped to a plane
-                try:
-                    # Store existing AF map if any
-                    self.focus_map_storage = []
-                    self.already_using_fmap = self.autofocusController.use_focus_map
-                    for x, y, z in self.autofocusController.focus_map_coords:
-                        self.focus_map_storage.append((x, y, z))
-
-                    # Define grid corners for AF map
-                    coord1 = (starting_x_mm, starting_y_mm)  # Starting corner
-                    coord2 = (
-                        starting_x_mm + (fmap_Nx - 1) * fmap_dx,
-                        starting_y_mm,
-                    )  # X-axis corner
-                    coord3 = (
-                        starting_x_mm,
-                        starting_y_mm + (fmap_Ny - 1) * fmap_dy,
-                    )  # Y-axis corner
-
-                    self._log.info(f"Generating AF Map: Nx={fmap_Nx}, Ny={fmap_Ny}")
-                    self._log.info(f"Spacing: dx={fmap_dx:.3f}mm, dy={fmap_dy:.3f}mm")
-                    self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
-
-                    # Generate and enable the AF map
-                    self.autofocusController.gen_focus_map(
-                        coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
-                    )
-                    self.autofocusController.set_focus_map_use(True)
-
-                    # Return to center position
-                    move_xy_with_z_retract(
-                        self.stage,
-                        x_center,
-                        y_center,
-                        retract=self.retract_z_between_regions,
-                        z_target_mm=None,
-                        home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
-                        log=self._log,
-                    )
-
-                except ValueError:
-                    self._log.exception("Invalid coordinates for autofocus plane, aborting.")
-                    return
+            prepare_focus = None
+            if not self.focus_map and self.gen_focus_map and not self.do_reflection_af:
+                self.focus_map_storage = list(self.autofocusController.focus_map_coords)
+                self.already_using_fmap = self.autofocusController.use_focus_map
+                prepare_focus = self._generate_acquisition_focus_map
 
             def finish_fn():
                 try:
@@ -1918,6 +1838,8 @@ class MultiPointController:
                     slack_notifier=self._slack_notifier,
                     prewarmed_job_runner=prewarmed_runner,
                     prewarmed_bp_values=prewarmed_bp_values,
+                    upload_manager_ready=upload_manager_ready,
+                    prepare_focus=prepare_focus,
                 )
             except Exception:
                 # Clean up pre-warmed runner if worker creation failed.
@@ -1950,6 +1872,84 @@ class MultiPointController:
                     self.selected_observation_state_names = list(prior_selection)
                     self._selected_observation_state_names_before_run = None
                 self._inline_observation_states_for_run = {}
+
+    def _generate_acquisition_focus_map(self):
+        """Hardware-only focus preparation, invoked by the worker just before imaging."""
+        self._log.info("Generating autofocus plane for multipoint grid")
+        bounds = self.scanCoordinates.get_scan_bounds()
+        if not bounds:
+            raise ValueError("No scan bounds available for autofocus map")
+        x_min, x_max = bounds["x"]
+        y_min, y_max = bounds["y"]
+
+        # Calculate scan dimensions and center
+        x_span = abs(x_max - x_min)
+        y_span = abs(y_max - y_min)
+        x_center = (x_max + x_min) / 2
+        y_center = (y_max + y_min) / 2
+
+        # Determine grid size based on scan dimensions
+        if x_span < self.deltaX:
+            fmap_Nx = 2
+            fmap_dx = self.deltaX  # Force deltaX spacing for small scans
+        else:
+            fmap_Nx = min(4, max(2, int(x_span / self.deltaX) + 1))
+            fmap_dx = max(self.deltaX, x_span / (fmap_Nx - 1))
+
+        if y_span < self.deltaY:
+            fmap_Ny = 2
+            fmap_dy = self.deltaY  # Force deltaY spacing for small scans
+        else:
+            fmap_Ny = min(4, max(2, int(y_span / self.deltaY) + 1))
+            fmap_dy = max(self.deltaY, y_span / (fmap_Ny - 1))
+
+        # Calculate starting corner position (top-left of the AF map grid)
+        starting_x_mm = x_center - (fmap_Nx - 1) * fmap_dx / 2
+        starting_y_mm = y_center - (fmap_Ny - 1) * fmap_dy / 2
+        # TODO(sm): af map should be a grid mapped to a surface, instead of just corners mapped to a plane
+        try:
+            # Store existing AF map if any
+            self.focus_map_storage = []
+            self.already_using_fmap = self.autofocusController.use_focus_map
+            for x, y, z in self.autofocusController.focus_map_coords:
+                self.focus_map_storage.append((x, y, z))
+
+            # Define grid corners for AF map
+            coord1 = (starting_x_mm, starting_y_mm)  # Starting corner
+            coord2 = (
+                starting_x_mm + (fmap_Nx - 1) * fmap_dx,
+                starting_y_mm,
+            )  # X-axis corner
+            coord3 = (
+                starting_x_mm,
+                starting_y_mm + (fmap_Ny - 1) * fmap_dy,
+            )  # Y-axis corner
+
+            self._log.info(f"Generating AF Map: Nx={fmap_Nx}, Ny={fmap_Ny}")
+            self._log.info(f"Spacing: dx={fmap_dx:.3f}mm, dy={fmap_dy:.3f}mm")
+            self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
+
+            # Generate and enable the AF map
+            self.autofocusController.gen_focus_map(
+                coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
+            )
+            self.autofocusController.set_focus_map_use(True)
+
+            # Return to center position
+            move_xy_with_z_retract(
+                self.stage,
+                x_center,
+                y_center,
+                retract=self.retract_z_between_regions,
+                z_target_mm=None,
+                home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                log=self._log,
+            )
+
+        except ValueError:
+            self._log.exception("Invalid coordinates for autofocus plane, aborting.")
+            raise
+
 
     def build_params(self, scan_position_information: ScanPositionInformation) -> AcquisitionParameters:
         # Determine plate dimensions from wellplate format if available

@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Type
 from datetime import datetime
 
@@ -1160,9 +1161,14 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         slack_notifier=None,
         prewarmed_job_runner: Optional[JobRunner] = None,
         prewarmed_bp_values: Optional["BackpressureValues"] = None,
+        upload_manager_ready: Optional[Future] = None,
+        prepare_focus: Optional[Callable[[], None]] = None,
     ):
         self._log = squid.logging.get_logger(__class__.__name__)
         self._timing = utils.TimingManager("MultiPointWorker Timer Manager")
+        self._prepare_focus = prepare_focus
+        self._upload_registration = None
+        self._startup_prepared = False
         self._alignment_widget = alignment_widget  # Optional AlignmentWidget for coordinate offset
         self._slack_notifier = slack_notifier  # Optional SlackNotifier for notifications
 
@@ -1664,7 +1670,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             from control.core.upload_manager_client import UploadManagerClient
 
             dataset_id = str(uuid4())
-            UploadManagerClient().register_dataset(
+            registration_params = dict(
                 dataset_id=dataset_id,
                 name=os.path.basename(os.path.normpath(self.experiment_path)),
                 local_root=self.experiment_path,
@@ -1673,11 +1679,14 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 deletion_mode="individual",
             )
             self._upload_target.manager_dataset_id = dataset_id
-            self._log.info(
-                f"Registered persistent upload dataset {dataset_id} "
-                f"-> {self._upload_target.remote_root}, "
-                f"delete_after_verify={self._upload_target.delete_after_verify}"
-            )
+            def register_upload():
+                if upload_manager_ready is not None:
+                    upload_manager_ready.result()
+                result = UploadManagerClient().register_dataset(**registration_params)
+                self._log.info("Registered persistent upload dataset %s", dataset_id)
+                return result
+
+            self._upload_registration = self._background_preparation(register_upload, "Upload registration")
             # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
             # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
             # run has len(array_keys) raw plates, and postprocessing adds one per
@@ -2160,6 +2169,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 # False below); without this seed, streaming would start in whatever
                 # mode live mode left the camera in.
                 self._seed_camera_for_first_observation_state()
+                self._start_postprocess_warmup_once()
                 self.camera.start_streaming()
                 # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
                 this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
@@ -2510,6 +2520,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             runners_exited_event.set()
             if self._upload_target is not None and self._upload_target.manager_owned:
                 try:
+                    registration = getattr(self, "_upload_registration", None)
+                    if registration is not None:
+                        registration.result()  # also order abort/finalize after registration
                     from control.core.upload_manager_client import UploadManagerClient
                     from control.core.zarr_upload import collect_sidecar_files
                     from control.core.zarr_layout import array_chunk_path
@@ -3565,7 +3578,69 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             "yx_shape": self._postprocess_frame_shape(),
         }
 
-    def _prewarm_postprocess_routines(self) -> None:
+    @staticmethod
+    def _background_preparation(fn, name):
+        future = Future()
+
+        def run():
+            try:
+                future.set_result(fn())
+            except Exception as exc:
+                future.set_exception(exc)
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+        return future
+
+    def _prepare_acquisition_once(self):
+        """Overlap compute/IPC with serialized hardware setup; join before AF."""
+        if getattr(self, "_startup_prepared", False) or self.abort_requested_fn():
+            return
+        try:
+            if self.validation_mode:
+                self._backpressure.reset()
+            else:
+                # Build metadata on the acquisition thread after camera seeding.
+                # Only pure postprocessing jobs execute concurrently with optics.
+                warmup = self._start_postprocess_warmup_once()
+                self._prewarm_observation_states()
+                for job_class, runner in self._job_runners:
+                    if self.abort_requested_fn():
+                        return
+                    if runner is not None and not runner.wait_ready(timeout_s=15.0):
+                        raise TimeoutError(f"Job runner for {job_class.__name__} did not become ready before autofocus")
+                self._wait_for_postprocess_warmup(warmup)
+                registration = getattr(self, "_upload_registration", None)
+                if registration is not None:
+                    self._log.info("Waiting for upload registration before autofocus")
+                    while not self.abort_requested_fn():
+                        try:
+                            registration.result(timeout=0.05)
+                            break
+                        except FutureTimeoutError:
+                            # A completed future can itself contain TimeoutError.
+                            if registration.done():
+                                raise
+                self._first_job_dispatched = True
+            if not self.abort_requested_fn():
+                self._startup_prepared = True
+        except Exception:
+            self.request_abort_fn()
+            raise
+
+    def _start_postprocess_warmup_once(self):
+        if not getattr(self, "_postprocess_warmup_started", False):
+            # Warmup jobs increment the same shared counters as image jobs.
+            # Reset before dispatch, never while those jobs are already pending.
+            self._backpressure.reset()
+            try:
+                self._postprocess_warmup = self._prewarm_postprocess_routines(wait=False)
+            except Exception:
+                self.request_abort_fn()
+                raise
+            self._postprocess_warmup_started = True
+        return self._postprocess_warmup
+
+    def _prewarm_postprocess_routines(self, *, wait=True):
         """Precompute FOV-shared routine state (e.g. transfer functions) BEFORE
         the first hardware trigger, so the first FOV's compute is a cache hit and
         never stalls saving/display or backpressures the run.
@@ -3611,14 +3686,32 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             return
         self._log.info(f"Pre-computing {len(jobs)} postprocess routine(s) before acquisition...")
         if runner is None:
-            # No multiprocessing runner (e.g. USE_MULTIPROCESSING False): run inline.
+            # No multiprocessing runner: compute in a background thread while
+            # hardware setup continues; imaging only starts after the join.
+            runner = self._background_preparation(lambda: [job.run() for job in jobs], "Postprocess precomputation")
+        else:
+            # Queues exist at start(); dispatch can overlap subprocess startup.
             for job in jobs:
-                job.run()
+                if not runner.dispatch(job):
+                    raise RuntimeError("Could not dispatch postprocess warmup")
+        if wait:
+            self._wait_for_postprocess_warmup(runner)
+        return runner
+
+    def _wait_for_postprocess_warmup(self, runner):
+        if runner is None:
             return
-        # Make sure the subprocess is up before dispatching (bounded).
-        runner.wait_ready(timeout_s=15.0)
-        for job in jobs:
-            runner.dispatch(job)
+        if isinstance(runner, Future):
+            # Inline routines share the in-process cache, so finish before capture.
+            deadline = time.monotonic() + 180.0
+            while not self.abort_requested_fn():
+                try:
+                    runner.result(timeout=0.05)
+                    return
+                except FutureTimeoutError:
+                    if runner.done() or time.monotonic() >= deadline:
+                        raise
+            return
         # Wait for warmups to finish so the first FOV is a cache hit. Bounded so a
         # hung warmup can't wedge the run — on timeout we proceed (lazy compute).
         deadline = time.time() + 180.0
@@ -4003,24 +4096,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # Reset backpressure counters at acquisition start
         # IMPORTANT: Must be before any camera triggers
         ordered_visit = getattr(self, "_ordered_visit", None)
-        prewarm = ordered_visit is None or not self._ordered_prewarmed
-        if prewarm:
-            self._backpressure.reset()
-
-        # Pre-warm every distinct observation state preset once BEFORE the
-        # FOV loop. Absorbs the first-call one-off costs (most notably the
-        # ~1 s GenICam SensorOperationMode write + Cap_Start that
-        # set_camera_mode pays the first time it actually switches modes)
-        # into a dedicated init timer instead of polluting the first FOV's
-        # per-capture stats. Amortizes to ~zero over long runs.
-        if not self.validation_mode and prewarm:
-            self._prewarm_observation_states()
-
-        # Precompute FOV-shared postprocessing state (e.g. transfer functions)
-        # before any hardware fires, so the first FOV's compute is a cache hit
-        # and never stalls the first save/display.
-        if not self.validation_mode and prewarm:
-            self._prewarm_postprocess_routines()
+        self._prepare_acquisition_once()
         if ordered_visit is not None:
             self._ordered_prewarmed = True
 
@@ -4536,6 +4612,18 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         """Run focus preparation after warmups, immediately before the FOV loop."""
         if getattr(self, "_acquisition_focus_initialized", False) or self.abort_requested_fn():
             return
+        prepare_focus = getattr(self, "_prepare_focus", None)
+        if prepare_focus is not None:
+            config = self.liveController.get_observation_state_by_name(MULTIPOINT_AUTOFOCUS_CHANNEL)
+            if config is None:
+                self.request_abort_fn()
+                raise RuntimeError(f"Missing contrast autofocus observation state {MULTIPOINT_AUTOFOCUS_CHANNEL!r}")
+            self._select_config(config)
+            try:
+                prepare_focus()
+            except Exception:
+                self.request_abort_fn()
+                raise
         if self.do_reflection_af and self.laser_auto_focus_controller is not None:
             # Preset warmup can change illumination. AF needs a clean reflection.
             self.liveController.obs_controller.turn_off_illumination()
@@ -4549,6 +4637,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 elif self._laser_af_seed_mode == "scan":
                     with self._timing.get_timer("laser_af_seed_scan"):
                         self._seed_fov_z_map()
+            except Exception:
+                self.request_abort_fn()
+                raise
             finally:
                 af._timing = saved_timing
         if not self.abort_requested_fn():
