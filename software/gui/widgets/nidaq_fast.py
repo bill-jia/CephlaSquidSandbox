@@ -177,6 +177,7 @@ class NIDAQWidget(QWidget):
         rate_row = QHBoxLayout()
         rate_row.addWidget(QLabel("Sample Rate (Hz):"))
         self.sample_rate_spin = QDoubleSpinBox()
+        self.sample_rate_spin.setKeyboardTracking(False)
         self.sample_rate_spin.setRange(1, 1000000)
         self.sample_rate_spin.setValue(10000)
         self.sample_rate_spin.setDecimals(0)
@@ -187,6 +188,7 @@ class NIDAQWidget(QWidget):
         samples_row = QHBoxLayout()
         samples_row.addWidget(QLabel("Samples per Channel:"))
         self.num_samples_spin = QSpinBox()
+        self.num_samples_spin.setKeyboardTracking(False)
         self.num_samples_spin.setRange(2, 10000000)
         self.num_samples_spin.setValue(10000)
         samples_row.addWidget(self.num_samples_spin)
@@ -406,6 +408,9 @@ class NIDAQWidget(QWidget):
         daq_dur_row = QHBoxLayout()
         daq_dur_row.addWidget(QLabel("Duration (s):"))
         self.daq_only_duration_spin = QDoubleSpinBox()
+        # Apply typed durations on Enter/focus loss, not each intermediate digit:
+        # valueChanged resizes (and can permanently crop) the stored waveforms.
+        self.daq_only_duration_spin.setKeyboardTracking(False)
         self.daq_only_duration_spin.setRange(0.001, 86400.0)
         self.daq_only_duration_spin.setValue(10.0)
         self.daq_only_duration_spin.setDecimals(3)
@@ -967,6 +972,9 @@ class NIDAQWidget(QWidget):
         for ax in (self.ax_ao, self.ax_do):
             ax.relim()
             ax.autoscale_view()
+        # Empty plots must have the same timebase as populated plots. Otherwise an
+        # initial redraw caches Matplotlib's default limits and clips the first pattern.
+        self.ax_ao.set_xlim(0.0, max(xspan_s, 1.0 / rate))
         tb = getattr(self, "plot_toolbar", None)
         if tb is not None:
             tb.update()          # drop stale nav history
@@ -1695,7 +1703,9 @@ class NIDAQWidget(QWidget):
             # Configure DAQ with minimal settings for writing zeros
             zero_config = {
                 "device_name": self._ni_daq.device_name,
-                "sample_rate_hz": 1000.0,  # Low rate for quick write
+                # configure() mutates the shared timebase used to display stored
+                # waveforms; cleanup must preserve their acquisition sample rate.
+                "sample_rate_hz": self._ni_daq.sample_rate_hz,
                 "samples_per_channel": num_samples,
                 "ao_channels": ao_channels,
                 "do_port": self._ni_daq.do_port,
@@ -2426,11 +2436,12 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Frame Rate (Hz):"), 0, 0)
         self.frame_rate_spinbox = QDoubleSpinBox()
+        self.frame_rate_spinbox.setKeyboardTracking(False)
         self.frame_rate_spinbox.setRange(0.1, 1000.0)
         self.frame_rate_spinbox.setValue(10.0)
         self.frame_rate_spinbox.setDecimals(2)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
-        self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
+        self.frame_rate_spinbox.valueChanged.connect(self._on_frame_rate_changed)
         self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
         self.max_frame_rate_label = QLabel("")
         self.max_frame_rate_label.setToolTip(
@@ -2457,6 +2468,7 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Number of Frames:"), 1, 0)
         self.num_frames_spinbox = QSpinBox()
+        self.num_frames_spinbox.setKeyboardTracking(False)
         self.num_frames_spinbox.setRange(0, 1000000)
         self.num_frames_spinbox.setValue(100)
         self.num_frames_spinbox.setSpecialValueText("Continuous")
@@ -2465,6 +2477,8 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Total Acquisition Time (s):"), 1, 2)
         self.total_time_spinbox = QDoubleSpinBox()
+        # Avoid cropping linked waveforms while a duration is still being typed.
+        self.total_time_spinbox.setKeyboardTracking(False)
         self.total_time_spinbox.setRange(0.001, 3600.0)
         self.total_time_spinbox.setValue(10.0)
         self.total_time_spinbox.setDecimals(3)
@@ -2527,6 +2541,7 @@ class FastAcquisitionWidget(QWidget):
 
         daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 1, 2)
         self.daq_sample_rate_spinbox = QDoubleSpinBox()
+        self.daq_sample_rate_spinbox.setKeyboardTracking(False)
         self.daq_sample_rate_spinbox.setRange(100.0, 1000000.0)
         self.daq_sample_rate_spinbox.setValue(10000.0)
         self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
@@ -2583,6 +2598,11 @@ class FastAcquisitionWidget(QWidget):
         
         # Connect DAQ sample rate changes
         self.daq_sample_rate_spinbox.valueChanged.connect(self._on_daq_sample_rate_changed)
+        self.ni_daq_widget.link_to_fast_acquisition_checkbox.toggled.connect(
+            lambda linked: self._on_daq_sample_rate_changed(self.daq_sample_rate_spinbox.value())
+            if linked else None
+        )
+        self._on_daq_sample_rate_changed(self.daq_sample_rate_spinbox.value())
         
         # Note: Total acquisition time changes are already handled in 
         # _update_acquisition_time_from_frames and _update_frames_from_acquisition_time
@@ -2783,10 +2803,16 @@ class FastAcquisitionWidget(QWidget):
             # Fallback: keep original maximum
             self.exposure_time_spinbox.setMaximum(10000.0)
     
+    def _on_frame_rate_changed(self):
+        """Keep the requested duration fixed when changing frame rate."""
+        if self.num_frames_spinbox.value() == 0:
+            return  # Preserve explicitly selected continuous acquisition.
+        self._update_frames_from_acquisition_time()
+
     def _update_acquisition_time_from_frames(self):
         """
         Update total acquisition time based on number of frames and frame rate.
-        Called when number of frames or frame rate changes.
+        Called when number of frames changes.
         """
         if self._updating_acquisition_params:
             return
