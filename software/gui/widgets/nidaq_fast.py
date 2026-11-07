@@ -1676,71 +1676,10 @@ class NIDAQWidget(QWidget):
                 self._log.debug("No outputs configured, nothing to zero")
                 return
             
-            # Create zero waveforms for all configured outputs
-            # Use current config to determine number of samples
-            num_samples = self._ni_daq.samples_per_channel
-            if num_samples == 0:
-                num_samples = 1  # At least one sample needed
-            
-            zero_ao_waveforms = {}
-            zero_do_patterns = {}
-            
-            # Create zero waveforms for analog outputs
-            for channel in ao_channels:
-                zero_ao_waveforms[channel] = np.zeros(num_samples, dtype=np.float64)
-            
-            # Create zero patterns for digital outputs
-            for line in do_lines:
-                zero_do_patterns[line] = np.zeros(num_samples, dtype=bool)
-            
-            # Create a minimal config for writing zeros
-            from control.nidaq import WaveformData, TriggerSource
-            zero_waveforms = WaveformData(
-                analog_output=zero_ao_waveforms,
-                digital_output=zero_do_patterns
-            )
-            
-            # Configure DAQ with minimal settings for writing zeros
-            zero_config = {
-                "device_name": self._ni_daq.device_name,
-                # configure() mutates the shared timebase used to display stored
-                # waveforms; cleanup must preserve their acquisition sample rate.
-                "sample_rate_hz": self._ni_daq.sample_rate_hz,
-                "samples_per_channel": num_samples,
-                "ao_channels": ao_channels,
-                "do_port": self._ni_daq.do_port,
-                "do_lines": do_lines,
-                "trigger_source": TriggerSource.SOFTWARE,
-                "continuous": False,
-                "do_logic_family": self._ni_daq.do_logic_family,
-            }
-            
-            # Stop any running tasks first
-            try:
-                self._ni_daq.stop()
-            except:
-                pass
-            
-            # Configure and set zero waveforms
-            self._ni_daq.configure(**zero_config)
-            self._ni_daq.set_waveforms(zero_waveforms)
-            
-            # Arm and trigger to write zeros
-            self._ni_daq.arm()
-            self._ni_daq.start_trigger()
-            
-            # Wait briefly for the write to complete
-            import time
-            time.sleep(0.1)
-            
-            # Stop and release tasks so the device is free for live output or next acquisition
-            self._ni_daq.stop()
-            self._ni_daq.release_tasks()
-            
-            # Note: We do NOT update self._ao_waveforms or self._do_patterns here
-            # to preserve the user's configured waveforms. Only the hardware outputs
-            # are zeroed, not the stored waveform data.
-            
+            # Use dedicated output writes; never restart the full acquisition
+            # (including its input tasks) just to set resting levels.
+            self._ni_daq.zero_outputs(ao_channels, do_lines)
+
             self._log.info(f"Zeroed all outputs: {len(ao_channels)} AO channels, {len(do_lines)} DO lines")
             
         except Exception as e:
@@ -3101,6 +3040,7 @@ class FastAcquisitionWidget(QWidget):
         
         except Exception as e:
             self._log.error(f"Error starting acquisition: {e}", exc_info=True)
+            self._restore_camera_state()
             error_dialog(f"Failed to start acquisition: {e}", "Error")
     
     def stop_acquisition(self):
