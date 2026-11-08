@@ -1,6 +1,7 @@
 """Bounded, cancellable sample/illumination calibration acquisition workflow."""
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import threading
 import time
 import traceback
@@ -9,6 +10,7 @@ import sys
 import numpy as np
 
 from control.core.sample_incidence_analysis import (
+    analysis_pixel_scale,
     assess_flatness,
     focus_peaks,
     incidence_from_planes,
@@ -35,8 +37,24 @@ class AlignmentSettings:
     black_level: float = 0.0
     settle_s: float = 0.05
     repeat: bool = True
+    sample_kind: str = "texture"
+    bead_radius_px: int = 16
+    bead_focus_metric: str = "sharpness"
+    analysis_maximum: int = 512
+    bead_min_snr: float = 8.0
+    stage_rms_limit_px: float = 1.0
 
     def validate(self):
+        if not np.isfinite(self.stage_rms_limit_px) or not 0.25 <= self.stage_rms_limit_px <= 10:
+            raise ValueError("Stage-motion RMS limit must be 0.25–10 pixels at the reference analysis resolution.")
+        if self.analysis_maximum not in (0, 256, 512, 1024, 2048):
+            raise ValueError("Analysis resolution must be native (0), 256, 512, 1024 or 2048 pixels.")
+        if not np.isfinite(self.bead_min_snr) or not 3 <= self.bead_min_snr <= 20:
+            raise ValueError("Bead signal threshold must be 3–20 times estimated noise.")
+        if self.sample_kind not in ("texture", "beads") or self.bead_focus_metric not in ("sharpness", "brightness"):
+            raise ValueError("Unknown sample type or bead focus metric.")
+        if not 4 <= self.bead_radius_px <= 48 or int(self.bead_radius_px) != self.bead_radius_px:
+            raise ValueError("Bead aperture radius must be 4–48 native camera pixels.")
         numbers = (
             self.dither_fraction,
             self.focus_half_range_um,
@@ -52,8 +70,8 @@ class AlignmentSettings:
             raise ValueError("Dither radius must be 0.05–0.45 FOV, preserving overlap and staying within one FOV.")
         if not 0.1 <= self.focus_half_range_um <= 20 or not 0.2 <= self.z_baseline_um <= 40:
             raise ValueError("Focus range or incidence Z baseline is outside supported bounds.")
-        if self.focus_steps < 5 or self.focus_steps > 31 or self.focus_steps % 2 != 1:
-            raise ValueError("Use an odd focus plane count between 5 and 31.")
+        if self.focus_steps < 5 or self.focus_steps > 61 or self.focus_steps % 2 != 1:
+            raise ValueError("Use an odd focus plane count between 5 and 61.")
         if min(self.max_plane_span_um, self.max_residual_um) <= 0 or self.black_level < 0 or self.settle_s < 0:
             raise ValueError("Tolerances must be positive, and black level/settling nonnegative.")
 
@@ -84,12 +102,45 @@ class AlignmentHardware:
         self.mcu = getattr(drivers, "microcontroller", None)
         self.illumination = getattr(microscope, "illumination_controller", None)
         self._saved = None
+        self._continuous_light = False
 
     def _lights_off(self):
         if self.illumination is not None:
             self.illumination.turn_off_all_hardware_preserving_state()
         else:
             self.scope.obs_controller.turn_off_illumination()
+
+    def _lights_on(self):
+        config = self.scope.obs_controller.current_observation_state
+        if self.illumination is not None:
+            if config is None or not config.active_illuminator_states:
+                raise ValueError("Select an active fluorescence illumination state before calibration.")
+            self.illumination.apply_observation_illumination(
+                config.active_illuminator_states, turn_on=True, force_hardware=True
+            )
+        else:
+            self.scope.obs_controller.turn_on_illumination()
+
+    @contextmanager
+    def illuminated(self, settle_s=0.05):
+        """Keep steady illumination through a bounded stack/sweep, including errors."""
+        config = self.scope.obs_controller.current_observation_state
+        if config is not None and getattr(config, "is_waveform_driven", False):
+            raise ValueError("Bead calibration requires steady illumination; select a non-timed fluorescence preset.")
+        if self._continuous_light:
+            raise RuntimeError("An illuminated calibration block is already active.")
+        try:
+            self._wait_mcu()
+            self._lights_on()
+            self._continuous_light = True
+            self._wait_mcu()
+            if self.cancel.wait(settle_s):
+                raise CalibrationCancelled()
+            yield
+        finally:
+            self._continuous_light = False
+            self._lights_off()
+            self._wait_mcu()
 
     def _restore_logical_illumination(self, snapshot):
         # Do not use IlluminationController.restore here: it logs individual
@@ -270,6 +321,8 @@ class AlignmentHardware:
 
     def refocus(self, max_correction_um):
         self.check_cancelled()
+        if self._continuous_light:
+            raise RuntimeError("Laser AF must run outside an illuminated measurement block.")
         if self.af_ready:
             # Explicitly darken the specimen before AF, including manually
             # asserted light. The main live trigger stays stopped throughout
@@ -316,15 +369,8 @@ class AlignmentHardware:
                     raise RuntimeError("The timed illumination pulse did not fire.")
 
                 cleanup = arm_nidaq_pulse_for_capture(self.scope, config, log=log, on_wait_failure=failed)
-            else:
-                if self.illumination is not None:
-                    if config is None or not config.active_illuminator_states:
-                        raise ValueError("Select an active fluorescence illumination state before calibration.")
-                    self.illumination.apply_observation_illumination(
-                        config.active_illuminator_states, turn_on=True, force_hardware=True
-                    )
-                else:
-                    self.scope.obs_controller.turn_on_illumination()
+            elif not self._continuous_light:
+                self._lights_on()
             self._wait_mcu()
             self.camera.send_trigger(self.camera.get_exposure_time())
             while time.monotonic() < deadline:
@@ -348,7 +394,8 @@ class AlignmentHardware:
                 if cleanup is not None:
                     cleanup()
             finally:
-                self._lights_off()
+                if not self._continuous_light:
+                    self._lights_off()
                 self._wait_mcu()
 
 
@@ -364,11 +411,14 @@ class SampleIncidenceSession:
         flatness_ready=lambda *a: None,
         incidence_ready=lambda *a: None,
         recorder=None,
+        phase="both",
+        calibration=None,
     ):
         self.hardware, self.settings, self.pixel_size_um = hardware, settings, pixel_size_um
         self.progress, self.flatness_ready, self.incidence_ready = progress, flatness_ready, incidence_ready
         self.recorder = recorder
         self.sweep = 0
+        self.phase, self.calibration = phase, calibration
 
     def _record(self, kind, **data):
         if self.recorder is not None:
@@ -394,6 +444,14 @@ class SampleIncidenceSession:
     def run(self):
         s, hw = self.settings, self.hardware
         s.validate()
+        if self.phase not in ("flatness", "incidence", "both"):
+            raise ValueError("Unknown calibration step.")
+        if self.phase == "incidence":
+            if self.calibration is None or not self.calibration["flatness"].accepted:
+                raise ValueError("Measure and pass sample flatness before starting incidence.")
+            state = hw.scope.obs_controller.current_observation_state
+            if state is None or getattr(state, "confocal_mode", True):
+                raise ValueError("Switch to a widefield fluorescence preset, then click Measure incidence.")
         if not np.isfinite(self.pixel_size_um) or self.pixel_size_um <= 0:
             raise ValueError("A calibrated objective/camera pixel size is required.")
         if self.recorder is None:
@@ -402,6 +460,7 @@ class SampleIncidenceSession:
         self.recorder.start(
             dict(
                 settings=s,
+                measurement_phase=self.phase,
                 pixel_size_um=self.pixel_size_um,
                 python_version=sys.version,
                 numpy_version=np.__version__,
@@ -441,9 +500,14 @@ class SampleIncidenceSession:
 
     def _run(self):
         s, hw = self.settings, self.hardware
+        if s.sample_kind == "beads":
+            from control.core.sample_bead_calibration import run_bead_session
+
+            return run_bead_session(self)
         with hw:
             self._record("hardware_state", saved_state=hw._saved)
             first = self._capture("initial")
+            pixel_scale = analysis_pixel_scale(first.shape, s.analysis_maximum)
             fov_um = min(first.shape[:2]) * self.pixel_size_um
             offsets = dither_offsets(s.dither_fraction * fov_um)
             hw.validate_path(offsets, max(5, 2 * s.focus_half_range_um) + s.focus_half_range_um + s.z_baseline_um / 2)
@@ -466,7 +530,7 @@ class SampleIncidenceSession:
                             image = self._capture("flatness", field=index + 1, plane=plane + 1, target_z_um=target)
                             score = texture_scores(image, s.black_level)
                             scores.append(score)
-                            small = preview(image)
+                            small = preview(image, s.analysis_maximum)
                             if np.mean(score) > best_score:
                                 best_image, best_score = small, np.mean(score)
                             self.progress(f"Flatness: field {index+1}/9, Z plane {plane+1}/{s.focus_steps}", small)
@@ -483,7 +547,7 @@ class SampleIncidenceSession:
                     images.append(best_image)
                     nominal_heights.append(base_z + piezo)
                 self._record("flatness_registration_input", images=images, positions_um=positions)
-                shifts, transform, error = register_fields(images, positions)
+                shifts, transform, error = register_fields(images, positions, s.analysis_maximum, pixel_scale)
                 self._record("flatness_registration", shifts=shifts, transform=transform, error_px=error)
                 flatness = assess_flatness(
                     positions - positions[0], scans, transform, images[0].shape, s.max_plane_span_um, s.max_residual_um
@@ -506,7 +570,13 @@ class SampleIncidenceSession:
                         "brightness variation alone is not evidence of height or holder tilt."
                     )
                 self._record("flatness", result=flatness, focus_offsets_um=focus_offsets)
+                self.calibration = {"kind": "texture", "flatness": flatness}
                 self.flatness_ready(flatness)
+                if self.phase == "flatness":
+                    self.progress(
+                        "Flatness complete. Review the result, select widefield, then click Measure incidence.", None
+                    )
+                    return
                 if not flatness.accepted:
                     self.progress(
                         "Flatness did not pass. Adjust holder/coating and repeat; incidence is gated.", images[0]
@@ -537,7 +607,8 @@ class SampleIncidenceSession:
                                         plane=plane + 1,
                                         delta_z_um=delta,
                                         target_z_um=base_z + delta,
-                                    )
+                                    ),
+                                    s.analysis_maximum,
                                 )
                                 planes[plane].append(small)
                                 times[plane].append(self.last_capture_monotonic_s)
@@ -563,7 +634,8 @@ class SampleIncidenceSession:
                                     plane=plane + 1,
                                     delta_z_um=delta,
                                     target_z_um=base_z + delta,
-                                )
+                                ),
+                                s.analysis_maximum,
                             )
                             first_signal = np.median(planes[plane][0]) - s.black_level
                             last_signal = np.median(reference) - s.black_level
@@ -600,7 +672,9 @@ class SampleIncidenceSession:
                     fits, transforms = [], []
                     for plane, fields in enumerate(planes):
                         self._record("incidence_registration_input", cycle=cycle + 1, plane=plane + 1, images=fields)
-                        plane_shifts, plane_transform, _ = register_fields(fields, positions)
+                        plane_shifts, plane_transform, _ = register_fields(
+                            fields, positions, s.analysis_maximum, pixel_scale
+                        )
                         self._record(
                             "incidence_registration",
                             cycle=cycle + 1,
@@ -613,10 +687,10 @@ class SampleIncidenceSession:
                         self._record("incidence_illumination", cycle=cycle + 1, plane=plane + 1, result=fits[-1])
                     if any(np.linalg.norm(t - transform) / np.linalg.norm(transform) > 0.05 for t in transforms):
                         raise ValueError("Image scale/orientation changed across Z; incidence angle is inconclusive.")
-                    result = incidence_from_planes(*fits, s.z_baseline_um, transform)
+                    result = incidence_from_planes(*fits, s.z_baseline_um, transform, pixel_scale)
                     result.reference_drift = drift
                     self._record("incidence", cycle=cycle + 1, result=result)
                     self.incidence_ready(result)
                     hw.move_xy(*positions[0])
-                if not s.repeat:
+                if not s.repeat or self.phase == "incidence":
                     return

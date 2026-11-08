@@ -30,8 +30,12 @@ def result(angle=1.0, center=(15.5, 15.5)):
     return IncidenceResult(illumination, angle, None, "Test result", 0.01 if angle is not None else None)
 
 
-def test_popup_blocks_parent_and_best_uses_angle_and_center(dialog):
+def test_popup_allows_mode_switch_when_idle_and_best_uses_angle_and_center(dialog):
+    assert dialog.windowModality() == Qt.NonModal
+    dialog._set_running(True)
     assert dialog.windowModality() == Qt.WindowModal
+    dialog._set_running(False)
+    assert dialog.windowModality() == Qt.NonModal
     dialog._incidence(result(2))
     first = dialog.best
     dialog._incidence(result(1))
@@ -107,6 +111,76 @@ def test_busy_acquisition_cannot_start_calibration(dialog):
     dialog.start_button.click()
     assert not dialog.running
     assert "Another acquisition" in dialog.status.text()
+
+
+def test_sampling_controls_invalidate_flatness_and_lock_during_acquisition(dialog, qtbot, monkeypatch):
+    import gui.widgets.sample_incidence_alignment as module
+
+    settings_seen = []
+
+    class Session:
+        def __init__(self, hw, settings, *args, **kwargs):
+            settings_seen.append(settings)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(module, "SampleIncidenceSession", Session)
+    assert dialog.analysis_resolution.currentData() == 512
+    assert not dialog.bead_snr.isEnabled()
+    assert not dialog.stage_rms_limit.isEnabled()
+    dialog.sample_kind.setCurrentIndex(1)
+    assert dialog.bead_snr.isEnabled() and dialog.bead_snr.value() == 8
+    assert dialog.stage_rms_limit.isEnabled() and dialog.stage_rms_limit.value() == 1
+    for control, change in (
+        (dialog.analysis_resolution, lambda: dialog.analysis_resolution.setCurrentIndex(4)),
+        (dialog.bead_snr, lambda: dialog.bead_snr.setValue(5)),
+        (dialog.stage_rms_limit, lambda: dialog.stage_rms_limit.setValue(1.5)),
+    ):
+        dialog._calibration = {"flatness": flatness_example()}
+        dialog.incidence_button.setEnabled(True)
+        change()
+        assert dialog._calibration is None and not dialog.incidence_button.isEnabled()
+    dialog._set_running(True)
+    assert not dialog.analysis_resolution.isEnabled() and not dialog.bead_snr.isEnabled()
+    assert not dialog.stage_rms_limit.isEnabled()
+    dialog._set_running(False)
+    dialog.start_button.click()
+    qtbot.waitUntil(lambda: settings_seen and not dialog.running and dialog.start_button.isEnabled())
+    assert settings_seen[0].analysis_maximum == 0
+    assert settings_seen[0].bead_min_snr == 5
+    assert settings_seen[0].stage_rms_limit_px == 1.5
+
+
+def test_flatness_requires_explicit_second_click_and_keeps_transform(dialog, qtbot, monkeypatch):
+    import gui.widgets.sample_incidence_alignment as module
+
+    runs = []
+    flat = flatness_example()
+
+    class Session:
+        def __init__(self, hw, settings, pixel_um, progress, flatness, incidence, **kwargs):
+            self.flatness = flatness
+
+        def run(self):
+            runs.append(self.phase)
+            if self.phase == "flatness":
+                self.calibration = {"kind": "beads", "flatness": flat}
+                self.flatness(flat)
+
+    monkeypatch.setattr(module, "SampleIncidenceSession", Session)
+    dialog.sample_kind.setCurrentIndex(1)
+    assert dialog.steps.value() == 31 and not dialog.incidence_button.isEnabled()
+    dialog.start_button.click()
+    qtbot.waitUntil(lambda: not dialog.running and dialog.incidence_button.isEnabled())
+    assert runs == ["flatness"]
+    assert dialog.windowModality() == Qt.NonModal
+    dialog.incidence_button.click()
+    qtbot.waitUntil(lambda: len(runs) == 2 and not dialog.running and dialog.start_button.isEnabled())
+    assert runs == ["flatness", "incidence"]
+    np.testing.assert_allclose(dialog._stage_to_image, flat.stage_to_image)
+    dialog.sample_kind.setCurrentIndex(0)
+    assert not dialog.incidence_button.isEnabled()
 
 
 def test_recording_checkbox_folder_picker_and_missing_folder_validation(dialog, monkeypatch, tmp_path):

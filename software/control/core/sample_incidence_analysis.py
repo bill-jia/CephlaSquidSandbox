@@ -19,12 +19,20 @@ def preview(image, maximum=512):
         image = image[..., :3].mean(axis=-1)
     if image.ndim != 2 or min(image.shape) < 24 or not np.isfinite(image).all():
         raise ValueError("A finite monochrome/RGB camera field of at least 24 pixels is required.")
-    scale = min(1.0, maximum / max(image.shape))
+    if maximum != 0 and (maximum < 24 or int(maximum) != maximum):
+        raise ValueError("Analysis image limit must be zero (native) or at least 24 pixels.")
+    scale = min(1.0, maximum / max(image.shape)) if maximum else 1.0
     return cv2.resize(
         image.astype(np.float32),
         (round(image.shape[1] * scale), round(image.shape[0] * scale)),
         interpolation=cv2.INTER_AREA,
     )
+
+
+def analysis_pixel_scale(native_shape, maximum=512):
+    """Scale pixel tolerances with resolution, preserving their original FOV size."""
+    edge = max(native_shape[:2])
+    return min(edge, maximum or edge) / min(edge, 512)
 
 
 def robust_fit(design, values, iterations=8):
@@ -109,20 +117,20 @@ def focus_peaks(z_um, scores):
     return FocusPeaks(height, uncertainty, np.isfinite(height))
 
 
-def register_fields(images, positions_um):
+def register_fields(images, positions_um, maximum=512, pixel_scale=1.0):
     """Measure texture motion, then calibrate stage-to-image direction/scale.
 
     High-pass phase correlation tolerates broad illumination differences. This
     empirical transform handles image rotation, reflection and stage axis signs.
     """
-    fields = [preview(image) for image in images]
+    fields = [preview(image, maximum) for image in images]
     if any(image.shape != fields[0].shape for image in fields):
         raise ValueError("Camera field dimensions changed during the sweep.")
-    reference = fields[0] - cv2.GaussianBlur(fields[0], (0, 0), 8)
+    reference = fields[0] - cv2.GaussianBlur(fields[0], (0, 0), 8 * pixel_scale)
     window = cv2.createHanningWindow((reference.shape[1], reference.shape[0]), cv2.CV_32F)
     shifts = [np.zeros(2)]
     for image in fields[1:]:
-        high = image - cv2.GaussianBlur(image, (0, 0), 8)
+        high = image - cv2.GaussianBlur(image, (0, 0), 8 * pixel_scale)
         shift, response = cv2.phaseCorrelate(reference.copy(), high, window.copy())
         if response < 0.12 or not np.isfinite(shift).all():
             raise ValueError("Overlapping texture could not be registered reliably; use a smaller XY dither.")
@@ -132,7 +140,7 @@ def register_fields(images, positions_um):
     offsets = positions - positions[0]
     transform = np.linalg.lstsq(offsets, shifts, rcond=None)[0].T
     error = float(np.sqrt(np.mean(np.sum((offsets @ transform.T - shifts) ** 2, axis=1))))
-    if np.linalg.matrix_rank(transform) < 2 or np.linalg.cond(transform) > 4 or error > 2:
+    if np.linalg.matrix_rank(transform) < 2 or np.linalg.cond(transform) > 4 or error > 2 * pixel_scale:
         raise ValueError("Texture motion is inconsistent with XY travel; alignment measurements are inconclusive.")
     return shifts, transform, error
 
@@ -209,6 +217,8 @@ def assess_flatness(positions_um, peaks, transform, field_shape, max_span_um=0.5
     checks. Weak edge curves are excluded, not assigned a spurious height.
     Nine valid central regions can establish a plane without usable edge peaks;
     unavailable local slopes/overlap checks are reported explicitly in that case.
+    Separation assumes stable XY height travel. It does not establish the
+    absolute objective axis or distinguish stage-axis tilt from optical tilt.
     """
     resolutions = [np.median(peak.uncertainty_um[peak.valid]) for peak in peaks if np.any(peak.valid)]
     if not resolutions or max(resolutions) > max_residual_um:
@@ -292,7 +302,9 @@ def assess_flatness(positions_um, peaks, transform, field_shape, max_span_um=0.5
                 " Edge peaks unresolved; flatness uses distributed central regions, without an overlap focus check."
             )
     elif consistent and residual_rms <= max_residual_um and overlap_ok:
-        diagnosis = "Consistent geometric tilt across fields; adjust sample holder relative to the objective."
+        diagnosis = (
+            "Consistent geometric tilt relative to stage travel; check sample seating and stage/optical alignment."
+        )
     else:
         diagnosis = "Inconsistent sample-fixed defocus: coating/topography or changing optical effects; holder tilt is unproven."
     # Directly observed focus relative to each field's center, BEFORE removing
@@ -449,7 +461,7 @@ class IncidenceResult:
     reference_drift: float = 0.0
 
 
-def incidence_from_planes(lower, middle, upper, z_baseline_um, transform):
+def incidence_from_planes(lower, middle, upper, z_baseline_um, transform, pixel_scale=1.0):
     """Apparent geometric ray angle from a known sample-stage Z translation.
 
     Unbounded/flat envelopes cannot locate a beam center and do not yield an
@@ -462,13 +474,13 @@ def incidence_from_planes(lower, middle, upper, z_baseline_um, transform):
     if any(result.center_px is None for result in (lower, middle, upper)):
         return IncidenceResult(middle, None, None, "Beam maximum is not bounded reliably; incidence angle unavailable.")
     uncertainty = float(np.hypot(lower.center_uncertainty_px, upper.center_uncertainty_px))
-    if not np.isfinite(uncertainty) or uncertainty > 1:
+    if not np.isfinite(uncertainty) or uncertainty > pixel_scale:
         return IncidenceResult(
             middle, None, None, "Beam center varies between specimen fields; angle uncertainty is too large."
         )
     midpoint_error = middle.center_px - (lower.center_px + upper.center_px) / 2
     shift = upper.center_px - lower.center_px
-    if np.linalg.norm(midpoint_error) > max(0.75, 0.2 * np.linalg.norm(shift)):
+    if np.linalg.norm(midpoint_error) > max(0.75 * pixel_scale, 0.2 * np.linalg.norm(shift)):
         return IncidenceResult(
             middle, None, None, "Beam motion is nonlinear across Z; increase signal or reduce Z baseline."
         )
@@ -480,6 +492,6 @@ def incidence_from_planes(lower, middle, upper, z_baseline_um, transform):
         middle,
         angle,
         lateral_um,
-        "Apparent beam angle relative to optical Z; sample tilt reported separately.",
+        "Apparent beam angle relative to stage Z; sample focus slope reported separately.",
         angle_uncertainty,
     )

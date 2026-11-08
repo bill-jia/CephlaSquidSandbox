@@ -209,6 +209,48 @@ def test_laser_af_runs_with_both_live_modes_stopped_and_specimen_illumination_of
     assert hw.live.is_live and hw.focus_live.is_live
 
 
+@pytest.mark.parametrize("failure", ["none", "cancel", "capture"])
+def test_continuous_bead_stack_keeps_light_on_and_cleans_up_on_every_exit(failure):
+    hw, light, _ = hardware(initialized=False)
+    on = hw.scope.obs_controller.turn_on_illumination
+    starts = []
+
+    def start():
+        starts.append(1)
+        on()
+
+    hw.scope.obs_controller.turn_on_illumination = start
+    try:
+        with hw:
+            with hw.illuminated(0):
+                hw.capture(0)
+                assert light.on
+                hw.capture(0)
+                assert light.on and len(starts) == 1
+                with pytest.raises(RuntimeError, match="outside"):
+                    hw.refocus(5)
+                if failure == "cancel":
+                    hw.cancel.set()
+                    hw.capture(0)
+                if failure == "capture":
+                    raise ValueError("Injected bead capture error")
+            assert not light.on
+    except (CalibrationCancelled, ValueError):
+        assert failure != "none"
+    assert not light.on and not hw._continuous_light and hw.live.is_live
+    np.testing.assert_allclose(hw.stage.xyz, [10, 11, 2])
+
+
+def test_timed_preset_cannot_be_held_on_for_bead_scan():
+    hw, light, _ = hardware(initialized=False)
+    hw.scope.obs_controller.current_observation_state = SimpleNamespace(is_waveform_driven=True)
+    with hw:
+        with pytest.raises(ValueError, match="steady illumination"):
+            with hw.illuminated(0):
+                pytest.fail("Timed waveform must not be forced continuously on")
+    assert not light.on
+
+
 def test_cancel_restores_state_and_out_of_range_moves_are_rejected():
     hw, light, _ = hardware()
     with pytest.raises(CalibrationCancelled):
@@ -485,7 +527,22 @@ def test_last_live_timer_scheduled_during_stop_is_also_drained():
     assert not fired.is_set()
 
 
-@pytest.mark.parametrize("kwargs", [{"dither_fraction": 1}, {"focus_steps": 6}, {"z_baseline_um": 0}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dither_fraction": 1},
+        {"focus_steps": 6},
+        {"z_baseline_um": 0},
+        {"analysis_maximum": -1},
+        {"analysis_maximum": 1000},
+        {"bead_min_snr": 2.9},
+        {"bead_min_snr": 21},
+        {"bead_min_snr": float("nan")},
+        {"stage_rms_limit_px": 0},
+        {"stage_rms_limit_px": 11},
+        {"stage_rms_limit_px": float("nan")},
+    ],
+)
 def test_invalid_motion_settings_are_rejected(kwargs):
     with pytest.raises(ValueError):
         AlignmentSettings(**kwargs).validate()

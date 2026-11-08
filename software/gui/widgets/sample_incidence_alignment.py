@@ -8,6 +8,7 @@ from qtpy.QtCore import QObject, Qt, Signal
 from qtpy.QtGui import QTransform
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -48,9 +49,9 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.scope, self.laser_af, self.is_busy = microscope, laser_af, is_busy
         self.log = squid.logging.get_logger(self.__class__.__name__)
         self.setWindowTitle("Sample flatness and laser incidence alignment")
-        # Blocking the parent while this window is open prevents concurrent
-        # manual motion, channel/objective changes, or another acquisition.
-        self.setWindowModality(Qt.WindowModal)
+        # Idle steps allow a preset/mode change in the main window. Acquisition
+        # temporarily blocks the parent until restoration has completed.
+        self.setWindowModality(Qt.NonModal)
         self.resize(1240, 920)
         self._thread = None
         self._cancel = threading.Event()
@@ -62,6 +63,9 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.best_score = float("inf")
         self._stage_to_image = None
         self._recorder = None
+        self._session = None
+        self._calibration = None
+        self._phase = "flatness"
         self.signals = _CalibrationSignals(self)
         self.signals.progress.connect(self._progress)
         self.signals.flatness.connect(self._flatness)
@@ -71,10 +75,10 @@ class SampleIncidenceAlignmentDialog(QDialog):
 
         layout = QVBoxLayout(self)
         instructions = QLabel(
-            "Select a fluorescence channel and focus on the marker before opening this tool. "
-            "Start acquires overlapping XY fields and texture Z scans; it uses laser AF when initialized with a reference. "
-            "Incidence follows only after flatness passes, using three Z heights and matched specimen overlaps. "
-            "Each dither stays within one FOV of the starting center. Stop returns to the starting position."
+            "1. Select a fluorescence preset, focus on the sample, and measure flatness (confocal is useful for beads). "
+            "2. Review the result. Change to a widefield preset in the main window without moving the sample. "
+            "3. Click Measure incidence. Bead mode checks the same beads and the widefield focus offset first. "
+            "Each step restores the starting position and camera state. Incidence never starts automatically."
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -82,7 +86,7 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.dither = self._number(0.05, 0.45, 0.33, 0.01)
         self.focus_range = self._number(0.1, 20, 2.0, 0.25)
         self.steps = QSpinBox()
-        self.steps.setRange(5, 31)
+        self.steps.setRange(5, 61)
         self.steps.setSingleStep(2)
         self.steps.setValue(9)
         self.baseline = self._number(0.2, 40, 4.0, 0.5)
@@ -120,6 +124,62 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.dither.setToolTip("Offset along each axis. Default 0.33 FOV gives substantial shared specimen overlap.")
         self.black_level.setToolTip("Camera offset from a dark image; do not subtract the dimmest fluorescent region.")
         layout.addLayout(controls)
+        sample_controls = QHBoxLayout()
+        self.sample_kind = QComboBox()
+        self.sample_kind.addItem("Textured fluorescent surface", "texture")
+        self.sample_kind.addItem("Fluorescent beads", "beads")
+        self.bead_metric = QComboBox()
+        self.bead_metric.addItem("Normalized bead sharpness", "sharpness")
+        self.bead_metric.addItem("Peak bead brightness", "brightness")
+        self.bead_radius = QSpinBox()
+        self.bead_radius.setRange(4, 48)
+        self.bead_radius.setValue(16)
+        self.bead_radius.setSuffix(" px")
+        self.bead_radius.setToolTip(
+            "Photometry radius in native camera pixels. Use isolated beads farther apart than twice this radius."
+        )
+        sample_controls.addWidget(QLabel("Sample"))
+        sample_controls.addWidget(self.sample_kind)
+        sample_controls.addWidget(self.bead_metric)
+        sample_controls.addWidget(QLabel("Bead aperture radius"))
+        sample_controls.addWidget(self.bead_radius)
+        layout.addLayout(sample_controls)
+        self._controls += [self.sample_kind, self.bead_metric, self.bead_radius]
+        sampling_controls = QHBoxLayout()
+        self.analysis_resolution = QComboBox()
+        for limit in (256, 512, 1024, 2048, 0):
+            self.analysis_resolution.addItem(f"{limit} px long edge" if limit else "Native (no reduction)", limit)
+        self.analysis_resolution.setCurrentIndex(1)
+        self.analysis_resolution.setToolTip(
+            "Area-average the full camera field for registration and spatial analysis. "
+            "Higher resolution preserves small features but uses more time and memory. "
+            "Bead detection and photometry always use delivered camera pixels; camera ROI/binning is unchanged."
+        )
+        self.bead_snr = self._number(3, 20, 8, 0.5)
+        self.bead_snr.setToolTip(
+            "Minimum bead signal relative to estimated noise, for detection and photometry. "
+            "Lower values admit dimmer beads and more noise; higher values require stronger beads."
+        )
+        self.stage_rms_limit = self._number(0.25, 10, 1, 0.25)
+        self.stage_rms_limit.setToolTip(
+            "Maximum RMS disagreement of bead-measured motion with stage travel. "
+            "Pixels refer to the camera image reduced to at most 512 pixels on its long edge; "
+            "the limit scales automatically with analysis resolution. "
+            "Raising this accepts more XY mismatch; it does not correct drift or relax bead matching or focus checks."
+        )
+        sampling_controls.addWidget(QLabel("Analysis resolution"))
+        sampling_controls.addWidget(self.analysis_resolution)
+        sampling_controls.addWidget(QLabel("Bead signal threshold (× noise)"))
+        sampling_controls.addWidget(self.bead_snr)
+        sampling_controls.addWidget(QLabel("Stage-motion RMS limit (512 px equiv.)"))
+        sampling_controls.addWidget(self.stage_rms_limit)
+        sampling_controls.addStretch()
+        layout.addLayout(sampling_controls)
+        self._controls += [self.analysis_resolution, self.bead_snr, self.stage_rms_limit]
+        self.analysis_resolution.currentIndexChanged.connect(self._sampling_changed)
+        self.bead_snr.valueChanged.connect(self._sampling_changed)
+        self.stage_rms_limit.valueChanged.connect(self._sampling_changed)
+        self.sample_kind.currentIndexChanged.connect(self._sample_changed)
         recording = QHBoxLayout()
         self.save_intermediate = QCheckBox("Save troubleshooting data")
         self.recording_folder = QLineEdit()
@@ -140,19 +200,22 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.recording_location.hide()
         layout.addWidget(self.recording_location)
         buttons = QHBoxLayout()
-        self.repeat = QCheckBox("Repeat; recheck flatness every 3 incidence sweeps")
-        self.repeat.setChecked(True)
+        self.repeat = QCheckBox("Acquire three incidence sweeps")
+        self.repeat.setChecked(False)
         self.start_button, self.stop_button, self.reset_button = (
-            QPushButton("Start calibration"),
+            QPushButton("1. Measure flatness"),
             QPushButton("Stop and return"),
             QPushButton("Reset best"),
         )
         for button in (self.start_button, self.stop_button, self.reset_button):
             button.setAutoDefault(False)
         self.stop_button.setEnabled(False)
+        self.incidence_button = QPushButton("2. Measure incidence")
+        self.incidence_button.setAutoDefault(False)
+        self.incidence_button.setEnabled(False)
         buttons.addWidget(self.repeat)
         buttons.addStretch()
-        for button in (self.start_button, self.stop_button, self.reset_button):
+        for button in (self.start_button, self.incidence_button, self.stop_button, self.reset_button):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         self.status = QLabel("Ready. The current optical configuration is held fixed during calibration.")
@@ -233,18 +296,40 @@ class SampleIncidenceAlignmentDialog(QDialog):
             "Repeatable camera-field focus effects are excluded from sample flatness. "
             "Image labels show measured best-focus ΔZ from the field center, including optics; negative means lower Z. "
             "Slopes use the same Z coordinate as the stage controls: positive means higher best-focus Z as X or Y increases. "
-            "Consistent defocus supports geometric tilt relative to the objective; it cannot uniquely identify a holder fault. "
-            "Variable coating is reported separately. A flat/unbounded beam or inconsistent overlaps yield no angle. "
+            "Focus slopes are relative to stage travel; objective, holder and camera tilt are not independently determined. "
+            "Bead mode keeps steady illumination on throughout each stack/sweep. "
+            "A flat/unbounded beam, sparse beads or inconsistent overlaps yield no angle. "
             "Best minimizes angle/angle-target and center-offset/center-target jointly."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
         self.start_button.clicked.connect(self.start)
+        self.incidence_button.clicked.connect(lambda: self.start(phase="incidence"))
         self.stop_button.clicked.connect(self.request_stop)
         self.reset_button.clicked.connect(self.reset_best)
         self.save_intermediate.toggled.connect(self._update_recording_controls)
         self.browse_recording_folder.clicked.connect(self._choose_recording_folder)
         self._update_recording_controls()
+        self._sample_changed()
+
+    def _sample_changed(self):
+        beads = self.sample_kind.currentData() == "beads"
+        self.bead_metric.setEnabled(beads and not self.running)
+        self.bead_radius.setEnabled(beads and not self.running)
+        self.bead_snr.setEnabled(beads and not self.running)
+        self.stage_rms_limit.setEnabled(beads and not self.running)
+        self._calibration = None
+        self.incidence_button.setEnabled(False)
+        if beads:
+            self.focus_range.setValue(3)
+            self.steps.setValue(31)
+        self.focus_plot.setTitle("Sample best-focus Z · field correction assumes stable XY travel")
+
+    def _sampling_changed(self):
+        self._calibration = None
+        self.incidence_button.setEnabled(False)
+        self.reset_best()
+        self.status.setText("Analysis settings changed; measure flatness again before incidence.")
 
     def _update_recording_controls(self):
         enabled = self.save_intermediate.isChecked() and self.start_button.isEnabled()
@@ -271,11 +356,14 @@ class SampleIncidenceAlignmentDialog(QDialog):
     def running(self):
         return self._thread is not None and self._thread.is_alive() and not self._worker_finished.is_set()
 
-    def start(self):
+    def start(self, checked=False, *, phase="flatness"):
         if self.running:
             return
         if self.is_busy():
             self.status.setText("Another acquisition or autofocus is active; finish it before starting calibration.")
+            return
+        if phase == "incidence" and (self._calibration is None or not self._calibration["flatness"].accepted):
+            self.status.setText("Measure and pass sample flatness before starting incidence.")
             return
         settings = AlignmentSettings(
             dither_fraction=self.dither.value(),
@@ -286,6 +374,12 @@ class SampleIncidenceAlignmentDialog(QDialog):
             max_residual_um=self.residual_tolerance.value(),
             black_level=self.black_level.value(),
             repeat=self.repeat.isChecked(),
+            sample_kind=self.sample_kind.currentData(),
+            bead_radius_px=self.bead_radius.value(),
+            bead_focus_metric=self.bead_metric.currentData(),
+            analysis_maximum=self.analysis_resolution.currentData(),
+            bead_min_snr=self.bead_snr.value(),
+            stage_rms_limit_px=self.stage_rms_limit.value(),
         )
         try:
             settings.validate()
@@ -297,6 +391,9 @@ class SampleIncidenceAlignmentDialog(QDialog):
             self._error(str(error))
             return
         self.reset_best()
+        self._phase = phase
+        if phase == "flatness":
+            self._calibration = None
         self.recording_location.setText("Preparing troubleshooting folder…" if self._recorder else "")
         self.recording_location.setVisible(self._recorder is not None)
         self._stage_to_image = None
@@ -308,7 +405,8 @@ class SampleIncidenceAlignmentDialog(QDialog):
             item.clear()
         self.current_x.clear()
         self.current_y.clear()
-        self.flatness_status.setText("Flatness has not been measured for this session.")
+        if phase == "flatness":
+            self.flatness_status.setText("Flatness has not been measured for this session.")
         self.incidence_status.setText("Incidence is gated on reliable, acceptable flatness.")
         for item in (self.raw_image, self.current_image, self.best_image):
             item.resetTransform()
@@ -327,7 +425,7 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self.status.setText(
             "Starting with laser AF."
             if hardware.af_ready
-            else "Laser AF unavailable/unreferenced; using texture focus scans."
+            else "Laser AF unavailable/unreferenced; using image focus scans."
         )
         session = SampleIncidenceSession(
             hardware,
@@ -338,6 +436,15 @@ class SampleIncidenceAlignmentDialog(QDialog):
             self.signals.incidence.emit,
             **({"recorder": self._recorder} if self._recorder is not None else {}),
         )
+        # Set the requested phase before the worker starts. Existing session
+        # constructors used by integrations retain their positional API.
+        session.phase = phase
+        session.calibration = self._calibration
+        self._session = session
+        if phase == "incidence" and self._calibration.get("kind") == "beads":
+            # The bead incidence step reuses the accepted result rather than
+            # emitting another flatness result. Restore its plot transform.
+            self._flatness(self._calibration["flatness"])
 
         def run():
             try:
@@ -358,6 +465,21 @@ class SampleIncidenceAlignmentDialog(QDialog):
         for widget in self._controls + [self.repeat, self.start_button, self.save_intermediate]:
             widget.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.incidence_button.setEnabled(
+            not running and self._calibration is not None and self._calibration["flatness"].accepted
+        )
+        beads = self.sample_kind.currentData() == "beads"
+        self.bead_metric.setEnabled(not running and beads)
+        self.bead_radius.setEnabled(not running and beads)
+        self.bead_snr.setEnabled(not running and beads)
+        self.stage_rms_limit.setEnabled(not running and beads)
+        # Qt applies changed window modality when the window is shown again.
+        visible = self.isVisible()
+        if visible:
+            self.hide()
+        self.setWindowModality(Qt.WindowModal if running else Qt.NonModal)
+        if visible:
+            self.show()
         self._update_recording_controls()
 
     def request_stop(self):
@@ -393,11 +515,16 @@ class SampleIncidenceAlignmentDialog(QDialog):
         image.setTransform(QTransform(matrix[0, 0], matrix[1, 0], matrix[0, 1], matrix[1, 1], offset[0], offset[1]))
 
     def _flatness(self, result):
+        self._calibration = getattr(self._session, "calibration", None)
         self._stage_to_image = result.stage_to_image
         if self._stage_to_image is not None:
             for item in (self.raw_image, self.current_image, self.best_image):
                 self._orient_image(item)
-            self.raw_plot.setTitle("Latest field · last sweep's median focus ΔZ (µm)")
+            self.raw_plot.setTitle(
+                "Latest field · fitted bead focus ΔZ (µm)"
+                if self.sample_kind.currentData() == "beads"
+                else "Latest field · last sweep's median focus ΔZ (µm)"
+            )
             self.raw_plot.setLabel("bottom", "Stage X from field center →", units="µm")
             self.raw_plot.setLabel("left", "Stage Y from field center ↓", units="µm")
             self.orientation_status.setText(
@@ -431,7 +558,7 @@ class SampleIncidenceAlignmentDialog(QDialog):
             else np.nanmax(result.camera_focus_offsets_um) - np.nanmin(result.camera_focus_offsets_um)
         )
         self.flatness_status.setText(
-            f"{result.diagnosis}\nPlane tilt: {tilt:.3f}° · height span: {result.plane_span_um:.3f} µm · "
+            f"{result.diagnosis}\nPlane tilt vs XY travel: {tilt:.3f}° · height span: {result.plane_span_um:.3f} µm · "
             f"best-focus dZ/dX: {1000 * result.plane[0]:+.3f}, dZ/dY: {1000 * result.plane[1]:+.3f} µm/mm · "
             f"residual RMS: {result.residual_rms_um:.3f} µm · overlap RMS: {overlap_text} · "
             f"direction agreement: {direction_text} · camera-fixed focus variation ignored: {optical_span:.3f} µm"
@@ -450,7 +577,10 @@ class SampleIncidenceAlignmentDialog(QDialog):
             self.beam_center.clear()
             self.incidence_status.setText("Incidence gated: sample flatness/consistency did not pass.")
         else:
-            self.incidence_status.setText("Flatness passed; incidence is eligible once the Z-baseline sweep completes.")
+            self.incidence_status.setText(
+                "Flatness passed. Review the result, select a widefield preset in the main window, "
+                "then click Measure incidence. Do not move or adjust the sample between steps."
+            )
 
     def _draw(self, illumination, image, curve_x, curve_y):
         envelope = illumination.envelope
@@ -519,7 +649,14 @@ class SampleIncidenceAlignmentDialog(QDialog):
         self._show_recording_location()
         self._set_running(False)
         if not self._failed:
-            self.status.setText("Calibration stopped/completed. Starting stage, piezo and camera state restored.")
+            self.status.setText(
+                "Measurement stopped/completed. Starting stage, piezo and camera state restored. "
+                + (
+                    "Review flatness and select widefield before starting incidence."
+                    if self._phase == "flatness"
+                    else "Remeasure flatness after any sample/holder adjustment."
+                )
+            )
         if self._close_when_stopped:
             self._close_when_stopped = False
             self.close()

@@ -59,8 +59,9 @@ def position_snapshot(hardware):
 class AlignmentRecorder:
     """Write each image/event immediately; keep completed data after any stop.
 
-    Disk writes run on the calibration worker, after capture has switched its
-    illumination off. Errors propagate so the normal hardware restoration runs.
+    Disk writes run on the calibration worker. Bead stacks/sweeps keep steady
+    illumination on while writing; texture captures switch it off per frame.
+    Errors propagate so the normal hardware restoration runs.
     There are no background writer threads, persistent handles or queued images.
     """
 
