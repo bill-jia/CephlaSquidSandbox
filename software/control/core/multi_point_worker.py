@@ -4650,7 +4650,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
         Keep the optical reference fixed. Only verified Z estimates are cached;
         acquisition still measures every FOV. Coordinates are the finalized path,
-        so the first tile can lie in any corner.
+        so the first tile can lie in any corner. Only regions with a supplied
+        center Z get this preparation; others rely on normal acquisition AF.
         """
         centers = dict(zip(self.scan_region_names, self.scan_region_coords_mm))
         for region_id, coords in self.scan_region_fov_coords_mm.items():
@@ -4659,9 +4660,12 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             if not coords:
                 continue
             center = centers[region_id]
-            z = center[2] if len(center) > 2 else coords[0][2] if len(coords[0]) > 2 else None
+            z = center[2] if len(center) > 2 else None
             if z is None:
-                raise RuntimeError(f"No focused center Z for laser-AF region {region_id}")
+                # Neither current stage Z nor a tile's Z establishes a focused
+                # region center. Leave these regions to normal per-FOV AF.
+                self._log.info("Skipping laser-AF entry walk for region %s: no supplied center Z", region_id)
+                continue
             self._apply_region_laser_af_reference(region_id)
             self.move_to_coordinate((center[0], center[1], z), region_id, -1)
             if not self.laser_auto_focus_controller.move_to_target(0):
