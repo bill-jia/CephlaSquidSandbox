@@ -2369,24 +2369,17 @@ class LiveControlWidget(QFrame):
         """Write ``{snap_stem}_acquisition_metadata.yaml`` next to the snap TIFF."""
         from pathlib import Path
 
-        from control.core.acquisition_metadata_helpers import build_acquisition_metadata
-        from control.core.observation_state_service import collect_emission_filter_positions
+        from control.core.acquisition_metadata_helpers import (
+            build_acquisition_metadata,
+            collect_acquisition_observation_state,
+        )
 
         path = Path(filepath)
         stem = path.stem
         meta_filename = f"{stem}_acquisition_metadata.yaml"
         repo = self.liveController.microscope.config_repo
 
-        obs_state = None
-        if repo.current_profile:
-            try:
-                wheel = getattr(self.liveController.microscope, "emission_filter_wheel", None)
-                emission = collect_emission_filter_positions(wheel)
-                obs_state = self.liveController.obs_controller.collect_observation_state(
-                    emission_filter_positions=emission or None,
-                )
-            except Exception as e:
-                self._log.warning("Snap: could not collect observation state for metadata: %s", e)
+        obs_state = collect_acquisition_observation_state(self.liveController, self._log)
 
         selected_names = []
         if obs_state and obs_state.illuminator_states:

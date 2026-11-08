@@ -760,3 +760,58 @@ def test_save_acquisition_metadata_custom_filename(tmp_path: Path):
     out = repo.save_acquisition_metadata(tmp_path, meta, filename="2025-01-01_12-00-00_tag_acquisition_metadata.yaml")
     assert out.name == "2025-01-01_12-00-00_tag_acquisition_metadata.yaml"
     assert out.exists()
+
+
+@pytest.mark.parametrize("profile", [None, "default"])
+def test_snap_and_multipoint_capture_same_hardware_without_profile(profile, monkeypatch):
+    from types import SimpleNamespace
+    from control.core import acquisition_metadata_helpers as helpers
+    from control.core import observation_state_service
+
+    state = _minimal_state(on=True).model_copy(update={
+        "confocal_mode": True,
+        "emission_filter_positions": {"wheel": 3},
+    })
+    collector = MagicMock(return_value=state)
+    scope = SimpleNamespace(
+        stage=SimpleNamespace(get_pos=lambda: SimpleNamespace(x_mm=1.2, y_mm=3.4, z_mm=0.5)),
+        addons=SimpleNamespace(piezo_stage=SimpleNamespace(position=42.0)),
+        emission_filter_wheel=object(),
+    )
+    live = SimpleNamespace(
+        microscope=scope,
+        obs_controller=SimpleNamespace(collect_observation_state=collector, is_confocal_mode=lambda: False),
+        get_trigger_mode=lambda: "Software Trigger",
+    )
+    monkeypatch.setattr(observation_state_service, "collect_emission_filter_positions", lambda wheel: {"wheel": 3})
+    objective = SimpleNamespace(current_objective="10x", objectives_dict={"10x": {"magnification": 10}})
+    camera = SimpleNamespace(get_pixel_size_binned_um=lambda: 6.5)
+    collected = helpers.collect_acquisition_observation_state(live)
+    snap = helpers.build_acquisition_metadata(
+        experiment_id="snap", recording_start_time=1.0, objective_store=objective,
+        live_controller=live, camera=camera, scan_parameters={}, observation_state=collected,
+        selected_channel_names=["TestLaser"],
+    )
+    multipoint = helpers.augment_multipoint_acquisition_yaml_dict(
+        {}, experiment_id="multi", recording_start_time=1.0,
+        repo=SimpleNamespace(current_profile=profile), objective_store=objective,
+        live_controller=live, camera=camera,
+        selected_configurations=[SimpleNamespace(name="TestLaser")], obs_names=[],
+    )["manifest"]
+    snap_dump = snap.model_dump(mode="json", exclude_none=True)
+    for key in multipoint:
+        assert multipoint[key] == snap_dump[key]
+    assert snap.confocal_mode is True  # Hardware snapshot wins over stale controller flag.
+    assert snap.stage_position_mm == {"x_mm": 1.2, "y_mm": 3.4, "z_mm": 0.5}
+    assert snap.piezo_position_um == 42.0
+    assert collector.call_count == 2
+    collector.assert_called_with(emission_filter_positions={"wheel": 3})
+    assert AcquisitionMetadata.model_validate(yaml.safe_load(yaml.safe_dump(snap_dump))) == snap
+
+
+def test_acquisition_hardware_collection_failure_is_best_effort():
+    from types import SimpleNamespace
+    from control.core.acquisition_metadata_helpers import collect_acquisition_observation_state
+
+    live = SimpleNamespace(microscope=SimpleNamespace(), obs_controller=None)
+    assert collect_acquisition_observation_state(live) is None

@@ -22,6 +22,24 @@ if TYPE_CHECKING:
     from control.models.observation_state import ObservationState
 
 
+def collect_acquisition_observation_state(
+    live_controller: Any, logger: Any = None
+) -> Optional["ObservationState"]:
+    """Capture live hardware without requiring a saved profile or preset."""
+    from control.core.observation_state_service import collect_emission_filter_positions
+
+    try:
+        wheel = getattr(live_controller.microscope, "emission_filter_wheel", None)
+        return live_controller.obs_controller.collect_observation_state(
+            emission_filter_positions=collect_emission_filter_positions(wheel) or None,
+        )
+    except Exception as exc:
+        (logger or logging.getLogger(__name__)).warning(
+            "Could not collect acquisition observation state: %s", exc
+        )
+        return None
+
+
 def build_acquisition_metadata(
     *,
     experiment_id: str,
@@ -62,12 +80,35 @@ def build_acquisition_metadata(
 
     bx, by, cm = observation_state_binning_mode_for_metadata(observation_state, camera)
 
+    # Stage coordinates are measured; the piezo driver exposes its last commanded
+    # position. Keep their units explicit and allow either device to be absent.
+    microscope = getattr(live_controller, "microscope", None)
+    stage_position_mm = None
+    piezo_position_um = None
+    try:
+        position = microscope.stage.get_pos()
+        stage_position_mm = {axis: float(getattr(position, axis)) for axis in ("x_mm", "y_mm", "z_mm")}
+    except Exception:
+        pass
+    try:
+        piezo = getattr(getattr(microscope, "addons", None), "piezo_stage", None)
+        if piezo is not None:
+            piezo_position_um = float(piezo.position)
+    except Exception:
+        pass
+
     return AcquisitionMetadata(
+        stage_position_mm=stage_position_mm,
+        piezo_position_um=piezo_position_um,
         experiment_id=experiment_id,
         recording_start_time=t0,
         objective=current_objective,
         objective_details=objective_details,
-        confocal_mode=live_controller.obs_controller.is_confocal_mode() if live_controller.obs_controller else False,
+        confocal_mode=(
+            observation_state.confocal_mode
+            if observation_state is not None
+            else live_controller.obs_controller.is_confocal_mode() if live_controller.obs_controller else False
+        ),
         sensor_pixel_size_um=sensor_px,
         tube_lens_mm=TUBE_LENS_MM,
         trigger_mode=trigger_mode,
@@ -139,8 +180,6 @@ def augment_multipoint_acquisition_yaml_dict(
     Merge layout YAML (grid, objective, z-stack, …) with a non-duplicative ``manifest`` slice
     and ``observation_states_used`` (full preset snapshots for selected names only).
     """
-    from control.core.observation_state_service import collect_emission_filter_positions
-
     _log = logger or logging.getLogger(__name__)
     uses_presets = bool(obs_names)
     inline_states = inline_observation_states or {}
@@ -151,16 +190,7 @@ def augment_multipoint_acquisition_yaml_dict(
             return st
         return repo.load_observation_preset(pname)
 
-    obs_state: Optional[Any] = None
-    if not uses_presets and repo.current_profile:
-        try:
-            wheel = getattr(live_controller.microscope, "emission_filter_wheel", None)
-            emission = collect_emission_filter_positions(wheel)
-            obs_state = live_controller.obs_controller.collect_observation_state(
-                emission_filter_positions=emission or None,
-            )
-        except Exception as e:
-            _log.warning("Could not collect observation state for multipoint metadata: %s", e)
+    obs_state = None if uses_presets else collect_acquisition_observation_state(live_controller, _log)
 
     resolved_channel_names: List[str] = []
     if uses_presets:
