@@ -368,6 +368,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
             "validation_mode": params.validation_mode,
+            "log_af_events": params.log_af_events,
             "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
@@ -585,6 +586,7 @@ class MultiPointController:
         self.use_fluidics = False
         self.skip_saving = False
         self.validation_mode = False
+        self.log_af_events = False
         self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
@@ -894,6 +896,9 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_log_af_events(self, enabled: bool):
+        self.log_af_events = bool(enabled)
 
     def set_validation_mode(self, enabled: bool):
         self.validation_mode = bool(enabled)
@@ -1995,6 +2000,7 @@ class MultiPointController:
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving or self.validation_mode,
             validation_mode=self.validation_mode,
+            log_af_events=self.log_af_events,
             retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
@@ -2197,8 +2203,8 @@ class MultiPointController:
             if self.use_fluidics and self.Nt > 1 and order[0] != "T":
                 self._log.error("Fluidics requires T as the outermost acquisition loop.")
                 return False
-        if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
-            self._log.error("AF validation requires laser autofocus and a valid reference.")
+        if (self.validation_mode or getattr(self, "log_af_events", False)) and (not self.do_reflection_af or self.laserAutoFocusController is None):
+            self._log.error("AF validation/event logging requires laser autofocus and a valid reference.")
             return False
         # Region names (user-editable on the Flexible tab) become folder names, image
         # filename prefixes and the "region" column of every sidecar. Catch anything

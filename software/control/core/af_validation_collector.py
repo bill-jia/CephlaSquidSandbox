@@ -16,6 +16,7 @@ EVENT_COLUMNS = (
     "z_before_mm", "z_after_mm", "piezo_before_um", "piezo_after_um", "frame_z_mm", "snapshot_z_mm",
     "displacement_um", "correlation", "reference_id", "snapshot_captured", "snapshot_error",
     "rejected_count", "correlation_unregistered", "y_registration_shift_px",
+    "displacement_before_um", "displacement_after_um", "measurements_json",
 )
 
 
@@ -80,6 +81,10 @@ class AFValidationCollector:
             meta.update(af_attempted=True, af_success=operation["success"], reference_id=self._reference(operation))
         else:
             meta.update(kind="table", af_attempted=False, af_success=None)
+        measurements = operation.get("measurements", []) if operation is not None else []
+        meta["displacement_before_um"] = measurements[0]["displacement_um"] if measurements else None
+        meta["displacement_after_um"] = measurements[-1]["displacement_um"] if measurements else None
+        meta["measurements_json"] = json.dumps(measurements)
         meta.update(event_id=self._next_event, snapshot_captured=snapshot is not None, rejected_count=len(rejects))
         self._next_event += 1
         path = self.output_dir / "events.csv"

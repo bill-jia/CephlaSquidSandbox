@@ -1986,6 +1986,9 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
     validation_checkbox = getattr(widget, "checkbox_afValidation", None)
     if validation_checkbox is not None:
         validation_checkbox.setChecked(yaml_data.validation_mode)
+    logging_checkbox = getattr(widget, "checkbox_logAFEvents", None)
+    if logging_checkbox is not None:
+        logging_checkbox.setChecked(yaml_data.log_af_events)
     combo = widget.combobox_fileSavingFormat
     if yaml_data.skip_saving:
         combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
@@ -3760,6 +3763,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_logAFEvents = QCheckBox("Log AF events during imaging")
+        self.checkbox_logAFEvents.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_logAFEvents.setToolTip(
+            "Requires Laser AF. Save measurements, correlation, references and native AF evidence "
+            "in af_events alongside normal images and Z stacks. No extra camera exposures."
+        )
+
         self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
@@ -3999,6 +4009,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_logAFEvents)
         saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
@@ -4619,6 +4630,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # flexible and wellplate tabs each have their own combo/row bound
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
+            self.multipointController.set_log_af_events(self.checkbox_logAFEvents.isChecked())
             self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
@@ -5514,6 +5526,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
     def on_snap_images(self):
         # Snap is a single plane at each region's nominal Z, regardless of stack overrides.
         self.scanCoordinates.region_z_ranges.clear()
+        self.multipointController.set_log_af_events(False)
         self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
@@ -6102,6 +6115,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_logAFEvents = QCheckBox("Log AF events during imaging")
+        self.checkbox_logAFEvents.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_logAFEvents.setToolTip(
+            "Requires Laser AF. Save measurements, correlation, references and native AF evidence "
+            "in af_events alongside normal images and Z stacks. No extra camera exposures."
+        )
+
         self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
@@ -6359,6 +6379,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_logAFEvents)
         saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
@@ -7466,6 +7487,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # Re-push THIS tab's visible save-format + streaming state (the
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
+            self.multipointController.set_log_af_events(self.checkbox_logAFEvents.isChecked())
             self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
@@ -7627,6 +7649,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.base_path_is_set = True
 
     def on_snap_images(self):
+        self.multipointController.set_log_af_events(False)
         self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
@@ -8427,6 +8450,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
                 self.checkbox_retractZBetweenRegions.isChecked()
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
+            self.multipointController.set_log_af_events(False)
             self.multipointController.set_validation_mode(False)
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_cycles(

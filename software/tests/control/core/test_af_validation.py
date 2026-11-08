@@ -329,12 +329,13 @@ def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled):
         lambda base_yaml, **kwargs: {"schema_version": 2, **base_yaml},
     )
     _save_unified_multipoint_acquisition_yaml(
-        _params(validation_mode=enabled, skip_saving=enabled), str(tmp_path),
+        _params(validation_mode=enabled, skip_saving=enabled, log_af_events=enabled), str(tmp_path),
         widget_type="flexible", repo=MagicMock(), live_controller=MagicMock(),
         camera=MagicMock(), objective_store=MagicMock(), recording_start_time=0.0,
         selected_observation_state_names=[], use_manual_focus_map=False, logger=MagicMock(),
     )
     restored = parse_acquisition_yaml(str(tmp_path / "acquisition.yaml"))
+    assert restored.log_af_events is enabled
     assert restored.validation_mode is enabled
     assert restored.skip_saving is enabled
 
@@ -360,3 +361,25 @@ def test_fatal_snapshot_error_preserves_completed_af_result(tmp_path):
     event = rows(tmp_path)[0]
     assert event["af_success"] == "True"
     assert "Fatal snapshot error" in event["snapshot_error"]
+
+
+def test_imaging_event_logging_preserves_native_measurements_without_snapshot(tmp_path):
+    import json
+
+    worker, controller, stage = make_worker(tmp_path)
+    worker.validation_mode = False
+    controller.capture_validation_frame = MagicMock(side_effect=AssertionError("no extra exposures"))
+    stage.z_um = 10
+    worker._autofocus_and_record("R0", 0, str(tmp_path))
+    event = rows(tmp_path)[0]
+    assert event["region_id"] == "R0"
+    assert event["fov"] == "0" and event["time_point"] == "0"
+    assert event["af_success"] == "True"
+    assert event["snapshot_captured"] == "False"
+    measurements = json.loads(event["measurements_json"])
+    assert float(event["displacement_before_um"]) == measurements[0]["displacement_um"]
+    assert float(event["displacement_after_um"]) == measurements[-1]["displacement_um"]
+    assert abs(float(event["displacement_after_um"])) < 1
+    assert event["reference_id"]
+    controller.capture_validation_frame.assert_not_called()
+    worker.request_abort_fn.assert_not_called()

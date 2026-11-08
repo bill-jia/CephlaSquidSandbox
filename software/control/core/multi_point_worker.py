@@ -1429,11 +1429,12 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
         self.skip_saving = acquisition_parameters.skip_saving or self.validation_mode
         self._af_validator = None
-        if self.validation_mode:
+        if self.validation_mode or acquisition_parameters.log_af_events:
             if not self.do_reflection_af or self.laser_auto_focus_controller is None:
                 raise ValueError("AF validation requires laser autofocus")
             from control.core.af_validation_collector import AFValidationCollector
-            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, "af_validation"))
+            folder = "af_validation" if self.validation_mode else "af_events"
+            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, folder))
         # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
         # move that enters a region (and before the very first move of the
         # run), then drive Z back to the target. Never fires between FOVs
@@ -5309,7 +5310,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 snapshot, snapshot_error, restore_error = None, None, None
                 if fatal_error is not None:
                     snapshot_error = f"Snapshot skipped after fatal AF error: {fatal_error}"
-                elif operations:
+                elif operations and self.validation_mode:
                     try:
                         snapshot = controller.capture_validation_frame()
                         if snapshot is None:

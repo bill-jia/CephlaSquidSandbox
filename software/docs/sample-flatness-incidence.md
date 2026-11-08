@@ -228,6 +228,47 @@ the flatness calibration.
 
 ## What the results mean
 
+### The three top-row plots
+
+In **bead mode**, all focus values in the top row use the selected **Bead focus
+metric**. The default is **Normalized bead sharpness**; selecting **Peak bead
+brightness** changes the focus estimates used by all three plots. They are
+**not three different focus metrics**, and they do not compare sharpness with
+brightness side by side. Neither metric measures laser incidence by itself.
+
+| Position / title | What is displayed | Focus metric and correction |
+| --- | --- | --- |
+| **Left: Latest field · fitted bead focus ΔZ (µm)** | The latest camera image, with nine fitted focus-height labels at a 3×3 grid of positions within a camera field. Each label is best-focus Z relative to the field center; negative means lower stage Z. These are not nine separate FOV measurements or nine directly measured bead heights. | The background is image intensity, not a focus-score map, and may show an out-of-focus stack plane. The labels use the selected bead focus metric and combine the fitted sample-plane slope with the camera-field focus term: **before removing camera-field focus effects**. They summarize the flatness fit, not the instantaneous focus of the displayed frame. |
+| **Middle: Sample best-focus Z · optics corrected** | Each point is a bead focus observation at its specimen XY position across the nine overlapping fields. Color represents corrected best-focus Z. Repeated observations of the same bead can occupy nearly the same position. | The selected metric determines each bead's best-focus Z. The fitted camera-field focus term is then subtracted. The plot retains the sample slope and measurement residuals; it is **not a residual-only map**, a brightness map, or just the fitted plane. |
+| **Right: Best-focus Z slope in each FOV (µm/mm)** | Each point is a local plane fitted to the corrected bead heights in one FOV. Horizontal position is `dZ/dX`; vertical position is `dZ/dY`, both in µm/mm. | Uses the same selected focus metric and camera-field correction as the middle plot. The distance from the origin describes slope magnitude; the spread of points describes variation among local slopes. The points are not illumination directions or laser angles. |
+
+The image and sample-map axes are oriented to stage X/Y after registration
+(+X right, +Y down). The right plot uses slope components rather than physical
+XY positions. The middle plot rescales its colors to each result's minimum and
+maximum height, and plot axes automatically adjust to the displayed data.
+Consequently, compare numerical spans, slopes and residuals, or use common
+plot scales, when comparing separate runs. Similar colors need not mean equal
+height differences, and apparent scatter can be exaggerated by axis scaling.
+
+The camera-field term removed from the middle and right plots includes fitted
+focus tilt/curvature in camera coordinates. It does not identify the camera
+sensor as the cause or independently establish the objective axis. Its span is
+reported in the status text as **camera-fixed focus variation ignored**; the
+left labels still include it.
+
+In **textured-surface mode**, focus comes from the texture focus score rather
+than the bead metric selector. The middle observations are focus tiles, and
+the left labels summarize the last sweep's median focus differences. The
+same distinction between raw focus, corrected sample focus and local slopes
+applies.
+
+The lower illumination plots and incidence calculation use **integrated bead
+flux**, regardless of the bead focus metric. The brightness-minus-sharpness
+maps in the [November 7 rotation analysis](sample-flatness-incidence-20261107-analysis.md)
+were additional offline analyses; they are not one of the dialog's top plots.
+
+### Flatness and incidence interpretation
+
 Flatness jointly fits a sample plane and a quadratic camera-field focus term
 using individual bead heights across the stage dither. It checks repeated
 observations of the same beads for consistency. The raw-field 3×3 labels are
@@ -256,6 +297,10 @@ started widefield incidence step performs a fresh texture-flatness check before
 the incidence sweep; it does not transfer a confocal texture calibration.
 
 ## Records and validation
+
+The [November 7 four-rotation analysis](sample-flatness-incidence-20261107-analysis.md)
+records the run identifiers, settings, replay results, focus-metric comparison,
+interpretation limits and recommended follow-up measurements.
 
 Enable **Save troubleshooting data** before either measurement to record it in
 its own run folder. Records include full-resolution images, requested and
