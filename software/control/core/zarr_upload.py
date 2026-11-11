@@ -31,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import squid.logging
@@ -246,6 +247,21 @@ def _stream_copy_with_hash(
     return h.hexdigest(), bytes_written
 
 
+@lru_cache(maxsize=128)
+def _remote_temp_candidates(remote_dir: str, scan_epoch: int) -> Tuple[str, ...]:
+    """Snapshot possible orphan names once per directory/hour in each worker.
+
+    Listing an SMB directory containing thousands of shards can take a minute.
+    Keep only temporary names, and let callers check their own destination's
+    prefix and age. The hourly epoch refreshes the best-effort snapshot without
+    scanning the directory for every shard. The bounded cache limits memory.
+    """
+    try:
+        return tuple(name for name in os.listdir(remote_dir) if ".part-" in name)
+    except OSError:
+        return ()
+
+
 def upload_one_file(
     local_path: str,
     remote_path: str,
@@ -304,12 +320,12 @@ def upload_one_file(
     # same destination. Age-gated at 24h since last modification: generous
     # enough that server/client clock skew (or a slow concurrent uploader of
     # the same file) can never make a LIVE temp look stale, while orphans
-    # still get reclaimed the next time the file is uploaded. One listdir per
-    # upload is noise next to the copy + read-back.
+    # still get reclaimed when this destination is uploaded. Reuse a directory
+    # snapshot across uploads: repeated SMB enumeration can dwarf copy time.
     stale_prefix = os.path.basename(remote_path) + ".part-"
     with elapsed(timings, "remote_temp_cleanup"):
         try:
-            for entry in os.listdir(remote_dir):
+            for entry in _remote_temp_candidates(remote_dir, int(time.monotonic() // 3600)):
                 if entry.startswith(stale_prefix):
                     stale = os.path.join(remote_dir, entry)
                     try:
