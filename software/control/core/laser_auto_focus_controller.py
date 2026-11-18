@@ -14,7 +14,7 @@ import control._def
 from control.core.config import ConfigRepository
 from control.core.live_controller import LiveController
 from control.core.objective_store import ObjectiveStore
-from control.microcontroller import Microcontroller
+from control.microcontroller import CommandAborted, Microcontroller
 from control.piezo import PiezoStage
 from control.models import LaserAFConfig, LaserAFReference
 from control.models.machine_config import LaserAFCalibrationSettings, LaserAFDeviceSettings
@@ -181,6 +181,7 @@ class LaserAutofocusController(QObject):
         record = {
             "kind": kind, "success": False, "failure_reason": None,
             "timestamp": time.time(), "displacement_um": None, "correlation": None,
+            "correlation_unregistered": None, "y_registration_shift_px": None,
             "z_before_mm": self.stage.get_pos().z_mm,
             "piezo_before_um": self.piezo.position if self.piezo is not None else None,
             "config": props.model_dump(mode="json", exclude={
@@ -237,10 +238,10 @@ class LaserAutofocusController(QObject):
                         self.microcontroller.turn_off_AF_laser()
                         self.microcontroller.wait_till_operation_is_completed()
                     return
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     if attempt:
-                        self._validation_update(warning="AF laser shutdown timed out twice")
-                        self._log.error("AF laser shutdown timed out twice; laser state is unknown.")
+                        self._validation_update(warning="AF laser shutdown failed twice")
+                        self._log.error("AF laser shutdown failed twice; laser state is unknown.")
                         raise
                     self._log.warning("AF laser shutdown timed out; retrying once.")
                     time.sleep(0.05)
@@ -417,7 +418,7 @@ class LaserAutofocusController(QObject):
         """
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser before pixel to um calibration, cannot continue!")
             return False
 
@@ -454,7 +455,7 @@ class LaserAutofocusController(QObject):
         finally:
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception(
                     "Error turning off AF laser after spot calibration acquisition.  Continuing in unknown state"
                 )
@@ -567,10 +568,12 @@ class LaserAutofocusController(QObject):
         with self._validation_operation("measurement"), self._time("af:measure_displacement"):
             try:
                 self.turn_on_AF_laser()
-            except TimeoutError:
-                self._log.exception("Turning on AF laser timed out, failed to measure displacement.")
+            except (TimeoutError, CommandAborted) as exc:
+                self._log.exception("Turning on AF laser failed; cannot measure displacement.")
                 self.signal_displacement_um.emit(float("nan"))
-                self._validation_update(failure_reason="laser_on_timeout")
+                self._validation_update(
+                    failure_reason="laser_on_rejected" if isinstance(exc, CommandAborted) else "laser_on_timeout"
+                )
                 return float("nan")
 
             try:
@@ -580,9 +583,9 @@ class LaserAutofocusController(QObject):
             finally:
                 try:
                     self.turn_off_AF_laser()
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     self._log.exception(
-                        "Turning off AF laser timed out!  We got a displacement but laser may still be on."
+                        "Turning off AF laser failed! We got a displacement but laser may still be on."
                     )
                     # Continue with the measurement, but we're essentially in an unknown / weird state here.
 
@@ -643,9 +646,10 @@ class LaserAutofocusController(QObject):
 
             try:
                 self.turn_on_AF_laser()
-            except TimeoutError:
-                self._log.exception("Turning on AF laser timed out, cannot move to target.")
-                return self._validation_result(False, "laser_on_timeout")
+            except (TimeoutError, CommandAborted) as exc:
+                self._log.exception("Turning on AF laser failed; cannot move to target.")
+                reason = "laser_on_rejected" if isinstance(exc, CommandAborted) else "laser_on_timeout"
+                return self._validation_result(False, reason)
 
             total_moved_um = 0.0
             try:
@@ -734,7 +738,7 @@ class LaserAutofocusController(QObject):
             finally:
                 try:
                     self.turn_off_AF_laser()
-                except TimeoutError:
+                except (TimeoutError, CommandAborted):
                     self._log.exception("Failed to turn off AF laser after move_to_target, laser in unknown state!")
 
     def _move_z(self, um_to_move: float) -> None:
@@ -780,7 +784,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser for reference capture!")
             return None
 
@@ -791,7 +795,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_off_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn off AF laser after capturing reference, laser is in an unknown state!")
             # Continue on since we got our reading, but the system is potentially in a weird state!
 
@@ -885,7 +889,7 @@ class LaserAutofocusController(QObject):
 
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on AF laser for verifying spot alignment.")
             return failure_return_value
 
@@ -894,7 +898,7 @@ class LaserAutofocusController(QObject):
         finally:
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception("Failed to turn off AF laser after verifying spot alignment, laser in unknown state!")
                 # Continue on because we got a reading, but the system is in a potentially weird and unknown state here.
 
@@ -904,9 +908,14 @@ class LaserAutofocusController(QObject):
         failure_return_value = False, float("nan")
 
         with self._time("af:verify_spot_alignment"):
-            # Get current spot image
-            self._get_laser_spot_centroid()
+            # Keep the detection result: registration must not rescue a frame
+            # with no detected spot, or an out-of-tolerance X displacement.
+            centroid = self._get_laser_spot_centroid()
             current_image = self.image
+
+            if centroid is None:
+                self._log.warning("Cannot verify spot alignment - no spot detected")
+                return failure_return_value
 
             if self.reference_crop is None:
                 self._log.warning("No reference crop stored")
@@ -931,8 +940,19 @@ class LaserAutofocusController(QObject):
                 y_end = min(current_image.shape[0], center_y + self.laser_af_properties.spot_crop_size // 2)
 
                 current_crop = current_image[y_start:y_end, x_start:x_end].astype(np.float32)
+                if current_crop.size == 0 or current_crop.shape != self.reference_crop.shape:
+                    self._log.warning("Cross correlation check failed - empty or mismatched crop")
+                    return failure_return_value
+                if (
+                    not np.all(np.isfinite(current_crop))
+                    or not np.all(np.isfinite(self.reference_crop))
+                    or np.ptp(current_crop) == 0
+                    or np.ptp(self.reference_crop) == 0
+                ):
+                    self._log.warning("Cross correlation check failed - flat or non-finite crop")
+                    return failure_return_value
                 crop_max = float(np.max(current_crop))
-                if crop_max <= 0 or current_crop.size != self.reference_crop.size:
+                if crop_max <= 0:
                     self._log.warning(
                         f"Cross correlation check failed - crop unusable "
                         f"(max={crop_max:.1f}, size={current_crop.size} vs reference {self.reference_crop.size})"
@@ -944,17 +964,75 @@ class LaserAutofocusController(QObject):
                 correlation = float(np.corrcoef(current_norm.ravel(), self.reference_crop.ravel())[0, 1])
 
             self._log.debug(f"Cross correlation with reference: {correlation:.3f}")
+            self._validation_update(correlation_unregistered=correlation, y_registration_shift_px=None)
 
-            # A NaN correlation (e.g. a flat crop) must fail, not slip past the
-            # threshold comparison below (nan < x is False).
-            if not math.isfinite(correlation) or correlation < self.laser_af_properties.correlation_threshold:
-                self._log.warning(
-                    f"Cross correlation check failed - spots not well aligned "
-                    f"(correlation={correlation:.3f}, threshold={self.laser_af_properties.correlation_threshold})"
+            threshold = self.laser_af_properties.correlation_threshold
+            # Fast path: most frames need no registration at all.
+            if math.isfinite(correlation) and correlation >= threshold:
+                return True, correlation
+
+            displacement_um = (
+                (centroid[0] - self.laser_af_properties.x_reference) * self.laser_af_properties.pixel_to_um
+            )
+            window_um = max(self.laser_af_properties.displacement_success_window_um, 1e-3)
+            if (
+                math.isfinite(correlation)
+                and math.isfinite(displacement_um)
+                and abs(displacement_um) <= window_um
+                and self.laser_af_properties.correlation_y_tolerance_px > 0
+            ):
+                with self._time("af:verify_y_registration"):
+                    registered, shift_y = self._register_spot_y(current_image, x_start, x_end, y_start, y_end)
+                self._validation_update(y_registration_shift_px=shift_y)
+                self._log.debug(
+                    "Y-only spot registration: shift=%s px, correlation %.3f -> %.3f (X held fixed)",
+                    shift_y, correlation, registered,
                 )
-                return False, correlation
+                if math.isfinite(registered):
+                    correlation = max(correlation, registered)
+                    if correlation >= threshold:
+                        return True, correlation
 
-            return True, correlation
+            self._log.warning(
+                f"Cross correlation check failed - spots not well aligned "
+                f"(correlation={correlation:.3f}, threshold={threshold})"
+            )
+            return False, correlation
+
+    def _register_spot_y(
+        self, image: np.ndarray, x_start: int, x_end: int, y_start: int, y_end: int
+    ) -> Tuple[float, Optional[int]]:
+        """Match the reference in a bounded vertical strip, keeping X fixed.
+
+        Uses the existing verification frame. No padding, wrapping, resizing,
+        or horizontal translation is allowed; only complete crops inside the
+        camera ROI are candidates. Recheck the winner with the same Pearson
+        correlation as the fixed crop, including its flat/non-finite guards.
+        """
+        reference = np.asarray(self.reference_crop, dtype=np.float32)
+        tolerance = self.laser_af_properties.correlation_y_tolerance_px
+        search_start = max(0, y_start - tolerance)
+        search_end = min(image.shape[0], y_end + tolerance)
+        strip = image[search_start:search_end, x_start:x_end].astype(np.float32)
+        if (
+            reference.ndim != 2
+            or reference.size == 0
+            or strip.shape[1] != reference.shape[1]
+            or strip.shape[0] < reference.shape[0]
+            or not np.all(np.isfinite(reference))
+            or not np.all(np.isfinite(strip))
+            or np.ptp(reference) == 0
+        ):
+            return float("nan"), None
+        scores = cv2.matchTemplate(strip, reference, cv2.TM_CCOEFF_NORMED).ravel()
+        if not np.any(np.isfinite(scores)):
+            return float("nan"), None
+        best = int(np.argmax(np.where(np.isfinite(scores), scores, -np.inf)))
+        crop = strip[best : best + reference.shape[0]]
+        if np.ptp(crop) == 0:
+            return float("nan"), None
+        correlation = float(np.corrcoef(crop.ravel(), reference.ravel())[0, 1])
+        return correlation, search_start + best - y_start
 
     def get_new_frame(self) -> Optional[np.ndarray]:
         """Trigger the focus camera and return a frame newer than the last one.
@@ -1231,7 +1309,7 @@ class LaserAutofocusController(QObject):
         # turn on the laser
         try:
             self.turn_on_AF_laser()
-        except TimeoutError:
+        except (TimeoutError, CommandAborted):
             self._log.exception("Failed to turn on laser AF laser before get_image, cannot get image.")
             return None
 
@@ -1255,5 +1333,5 @@ class LaserAutofocusController(QObject):
             # turn off the laser
             try:
                 self.turn_off_AF_laser()
-            except TimeoutError:
+            except (TimeoutError, CommandAborted):
                 self._log.exception("Failed to turn off AF laser after get_image!")

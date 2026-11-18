@@ -23,14 +23,16 @@ class OrderedAcquisitionMixin:
         if any(not plan.events for plan in plans):
             raise ValueError("No observation states selected for acquisition.")
         ref_z = self._reference_z_level()
+        position_nz = [self._region_nz(region) for region, _ in positions]
+        position_ref_z = [self._region_reference_z_level(region) for region, _ in positions]
         counts = [sum(
-            self.NZ if e.is_wait or e.is_stimulus or e.acquire_z_stack else 1
+            nz if e.is_wait or e.is_stimulus or e.acquire_z_stack else 1
             for e in plan.events
-        ) for plan in plans]
+        ) for plan, nz in zip(plans, position_nz)]
         self._ordered_time_states = {}
         self._ordered_focus = {}
         self._ordered_frames_completed = 0
-        self._ordered_frames_total = self.Nt * sum(self._captured_frames_per_fov(plan) for plan in plans)
+        self._ordered_frames_total = self.Nt * sum(self._captured_frames_per_fov(plan, nz) for plan, nz in zip(plans, position_nz))
         self._ordered_prewarmed = False
         remaining = {}
         position_remaining = {}
@@ -39,6 +41,7 @@ class OrderedAcquisitionMixin:
         visits = iter_ordered_visits(
             self.acquisition_order, plans, self.Nt, self.NZ, ref_z,
             snake=self.snake_observation_states,
+            position_nz=position_nz, position_reference_z=position_ref_z,
         )
         try:
             for visit in visits:

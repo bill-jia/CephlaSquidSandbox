@@ -134,6 +134,11 @@ class LaserAutofocusSettingWidget(QWidget):
             settings_layout, "Displacement Success Window (μm):", "displacement_success_window_um", 0.1, 10.0, 2
         )
         self._add_spinbox(settings_layout, "Correlation Threshold:", "correlation_threshold", 0.1, 1.0, 2, 0.1)
+        self._add_spinbox(settings_layout, "Correlation Y Tolerance (pixels):", "correlation_y_tolerance_px", 0, 100, 0)
+        self.spinboxes["correlation_y_tolerance_px"].setToolTip(
+            "After fixed-crop correlation fails, retry within this Y shift while keeping X fixed. "
+            "0 disables the retry. The correlation threshold is unchanged."
+        )
         self._add_spinbox(settings_layout, "Laser AF Range (μm):", "laser_af_range", 1, 1000, 1)
         self.update_threshold_button = QPushButton("Apply without Re-initialization")
         settings_layout.addWidget(self.update_threshold_button)
@@ -349,6 +354,7 @@ class LaserAutofocusSettingWidget(QWidget):
             "displacement_success_window_um": self.spinboxes["displacement_success_window_um"].value(),
             "spot_crop_size": int(self.spinboxes["spot_crop_size"].value()),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
+            "correlation_y_tolerance_px": int(self.spinboxes["correlation_y_tolerance_px"].value()),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
             "spot_detection_mode": self.spot_mode_combo.currentData(),
             "y_window": int(self.spinboxes["y_window"].value()),
@@ -377,6 +383,7 @@ class LaserAutofocusSettingWidget(QWidget):
             "laser_af_averaging_n": int(self.spinboxes["laser_af_averaging_n"].value()),
             "displacement_success_window_um": self.spinboxes["displacement_success_window_um"].value(),
             "correlation_threshold": self.spinboxes["correlation_threshold"].value(),
+            "correlation_y_tolerance_px": int(self.spinboxes["correlation_y_tolerance_px"].value()),
             "laser_af_range": self.spinboxes["laser_af_range"].value(),
         }
         self.laserAutofocusController.update_threshold_properties(updates)
@@ -480,6 +487,7 @@ class SpinningDiskConfocalWidget(QWidget):
     # (and saved with) the live observation state rather than being a
     # driver-only side effect the state never learns about.
     signal_emission_filter_changed = Signal(int)
+    signal_excitation_filter_changed = Signal(int)
     signal_dichroic_changed = Signal(int)
     signal_filter_slider_changed = Signal(int)
 
@@ -503,6 +511,8 @@ class SpinningDiskConfocalWidget(QWidget):
 
         if self.xlight.has_emission_filters_wheel:
             self.dropdown_emission_filter.currentIndexChanged.connect(self.set_emission_filter)
+        if self.xlight.has_excitation_filters_wheel:
+            self.dropdown_excitation_filter.currentIndexChanged.connect(self.set_excitation_filter)
         if self.xlight.has_dichroic_filters_wheel:
             self.dropdown_dichroic.currentIndexChanged.connect(self.set_dichroic)
         if self.xlight.has_dichroic_filter_slider:
@@ -532,7 +542,21 @@ class SpinningDiskConfocalWidget(QWidget):
             self._log.warning("Could not read confocal filter wheel names from the machine config", exc_info=True)
             return {}
         for wheel in wheels:
-            if getattr(wheel, "positions", None):
+            if wheel.type == "emission" and getattr(wheel, "positions", None):
+                return {int(slot): str(name) for slot, name in wheel.positions.items()}
+        return {}
+
+    def _excitation_filter_names(self) -> Dict[int, str]:
+        """Slot -> filter name declared for the confocal excitation wheel, if any."""
+        if self.config_repo is None:
+            return {}
+        try:
+            wheels = self.config_repo.get_all_filter_wheels().get("confocal") or []
+        except Exception:
+            self._log.warning("Could not read confocal filter wheel names from the machine config", exc_info=True)
+            return {}
+        for wheel in wheels:
+            if wheel.type == "excitation" and getattr(wheel, "positions", None):
                 return {int(slot): str(name) for slot, name in wheel.positions.items()}
         return {}
 
@@ -611,6 +635,19 @@ class SpinningDiskConfocalWidget(QWidget):
             self.dropdown_emission_filter.setMinimumContentsLength(8)
             add_row("Emission", self.dropdown_emission_filter)
 
+        # --- excitation wheel ----------------------------------------------------
+        self.dropdown_excitation_filter = None
+        if self.xlight.has_excitation_filters_wheel:
+            self.dropdown_excitation_filter = QComboBox(self)
+            names = self._excitation_filter_names()
+            for i in range(self.xlight.excitation_filter_positions):
+                slot = i + 1
+                name = names.get(slot)
+                self.dropdown_excitation_filter.addItem(f"{slot}: {name}" if name else str(slot), slot)
+            self.dropdown_excitation_filter.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+            self.dropdown_excitation_filter.setMinimumContentsLength(8)
+            add_row("Excitation", self.dropdown_excitation_filter)
+
         # --- irises -------------------------------------------------------------
         self.slider_illumination_iris = QSlider(Qt.Horizontal)
         self.slider_illumination_iris.setRange(0, 100)
@@ -642,6 +679,8 @@ class SpinningDiskConfocalWidget(QWidget):
     def enable_all_buttons(self, enable: bool):
         if self.dropdown_emission_filter:
             self.dropdown_emission_filter.setEnabled(enable)
+        if self.dropdown_excitation_filter:
+            self.dropdown_excitation_filter.setEnabled(enable)
         if self.dropdown_dichroic:
             self.dropdown_dichroic.setEnabled(enable)
         self.switch_confocal.setEnabled(enable)
@@ -758,6 +797,39 @@ class SpinningDiskConfocalWidget(QWidget):
         finally:
             self.dropdown_emission_filter.blockSignals(blocked)
 
+    def set_excitation_filter(self, index):
+        """Emit the chosen excitation wheel slot.
+
+        The hardware move is done by the observation state controller (see
+        ``signal_excitation_filter_changed``) so the position is recorded on the
+        live observation state instead of being a hardware-only side effect.
+        """
+        slot = self.dropdown_excitation_filter.currentData()
+        if slot is None:
+            return
+        self.enable_all_buttons(False)
+        try:
+            self.signal_excitation_filter_changed.emit(int(slot))
+        finally:
+            self.enable_all_buttons(True)
+
+    def select_excitation_filter_slot(self, slot) -> None:
+        """Show ``slot`` in the excitation wheel dropdown without moving hardware."""
+        if not self.dropdown_excitation_filter:
+            return
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return
+        index = self.dropdown_excitation_filter.findData(slot)
+        if index < 0:
+            return
+        blocked = self.dropdown_excitation_filter.blockSignals(True)
+        try:
+            self.dropdown_excitation_filter.setCurrentIndex(index)
+        finally:
+            self.dropdown_excitation_filter.blockSignals(blocked)
+
     def set_confocal_mode_display(self, confocal: bool) -> None:
         """Refresh the widefield/confocal switch to match an externally applied state.
 
@@ -823,6 +895,8 @@ class SpinningDiskConfocalWidget(QWidget):
             self.dropdown_dichroic.blockSignals(block)
         if self.dropdown_emission_filter is not None:
             self.dropdown_emission_filter.blockSignals(block)
+        if self.dropdown_excitation_filter is not None:
+            self.dropdown_excitation_filter.blockSignals(block)
         self.filter_slider.blockSignals(block)
 
     def sync_from_observation_state(self, state=None):
@@ -895,6 +969,14 @@ class SpinningDiskConfocalWidget(QWidget):
                     slot = self._hardware_value("emission_wheel_pos", self.xlight.get_emission_filter)
                 if slot is not None:
                     self.select_emission_filter_slot(slot)
+
+            if self.xlight.has_excitation_filters_wheel:
+                slot = getattr(state, "excitation_filter_positions", None) or {}
+                slot = slot.get("default") if isinstance(slot, dict) else None
+                if slot is None:
+                    slot = self._hardware_value("excitation_wheel_pos", self.xlight.get_excitation_filter)
+                if slot is not None:
+                    self.select_excitation_filter_slot(slot)
 
             if state is not None:
                 confocal = bool(getattr(state, "confocal_mode", False))
@@ -2296,24 +2378,17 @@ class LiveControlWidget(QFrame):
         """Write ``{snap_stem}_acquisition_metadata.yaml`` next to the snap TIFF."""
         from pathlib import Path
 
-        from control.core.acquisition_metadata_helpers import build_acquisition_metadata
-        from control.core.observation_state_service import collect_emission_filter_positions
+        from control.core.acquisition_metadata_helpers import (
+            build_acquisition_metadata,
+            collect_acquisition_observation_state,
+        )
 
         path = Path(filepath)
         stem = path.stem
         meta_filename = f"{stem}_acquisition_metadata.yaml"
         repo = self.liveController.microscope.config_repo
 
-        obs_state = None
-        if repo.current_profile:
-            try:
-                wheel = getattr(self.liveController.microscope, "emission_filter_wheel", None)
-                emission = collect_emission_filter_positions(wheel)
-                obs_state = self.liveController.obs_controller.collect_observation_state(
-                    emission_filter_positions=emission or None,
-                )
-            except Exception as e:
-                self._log.warning("Snap: could not collect observation state for metadata: %s", e)
+        obs_state = collect_acquisition_observation_state(self.liveController, self._log)
 
         selected_names = []
         if obs_state and obs_state.illuminator_states:
@@ -3044,7 +3119,6 @@ class AutoFocusWidget(QFrame):
         self.btn_autofocus.setChecked(False)
 
 
-
 class StatsDisplayWidget(QFrame):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -3314,4 +3388,3 @@ class WellSelectionWidget(QTableWidget):
         }
         """
         self.setStyleSheet(style)
-

@@ -15,6 +15,7 @@ class AcquisitionYAMLData:
     xy_mode: str = "Select Wells"
     skip_saving: bool = False  # dry run: the acquisition ran but wrote no image files
     validation_mode: bool = False
+    log_af_events: bool = False
     snake_observation_states: bool = False
     acquisition_order: Tuple[str, ...] = ("T", "Pos", "Z", "C")
     # Z retracted to OBJECTIVE_RETRACTED_POS_MM around inter-region XY moves. Optional:
@@ -125,6 +126,7 @@ def parse_acquisition_yaml(file_path: str) -> AcquisitionYAMLData:
         xy_mode=acq.get("xy_mode", "Select Wells"),
         skip_saving=bool(acq.get("skip_saving", False)),
         validation_mode=bool(acq.get("validation_mode", False)),
+        log_af_events=bool(acq.get("log_af_events", False)),
         snake_observation_states=bool(acq.get("snake_observation_states", False)),
         retract_z_between_regions=(
             None if acq.get("retract_z_between_regions") is None else bool(acq["retract_z_between_regions"])

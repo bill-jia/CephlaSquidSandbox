@@ -12,9 +12,15 @@ import pytest
 
 import control.microcontroller
 import control.microscope
+import squid.logging
 from control.firmware_sim_serial import FirmwareSimSerial
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def isolate_mcu_diagnostic_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(squid.logging, "get_current_log_file_path", lambda: str(tmp_path / "main_hcs.log"))
 
 
 def _make_tracking_init(original_init, instances_list):

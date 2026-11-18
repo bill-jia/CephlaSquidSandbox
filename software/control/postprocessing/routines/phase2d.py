@@ -1,9 +1,8 @@
 """
 2D quantitative phase from a defocused brightfield z-stack (waveorder).
 
-Uses the high-level ``waveorder.api.phase`` pipeline — ``phase.Settings`` →
-``phase.compute_transfer_function`` (``recon_dim=2``) → ``phase.apply_inverse_
-transfer_function`` — to invert the acquired z-defocus stack ``(Z, Y, X)`` into a
+Uses waveorder's 2D phase model and ``phase.apply_inverse_transfer_function``
+to invert the acquired z-defocus stack ``(Z, Y, X)`` into a
 single 2D phase image. The transfer function (returned as an ``xr.Dataset`` of the
 singular system) depends only on the acquisition geometry, so it is computed once
 (pre-acquisition ``warmup``, or the first FOV) and cached in ``ctx.cache`` for
@@ -110,7 +109,6 @@ class Phase2DRoutine(PostprocessRoutine):
 
     def _build_settings(self, o: dict):
         from waveorder.api import phase
-        print(o)
         return phase.Settings(
             transfer_function=phase.TransferFunctionSettings(
                 wavelength_illumination=o["wavelength_um"],
@@ -156,8 +154,6 @@ class Phase2DRoutine(PostprocessRoutine):
         and the SVD's transient GPU allocation is released afterwards.
         """
         import torch
-        import xarray as xr
-        from waveorder.api import phase
 
         cache_key = (
             tuple(yx_shape),
@@ -180,23 +176,84 @@ class Phase2DRoutine(PostprocessRoutine):
         # the host OOM. Keep only one transfer function resident at a time.
         ctx.cache.clear()
         self._release_memory()
-        # compute_transfer_function only reads the CZYX shape, so a zeros DataArray
-        # of the run geometry is enough to build the (data-independent) TF.
-        czyx = xr.DataArray(
-            np.zeros((1, nz) + tuple(yx_shape), dtype=np.float32), dims=("c", "z", "y", "x")
+        ctx.logger.info(
+            "phase2d: building transfer function in bounded batches (yx_shape=%s, nz=%d)", tuple(yx_shape), nz
         )
         with torch.no_grad():
-            tf = phase.compute_transfer_function(czyx, recon_dim=2, settings=settings, device="auto")
+            tf = self._compute_transfer_function(settings, yx_shape, nz)
         # Return the SVD's transient GPU working set to the driver so it is not
         # left reserved on top of the per-FOV reconstruction.
         self._release_memory()
         ctx.cache[cache_key] = tf
         ctx.logger.info(
-            "phase2d: computed transfer function (waveorder api, recon_dim=2, yx_shape=%s, nz=%d)",
+            "phase2d: computed transfer function (waveorder model, recon_dim=2, yx_shape=%s, nz=%d)",
             tuple(yx_shape),
             nz,
         )
         return tf
+
+    @staticmethod
+    def _compute_transfer_function(settings, yx_shape, nz, *, device="auto", max_svd_pixels=16384):
+        """Waveorder's full SVD, with bounded GPU intermediates.
+
+        Optical propagation is independent per defocus plane; the SVD is
+        independent per spatial frequency. Keep the full arrays on the host,
+        computing one optical plane and a small batch of SVDs at a time. This
+        avoids both a Z-sized oversampled FFT working set and a millions-wide
+        cuSOLVER batch. No image tiling or change to the optical model is used.
+        """
+        import torch
+        import xarray as xr
+        from waveorder.device import resolve_device
+        from waveorder.models import isotropic_thin_3d
+
+        device = resolve_device(device)
+        s = settings.transfer_function.resolve_floats()
+        y, x = yx_shape
+        absorption = np.empty((nz, y, x), dtype=np.complex64)
+        phase_tf = np.empty_like(absorption)
+        for z in range(nz):
+            z_positions = torch.tensor(
+                [(nz // 2 - z + s.z_focus_offset) * s.z_pixel_size],
+                dtype=torch.float32, device=device,
+            )
+            a, p = isotropic_thin_3d.calculate_transfer_function(
+                yx_shape=yx_shape,
+                yx_pixel_size=s.yx_pixel_size,
+                z_position_list=z_positions,
+                wavelength_illumination=s.wavelength_illumination,
+                index_of_refraction_media=s.index_of_refraction_media,
+                numerical_aperture_illumination=s.numerical_aperture_illumination,
+                numerical_aperture_detection=s.numerical_aperture_detection,
+                invert_phase_contrast=s.invert_phase_contrast,
+                tilt_angle_zenith=s.tilt_angle_zenith,
+                tilt_angle_azimuth=s.tilt_angle_azimuth,
+            )
+            absorption[z] = a[0].cpu().numpy()
+            phase_tf[z] = p[0].cpu().numpy()
+            del a, p
+
+        arrays = {
+            "singular_system_U": np.empty((2, 2, y, x), dtype=np.complex64),
+            "singular_system_S": np.empty((2, y, x), dtype=np.float32),
+            "singular_system_Vh": np.empty((2, nz, y, x), dtype=np.complex64),
+        }
+        # Slice contiguous frequency rows on the host before uploading. Flatten
+        # only YX, leaving the complete Z vector in each independent SVD.
+        absorption = absorption.reshape(nz, -1)
+        phase_tf = phase_tf.reshape(nz, -1)
+        for start in range(0, y * x, max_svd_pixels):
+            end = min(start + max_svd_pixels, y * x)
+            a = torch.from_numpy(absorption[:, start:end, None]).to(device)
+            p = torch.from_numpy(phase_tf[:, start:end, None]).to(device)
+            singular_system = isotropic_thin_3d.calculate_singular_system(a, p)
+            for array, tensor in zip(arrays.values(), singular_system):
+                array.reshape(*array.shape[:-2], -1)[..., start:end] = tensor[..., 0].cpu().numpy()
+            del a, p, singular_system, tensor
+        return xr.Dataset({
+            name: xr.DataArray(array, dims=tuple(f"{name}_d{i}" for i in range(array.ndim)))
+            for name, array in arrays.items()
+        })
 
     def warmup(self, input_states, ctx, params):
         if not ctx.yx_shape:

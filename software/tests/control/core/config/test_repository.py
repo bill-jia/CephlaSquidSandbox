@@ -902,7 +902,8 @@ devices:
         assert FILTER_WHEEL_SOURCE_CONFOCAL not in repo.get_all_filter_wheels()
 
     def test_get_all_filter_wheels_from_library_config(self, temp_dir):
-        """The X-Light library config yields its 8-slot emission wheel with no standalone registry."""
+        """The X-Light library config yields both built-in wheels with no standalone registry."""
+
         machine_configs = temp_dir / "machine_configs"
         machine_configs.mkdir()
 
@@ -919,12 +920,18 @@ devices:
 
         assert FILTER_WHEEL_SOURCE_STANDALONE not in all_wheels
         wheels = all_wheels[FILTER_WHEEL_SOURCE_CONFOCAL]
-        assert len(wheels) == 1
+        assert len(wheels) == 2
         assert wheels[0].name == "XLight emission wheel"
         assert wheels[0].id == 1
         assert wheels[0].type == FilterWheelType.EMISSION
         assert len(wheels[0].positions) == 8
-        assert repo.get_all_filter_wheel_names() == ["XLight emission wheel"]
+        assert wheels[1].name == "XLight excitation wheel"
+        assert wheels[1].id == 2
+        assert wheels[1].type == FilterWheelType.EXCITATION
+        assert len(wheels[1].positions) == 4
+        assert repo.get_all_filter_wheel_names() == ["XLight emission wheel", "XLight excitation wheel"]
+        assert repo.get_emission_wheels()[FILTER_WHEEL_SOURCE_CONFOCAL] == [wheels[0]]
+        assert repo.get_excitation_wheels()[FILTER_WHEEL_SOURCE_CONFOCAL] == [wheels[1]]
 
         # hardware_bindings-style resolution still finds it under "confocal"
         ref = FilterWheelReference(source=FILTER_WHEEL_SOURCE_CONFOCAL, id=1)
@@ -934,6 +941,7 @@ devices:
 
         settings = repo.get_confocal_settings()
         assert settings.emission_filter_positions == 8
+        assert settings.excitation_filter_positions == 4
         assert settings.illumination_iris_default == 80.0
 
     def test_iris_seeding_uses_device_defaults(self, repo_with_profile, temp_dir):

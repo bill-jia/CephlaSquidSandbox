@@ -234,8 +234,10 @@ def test_ordered_coordinate_visit_does_not_scan_other_positions():
     worker._ordered_prewarmed = False
     worker._backpressure = MagicMock()
     worker.validation_mode = False
+    worker.do_reflection_af = False
     worker._prewarm_observation_states = MagicMock()
-    worker._prewarm_postprocess_routines = MagicMock()
+    worker._prewarm_postprocess_routines = MagicMock(return_value=None)
+    worker._job_runners = []
     worker.scan_region_coords_mm = [(0, 0), (1, 1)]
     worker._summarize_runner_outputs = lambda: SimpleNamespace(none_failed=True)
     worker._first_fov_pre_moved = False

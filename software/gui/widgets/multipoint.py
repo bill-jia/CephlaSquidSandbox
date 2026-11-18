@@ -16,6 +16,8 @@ from .tile_spacing import TileSpacingWidget, spacing_parameters
 from .acquisition_order import AcquisitionOrderWidget
 from control.core.scan_coordinates import normalize_region_name, validate_region_name
 from control.models import LaserAFReference
+from control.models.region_z_stack import default_z_range, normalize_z_stacking_config, z_stack_count
+from qtpy.QtCore import QSignalBlocker
 
 
 def _get_checked_names(list_widget: QListWidget) -> list:
@@ -935,6 +937,8 @@ class CycleEditorDialog(QDialog):
         super().__init__(parent)
         self.microscope = microscope
         self.repo = microscope.config_repo
+        self._loaded_cycle_name = None
+        self._saved_snapshot = None
         self.setWindowTitle("Edit Acquisition Cycles")
 
         layout = QHBoxLayout(self)
@@ -943,23 +947,28 @@ class CycleEditorDialog(QDialog):
         left = QVBoxLayout()
         left.addWidget(QLabel("Saved cycles"))
         self.list_existing = QListWidget()
-        self.list_existing.itemClicked.connect(lambda it: self._load_cycle(it.text()))
+        self.list_existing.setToolTip("Select a cycle to edit its steps and repeats")
+        self.list_existing.currentItemChanged.connect(self._on_cycle_selected)
         left.addWidget(self.list_existing)
         row = QHBoxLayout()
-        btn_new = QPushButton("New")
-        btn_new.clicked.connect(self._new_cycle)
-        btn_del = QPushButton("Delete")
-        btn_del.clicked.connect(self._delete_selected_cycle)
-        row.addWidget(btn_new)
-        row.addWidget(btn_del)
+        self.btn_new_cycle = QPushButton("New Cycle")
+        self.btn_new_cycle.clicked.connect(self._new_cycle)
+        self.btn_delete_cycle = QPushButton("Delete…")
+        self.btn_delete_cycle.setToolTip("Delete the selected saved cycle")
+        self.btn_delete_cycle.clicked.connect(self._delete_selected_cycle)
+        row.addWidget(self.btn_new_cycle)
+        row.addWidget(self.btn_delete_cycle)
         left.addLayout(row)
         layout.addLayout(left, 1)
 
         # ── Right: editor ──
         right = QVBoxLayout()
         name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
+        name_row.addWidget(QLabel("Editing:"))
         self.edit_name = QLineEdit()
+        self.edit_name.setReadOnly(True)
+        self.edit_name.setPlaceholderText("New cycle — use Save As…")
+        self.edit_name.setToolTip("Save Changes updates this cycle. Save As creates a separate cycle.")
         name_row.addWidget(self.edit_name)
         name_row.addWidget(QLabel("Repeat:"))
         self.spin_repeat = QSpinBox()
@@ -994,18 +1003,30 @@ class CycleEditorDialog(QDialog):
         right.addLayout(tools)
 
         save_row = QHBoxLayout()
+        self.label_cycle_status = QLabel()
+        save_row.addWidget(self.label_cycle_status)
         save_row.addStretch()
-        btn_save = QPushButton("Save")
-        btn_save.clicked.connect(self._save_cycle)
+        self.btn_save_cycle = QPushButton("Save Changes")
+        self.btn_save_cycle.setToolTip("Replace the cycle being edited with these steps and repeats")
+        self.btn_save_cycle.clicked.connect(self._save_cycle)
+        self.btn_save_cycle_as = QPushButton("Save As…")
+        self.btn_save_cycle_as.setToolTip("Save these steps and repeats as a new cycle with a different name")
+        self.btn_save_cycle_as.clicked.connect(self._save_cycle_as)
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
-        save_row.addWidget(btn_save)
+        for button in (
+            self.btn_new_cycle, self.btn_delete_cycle, self.btn_save_cycle, self.btn_save_cycle_as, btn_close
+        ):
+            button.setAutoDefault(False)
+        save_row.addWidget(self.btn_save_cycle)
+        save_row.addWidget(self.btn_save_cycle_as)
         save_row.addWidget(btn_close)
         right.addLayout(save_row)
         layout.addLayout(right, 2)
 
         self.resize(720, 420)
         self._refresh_existing()
+        self._new_cycle()
 
     # ── preset combo helper ──
     def _preset_names(self):
@@ -1530,12 +1551,56 @@ class CycleEditorDialog(QDialog):
 
     # ── persistence ──
     def _refresh_existing(self):
-        self.list_existing.clear()
-        for name in _multipoint_cycle_display_names(self.microscope):
-            self.list_existing.addItem(name)
+        with QSignalBlocker(self.list_existing):
+            self.list_existing.clear()
+            for name in _multipoint_cycle_display_names(self.microscope):
+                self.list_existing.addItem(name)
+            matches = self.list_existing.findItems(self._loaded_cycle_name or "", Qt.MatchExactly)
+            if matches:
+                self.list_existing.setCurrentItem(matches[0])
+        self._update_cycle_actions()
+
+    def _update_cycle_actions(self):
+        has_profile = bool(self.repo.current_profile)
+        self.btn_save_cycle.setEnabled(has_profile and self._loaded_cycle_name is not None)
+        self.btn_save_cycle_as.setEnabled(has_profile)
+        self.btn_delete_cycle.setEnabled(has_profile and self.list_existing.currentItem() is not None)
+
+    def _on_cycle_selected(self, current, _previous):
+        if current is not None and not self._load_cycle(current.text()):
+            # A cancelled switch must leave the library pointing at the draft's owner.
+            self._refresh_existing()
+        self._update_cycle_actions()
+
+    def _snapshot(self):
+        return (self.spin_repeat.value(), self._read_tree())
+
+    def _confirm_leave_cycle(self):
+        if self._saved_snapshot is None or self._snapshot() == self._saved_snapshot:
+            return True
+        choice = QMessageBox.question(
+            self,
+            "Unsaved cycle changes",
+            f"Save changes to '{self._loaded_cycle_name or 'New cycle'}' before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if choice == QMessageBox.Save:
+            return self._save_cycle(confirm=False) if self._loaded_cycle_name else self._save_cycle_as()
+        return choice == QMessageBox.Discard
+
+    def done(self, result):
+        if self._confirm_leave_cycle():
+            super().done(result)
 
     def _new_cycle(self):
+        if not self._confirm_leave_cycle():
+            return
         self._load_model("", 1, [])
+        self._loaded_cycle_name = None
+        self._saved_snapshot = self._snapshot()
+        self.label_cycle_status.setText("Unsaved cycle")
+        self._refresh_existing()
 
     @staticmethod
     def _leaf_to_dict(item):
@@ -1593,9 +1658,14 @@ class CycleEditorDialog(QDialog):
     def _load_cycle(self, name):
         from control.models.acquisition_cycle import CycleGroup
 
+        if name == self._loaded_cycle_name:
+            return True
+        if not self._confirm_leave_cycle():
+            return False
         cyc = self.repo.load_acquisition_cycle(name)
         if cyc is None:
-            return
+            QMessageBox.warning(self, "Load failed", f"Could not load cycle '{name}'.")
+            return False
         model = []
         for item in cyc.items:
             if isinstance(item, CycleGroup):
@@ -1610,18 +1680,41 @@ class CycleEditorDialog(QDialog):
             else:
                 model.append(self._leaf_to_dict(item))
         self._load_model(cyc.name, cyc.repeat, model)
+        self._loaded_cycle_name = name
+        self._saved_snapshot = self._snapshot()
+        self.label_cycle_status.setText(f"Loaded '{name}'")
+        self._refresh_existing()
+        return True
 
     def _delete_selected_cycle(self):
         item = self.list_existing.currentItem()
         if item is None:
             return
         name = item.text()
-        if QMessageBox.question(self, "Delete cycle", f"Delete cycle '{name}'?") != QMessageBox.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "Delete cycle",
+                f"Delete the saved cycle '{name}'? This cannot be undone.\n\n"
+                "The steps in the editor will be kept as an unsaved cycle. "
+                "Acquisitions using this cycle will need another cycle selected.",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            != QMessageBox.Yes
+        ):
             return
         try:
-            self.repo.delete_acquisition_cycle(name)
+            if not self.repo.delete_acquisition_cycle(name):
+                raise ValueError(f"Cycle '{name}' was not found.")
         except Exception as e:
             QMessageBox.warning(self, "Delete failed", str(e))
+            return
+        self._loaded_cycle_name = None
+        self.edit_name.clear()
+        # The retained draft must be saved under a new name before closing.
+        self._saved_snapshot = (1, [])
+        self.label_cycle_status.setText("Deleted saved cycle; draft kept")
         self._refresh_existing()
 
     @staticmethod
@@ -1685,13 +1778,55 @@ class CycleEditorDialog(QDialog):
             )
         return None
 
-    def _save_cycle(self):
+    def _save_cycle(self, *, confirm=True):
+        name = self._loaded_cycle_name
+        if not name or name not in self.repo.list_acquisition_cycles():
+            QMessageBox.warning(self, "Save cycle", "Select an existing cycle, or use Save As to create one.")
+            return False
+        if confirm and (
+            QMessageBox.question(
+                self,
+                "Save cycle changes",
+                f"Replace the saved steps and repeats for '{name}' with the current edits?",
+                QMessageBox.Save | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            != QMessageBox.Save
+        ):
+            return False
+        return self._write_cycle(name)
+
+    def _save_cycle_as(self):
+        from control.core.observation_state_service import acquisition_cycle_path
+
+        if not self.repo.current_profile:
+            QMessageBox.warning(self, "Save cycle", "Load a user profile before saving a cycle.")
+            return False
+        suggestion = f"{self._loaded_cycle_name} copy" if self._loaded_cycle_name else ""
+        while True:
+            name, ok = QInputDialog.getText(self, "Save Cycle As", "New cycle name:", text=suggestion)
+            if not ok:
+                return False
+            name = name.strip()
+            suggestion = name
+            try:
+                path = acquisition_cycle_path(self.repo, name)
+            except ValueError as e:
+                QMessageBox.warning(self, "Save cycle", str(e))
+                continue
+            if name in self.repo.list_acquisition_cycles() or path.exists():
+                QMessageBox.warning(
+                    self,
+                    "Cycle already exists",
+                    "That name is already in use. Choose another name, or select the existing "
+                    "cycle and use Save Changes to replace it.",
+                )
+                continue
+            return self._write_cycle(name)
+
+    def _build_cycle(self, name):
         from control.models.acquisition_cycle import AcquisitionCycle, CycleGroup, PostprocessSpec
 
-        name = self.edit_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Save cycle", "Enter a cycle name.")
-            return
         model = self._read_tree()
         items = []
         for entry in model:
@@ -1718,14 +1853,23 @@ class CycleEditorDialog(QDialog):
         if not items:
             QMessageBox.warning(self, "Save cycle", "Add at least one step.")
             return
-        cycle = AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+        return AcquisitionCycle(name=name, repeat=self.spin_repeat.value(), items=items)
+
+    def _write_cycle(self, name):
         try:
+            cycle = self._build_cycle(name)
+            if cycle is None:
+                return False
             self.repo.save_acquisition_cycle(name, cycle)
         except Exception as e:
             QMessageBox.warning(self, "Save failed", str(e))
-            return
+            return False
+        self._loaded_cycle_name = name
+        self.edit_name.setText(name)
+        self._saved_snapshot = self._snapshot()
         self._refresh_existing()
-        QMessageBox.information(self, "Saved", f"Cycle '{name}' saved.")
+        self.label_cycle_status.setText(f"Saved '{name}'")
+        return True
 
 
 def _open_cycle_editor(widget) -> None:
@@ -1842,6 +1986,9 @@ def _apply_save_format_from_yaml(widget, yaml_data) -> None:
     validation_checkbox = getattr(widget, "checkbox_afValidation", None)
     if validation_checkbox is not None:
         validation_checkbox.setChecked(yaml_data.validation_mode)
+    logging_checkbox = getattr(widget, "checkbox_logAFEvents", None)
+    if logging_checkbox is not None:
+        logging_checkbox.setChecked(yaml_data.log_af_events)
     combo = widget.combobox_fileSavingFormat
     if yaml_data.skip_saving:
         combo.setCurrentText(DRY_RUN_SAVE_FORMAT)
@@ -3314,9 +3461,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
     _COL_X = 0
     _COL_Y = 1
     _COL_Z = 2
-    _COL_AF_REF = 3
-    _COL_NAME = 4
-    _COL_COUNT = 5
+    _COL_Z_MIN = 3
+    _COL_Z_MAX = 4
+    _COL_NZ = 5
+    _COL_AF_REF = 6
+    _COL_NAME = 7
+    _COL_COUNT = 8
 
     # An empty list is not an error: acquisition_in_place() silently acquires wherever
     # the stage happens to be, so say so rather than just "no positions".
@@ -3367,6 +3517,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # which drops the references it holds; the widget owns the position list, so
         # it owns the references too and re-applies them after each rebuild.
         self._region_laser_af_references = {}
+        self._region_z_ranges = {}
         self.use_overlap = True  # All interactive pitch modes use the shared grid generator.
         self.add_components()
         self.setup_layout()
@@ -3422,11 +3573,16 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         labels[self._COL_X] = "x (mm)"
         labels[self._COL_Y] = "y (mm)"
         labels[self._COL_Z] = "z (μm)"
+        labels[self._COL_Z_MIN] = "Z min (μm)"
+        labels[self._COL_Z_MAX] = "Z max (μm)"
+        labels[self._COL_NZ] = "Z count"
         labels[self._COL_AF_REF] = "AF Ref"
         labels[self._COL_NAME] = "Region Name"
         self.table_location_list.setHorizontalHeaderLabels(labels)
         self.table_location_list.setToolTip(
-            "Click a row to move there. Edit x/y/z to move a position, or the Region\n"
+            "Click a row to move there. Edit x/y/z to move a position; editing Z shifts its stack too.\n"
+            "Edit Z min/Z max for an independent region stack; Z count uses the shared Z step.\n"
+            "Clear a Z limit to return that region to the shared stack settings. Edit the Region\n"
             "Name to rename it. Region names are written to coordinates.csv,\n"
             "acquisition.yaml and the per-region sidecars, and are used as the image\n"
             "filename prefix and zarr folder name — so they must be unique and\n"
@@ -3437,7 +3593,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.table_location_list.setAlternatingRowColors(True)
         self.table_location_list.verticalHeader().setDefaultSectionSize(22)
         header = self.table_location_list.horizontalHeader()
-        for col in (self._COL_X, self._COL_Y, self._COL_Z, self._COL_AF_REF):  # numbers stay narrow...
+        for col in (self._COL_X, self._COL_Y, self._COL_Z, self._COL_Z_MIN, self._COL_Z_MAX, self._COL_NZ, self._COL_AF_REF):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self._COL_NAME, QHeaderView.Stretch)  # ...name takes the slack
         # ~5 rows visible, then scroll. The tab panel is clamped to its sizeHint by
@@ -3501,7 +3657,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
         self.entry_deltaZ = QDoubleSpinBox()
         self.entry_deltaZ.setKeyboardTracking(False)
-        self.entry_deltaZ.setMinimum(0)
+        self.entry_deltaZ.setMinimum(0.001)
         self.entry_deltaZ.setMaximum(1000)
         self.entry_deltaZ.setSingleStep(0.1)
         self.entry_deltaZ.setValue(Acquisition.DZ)
@@ -3608,6 +3764,13 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_logAFEvents = QCheckBox("Log AF events during imaging")
+        self.checkbox_logAFEvents.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_logAFEvents.setToolTip(
+            "Requires Laser AF. Save measurements, correlation, references and native AF evidence "
+            "in af_events alongside normal images and Z stacks. No extra camera exposures."
+        )
+
         self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
@@ -3655,6 +3818,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
         self.checkbox_set_z_range = QCheckBox("Set Z-range")
         self.checkbox_set_z_range.toggled.connect(self.toggle_z_range_controls)
+        self.checkbox_set_z_globally = QCheckBox("Set Z globally")
+        self.checkbox_set_z_globally.setToolTip(
+            "Unchecked: these controls edit the selected position's Z limits. "
+            "Checked: these controls apply each limit change to all positions."
+        )
+        self.checkbox_set_z_globally.toggled.connect(self._sync_z_range_controls)
 
         # Add new components for Z-range
         self.entry_minZ = QDoubleSpinBox()
@@ -3812,6 +3981,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
         zstack_content.addLayout(self.z_min_layout)
         zstack_content.addLayout(self.z_max_layout)
+        zstack_content.addWidget(self.checkbox_set_z_globally)
         self._zstack_controls = _collect_widgets(zstack_content)
 
         timelapse_section, timelapse_content, self.checkbox_timelapse = _make_checkable_section("Time-lapse")
@@ -3840,6 +4010,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_logAFEvents)
         saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
@@ -3893,6 +4064,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.entry_Nt.valueChanged.connect(lambda *_: self.multipointController.set_Nt(self._effective_Nt()))
         self.checkbox_zstack.toggled.connect(lambda *_: self._apply_zstack_enabled())
         self.checkbox_timelapse.toggled.connect(lambda *_: self._apply_timelapse_enabled())
+        self.entry_NZ.valueChanged.connect(self._refresh_region_z_cells)
+        self.checkbox_zstack.toggled.connect(self._refresh_region_z_cells)
+        self.combobox_z_stack.currentIndexChanged.connect(self._refresh_region_z_cells)
         self.combobox_z_stack.currentIndexChanged.connect(self.multipointController.set_z_stacking_config)
         self.checkbox_genAFMap.toggled.connect(self.multipointController.set_gen_focus_map_flag)
         self.checkbox_useFocusMap.toggled.connect(self.focusMapWidget.setEnabled)
@@ -3949,6 +4123,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # add, a removal, an import — never moves the stage behind the user's back.
         self.table_location_list.cellClicked.connect(self.cell_was_clicked)
         self.table_location_list.cellChanged.connect(self.cell_was_changed)
+        self.table_location_list.currentCellChanged.connect(lambda *_: self._sync_z_range_controls())
+        self.entry_minZ.valueChanged.connect(lambda value: self._set_region_range_boundary(0, value))
+        self.entry_maxZ.valueChanged.connect(lambda value: self._set_region_range_boundary(1, value))
         self.btn_update_z.clicked.connect(self.update_z)
         self.btn_update_ref.clicked.connect(self.update_reference)
         if self._enable_laser_autofocus:
@@ -3986,53 +4163,81 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
     def toggle_z_range_controls(self, state):
         is_visible = bool(state)
-
-        # Hide/show widgets in z_min_layout
-        for i in range(self.z_min_layout.count()):
-            widget = self.z_min_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setVisible(is_visible)
-            widget = self.z_max_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setVisible(is_visible)
-
-        # Disable Laser AF checkbox if Z-range is visible
+        for layout in (self.z_min_layout, self.z_max_layout):
+            for i in range(layout.count()):
+                widget = layout.itemAt(i).widget()
+                if widget is not None:
+                    widget.setVisible(is_visible)
+        self.checkbox_set_z_globally.setVisible(is_visible)
         if self._enable_laser_autofocus:
             self.checkbox_withReflectionAutofocus.setEnabled(not is_visible)
-        # Enable/disable NZ entry based on the inverse of is_visible
-        self.entry_NZ.setEnabled(not is_visible)
-        current_z = self.stage.get_pos().z_mm * 1000
-        self.entry_minZ.setValue(current_z)
-        if is_visible:
-            self._reset_reflection_af_reference()
-        self.entry_maxZ.setValue(current_z)
-
-        if not is_visible:
-            try:
-                self.entry_minZ.valueChanged.disconnect(self.update_z_max)
-                self.entry_maxZ.valueChanged.disconnect(self.update_z_min)
-                self.entry_minZ.valueChanged.disconnect(self.update_Nz)
-                self.entry_maxZ.valueChanged.disconnect(self.update_Nz)
-                self.entry_deltaZ.valueChanged.disconnect(self.update_Nz)
-            except:
-                pass
-            # When Z-range is not specified, set Z-min and Z-max to current Z position
-            current_z = self.stage.get_pos().z_mm * 1000
-            self.entry_minZ.setValue(current_z)
-            self.entry_maxZ.setValue(current_z)
-        else:
-            self.entry_minZ.valueChanged.connect(self.update_z_max)
-            self.entry_maxZ.valueChanged.connect(self.update_z_min)
-            self.entry_minZ.valueChanged.connect(self.update_Nz)
-            self.entry_maxZ.valueChanged.connect(self.update_Nz)
-            self.entry_deltaZ.valueChanged.connect(self.update_Nz)
-
-        # Update the layout
+        self.entry_NZ.setEnabled(self._zstack_checkbox.isChecked() and not is_visible)
+        self._sync_z_range_controls()
         self.grid.update()
         self.updateGeometry()
         self.update()
 
+    def _sync_z_range_controls(self, *_):
+        """Show the selected range without turning selection into a range edit."""
+        if not hasattr(self, "checkbox_set_z_globally"):
+            return
+        row = self._selected_row()
+        globally = self.checkbox_set_z_globally.isChecked()
+        if row < 0 and globally and len(self.location_ids):
+            row = 0
+        stack_enabled = self._zstack_checkbox.isChecked() and not self.multipointController.acquisition_in_progress()
+        range_mode = self.checkbox_set_z_range.isChecked()
+        # dz is shared by both stack modes and never requires a selected position.
+        # Restore its state even when a previous group/acquisition disabled it.
+        self.entry_deltaZ.setEnabled(stack_enabled)
+        self.entry_NZ.setEnabled(stack_enabled and not range_mode)
+        enabled = row >= 0 and stack_enabled and range_mode
+        for widget in (self.set_minZ_button, self.set_maxZ_button, self.goto_minZ_button, self.goto_maxZ_button,
+                       self.entry_minZ, self.entry_maxZ):
+            widget.setEnabled(enabled)
+        scope = "all positions" if globally else "the selected position"
+        self.set_minZ_button.setToolTip(f"Use the current stage Z as Z min for {scope}.")
+        self.set_maxZ_button.setToolTip(f"Use the current stage Z as Z max for {scope}.")
+        if row >= 0:
+            bounds = self._region_z_bounds(row)
+            with QSignalBlocker(self.entry_minZ), QSignalBlocker(self.entry_maxZ):
+                self.entry_minZ.setValue(bounds[0] * 1000)
+                self.entry_maxZ.setValue(bounds[1] * 1000)
+
+    def _set_region_range_boundary(self, boundary, value_um):
+        """Apply one boundary atomically to the selected position or every position."""
+        if not self.checkbox_set_z_range.isChecked() or not self._zstack_checkbox.isChecked():
+            return
+        if self.multipointController.acquisition_in_progress():
+            return
+        if self.checkbox_set_z_globally.isChecked():
+            rows = range(len(self.location_ids))
+        else:
+            row = self._selected_row()
+            rows = [row] if row >= 0 else []
+        updates = {}
+        try:
+            for row in rows:
+                bounds = list(self._region_z_bounds(row))
+                bounds[boundary] = float(value_um) / 1000
+                # Match the range fields' usual crossing behavior without changing
+                # another position's opposite boundary unless it would be invalid.
+                if bounds[0] > bounds[1]:
+                    bounds[1 - boundary] = bounds[boundary]
+                if z_stack_count(*bounds, self.entry_deltaZ.value() / 1000) > self.entry_NZ.maximum():
+                    raise ValueError(f"A region can have at most {self.entry_NZ.maximum()} Z planes.")
+                updates[str(self.location_ids[row])] = tuple(bounds)
+        except (ValueError, OverflowError) as exc:
+            QMessageBox.warning(self, "Invalid Z Range", str(exc))
+            self._sync_z_range_controls()
+            return
+        self._region_z_ranges.update(updates)
+        self._refresh_region_z_cells()
+
     def init_z(self, z_pos_mm=None):
+        if self.checkbox_set_z_range.isChecked():
+            self._sync_z_range_controls()
+            return
         if z_pos_mm is None:
             z_pos_mm = self.stage.get_pos().z_mm
 
@@ -4049,13 +4254,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.entry_maxZ.blockSignals(False)
 
     def set_z_min(self):
-        z_value = self.stage.get_pos().z_mm * 1000  # Convert to μm
-        self.entry_minZ.setValue(z_value)
-        self._reset_reflection_af_reference()
+        self._set_region_range_boundary(0, self.stage.get_pos().z_mm * 1000)
 
     def set_z_max(self):
-        z_value = self.stage.get_pos().z_mm * 1000  # Convert to μm
-        self.entry_maxZ.setValue(z_value)
+        self._set_region_range_boundary(1, self.stage.get_pos().z_mm * 1000)
 
     def goto_z_min(self):
         # Z-only move: the retract-Z-for-XY-moves setting does not apply, there is
@@ -4077,11 +4279,18 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
     def _reset_reflection_af_reference(self):
         if not self._enable_laser_autofocus:
             return
-        if (
-            self.checkbox_withReflectionAutofocus.isChecked()
-            and not self.multipointController.laserAutoFocusController.set_reference()
-        ):
-            error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
+        if self.checkbox_withReflectionAutofocus.isChecked():
+            live = self.multipointController.liveController
+            was_live = live.is_live
+            if was_live:
+                live.stop_live()
+            try:
+                success = self.multipointController.laserAutoFocusController.set_reference()
+            finally:
+                if was_live:
+                    live.start_live()
+            if not success:
+                error_dialog("Failed to set reference for Laser AF. Is the laser autofocus initialized?")
 
     def update_z(self):
         index = self._selected_row()
@@ -4089,6 +4298,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             return
         z_mm = self.stage.get_pos().z_mm
         region_id = str(self.location_ids[index])
+        old_z = self.location_list[index, 2]
+        if region_id in self._region_z_ranges:
+            self._region_z_ranges[region_id] = tuple(v + z_mm - old_z for v in self._region_z_ranges[region_id])
         self.location_list[index, 2] = z_mm
         self.scanCoordinates.region_centers[region_id][2] = z_mm
         self.scanCoordinates.region_fov_coordinates[region_id] = [
@@ -4100,13 +4312,12 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         if params is not None and "center_z" in params:
             params["center_z"] = z_mm
         self._refresh_position_cells(index)
+        self._refresh_region_z_cells()
 
     def update_Nz(self):
-        z_min = self.entry_minZ.value()
-        z_max = self.entry_maxZ.value()
-        dz = self.entry_deltaZ.value()
-        nz = math.ceil((z_max - z_min) / dz) + 1
-        self.entry_NZ.setValue(nz)
+        # The shared Nz remains the default for unmodified positions. Counts for
+        # explicitly bounded regions are calculated in the region table.
+        self._refresh_region_z_cells()
 
     def update_region_progress(self, current_fov, num_fovs):
         self._log.debug(f"Updating region progress for {current_fov=}, {num_fovs=}")
@@ -4233,6 +4444,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # The rebuild above went through clear_regions, which drops scanCoordinates'
         # per-region laser-AF targets. Put them back.
         self._restore_region_references()
+        self._refresh_region_z_cells()
 
         _refresh_size_estimate(self)
 
@@ -4240,10 +4452,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         if self.checkbox_usePiezo.isChecked():
             deltaZ = value
         else:
-            mm_per_ustep = 1.0 / self.stage.get_config().Z_AXIS.convert_real_units_to_ustep(1.0)
-            deltaZ = round(value / 1000 / mm_per_ustep) * mm_per_ustep * 1000
-        self.entry_deltaZ.setValue(deltaZ)
+            axis = self.stage.get_config().Z_AXIS
+            # Stack spacing is a magnitude, independent of motor direction.
+            mm_per_ustep = abs(axis.SCREW_PITCH / (axis.MICROSTEPS_PER_STEP * axis.FULL_STEPS_PER_REV))
+            deltaZ = max(1, round(value / 1000 / mm_per_ustep)) * mm_per_ustep * 1000
+        with QSignalBlocker(self.entry_deltaZ):
+            self.entry_deltaZ.setValue(deltaZ)
         self.multipointController.set_deltaZ(deltaZ)
+        self._refresh_region_z_cells()
 
     def set_saving_dir(self):
         dialog = QFileDialog()
@@ -4373,6 +4589,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # user captured: the worker reads them from there, and so does the
             # "every region has a reference" pre-flight check.
             self._restore_region_references()
+            self._refresh_region_z_cells()
 
             # The Z-stack / Time-lapse header checkboxes decide whether this run is a
             # stack / a time series at all; with a group off its spinbox is greyed out
@@ -4414,6 +4631,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # flexible and wellplate tabs each have their own combo/row bound
             # to the one controller, so without this the run would use the
             # last edit made in ANY tab, not what this tab displays.
+            self.multipointController.set_log_af_events(self.checkbox_logAFEvents.isChecked())
             self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
@@ -4485,6 +4703,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.table_location_list.blockSignals(True)
             self.table_location_list.selectRow(row)
             self.table_location_list.blockSignals(False)
+            self._sync_z_range_controls()
 
     @classmethod
     def _position_cells(cls, x, y, z):
@@ -4503,7 +4722,73 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.table_location_list.blockSignals(True)
         for col, item in self._position_cells(x, y, z).items():
             self.table_location_list.setItem(row, col, item)
+        self._write_region_z_cells(row)
         self.table_location_list.blockSignals(False)
+
+    def _region_z_bounds(self, row):
+        reference = float(self.location_list[row, 2])
+        if not self._zstack_checkbox.isChecked():
+            return reference, reference
+        region_id = str(self.location_ids[row])
+        if region_id in self._region_z_ranges:
+            return self._region_z_ranges[region_id]
+        return default_z_range(reference, self.entry_NZ.value(), self.entry_deltaZ.value() / 1000,
+                               self.combobox_z_stack.currentText().upper())
+
+    def _effective_NZ(self):
+        if not self._zstack_checkbox.isChecked():
+            return 1
+        if not len(getattr(self, "location_ids", ())):
+            return self.entry_NZ.value()
+        return max(
+            z_stack_count(*self._region_z_bounds(row), self.entry_deltaZ.value() / 1000)
+            for row in range(len(self.location_ids))
+        )
+
+    def _write_region_z_cells(self, row):
+        bounds = self._region_z_bounds(row)
+        count = z_stack_count(*bounds, self.entry_deltaZ.value() / 1000)
+        for column, value in ((self._COL_Z_MIN, bounds[0] * 1000), (self._COL_Z_MAX, bounds[1] * 1000),
+                              (self._COL_NZ, count)):
+            item = QTableWidgetItem(str(count) if column == self._COL_NZ else f"{value:.3f}")
+            if column == self._COL_NZ or not self._zstack_checkbox.isChecked():
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setToolTip("Planes stay inside these limits using the shared Z step. Edit a limit to override this region; "
+                            "clear either limit to use the shared stack settings again.")
+            self.table_location_list.setItem(row, column, item)
+
+    def _refresh_region_z_cells(self, *_):
+        if not hasattr(self, "_zstack_checkbox"):
+            return
+        previous = self.table_location_list.blockSignals(True)
+        try:
+            self.scanCoordinates.region_z_ranges.clear()
+            for row, region_id in enumerate(self.location_ids):
+                self._write_region_z_cells(row)
+                if self._zstack_checkbox.isChecked():
+                    self.scanCoordinates.region_z_ranges[str(region_id)] = self._region_z_bounds(row)
+            self.multipointController.set_NZ(self._effective_NZ())
+        finally:
+            self.table_location_list.blockSignals(previous)
+        self._sync_z_range_controls()
+        _refresh_size_estimate(self)
+
+    def _edit_region_z_limit(self, row, column):
+        region_id = str(self.location_ids[row])
+        text = self.table_location_list.item(row, column).text().strip()
+        try:
+            if not text:
+                self._region_z_ranges.pop(region_id, None)
+            else:
+                bounds = list(self._region_z_bounds(row))
+                bounds[0 if column == self._COL_Z_MIN else 1] = float(text) / 1000
+                count = z_stack_count(*bounds, self.entry_deltaZ.value() / 1000)
+                if count > self.entry_NZ.maximum():
+                    raise ValueError(f"A region can have at most {self.entry_NZ.maximum()} Z planes.")
+                self._region_z_ranges[region_id] = tuple(bounds)
+        except (ValueError, OverflowError) as exc:
+            QMessageBox.warning(self, "Invalid Z Range", str(exc))
+        self._refresh_region_z_cells()
 
     def _update_position_count(self):
         n = len(self.location_ids)
@@ -4574,7 +4859,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         """
         if not self._enable_laser_autofocus or not self.checkbox_withReflectionAutofocus.isChecked():
             return False
-        reference = self.multipointController.laserAutoFocusController.capture_reference()
+        # Match the global Set Reference path: imaging illumination must be off
+        # when capturing the crop that acquisition will later verify in the dark.
+        # Live light leaking into the focus camera can otherwise change the crop
+        # without noticeably changing the measured spot X position.
+        live = self.multipointController.liveController
+        was_live = live.is_live
+        if was_live:
+            live.stop_live()
+        try:
+            reference = self.multipointController.laserAutoFocusController.capture_reference()
+        finally:
+            if was_live:
+                live.start_live()
         if reference is None:
             if warn_on_failure:
                 error_dialog(
@@ -4667,6 +4964,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self._region_obs_state_map = None
             self._update_per_point_button_text()
             self._update_position_count()
+            self._refresh_region_z_cells()
             _refresh_size_estimate(self)
         else:
             self._log.warning("Invalid region: a position with these x/y coordinates already exists")
@@ -4693,6 +4991,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # (regenerate_for_fov) would then resurrect the region we just deleted.
         self.scanCoordinates.remove_region(region_id)
         self._region_laser_af_references.pop(region_id, None)
+        self._region_z_ranges.pop(region_id, None)
 
         # Clear overlay if no locations remain
         if len(self.location_list) == 0:
@@ -4732,6 +5031,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
         self._region_laser_af_references.clear()
+        self._region_z_ranges.clear()
         self.scanCoordinates.clear_regions()
         self.table_location_list.setRowCount(0)
         self.navigationViewer.clear_overlay()
@@ -4746,6 +5046,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.location_list = np.empty((0, 3), dtype=float)
         self.location_ids = np.empty((0,), dtype=object)
         self._region_laser_af_references.clear()
+        self._region_z_ranges.clear()
+        self._region_obs_state_map = None
+        if hasattr(self, "_update_per_point_button_text"):
+            self._update_per_point_button_text()
         self.table_location_list.setRowCount(0)
         self._update_position_count()
 
@@ -4859,6 +5163,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         # the reference under the old name and leave the renamed region without one.
         if old_id in self._region_laser_af_references:
             self._region_laser_af_references[new_id] = self._region_laser_af_references.pop(old_id)
+        if old_id in self._region_z_ranges:
+            self._region_z_ranges[new_id] = self._region_z_ranges.pop(old_id)
         # Focus points are tagged with their region id too, and a "By Region" surface
         # fit refuses to run when those tags don't match the scan regions.
         if self.focusMapWidget is not None:
@@ -4867,11 +5173,19 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
     def cell_was_changed(self, row, column):
         # The "AF Ref" column is a read-only indicator; ignore changes to it.
-        if column == self._COL_AF_REF:
+        if column in (self._COL_AF_REF, self._COL_NZ):
+            return
+        if not 0 <= row < len(self.location_ids):
+            return
+        if column != self._COL_NAME and self.multipointController.acquisition_in_progress():
+            self._refresh_position_cells(row)
             return
 
         # Get region ID
         region_id = str(self.location_ids[row])
+        if column in (self._COL_Z_MIN, self._COL_Z_MAX):
+            self._edit_region_z_limit(row, column)
+            return
 
         if column == self._COL_NAME:  # Renaming must not move the stage.
             self._rename_region_from_cell(row, region_id)
@@ -4914,6 +5228,9 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
         else:  # Z coordinate changed
             z = float(val_edit) / 1000
+            old_z = self.location_list[row, 2]
+            if region_id in self._region_z_ranges:
+                self._region_z_ranges[region_id] = tuple(v + z - old_z for v in self._region_z_ranges[region_id])
             self.location_list[row, 2] = z
             self.scanCoordinates.region_centers[region_id][2] = z
             # Keep the stored generation params in step, or the acquisition-start
@@ -4921,10 +5238,14 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             params = self.scanCoordinates.region_generation_params.get(region_id)
             if params is not None and "center_z" in params:
                 params["center_z"] = z
+            self.scanCoordinates.region_fov_coordinates[region_id] = [
+                (coord[0], coord[1], z) for coord in self.scanCoordinates.region_fov_coordinates[region_id]
+            ]
 
         # Re-render the row so the displayed value matches what was actually stored,
         # then drive the stage to the edited position.
         self._refresh_position_cells(row)
+        self._refresh_region_z_cells()
         self.go_to(row)
 
     def keyPressEvent(self, event):
@@ -4945,7 +5266,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             return {}
         try:
             with open(sidecar_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                references = json.load(f)
+            if not isinstance(references, dict):
+                raise ValueError("Laser AF sidecar must contain a region-to-reference mapping.")
+            return references
         except Exception as e:
             self._log.error(f"Failed to read laser AF sidecar {sidecar_path}: {e}")
             return {}
@@ -4971,13 +5295,36 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             return None
 
     def export_location_list(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Export Location List", "", "CSV Files (*.csv);;All Files (*)")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Location List", self.microscope.config_repo.default_saving_path(),
+            "CSV Files (*.csv);;All Files (*)",
+        )
         if file_path:
             # Export from the widget's durable store, not scanCoordinates: the latter
             # is empty whenever the regions have been cleared but not yet rebuilt.
             refs = self._region_laser_af_references
+            mode = normalize_z_stacking_config(self.combobox_z_stack.currentText())
             location_list_df = pd.DataFrame(self.location_list, columns=["x (mm)", "y (mm)", "z (mm)"])
             location_list_df["ID"] = self.location_ids
+            # Save the configured ranges even while stacking is disabled, so the
+            # switch and the settings it temporarily hides both round-trip.
+            bounds = [
+                self._region_z_ranges.get(
+                    str(rid),
+                    default_z_range(
+                        float(self.location_list[row, 2]), self.entry_NZ.value(), self.entry_deltaZ.value() / 1000, mode
+                    ),
+                )
+                for row, rid in enumerate(self.location_ids)
+            ]
+            location_list_df["z_min (mm)"] = [b[0] for b in bounds]
+            location_list_df["z_max (mm)"] = [b[1] for b in bounds]
+            location_list_df["z_count"] = [z_stack_count(*b, self.entry_deltaZ.value() / 1000) for b in bounds]
+            location_list_df["delta_z_um"] = self.entry_deltaZ.value()
+            location_list_df["z_stacking_config"] = mode
+            location_list_df["z_stack_enabled"] = self._zstack_checkbox.isChecked()
+            location_list_df["default_z_count"] = self.entry_NZ.value()
+            location_list_df["z_range_override"] = [str(rid) in self._region_z_ranges for rid in self.location_ids]
             # Human-readable spot position per region; blank when no reference.
             location_list_df["laser_af_x_reference"] = [
                 (refs[rid].x_reference if rid in refs else "") for rid in self.location_ids
@@ -4989,98 +5336,198 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
             # Full references (incl. the cross-correlation crop image) go to a
             # sidecar so the CSV stays readable but the export round-trips fully.
-            sidecar = {
-                str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs
-            }
-            if sidecar:
-                try:
-                    with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
-                        json.dump(sidecar, f)
-                except Exception as e:
-                    self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
+            sidecar = {str(rid): refs[rid].model_dump() for rid in self.location_ids if rid in refs}
+            # Always replace the sidecar: an earlier export's references must not
+            # come back after the user clears AF targets and reuses a filename.
+            try:
+                with open(self._laser_af_sidecar_path(file_path), "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f)
+            except Exception as e:
+                self._log.error(f"Failed to write laser AF sidecar for {file_path}: {e}")
+                error_dialog(f"Positions were saved, but laser AF references could not be saved: {e}")
 
     def import_location_list(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Import Location List", "", "CSV Files (*.csv);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Location List", self.microscope.config_repo.default_saving_path(),
+            "CSV Files (*.csv);;All Files (*)",
+        )
         if file_path:
-            location_list_df = pd.read_csv(file_path)
-            location_list_df_relevant = None
             try:
-                location_list_df_relevant = location_list_df[["x (mm)", "y (mm)", "z (mm)"]]
-            except KeyError:
-                self._log.error("Improperly formatted location list being imported")
+                # IDs are names: preserve leading zeros and names such as "NA".
+                location_list_df = pd.read_csv(file_path, dtype={"ID": str}, keep_default_na=False)
+                if location_list_df.empty:
+                    raise ValueError("The location list contains no positions.")
+                location_list_df_relevant = location_list_df[["x (mm)", "y (mm)", "z (mm)"]].astype(float)
+            except (OSError, ValueError, KeyError, pd.errors.ParserError) as exc:
+                error_dialog(f"Could not import positions: {exc}")
                 return
             if "ID" in location_list_df.columns:
                 location_list_df_relevant["ID"] = location_list_df["ID"].astype(str)
             else:
-                location_list_df_relevant["ID"] = "None"
+                location_list_df_relevant["ID"] = ""
             if "laser_af_x_reference" in location_list_df.columns:
                 location_list_df_relevant["laser_af_x_reference"] = location_list_df["laser_af_x_reference"]
+            for column in ("z_min (mm)", "z_max (mm)", "z_range_override"):
+                if column in location_list_df.columns:
+                    location_list_df_relevant[column] = location_list_df[column]
+            # Validate the entire imported geometry before clearing any existing regions.
+            try:
+                step = self.entry_deltaZ.value()
+                if "delta_z_um" in location_list_df.columns:
+                    steps = location_list_df["delta_z_um"].astype(float).unique()
+                    if len(steps) != 1 or not math.isfinite(steps[0]) or steps[0] < 0:
+                        raise ValueError("Imported regions must share one finite, nonnegative Z step.")
+                    step = float(steps[0])
+                    if not self.entry_deltaZ.minimum() <= step <= self.entry_deltaZ.maximum():
+                        raise ValueError("Imported Z step is outside the supported range.")
+                    if not math.isclose(step, round(step, self.entry_deltaZ.decimals()), abs_tol=1e-12):
+                        raise ValueError("Imported Z step has more precision than the Z step control supports.")
+                if not np.isfinite(
+                    location_list_df_relevant[["x (mm)", "y (mm)", "z (mm)"]].to_numpy(dtype=float)
+                ).all():
+                    raise ValueError("Imported positions must be finite numbers.")
+                mode = normalize_z_stacking_config(self.combobox_z_stack.currentText())
+                if "z_stacking_config" in location_list_df.columns:
+                    modes = location_list_df["z_stacking_config"].map(normalize_z_stacking_config).unique()
+                    if len(modes) != 1:
+                        raise ValueError("Imported regions must share one Z stacking mode.")
+                    mode = modes[0]
+
+                # Spreadsheet edits can encode booleans as words or numbers. Do
+                # not silently discard ranges on an unrecognized override flag.
+                def parse_bool(value):
+                    value = str(value).strip().lower()
+                    if value in ("true", "1", "1.0"):
+                        return True
+                    if value in ("false", "0", "0.0"):
+                        return False
+                    raise ValueError(f"Invalid boolean value: {value!r}.")
+
+                if "z_range_override" in location_list_df.columns:
+                    location_list_df_relevant["z_range_override"] = location_list_df["z_range_override"].map(parse_bool)
+                default_count = self.entry_NZ.value()
+                stack_enabled = self._zstack_checkbox.isChecked()
+                if "z_min (mm)" in location_list_df.columns or "z_max (mm)" in location_list_df.columns:
+                    if not {"z_min (mm)", "z_max (mm)"}.issubset(location_list_df.columns):
+                        raise ValueError("Imported Z ranges need both Z min and Z max.")
+                    for _, row in location_list_df.iterrows():
+                        if z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000) > self.entry_NZ.maximum():
+                            raise ValueError(f"A region can have at most {self.entry_NZ.maximum()} Z planes.")
+                    defaults = location_list_df_relevant
+                    if "z_range_override" in defaults.columns:
+                        defaults = defaults[~defaults["z_range_override"]]
+                    if not defaults.empty:
+                        default_count = max(
+                            z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000)
+                            for _, row in defaults.iterrows()
+                        )
+                    stack_enabled = any(
+                        z_stack_count(row["z_min (mm)"], row["z_max (mm)"], step / 1000) > 1
+                        for _, row in location_list_df.iterrows()
+                    )
+                if "default_z_count" in location_list_df.columns:
+                    counts = location_list_df["default_z_count"].astype(float).unique()
+                    if (
+                        len(counts) != 1
+                        or not math.isfinite(counts[0])
+                        or counts[0] != int(counts[0])
+                        or not self.entry_NZ.minimum() <= counts[0] <= self.entry_NZ.maximum()
+                    ):
+                        raise ValueError("Imported regions must share one supported default Z count.")
+                    default_count = int(counts[0])
+                if "z_stack_enabled" in location_list_df.columns:
+                    enabled = location_list_df["z_stack_enabled"].map(parse_bool).unique()
+                    if len(enabled) != 1:
+                        raise ValueError("Imported regions must share one Z stack enabled setting.")
+                    stack_enabled = bool(enabled[0])
+            except (ValueError, TypeError, OverflowError) as exc:
+                error_dialog(f"Invalid imported positions: {exc}")
+                return
+            # Avoid edit callbacks quantizing the step or rebuilding old regions
+            # while the imported settings are only partially applied.
+            with QSignalBlocker(self.entry_deltaZ), QSignalBlocker(self.entry_NZ), QSignalBlocker(
+                self.combobox_z_stack
+            ):
+                self.entry_deltaZ.setValue(step)
+                self.entry_NZ.setValue(default_count)
+                self.combobox_z_stack.setCurrentIndex({"FROM BOTTOM": 0, "FROM CENTER": 1, "FROM TOP": 2}[mode])
+            self.multipointController.set_deltaZ(step)
+            self.multipointController.set_z_stacking_config(self.combobox_z_stack.currentIndex())
             # Full per-region references (incl. crops) ride in a sidecar next to
             # the CSV; the x_reference column is the human-readable fallback.
             sidecar_refs = self._load_laser_af_sidecar(file_path)
             # clear_only_location_list drops the widget's references; scanCoordinates
             # keeps its own copy until the regions below replace them.
+            signal_blocker = QSignalBlocker(self.table_location_list)
             self.clear_only_location_list()
-            self.scanCoordinates.region_laser_af_references.clear()
+            self.scanCoordinates.clear_regions()
 
-            self.table_location_list.blockSignals(True)
             for _, row in location_list_df_relevant.iterrows():
                 x = row["x (mm)"]
                 y = row["y (mm)"]
                 z = row["z (mm)"]
                 region_id = normalize_region_name(row["ID"])
-                # CSVs without an ID column give every row "None"; duplicate, missing
+                # CSVs without an ID column give every row a blank name; duplicate, missing
                 # or filesystem-unsafe ids would collapse into one scanCoordinates
                 # entry (or break the output paths). Fall back to a fresh unique id.
-                if region_id in ("None", "nan") or validate_region_name(region_id, self.location_ids) is not None:
+                if validate_region_name(region_id, self.location_ids) is not None:
                     replacement = self._next_region_id()
-                    if region_id not in ("None", "nan", ""):
+                    if region_id:
                         self._log.warning(f"Imported region name '{region_id}' is unusable; using '{replacement}'")
                     region_id = replacement
-                if not np.any(np.all(self.location_list[:, :2] == [x, y], axis=1)):
-                    self.location_list = np.vstack((self.location_list, [[x, y, z]]))
-                    self.location_ids = np.append(self.location_ids, region_id)
-                    table_row = self.table_location_list.rowCount()
-                    self.table_location_list.insertRow(table_row)
-                    for col, item in self._position_cells(x, y, z).items():
-                        self.table_location_list.setItem(table_row, col, item)
-                    self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
-                    if self.use_overlap:
-                        self.scanCoordinates.add_flexible_region(
-                            region_id,
-                            x,
-                            y,
-                            z,
-                            self.entry_NX.value(),
-                            self.entry_NY.value(),
-                            overlap_percent=self.entry_overlap.value(), **spacing_parameters(self),
-                        )
-                    else:
-                        self.scanCoordinates.add_flexible_region_with_step_size(
-                            region_id,
-                            x,
-                            y,
-                            z,
-                            self.entry_NX.value(),
-                            self.entry_NY.value(),
-                            self.entry_deltaX.value(),
-                            self.entry_deltaY.value(),
-                        )
-                    # Restore this region's laser-AF reference (sidecar by original
-                    # id, else the x_reference column). row["ID"] is the original
-                    # exported id even when region_id was reassigned above.
-                    reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
-                    if reference is not None:
-                        self._store_region_reference(region_id, reference)
-                    self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
+                # Distinct named regions may share XY (for example at different
+                # depths); importing an exported list must preserve every row.
+                self.location_list = np.vstack((self.location_list, [[x, y, z]]))
+                self.location_ids = np.append(self.location_ids, region_id)
+                if "z_min (mm)" in row and "z_max (mm)" in row:
+                    bounds = (float(row["z_min (mm)"]), float(row["z_max (mm)"]))
+                    default_bounds = default_z_range(z, default_count, step / 1000, mode)
+                    if row.get("z_range_override", True) or not np.allclose(bounds, default_bounds, rtol=0, atol=1e-12):
+                        self._region_z_ranges[region_id] = bounds
+                table_row = self.table_location_list.rowCount()
+                self.table_location_list.insertRow(table_row)
+                for col, item in self._position_cells(x, y, z).items():
+                    self.table_location_list.setItem(table_row, col, item)
+                self.table_location_list.setItem(table_row, self._COL_NAME, QTableWidgetItem(region_id))
+                if self.use_overlap:
+                    self.scanCoordinates.add_flexible_region(
+                        region_id,
+                        x,
+                        y,
+                        z,
+                        self.entry_NX.value(),
+                        self.entry_NY.value(),
+                        overlap_percent=self.entry_overlap.value(),
+                        **spacing_parameters(self),
+                    )
                 else:
-                    self._log.warning("Duplicate values not added based on x and y.")
-            self.table_location_list.blockSignals(False)
+                    self.scanCoordinates.add_flexible_region_with_step_size(
+                        region_id,
+                        x,
+                        y,
+                        z,
+                        self.entry_NX.value(),
+                        self.entry_NY.value(),
+                        self.entry_deltaX.value(),
+                        self.entry_deltaY.value(),
+                    )
+                # Use the original name to find references even after renaming
+                # an unsafe or duplicate ID.
+                reference = self._reference_from_import_row(str(row["ID"]), row, sidecar_refs)
+                if reference is not None:
+                    self._store_region_reference(region_id, reference)
+                self.table_location_list.setItem(table_row, self._COL_AF_REF, self._af_ref_item(reference))
+            del signal_blocker
+            self._zstack_checkbox.setChecked(stack_enabled)
             self._select_row(0)
             self._update_position_count()
+            self._refresh_region_z_cells()
             self._log.debug(self.location_list)
 
     def on_snap_images(self):
+        # Snap is a single plane at each region's nominal Z, regardless of stack overrides.
+        self.scanCoordinates.region_z_ranges.clear()
+        self.multipointController.set_log_af_events(False)
         self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
@@ -5155,6 +5602,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.checkbox_withReflectionAutofocus.setEnabled(enabled)
         self.checkbox_stitchOutput.setEnabled(enabled)
         self.checkbox_set_z_range.setEnabled(enabled)
+        self.checkbox_set_z_globally.setEnabled(enabled)
+        for control in (self.set_minZ_button, self.set_maxZ_button, self.goto_minZ_button, self.goto_maxZ_button,
+                        self.entry_minZ, self.entry_maxZ):
+            control.setEnabled(enabled)
         self.checkbox_zstack.setEnabled(enabled)
         self.checkbox_timelapse.setEnabled(enabled)
         # The worker snapshots the position list at start, so editing it mid-run would
@@ -5265,6 +5716,8 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             self.checkbox_zstack.setChecked(yaml_data.nz > 1)
             self.entry_NZ.setValue(yaml_data.nz)
             self.entry_deltaZ.setValue(yaml_data.delta_z_um)
+            mode = normalize_z_stacking_config(yaml_data.z_stacking_config)
+            self.combobox_z_stack.setCurrentIndex({"FROM BOTTOM": 0, "FROM CENTER": 1, "FROM TOP": 2}[mode])
 
             # Piezo setting
             self.checkbox_usePiezo.setChecked(yaml_data.use_piezo)
@@ -5313,8 +5766,17 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
 
     def _load_positions(self, positions):
         """Load positions from YAML into the location list."""
+        # Validate new range fields before replacing the user's current positions.
+        for pos in positions:
+            if pos.get("z_range_mm") is not None:
+                bounds = pos["z_range_mm"]
+                if len(bounds) != 2:
+                    raise ValueError("Each region Z range needs two limits.")
+                z_stack_count(*bounds, self.entry_deltaZ.value() / 1000)
         # Clear existing locations
         self.clear_only_location_list()
+        self.scanCoordinates.clear_regions()
+        signal_blocker = QSignalBlocker(self.table_location_list)
 
         for pos in positions:
             # A name from the file still has to be a unique, filesystem-safe region id.
@@ -5345,6 +5807,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
             # Add to data structures
             self.location_list = np.vstack((self.location_list, [[x, y, z]]))
             self.location_ids = np.append(self.location_ids, name)
+            if pos.get("z_range_mm") is not None:
+                bounds = tuple(float(v) for v in pos["z_range_mm"])
+                z_stack_count(*bounds, self.entry_deltaZ.value() / 1000)
+                self._region_z_ranges[name] = bounds
 
             # Update UI - table
             row = self.table_location_list.rowCount()
@@ -5379,8 +5845,10 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
                     self.entry_deltaY.value(),
                 )
 
+        del signal_blocker
         self._select_row(0)
         self._update_position_count()
+        self._refresh_region_z_cells()
 
 
 class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, AcquisitionYAMLDropMixin, QFrame):
@@ -5648,6 +6116,13 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         self.checkbox_stitchOutput = QCheckBox("Stitch Scans")
         self.checkbox_stitchOutput.setChecked(False)
 
+        self.checkbox_logAFEvents = QCheckBox("Log AF events during imaging")
+        self.checkbox_logAFEvents.setEnabled(self._enable_laser_autofocus)
+        self.checkbox_logAFEvents.setToolTip(
+            "Requires Laser AF. Save measurements, correlation, references and native AF evidence "
+            "in af_events alongside normal images and Z stacks. No extra camera exposures."
+        )
+
         self.checkbox_afValidation = QCheckBox("AF validation run (skip imaging)")
         self.checkbox_afValidation.setEnabled(self._enable_laser_autofocus)
         self.checkbox_afValidation.setToolTip(
@@ -5905,6 +6380,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
         focus_content.addWidget(self.checkbox_useFocusMap)
 
         saving_section, saving_content = _make_section("Saving")
+        saving_content.addWidget(self.checkbox_logAFEvents)
         saving_content.addWidget(self.checkbox_afValidation)
         saving_content.addLayout(self.fileSavingFormatRow)
         saving_content.addLayout(self.zarrStreamingRow)
@@ -7012,6 +7488,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             # Re-push THIS tab's visible save-format + streaming state (the
             # flexible tab shares the controller; last-edit-anywhere must not
             # override what this tab displays at Start).
+            self.multipointController.set_log_af_events(self.checkbox_logAFEvents.isChecked())
             self.multipointController.set_validation_mode(self.checkbox_afValidation.isChecked())
             _push_save_format_to_controller(self)
             # Same story for the retract flag: one controller, a checkbox per tab.
@@ -7173,6 +7650,7 @@ class WellplateMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisi
             self.base_path_is_set = True
 
     def on_snap_images(self):
+        self.multipointController.set_log_af_events(False)
         self.multipointController.set_validation_mode(False)
         # Set the selected channels for acquisition (empty list = use current
         # live-controller state as a synthetic single observation state).
@@ -7973,6 +8451,7 @@ class MultiPointWithFluidicsWidget(_WritebackStatusMixin, QFrame):
                 self.checkbox_retractZBetweenRegions.isChecked()
             )
             self.multipointController.set_base_path(self.lineEdit_savingDir.text())
+            self.multipointController.set_log_af_events(False)
             self.multipointController.set_validation_mode(False)
             self.multipointController.set_use_fluidics(True)  # may be set to False from other widgets
             self.multipointController.set_selected_cycles(
@@ -8895,5 +9374,3 @@ class TemplateMultiPointWidget(FlexibleMultiPointWidget):
     def clear(self):
         super().clear()
         self.region_id = 0
-
-

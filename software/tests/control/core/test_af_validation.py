@@ -12,6 +12,7 @@ from control.core.af_validation_collector import AFValidationCollector
 from control.core.laser_auto_focus_controller import AFValidationRestoreError
 from control.core.multi_point_controller import MultiPointController
 from control.core.multi_point_worker import MultiPointWorker
+from control.microcontroller import CommandAborted
 from tests.control.core.test_laser_auto_focus_controller import (
     FakeFocusCamera, FakeStage, apply_reference_at_current_position, make_controller, render_spot,
 )
@@ -175,6 +176,25 @@ def test_collector_keeps_region_reference_comparisons_separate(tmp_path):
     assert len(list((tmp_path / "references").iterdir())) == 1
 
 
+def test_collector_records_fixed_correlation_and_y_registration(tmp_path):
+    controller, stage, camera = controller_fixture()
+    render = camera._render
+    camera._render = lambda: np.roll(render(), -9, axis=0)
+    with controller.collect_validation_event() as records:
+        assert controller.move_to_target(0)
+    record = records[0]
+    assert record["correlation_unregistered"] < 0.9
+    assert record["correlation"] > 0.99
+    assert record["y_registration_shift_px"] == -9
+
+    collector = AFValidationCollector(tmp_path)
+    collector.record(metadata(), record)
+    event = rows(tmp_path)[0]
+    assert float(event["correlation_unregistered"]) < 0.9
+    assert float(event["correlation"]) > 0.99
+    assert event["y_registration_shift_px"] == "-9"
+
+
 def make_worker(tmp_path):
     controller, stage, camera = controller_fixture()
     worker = MultiPointWorker.__new__(MultiPointWorker)
@@ -222,6 +242,8 @@ def make_worker(tmp_path):
 
 def test_validation_walk_uses_real_af_cadence_without_images_stacks_or_stimuli(tmp_path):
     worker, controller, stage = make_worker(tmp_path)
+    # This fixture exercises per-FOV validation after startup focus preparation.
+    worker._acquisition_focus_initialized = True
     worker._backpressure = MagicMock()
     worker._prewarm_observation_states = MagicMock(side_effect=AssertionError("no camera prewarm"))
     worker._prewarm_postprocess_routines = MagicMock(side_effect=AssertionError("no postprocessing prewarm"))
@@ -241,6 +263,24 @@ def test_validation_walk_uses_real_af_cadence_without_images_stacks_or_stimuli(t
     worker.acquire_camera_image.assert_not_called()
     worker._run_nidaq_stimulus.assert_not_called()
     worker.request_abort_fn.assert_not_called()
+
+
+def test_firmware_rejection_aborts_acquisition_without_capturing(tmp_path):
+    worker = MagicMock()
+    worker.validation_mode = False
+    worker.laser_auto_focus_controller = None
+    worker.scan_region_fov_coords_mm = {"R0": [(0, 0)]}
+    worker._slack_notifier = None
+    # Applying the first optical state can reject a filter-wheel move.
+    worker._seed_camera_for_first_observation_state.side_effect = CommandAborted(
+        1, "firmware rejected filter move", recoverable=True
+    )
+    MultiPointWorker.run(worker)
+    worker.request_abort_fn.assert_called_once()
+    worker.acquire_camera_image.assert_not_called()
+    worker._run_nidaq_stimulus.assert_not_called()
+    worker._finish_jobs.assert_called_once()
+    worker.callbacks.signal_acquisition_finished.assert_called_once()
 
 
 def test_single_fov_success_avoids_duplicate_measurement(tmp_path):
@@ -271,6 +311,7 @@ def test_worker_records_restore_failure_then_aborts(tmp_path):
 
 def test_preflight_requires_laser_af():
     controller = MultiPointController.__new__(MultiPointController)
+    controller.scanCoordinates = SimpleNamespace(region_z_ranges={})
     controller.validation_mode = True
     controller.do_reflection_af = False
     controller._log = MagicMock()
@@ -288,12 +329,13 @@ def test_validation_yaml_roundtrip(tmp_path, monkeypatch, enabled):
         lambda base_yaml, **kwargs: {"schema_version": 2, **base_yaml},
     )
     _save_unified_multipoint_acquisition_yaml(
-        _params(validation_mode=enabled, skip_saving=enabled), str(tmp_path),
+        _params(validation_mode=enabled, skip_saving=enabled, log_af_events=enabled), str(tmp_path),
         widget_type="flexible", repo=MagicMock(), live_controller=MagicMock(),
         camera=MagicMock(), objective_store=MagicMock(), recording_start_time=0.0,
         selected_observation_state_names=[], use_manual_focus_map=False, logger=MagicMock(),
     )
     restored = parse_acquisition_yaml(str(tmp_path / "acquisition.yaml"))
+    assert restored.log_af_events is enabled
     assert restored.validation_mode is enabled
     assert restored.skip_saving is enabled
 
@@ -319,3 +361,25 @@ def test_fatal_snapshot_error_preserves_completed_af_result(tmp_path):
     event = rows(tmp_path)[0]
     assert event["af_success"] == "True"
     assert "Fatal snapshot error" in event["snapshot_error"]
+
+
+def test_imaging_event_logging_preserves_native_measurements_without_snapshot(tmp_path):
+    import json
+
+    worker, controller, stage = make_worker(tmp_path)
+    worker.validation_mode = False
+    controller.capture_validation_frame = MagicMock(side_effect=AssertionError("no extra exposures"))
+    stage.z_um = 10
+    worker._autofocus_and_record("R0", 0, str(tmp_path))
+    event = rows(tmp_path)[0]
+    assert event["region_id"] == "R0"
+    assert event["fov"] == "0" and event["time_point"] == "0"
+    assert event["af_success"] == "True"
+    assert event["snapshot_captured"] == "False"
+    measurements = json.loads(event["measurements_json"])
+    assert float(event["displacement_before_um"]) == measurements[0]["displacement_um"]
+    assert float(event["displacement_after_um"]) == measurements[-1]["displacement_um"]
+    assert abs(float(event["displacement_after_um"])) < 1
+    assert event["reference_id"]
+    controller.capture_validation_frame.assert_not_called()
+    worker.request_abort_fn.assert_not_called()

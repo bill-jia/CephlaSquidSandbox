@@ -162,6 +162,7 @@ class ScanCoordinates:
         # plumbing for both flexible and wellplate acquisition; only flexible
         # populates it today.
         self.region_laser_af_references = {}  # {region_id: LaserAFReference}
+        self.region_z_ranges = {}  # {region_id: (z_min_mm, z_max_mm)}
         # 2D grid (rows top-to-bottom, each row left-to-right) for regions that were generated
         # from a rectangular lattice. Kept alongside the flat list so sort_coordinates can
         # re-snake each region from the corner nearest the previous region's exit.
@@ -599,6 +600,7 @@ class ScanCoordinates:
 
             self.region_fov_rows.pop(well_id, None)
             self.region_laser_af_references.pop(well_id, None)
+            self.region_z_ranges.pop(well_id, None)
             self.region_generation_params.pop(well_id, None)
 
             if well_id in self.region_fov_coordinates:
@@ -616,6 +618,7 @@ class ScanCoordinates:
             self.region_shapes,
             self.region_fov_coordinates,
             self.region_laser_af_references,
+            self.region_z_ranges,
             self.region_fov_rows,
             self.region_generation_params,
         )

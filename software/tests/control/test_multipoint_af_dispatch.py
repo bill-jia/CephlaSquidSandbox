@@ -59,3 +59,74 @@ def test_missing_autofocus_observation_state_reports_configuration_error():
         worker.perform_autofocus("region", 0)
 
     worker.autofocusController.autofocus.assert_not_called()
+
+
+@pytest.mark.parametrize("first_xy", [(1, 1), (-1, 1), (1, -1), (-1, -1)])
+@pytest.mark.parametrize(
+    "center,first_z,expected_start_z",
+    [
+        ((0, 0, 2), (3,), 2),  # Explicit center takes precedence over tile Z.
+        ((0, 0), (3,), None),  # Tile Z does not establish a focused center.
+        ((0, 0), (), None),  # Wellplate grids and manual ROIs store XY only.
+        ((0, 0, None), (3,), None),
+        ((0, 0, None), (None,), None),
+    ],
+)
+def test_legacy_entry_walk_uses_actual_first_tile_and_carries_focus(first_xy, center, first_z, expected_start_z):
+    first = first_xy + first_z
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker.scan_region_names = ["r"]
+    worker.scan_region_coords_mm = [center]
+    worker.scan_region_fov_coords_mm = {"r": [first]}
+    worker.abort_requested_fn = lambda: False
+    worker._apply_region_laser_af_reference = MagicMock()
+    worker.move_to_coordinate = MagicMock()
+    worker.stage = SimpleNamespace(get_pos=MagicMock(return_value=SimpleNamespace(z_mm=2.1)))
+    worker.laser_auto_focus_controller = SimpleNamespace(move_to_target=MagicMock(return_value=True))
+    worker._z_pos_proposal = {}
+    worker._log = MagicMock()
+
+    worker._initialize_legacy_region_entries()
+
+    if expected_start_z is None:
+        worker.move_to_coordinate.assert_not_called()
+        worker.stage.get_pos.assert_not_called()
+        worker._apply_region_laser_af_reference.assert_not_called()
+        worker.laser_auto_focus_controller.move_to_target.assert_not_called()
+        assert not worker._z_pos_proposal
+        return
+
+    moves = worker.move_to_coordinate.call_args_list
+    assert moves[0].args[0] == (0, 0, expected_start_z)
+    assert moves[1].args[0] == (first[0] / 2, first[1] / 2, 2.1)
+    assert moves[-1].args[0] == (first[0], first[1], 2.1)
+    assert worker.laser_auto_focus_controller.move_to_target.call_count == 3
+    assert worker._z_pos_proposal == {("r", 0): 2.1}
+
+    worker._z_pos_proposal.clear()
+    worker.laser_auto_focus_controller.move_to_target.return_value = False
+    with pytest.raises(RuntimeError, match="verify center"):
+        worker._initialize_legacy_region_entries()
+    assert not worker._z_pos_proposal
+
+
+@pytest.mark.parametrize("cadence,seed,expected", [(1, "lazy", "entry"), (10, "scan", "scan"), (10, "lazy", None)])
+def test_focus_preparation_runs_once_and_restores_timing(cadence, seed, expected):
+    from contextlib import nullcontext
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker.abort_requested_fn = lambda: False
+    worker.do_reflection_af = True
+    marker = object()
+    worker.laser_auto_focus_controller = SimpleNamespace(_timing=marker)
+    worker.liveController = SimpleNamespace(obs_controller=SimpleNamespace(turn_off_illumination=MagicMock()))
+    worker._timing = SimpleNamespace(get_timer=lambda name: nullcontext())
+    worker._laser_af_refresh_every_n_fovs = cadence
+    worker._laser_af_seed_mode = seed
+    worker._initialize_legacy_region_entries = MagicMock()
+    worker._seed_fov_z_map = MagicMock()
+    worker._initialize_acquisition_focus_once()
+    worker._initialize_acquisition_focus_once()
+    assert worker._initialize_legacy_region_entries.call_count == (expected == "entry")
+    assert worker._seed_fov_z_map.call_count == (expected == "scan")
+    assert worker.laser_auto_focus_controller._timing is marker
+    worker.liveController.obs_controller.turn_off_illumination.assert_called_once()

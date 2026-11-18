@@ -1,5 +1,34 @@
 #include "operations.h"
 
+#include "tmc/drivers/stepper_driver.h"   // DRIVER_UNKNOWN, tmc_driver_ready
+
+/*
+  THE OPERATOR-DRIVEN MOTION PATHS ARE PART OF THE FAIL-SAFE.
+
+  stage_commands.cpp rejects host move commands on an axis whose driver the
+  probe could not identify. The three gates below close the other door: the
+  joystick and the focus wheel command motion directly, from the panel's UART
+  packets, without going through a command callback at all.
+
+  Leaving them open would be worse than an oversight. Rejecting the host's
+  moves means *_commanded_movement_in_progress never becomes true on that axis,
+  which is one of the conditions the joystick blocks wait for — so the guards in
+  stage_commands.cpp hold the joystick gate PERMANENTLY OPEN on exactly the axis
+  they just locked. The realistic sequence: X probes DRIVER_UNKNOWN on a
+  mis-populated board, the host's MOVE_X comes back CMD_EXECUTION_ERROR, the
+  operator reads that as "X is inhibited" and reaches for the joystick to jog it
+  by hand — and X moves at whatever current its power stage happens to be
+  strapped to, because tmc_driver_init() has no DRIVER_UNKNOWN arm and never
+  configured it.
+
+  These gates are SILENT: they must not touch mcu_cmd_execution_status. The
+  joystick and focus wheel are not host commands and have no command status of
+  their own, so writing CMD_EXECUTION_ERROR here would attribute a hardware
+  fault to whatever unrelated command the host last sent. That is the one
+  behavioural difference from the axis_driver_ready helper in
+  stage_commands.cpp, which exists to report exactly that status.
+*/
+
 // TODO: move the movement direction sign from configuration.txt (python) to the firmware (with
 // setPinsInverted() so that homing_direction_X, homing_direction_Y, homing_direction_Z will no
 // longer be needed. This way the home switches can act as limit switches - right now because
@@ -369,9 +398,23 @@ void finalize_homing_w()
   if (is_homing_W && home_W_found && ( tmc4361A_currentPosition(&tmc4361[w]) == tmc4361A_targetPosition(&tmc4361[w]) || us_since_w_home_found > 500 * 1000 ) )
   {
     if (enable_filterwheel == true) {
+      // Anchor the driver coordinate to 0 at the home reference so the
+      // host can target absolute slot positions via MOVETO_W.
+      tmc4361A_setCurrentPosition(&tmc4361[w], 0);
       tmc4361A_write_encoder(&tmc4361[w], 0);
       if (stage_PID_enabled[w])
         tmc4361A_set_PID(&tmc4361[w], PID_BPG0);
+      // The filter wheel is ROTARY (no travel end-stop) -- the linear-stage
+      // [xmin,xmax] range gate in tmc4361A_moveTo does not apply to it. Homing
+      // leaves xmin = L - C (L = press-latch position, C = release-detect
+      // position); a stale/mis-ordered latch makes xmin exceed the small absolute
+      // post-home offset target, so MOVETO_W is wrongly rejected with
+      // CMD_EXECUTION_ERROR. Reset to full range so valid rotary moves are never
+      // range-rejected. Safe: W xmin/xmax are written only in check_homing_w and
+      // consumed only by the moveTo range check (check_limits acts on X/Y/Z only,
+      // stopping them on a limit-switch event, and never touches W/W2).
+      tmc4361[w].xmin = INT32_MIN;
+      tmc4361[w].xmax = INT32_MAX;
     }
     W_pos = 0;
     is_homing_W = false;
@@ -386,9 +429,13 @@ void finalize_homing_w2()
   if (is_homing_W2 && home_W2_found && ( tmc4361A_currentPosition(&tmc4361[w2]) == tmc4361A_targetPosition(&tmc4361[w2]) || us_since_w2_home_found > 500 * 1000 ) )
   {
     if (enable_filterwheel_w2 == true) {
+      tmc4361A_setCurrentPosition(&tmc4361[w2], 0);
       tmc4361A_write_encoder(&tmc4361[w2], 0);
       if (stage_PID_enabled[w2])
         tmc4361A_set_PID(&tmc4361[w2], PID_BPG0);
+      // Rotary wheel: no travel end-stop -> full range (see finalize_homing_w).
+      tmc4361[w2].xmin = INT32_MIN;
+      tmc4361[w2].xmax = INT32_MAX;
     }
     W2_pos = 0;
     is_homing_W2 = false;
@@ -444,7 +491,10 @@ void check_joystick()
 	  us_since_last_joystick_update = 0;
 
 	  // read x joystick
-	  if (!X_commanded_movement_in_progress && !is_homing_X && !is_preparing_for_homing_X) //if(stepper_X.distanceToGo()==0) // only read joystick when computer commanded travel has finished - doens't work
+	  // tmc_driver_ready gates the whole block, not just the two setSpeed calls:
+	  // an axis that is never commanded to move has nothing for the else-branch
+	  // stop to halt, and a stop is itself a write to an unconfigured driver.
+	  if (tmc_driver_ready(&tmc4361[x]) && !X_commanded_movement_in_progress && !is_homing_X && !is_preparing_for_homing_X) //if(stepper_X.distanceToGo()==0) // only read joystick when computer commanded travel has finished - doens't work
 	  {
 	    // joystick at motion position
 	    if (abs(joystick_delta_x) > 0)
@@ -460,7 +510,7 @@ void check_joystick()
 	  }
 
 	  // read y joystick
-	  if (!Y_commanded_movement_in_progress && !is_homing_Y && !is_preparing_for_homing_Y)
+	  if (tmc_driver_ready(&tmc4361[y]) && !Y_commanded_movement_in_progress && !is_homing_Y && !is_preparing_for_homing_Y)
 	  {
 	    // joystick at motion position
 	    if (abs(joystick_delta_y) > 0)
@@ -487,7 +537,11 @@ void do_focus_control()
     focusPosition = Z_POS_LIMIT;
   if (focusPosition < Z_NEG_LIMIT)
     focusPosition = Z_NEG_LIMIT;
-  if (is_homing_Z == false && is_preparing_for_homing_Z == false)
+  // The clamp above still runs on a rejected axis: focusPosition is written by
+  // the focus wheel (functions.cpp, onJoystickPacketReceived) whether or not Z
+  // can be driven, and letting it drift outside the limits would hand Z a wild
+  // target the moment the axis is recovered. Only the move is gated.
+  if (tmc_driver_ready(&tmc4361[z]) && is_homing_Z == false && is_preparing_for_homing_Z == false)
     tmc4361A_moveTo(&tmc4361[z], focusPosition);
 }
 

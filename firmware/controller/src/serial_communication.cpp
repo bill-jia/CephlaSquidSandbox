@@ -1,4 +1,5 @@
 #include "serial_communication.h"
+#include "diagnostics.h"
 
 void process_serial_message()
 {
@@ -13,6 +14,7 @@ void process_serial_message()
       uint8_t checksum = crc8ccitt(buffer_rx, CMD_LENGTH - 1);
       if (checksum != buffer_rx[CMD_LENGTH - 1])
       {
+        diagnostics_command(false);
         checksum_error = true;
         // empty the serial buffer because byte-level out-of-sync can also cause this error
         while (SerialUSB.available())
@@ -25,6 +27,18 @@ void process_serial_message()
       }
       // Reset watchdog timer on every valid serial message
       last_serial_message_time = millis();
+      diagnostics_command(true);
+
+      // Default the status to success; callbacks call mark_move_failed()
+      // on the failure path to override it before the next status broadcast.
+      // Skip for HEARTBEAT — the keepalive has no result to report, and
+      // resetting here would clobber a pending CMD_EXECUTION_ERROR from a
+      // previous command if the broadcast hasn't fired yet. Any future
+      // background-sender command should be added to this skip list.
+      if (buffer_rx[1] != HEARTBEAT)
+      {
+          mcu_cmd_execution_status = COMPLETED_WITHOUT_ERRORS;
+      }
 
       CommandCallback p_callback = cmd_map[buffer_rx[1]];
       if (!p_callback) {
@@ -46,8 +60,10 @@ void send_position_update()
     buffer_tx[0] = cmd_id;
     if (checksum_error)
       buffer_tx[1] = CMD_CHECKSUM_ERROR; // cmd_execution_status
+    else if (mcu_cmd_execution_in_progress)
+      buffer_tx[1] = IN_PROGRESS;
     else
-      buffer_tx[1] = mcu_cmd_execution_in_progress ? IN_PROGRESS : COMPLETED_WITHOUT_ERRORS; // cmd_execution_status
+      buffer_tx[1] = mcu_cmd_execution_status; // COMPLETED_WITHOUT_ERRORS or CMD_EXECUTION_ERROR
 
     uint32_t X_pos_int32t = uint32_t( X_use_encoder ? X_pos : int32_t(tmc4361A_currentPosition(&tmc4361[x])) );
     buffer_tx[2] = byte(X_pos_int32t >> 24);
@@ -74,10 +90,8 @@ void send_position_update()
     buffer_tx[18] &= ~ (1 << BIT_POS_JOYSTICK_BUTTON); // clear the joystick button bit
     buffer_tx[18] = buffer_tx[18] | joystick_button_pressed << BIT_POS_JOYSTICK_BUTTON;
 
-    // Clear reserved bytes to avoid stale data affecting the checksum
-    buffer_tx[19] = 0;
-    buffer_tx[20] = 0;
-    buffer_tx[21] = 0;
+    // Passive telemetry uses only the former reserved bytes. CRC covers it.
+    diagnostics_status(buffer_tx);
 
     // Firmware version in byte 22: high nibble = major, low nibble = minor
     buffer_tx[22] = (FIRMWARE_VERSION_MAJOR << 4) | (FIRMWARE_VERSION_MINOR & 0x0F);

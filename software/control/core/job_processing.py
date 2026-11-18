@@ -26,6 +26,7 @@ import squid.abc
 import squid.logging
 from control.models.observation_state import ObservationState
 from control.core import utils_ome_tiff_writer as ome_tiff_writer
+from control.core.pipeline_diagnostics import WorkerDiagnostics, diagnostic_job, stage as diagnostic_stage
 from control.core.memory_profiler import (
     start_worker_monitoring,
     stop_worker_monitoring,
@@ -148,6 +149,8 @@ class CaptureInfo:
     # postprocess group (routed to the PostprocessJob runner) — its raw image is
     # NOT saved, and its save_* fields are None.
     postprocess_group: Optional[str] = None
+    # Immutable capture geometry: callbacks may run after the worker switches regions.
+    stack_z_size: Optional[int] = None
 
 
 @dataclass()
@@ -587,9 +590,9 @@ class SaveOMETiffJob(Job):
         for path, region_file in list(cls._region_files.items()):
             try:
                 region_file.finalize()
-                cls._log.info(f"Finalized OME-TIFF region file: {path}")
+                cls._log.debug(f"Finalized OME-TIFF region file: {path}")
             except Exception as e:
-                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}")
+                cls._log.error(f"Error finalizing OME-TIFF {path}: {e}", exc_info=True)
                 failed.append(path)
         cls._region_files.clear()
         cls._active_region_path = None
@@ -683,7 +686,7 @@ class SaveOMETiffJob(Job):
             n_series = ome_tiff_writer.region_fov_count(self.acquisition_info, info)
             metadata = ome_tiff_writer.initialize_metadata(self.acquisition_info, info, image, n_series)
             ome_tiff_writer.create_multiseries_file(output_path, metadata)
-            self._log.info(
+            self._log.debug(
                 f"Created region OME-TIFF {output_path} with {n_series} series, "
                 f"shape={tuple(metadata[ome_tiff_writer.SHAPE_KEY])}"
             )
@@ -698,7 +701,7 @@ class SaveOMETiffJob(Job):
                 )
                 self._log.warning(f"Writing into an already finalized region OME-TIFF {output_path}")
             else:
-                self._log.info(f"Resuming region OME-TIFF {output_path} from its sidecar")
+                self._log.debug(f"Resuming region OME-TIFF {output_path} from its sidecar")
             expected_shape = tuple(metadata[ome_tiff_writer.SHAPE_KEY])
             if expected_shape[-2:] != image.shape[-2:]:
                 raise ValueError("Image dimensions do not match existing OME memmap stack")
@@ -994,9 +997,9 @@ class SaveZarrJob(Job):
                             output_path=path,
                             upload_target=upload_target,
                         ).run()
-                    cls._log.info(f"Finalized zarr writer: {path}")
+                    cls._log.debug(f"Finalized zarr writer: {path}")
                 except Exception as e:
-                    cls._log.error(f"Error finalizing writer {path}: {e}")
+                    cls._log.error(f"Error finalizing writer {path}: {e}", exc_info=True)
                     failed_paths.append(path)
         cls._zarr_writers.clear()
         if failed_paths:
@@ -1195,7 +1198,7 @@ class SaveZarrJob(Job):
             if zwi.is_hcs:
                 self._write_hcs_metadata_if_needed(region_id, fov, ak)
             mode_str = "HCS" if zwi.is_hcs else "per-FOV"
-            self._log.info(f"Initialized zarr writer ({mode_str}): {output_path}")
+            self._log.debug(f"Initialized zarr writer ({mode_str}): {output_path}")
 
         writer = self._zarr_writers[writer_key]
         z = info.z_index
@@ -1301,7 +1304,8 @@ class FlushAndStageUploadJob:
         # Drain every outstanding TensorStore future tied to this writer. After
         # this returns, every shard file for this FOV is fully on disk and
         # safe to read for upload.
-        writer.wait_for_pending()
+        with diagnostic_stage("zarr_flush"):
+            writer.wait_for_pending()
 
         if not (self.upload_target and self.upload_target.enabled):
             return BarrierResult(
@@ -1388,12 +1392,13 @@ class FlushAndStageUploadJob:
                     }
                 )
             try:
-                UploadManagerClient().submit_batch(
-                    self.upload_target.manager_dataset_id,
-                    task_id,
-                    manager_files,
-                    task_id=task_id,
-                )
+                with diagnostic_stage("upload_submit"):
+                    UploadManagerClient().submit_batch(
+                        self.upload_target.manager_dataset_id,
+                        task_id,
+                        manager_files,
+                        task_id=task_id,
+                    )
             except Exception:
                 self._log.exception("Could not durably submit upload task %s", task_id)
                 return BarrierResult(
@@ -1480,6 +1485,7 @@ class PostprocessWarmupResult:
     label: str
     ok: bool
     error: Optional[str] = None
+    fatal: bool = False
 
 
 @dataclass
@@ -1499,6 +1505,7 @@ class PostprocessResult:
     outputs_written: int
     barrier_results: List[BarrierResult] = field(default_factory=list)
     display_images: Dict[str, np.ndarray] = field(default_factory=dict)  # output_key -> small preview
+    display_images_last: Dict[str, np.ndarray] = field(default_factory=dict)
     # The last input frame's CaptureInfo — lets the main process synthesize a
     # CameraFrame/CaptureInfo pair for the live-display signal (position, region…).
     source_capture_info: Optional[CaptureInfo] = None
@@ -1601,7 +1608,8 @@ class PostprocessJob(Job):
 
         t_scan = info.time_point or 0
         try:
-            outputs = self._compute(acc["frames"])
+            with diagnostic_stage("reconstruction"):
+                outputs = self._compute(acc["frames"])
         except Exception as e:
             self._log.exception(f"Postprocess group {self.group_key} failed for t={t_scan} fov={info.fov}")
             return PostprocessResult(
@@ -1610,25 +1618,38 @@ class PostprocessJob(Job):
                 region_id=str(info.region_id),
                 fov=info.fov,
                 outputs_written=0,
+                source_capture_info=info,
                 error=str(e),
             )
 
         barrier_results: List[BarrierResult] = []
         display_images: Dict[str, np.ndarray] = {}
+        display_images_last: Dict[str, np.ndarray] = {}
+        errors = []
         written = 0
         last_capture_time = acc["frames"][-1]["capture_time"]
         for spec in self.output_specs:
             out_key = f"{self.label}_{spec['name']}"
-            arr = outputs.get(spec["name"])
-            if arr is None:
-                self._log.error(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
-                continue
-            arr = self._coerce_output(arr, spec, acc["frames"])
-            written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
-            barrier = self._maybe_barrier(out_key)
-            if barrier is not None:
-                barrier_results.append(barrier)
-            display_images[out_key] = self._prepare_display_image(arr)
+            try:
+                arr = outputs.get(spec["name"])
+                if arr is None:
+                    raise ValueError(f"Routine {self.group_key} did not return declared output {spec['name']!r}")
+                arr = self._coerce_output(arr, spec, acc["frames"])
+                with diagnostic_stage("derived_write"):
+                    written += self._write_output(arr, out_key, spec, t_scan, last_capture_time)
+                barrier = self._maybe_barrier(out_key)
+                if barrier is not None:
+                    barrier_results.append(barrier)
+                with diagnostic_stage("preview_prepare"):
+                    display_images[out_key] = self._prepare_display_image(arr)
+                    display_images_last[out_key] = (
+                        self._prepare_display_image(arr, z_choice="last") if arr.ndim == 3 else display_images[out_key]
+                    )
+            except Exception as e:
+                # Return a keyed failure so the preview can settle this group;
+                # an unkeyed JobResult exception would leave it pending forever.
+                self._log.exception("Postprocess output %s failed", out_key)
+                errors.append(f"{out_key}: {e}")
 
         return PostprocessResult(
             group_key=self.group_key,
@@ -1638,7 +1659,9 @@ class PostprocessJob(Job):
             outputs_written=written,
             barrier_results=barrier_results,
             display_images=display_images,
+            display_images_last=display_images_last,
             source_capture_info=info,
+            error="; ".join(errors) if errors else None,
         )
 
     @classmethod
@@ -1840,17 +1863,14 @@ class PostprocessJob(Job):
         )
         return barrier.run()
 
-    def _prepare_display_image(self, arr: np.ndarray) -> np.ndarray:
+    def _prepare_display_image(self, arr: np.ndarray, z_choice: str = "middle") -> np.ndarray:
         """Produce a display-safe preview plane for the live viewer.
 
-        The live napari/contrast display assumes a single integer dtype and one
-        image size shared across all channels (it re-inits the whole canvas when
-        either changes). So a float output must be normalized to the raw camera
-        dtype (uint16) and kept at its native resolution (which, for image-in →
-        image-out routines, matches the camera frame) — otherwise it thrashes the
-        viewer every frame. Integer outputs pass through unchanged.
+        Legacy live/mosaic displays require integer data, so float outputs are
+        normalized to uint16 at native resolution. Z selection uses each output's
+        own extent, independently of the input stack or other output channels.
         """
-        plane = arr[arr.shape[0] // 2] if arr.ndim == 3 else arr
+        plane = arr[-1 if z_choice == "last" else arr.shape[0] // 2] if arr.ndim == 3 else arr
         if np.issubdtype(plane.dtype, np.integer):
             return np.ascontiguousarray(plane.astype(np.uint16, copy=False))
         finite = plane[np.isfinite(plane)]
@@ -1904,9 +1924,15 @@ class PostprocessWarmupJob:
             routine.warmup(input_states, ctx, dict(self.spec_dict.get("params", {})))
             return PostprocessWarmupResult(routine_key=key, label=self.label, ok=True)
         except Exception as e:
-            # Non-fatal: fall back to lazy compute on the first FOV.
-            self._log.warning(f"Postprocess warmup for {self.label!r} failed (will compute lazily): {e}")
-            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=False, error=str(e))
+            # A CUDA failure may poison this process's context. Retrying the
+            # same geometry during capture cannot repair it, and raw inputs to
+            # postprocessing are not saved. Stop before acquiring those inputs.
+            fatal = any(token in str(e).lower() for token in ("cuda", "cusolver", "cufft"))
+            action = "acquisition must stop; restart the worker before retrying" if fatal else "will compute lazily"
+            self._log.warning(
+                "Postprocess warmup for %r failed (%s): %s", self.label, action, e, exc_info=True
+            )
+            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=False, error=str(e), fatal=fatal)
 
 
 # These are debugging jobs - they should not be used in normal usage!
@@ -2249,8 +2275,18 @@ class JobRunner(multiprocessing.Process):
         self._bp_pending_jobs = bp_pending_jobs
         self._bp_pending_bytes = bp_pending_bytes
         self._bp_capacity_event = bp_capacity_event
+        self._pipeline_diagnostics = WorkerDiagnostics()
 
     def dispatch(self, job: Job):
+        with self._pipeline_diagnostics.dispatch_lock:
+            self._pipeline_diagnostics.dispatched(job)
+            try:
+                return self._dispatch(job)
+            except BaseException:
+                self._pipeline_diagnostics.rollback()
+                raise
+
+    def _dispatch(self, job: Job):
         # Inject acquisition_info into SaveOMETiffJob instances before serialization.
         # The job object is pickled when placed in the queue, so injection must happen here.
         if isinstance(job, SaveOMETiffJob):
@@ -2455,15 +2491,13 @@ class JobRunner(multiprocessing.Process):
 
         # Configure logging in subprocess - the squid.logging module sets up console logging
         # on import, but we need to ensure it's properly initialized in this process.
-        # Default to INFO for stdout in the worker, and allow overriding via
+        # Default to INFO for both stdout and the worker file, and allow overriding via
         # the SQUID_WORKER_LOG_LEVEL environment variable (e.g. "DEBUG").
-        stdout_level = logging.INFO
-        env_level = os.environ.get("SQUID_WORKER_LOG_LEVEL")
-        if env_level:
-            env_level_upper = env_level.upper()
-            if hasattr(logging, env_level_upper):
-                stdout_level = getattr(logging, env_level_upper)
-        squid.logging.set_stdout_log_level(stdout_level)
+        env_level = os.environ.get("SQUID_WORKER_LOG_LEVEL", "INFO").strip().upper()
+        worker_level = logging.getLevelName(env_level)
+        if not isinstance(worker_level, int):
+            worker_level = logging.INFO
+        squid.logging.set_stdout_log_level(worker_level)
 
         # Set up file logging if a log file path was provided
         # Use a separate file for the worker to avoid multiprocess file write conflicts
@@ -2471,7 +2505,7 @@ class JobRunner(multiprocessing.Process):
         if self._log_file_path:
             base, ext = os.path.splitext(self._log_file_path)
             worker_log_path = f"{base}_worker{ext}"
-            squid.logging.add_file_handler(worker_log_path, replace_existing=True, level=logging.DEBUG)
+            squid.logging.add_file_handler(worker_log_path, replace_existing=True, level=worker_level)
 
         self._log = squid.logging.get_logger(self.__class__.__name__)
         worker_log_msg = f", worker_log={worker_log_path}" if worker_log_path else ""
@@ -2535,7 +2569,11 @@ class JobRunner(multiprocessing.Process):
                         break
                     continue
 
-                self._log.debug(f"Running job {job.job_id} (waited {(t_got_job - t_wait_start)*1000:.1f}ms in queue)...")
+                self._log.debug(
+                    "Running job %s (waited %.1fms for input)...",
+                    job.job_id,
+                    (t_got_job - t_wait_start) * 1000,
+                )
 
                 # Set operation context for memory tracking
                 if isinstance(job, DownsampledViewJob):
@@ -2544,20 +2582,26 @@ class JobRunner(multiprocessing.Process):
                     set_worker_operation(job.__class__.__name__)
 
                 t_run_start = time.perf_counter()
-                result = job.run()
+                with diagnostic_job(self._pipeline_diagnostics, job):
+                    result = job.run()
                 t_run_end = time.perf_counter()
 
-                # Only queue non-None results (DownsampledViewJob returns None for intermediate FOVs)
+                # Accumulating jobs legitimately produce no output until their
+                # group is complete (postprocess Z stacks, downsampled FOVs).
+                # None is normal completion, not a failed or dropped frame.
                 if result is not None:
-                    self._log.debug(
-                        f"Job {job.job_id} returned in {(t_run_end - t_run_start)*1000:.1f}ms. "
-                        f"Sending result to output queue."
-                    )
                     self._output_queue.put_nowait(JobResult(job_id=job.job_id, result=result, exception=None))
-                    self._log.debug(f"Result for {job.job_id} is on output queue.")
+                    self._log.debug(
+                        "Job %s completed in %.1fms; result queued.",
+                        job.job_id,
+                        (t_run_end - t_run_start) * 1000,
+                    )
                 else:
-                    self._log.warning(
-                        f"Job {job.job_id} returned None in {(t_run_end - t_run_start)*1000:.1f}ms, not queuing."
+                    self._log.debug(
+                        "%s job %s completed in %.1fms without an output result; no result queued.",
+                        type(job).__name__,
+                        job.job_id,
+                        (t_run_end - t_run_start) * 1000,
                     )
             except queue.Empty:
                 pass
@@ -2628,7 +2672,8 @@ class JobRunner(multiprocessing.Process):
         # Finalize any zarr writers that are still open
         t_finalize_start = time.perf_counter()
         try:
-            success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
+            with self._pipeline_diagnostics.stage("finalize"):
+                success = SaveZarrJob.finalize_all_writers(upload_target=self._upload_target)
             if not success:
                 self._log.error("ZARR FINALIZATION INCOMPLETE - Some data may not be saved correctly")
         except Exception as e:
@@ -2639,10 +2684,12 @@ class JobRunner(multiprocessing.Process):
         # abort/shutdown, so an aborted acquisition still leaves readable
         # positions/timestamps instead of a bare pre-allocated stack.
         try:
-            if not SaveOMETiffJob.finalize_all_writers():
+            with self._pipeline_diagnostics.stage("finalize"):
+                success = SaveOMETiffJob.finalize_all_writers()
+            if not success:
                 self._log.error("OME-TIFF FINALIZATION INCOMPLETE - Some metadata may be missing")
         except Exception as e:
-            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}")
+            self._log.error(f"Error finalizing OME-TIFF writers during shutdown: {e}", exc_info=True)
         self._log.info(
             f"finalize_all_writers() completed in {time.perf_counter() - t_finalize_start:.1f}s"
         )

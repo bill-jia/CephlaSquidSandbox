@@ -46,6 +46,12 @@ class AcquisitionMetadata(BaseModel):
         default_factory=dict,
         description="Legacy-compatible scan grid/time parameters (dx, Nx, AF flags, etc.)",
     )
+    stage_position_mm: Optional[Dict[str, float]] = Field(
+        None, description="Measured stage coordinates x_mm, y_mm, z_mm at snapshot time"
+    )
+    piezo_position_um: Optional[float] = Field(
+        None, description="Last commanded objective piezo position in micrometers at snapshot time"
+    )
     instrument_state_h5: Optional[str] = Field(
         None,
         description="Relative path to instrument_state.h5 when large/binary blobs are stored",

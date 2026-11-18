@@ -37,6 +37,14 @@ Compare `frame_z_mm` with `snapshot_z_mm`; event YAML also records individual
 displacement measurements and piezo positions. Rejected frames from earlier correction
 iterations remain available even if final verification succeeds.
 
+Verification tries the fixed reference crop first, then bounded Y-only
+registration when needed and when X displacement is within tolerance. The
+`correlation` field is the best verification score; `correlation_unregistered`
+records the original fixed-crop score. `y_registration_shift_px` records the
+selected retry shift (positive means the crop moved downward in camera pixels),
+or is blank if no retry ran. These fields are saved in both `events.csv` and
+event YAML. Registration keeps X fixed and uses the same correlation threshold.
+
 Only one previous success is held in memory. Routine successful snapshots are discarded
 after they cease to be that previous success; failures and warnings accumulate on disk.
 Full-sensor capture restores the actual focus-camera ROI, streaming state, and callback
@@ -55,3 +63,26 @@ This mode keeps the existing spot detector, acceptance thresholds, calibration, 
 closed-loop correction. The independent matched-filter acceptance and next-FOV drift
 prediction experiments are not enabled. Hardware validation is required to establish
 whether focus reliability or residual displacement improves on the microscope.
+
+## Event logging during imaging
+
+In either multipoint panel, enable **Log AF events during imaging** under Saving
+and enable Laser AF. Leave **AF validation run (skip imaging)** unchecked to
+acquire normal channel images and Z stacks. The setting defaults off and is
+saved/restored in acquisition.yaml as acquisition.log_af_events.
+
+Evidence is saved under `<experiment>/af_events/`, using the same CSV, references,
+baseline and noteworthy-event native images described above. No additional
+full-sensor exposures are taken. Collection and disk writes add some overhead.
+If validation mode is also enabled, validation takes precedence and writes to
+af_validation with its usual snapshots and imaging skipped.
+
+Join events to images using time_point, region_id and fov (zero-based indices).
+Multiple operations can occur per visit; distinguish seed from acquisition phase
+and correction from measurement kind. Timestamps are Unix seconds. The CSV includes
+stage Z in mm, piezo positions in micrometers, displacement_before_um and
+displacement_after_um (first/last measurements), and measurements_json containing
+the full sequence with stage/piezo coordinates. A failed correction may roll back:
+the last measured residual is not necessarily the residual at the final image Z.
+Table-only visits have no displacement measurements. References remain deduplicated
+by reference_id. Evidence-write failures request acquisition abort.

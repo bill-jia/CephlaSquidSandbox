@@ -666,7 +666,6 @@ class ConfigRepository:
             return registry.get_camera_names()
         return []
 
-
     # ───────────────────────────────────────────────────────────────────────────
     # v1.1 Hardware Bindings and Filter Wheel Aggregation
     # ───────────────────────────────────────────────────────────────────────────
@@ -702,10 +701,11 @@ class ConfigRepository:
 
         Returns a dict mapping source name to list of wheels:
         - "standalone": wheels from embedded ``machine_config.filter_wheel_registry`` or ``filter_wheels.yaml``
-        - "confocal": the emission wheel declared by the confocal device entry
+        - "confocal": the emission and excitation wheels declared by the confocal device entry
 
         Each source has its own ID namespace (no global conflicts).
         """
+
         result: Dict[str, List[FilterWheelDefinition]] = {}
 
         # Standalone wheels from filter_wheels.yaml
@@ -719,6 +719,9 @@ class ConfigRepository:
             wheel = confocal.build_emission_wheel_definition()
             if wheel is not None:
                 result[FILTER_WHEEL_SOURCE_CONFOCAL] = [wheel]
+            excitation = confocal.build_excitation_wheel_definition()
+            if excitation is not None:
+                result.setdefault(FILTER_WHEEL_SOURCE_CONFOCAL, []).append(excitation)
 
         return result
 
@@ -1185,6 +1188,17 @@ class ConfigRepository:
             raise
         return path
 
+    def delete_observation_preset(self, name: str, profile: Optional[str] = None) -> None:
+        """Delete a saved preset from the current (or specified) profile."""
+        from control.core.observation_state_service import observation_preset_path
+
+        profile = profile or self._current_profile
+        if profile is None:
+            raise ValueError("No profile set. Call set_profile() or pass profile= explicitly.")
+        if name not in self.list_observation_presets(profile):
+            raise ValueError(f"Preset '{name}' was not found.")
+        observation_preset_path(self, name, profile=profile).unlink()
+
     def load_observation_preset(self, name: str, profile: Optional[str] = None) -> Optional[ObservationState]:
         """
         Load a named Observation State preset from the profile.
@@ -1242,6 +1256,9 @@ class ConfigRepository:
             emission_filter_positions = cam_state.get("emission_filter_positions") or {}
             if not isinstance(emission_filter_positions, dict):
                 emission_filter_positions = {}
+            excitation_filter_positions = cam_state.get("excitation_filter_positions") or {}
+            if not isinstance(excitation_filter_positions, dict):
+                excitation_filter_positions = {}
 
             enable_auto_filter = data.get("enable_channel_auto_filter_switching")
             enable_auto_filter = bool(enable_auto_filter) if enable_auto_filter is not None else None
@@ -1278,6 +1295,7 @@ class ConfigRepository:
                 camera_live=camera_live,
                 illuminator_states=illuminator_states,
                 emission_filter_positions=dict(emission_filter_positions),
+                excitation_filter_positions=dict(excitation_filter_positions),
                 z_offset_um=z_offset_um,
                 confocal_hardware_settings=confocal_hw,
                 display_color=display_color,

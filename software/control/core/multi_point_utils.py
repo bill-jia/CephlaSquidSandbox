@@ -21,6 +21,7 @@ class ScanPositionInformation:
     # Optional per-region laser-AF focus targets, keyed by region id. Regions
     # without an entry fall back to the controller's global reference.
     scan_region_laser_af_references: Dict[str, "LaserAFReference"] = field(default_factory=dict)
+    scan_region_z_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
     @staticmethod
     def from_scan_coordinates(scan_coordinates: ScanCoordinates):
@@ -31,6 +32,7 @@ class ScanPositionInformation:
             scan_region_laser_af_references=dict(
                 getattr(scan_coordinates, "region_laser_af_references", {})
             ),
+            scan_region_z_ranges=dict(getattr(scan_coordinates, "region_z_ranges", {})),
         )
 
 
@@ -65,6 +67,7 @@ class AcquisitionParameters:
     skip_saving: bool = False
     # AF-only diagnostic walk: no channel images, stacks, stimuli or fluidics.
     validation_mode: bool = False
+    log_af_events: bool = False
     # Which wellplate tiling method NX/NY describe ("fraction" or "grid"); metadata only
     # (the worker does not read it), recorded so a dropped acquisition.yaml can tell a
     # real Nx x Ny grid from the 1x1 a fraction-of-well run also writes.
@@ -218,3 +221,5 @@ class MultiPointControllerFunctions:
     # the point at which it is safe to move/copy the dataset. Used by the GUI to
     # keep the progress bar up as "Finalizing..." until writeback truly completes.
     signal_data_writing_complete: Callable[[], None] = lambda *a, **kw: None
+    # Structured preview events; independent of saving and legacy mosaic updates.
+    signal_acquisition_preview: Callable[[object], None] = lambda *a, **kw: None

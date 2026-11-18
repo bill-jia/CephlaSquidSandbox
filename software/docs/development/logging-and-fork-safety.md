@@ -46,6 +46,20 @@ Main Process                    Forked Subprocess
 
 ## Usage
 
+### Acquisition worker logs
+
+`JobRunner` subprocesses append to `<main-log-name>_worker.log`. Both worker
+console output and this file default to `INFO`, keeping lifecycle summaries,
+warnings, and errors without per-frame writes, job queue chatter, or periodic
+memory samples. Set `SQUID_WORKER_LOG_LEVEL=DEBUG` before launching the application
+to include those diagnostics in both outputs. Unrecognized values fall back to
+`INFO`. This setting does not change the main application's logging level or its
+per-acquisition `acquisition.log` handler.
+
+The shared worker file accumulates across application launches; this setting
+reduces new output and does not remove existing logs. Multipoint timing reports
+are opt-in with `SQUID_TIMING_REPORT=1` and appear once, sorted by total time.
+
 ### GUI Application
 
 ```python

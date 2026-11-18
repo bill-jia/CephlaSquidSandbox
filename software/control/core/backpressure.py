@@ -209,6 +209,13 @@ class BackpressureController:
         if not self._enabled or not self.should_throttle():
             return True
 
+        started = time.monotonic()
+        initial = self.get_stats()
+        jobs_over = initial.pending_jobs >= self._max_jobs
+        bytes_over = initial.pending_bytes_mb >= self._max_bytes / _BYTES_PER_MB
+        reason = "jobs+bytes" if jobs_over and bytes_over else (
+            "jobs" if jobs_over else "bytes" if bytes_over else "capacity_changed"
+        )
         log.info(
             f"Backpressure throttling: jobs={self.get_pending_jobs()}/{self._max_jobs}, "
             f"MB={self.get_pending_mb():.1f}/{self._max_bytes / _BYTES_PER_MB:.1f}"
@@ -218,6 +225,10 @@ class BackpressureController:
         while self.should_throttle():
             if time.monotonic() > deadline:
                 log.warning(f"Backpressure timeout after {self._timeout_s}s, continuing")
+                log.info(
+                    "[PIPELINE] Throttle ended: reason=%s, outcome=timeout, waited=%.3fs, jobs=%d, MiB=%.1f",
+                    reason, time.monotonic() - started, self.get_pending_jobs(), self.get_pending_mb(),
+                )
                 return False
             # Capture reference to avoid race with close()
             event = self._capacity_event
@@ -230,7 +241,11 @@ class BackpressureController:
             if self.should_throttle():
                 event.wait(timeout=0.1)
 
-        log.debug("Backpressure released")
+        log.info(
+            "[PIPELINE] Throttle ended: reason=%s, outcome=%s, waited=%.3fs, jobs=%d, MiB=%.1f",
+            reason, "closed" if self._closed else "capacity_available", time.monotonic() - started,
+            self.get_pending_jobs(), self.get_pending_mb(),
+        )
         return True
 
     def job_dispatched(self, image_bytes: int) -> None:

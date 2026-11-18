@@ -2,11 +2,11 @@ import atexit
 import csv
 import contextlib
 import json
-import logging
 import os
 import queue
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Type
 from datetime import datetime
 
@@ -31,7 +31,7 @@ from control.core.multi_point_utils import (
     PlateViewUpdate,
 )
 from control.core.objective_store import ObjectiveStore
-from control.microcontroller import Microcontroller
+from control.microcontroller import CommandAborted, Microcontroller
 from control.microscope import Microscope
 from control.piezo import PiezoStage
 from control.models.observation_state import ObservationState
@@ -367,6 +367,7 @@ class _BackgroundUploadDrainer:
         experiment_path: Optional[str],
         runner_output_queues: Optional[List] = None,
         runners_done_event: Optional[threading.Event] = None,
+        writers_stopped_event: Optional[threading.Event] = None,
         stall_window_s: float = 120.0,
         failed_deletions: int = 0,
     ):
@@ -392,6 +393,7 @@ class _BackgroundUploadDrainer:
         # during the up-to-600s background finalize; we consume them here.
         self._runner_queues: List = list(runner_output_queues or [])
         self._runners_done = runners_done_event
+        self._writers_stopped = writers_stopped_event
         self._stall_window_s = stall_window_s
         self._log = squid.logging.get_logger(self.__class__.__name__)
         self._done = threading.Event()
@@ -831,6 +833,8 @@ class _BackgroundUploadDrainer:
         Late BarrierResults are consumed from the runner output queues here —
         the main process's last drain happened before the background shutdown,
         so without this the tasks those barriers staged would be untracked.
+        Once writers have stopped, metadata consolidation may take longer than
+        the runner timeout. Wait for its completion before the final resync.
         """
         if self._runners_done is None:
             return
@@ -840,7 +844,7 @@ class _BackgroundUploadDrainer:
             self._drain_runner_barrier_results()
             self._drain_available_results()
             now = time.time()
-            if now > deadline:
+            if now > deadline and not (self._writers_stopped is not None and self._writers_stopped.is_set()):
                 self._log.error(
                     f"[{tag}] JobRunners did not finish within "
                     f"{int(JOB_RUNNER_FINALIZE_TIMEOUT_S + 60)}s; proceeding with "
@@ -1157,9 +1161,14 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         slack_notifier=None,
         prewarmed_job_runner: Optional[JobRunner] = None,
         prewarmed_bp_values: Optional["BackpressureValues"] = None,
+        upload_manager_ready: Optional[Future] = None,
+        prepare_focus: Optional[Callable[[], None]] = None,
     ):
         self._log = squid.logging.get_logger(__class__.__name__)
         self._timing = utils.TimingManager("MultiPointWorker Timer Manager")
+        self._prepare_focus = prepare_focus
+        self._upload_registration = None
+        self._startup_prepared = False
         self._alignment_widget = alignment_widget  # Optional AlignmentWidget for coordinate offset
         self._slack_notifier = slack_notifier  # Optional SlackNotifier for notifications
 
@@ -1195,6 +1204,20 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self._aborted_on_frame_timeout = False
         self.NZ = acquisition_parameters.NZ
         self.deltaZ = acquisition_parameters.deltaZ
+        self._default_NZ = self.NZ
+        self._region_z_ranges = dict(acquisition_parameters.scan_position_information.scan_region_z_ranges)
+        if self._region_z_ranges:
+            self.deltaZ = (-1 if acquisition_parameters.z_stacking_config == "FROM TOP" else 1) * abs(self.deltaZ)
+        from control.models.region_z_stack import z_stack_count
+
+        self.NZ = max([self.NZ] + [z_stack_count(*bounds, self.deltaZ) for bounds in self._region_z_ranges.values()])
+        self._active_region_z_range = None
+        self._region_nominal_z = {
+            name: center[2] for name, center in zip(
+                acquisition_parameters.scan_position_information.scan_region_names,
+                acquisition_parameters.scan_position_information.scan_region_coords_mm,
+            ) if len(center) > 2
+        }
 
         self.Nt = acquisition_parameters.Nt
         self.dt = acquisition_parameters.deltat
@@ -1254,7 +1277,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         except Exception:
             self._pixel_size_um = None
         self._time_increment_s = self.dt if self.Nt > 1 and self.dt > 0 else None
-        self._physical_size_z_um = self.deltaZ if self.NZ > 1 else None
+        self._physical_size_z_um = abs(self.deltaZ) * 1000 if self.NZ > 1 else None
         self.timestamp_acquisition_started = acquisition_parameters.acquisition_start_time
         self.timestamp_prev_timepoint_started = None
 
@@ -1406,11 +1429,12 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
         self.skip_saving = acquisition_parameters.skip_saving or self.validation_mode
         self._af_validator = None
-        if self.validation_mode:
+        if self.validation_mode or acquisition_parameters.log_af_events:
             if not self.do_reflection_af or self.laser_auto_focus_controller is None:
                 raise ValueError("AF validation requires laser autofocus")
             from control.core.af_validation_collector import AFValidationCollector
-            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, "af_validation"))
+            folder = "af_validation" if self.validation_mode else "af_events"
+            self._af_validator = AFValidationCollector(os.path.join(self.experiment_path, folder))
         # Retract the objective to OBJECTIVE_RETRACTED_POS_MM before every XY
         # move that enters a region (and before the very first move of the
         # run), then drive Z back to the target. Never fires between FOVs
@@ -1647,7 +1671,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             from control.core.upload_manager_client import UploadManagerClient
 
             dataset_id = str(uuid4())
-            UploadManagerClient().register_dataset(
+            registration_params = dict(
                 dataset_id=dataset_id,
                 name=os.path.basename(os.path.normpath(self.experiment_path)),
                 local_root=self.experiment_path,
@@ -1656,11 +1680,14 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 deletion_mode="individual",
             )
             self._upload_target.manager_dataset_id = dataset_id
-            self._log.info(
-                f"Registered persistent upload dataset {dataset_id} "
-                f"-> {self._upload_target.remote_root}, "
-                f"delete_after_verify={self._upload_target.delete_after_verify}"
-            )
+            def register_upload():
+                if upload_manager_ready is not None:
+                    upload_manager_ready.result()
+                result = UploadManagerClient().register_dataset(**registration_params)
+                self._log.info("Registered persistent upload dataset %s", dataset_id)
+                return result
+
+            self._upload_registration = self._background_preparation(register_upload, "Upload registration")
             # Each FOV visit emits one FlushAndStageUploadJob (⇒ one BarrierResult
             # ⇒ one UploadResult) PER on-disk plate key, not one per FOV: a ragged
             # run has len(array_keys) raw plates, and postprocessing adds one per
@@ -2143,6 +2170,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 # False below); without this seed, streaming would start in whatever
                 # mode live mode left the camera in.
                 self._seed_camera_for_first_observation_state()
+                self._start_postprocess_warmup_once()
                 self.camera.start_streaming()
                 # self._log.info(f"Camera acquisition mode {self.camera.get_acquisition_mode()}, trigger mode {self.camera._capture_mode_genicam}")
                 this_image_callback_id = self.camera.add_frame_callback(self._image_callback)
@@ -2175,28 +2203,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     )
                 except Exception as e:
                     self._log.warning(f"Failed to send Slack acquisition start notification: {e}")
-
-            # Pre-acquisition laser-AF seed scan. Populates `_fov_z_map` so later
-            # timepoints use the table-and-anchor path in perform_autofocus rather
-            # than a full laser AF at every FOV. Lazy mode skips this and seeds
-            # on first visit during normal acquisition instead.
-            if (
-                self.do_reflection_af
-                and self._laser_af_seed_mode == "scan"
-                and self.laser_auto_focus_controller is not None
-            ):
-                # Suppress laser-AF sub-timers (af:*) during the one-time seed
-                # scan so they reflect only per-FOV acquisition costs. The outer
-                # laser_af_seed_scan bucket still captures the full seed-scan
-                # wall time for a complete breakdown. Matches the
-                # obs_controller._timing=None pattern used by prewarm.
-                saved_af_timing = self.laser_auto_focus_controller._timing
-                self.laser_auto_focus_controller._timing = None
-                try:
-                    with self._timing.get_timer("laser_af_seed_scan"):
-                        self._seed_fov_z_map()
-                finally:
-                    self.laser_auto_focus_controller._timing = saved_af_timing
 
             ordered_run = (
                 self._explicit_acquisition_order and not self.validation_mode
@@ -2281,6 +2287,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 f"Frames captured so far are saved; restart the app to recover the camera."
             )
             self.request_abort_fn()
+        except CommandAborted as exc:
+            self._log.error("Firmware rejected an operation during acquisition; aborting acquisition: %s", exc)
+            self.request_abort_fn()
         except TimeoutError as te:
             origin = None
             tb = te.__traceback__
@@ -2293,7 +2302,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self._log.error(f"Operation timed out during acquisition at {origin[0]}() (multi_point_worker.py:{origin[1]}), aborting acquisition!")
             else:
                 self._log.error(f"Operation timed out during acquisition, aborting acquisition!")
-            self._log.error(te)
+            self._log.error(te, exc_info=True)
             self.request_abort_fn()
         # except Exception as e:
         #     self._log.exception(e)
@@ -2302,15 +2311,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             # We do this above, but there are some paths that skip the proper end of the acquisition so make
             # sure to always wait for final images here before removing our callback.
             self._wait_for_outstanding_callback_images()
-            # Timing collection and report emission are gated by TimingManager's
-            # class-level switch (SQUID_TIMING_REPORT=1 env var). When disabled,
-            # get_timer() returns a null context manager so every `with ...`
-            # site across the worker/obs_controller/laser_af path is a no-op,
-            # and get_report() returns a short "disabled" line. When enabled,
-            # the full report surfaces at INFO.
-            _timing_level = logging.INFO if utils.TimingManager.is_enabled() else logging.DEBUG
-            self._log.log(_timing_level, self._timing.get_report())
-            self._log.log(_timing_level, self._timing.get_report(sort=True))
+            # Emit one report, sorted by total time, only when timing was requested.
+            if utils.TimingManager.is_enabled():
+                self._log.info(self._timing.get_report(sort=True))
             # Detach the timing manager from the obs controller so live-mode
             # calls from widgets don't keep writing into the acquisition's
             # timing report.
@@ -2392,6 +2395,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             )
 
     def _finish_jobs(self, timeout_s=10):
+        self._report_pipeline_health("capture_finished")
         # Drain and summarize all currently available job results before waiting for completion
         self._summarize_runner_outputs(drain_all=True)
 
@@ -2471,6 +2475,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # closing the queues when it finishes.
         upload_runner_queues = []
         runners_exited_event = threading.Event()
+        writers_stopped_event = threading.Event()
         shutdown_threads = []
         for job_class, job_runner in active_runners:
             keep_queue_open = job_runner.has_upload_pipeline()
@@ -2497,11 +2502,28 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         def _announce_writeback_complete(threads):
             for th in threads:
                 th.join()
+            self._report_pipeline_health("writers_stopped")
+            writers_stopped_event.set()
+            # All raw/derived writers must finish before taking a plate-wide
+            # snapshot. Publish it before either upload path resyncs metadata
+            # and before declaring the local acquisition safe to copy.
+            if self._zarr_writer_info is not None:
+                try:
+                    from control.core.zarr_metadata import consolidate_acquisition_metadata
+
+                    failures = consolidate_acquisition_metadata(self.experiment_path)
+                    if failures:
+                        log.error("Zarr metadata consolidation failed for %s", failures)
+                except Exception:
+                    log.exception("Could not consolidate acquisition metadata")
             # The upload drainer waits on this before its "post-finalize"
             # metadata resync — only now is every zarr.json actually final.
             runners_exited_event.set()
             if self._upload_target is not None and self._upload_target.manager_owned:
                 try:
+                    registration = getattr(self, "_upload_registration", None)
+                    if registration is not None:
+                        registration.result()  # also order abort/finalize after registration
                     from control.core.upload_manager_client import UploadManagerClient
                     from control.core.zarr_upload import collect_sidecar_files
                     from control.core.zarr_layout import array_chunk_path
@@ -2584,6 +2606,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             stall_window_s=UPLOAD_DRAINER_STALL_WINDOW_S,
             runner_output_queues=upload_runner_queues,
             runners_done_event=runners_exited_event,
+            writers_stopped_event=writers_stopped_event,
         )
 
         # Release backpressure resources now that all jobs are complete
@@ -2597,6 +2620,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         stall_window_s: float,
         runner_output_queues: Optional[List] = None,
         runners_done_event: Optional[threading.Event] = None,
+        writers_stopped_event: Optional[threading.Event] = None,
     ) -> None:
         """Detach the UploadWorker drain to a background thread.
 
@@ -2632,6 +2656,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             experiment_path=self.experiment_path,
             runner_output_queues=runner_output_queues,
             runners_done_event=runners_done_event,
+            writers_stopped_event=writers_stopped_event,
             stall_window_s=stall_window_s,
             failed_deletions=self._upload_failed_deletions,
         )
@@ -2717,7 +2742,11 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                         sidecar = {
                             "channel_names": list(self.observation_state_names),
                             "num_time_points": self.Nt,
-                            "num_z_levels": self.NZ,
+                            "num_z_levels": max(self._region_nz(r) for r in self.scan_region_fov_coords_mm),
+                            "region_z_stacks": {
+                                str(r): {"z_range_mm": list(bounds), "nz": self._region_nz(r)}
+                                for r, bounds in getattr(self, "_region_z_ranges", {}).items()
+                            },
                             "num_channels": len(self.observation_state_names),
                             "pixel_size_um": self._pixel_size_um,
                             "z_step_um": self._physical_size_z_um,
@@ -2736,7 +2765,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
             # init z parameters, z range
             with self._timing.get_timer("initialize_z_stack"):
-                if self.NZ > 1 and not self.validation_mode:
+                if self.NZ > 1 and not self.validation_mode and not getattr(self, "_region_z_ranges", {}):
                     self.initialize_z_stack()
 
             with self._timing.get_timer("run_coordinate_acquisition"):
@@ -2754,7 +2783,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     plate_resolution = int(self._downsampled_plate_resolution_um)
                     plate_view_path = os.path.join(current_path, "downsampled", f"plate_{plate_resolution}um.tiff")
                     self.save_plate_view(plate_view_path)
-                    self._log.info(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
+                    self._log.debug(f"Saved plate view for timepoint {self.time_point} to {plate_view_path}")
                     # Clear plate view for next timepoint
                     self._downsampled_view_manager.clear()
 
@@ -2940,6 +2969,13 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         z_target_mm = None
         if (self.do_reflection_af or self.do_autofocus) and (region_id, fov) in self._z_pos_proposal:
             z_target_mm = self._z_pos_proposal[(region_id, fov)]
+        elif (
+            self.do_reflection_af
+            and getattr(self, "_laser_af_refresh_every_n_fovs", None) == 1
+            and fov >= 0
+            and getattr(self, "_last_move_region_id", None) == region_id
+        ):
+            z_target_mm = curr_pos.z_mm
         elif len(coordinate_mm) == 3:
             if (self.do_reflection_af or self.do_autofocus) and self.time_point > 0:
                 self._log.warning(
@@ -3024,10 +3060,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         self._pending_move_settle = False
         self._pending_move_stabilization_s = 0.0
 
-
-
     def move_to_z_level(self, z_mm, blocking=True):
-        self._log.debug("moving z")
         self.stage.move_z_to(z_mm, blocking=blocking)
         self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
@@ -3052,7 +3085,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             while True:
                 try:
                     job_result: JobResult = out_queue.get_nowait()
-                    none_failed = none_failed and self._summarize_job_result(job_result)
+                    none_failed = self._summarize_job_result(job_result) and none_failed
                     had_results = True
                     if not drain_all:
                         break  # Only process one result per queue if not draining
@@ -3309,14 +3342,26 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     self._handle_barrier_result(br)
                 self._emit_postprocess_display(pr)
                 return pr.error is None
-            # Pre-acquisition routine warmup finished (non-fatal if it failed).
+            # CUDA warmup failures must stop capture; other failures can retry lazily.
             elif isinstance(job_result.result, PostprocessWarmupResult):
-                wr = job_result.result
-                if wr.ok:
-                    self._log.info(f"Postprocess routine warmup complete: {wr.label}")
-                else:
-                    self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
+                return self._handle_postprocess_warmup_result(job_result.result)
             return True
+
+    def _handle_postprocess_warmup_result(self, wr: PostprocessWarmupResult) -> bool:
+        getattr(self, "_postprocess_warmup_pending", set()).discard(wr.routine_key)
+        if wr.ok:
+            self._log.info(f"Postprocess routine warmup complete: {wr.label}")
+        elif wr.fatal:
+            self._log.error(
+                "Postprocess routine warmup failed for %s: %s. Aborting acquisition; "
+                "the CUDA worker must exit before retrying.", wr.label, wr.error,
+            )
+            self._acquisition_error_count += 1
+            self.request_abort_fn()
+            return False
+        else:
+            self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
+        return True
 
     def _handle_barrier_result(self, br: "BarrierResult") -> None:
         """Track an upload barrier: register its task_id (submitted) or account it
@@ -3354,7 +3399,18 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         the derived image flows through the same signal_new_image path as raw
         frames. Best-effort — display must never break the acquisition.
         """
+        from control.core.acquisition_preview import PreviewProcessed
+
         src = pr.source_capture_info
+        self.callbacks.signal_acquisition_preview(
+            PreviewProcessed(
+                (str(self.experiment_path), pr.time_point, str(pr.region_id), pr.fov),
+                pr.group_key,
+                pr.display_images,
+                pr.display_images_last or pr.display_images,
+                pr.error,
+            )
+        )
         if src is None or not pr.display_images:
             return
         import dataclasses
@@ -3362,10 +3418,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         from squid.config import CameraPixelFormat
 
         for out_key, image in pr.display_images.items():
-            # The live display shares one image size + integer dtype across all
-            # channels; a preview that doesn't match the current raw-frame size
-            # would thrash the viewer (re-init every frame). Skip mismatches —
-            # the output is still saved to its plate.
+            # Legacy live/mosaic paths require the raw frame's shape. Structured
+            # multichannel previews above support each output's native shape.
             if self._last_raw_display_shape is not None and image.shape[:2] != self._last_raw_display_shape:
                 self._log.debug(
                     "Skipping live display of %s: shape %s != live frame %s",
@@ -3477,8 +3531,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             return None
         expected = 0
         for s in group.input_states.values():
-            expected += s.frames_per_visit * (self.NZ if s.acquire_z_stack else 1)
-        ctx_meta = self._postprocess_ctx_meta(group)
+            expected += s.frames_per_visit * ((info.stack_z_size or self._region_nz(info.region_id)) if s.acquire_z_stack else 1)
+        ctx_meta = self._postprocess_ctx_meta(group, nz=info.stack_z_size or self._region_nz(info.region_id))
         output_specs = [
             {
                 "name": o.name,
@@ -3517,10 +3571,11 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         except Exception:
             return None
 
-    def _postprocess_ctx_meta(self, group) -> dict:
+    def _postprocess_ctx_meta(self, group, nz=None) -> dict:
         """Run geometry + per-group state metadata handed to a routine's context.
         Shared by the per-FOV job and the pre-acquisition warmup so their cache
         keys match (first FOV is then a cache hit)."""
+        nz = self.NZ if nz is None else nz
         state_meta = {}
         for name in group.input_states:
             _color, wl = self._channel_display_meta(name)
@@ -3529,21 +3584,83 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             "pixel_size_um": self._pixel_size_um,
             # self.deltaZ is the mechanical z step in MILLIMETRES (stage units);
             # convert to micrometres for the routine geometry.
-            "dz_um": (self.deltaZ * 1000.0) if self.NZ > 1 else None,
-            "nz": self.NZ,
+            "dz_um": (self.deltaZ * 1000.0) if nz > 1 else None,
+            "nz": nz,
             "nt": self.Nt,
             "state_meta": state_meta,
             "yx_shape": self._postprocess_frame_shape(),
         }
 
-    def _prewarm_postprocess_routines(self) -> None:
+    @staticmethod
+    def _background_preparation(fn, name):
+        future = Future()
+
+        def run():
+            try:
+                future.set_result(fn())
+            except Exception as exc:
+                future.set_exception(exc)
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+        return future
+
+    def _prepare_acquisition_once(self):
+        """Overlap compute/IPC with serialized hardware setup; join before AF."""
+        if getattr(self, "_startup_prepared", False) or self.abort_requested_fn():
+            return
+        try:
+            if self.validation_mode:
+                self._backpressure.reset()
+            else:
+                # Build metadata on the acquisition thread after camera seeding.
+                # Only pure postprocessing jobs execute concurrently with optics.
+                warmup = self._start_postprocess_warmup_once()
+                self._prewarm_observation_states()
+                for job_class, runner in self._job_runners:
+                    if self.abort_requested_fn():
+                        return
+                    if runner is not None and not runner.wait_ready(timeout_s=15.0):
+                        raise TimeoutError(f"Job runner for {job_class.__name__} did not become ready before autofocus")
+                self._wait_for_postprocess_warmup(warmup)
+                registration = getattr(self, "_upload_registration", None)
+                if registration is not None:
+                    self._log.info("Waiting for upload registration before autofocus")
+                    while not self.abort_requested_fn():
+                        try:
+                            registration.result(timeout=0.05)
+                            break
+                        except FutureTimeoutError:
+                            # A completed future can itself contain TimeoutError.
+                            if registration.done():
+                                raise
+                self._first_job_dispatched = True
+            if not self.abort_requested_fn():
+                self._startup_prepared = True
+        except Exception:
+            self.request_abort_fn()
+            raise
+
+    def _start_postprocess_warmup_once(self):
+        if not getattr(self, "_postprocess_warmup_started", False):
+            # Warmup jobs increment the same shared counters as image jobs.
+            # Reset before dispatch, never while those jobs are already pending.
+            self._backpressure.reset()
+            try:
+                self._postprocess_warmup = self._prewarm_postprocess_routines(wait=False)
+            except Exception:
+                self.request_abort_fn()
+                raise
+            self._postprocess_warmup_started = True
+        return self._postprocess_warmup
+
+    def _prewarm_postprocess_routines(self, *, wait=True):
         """Precompute FOV-shared routine state (e.g. transfer functions) BEFORE
         the first hardware trigger, so the first FOV's compute is a cache hit and
         never stalls saving/display or backpressures the run.
 
         Dispatches one PostprocessWarmupJob per distinct routine (deduped by
         routine identity) to the postprocess runner and waits for them (bounded).
-        A warmup failure is non-fatal — the routine falls back to lazy compute.
+        Non-CUDA warmup failures fall back to lazy compute. CUDA failures abort.
         """
         if not self._has_postprocess:
             return
@@ -3580,20 +3697,43 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 )
         if not jobs:
             return
+        self._postprocess_warmup_pending = {postprocess_routine_key(job.spec_dict) for job in jobs}
         self._log.info(f"Pre-computing {len(jobs)} postprocess routine(s) before acquisition...")
         if runner is None:
-            # No multiprocessing runner (e.g. USE_MULTIPROCESSING False): run inline.
+            # No multiprocessing runner: compute in a background thread while
+            # hardware setup continues; imaging only starts after the join.
+            runner = self._background_preparation(lambda: [job.run() for job in jobs], "Postprocess precomputation")
+        else:
+            # Queues exist at start(); dispatch can overlap subprocess startup.
             for job in jobs:
-                job.run()
+                if not runner.dispatch(job):
+                    raise RuntimeError("Could not dispatch postprocess warmup")
+        if wait:
+            self._wait_for_postprocess_warmup(runner)
+        return runner
+
+    def _wait_for_postprocess_warmup(self, runner):
+        if runner is None:
             return
-        # Make sure the subprocess is up before dispatching (bounded).
-        runner.wait_ready(timeout_s=15.0)
-        for job in jobs:
-            runner.dispatch(job)
+        if isinstance(runner, Future):
+            # Inline routines share the in-process cache, so finish before capture.
+            deadline = time.monotonic() + 180.0
+            while not self.abort_requested_fn():
+                try:
+                    for result in runner.result(timeout=0.05) or []:
+                        self._handle_postprocess_warmup_result(result)
+                    return
+                except FutureTimeoutError:
+                    if runner.done() or time.monotonic() >= deadline:
+                        raise
+            return
         # Wait for warmups to finish so the first FOV is a cache hit. Bounded so a
         # hung warmup can't wedge the run — on timeout we proceed (lazy compute).
         deadline = time.time() + 180.0
-        while runner.has_pending() and time.time() < deadline:
+        # The pending counter can reach zero before the multiprocessing queue's
+        # feeder delivers the result. Wait for the acknowledgement too, so a
+        # fatal warmup cannot be discovered only after capture has started.
+        while (runner.has_pending() or getattr(self, "_postprocess_warmup_pending", set())) and time.time() < deadline:
             if self.abort_requested_fn():
                 break
             self._summarize_runner_outputs()
@@ -3691,7 +3831,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             output_dir=output_dir,
             channel_names=channel_names,
             z_index=info.z_index,
-            total_z_levels=self.NZ,
+            total_z_levels=info.save_z_size or info.stack_z_size or self._region_nz(info.region_id),
             z_projection_mode=self._downsampled_z_projection,
             interpolation_method=self._downsampled_interpolation_method,
             skip_saving=self.skip_saving
@@ -3974,32 +4114,21 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # Reset backpressure counters at acquisition start
         # IMPORTANT: Must be before any camera triggers
         ordered_visit = getattr(self, "_ordered_visit", None)
-        prewarm = ordered_visit is None or not self._ordered_prewarmed
-        if prewarm:
-            self._backpressure.reset()
-
-        # Pre-warm every distinct observation state preset once BEFORE the
-        # FOV loop. Absorbs the first-call one-off costs (most notably the
-        # ~1 s GenICam SensorOperationMode write + Cap_Start that
-        # set_camera_mode pays the first time it actually switches modes)
-        # into a dedicated init timer instead of polluting the first FOV's
-        # per-capture stats. Amortizes to ~zero over long runs.
-        if not self.validation_mode and prewarm:
-            self._prewarm_observation_states()
-
-        # Precompute FOV-shared postprocessing state (e.g. transfer functions)
-        # before any hardware fires, so the first FOV's compute is a cache hit
-        # and never stalls the first save/display.
-        if not self.validation_mode and prewarm:
-            self._prewarm_postprocess_routines()
+        self._prepare_acquisition_once()
         if ordered_visit is not None:
             self._ordered_prewarmed = True
+
+        # Focus preparation is once per run and last, after both warmups.
+        self._initialize_acquisition_focus_once()
+        if self.abort_requested_fn():
+            return
 
         n_regions = len(self.scan_region_coords_mm)
 
         for region_index, (region_id, coordinates) in enumerate(self.scan_region_fov_coords_mm.items()):
             if ordered_visit is not None and region_id != self._ordered_position[0]:
                 continue
+            self._set_region_z_stack(region_id)
             self.callbacks.signal_overall_progress(
                 OverallProgressUpdate(
                     current_region=region_index + 1,
@@ -4222,9 +4351,43 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         )
         return True
 
-    def _captured_frames_per_fov(self, plan):
+    def _region_nz(self, region_id):
+        from control.models.region_z_stack import z_stack_count
+
+        bounds = getattr(self, "_region_z_ranges", {}).get(region_id)
+        return z_stack_count(*bounds, self.deltaZ) if bounds is not None else getattr(self, "_default_NZ", self.NZ)
+
+    def _region_reference_z_level(self, region_id):
+        nz = self._region_nz(region_id)
+        bounds = getattr(self, "_region_z_ranges", {}).get(region_id)
+        if bounds is not None and nz > 1:
+            coords = self.scan_region_fov_coords_mm[region_id]
+            reference = getattr(self, "_region_nominal_z", {}).get(
+                region_id, coords[0][2] if coords and len(coords[0]) > 2 else bounds[0]
+            )
+            start = bounds[1] if self.z_stacking_config == "FROM TOP" else bounds[0]
+            step = -abs(self.deltaZ) if self.z_stacking_config == "FROM TOP" else abs(self.deltaZ)
+            return max(0, min(nz - 1, int(round((reference - start) / step))))
+        return max(0, min(nz - 1, int(round((nz - 1) / 2)))) if self.z_stacking_config == "FROM CENTER" else 0
+
+    def _set_region_z_stack(self, region_id):
+        if not getattr(self, "_region_z_ranges", {}):
+            return
+        self.NZ = self._region_nz(region_id)
+        self._active_region_z_range = self._region_z_ranges.get(region_id)
+        self._active_region_reference = self._region_reference_z_level(region_id)
+        self.deltaZ = -abs(self.deltaZ) if self.z_stacking_config == "FROM TOP" else abs(self.deltaZ)
+        if self._active_region_z_range is None:
+            return
+        coords = self.scan_region_fov_coords_mm[region_id]
+        self._active_region_nominal_z = getattr(self, "_region_nominal_z", {}).get(
+            region_id, coords[0][2] if coords and len(coords[0]) > 2 else self._active_region_z_range[0]
+        )
+
+    def _captured_frames_per_fov(self, plan, nz=None):
+        nz = self.NZ if nz is None else nz
         return sum(
-            self.NZ if event.acquire_z_stack else 1
+            nz if event.acquire_z_stack else 1
             for event in plan.events if not (event.is_wait or event.is_stimulus)
         )
 
@@ -4240,6 +4403,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         return bool(ordinal % 2)
 
     def acquire_at_position(self, region_id, current_path, fov):
+        self._set_region_z_stack(region_id)
         # Autofocus once at the FOV's nominal plane to establish the focal
         # (reference) plane BEFORE the z-stack is positioned around it. The
         # stacking mode then decides whether that plane becomes the bottom,
@@ -4271,7 +4435,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self.af_fov_count += 1
             return
 
-        if self.NZ > 1:
+        if self.NZ > 1 or getattr(self, "_active_region_z_range", None) is not None:
             self.prepare_z_stack()
 
         if self.use_piezo:
@@ -4288,6 +4452,16 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         if not region_plan.events:
             raise ValueError("No observation states selected for acquisition.")
         frames_per_fov = self._captured_frames_per_fov(region_plan)
+        from control.core.acquisition_preview import PreviewStarted, PreviewCaptured
+
+        preview_key = (str(getattr(self, "experiment_path", "")), self.time_point, str(region_id), fov)
+        self.callbacks.signal_acquisition_preview(
+            PreviewStarted(
+                preview_key,
+                frames_per_fov,
+                tuple(region_plan.postprocess_groups) if not getattr(self, "skip_saving", False) else (),
+            )
+        )
         imaged_step = 0
         current_z_level = 0  # prepare_z_stack positions the canonical first plane
         recorded_z_levels = set()
@@ -4302,7 +4476,16 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             if self.abort_requested_fn():
                 break
             if z_level != current_z_level:
-                self.move_z_for_stack(z_level - current_z_level)
+                context = dict(timepoint=self.time_point, region=str(region_id), fov=fov,
+                               from_plane=current_z_level, to_plane=z_level, delta_z_mm=self.deltaZ)
+                record = getattr(getattr(self, "microcontroller", None), "record_diagnostic_event", None)
+                if record is not None:
+                    record("stack_z_move", **context)
+                try:
+                    self.move_z_for_stack(z_level - current_z_level)
+                except Exception:
+                    self._log.exception("Z stack move failed: %s", context)
+                    raise
                 current_z_level = z_level
             file_ID = f"{region_id}_{fov:0{FILE_ID_PADDING}}_{z_level:0{FILE_ID_PADDING}}"
 
@@ -4423,7 +4606,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self.handle_acquisition_abort(current_path)
                 break
 
-        if self.NZ > 1:
+        if self.NZ > 1 or getattr(self, "_active_region_z_range", None) is not None:
             self.move_z_back_after_stack(current_z_level)
 
         # Contrast-AF cadence counter: one increment per FOV visit, never per
@@ -4434,12 +4617,96 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # Increment FOV counter for Slack notification stats
         if ordered_visit is None or self._ordered_final_position:
             self._timepoint_fov_count += 1
+            if not self.abort_requested_fn():
+                self.callbacks.signal_acquisition_preview(PreviewCaptured(preview_key))
 
     def _select_config(self, config):
         """Apply an ObservationState to hardware before capture."""
         self.callbacks.signal_current_configuration(config)
         self.liveController.obs_controller.apply_full_observation_state(config)
         self.wait_till_operation_is_completed()
+
+    def _initialize_acquisition_focus_once(self):
+        """Run focus preparation after warmups, immediately before the FOV loop."""
+        if getattr(self, "_acquisition_focus_initialized", False) or self.abort_requested_fn():
+            return
+        prepare_focus = getattr(self, "_prepare_focus", None)
+        if prepare_focus is not None:
+            config = self.liveController.get_observation_state_by_name(MULTIPOINT_AUTOFOCUS_CHANNEL)
+            if config is None:
+                self.request_abort_fn()
+                raise RuntimeError(f"Missing contrast autofocus observation state {MULTIPOINT_AUTOFOCUS_CHANNEL!r}")
+            self._select_config(config)
+            try:
+                prepare_focus()
+            except Exception:
+                self.request_abort_fn()
+                raise
+        if self.do_reflection_af and self.laser_auto_focus_controller is not None:
+            # Preset warmup can change illumination. AF needs a clean reflection.
+            self.liveController.obs_controller.turn_off_illumination()
+            af = self.laser_auto_focus_controller
+            saved_timing = af._timing
+            af._timing = None
+            try:
+                if self._laser_af_refresh_every_n_fovs == 1:
+                    with self._timing.get_timer("laser_af_entry_initialization"):
+                        self._initialize_legacy_region_entries()
+                elif self._laser_af_seed_mode == "scan":
+                    with self._timing.get_timer("laser_af_seed_scan"):
+                        self._seed_fov_z_map()
+            except Exception:
+                self.request_abort_fn()
+                raise
+            finally:
+                af._timing = saved_timing
+        if not self.abort_requested_fn():
+            self._acquisition_focus_initialized = True
+
+    def _initialize_legacy_region_entries(self):
+        """Establish entry Z once, walking from each focused center to its first tile.
+
+        Keep the optical reference fixed. Only verified Z estimates are cached;
+        acquisition still measures every FOV. Coordinates are the finalized path,
+        so the first tile can lie in any corner. Only regions with a supplied
+        center Z get this preparation; others rely on normal acquisition AF.
+        """
+        centers = dict(zip(self.scan_region_names, self.scan_region_coords_mm))
+        for region_id, coords in self.scan_region_fov_coords_mm.items():
+            if self.abort_requested_fn():
+                return
+            if not coords:
+                continue
+            center = centers[region_id]
+            z = center[2] if len(center) > 2 else None
+            if z is None:
+                # Neither current stage Z nor a tile's Z establishes a focused
+                # region center. Leave these regions to normal per-FOV AF.
+                self._log.info("Skipping laser-AF entry walk for region %s: no supplied center Z", region_id)
+                continue
+            self._apply_region_laser_af_reference(region_id)
+            self.move_to_coordinate((center[0], center[1], z), region_id, -1)
+            if not self.laser_auto_focus_controller.move_to_target(0):
+                raise RuntimeError(f"Laser AF could not verify center of region {region_id}")
+            # Bound each axis step by the smallest grid spacing, capped at
+            # 0.5 mm for sparse or single-tile regions.
+            spacings = [0.5]
+            for axis in (0, 1):
+                values = sorted(set(c[axis] for c in coords))
+                spacings.extend(b - a for a, b in zip(values, values[1:]) if b - a > 1e-6)
+            step = min(spacings)
+            dx, dy = coords[0][0] - center[0], coords[0][1] - center[1]
+            count = int(np.ceil(max(abs(dx), abs(dy)) / step))
+            for i in range(1, count + 1):
+                if self.abort_requested_fn():
+                    return
+                target = (center[0] + dx * i / count, center[1] + dy * i / count,
+                          self.stage.get_pos().z_mm)
+                self.move_to_coordinate(target, region_id, -1)
+                if not self.laser_auto_focus_controller.move_to_target(0):
+                    raise RuntimeError(f"Laser AF entry initialization failed in region {region_id}, step {i}/{count}")
+            self._z_pos_proposal[(region_id, 0)] = self.stage.get_pos().z_mm
+            self._log.info(f"Initialized laser-AF entry for region {region_id} at {coords[0][:2]}")
 
     def _seed_fov_z_map(self):
         """Visit every (region, fov) and record its absolute Z via laser AF.
@@ -4930,7 +5197,10 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             # static seed values — but re-parameterizing them against the live
             # anchor keeps both the fallback path and `move_to_coordinate`'s
             # non-blocking Z pre-move consistent.
-            self._recompute_region_proposals(region_id, anchor_fov=fov)
+            if self._laser_af_refresh_every_n_fovs == 1:
+                self._z_pos_proposal[(region_id, fov)] = measured_z
+            else:
+                self._recompute_region_proposals(region_id, anchor_fov=fov)
             self._last_af_status = "ok"
             return True
 
@@ -5057,7 +5327,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 snapshot, snapshot_error, restore_error = None, None, None
                 if fatal_error is not None:
                     snapshot_error = f"Snapshot skipped after fatal AF error: {fatal_error}"
-                elif operations:
+                elif operations and self.validation_mode:
                     try:
                         snapshot = controller.capture_validation_frame()
                         if snapshot is None:
@@ -5133,6 +5403,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         prepare_z_stack): the first acquired plane (z_level 0) for From Bottom and
         From Top, and the middle plane for From Center. Clamped to [0, NZ-1].
         """
+        if getattr(self, "_active_region_z_range", None) is not None:
+            return self._active_region_reference
         if self.NZ <= 1:
             return 0
         if self.z_stacking_config == "FROM CENTER":
@@ -5140,6 +5412,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         return 0
 
     def prepare_z_stack(self):
+        bounds = getattr(self, "_active_region_z_range", None)
+        if bounds is not None:
+            # Preserve the nominal/AF-corrected position independently of stack limits.
+            self._stack_reference_z_mm = self.stage.get_pos().z_mm
+            self._stack_reference_piezo_um = self.piezo.position if self.use_piezo else None
+            start = bounds[1] if self.z_stacking_config == "FROM TOP" else bounds[0]
+            # Carry the AF/focus-map correction into the region's stack offsets.
+            start += self._stack_reference_z_mm - self._active_region_nominal_z
+            self.stage.move_z_to(start)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+            return
         # Position the stage at the START slice of the stack, relative to the
         # focal plane established by _autofocus_and_record (which already ran).
         # FROM CENTER: step down half the stack so the AF plane is the center.
@@ -5233,7 +5516,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self._capture_ts["ic_event_set"] = time.perf_counter()
         try:
             with self._timing.get_timer("_image_callback"):
-                self._log.debug(f"In Image callback for frame_id={camera_frame.frame_id}")
                 if not info:
                     self._log.error("In image callback, no current capture info! Something is wrong. Aborting.")
                     self.request_abort_fn()
@@ -5281,9 +5563,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                                 return
                         else:
                             try:
-                                # NOTE(imo): We don't have any way of people using results, so for now just
-                                # grab and ignore it.
                                 result = job.run()
+                                if isinstance(result, PostprocessResult):
+                                    self._emit_postprocess_display(result)
                             except Exception:
                                 self._log.exception("Failed to execute job, abandoning acquisition!")
                                 self.request_abort_fn()
@@ -5302,6 +5584,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     # so a postprocess output preview is only safe to display when
                     # it matches this (see _emit_postprocess_display).
                     self._last_raw_display_shape = image.shape[:2]
+                    from control.core.acquisition_preview import PreviewFrame, position_key
+
+                    self.callbacks.signal_acquisition_preview(
+                        PreviewFrame(
+                            position_key(info),
+                            info.observation_state.name,
+                            image,
+                            info.z_index,
+                            info.save_z_size or info.stack_z_size or 1,
+                        )
+                    )
                     self.callbacks.signal_new_image(camera_frame, info)
 
         finally:
@@ -5396,14 +5689,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 self.request_abort_fn()
                 return
 
+        self._report_pipeline_health()
         # Backpressure check AFTER previous frame dispatched, BEFORE next trigger
         # This is when we know the previous image's jobs have been dispatched (and counters incremented)
         if self._backpressure.should_throttle():
+            self._report_pipeline_health("throttle")
             with self._timing.get_timer("backpressure.wait_for_capacity"):
                 got_capacity = self._backpressure.wait_for_capacity()
+                self._report_pipeline_health("throttle_released" if got_capacity else "throttle_timeout")
                 if not got_capacity:
                     self._log.error(
-                        f"Backpressure timeout - disk I/O cannot keep up. Stats: {self._backpressure.get_stats()}"
+                        f"Backpressure timeout - processing/writing cannot keep up. Stats: {self._backpressure.get_stats()}"
                     )
 
         # The prior-frame `_ready_for_next_trigger.wait` above already guarantees
@@ -5438,6 +5734,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 save_t_size=(save_layout.t_size if save_layout else None),
                 save_c_size=(save_layout.c_size if save_layout else None),
                 save_z_size=(save_layout.z_size if save_layout else None),
+                stack_z_size=self.NZ,
                 cycle_event_index=(save_layout.cycle_event_index if save_layout else None),
                 state_frame_index=(save_layout.state_frame_index if save_layout else state_frame_index),
                 frame_suffix=(save_layout.frame_suffix if save_layout else None),
@@ -5515,8 +5812,6 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         try:
             with self._timing.get_timer("exposure_time_done_sleep_hw or wait_for_image_sw"):
                 if self.liveController.trigger_mode == TriggerMode.HARDWARE:
-                    # Per-capture, so keep at debug to avoid log-format overhead on the hot path.
-                    self._log.debug("Waiting %.3f [s] for exposure to complete", self.camera.get_total_frame_time() / 1e3)
                     exposure_done_time = time.time() + self.camera.get_total_frame_time() / 1e3
                     # Even though we can do overlapping triggers, we want to make sure that we don't move before our exposure
                     # is done.  So we still need to at least sleep for the total frame time corresponding to this exposure.
@@ -5633,6 +5928,17 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
         self._wait_for_outstanding_callback_images()
 
+    def _report_pipeline_health(self, reason="periodic"):
+        # Observations must never interrupt capture or change throttle decisions.
+        try:
+            from control.core.pipeline_diagnostics import PipelineReporter
+            reporter = getattr(self, "_pipeline_reporter", None)
+            if reporter is None:
+                reporter = self._pipeline_reporter = PipelineReporter(self._log, str(self.experiment_path))
+            reporter.report(self._job_runners, reason)
+        except Exception:
+            self._log.exception("[PIPELINE] Could not report worker diagnostics")
+
     def move_z_for_stack(self, steps=1):
         if self.use_piezo:
             self.z_piezo_um += self.deltaZ * 1000 * steps
@@ -5646,6 +5952,13 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
 
     def move_z_back_after_stack(self, z_level=None):
+        if getattr(self, "_active_region_z_range", None) is not None:
+            if self.use_piezo:
+                self.piezo.move_to(self._stack_reference_piezo_um)
+                self.z_piezo_um = self._stack_reference_piezo_um
+            self.stage.move_z_to(self._stack_reference_z_mm)
+            self._sleep(SCAN_STABILIZATION_TIME_MS_Z / 1000)
+            return
         if z_level is None:
             z_level = self.NZ - 1
         if self.use_piezo:

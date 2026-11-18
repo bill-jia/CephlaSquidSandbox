@@ -9,12 +9,29 @@
 // Version is sent in response byte 22 as nibble-encoded: high nibble = major, low nibble = minor
 // Version 1.0 = first version with multi-port illumination support
 // Version 1.1 = serial watchdog for illumination auto-shutoff
+// Version 1.2 = CMD_EXECUTION_ERROR reported on failed moves + MOVETO_W2 command
+// Version 1.3 = strobe ISR latches illumination source at start (race fix when
+//               channel switched during live HW-triggered acquisition)
+// Version 1.4 = filter-wheel (W/W2) home resets xmin/xmax to full range (rotary
+//               axis has no travel end-stop); fixes intermittent post-home
+//               MOVETO_W CMD_EXECUTION_ERROR (home left xmin = L - C > offset)
+// Version 1.5 = TMC2240 stepper driver support: each axis's power stage is
+//               identified at init (TMC2660 or TMC2240) behind a driver seam in
+//               src/tmc/drivers/, so one image serves both board populations.
+//               An axis whose driver could not be identified is left
+//               unconfigured and rejects moves. No protocol change: command
+//               codes, packet layout and the host contract are untouched
 #define FIRMWARE_VERSION_MAJOR 1
-#define FIRMWARE_VERSION_MINOR 1
+#define FIRMWARE_VERSION_MINOR 5
+// 1.5.1: passive paged diagnostics in status bytes 19..21. Byte 22 retains
+// major/minor compatibility; the patch is advertised in telemetry page 0.
+// Telemetry schema 2 reports timing maxima per snapshot interval.
+#define FIRMWARE_VERSION_PATCH 1
+#define FIRMWARE_VERSION_STRING "1.5.1"
 
 #include "def/def_v1.h"
 
-#include "tmc/TMC4361A_TMC2660_Utils.h"
+#include "tmc/TMC4361A_Utils.h"
 
 // default axes, such as X,Y,Z
 #define STAGE_AXES 3

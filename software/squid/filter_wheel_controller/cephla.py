@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Union
 
 import squid.logging
 from control._def import *
-from control.microcontroller import Microcontroller
+from control.microcontroller import CommandAborted, Microcontroller
 from squid.abc import AbstractFilterWheelController, FilterWheelInfo
 from squid.config import SquidFilterWheelConfig
 
@@ -42,6 +42,22 @@ class SquidFilterWheel(AbstractFilterWheelController):
 
         self.microcontroller = microcontroller
 
+        # Fail loudly on a host/firmware version mismatch before any moves
+        # are issued — runs unconditionally (including the skip_init restart
+        # path) because firmware could have been re-flashed between launches.
+        fw = self.microcontroller.firmware_version
+        _log.info(f"SquidFilterWheel.__init__: firmware v{fw[0]}.{fw[1]}, skip_init={skip_init}")
+        if fw < self._MIN_FIRMWARE_VERSION:
+            min_major, min_minor = self._MIN_FIRMWARE_VERSION
+            raise RuntimeError(
+                f"SquidFilterWheel requires firmware >= v{min_major}.{min_minor} "
+                f"(got v{fw[0]}.{fw[1]}). Older firmware does not anchor the "
+                f"filter-wheel driver position to 0 after homing, so absolute "
+                f"MOVETO targets would land at the wrong slot; the W2 MOVETO "
+                f"command also does not exist on older firmware. Re-flash "
+                f"firmware from firmware/controller."
+            )
+
         # Convert single config to dict format for uniform handling
         if isinstance(configs, SquidFilterWheelConfig):
             self._configs: Dict[int, SquidFilterWheelConfig] = {1: configs}
@@ -50,6 +66,13 @@ class SquidFilterWheel(AbstractFilterWheelController):
 
         # Track per-wheel positions (wheel_id -> position index)
         self._positions: Dict[int, int] = {}
+        self._unknown_positions = set()
+
+        for wheel_id, config in self._configs.items():
+            _log.info(
+                f"Filter wheel {wheel_id}: motor_slot={config.motor_slot_index}, "
+                f"range=[{config.min_index},{config.max_index}], offset={config.offset}mm"
+            )
 
         if not skip_init:
             # Configure each wheel
@@ -61,6 +84,10 @@ class SquidFilterWheel(AbstractFilterWheelController):
             # Just initialize position tracking without hardware init
             for wheel_id, config in self._configs.items():
                 self._positions[wheel_id] = config.min_index
+            _log.warning(
+                f"skip_init=True: assuming all wheels at min_index without homing — "
+                f"tracked positions may not match physical state"
+            )
 
         self._available_filter_wheels: List[int] = []
 
@@ -70,6 +97,23 @@ class SquidFilterWheel(AbstractFilterWheelController):
     # The protocol_axis_to_internal() function in firmware handles this conversion.
     _MOTOR_SLOT_TO_AXIS = {3: AXIS.W, 4: AXIS.W2}
 
+    # Map motor_slot_index to the Microcontroller method names that drive
+    # that axis. Keeps the slot→method dispatch in one place instead of
+    # branching `if motor_slot == 3 / == 4` at every call site.
+    _MOTOR_SLOT_MCU_METHODS = {
+        3: {"home": "home_w", "move_to_usteps": "move_w_to_usteps"},
+        4: {"home": "home_w2", "move_to_usteps": "move_w2_to_usteps"},
+    }
+
+    _RECOVERABLE_MOVE_ERRORS = (TimeoutError, CommandAborted)
+
+    # Minimum firmware that anchors the W/W2 driver position to 0 at home
+    # (finalize_homing_w/_w2) and reports CMD_EXECUTION_ERROR on failed
+    # moves. Sending MOVETO_W against older firmware would target the
+    # wrong absolute slot because X_ACTUAL would still be at the
+    # limit-switch latch value.
+    _MIN_FIRMWARE_VERSION = (1, 2)
+
     def _configure_wheel(self, wheel_id: int, config: SquidFilterWheelConfig):
         """Configure a single filter wheel motor."""
         motor_slot = config.motor_slot_index
@@ -78,9 +122,9 @@ class SquidFilterWheel(AbstractFilterWheelController):
             raise ValueError(f"Unsupported motor_slot_index: {motor_slot}. Expected 3 (W) or 4 (W2).")
 
         self.microcontroller.init_filter_wheel(axis)
-        time.sleep(0.5)
+        self.microcontroller.wait_till_operation_is_completed()
         self.microcontroller.configure_squidfilter(axis)
-        time.sleep(0.5)
+        self.microcontroller.wait_till_operation_is_completed()
 
         # Common PID setup for both wheels (they share identical encoder settings)
         # Use protocol axis (AXIS.W / AXIS.W2), not motor_slot index (3 / 4),
@@ -89,6 +133,68 @@ class SquidFilterWheel(AbstractFilterWheelController):
             self.microcontroller.set_pid_arguments(axis, PID_P_W, PID_I_W, PID_D_W)
             self.microcontroller.configure_stage_pid(axis, config.transitions_per_revolution, ENCODER_FLIP_DIR_W)
             self.microcontroller.turn_on_stage_pid(axis, ENABLE_PID_W)
+
+    @staticmethod
+    def _delta_to_usteps(delta_mm: float) -> int:
+        """Microsteps the firmware will be commanded to step for `delta_mm` mm.
+
+        Includes STAGE_MOVEMENT_SIGN_W so the result already accounts for
+        which direction the motor needs to drive to advance through slots.
+        """
+        return int(
+            STAGE_MOVEMENT_SIGN_W * delta_mm / (SCREW_PITCH_W_MM / (MICROSTEPPING_DEFAULT_W * FULLSTEPS_PER_REV_W))
+        )
+
+    @staticmethod
+    def _target_pos_to_usteps(config: SquidFilterWheelConfig, target_pos: int) -> int:
+        """Absolute target microstep address for a given slot index.
+
+        Assumes the firmware anchors X_ACTUAL to 0 at the home reference
+        (see finalize_homing_w / finalize_homing_w2 in firmware).
+        """
+        step_size_mm = SCREW_PITCH_W_MM / (config.max_index - config.min_index + 1)
+        target_mm_from_home = config.offset + (target_pos - config.min_index) * step_size_mm
+        return SquidFilterWheel._delta_to_usteps(target_mm_from_home)
+
+    def _mcu_method(self, wheel_id: int, action: str):
+        """Resolve the Microcontroller method for `action` on this wheel's axis."""
+        motor_slot = self._configs[wheel_id].motor_slot_index
+        methods = self._MOTOR_SLOT_MCU_METHODS.get(motor_slot)
+        if methods is None:
+            raise ValueError(f"Unsupported motor_slot_index: {motor_slot}. Expected 3 (W) or 4 (W2).")
+        return getattr(self.microcontroller, methods[action])
+
+    def _move_to_usteps(self, wheel_id: int, usteps: int):
+        """Dispatch an absolute MOVETO_W / MOVETO_W2 by motor_slot_index."""
+        self._mcu_method(wheel_id, "move_to_usteps")(usteps)
+
+    def _move_to_usteps_with_resend(self, wheel_id: int, usteps: int):
+        """Issue an absolute MOVETO and wait; on a *recoverable* CommandAborted,
+        ack and resend the identical MOVETO once.
+
+        Only a recoverable abort (firmware-reported CMD_EXECUTION_ERROR) is
+        resent: it means the firmware rejected the move before the motor moved
+        (e.g. tmc4361A_moveTo returned non-zero, or the move arrived before
+        INITFILTERWHEEL), so resending the same absolute target is safe and
+        avoids the ~4 s re-home cost. A non-recoverable abort (ack timeout /
+        checksum failure after retries) leaves the motor state uncertain and is
+        re-raised — as is a TimeoutError and a failed resend — so the caller
+        decides whether to re-home. The pending abort is acknowledged before
+        the resend so the next send_command doesn't log a spurious "not cleared
+        before new command sent" warning.
+        """
+        try:
+            self._move_to_usteps(wheel_id, usteps)
+            self.microcontroller.wait_till_operation_is_completed()
+            return
+        except CommandAborted as e:
+            if not e.recoverable:
+                raise
+            _log.warning(f"Filter wheel {wheel_id} move aborted ({e}); resending in software...")
+            self.microcontroller.acknowledge_aborted_command()
+        self._move_to_usteps(wheel_id, usteps)
+        self.microcontroller.wait_till_operation_is_completed()
+        _log.info(f"Filter wheel {wheel_id} software resend succeeded")
 
     def _move_wheel(self, wheel_id: int, delta: float):
         """Move a specific wheel by delta distance.
@@ -109,80 +215,110 @@ class SquidFilterWheel(AbstractFilterWheelController):
             self.microcontroller.move_w2_usteps(usteps)
         else:
             raise ValueError(f"Unsupported motor_slot_index: {motor_slot}")
+        # Legacy relative moves do not establish a slot index.
+        self._unknown_positions.add(wheel_id)
 
     def _move_to_position(self, wheel_id: int, target_pos: int):
-        """Move wheel to target position with automatic re-home on failure.
+        """Move wheel to target position using absolute MOVETO; recover on failure.
 
-        If the movement times out (e.g., motor stall), this method will:
-        1. Log a warning
-        2. Re-home the wheel to re-synchronize position tracking
-        3. Retry the movement to the target position
-        4. Raise an exception if retry also fails
+        Recovery is conditioned on failure type, because the absolute-move
+        approach already self-corrects on the next *successful* command —
+        the goal here is just to make sure that next command actually goes
+        out, with the right re-home cost.
 
-        Args:
-            wheel_id: The ID of the wheel to move.
-            target_pos: The target position index.
+        - CommandAborted (CMD_EXECUTION_ERROR): firmware rejected the move
+          before the motor moved (e.g. tmc4361A_moveTo returned non-zero
+          or move arrived before INITFILTERWHEEL). The motor didn't move;
+          a plain resend is safe and avoids the ~4 s re-home cost.
+        - TimeoutError (ack never arrived): motor state is uncertain (could
+          be partially moved). Re-home to re-anchor the coordinate frame,
+          then retry to the same absolute target.
 
         Raises:
-            TimeoutError: If both the initial move and retry after re-home fail.
+            TimeoutError or CommandAborted: If all attempts fail.
         """
         config = self._configs[wheel_id]
+        if wheel_id in self._unknown_positions:
+            self._home_wheel(wheel_id)
         current_pos = self._positions[wheel_id]
 
         if target_pos == current_pos:
             return
 
-        step_size = SCREW_PITCH_W_MM / (config.max_index - config.min_index + 1)
-        delta = (target_pos - current_pos) * step_size
+        target_usteps = self._target_pos_to_usteps(config, target_pos)
+        _log.info(f"Filter wheel {wheel_id}: {current_pos} -> {target_pos} (usteps={target_usteps})")
 
         try:
-            self._move_wheel(wheel_id, delta)
+            self._move_to_usteps_with_resend(wheel_id, target_usteps)
+            self._positions[wheel_id] = target_pos
+            return
+        except self._RECOVERABLE_MOVE_ERRORS as e:
+            # CMD_EXECUTION_ERROR survived a resend, or the ack never arrived
+            # (motor state uncertain) — re-home to re-anchor the coordinate
+            # frame, then retry to the same absolute target.
+            _log.warning(f"Filter wheel {wheel_id} move failed ({e}); re-homing to re-sync...")
+
+        # Clear any pending abort (set when wait_till_operation_is_completed
+        # raised CommandAborted) so the home command's send_command doesn't
+        # log a spurious "not cleared before new command sent" warning.
+        if self.microcontroller.last_command_aborted_error is not None:
+            self.microcontroller.acknowledge_aborted_command()
+        self._home_wheel(wheel_id)
+        try:
+            self._move_to_usteps(wheel_id, target_usteps)
             self.microcontroller.wait_till_operation_is_completed()
             self._positions[wheel_id] = target_pos
-        except TimeoutError:
-            _log.warning(f"Filter wheel {wheel_id} movement timed out. " f"Re-homing to re-sync position tracking...")
-            # Re-home to re-synchronize position tracking
-            self._home_wheel(wheel_id)
-
-            # Retry the movement (position is now at min_index after homing)
-            current_pos = self._positions[wheel_id]
-            delta = (target_pos - current_pos) * step_size
-            try:
-                self._move_wheel(wheel_id, delta)
-                self.microcontroller.wait_till_operation_is_completed()
-                self._positions[wheel_id] = target_pos
-                _log.info(f"Filter wheel {wheel_id} recovery successful, now at position {target_pos}")
-            except TimeoutError:
-                _log.error(
-                    f"Filter wheel {wheel_id} movement failed even after re-home. " f"Hardware may need attention."
-                )
-                raise
+            _log.info(f"Filter wheel {wheel_id} recovery via re-home succeeded, now at position {target_pos}")
+        except self._RECOVERABLE_MOVE_ERRORS:
+            self._unknown_positions.add(wheel_id)
+            _log.error(f"Filter wheel {wheel_id} movement failed even after re-home. Hardware may need attention.")
+            raise
 
     def _home_wheel(self, wheel_id: int):
-        """Home a specific wheel.
+        """Home a wheel, then drive to its first slot (config.min_index) absolutely.
 
-        Args:
-            wheel_id: The ID of the wheel to home.
+        The firmware anchors the driver's X_ACTUAL counter to 0 at the
+        home reference, so the host can target absolute slot positions
+        as `slot_index * usteps_per_slot + offset_usteps` thereafter.
+
+        On failure, `_positions[wheel_id]` is *not* updated and may now be
+        stale relative to physical hardware — callers should treat the
+        wheel's position as unknown until a successful home completes.
         """
         config = self._configs[wheel_id]
-        motor_slot = config.motor_slot_index
+        _log.info(f"Homing filter wheel {wheel_id} (prev tracked={self._positions.get(wheel_id)})")
+        self._unknown_positions.add(wheel_id)
+        home_start = time.monotonic()
 
-        if motor_slot == 3:
-            self.microcontroller.home_w()
-        elif motor_slot == 4:
-            self.microcontroller.home_w2()
-        else:
-            raise ValueError(f"Unsupported motor_slot_index: {motor_slot}")
+        try:
+            self._mcu_method(wheel_id, "home")()
+            self.microcontroller.wait_till_operation_is_completed(15)
+        except Exception:
+            _log.error(
+                f"Filter wheel {wheel_id} home command failed; physical "
+                f"position is unknown and tracked position may be stale."
+            )
+            raise
 
-        # Wait for homing to complete (needs longer timeout)
-        self.microcontroller.wait_till_operation_is_completed(15)
+        # The post-home offset move is subject to the same recoverable
+        # CMD_EXECUTION_ERROR as any slot move, so resend once on abort (see
+        # _move_to_usteps_with_resend). Re-homing is not a recovery option
+        # here — we are already inside the home path — so a failed resend or
+        # any other error propagates. Homing runs uncaught during startup, so
+        # without this resend a single transient abort would crash launch.
+        try:
+            self._move_to_usteps_with_resend(wheel_id, self._delta_to_usteps(config.offset))
+        except Exception:
+            _log.error(
+                f"Filter wheel {wheel_id} home succeeded but offset move failed; "
+                f"wheel is at the home reference, not slot {config.min_index}. "
+                f"Tracked position not updated."
+            )
+            raise
 
-        # Move to offset position
-        self._move_wheel(wheel_id, config.offset)
-        self.microcontroller.wait_till_operation_is_completed()
-
-        # Reset position tracking
         self._positions[wheel_id] = config.min_index
+        self._unknown_positions.discard(wheel_id)
+        _log.info(f"Filter wheel {wheel_id} homed in {time.monotonic() - home_start:.2f}s")
 
     def initialize(self, filter_wheel_indices: List[int]):
         """Initialize the filter wheel controller with the given wheel indices.
@@ -290,6 +426,8 @@ class SquidFilterWheel(AbstractFilterWheelController):
         Returns:
             Dict mapping wheel_id -> current position.
         """
+        if self._unknown_positions:
+            raise RuntimeError(f"Filter wheel position unknown; re-home wheels {sorted(self._unknown_positions)}")
         return dict(self._positions)
 
     def set_delay_offset_ms(self, delay_offset_ms: float):
@@ -312,7 +450,6 @@ class SquidFilterWheel(AbstractFilterWheelController):
         """Close the filter wheel controller (no-op for SQUID)."""
         pass
 
-    # Backward compatibility methods
+    # Backward compatibility for callers issuing relative wheel moves.
     def move_w(self, delta: float):
-        """Move the first wheel by delta. For backward compatibility."""
         self._move_wheel(1, delta)

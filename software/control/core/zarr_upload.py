@@ -31,9 +31,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import squid.logging
+from control.core.pipeline_diagnostics import elapsed
 
 
 # Block size for streaming copy + hash. 4 MiB balances syscall overhead against
@@ -245,6 +247,21 @@ def _stream_copy_with_hash(
     return h.hexdigest(), bytes_written
 
 
+@lru_cache(maxsize=128)
+def _remote_temp_candidates(remote_dir: str, scan_epoch: int) -> Tuple[str, ...]:
+    """Snapshot possible orphan names once per directory/hour in each worker.
+
+    Listing an SMB directory containing thousands of shards can take a minute.
+    Keep only temporary names, and let callers check their own destination's
+    prefix and age. The hourly epoch refreshes the best-effort snapshot without
+    scanning the directory for every shard. The bounded cache limits memory.
+    """
+    try:
+        return tuple(name for name in os.listdir(remote_dir) if ".part-" in name)
+    except OSError:
+        return ()
+
+
 def upload_one_file(
     local_path: str,
     remote_path: str,
@@ -255,6 +272,7 @@ def upload_one_file(
     stable_read: bool = False,
     verify_readback: bool = UPLOAD_VERIFY_READBACK,
     heartbeat: Optional[Callable[[int], None]] = None,
+    timings: Optional[dict] = None,
 ) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
     """Copy ``local_path`` to ``remote_path`` with retry, sha256 verification,
     and atomic rename.
@@ -285,8 +303,9 @@ def upload_one_file(
     ``sha256_hex`` and ``bytes_written`` are ``None``; ``error`` carries the
     last exception's string for the manifest/log.
     """
-    if not os.path.exists(local_path):
-        return False, None, None, f"source missing: {local_path}"
+    with elapsed(timings, "source_check"):
+        if not os.path.exists(local_path):
+            return False, None, None, f"source missing: {local_path}"
 
     remote_dir = os.path.dirname(remote_path)
     # Unique temp name per call: two concurrent uploads of the SAME remote
@@ -301,36 +320,40 @@ def upload_one_file(
     # same destination. Age-gated at 24h since last modification: generous
     # enough that server/client clock skew (or a slow concurrent uploader of
     # the same file) can never make a LIVE temp look stale, while orphans
-    # still get reclaimed the next time the file is uploaded. One listdir per
-    # upload is noise next to the copy + read-back.
+    # still get reclaimed when this destination is uploaded. Reuse a directory
+    # snapshot across uploads: repeated SMB enumeration can dwarf copy time.
     stale_prefix = os.path.basename(remote_path) + ".part-"
-    try:
-        for entry in os.listdir(remote_dir):
-            if entry.startswith(stale_prefix):
-                stale = os.path.join(remote_dir, entry)
-                try:
-                    if time.time() - os.path.getmtime(stale) > 24 * 3600.0:
-                        os.remove(stale)
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    with elapsed(timings, "remote_temp_cleanup"):
+        try:
+            for entry in _remote_temp_candidates(remote_dir, int(time.monotonic() // 3600)):
+                if entry.startswith(stale_prefix):
+                    stale = os.path.join(remote_dir, entry)
+                    try:
+                        if time.time() - os.path.getmtime(stale) > 24 * 3600.0:
+                            os.remove(stale)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     last_error: Optional[str] = None
     for attempt in range(max_attempts):
         try:
             if remote_dir:
-                os.makedirs(remote_dir, exist_ok=True)
+                with elapsed(timings, "remote_mkdir"):
+                    os.makedirs(remote_dir, exist_ok=True)
         except OSError as e:
             last_error = f"mkdir {remote_dir}: {e}"
             log.warning(last_error)
         else:
             try:
-                src_hash, n_bytes = _stream_copy_with_hash(
-                    local_path, part_path, heartbeat=heartbeat
-                )
+                with elapsed(timings, "copy_and_source_hash"):
+                    src_hash, n_bytes = _stream_copy_with_hash(
+                        local_path, part_path, heartbeat=heartbeat
+                    )
                 if stable_read:
-                    src_hash_post = _sha256_of_file(local_path, heartbeat=heartbeat)
+                    with elapsed(timings, "source_recheck"):
+                        src_hash_post = _sha256_of_file(local_path, heartbeat=heartbeat)
                     if src_hash_post != src_hash:
                         last_error = (
                             f"source changed during copy "
@@ -343,7 +366,8 @@ def upload_one_file(
                         # Fall through to retry/backoff path.
                         if attempt < max_attempts - 1:
                             wait = initial_backoff_s * (2 ** attempt)
-                            time.sleep(wait)
+                            with elapsed(timings, "retry_backoff"):
+                                time.sleep(wait)
                         continue
                 if verify_readback:
                     # Read the bytes back off the remote and hash them. There is
@@ -351,7 +375,8 @@ def upload_one_file(
                     # verification means reading the stored file back down — the
                     # cost is hidden by running this lane concurrently with other
                     # files' uploads on the full-duplex link, not by skipping it.
-                    dest_hash = _sha256_of_file(part_path, heartbeat=heartbeat)
+                    with elapsed(timings, "remote_readback_hash"):
+                        dest_hash = _sha256_of_file(part_path, heartbeat=heartbeat)
                     verified = src_hash == dest_hash
                     mismatch_err = (
                         f"sha256 mismatch after copy: src={src_hash} dest={dest_hash}"
@@ -360,7 +385,8 @@ def upload_one_file(
                     # Weaker guarantee: trust the source hash + the write, confirm
                     # only that the remote size matches. Catches truncation/short
                     # writes, not silent corruption. Off by default.
-                    dest_size = os.path.getsize(part_path)
+                    with elapsed(timings, "remote_size_check"):
+                        dest_size = os.path.getsize(part_path)
                     verified = dest_size == n_bytes
                     mismatch_err = (
                         f"size mismatch after copy: src={n_bytes} dest={dest_size}"
@@ -370,7 +396,8 @@ def upload_one_file(
                     log.warning(f"{last_error} ({local_path} -> {remote_path})")
                 else:
                     # Atomic on Windows and POSIX. SMB honors rename on the same share.
-                    os.replace(part_path, remote_path)
+                    with elapsed(timings, "remote_rename"):
+                        os.replace(part_path, remote_path)
                     return True, src_hash, n_bytes, None
             except OSError as e:
                 last_error = f"{type(e).__name__}: {e}"
@@ -381,7 +408,8 @@ def upload_one_file(
 
         if attempt < max_attempts - 1:
             wait = initial_backoff_s * (2 ** attempt)
-            time.sleep(wait)
+            with elapsed(timings, "retry_backoff"):
+                time.sleep(wait)
 
     # Best-effort: don't leave our own temp file behind on final failure.
     try:

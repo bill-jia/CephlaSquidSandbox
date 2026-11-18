@@ -76,6 +76,10 @@ class CephlaStage(AbstractStage):
         # canonical rel_mm to raw first.
         rel_mm_raw = self._config.Z_AXIS.canonical_to_raw_delta(rel_mm)
         need_clear_backlash = rel_mm_raw < 0
+        record = getattr(self._microcontroller, "record_diagnostic_event", None)
+        if record is not None:
+            record("z_move", requested_mm=rel_mm, raw_mm=rel_mm_raw, blocking=blocking,
+                   backlash=blocking and need_clear_backlash, axis_config=repr(self._config.Z_AXIS))
 
         # NOTE(imo): It seems really tricky to only clear backlash if via the blocking call?
         final_rel_move_raw_mm = rel_mm_raw
@@ -89,13 +93,18 @@ class CephlaStage(AbstractStage):
             rel_move_with_backlash_offset_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(
                 rel_move_with_backlash_offset_mm
             )
+            if record is not None:
+                record("z_submove", phase="backlash_overshoot", usteps=rel_move_with_backlash_offset_usteps)
             self._microcontroller.move_z_usteps(rel_move_with_backlash_offset_usteps)
             if blocking:
                 self._microcontroller.wait_till_operation_is_completed(
                     self._calc_move_timeout(rel_move_with_backlash_offset_mm, self.get_config().Z_AXIS.MAX_SPEED)
                 )
 
-        self._microcontroller.move_z_usteps(self._config.Z_AXIS.convert_real_units_to_ustep(final_rel_move_raw_mm))
+        final_usteps = self._config.Z_AXIS.convert_real_units_to_ustep(final_rel_move_raw_mm)
+        if record is not None:
+            record("z_submove", phase="final", usteps=final_usteps)
+        self._microcontroller.move_z_usteps(final_usteps)
         if blocking:
             self._microcontroller.wait_till_operation_is_completed(
                 self._calc_move_timeout(final_rel_move_raw_mm, self.get_config().Z_AXIS.MAX_SPEED)

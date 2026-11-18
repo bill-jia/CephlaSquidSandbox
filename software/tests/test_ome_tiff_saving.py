@@ -656,6 +656,110 @@ def test_region_fov_count_falls_back_to_the_frame() -> None:
     assert ome_tiff_writer.region_fov_count(acquisition_info, info) == 7
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sparse allocation")
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32])
+def test_sparse_timelapse_allocation_and_memmap_roundtrip(tmp_path, dtype) -> None:
+    """Full-size timelapses leave holes, including beyond 4 GiB, until written."""
+    import ctypes
+    from ctypes import wintypes
+    import tifffile
+    from control.core import utils_ome_tiff_writer as ome_tiff_writer
+
+    # Probe the actual destination before requesting a large logical file: an
+    # unsupported test filesystem must not allocate tens of GB as a fallback.
+    with (tmp_path / "probe").open("w+b") as probe:
+        if not ome_tiff_writer._try_enable_sparse_file(probe):
+            pytest.skip("Test destination does not support Windows sparse files")
+
+    path = tmp_path / "timelapse.ome.tiff"
+    shape = (288, 1, 1, 2400, 2400)
+    metadata = {
+        ome_tiff_writer.DTYPE_KEY: np.dtype(dtype).str,
+        ome_tiff_writer.AXES_KEY: "TZCYX",
+        ome_tiff_writer.SHAPE_KEY: list(shape),
+        ome_tiff_writer.N_SERIES_KEY: 4,
+        ome_tiff_writer.REGION_ID_KEY: "A1",
+        ome_tiff_writer.CHANNEL_NAMES_KEY: ["phase"],
+    }
+
+    get_size = ctypes.WinDLL("kernel32", use_last_error=True).GetCompressedFileSizeW
+    get_size.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD))
+    get_size.restype = wintypes.DWORD
+
+    def allocated_bytes():
+        high = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        low = get_size(str(path), ctypes.byref(high))
+        if low == 0xFFFFFFFF and ctypes.get_last_error():
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (high.value << 32) | low
+
+    ome_tiff_writer.create_multiseries_file(str(path), metadata)
+    assert path.stat().st_file_attributes & 0x200  # FILE_ATTRIBUTE_SPARSE_FILE
+    assert path.stat().st_size > 2**32
+    before = allocated_bytes()
+    assert before < 16 * 1024**2
+
+    expected = np.full(shape[-2:], 7.25 if dtype == np.float32 else 1234, dtype=dtype)
+    for fov in (0, 3):
+        data = tifffile.memmap(path, series=fov, mode="r+").reshape(shape)
+        try:
+            # First/last fields and timepoints cross the classic TIFF offset limit.
+            assert not data[0, 0, 0].any()
+            assert not data[-1, 0, 0].any()
+            data[-1, 0, 0] = expected
+            data.flush()
+        finally:
+            data._mmap.close()
+
+    after = allocated_bytes()
+    assert after > before
+    assert after < 128 * 1024**2
+    with tifffile.TiffFile(path) as tif:
+        assert tif.is_bigtiff
+        assert len(tif.series) == 4
+        for fov in (0, 3):
+            np.testing.assert_array_equal(tif.series[fov].pages[-1].asarray(), expected)
+        # An untouched FOV/timepoint is still zero, with no invented Plane metadata.
+        assert not tif.series[1].pages[-1].asarray().any()
+        assert not ET.fromstring(tif.ome_metadata).findall(".//ome:Plane", OME_NS)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows sparse allocation")
+def test_sparse_allocation_unsupported_falls_back(tmp_path, monkeypatch, caplog) -> None:
+    """An unsupported destination still creates a readable, writable OME-TIFF."""
+    import ctypes
+    from types import SimpleNamespace
+    import tifffile
+    from control.core import utils_ome_tiff_writer as ome_tiff_writer
+
+    def unsupported(*args):
+        ctypes.set_last_error(1)  # ERROR_INVALID_FUNCTION (unsupported filesystem)
+        return 0
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **k: SimpleNamespace(DeviceIoControl=unsupported))
+    path = tmp_path / "fallback.ome.tiff"
+    metadata = {
+        ome_tiff_writer.DTYPE_KEY: np.dtype(np.uint16).str,
+        ome_tiff_writer.AXES_KEY: "TZCYX",
+        ome_tiff_writer.SHAPE_KEY: [2, 1, 1, 32, 32],
+        ome_tiff_writer.N_SERIES_KEY: 2,
+        ome_tiff_writer.REGION_ID_KEY: "A1",
+        ome_tiff_writer.CHANNEL_NAMES_KEY: ["DAPI"],
+    }
+    ome_tiff_writer.create_multiseries_file(str(path), metadata)
+    assert "using ordinary OME-TIFF allocation" in caplog.text
+    data = tifffile.memmap(path, series=1, mode="r+")
+    try:
+        assert not data.any()
+        data[-1] = 42
+        data.flush()
+    finally:
+        data._mmap.close()
+    with tifffile.TiffFile(path) as tif:
+        np.testing.assert_array_equal(tif.series[1].pages[-1].asarray(), 42)
+
+
 def test_job_runner_injects_acquisition_info() -> None:
     """Test that JobRunner.dispatch() properly injects acquisition_info into SaveOMETiffJob."""
     from control.core.job_processing import SaveOMETiffJob, JobImage, AcquisitionInfo, JobRunner

@@ -243,6 +243,13 @@ devices:
           3: "BP 600/50"
           4: "BP 700/75"
           5: "LP 650"
+      excitation_filter_wheel:
+        name: "XLight excitation wheel"
+        positions:
+          1: "Position 1"
+          2: "Position 2"
+          3: "Position 3"
+          4: "Position 4"
 ```
 
 **Fields (`ConfocalDeviceSettings`):**
@@ -250,11 +257,13 @@ devices:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `sleep_time_for_wheel` | `0.25` | Seconds the driver waits after a wheel move |
-| `validate_wheel_pos` | `false` | Default for `XLight.set_emission_filter(validate=...)`: read the position back after each move |
+| `validate_wheel_pos` | `false` | Default for emission and excitation filter moves: read the position back after each move |
 | `illumination_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.illumination_iris` |
 | `emission_iris_default` | `100` | Seeds `ObservationState.confocal_hardware_settings.emission_iris` |
 | `emission_filter_wheel.name` | `"Emission Wheel"` | Name shown in filter wheel dropdowns |
 | `emission_filter_wheel.positions` | `{}` | Slot number → filter name; `len(positions)` is the slot count the driver accepts (8 = X-Light V3, 5 = Cicero). Omitted → the driver falls back to 8 slots and no wheel is published to the UI. |
+| `excitation_filter_wheel.name` | `"Excitation Wheel"` | Name shown in filter wheel dropdowns |
+| `excitation_filter_wheel.positions` | `{}` | Slot number → filter name; `len(positions)` is the slot count the driver accepts. Omitted → 4 slots (X-Light V3). Use consecutive slots starting at 1. |
 
 Unknown keys in this block are rejected, so typos surface at startup.
 
@@ -267,6 +276,17 @@ Unknown keys in this block are rejected, so typos surface at startup.
   duplicate `filter_wheel_registry` entry.
 - The iris defaults seed `confocal_hardware_settings` the first time an iris is
   edited, and when default configs are generated for a new profile.
+
+The excitation wheel uses `confocal.2`; the emission wheel keeps `confocal.1`.
+The XLight panel shows each excitation slot with its configured filter name when
+the unit reports an excitation wheel. Both LDI library configurations declare
+four slots; replace any remaining `Position N` labels with installed filter
+names. A panel selection updates `ObservationState.excitation_filter_positions["default"]`.
+The selected position is retained in `general.yaml`, saved presets and acquisition
+metadata: `observation_state.excitation_filter_positions` in sidecars and live
+multipoint manifests, and `camera_states.<camera>.excitation_filter_positions`
+in multipoint `observation_states_used` snapshots. Applying a preset restores
+the slot; older presets without an excitation position leave the wheel alone.
 
 **Redundant writes are skipped in the driver.**
 `ObservationStateController.apply_optical_path` writes the wheel slot and both

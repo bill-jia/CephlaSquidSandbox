@@ -31,8 +31,19 @@ defines displacement zero. Focusing is then: measure the spot, convert
    scale (`configured · commanded/measured-response`) so the operator knows
    what to recalibrate to.
 4. Cross-correlation verify: the spot image around `x_reference` is compared
-   with the reference crop (`correlation_threshold`). Failure rolls z back.
-   A NaN correlation (blank crop) counts as failure.
+   with the reference crop (`correlation_threshold`). If this fixed crop fails,
+   and the detected X displacement is within the success window, retry on the
+   same frame with bounded **Y-only registration**. X stays fixed and the
+   correlation threshold is unchanged. Failure rolls z back. Missing spots,
+   flat/non-finite crops, and mismatched crop shapes fail verification.
+
+The per-objective `correlation_y_tolerance_px` defaults to 20 pixels in either
+direction; 0 disables the retry. It is also available as **Correlation Y
+Tolerance (pixels)** in the laser-AF settings, applied without reinitialization.
+Only complete crops inside the camera ROI are considered. A successful fixed
+crop skips registration entirely; the retry adds no camera capture or Z move.
+Validation records the fixed correlation as `correlation_unregistered` and the
+selected shift as `y_registration_shift_px` (blank when no retry ran).
 
 The AF laser is held on across the whole loop (one on/off pair instead of one
 per measurement — each MCU toggle costs ~10 ms).
@@ -146,6 +157,46 @@ failures fall back to the per-region z table (see
 (`LaserAFReference`); the per-objective YAML cache stores the absolute-sensor
 x and adjusts on load.
 
+Flexible Multipoint pauses main-camera live imaging while capturing a region's
+reference (including when adding a location), and resumes it afterward. Its
+global reference reset does the same. This matches the laser-AF panel's Set
+Reference behavior: a reference captured with imaging illumination on can
+contain leaked light that is absent during acquisition, causing correlation
+rejection even when the spot's X position is correct. References captured before
+this fix need to be recaptured with live imaging stopped.
+
+For a persistent correlation failure, preserve the failing references and run
+an AF validation acquisition first (`docs/laser-af-validation.md`). Compare the
+saved native AF frame and reference crop, plus the displacement measurements
+before rollback. Validation skips channel imaging and preset prewarming, so a
+passing validation run followed by a failing imaging run suggests a difference
+in illumination or optical state that also needs investigation.
+
+### Imaging-light contamination reproduced on 20x (2026-10-19)
+
+Two validation runs over the same two 7x7 regions used the same calibration,
+detection settings, 0.9 correlation threshold, and enabled inter-region Z
+retraction. Changing reference capture from imaging off to imaging on changed
+the result from 98/98 successful corrections to 0/98. Correlations were
+0.980–1.000 with imaging-off references, versus 0.771–0.809 with imaging-on
+references. Every failed event was `verify_failed`; final measured displacement
+was within the configured ±1 µm window, and no detection frames were rejected.
+
+The saved imaging-on reference crops contain prominent bands and a changed
+spot profile. The verification frames contain the clean spot seen in the
+imaging-off references. This establishes reference contamination as the cause
+of these failures; it does not identify the optical component admitting the
+unwanted light. Keep the correlation threshold and Z retraction enabled.
+After restarting with the reference-capture fix, recapture all affected region
+references and verify a short normal imaging acquisition as well.
+
+Evidence: `debug_laser_af_2026-10-19_09-43-58.105972` and
+`debug_laser_af_reacpture_ref_imaging_on_2026-10-19_09-48-53.794292`, under
+`C:/Microscope_Data/Bill/20261017_FUCCI_QPM_timelapse/`; see each run's
+`af_validation/events.csv`, `references/`, and native frames. Failed-event
+full-sensor snapshots were taken after rollback; use the native frame for the
+actual verification position.
+
 ## Failure modes this design was hardened against (2026-07 incident)
 
 One acquisition session showed every multipoint AF event failing while live
@@ -169,3 +220,24 @@ One acquisition session showed every multipoint AF event failing while live
    saved/restored around the centroid loop.
 7. NaN cross-correlation passing the verify (nan < threshold is False) →
    explicit finite check.
+
+### Legacy region-entry initialization
+
+Every FOV mode now performs a one-time pass before acquisition: verify each
+region center at its nominal focused Z, then walk to the actual first tile in
+that region's finalized coordinate order. Each axis step is at most the smaller
+of the grid spacing and 0.5 mm, with live laser correction after every step.
+The optical reference remains unchanged. A failed correction stops initialization
+rather than caching an unverified Z. Abort requests are checked between steps.
+
+The verified first-tile Z is used for direct entry during acquisition. Every tile
+still receives live AF; successful measurements update that tile's positioning
+estimate independently of fast-mode spatial offsets. Unvisited intra-region tiles
+start from the preceding corrected Z. Estimates are scoped to this acquisition
+worker, so a new acquisition initializes again. Fast mode is unchanged.
+
+Both legacy entry initialization and fast-mode seed scanning run once, after
+observation-state and postprocessing warmups, immediately before the first
+position loop. Imaging illumination is turned off before this pass. Initialization
+is included in the first timepoint's elapsed duration and can therefore consume
+its requested time interval. Per-tile runtime AF remains unchanged.

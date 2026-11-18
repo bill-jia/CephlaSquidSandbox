@@ -51,6 +51,11 @@ class LaserAFConfig(BaseModel):
     # Spot detection
     spot_crop_size: int = Field(100, description="Size of spot crop region")
     correlation_threshold: float = Field(0.9, description="Correlation threshold")
+    correlation_y_tolerance_px: int = Field(
+        20,
+        ge=0,
+        description="Maximum Y-only registration shift after fixed-crop correlation fails; 0 disables the retry",
+    )
     # y_window: int = Field(96, description="Y window half-height for detection")
     y_window: int = Field(20, description="Y window half-height for detection") # Used to be 96, but reduced to 20 to avoid edge issues with smaller crop height
     x_window: int = Field(20, description="X window half-width for detection")

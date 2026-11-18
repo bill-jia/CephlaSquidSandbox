@@ -1526,7 +1526,7 @@ class WarningErrorWidget(QWidget):
         self.label_text = QLabel()
         self.label_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        # Expand button (shows when multiple messages or dropped messages)
+        # Expand button (available for every message, including a single clipped message)
         self.btn_expand = QPushButton()
         self.btn_expand.setFixedHeight(18)
         self.btn_expand.setMinimumWidth(32)  # Allow width to grow for longer text
@@ -1537,6 +1537,7 @@ class WarningErrorWidget(QWidget):
             "QPushButton:hover { background-color: #444; }"
             "QPushButton:pressed { background-color: #222; }"
         )
+        self.btn_expand.setToolTip("Show full warning and error messages")
         self.btn_expand.clicked.connect(self._on_expand_clicked)
         self.btn_expand.setVisible(False)
 
@@ -1862,9 +1863,9 @@ class WarningErrorWidget(QWidget):
             tooltip += f"\n\n⚠ {self._dropped_count} message(s) dropped due to rate limiting"
         self.setToolTip(tooltip)
 
-        # Show expand button if multiple messages or dropped messages
+        # Every message can be expanded to read its full text.
         msg_count = len(self._messages)
-        if msg_count > 1 or self._dropped_count > 0:
+        if msg_count > 0:
             if self._dropped_count > 0:
                 # Show both additional messages and dropped count
                 extra = msg_count - 1
@@ -1872,8 +1873,10 @@ class WarningErrorWidget(QWidget):
                     self.btn_expand.setText(f"+{extra} ({self._dropped_count}⚠)")
                 else:
                     self.btn_expand.setText(f"({self._dropped_count}⚠)")
-            else:
+            elif msg_count > 1:
                 self.btn_expand.setText(f"+{msg_count - 1}")
+            else:
+                self.btn_expand.setText("Expand")
             self.btn_expand.setVisible(True)
         else:
             self.btn_expand.setVisible(False)

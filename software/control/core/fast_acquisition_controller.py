@@ -441,23 +441,34 @@ class FastAcquisitionController:
             )
             self._writer_shutdown_thread.start()
 
-    def _cleanup_after_failed_camera_start(self) -> None:
-        """Stop writer and release buffer/writer if starting the camera acquisition failed."""
-        if self._daq_only:
-            return
-        if self._frame_writer is not None:
+    def _cleanup_after_failed_start(self, error: Exception) -> None:
+        """Abort partial startup without waiting for finite acquisition completion."""
+        self._stop_event.set()
+        self._is_acquiring = False
+        self._stop_called = True
+        self._completion_status = AcquisitionCompletionStatus.COMPLETED_ERROR
+        self._completion_error_message = str(error)
+
+        def cleanup(label, action):
             try:
-                self._frame_writer.stop(wait=True)
-            except Exception as e:
-                self._log.warning(f"Failed to stop frame writer after failed start: {e}", exc_info=True)
-        if self._camera is not None and hasattr(self._camera, "stop_fast_acquisition_frame_grabbing"):
-            try:
-                self._camera.stop_fast_acquisition_frame_grabbing()
-            except Exception as e:
-                self._log.warning(f"Failed to stop camera grab after failed start: {e}", exc_info=True)
-        self._cleanup_camera_acquisition_resources()
-        self._frame_shape = None
-        self._dtype = None
+                action()
+            except Exception:
+                self._log.warning(f"Failed startup cleanup: {label}", exc_info=True)
+
+        cleanup("release DAQ tasks", self._ni_daq.release_tasks)
+        if not self._daq_only and not self._external_frame_grabbing:
+            if hasattr(self._camera, "stop_fast_acquisition_frame_grabbing"):
+                cleanup("stop camera", self._camera.stop_fast_acquisition_frame_grabbing)
+            if self._frame_writer is not None:
+                cleanup("stop writer", lambda: self._frame_writer.stop(wait=True))
+            cleanup("release camera resources", self._cleanup_camera_acquisition_resources)
+            self._frame_shape = None
+            self._dtype = None
+        cleanup("restore DAQ live outputs", self._ni_daq.restore_after_acquisition)
+        if self._illumination_controller is not None and self._illumination_snapshot is not None:
+            cleanup("restore illumination", lambda: self._illumination_controller.restore(
+                self._illumination_snapshot, force_hardware=True))
+            self._illumination_snapshot = None
 
     def start_acquisition(self, num_frames: Optional[int] = None,
                          frame_rate_hz: float = 10.0,
@@ -628,142 +639,141 @@ class FastAcquisitionController:
                 self._illumination_snapshot = None
 
         # Prepare NI DAQ to hand off from any active live outputs to this task.
-        self._ni_daq.prepare_for_acquisition()
-        # self._ni_daq.configure(**config)
-        self._ni_daq.set_waveforms(local_waveforms)
-        self._ni_daq.arm()
+        try:
+            self._ni_daq.prepare_for_acquisition()
+            # self._ni_daq.configure(**config)
+            self._ni_daq.set_waveforms(local_waveforms)
+            self._ni_daq.arm()
 
-        if not self._daq_only and not self._external_frame_grabbing:
-            if self._camera.get_is_streaming():
-                self._log.info("Stopping existing camera streaming for fast acquisition")
-                self._camera.stop_streaming()
-            if acquisition_mode is None:
-                acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER
-            if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
-                raise ValueError(f"Invalid acquisition mode for fast acquisition: {acquisition_mode}")
-            try:
-                self._camera.set_acquisition_mode(acquisition_mode)
-                self._log.info(f"Camera set to {acquisition_mode.value} mode")
-            except (NotImplementedError, ValueError) as e:
-                self._log.error(f"Camera does not support {acquisition_mode.value} mode: {e}")
-                raise
-            if self._camera._config.camera_type == CameraVariant.TOUPCAM:
-                self._camera.start_streaming()
-
-            self._camera.set_exposure_time(exposure_time_ms)
-            self._camera.fast_acquisition_timeout_ms = int(np.ceil(1 / frame_rate_hz * 1000 * 1.1))
-            if hasattr(self._camera, '_optimize_for_fast_acquisition'):
+            if not self._daq_only and not self._external_frame_grabbing:
+                if self._camera.get_is_streaming():
+                    self._log.info("Stopping existing camera streaming for fast acquisition")
+                    self._camera.stop_streaming()
+                if acquisition_mode is None:
+                    acquisition_mode = CameraAcquisitionMode.HARDWARE_TRIGGER
+                if acquisition_mode not in [CameraAcquisitionMode.HARDWARE_TRIGGER, CameraAcquisitionMode.HARDWARE_TRIGGER_FIRST]:
+                    raise ValueError(f"Invalid acquisition mode for fast acquisition: {acquisition_mode}")
                 try:
-                    self._camera._optimize_for_fast_acquisition()
-                except Exception as e:
-                    self._log.warning(f"Could not optimize camera for fast acquisition: {e}")
-            self._create_camera_acquisition_resources(frame_rate_hz)
-            try:
+                    self._camera.set_acquisition_mode(acquisition_mode)
+                    self._log.info(f"Camera set to {acquisition_mode.value} mode")
+                except (NotImplementedError, ValueError) as e:
+                    self._log.error(f"Camera does not support {acquisition_mode.value} mode: {e}")
+                    raise
+                if self._camera._config.camera_type == CameraVariant.TOUPCAM:
+                    self._camera.start_streaming()
+
+                self._camera.set_exposure_time(exposure_time_ms)
+                self._camera.fast_acquisition_timeout_ms = int(np.ceil(1 / frame_rate_hz * 1000 * 1.1))
+                if hasattr(self._camera, '_optimize_for_fast_acquisition'):
+                    try:
+                        self._camera._optimize_for_fast_acquisition()
+                    except Exception as e:
+                        self._log.warning(f"Could not optimize camera for fast acquisition: {e}")
+                self._create_camera_acquisition_resources(frame_rate_hz)
                 self._frame_writer.start()
-            except Exception:
-                self._cleanup_after_failed_camera_start()
-                raise
 
-        self._frame_count = 0
-        self._start_time = time.time()
-        self._stop_event.clear()
-        self._stop_called = False
-        self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
-        self._completion_error_message = None
-        expected_decode_bytes = None
+            self._frame_count = 0
+            self._start_time = time.time()
+            self._stop_event.clear()
+            self._stop_called = False
+            self._completion_status = AcquisitionCompletionStatus.IN_PROGRESS
+            self._completion_error_message = None
+            expected_decode_bytes = None
 
-        if not self._daq_only and not self._external_frame_grabbing:
-            expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
-            def frame_callback(
-                frame: Union[bytes, np.ndarray], metadata: Optional[dict] = None
-            ):
-                md = dict(metadata) if metadata else {}
-                if isinstance(frame, np.ndarray):
-                    frame_bytes = np.ascontiguousarray(frame).tobytes()
-                    if "height" not in md:
-                        md["height"] = int(frame.shape[0])
-                    if "width" not in md:
-                        md["width"] = int(frame.shape[1])
-                else:
-                    frame_bytes = frame
+            if not self._daq_only and not self._external_frame_grabbing:
+                expected_decode_bytes = int(self._camera.get_fast_acquisition_max_frame_bytes())
+                def frame_callback(
+                    frame: Union[bytes, np.ndarray], metadata: Optional[dict] = None
+                ):
+                    md = dict(metadata) if metadata else {}
+                    if isinstance(frame, np.ndarray):
+                        frame_bytes = np.ascontiguousarray(frame).tobytes()
+                        if "height" not in md:
+                            md["height"] = int(frame.shape[0])
+                        if "width" not in md:
+                            md["width"] = int(frame.shape[1])
+                    else:
+                        frame_bytes = frame
 
-                if "expected_decode_bytes" not in md:
-                    md["expected_decode_bytes"] = expected_decode_bytes
-                placeholder_frame_id = self._frame_count
-                if not md:
-                    timestamp = time.time()
-                elif "frame_header" in md:
-                    timestamp = float(md["frame_header"]["timestampEofPs"]) / 1e9
-                elif "timestamp" in md:
-                    timestamp = float(md["timestamp"])
-                else:
-                    timestamp = time.time()
+                    if "expected_decode_bytes" not in md:
+                        md["expected_decode_bytes"] = expected_decode_bytes
+                    placeholder_frame_id = self._frame_count
+                    if not md:
+                        timestamp = time.time()
+                    elif "frame_header" in md:
+                        timestamp = float(md["frame_header"]["timestampEofPs"]) / 1e9
+                    elif "timestamp" in md:
+                        timestamp = float(md["timestamp"])
+                    else:
+                        timestamp = time.time()
 
-                success = self._frame_buffer.write_frame(
-                    frame_bytes, placeholder_frame_id, timestamp, md
-                )
-                if success:
-                    self._frame_count += 1
-                    with self._stats_lock:
-                        self._last_frame_time = time.time()
-                # Ring-full drops are counted and logged (throttled) by the buffer.
-
-            def frame_sink(src_ptr, n_bytes, metadata):
-                # Preferred single-copy path (cameras that support it, e.g. Tucsen).
-                # Runs on the camera SDK callback thread once per frame; the ring buffer
-                # copies the frame exactly once, straight from the SDK DMA buffer into
-                # its slab — no intermediate Python bytes object on this hot path.
-                md = dict(metadata) if metadata else {}
-                md.setdefault("expected_decode_bytes", expected_decode_bytes)
-                # The SDK header carries height/width; fall back to wall-clock arrival
-                # time when the firmware leaves the frame timestamp at 0.
-                ts = md.get("timestamp")
-                if not ts:
-                    ts = time.time()
-                placeholder_frame_id = self._frame_count
-                success = self._frame_buffer.write_frame_from_ptr(
-                    src_ptr, n_bytes, placeholder_frame_id, ts, md
-                )
-                if success:
-                    self._frame_count += 1
-                    with self._stats_lock:
-                        self._last_frame_time = time.time()
-                # Ring-full drops are counted and logged (throttled) by the buffer.
-
-            try:
-                if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
-                    self._camera.start_fast_acquisition_frame_grabbing(
-                        frame_rate_hz,
-                        n_frames_expected=num_frames,
-                        frame_callback=frame_callback,
-                        acquisition_mode=acquisition_mode,
-                        frame_sink=frame_sink,
+                    success = self._frame_buffer.write_frame(
+                        frame_bytes, placeholder_frame_id, timestamp, md
                     )
-                else:
-                    raise NotImplementedError(
-                        "Camera does not support fast acquisition frame grabbing. "
-                        "This requires a camera implementation with start_fast_acquisition_frame_grabbing() method."
+                    if success:
+                        self._frame_count += 1
+                        with self._stats_lock:
+                            self._last_frame_time = time.time()
+                    # Ring-full drops are counted and logged (throttled) by the buffer.
+
+                def frame_sink(src_ptr, n_bytes, metadata):
+                    # Preferred single-copy path (cameras that support it, e.g. Tucsen).
+                    # Runs on the camera SDK callback thread once per frame; the ring buffer
+                    # copies the frame exactly once, straight from the SDK DMA buffer into
+                    # its slab — no intermediate Python bytes object on this hot path.
+                    md = dict(metadata) if metadata else {}
+                    md.setdefault("expected_decode_bytes", expected_decode_bytes)
+                    # The SDK header carries height/width; fall back to wall-clock arrival
+                    # time when the firmware leaves the frame timestamp at 0.
+                    ts = md.get("timestamp")
+                    if not ts:
+                        ts = time.time()
+                    placeholder_frame_id = self._frame_count
+                    success = self._frame_buffer.write_frame_from_ptr(
+                        src_ptr, n_bytes, placeholder_frame_id, ts, md
                     )
-            except Exception:
-                self._cleanup_after_failed_camera_start()
-                raise
+                    if success:
+                        self._frame_count += 1
+                        with self._stats_lock:
+                            self._last_frame_time = time.time()
+                    # Ring-full drops are counted and logged (throttled) by the buffer.
 
-        self._is_acquiring = True
+                try:
+                    if hasattr(self._camera, 'start_fast_acquisition_frame_grabbing'):
+                        self._camera.start_fast_acquisition_frame_grabbing(
+                            frame_rate_hz,
+                            n_frames_expected=num_frames,
+                            frame_callback=frame_callback,
+                            acquisition_mode=acquisition_mode,
+                            frame_sink=frame_sink,
+                        )
+                    else:
+                        raise NotImplementedError(
+                            "Camera does not support fast acquisition frame grabbing. "
+                            "This requires a camera implementation with start_fast_acquisition_frame_grabbing() method."
+                        )
+                except Exception:
+                    raise
 
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_acquisition,
-            args=(
-                num_frames if (not self._daq_only and not self._external_frame_grabbing) else None,
-                frame_rate_hz,
-            ),
-            daemon=True
-        )
-        self._monitor_thread.start()
+            self._is_acquiring = True
 
-        self._ni_daq.start_trigger()
-        self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
-        self._log.info("Fast acquisition started with NI DAQ waveforms" + (" (DAQ-only)" if self._daq_only else ""))
-    
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_acquisition,
+                args=(
+                    num_frames if (not self._daq_only and not self._external_frame_grabbing) else None,
+                    frame_rate_hz,
+                ),
+                daemon=True
+            )
+            self._ni_daq.start_trigger()
+            self._monitor_thread.start()
+            self._log.info(f"NIDAQ is running: {self._ni_daq.is_running}")
+            self._log.info("Fast acquisition started with NI DAQ waveforms" + (" (DAQ-only)" if self._daq_only else ""))
+        except Exception as error:
+            self._log.exception("Fast acquisition startup failed; releasing partial startup resources")
+            self._cleanup_after_failed_start(error)
+            raise
+
     def stop_acquisition(self, manual_stop: bool = False, error_message: Optional[str] = None):
         """
         Stop fast acquisition.
@@ -1053,13 +1063,23 @@ class FastAcquisitionController:
                 f.attrs['frame_counter_dio_line'] = self._frame_counter_dio_line
                 f.attrs['num_frames_detected'] = len(self._frame_sample_indices)
 
-            self._log.info(f"Saved DAQ data to {h5_path}")
+            self._log.debug(f"Saved DAQ data to {h5_path}")
 
         except ImportError:
             # Fallback to NumPy format
             np_path = os.path.join(waveforms_dir, "frame_sync_map.npy")
-            np.save(np_path, np.array(self._frame_sample_indices))
-            self._log.info(f"Saved frame sync map to {np_path} (HDF5 not available)")
+            try:
+                np.save(np_path, np.array(self._frame_sample_indices))
+            except Exception:
+                self._log.error("Failed to save frame sync map to %s", np_path, exc_info=True)
+                raise
+            self._log.warning(
+                "HDF5 unavailable; saved only frame sync indices to %s. DAQ waveforms were not saved.", np_path
+            )
+
+        except Exception:
+            self._log.error("Failed to save DAQ data in %s", waveforms_dir, exc_info=True)
+            raise
 
     def _build_nidaq_snapshot(self) -> Optional[NIDAQConfigSnapshot]:
         """Build a NIDAQConfigSnapshot from ``self._ni_daq`` for HDF5 sidecar attrs.
@@ -1194,7 +1214,7 @@ class FastAcquisitionController:
         metadata_path = os.path.join(self._output_path, "metadata.json")
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        self._log.info(f"Saved metadata to {metadata_path}")
+        self._log.debug(f"Saved metadata to {metadata_path}")
         self._save_acquisition_metadata_yaml_sidecar(metadata)
 
     def _save_acquisition_metadata_yaml_sidecar(self, metadata_json: dict) -> None:
@@ -1239,7 +1259,7 @@ class FastAcquisitionController:
                 observation_state=obs_state,
             )
             out = repo.save_acquisition_metadata(self._output_path, am)
-            self._log.info("Saved acquisition metadata YAML to %s", out)
+            self._log.debug("Saved acquisition metadata YAML to %s", out)
         except Exception as e:
             self._log.warning("Could not save acquisition_metadata.yaml for fast acquisition: %s", e, exc_info=True)
 

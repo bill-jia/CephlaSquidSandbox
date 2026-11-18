@@ -7,7 +7,9 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import Future
 from pathlib import Path
+from threading import Thread
 from typing import Any, Iterable, Optional
 from uuid import uuid4
 
@@ -25,20 +27,33 @@ class UploadManagerUnavailable(ConnectionError):
 
 
 class UploadManagerClient:
-    def __init__(self, *, timeout_ms: int = 5000, state_dir: Optional[os.PathLike[str] | str] = None):
+    def __init__(
+        self,
+        *,
+        timeout_ms: int = 5000,
+        startup_timeout_ms: int = 60000,
+        state_dir: Optional[os.PathLike[str] | str] = None,
+    ):
         self.timeout_ms = timeout_ms
+        # Restoring the durable queue and reconciling existing datasets happens
+        # before the manager accepts IPC, and can exceed a normal request timeout.
+        self.startup_timeout_ms = startup_timeout_ms
         self.state_dir = Path(state_dir) if state_dir else default_state_dir()
 
     def request(self, method: str, params: Optional[dict] = None, *, start: bool = True) -> Any:
         response = self._request_once(method, params or {})
         if response is None and start:
             self.start_manager()
-            deadline = time.monotonic() + self.timeout_ms / 1000.0
+            deadline = time.monotonic() + self.startup_timeout_ms / 1000.0
             while response is None and time.monotonic() < deadline:
                 time.sleep(0.05)
                 response = self._request_once(method, params or {})
         if response is None:
-            raise UploadManagerUnavailable("Upload Manager did not accept a connection")
+            raise UploadManagerUnavailable(
+                f"Upload Manager did not respond to {method!r}"
+                + (f" after waiting up to {self.startup_timeout_ms / 1000:g}s for startup." if start else ".")
+                + f" See {self.state_dir / 'manager.stderr.log'} for details."
+            )
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "Upload Manager request failed"))
         return response.get("result")
@@ -83,11 +98,36 @@ class UploadManagerClient:
         process.setWorkingDirectory(str(entrypoint.parent))
         process.setStandardOutputFile(str(self.state_dir / "manager.stdout.log"), QIODevice.Append)
         process.setStandardErrorFile(str(self.state_dir / "manager.stderr.log"), QIODevice.Append)
-        if not process.startDetached():
-            raise UploadManagerUnavailable("could not start Upload Manager")
+        launched = process.startDetached()
+        # PyQt returns (success, pid); a failed (False, 0) tuple is still truthy.
+        success = launched[0] if isinstance(launched, tuple) else launched
+        if not success:
+            raise UploadManagerUnavailable(f"could not start Upload Manager: {process.errorString()}")
 
     def register_dataset(self, **params) -> dict:
         return self.request("register_dataset", params)
+
+    def ensure_ready_async(self) -> Future:
+        """Start/connect in the background; result() propagates startup failures.
+
+        The thread owns its Qt socket/process objects and only performs IPC.
+        No dataset is created, so an abandoned acquisition setup leaves no queue
+        entry behind. The detached manager may continue draining older datasets.
+        """
+        ready = Future()
+
+        def connect():
+            if not ready.set_running_or_notify_cancel():
+                return
+            try:
+                self.get_status()
+            except Exception as exc:
+                ready.set_exception(exc)
+            else:
+                ready.set_result(None)
+
+        Thread(target=connect, name="Upload Manager startup", daemon=True).start()
+        return ready
 
     def submit_batch(self, dataset_id: str, submission_id: str, files: Iterable[dict], *, task_id: Optional[str] = None) -> dict:
         """Durably retain the request locally until the manager acknowledges it."""

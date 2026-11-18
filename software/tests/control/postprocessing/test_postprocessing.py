@@ -476,6 +476,26 @@ def test_routine_key_distinguishes_params():
     assert a != b and a == same
 
 
+@pytest.mark.parametrize("message,fatal", [
+    ("CUDA error: an illegal memory access was encountered", True),
+    ("CUDA out of memory", True),
+    ("cuSOLVER failed", True),
+    ("optional precomputation unavailable", False),
+])
+def test_warmup_cuda_failure_is_fatal_and_logs_traceback(monkeypatch, caplog, message, fatal):
+    from types import SimpleNamespace
+    from control.core.job_processing import PostprocessWarmupJob
+
+    def fail(*args):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(PostprocessJob, "ensure_routine", lambda spec: (SimpleNamespace(warmup=fail), {}))
+    result = PostprocessWarmupJob(label="BF", spec_dict={"routine": "stub"}).run()
+    assert not result.ok and result.fatal is fatal
+    assert result.error == message
+    assert any(record.exc_info is not None for record in caplog.records)
+
+
 def test_disk_estimate_excludes_postprocessed_raw_and_adds_derived():
     """The disk-size estimator must NOT count postprocessed raw frames (they are
     consumed by the routine and never saved) and MUST add the derived output
@@ -577,6 +597,7 @@ def test_image_count_zmode_aware_and_derived_count():
     mpc.selected_cycle_names = ["c"]
     mpc.selected_observation_state_names = []
     mpc.region_cycle_map = None
+    mpc.region_observation_state_map = {}
     mpc.scanCoordinates = SimpleNamespace(region_fov_coordinates={"R0": [0]})  # 1 FOV
     mpc._resolve_plan = lambda names, region: plan
 
@@ -610,6 +631,9 @@ def test_prepare_display_image_is_display_safe():
     # A 3D (Z,Y,X) output previews its center plane.
     vol = np.zeros((3, 20, 20), np.float32)
     assert job._prepare_display_image(vol).shape == (20, 20)
+    vol = np.stack([np.full((4, 4), z, np.uint16) for z in range(4)])
+    assert np.all(job._prepare_display_image(vol) == 2)
+    assert np.all(job._prepare_display_image(vol, z_choice="last") == 3)
 
 
 def test_postprocess_job_partial_group_returns_none_and_holds_bytes():

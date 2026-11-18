@@ -394,6 +394,10 @@ class AbstractNIDAQ(abc.ABC):
         """Output constant values for debugging. Override in hardware implementation."""
         pass
 
+    def zero_outputs(self, ao_channels: Iterable[str], do_lines: Iterable[int]) -> None:
+        """Zero selected outputs without changing acquisition timing or waveforms."""
+        raise NotImplementedError
+
     def stop_live_output(self) -> None:
         """Stop constant live output. Override in hardware implementation."""
         pass
@@ -1260,6 +1264,42 @@ class NIDAQ(AbstractNIDAQ):
             self._stop_internal()
             self._cleanup_tasks()
             self._log.info("Tasks released; device free for new tasks")
+
+    def zero_outputs(self, ao_channels: Iterable[str], do_lines: Iterable[int]) -> None:
+        """Write resting levels without recreating acquisition/input tasks."""
+        ao_channels = list(ao_channels)
+        do_lines = list(do_lines)
+        if not ao_channels and not do_lines:
+            return
+        with self._lock:
+            self._stop_internal()
+            self._cleanup_tasks()
+            device = self._config.device_name
+            if do_lines:
+                # No sample clock: this single write completes immediately.
+                with self._nidaqmx.Task() as task:
+                    for line in do_lines:
+                        task.do_channels.add_do_chan(f"{device}/{self._config.do_port}/line{line}")
+                    task.write(False if len(do_lines) == 1 else [False] * len(do_lines), auto_start=True)
+                self._live_do_values.update({line: False for line in do_lines})
+            if ao_channels:
+                # Match the existing live-AO path's two-sample hardware timing,
+                # but wait for completion before closing instead of aborting it.
+                with self._nidaqmx.Task() as task:
+                    for channel in ao_channels:
+                        task.ao_channels.add_ao_voltage_chan(
+                            f"{device}/{channel}", min_val=self._config.ao_min_voltage,
+                            max_val=self._config.ao_max_voltage,
+                        )
+                    task.timing.cfg_samp_clk_timing(
+                        rate=1000.0, sample_mode=self._constants.AcquisitionType.FINITE,
+                        samps_per_chan=2,
+                    )
+                    data = np.zeros(2) if len(ao_channels) == 1 else np.zeros((len(ao_channels), 2))
+                    task.write(data, auto_start=False)
+                    task.start()
+                    task.wait_until_done(timeout=5.0)
+                self._live_ao_values.update({channel: 0.0 for channel in ao_channels})
     
     def _setup_tasks(self) -> None:
         """Set up all configured tasks."""
@@ -1653,6 +1693,11 @@ class SimulatedNIDAQ(AbstractNIDAQ):
             self._is_armed = False
             self._completion_event.set()
             self._log.info("[SIM] Tasks stopped")
+
+    def zero_outputs(self, ao_channels: Iterable[str], do_lines: Iterable[int]) -> None:
+        self.stop()
+        self._live_ao_values.update({channel: 0.0 for channel in ao_channels})
+        self._live_do_values.update({line: False for line in do_lines})
 
     def start_live_output(
         self,

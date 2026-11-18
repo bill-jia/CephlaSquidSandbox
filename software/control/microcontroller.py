@@ -22,6 +22,8 @@ The microcontroller firmware runs a control loop that:
 
 import abc
 import enum
+import json
+from pathlib import Path
 import struct
 import threading
 import time
@@ -38,6 +40,8 @@ from serial.serialutil import SerialException
 import squid.logging
 import control._def as _def
 from control._def import *
+from control.mcu_diagnostics import MCUDiagnostics, capture_thread_stacks
+from control.mcu_health_logging import HealthRecordWriter
 
 # Add user to the dialout group to avoid the need to use sudo for serial access
 
@@ -72,6 +76,7 @@ _CMD_NAMES = {
     CMD_SET.SET_DAC80508_REFDIV_GAIN: "SET_DAC80508_REFDIV_GAIN",
     CMD_SET.SET_ILLUMINATION_INTENSITY_FACTOR: "SET_ILLUMINATION_INTENSITY_FACTOR",
     CMD_SET.MOVETO_W: "MOVETO_W",
+    CMD_SET.MOVETO_W2: "MOVETO_W2",
     CMD_SET.SET_LIM_SWITCH_POLARITY: "SET_LIM_SWITCH_POLARITY",
     CMD_SET.CONFIGURE_STEPPER_DRIVER: "CONFIGURE_STEPPER_DRIVER",
     CMD_SET.SET_MAX_VELOCITY_ACCELERATION: "SET_MAX_VELOCITY_ACCELERATION",
@@ -132,9 +137,11 @@ class CommandAborted(RuntimeError):
     This does mean that if you don't check for command completion, you may miss these errors!
     """
 
-    def __init__(self, command_id, reason):
+    def __init__(self, command_id, reason, recoverable: bool = False):
         super().__init__(reason)
         self.command_id = command_id
+        # Only an explicit rejection before motion is safe to resend.
+        self.recoverable = recoverable
 
 
 # NOTE(imo): We'll want to pull this out into a common serial impl shared with serial_peripheral.py at some point, but
@@ -211,12 +218,14 @@ class SimSerial(AbstractCephlaMicroSerial):
     # Simulated firmware version
     # v1.0: multi-port illumination support
     # v1.1: serial watchdog for illumination auto-shutoff
+    # v1.4: failed-move reporting, absolute wheels, strobe and wheel-home fixes
+    # v1.5: per-axis TMC2660/TMC2240 driver identification
     FIRMWARE_VERSION_MAJOR = 1
-    FIRMWARE_VERSION_MINOR = 1
+    FIRMWARE_VERSION_MINOR = 5
 
     @staticmethod
     def response_bytes_for(
-        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 1)
+        command_id, execution_status, x, y, z, theta, joystick_button, switch, firmware_version=(1, 5)
     ) -> bytes:
         """
         - byte 0: command ID (1 byte)
@@ -259,6 +268,7 @@ class SimSerial(AbstractCephlaMicroSerial):
         self.w2 = 0
         self.joystick_button = False
         self.switch = False
+        self.execution_status = CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
 
         # Multi-port illumination state for simulation
         self.port_is_on = [False] * SimSerial.NUM_ILLUMINATION_PORTS
@@ -283,6 +293,8 @@ class SimSerial(AbstractCephlaMicroSerial):
         # CMD_SET handlers here.  Prefer this over adding checks for simulated mode in
         # the Microcontroller!
         command_byte = write_bytes[1]
+        if command_byte != CMD_SET.HEARTBEAT:
+            self.execution_status = CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
         # If this is a position related command, these are our position bytes.
         position_bytes = write_bytes[2:6]
         if command_byte == CMD_SET.MOVE_X:
@@ -303,6 +315,10 @@ class SimSerial(AbstractCephlaMicroSerial):
             self.y = self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.MOVETO_Z:
             self.z = self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVETO_W:
+            self.w = self.unpack_position(position_bytes)
+        elif command_byte == CMD_SET.MOVETO_W2:
+            self.w2 = self.unpack_position(position_bytes)
         elif command_byte == CMD_SET.HOME_OR_ZERO:
             axis = write_bytes[2]
             # NOTE: write_bytes[3] might indicate that we only want to "ZERO", but
@@ -388,7 +404,7 @@ class SimSerial(AbstractCephlaMicroSerial):
         self.response_buffer.extend(
             SimSerial.response_bytes_for(
                 write_bytes[0],
-                CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS,
+                self.execution_status,
                 self.x,
                 self.y,
                 self.z,
@@ -538,10 +554,13 @@ class MicrocontrollerSerial(AbstractCephlaMicroSerial):
                 raise
 
     def bytes_available(self) -> int:
-        if not self.is_open():
+        if not self._serial.is_open:
             return 0
-
-        return self._serial.in_waiting
+        try:
+            # is_open() also queries in_waiting; avoid doing the OS query twice.
+            return self._serial.in_waiting
+        except OSError:
+            return 0
 
     def is_open(self) -> bool:
         try:
@@ -654,6 +673,10 @@ class Microcontroller:
     # As of 2025-04-28, it's 10ms on the micro. So 0.1s (10x) is a reasonable timeout.
     # STALE_READ_TIMEOUT = 0.1  # Warn if no status packets received for this long
     STALE_READ_TIMEOUT = 0.3 # Increased to 300ms to reduce false positives on slow systems or during heavy load
+    DIAGNOSTIC_HEALTH_INTERVAL_S = 60.0
+    DIAGNOSTIC_STALL_THRESHOLD_S = 0.2
+    DIAGNOSTIC_STALL_POLL_S = 0.05
+    DIAGNOSTIC_STALL_COOLDOWN_S = 30.0
 
     def __init__(self, serial_device: AbstractCephlaMicroSerial, reset_and_initialize=True):
         """
@@ -665,6 +688,13 @@ class Microcontroller:
                                   (sets up drivers, configures actuators, etc.)
         """
         self.log = squid.logging.get_logger(self.__class__.__name__)
+
+        self.diagnostics = MCUDiagnostics()
+        self._diagnostic_tx_sequence = 0
+        self._diagnostic_command_sequence = 0
+        self._diagnostic_command_sent = None
+        self._diagnostic_health_stop = threading.Event()
+        self._diagnostic_health_thread = None
 
         if not serial_device:
             raise ValueError("You must pass in an AbstractCephlaSerial device for the microcontroller instance to use.")
@@ -700,12 +730,12 @@ class Microcontroller:
         self.z_pos = 0
         self.w_pos = 0      # W axis (if present, typically for additional positioning)
         self.theta_pos = 0   # Theta axis (rotation)
-        
+
         # Input state tracking (from status packets)
         self.button_and_switch_state = 0    # Bitfield of button/switch states
         self.joystick_button_pressed = 0    # Joystick button state
         self.switch_state = 0              # Limit switch states
-        
+
         # Joystick event handling
         # Can register callbacks for joystick button presses
         self.joystick_listener_events_enabled = False  # Enable/disable joystick events
@@ -723,7 +753,7 @@ class Microcontroller:
         self._heartbeat_stop_event = threading.Event()
 
         # Lock to serialize all outgoing serial commands (heartbeat thread + main thread)
-        self._cmd_lock = threading.Lock()
+        self._cmd_lock = threading.RLock()
 
         # Command tracking for error handling
         self.last_command = None
@@ -738,7 +768,9 @@ class Microcontroller:
         self.new_packet_callback_external = None
         self.terminate_reading_received_packet_thread = False
         self._received_packet_cv = threading.Condition()
-        self.thread_read_received_packet = threading.Thread(target=self.read_received_packet, daemon=True)
+        self.thread_read_received_packet = threading.Thread(
+            target=self.read_received_packet, name="MCU-reader", daemon=True
+        )
         self.thread_read_received_packet.start()
 
         # Initialize microcontroller if requested
@@ -756,6 +788,63 @@ class Microcontroller:
         # Detect firmware version early by sending a harmless command
         # This ensures supports_multi_port() returns accurate results immediately
         self._detect_firmware_version()
+        self.log.info(
+            "[MCU-DIAG] Recorder enabled (2048 RX, 1024 events, 64 firmware samples); "
+            "protocol firmware=%s.%s, port=%s. Firmware telemetry availability is confirmed separately.",
+            *self.firmware_version, getattr(self._serial, "_port", "simulated/unspecified"),
+        )
+        self._start_diagnostic_health()
+
+    def _start_diagnostic_health(self):
+        main_log = squid.logging.get_current_log_file_path()
+        directory = Path(main_log).parent if main_log else squid.logging.get_default_log_directory()
+        writer = HealthRecordWriter(directory, self.diagnostics.recorder_id)
+        self.log.info("[MCU-DIAG] health details: %s", json.dumps(str(writer.path)))
+        self.log.info(
+            "[MCU-DIAG] Reader stall capture enabled: threshold %.0f ms, cooldown %.0f s; details: %s",
+            self.DIAGNOSTIC_STALL_THRESHOLD_S * 1000, self.DIAGNOSTIC_STALL_COOLDOWN_S, writer.stall_path,
+        )
+
+        def monitor():
+            next_health = time.monotonic() + self.DIAGNOSTIC_HEALTH_INTERVAL_S
+            next_capture = 0.0
+            checked_through = time.monotonic()
+            while True:
+                delay = min(self.DIAGNOSTIC_STALL_POLL_S, max(0, next_health - time.monotonic()))
+                stopping = self._diagnostic_health_stop.wait(delay)
+                try:
+                    now = time.monotonic()
+                    if not stopping and now >= next_capture:
+                        evidence = self.diagnostics.stall_evidence(self.DIAGNOSTIC_STALL_THRESHOLD_S, checked_through)
+                        if evidence is not None:
+                            next_capture = now + self.DIAGNOSTIC_STALL_COOLDOWN_S
+                            self.diagnostics.event("stall_capture", evidence=evidence)
+                            snapshot = self.diagnostics.snapshot()
+                            snapshot.update(kind="reader_stall", unix_s=time.time(), evidence=evidence,
+                                            state=self._diagnostic_state(), threads_captured_monotonic_s=time.monotonic())
+                            snapshot["threads"] = capture_thread_stacks()
+                            writer.write_stall(snapshot, self.log)
+                    # Don't replay recovered stalls suppressed by the cooldown.
+                    checked_through = now
+                    if stopping or now >= next_health:
+                        summary = self.diagnostics.health_summary()
+                        summary.update(state=self._diagnostic_state(), final=stopping)
+                        writer.write(summary, self.log)
+                        next_health = time.monotonic() + self.DIAGNOSTIC_HEALTH_INTERVAL_S
+                except Exception:
+                    self.log.exception("[MCU-DIAG] Diagnostic monitor failed")
+                if stopping:
+                    return
+
+        self._diagnostic_health_thread = threading.Thread(target=monitor, name="MCU-health", daemon=True)
+        self._diagnostic_health_thread.start()
+
+    def _stop_diagnostic_health(self):
+        self._diagnostic_health_stop.set()
+        if self._diagnostic_health_thread is not None:
+            self._diagnostic_health_thread.join(timeout=2.0)
+            if self._diagnostic_health_thread.is_alive():
+                self.log.warning("[MCU-DIAG] Health logger has not stopped within 2s")
 
     def _warn_if_reads_stale(self):
         if self._is_simulated:
@@ -770,6 +859,7 @@ class Microcontroller:
             )
 
     def close(self):
+        self._stop_diagnostic_health()
         self.stop_heartbeat()
         self.terminate_reading_received_packet_thread = True
         self.thread_read_received_packet.join()
@@ -1076,10 +1166,18 @@ class Microcontroller:
         self.send_command(cmd)
 
     def send_heartbeat(self) -> None:
-        """Send a no-op heartbeat command to reset the firmware watchdog timer."""
-        cmd = bytearray(self.tx_buffer_length)
-        cmd[1] = CMD_SET.HEARTBEAT
-        self.send_command(cmd)
+        """Keep the watchdog alive without replacing the tracked operation.
+
+        Firmware 1.2+ retains execution status across HEARTBEAT but echoes its
+        command ID. Reuse the application command's ID so a pending error or
+        completion still belongs to that operation, even during long moves.
+        """
+        with self._cmd_lock:
+            cmd = bytearray(self.tx_buffer_length)
+            cmd[0] = self._cmd_id
+            cmd[1] = CMD_SET.HEARTBEAT
+            cmd[-1] = self.crc_calculator.calculate_checksum(cmd[:-1])
+            self._write_command_diagnostic(cmd, "heartbeat")
 
     def start_heartbeat(self, interval_s: float = None) -> None:
         """Start a daemon thread that sends periodic heartbeat commands.
@@ -1114,7 +1212,7 @@ class Microcontroller:
                     elif consecutive_failures % 50 == 0:
                         self.log.error(f"[MCU] Heartbeat still failing: {consecutive_failures} consecutive failures")
 
-        self._heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        self._heartbeat_thread = threading.Thread(target=_heartbeat_loop, name="MCU-heartbeat", daemon=True)
         self._heartbeat_thread.start()
         self.log.debug(f"[MCU] Heartbeat started: interval={interval_s}s")
 
@@ -1239,6 +1337,18 @@ class Microcontroller:
 
     def move_w2_usteps(self, usteps):
         self._move_axis_usteps(usteps, CMD_SET.MOVE_W2)
+
+    def _move_filter_wheel_to_usteps(self, usteps, command_code):
+        cmd = bytearray(self.tx_buffer_length)
+        cmd[1] = command_code
+        cmd[2:6] = self._int_to_payload(usteps, 4).to_bytes(4, "big")
+        self.send_command(cmd)
+
+    def move_w_to_usteps(self, usteps):
+        self._move_filter_wheel_to_usteps(usteps, CMD_SET.MOVETO_W)
+
+    def move_w2_to_usteps(self, usteps):
+        self._move_filter_wheel_to_usteps(usteps, CMD_SET.MOVETO_W2)
 
     def set_off_set_velocity_x(self, off_set_velocity):
         # off_set_velocity is in mm/s
@@ -1606,6 +1716,65 @@ class Microcontroller:
     def turn_off_AF_laser(self):
         self.set_pin_level(MCU_PINS.AF_LASER, 0)
 
+    def record_diagnostic_event(self, kind, **fields):
+        self.diagnostics.event(kind, **fields)
+
+    def _write_command_diagnostic(self, command, kind):
+        # Caller owns _cmd_lock. No diagnostics code performs serial IO itself.
+        self._diagnostic_tx_sequence += 1
+        sequence = self._diagnostic_tx_sequence
+        if kind == "command":
+            self._diagnostic_command_sequence = sequence
+            self._diagnostic_command_sent = time.monotonic()
+        started = time.monotonic()
+        self.diagnostics.event(
+            "tx_start", sequence=sequence, command_sequence=self._diagnostic_command_sequence,
+            tx_kind=kind, raw=bytes(command).hex(), command_id=command[0],
+            opcode=_CMD_NAMES.get(command[1], str(command[1])),
+            busy_before=self.mcu_cmd_execution_in_progress, retry=self.retry,
+        )
+        try:
+            written = self._serial.write(command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
+        except Exception as exc:
+            self.diagnostics.event("tx_error", sequence=sequence, duration_s=time.monotonic() - started,
+                                   error=repr(exc))
+            raise
+        self.diagnostics.event("tx_end", sequence=sequence, duration_s=time.monotonic() - started,
+                               bytes_written=written)
+        return written
+
+    def _diagnostic_state(self):
+        # Best-effort observation, deliberately no command lock/serial queries:
+        # those may be the very things that are blocked during a timeout.
+        return {
+            "host_sequence": self._diagnostic_command_sequence,
+            "last_tx_sequence": self._diagnostic_tx_sequence,
+            "command_id": self._cmd_id, "mcu_id": self._cmd_id_mcu,
+            "status": self._cmd_execution_status, "busy": self.mcu_cmd_execution_in_progress,
+            "command": None if self.last_command is None else bytes(self.last_command).hex(),
+            "command_age_s": None if self._diagnostic_command_sent is None else
+                time.monotonic() - self._diagnostic_command_sent,
+            "retry": self.retry, "position": self.get_pos(), "firmware": self.firmware_version,
+            "reader_alive": self.thread_read_received_packet.is_alive(),
+            "heartbeat_alive": self._heartbeat_thread is not None and self._heartbeat_thread.is_alive(),
+            "aborted": None if self.last_command_aborted_error is None else str(self.last_command_aborted_error),
+        }
+
+    def _log_diagnostic_snapshot(self, snapshot):
+        # Never called with _received_packet_cv held: logging can block on disk.
+        dump_id = f"{threading.get_native_id()}-{time.monotonic_ns()}"
+        sections = ("events", "rx", "telemetry", "threads")
+        summary = {key: value for key, value in snapshot.items() if key not in sections}
+        summary["dump_id"] = dump_id
+        # Write the summary first, so it survives even a later logging failure.
+        self.log.error("[MCU-DIAG] snapshot %s", json.dumps(summary, default=str))
+        for section in sections:
+            rows = snapshot.get(section, [])
+            # Bounded chunks keep individual log records manageable.
+            for start in range(0, len(rows), 64):
+                self.log.error("[MCU-DIAG] %s dump=%s offset=%s %s", section, dump_id, start,
+                               json.dumps(rows[start:start + 64], default=str))
+
     def send_command(self, command):
         with self._cmd_lock:
             self._cmd_id = (self._cmd_id + 1) % 256
@@ -1614,7 +1783,7 @@ class Microcontroller:
             cmd_type = command[1]
             cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
             self.log.debug(f"[MCU] >>> sending command {self._cmd_id}, type={cmd_name}")
-            self._serial.write(command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
+            self._write_command_diagnostic(command, "command")
             self.mcu_cmd_execution_in_progress = True
             self.last_command = command
             self.last_command_send_timestamp = time.time()
@@ -1628,12 +1797,18 @@ class Microcontroller:
 
             self._warn_if_reads_stale()
 
-    def abort_current_command(self, reason):
+    def abort_current_command(self, reason, recoverable: bool = False):
         cmd_type = self.last_command[1] if self.last_command is not None else -1
         cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
-        self.log.error(f"[MCU] !!! Command {self._cmd_id} ({cmd_name}) ABORTED: {reason}")
-        self.last_command_aborted_error = CommandAborted(reason=reason, command_id=self._cmd_id)
+        log = self.log.warning if recoverable else self.log.error
+        log(f"[MCU] !!! Command {self._cmd_id} ({cmd_name}) ABORTED: {reason}")
+        self.last_command_aborted_error = CommandAborted(
+            reason=reason, command_id=self._cmd_id, recoverable=recoverable
+        )
         self.mcu_cmd_execution_in_progress = False
+
+        self.diagnostics.event("command_aborted", reason=reason, recoverable=recoverable,
+                               command_id=self._cmd_id, host_sequence=self._diagnostic_command_sequence)
 
     def acknowledge_aborted_command(self):
         if self.last_command_aborted_error is None:
@@ -1641,10 +1816,11 @@ class Microcontroller:
 
         self.last_command_aborted_error = None
 
-    def resend_last_command(self):
+    def resend_last_command(self, reason="requested"):
         with self._cmd_lock:
             if self.last_command is not None:
-                self._serial.write(self.last_command, reconnect_tries=Microcontroller.MAX_RECONNECT_COUNT)
+                self.diagnostics.event("resend", reason=reason, retry=self.retry, command_id=self._cmd_id)
+                self._write_command_diagnostic(self.last_command, "resend")
                 self.mcu_cmd_execution_in_progress = True
                 # We use the retry count for both checksum errors, and to keep track of
                 # timeout re-attempts.
@@ -1654,61 +1830,70 @@ class Microcontroller:
                 self.log.warning("resend requested with no last_command, something is wrong!")
                 self.abort_current_command("Resend last requested with no last command")
 
+    def _read_status_packet(self, pending, crc_calculator):
+        """Read available bytes once, then consume packets in wire order.
+
+        A short read or a partial packet is retained for the next iteration.
+        Never request more bytes than were reported available. The existing
+        legacy zero-CRC compatibility and overflow reset policy are preserved.
+        """
+        if len(pending) < self.rx_buffer_length:
+            self.diagnostics.reader_poll("serial_poll")
+            backlog = self._serial.bytes_available()
+            self.diagnostics.reader_poll("buffer_check", backlog + len(pending))
+            if backlog >= BUFFER_SIZE_LIMIT:
+                reset_ok = self._serial.reset_input_buffer()
+                discarded = backlog + len(pending)
+                if reset_ok:
+                    pending.clear()
+                self.diagnostics.event("buffer_reset", bytes_discarded=discarded, success=reset_ok)
+                return None
+            if backlog:
+                self.diagnostics.reader_poll("serial_read")
+                pending.extend(self._serial.read(min(backlog, BUFFER_SIZE_LIMIT - len(pending))))
+
+        self.diagnostics.reader_poll("packet_parse", len(pending))
+        consumed = 0
+        while len(pending) - consumed >= self.rx_buffer_length:
+            msg = pending[consumed:consumed + self.rx_buffer_length]
+            checksum = crc_calculator.calculate_checksum(msg[:-1])
+            if checksum == msg[-1] or msg[-1] == 0:
+                del pending[:consumed + self.rx_buffer_length]
+                return msg
+            self.diagnostics.event("crc_failure", raw=bytes(msg).hex(), expected=checksum)
+            self.log.warning("Bad checksum %s for packet '%s', tossing first byte", checksum, list(msg))
+            consumed += 1
+        if consumed:
+            del pending[:consumed]
+        return None
+
     def read_received_packet(self):
         crc_calculator = CrcCalculator(Crc8.CCITT, table_based=True)
+        pending = bytearray()
         last_watchdog_fail_report = time.time()
         watchdog_fail_report_period = 5.0
 
         while not self.terminate_reading_received_packet_thread:
             try:
-                # If anything hangs, we may fall way behind reading the serial buffer.  In that case, toss everything
-                # in the read buffer and start over.  This should always be safe to do because the micro sends updates
-                # periodically without prompting, and so we'll always get more updates on the current micro state.
-                if self._serial.bytes_available() >= BUFFER_SIZE_LIMIT:
-                    self._serial.reset_input_buffer()
-                    continue
-
-                # If we don't at least have enough bytes for a full packet (rx_buffer_length), there's no reason to
-                # waste our time looking for a valid message.  So wait here until we have at least that many bytes.
-                if self._serial.bytes_available() < self.rx_buffer_length:
+                msg = self._read_status_packet(pending, crc_calculator)
+                if msg is None:
                     if time.time() - last_watchdog_fail_report > watchdog_fail_report_period:
                         last_watchdog_fail_report = time.time()
                         self._warn_if_reads_stale()
                     # Sleep a negligible amount of time just to give other threads time to run.  Otherwise,
                     # we run the rise of spinning forever here and not letting progress happen elsewhere.
+                    self.diagnostics.reader_poll("waiting_for_packet")
                     time.sleep(0.0001)
+                    self.diagnostics.reader_poll("serial_open_check")
                     if not self._serial.is_open():
-                        if not self._serial.reconnect(attempts=Microcontroller.MAX_RECONNECT_COUNT):
+                        pending.clear()
+                        self.diagnostics.event("reconnect_start")
+                        connected = self._serial.reconnect(attempts=Microcontroller.MAX_RECONNECT_COUNT)
+                        self.diagnostics.event("reconnect_end", success=connected)
+                        if not connected:
                             self.log.error(
                                 "In read loop, serial device failed to reconnect.  Microcontroller is defunct!"
                             )
-                    continue
-
-                # This helper reads bytes in the order received by serial, and checks that packet-sized chunks
-                # have valid checksums.  IF the first packet size chunk does not have a valid checksum, it tosses
-                # the first byte and keeps going until it either finds a valid checksum packet or runs out of bytes.
-                def get_msg_with_good_checksum():
-                    maybe_msg = []
-                    while self._serial.bytes_available() > 0:
-                        maybe_msg.append(ord(self._serial.read()))
-                        if len(maybe_msg) < self.rx_buffer_length:
-                            continue
-
-                        checksum = crc_calculator.calculate_checksum(maybe_msg[:-1])
-                        # NOTE(imo): Before April 2025, we didn't send the crc from the micro.  This is
-                        # here to support firmware that still sends 0 as the checksum.  This means for
-                        # the firmware that does support checksums, we can get fooled by zeros!
-                        if checksum == maybe_msg[-1] or maybe_msg[-1] == 0:
-                            return maybe_msg
-                        else:
-                            self.log.warning(f"Bad checksum {checksum} for packet '{maybe_msg}, tossing first byte'")
-                            maybe_msg.pop(0)
-                    return None
-
-                msg = get_msg_with_good_checksum()
-
-                if msg is None:
-                    self.log.warning("Back checksums found, skipping.")
                     continue
 
                 # parse the message
@@ -1720,57 +1905,89 @@ class Microcontroller:
                 - bytes 10-13: Z pos (4 bytes)
                 - bytes 14-17: Theta (4 bytes)
                 - byte 18: buttons and switches (1 byte)
-                - bytes 19-21: reserved (3 bytes)
+                - bytes 19-21: paged diagnostics in firmware 1.5.1+, otherwise reserved
                 - byte 22: firmware version, nibble-encoded (1 byte)
                 - byte 23: CRC (1 byte)
                 """
                 self._last_successful_read_time = time.time()
-                self._cmd_id_mcu = msg[0]
-                self._cmd_execution_status = msg[1]
-                if (self._cmd_id_mcu == self._cmd_id) and (
-                    self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
-                ):
-                    if self.mcu_cmd_execution_in_progress:
-                        self.mcu_cmd_execution_in_progress = False
-                        elapsed_ms = (time.time() - self.last_command_send_timestamp) * 1000
-                        cmd_type = self.last_command[1] if self.last_command is not None else -1
-                        cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
-                        self.log.debug(
-                            f"[MCU] <<< command {self._cmd_id} ({cmd_name}) complete (took {elapsed_ms:.1f}ms)"
+                first_telemetry = self.diagnostics.received(
+                    msg, crc_calculator.calculate_checksum(msg[:-1]) == msg[-1],
+                    self._cmd_id, self._diagnostic_command_sequence,
+                )
+                self.diagnostics.reader_poll("command_lock")
+                with self._cmd_lock:
+                    self.diagnostics.reader_poll("status_processing")
+                    self._cmd_id_mcu = msg[0]
+                    self._cmd_execution_status = msg[1]
+                    if (self._cmd_id_mcu == self._cmd_id) and (
+                        self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
+                    ):
+                        if self.mcu_cmd_execution_in_progress:
+                            self.mcu_cmd_execution_in_progress = False
+                            self.diagnostics.event("command_complete", command_id=self._cmd_id,
+                                                   host_sequence=self._diagnostic_command_sequence)
+                            elapsed_ms = (time.time() - self.last_command_send_timestamp) * 1000
+                            cmd_type = self.last_command[1] if self.last_command is not None else -1
+                            cmd_name = _CMD_NAMES.get(cmd_type, f"UNKNOWN({cmd_type})")
+                            self.log.debug(
+                                f"[MCU] <<< command {self._cmd_id} ({cmd_name}) complete (took {elapsed_ms:.1f}ms)"
+                            )
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu != self._cmd_id
+                        and time.time() - self.last_command_send_timestamp > self.LAST_COMMAND_ACK_TIMEOUT
+                        and self.last_command is not None
+                    ):
+                        if self.retry > self.MAX_RETRY_COUNT:
+                            self.abort_current_command(
+                                reason=f"Command timed out without an ack after {self.LAST_COMMAND_ACK_TIMEOUT} [s], and {self.retry} retries"
+                            )
+                        else:
+                            self.log.debug(
+                                f"[MCU] !!! command timed out without ack after {self.LAST_COMMAND_ACK_TIMEOUT}s, resending command"
+                            )
+                            self.resend_last_command(reason="ack_id_timeout")
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_CHECKSUM_ERROR
+                    ):
+                        if self.retry > self.MAX_RETRY_COUNT:
+                            self.abort_current_command(reason=f"Checksum error and 10 retries for {self._cmd_id}")
+                        else:
+                            self.log.error("[MCU] !!! checksum error, resending command")
+                            self.resend_last_command(reason="mcu_checksum_error")
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu == self._cmd_id
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_EXECUTION_ERROR
+                    ):
+                        # Only rejected moves are safe for a bounded resend. Other
+                        # errors (e.g. configuration failures) require attention.
+                        motion_commands = (
+                            CMD_SET.MOVE_X,
+                            CMD_SET.MOVE_Y,
+                            CMD_SET.MOVE_Z,
+                            CMD_SET.MOVE_W,
+                            CMD_SET.MOVE_W2,
+                            CMD_SET.MOVETO_X,
+                            CMD_SET.MOVETO_Y,
+                            CMD_SET.MOVETO_Z,
+                            CMD_SET.MOVETO_W,
+                            CMD_SET.MOVETO_W2,
                         )
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_id_mcu != self._cmd_id
-                    and time.time() - self.last_command_send_timestamp > self.LAST_COMMAND_ACK_TIMEOUT
-                    and self.last_command is not None
-                ):
-                    if self.retry > self.MAX_RETRY_COUNT:
                         self.abort_current_command(
-                            reason=f"Command timed out without an ack after {self.LAST_COMMAND_ACK_TIMEOUT} [s], and {self.retry} retries"
+                            reason="firmware reported CMD_EXECUTION_ERROR",
+                            recoverable=self.last_command is not None and self.last_command[1] in motion_commands,
                         )
-                    else:
+                    elif (
+                        self.mcu_cmd_execution_in_progress
+                        and self._cmd_id_mcu != self._cmd_id
+                        and self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
+                    ):
+                        # Log when we receive an ACK for a different command than we're waiting for
                         self.log.debug(
-                            f"[MCU] !!! command timed out without ack after {self.LAST_COMMAND_ACK_TIMEOUT}s, resending command"
+                            f"[MCU] !!! received ack for command {self._cmd_id_mcu}, but waiting for command {self._cmd_id}"
                         )
-                        self.resend_last_command()
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_execution_status == CMD_EXECUTION_STATUS.CMD_CHECKSUM_ERROR
-                ):
-                    if self.retry > self.MAX_RETRY_COUNT:
-                        self.abort_current_command(reason=f"Checksum error and 10 retries for {self._cmd_id}")
-                    else:
-                        self.log.error("[MCU] !!! checksum error, resending command")
-                        self.resend_last_command()
-                elif (
-                    self.mcu_cmd_execution_in_progress
-                    and self._cmd_id_mcu != self._cmd_id
-                    and self._cmd_execution_status == CMD_EXECUTION_STATUS.COMPLETED_WITHOUT_ERRORS
-                ):
-                    # Log when we receive an ACK for a different command than we're waiting for
-                    self.log.debug(
-                        f"[MCU] !!! received ack for command {self._cmd_id_mcu}, but waiting for command {self._cmd_id}"
-                    )
 
                 self.x_pos = self._payload_to_int(
                     msg[2:6], MicrocontrollerDef.N_BYTES_POS
@@ -1812,9 +2029,13 @@ class Microcontroller:
                 with self._received_packet_cv:
                     self._received_packet_cv.notify_all()
 
+                if first_telemetry is not None:
+                    self.log.info("[MCU-DIAG] Firmware telemetry active: %s", json.dumps(first_telemetry))
                 if self.new_packet_callback_external is not None:
+                    self.diagnostics.reader_poll("external_callback")
                     self.new_packet_callback_external(self)
             except Exception as e:
+                self.diagnostics.event("reader_exception", error=repr(e))
                 self.log.error("Read loop failed, continuing to loop to see if anything can recover.", exc_info=e)
 
     def get_pos(self):
@@ -1857,6 +2078,11 @@ class Microcontroller:
         Wait for the current command to complete.  If the wait times out, the current command isn't touched.  To
         abort it, you should call the abort_current_command(...) method.
         """
+        started = time.monotonic()
+        entry = self._diagnostic_state()
+        self.diagnostics.event("wait_start", timeout_s=timeout_limit_s, entry=entry)
+        snapshot = None
+        error = None
         with self._received_packet_cv:
 
             def still_busy():
@@ -1865,10 +2091,27 @@ class Microcontroller:
             self._received_packet_cv.wait_for(lambda: not still_busy(), timeout=timeout_limit_s)
 
             if still_busy():
-                raise TimeoutError(f"Current mcu operation timed out after {timeout_limit_s} [s].")
-
-            if self.last_command_aborted_error is not None:
-                raise self.last_command_aborted_error
+                error = TimeoutError(f"Current mcu operation timed out after {timeout_limit_s} [s].")
+            elif self.last_command_aborted_error is not None:
+                error = self.last_command_aborted_error
+            if error is not None:
+                self.diagnostics.event("wait_failed", error=str(error), elapsed_s=time.monotonic() - started)
+                snapshot = self.diagnostics.snapshot()
+                snapshot.update(wait_entry=entry, at_failure=self._diagnostic_state(),
+                                timeout_s=timeout_limit_s, error=str(error))
+        if snapshot is not None:
+            try:
+                snapshot["threads_captured_monotonic_s"] = time.monotonic()
+                snapshot["threads"] = capture_thread_stacks()
+            except Exception as exc:
+                snapshot["thread_capture_error"] = repr(exc)
+            try:
+                self._log_diagnostic_snapshot(snapshot)
+            except Exception:
+                self.log.exception("[MCU-DIAG] Failed to write diagnostic snapshot")
+            raise error
+        self.diagnostics.event("wait_end", elapsed_s=time.monotonic() - started,
+                               host_sequence=self._diagnostic_command_sequence)
 
     @staticmethod
     def _int_to_payload(signed_int, number_of_bytes) -> int:

@@ -13,6 +13,7 @@ No hardware: the worker is built with ``__new__`` (like
 stage that only records what it was asked to do.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -110,6 +111,53 @@ def test_flag_off_with_two_element_coordinates_issues_no_z_move():
     worker.move_to_coordinate((10.0, 20.0), "R0", 0)
 
     assert stage.calls == _xy((10.0, 20.0))
+
+
+@pytest.mark.parametrize("retract", [False, True])
+def test_legacy_entry_walk_skips_xy_only_well_between_supplied_centers(retract):
+    initial_z = 1.74853125
+    stage = RecordingStage(z_mm=initial_z)
+    worker = _worker(stage, retract=retract)
+    worker.do_reflection_af = True
+    worker._laser_af_refresh_every_n_fovs = 1
+    worker.scan_region_names = ["A1", "B1", "C1"]
+    worker.scan_region_coords_mm = [(11.0, 8.0, initial_z), (11.0, 12.5), (11.0, 17.0, initial_z + 0.01)]
+    worker.scan_region_fov_coords_mm = {
+        "A1": [(12.0, 7.0)], "B1": [(12.0, 11.5)], "C1": [(12.0, 16.0)],
+    }
+    worker.abort_requested_fn = lambda: False
+    worker._apply_region_laser_af_reference = MagicMock()
+    measured_positions = []
+
+    def focus(target):
+        assert target == 0
+        pos = stage.get_pos()
+        measured_positions.append((pos.x_mm, pos.y_mm, pos.z_mm))
+        stage.move_z_to(pos.z_mm + 0.001)
+        return True
+
+    worker.laser_auto_focus_controller = SimpleNamespace(move_to_target=focus)
+
+    worker._initialize_legacy_region_entries()
+
+    # Visit only supplied centers, carrying verified Z along each diagonal.
+    # Skipping B1 must not prevent C1's preparation or populate a B1 prior.
+    expected_positions = [
+        (11.0, 8.0, initial_z),
+        (11.5, 7.5, initial_z + 0.001),
+        (12.0, 7.0, initial_z + 0.002),
+        (11.0, 17.0, initial_z + 0.01),
+        (11.5, 16.5, initial_z + 0.011),
+        (12.0, 16.0, initial_z + 0.012),
+    ]
+    assert len(measured_positions) == len(expected_positions)
+    for actual, expected in zip(measured_positions, expected_positions):
+        assert actual == pytest.approx(expected)
+    assert worker._z_pos_proposal == pytest.approx({
+        ("A1", 0): initial_z + 0.003,
+        ("C1", 0): initial_z + 0.013,
+    })
+    assert stage.calls.count(("move_z_to", HOME_Z_MM, True)) == (2 if retract else 0)
 
 
 @pytest.mark.parametrize("time_point", [0, 1])

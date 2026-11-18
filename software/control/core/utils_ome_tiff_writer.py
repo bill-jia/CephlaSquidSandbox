@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import tifffile
+import squid.logging
 
 from control import utils
 
@@ -61,6 +63,49 @@ CLASSIC_TIFF_MAX_BYTES = 2**32
 # that finalisation writes into the (appended, hence size-counting) OME-XML.
 _BYTES_PER_PLANE_OVERHEAD = 1024 + 512
 _BASE_METADATA_OVERHEAD = 65536
+
+_log = squid.logging.get_logger(__name__)
+
+
+def _try_enable_sparse_file(file: BinaryIO) -> bool:
+    """Mark a new Windows file sparse before tifffile extends its pixel ranges.
+
+    Elsewhere, seek-based allocation already leaves holes on filesystems that
+    support them. Unsupported Windows destinations retain ordinary allocation.
+    This only changes physical allocation, never TIFF offsets or image data.
+    """
+    if sys.platform != "win32":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    try:
+        device_io_control = ctypes.WinDLL("kernel32", use_last_error=True).DeviceIoControl
+        device_io_control.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        )
+        device_io_control.restype = wintypes.BOOL
+        returned = wintypes.DWORD()
+        # FSCTL_SET_SPARSE with a NULL input buffer sets the sparse attribute.
+        if not device_io_control(
+            msvcrt.get_osfhandle(file.fileno()), 0x000900C4, None, 0, None, 0, ctypes.byref(returned), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except OSError as exc:
+        _log.warning("Sparse allocation unavailable for %s; using ordinary OME-TIFF allocation: %s", file.name, exc)
+        return False
+
+    _log.debug("Enabled sparse OME-TIFF allocation for %s", file.name)
+    return True
 
 
 def ome_region_folder(experiment_path: str) -> str:
@@ -338,6 +383,8 @@ def create_multiseries_file(output_path: str, metadata: Dict[str, Any]) -> None:
     ``TiffWriter.write(data=None, shape=...)`` reserves contiguous, memmappable
     pixel space per series and defers the OME-XML (covering all series) to
     close, so ``tifffile.memmap(path, series=i)`` afterwards addresses FOV *i*.
+    On Windows, mark the empty file sparse first so the planned pixel ranges
+    do not allocate/zero the whole timelapse before its first plane is written.
     """
     shape = tuple(int(v) for v in metadata[SHAPE_KEY])
     dtype = np.dtype(metadata[DTYPE_KEY])
@@ -348,13 +395,15 @@ def create_multiseries_file(output_path: str, metadata: Dict[str, Any]) -> None:
 
     if os.path.exists(output_path):
         os.remove(output_path)
-    with tifffile.TiffWriter(output_path, bigtiff=use_bigtiff, ome=True) as writer:
-        for series_index in range(n_series):
-            writer.write(
-                shape=shape,
-                dtype=dtype,
-                metadata=metadata_for_imwrite(metadata, series_index),
-            )
+    with open(output_path, "w+b") as file:
+        _try_enable_sparse_file(file)
+        with tifffile.TiffWriter(file, bigtiff=use_bigtiff, ome=True) as writer:
+            for series_index in range(n_series):
+                writer.write(
+                    shape=shape,
+                    dtype=dtype,
+                    metadata=metadata_for_imwrite(metadata, series_index),
+                )
 
 
 def planes_from_ome_xml(ome_xml: Optional[str]) -> Dict[str, Dict[str, Any]]:

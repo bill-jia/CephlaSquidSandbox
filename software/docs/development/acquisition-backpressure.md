@@ -1,6 +1,6 @@
 # Acquisition Backpressure
 
-A throttling mechanism that prevents RAM exhaustion when acquisition speed exceeds disk write speed. When the job queue fills up, acquisition pauses before triggering the next camera frame until capacity becomes available.
+A throttling mechanism that limits queued image memory when acquisition outpaces processing or writing. When the job queue fills up, acquisition pauses before triggering the next camera frame until capacity becomes available. Reconstruction, writing, flushes, and synchronous upload submission can all contribute to a backlog; a throttle message alone does not identify the cause.
 
 ## The Problem
 
@@ -36,7 +36,7 @@ Settings in `control/_def.py`:
 |---------|---------|-------------|
 | `ACQUISITION_THROTTLING_ENABLED` | `True` | Enable/disable backpressure throttling |
 | `ACQUISITION_MAX_PENDING_JOBS` | `10` | Max jobs in flight before throttling |
-| `ACQUISITION_MAX_PENDING_MB` | `500.0` | Max pending MB before throttling |
+| `ACQUISITION_MAX_PENDING_MB` | `2000.0` | Max pending MiB before throttling |
 | `ACQUISITION_THROTTLE_TIMEOUT_S` | `30.0` | Max wait time when throttled (continues with warning) |
 
 ### Recommended Settings by System RAM
@@ -80,12 +80,17 @@ This location ensures:
 
 All jobs (including `DownsampledViewJob`) release their bytes immediately when the job completes. This design prevents deadlock scenarios with z-stack acquisitions where many FOVs × z-levels × channels could exceed the byte limit before any well finishes.
 
-The bytes tracked represent data in the **main process queue**, not subprocess memory. When a job completes:
-- Job is removed from the queue (main process memory freed)
-- Image data moves to subprocess memory (not tracked by backpressure)
-- Capacity event is signaled to wake any throttled acquisition
+The bytes tracked represent input images for dispatched, unfinished jobs, including
+jobs currently executing. Completion releases this accounting and signals the
+capacity event. Postprocessing additionally holds incomplete input groups against
+the byte counter until the group is ready to compute. Reconstruction buffers,
+writer caches, preview accumulators, and other allocations are not fully counted,
+so the byte limit does not bound total RAM.
 
 ## Logging
+
+See [Pipeline diagnostics](pipeline-diagnostics.md) for `[PIPELINE]` summaries,
+queue ages, stage timings, upload diagnostics, detail-file locations, and limitations.
 
 When throttling activates, messages are logged at INFO level:
 
@@ -96,14 +101,14 @@ INFO:control.core.backpressure:Backpressure throttling: jobs=10/10, MB=450.2/500
 When capacity becomes available:
 
 ```
-DEBUG:control.core.backpressure:Backpressure released
+INFO:control.core.backpressure:[PIPELINE] Throttle ended: reason=jobs, outcome=capacity_available, waited=0.120s, jobs=9, MiB=420.0
 ```
 
 If timeout is reached:
 
 ```
 WARNING:control.core.backpressure:Backpressure timeout after 30.0s, continuing
-ERROR:control.core.multi_point_worker:Backpressure timeout - disk I/O cannot keep up. Stats: BackpressureStats(...)
+ERROR:control.core.multi_point_worker:Backpressure timeout - processing/writing cannot keep up. Stats: BackpressureStats(...)
 ```
 
 ## Monitoring

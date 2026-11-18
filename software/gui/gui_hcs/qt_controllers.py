@@ -90,7 +90,6 @@ import control.serial_peripherals as serial_peripherals
 import control.core_displacement_measurement as core_displacement_measurement
 
 
-
 if USE_JUPYTER_CONSOLE:
     from control.console import JupyterWidget
 
@@ -182,6 +181,8 @@ class QtAutoFocusController(AutoFocusController, QObject):
 
 
 class QtMultiPointController(MultiPointController, QObject):
+    acquisition_preview = Signal(object)
+    acquisition_preview_enabled = Signal(bool)
     acquisition_finished = Signal()
     # Fires after acquisition_finished, once background writeback/finalize is done
     # (all zarr writers flushed and on disk; safe to move/copy the dataset).
@@ -261,6 +262,7 @@ class QtMultiPointController(MultiPointController, QObject):
                 signal_frame_written=self._signal_frame_written_fn,
                 signal_new_time_point=self._signal_new_time_point_fn,
                 signal_data_writing_complete=self._signal_data_writing_complete_fn,
+                signal_acquisition_preview=self._signal_acquisition_preview_fn,
             ),
             scan_coordinates=scan_coordinates,
             laser_autofocus_controller=laser_autofocus_controller,
@@ -302,6 +304,10 @@ class QtMultiPointController(MultiPointController, QObject):
         if enabled and not self._show_live_during_acquisition:
             self._last_frames_per_channel.clear()
         self._show_live_during_acquisition = enabled
+        self.acquisition_preview_enabled.emit(enabled)
+
+    def _signal_acquisition_preview_fn(self, event):
+        self.acquisition_preview.emit(event)
 
     def _signal_acquisition_start_fn(self, parameters: AcquisitionParameters):
         # TODO mpc napari signals
@@ -311,6 +317,7 @@ class QtMultiPointController(MultiPointController, QObject):
         else:
             self.signal_set_display_tabs.emit(self.selected_configurations, 2, self.xy_mode)
         self.signal_acquisition_start.emit()
+        self.acquisition_preview_enabled.emit(self._show_live_during_acquisition)
 
         # NDViewer push-based API: emit start_acquisition signal
         scan_info = parameters.scan_position_information
@@ -612,4 +619,3 @@ class QtMultiPointController(MultiPointController, QObject):
                 fov_paths.append(path)
 
         return fov_paths
-

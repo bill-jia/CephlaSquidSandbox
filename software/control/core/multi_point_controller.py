@@ -46,6 +46,7 @@ from control import utils
 import control._def
 from control.core.auto_focus_controller import AutoFocusController
 from control.core.multi_point_utils import MultiPointControllerFunctions, ScanPositionInformation, AcquisitionParameters
+from control.models.region_z_stack import z_stack_count
 from control.core.scan_coordinates import ScanCoordinates, validate_region_names
 from control.core.laser_auto_focus_controller import LaserAutofocusController
 from control.core.live_controller import LiveController
@@ -367,6 +368,7 @@ def _save_unified_multipoint_acquisition_yaml(
             "xy_mode": params.xy_mode,
             "skip_saving": params.skip_saving,
             "validation_mode": params.validation_mode,
+            "log_af_events": params.log_af_events,
             "retract_z_between_regions": params.retract_z_between_regions,
             "use_manual_focus_map": use_manual_focus_map,
             "keep_illuminators_on_between_captures": params.keep_illuminators_on_between_captures,
@@ -378,7 +380,8 @@ def _save_unified_multipoint_acquisition_yaml(
             "wellplate_format": wellplate_format,
         },
         "z_stack": {
-            "nz": params.NZ,
+            "nz": max([params.NZ] + [z_stack_count(*bounds, params.deltaZ)
+                                      for bounds in params.scan_position_information.scan_region_z_ranges.values()]),
             "delta_z_mm": params.deltaZ,
             "config": params.z_stacking_config,
             "z_range_mm": _serialize_for_yaml(params.z_range) if params.z_range else None,
@@ -432,6 +435,9 @@ def _save_unified_multipoint_acquisition_yaml(
                 {
                     "name": name,
                     "center_mm": _serialize_for_yaml(center),
+                    **({"z_range_mm": list(params.scan_position_information.scan_region_z_ranges[name]),
+                        "nz": z_stack_count(*params.scan_position_information.scan_region_z_ranges[name], params.deltaZ)}
+                       if name in params.scan_position_information.scan_region_z_ranges else {}),
                 }
                 for name, center in zip(
                     params.scan_position_information.scan_region_names,
@@ -580,6 +586,7 @@ class MultiPointController:
         self.use_fluidics = False
         self.skip_saving = False
         self.validation_mode = False
+        self.log_af_events = False
         self.retract_z_between_regions = True
         self.file_saving_option = control._def.FILE_SAVING_OPTION
         self.keep_illuminators_on_between_captures = False
@@ -889,6 +896,9 @@ class MultiPointController:
 
     def set_skip_saving(self, skip_saving):
         self.skip_saving = skip_saving
+
+    def set_log_af_events(self, enabled: bool):
+        self.log_af_events = bool(enabled)
 
     def set_validation_mode(self, enabled: bool):
         self.validation_mode = bool(enabled)
@@ -1307,33 +1317,33 @@ class MultiPointController:
             # region has a list of coordinates that we capture at, and at each coordinate we need to
             # do a capture for each requested camera + lighting + other configuration selected.  So
             # total image count is:
-            coords_per_region = [
-                len(region_coords) for (region_id, region_coords) in self.scanCoordinates.region_fov_coordinates.items()
-            ]
-            all_regions_coord_count = sum(coords_per_region)
-
-            # Resolve the per-position plan so cycles (multiple frames per state), stimulus-only
-            # states (no camera frame), postprocessed steps (raw not saved), and per-step z-mode
-            # are all accounted for. frame_counts is keyed by (state, z-mode): a reference-z-only
-            # group carries the _refz suffix and is captured once (×1), full-z groups are ×NZ.
-            if self.selected_observation_state_names or self.selected_cycle_names:
-                plan = self._resolve_plan(self.selected_cycle_names, None)
-                planes_per_position = sum(
-                    count * (1 if key.endswith(REFZ_ARRAY_SUFFIX) else self.NZ)
-                    for key, count in plan.frame_counts.items()
-                )
-                non_merged_images = self.Nt * all_regions_coord_count * planes_per_position
-            else:
-                n_ch = len(self.selected_configurations)
-                non_merged_images = self.Nt * self.NZ * all_regions_coord_count * n_ch
-            # When capturing merged images, we capture 1 per fov (where all the configurations are merged)
-            merged_images = self.Nt * self.NZ * all_regions_coord_count if control._def.MERGE_CHANNELS else 0
-
-            return non_merged_images + merged_images
+            total = 0
+            plan_cache = {}
+            for region_id, coords in self.scanCoordinates.region_fov_coordinates.items():
+                nz = self._region_nz(region_id)
+                if self.selected_observation_state_names or self.selected_cycle_names or self.region_cycle_map:
+                    cycles = (self.region_cycle_map or {}).get(region_id, self.selected_cycle_names)
+                    states = (self.region_observation_state_map or {}).get(region_id)
+                    key = (tuple(cycles), None if states is None else tuple(states))
+                    if key not in plan_cache:
+                        plan_cache[key] = self._resolve_plan(cycles, states)
+                    plan = plan_cache[key]
+                    planes = sum(count * (1 if key.endswith(REFZ_ARRAY_SUFFIX) else nz)
+                                 for key, count in plan.frame_counts.items())
+                else:
+                    planes = nz * len(self.selected_configurations)
+                if control._def.MERGE_CHANNELS:
+                    planes += nz
+                total += self.Nt * len(coords) * planes
+            return total
         except AttributeError:
             # We don't init all fields in __init__, so it's easy to get attribute errors.  We consider
             # this "not configured" and want it to be a ValueError.
             raise ValueError("Not properly configured for an acquisition, cannot calculate image count.")
+
+    def _region_nz(self, region_id):
+        bounds = getattr(self.scanCoordinates, "region_z_ranges", {}).get(region_id)
+        return z_stack_count(*bounds, self.deltaZ) if bounds is not None else self.NZ
 
     def get_acquisition_derived_image_count(self) -> int:
         """Number of derived output image planes written by online postprocessing.
@@ -1574,6 +1584,18 @@ class MultiPointController:
 
         thread_started = False
         try:
+            upload_manager_ready = None
+            if (
+                self.file_saving_option == control._def.FileSavingOption.ZARR_V3
+                and self.zarr_upload_enabled
+                and self.zarr_upload_remote_root
+                and not self.validation_mode
+            ):
+                from control.core.upload_manager_client import UploadManagerClient
+
+                self._log.info("Starting Upload Manager connection while preparing acquisition")
+                upload_manager_ready = UploadManagerClient().ensure_ready_async()
+
             self._log.info("start multipoint")
             self._start_position = self.stage.get_pos()
 
@@ -1705,81 +1727,11 @@ class MultiPointController:
                         region_fov_coords[i] = (x, y, z)
                         self.scanCoordinates.update_fov_z_level(region_id, i, z)
 
-            elif self.gen_focus_map and not self.do_reflection_af:
-                self._log.info("Generating autofocus plane for multipoint grid")
-                bounds = self.scanCoordinates.get_scan_bounds()
-                if not bounds:
-                    return
-                x_min, x_max = bounds["x"]
-                y_min, y_max = bounds["y"]
-
-                # Calculate scan dimensions and center
-                x_span = abs(x_max - x_min)
-                y_span = abs(y_max - y_min)
-                x_center = (x_max + x_min) / 2
-                y_center = (y_max + y_min) / 2
-
-                # Determine grid size based on scan dimensions
-                if x_span < self.deltaX:
-                    fmap_Nx = 2
-                    fmap_dx = self.deltaX  # Force deltaX spacing for small scans
-                else:
-                    fmap_Nx = min(4, max(2, int(x_span / self.deltaX) + 1))
-                    fmap_dx = max(self.deltaX, x_span / (fmap_Nx - 1))
-
-                if y_span < self.deltaY:
-                    fmap_Ny = 2
-                    fmap_dy = self.deltaY  # Force deltaY spacing for small scans
-                else:
-                    fmap_Ny = min(4, max(2, int(y_span / self.deltaY) + 1))
-                    fmap_dy = max(self.deltaY, y_span / (fmap_Ny - 1))
-
-                # Calculate starting corner position (top-left of the AF map grid)
-                starting_x_mm = x_center - (fmap_Nx - 1) * fmap_dx / 2
-                starting_y_mm = y_center - (fmap_Ny - 1) * fmap_dy / 2
-                # TODO(sm): af map should be a grid mapped to a surface, instead of just corners mapped to a plane
-                try:
-                    # Store existing AF map if any
-                    self.focus_map_storage = []
-                    self.already_using_fmap = self.autofocusController.use_focus_map
-                    for x, y, z in self.autofocusController.focus_map_coords:
-                        self.focus_map_storage.append((x, y, z))
-
-                    # Define grid corners for AF map
-                    coord1 = (starting_x_mm, starting_y_mm)  # Starting corner
-                    coord2 = (
-                        starting_x_mm + (fmap_Nx - 1) * fmap_dx,
-                        starting_y_mm,
-                    )  # X-axis corner
-                    coord3 = (
-                        starting_x_mm,
-                        starting_y_mm + (fmap_Ny - 1) * fmap_dy,
-                    )  # Y-axis corner
-
-                    self._log.info(f"Generating AF Map: Nx={fmap_Nx}, Ny={fmap_Ny}")
-                    self._log.info(f"Spacing: dx={fmap_dx:.3f}mm, dy={fmap_dy:.3f}mm")
-                    self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
-
-                    # Generate and enable the AF map
-                    self.autofocusController.gen_focus_map(
-                        coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
-                    )
-                    self.autofocusController.set_focus_map_use(True)
-
-                    # Return to center position
-                    move_xy_with_z_retract(
-                        self.stage,
-                        x_center,
-                        y_center,
-                        retract=self.retract_z_between_regions,
-                        z_target_mm=None,
-                        home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
-                        log=self._log,
-                    )
-
-                except ValueError:
-                    self._log.exception("Invalid coordinates for autofocus plane, aborting.")
-                    return
+            prepare_focus = None
+            if not self.focus_map and self.gen_focus_map and not self.do_reflection_af:
+                self.focus_map_storage = list(self.autofocusController.focus_map_coords)
+                self.already_using_fmap = self.autofocusController.use_focus_map
+                prepare_focus = self._generate_acquisition_focus_map
 
             def finish_fn():
                 try:
@@ -1891,6 +1843,8 @@ class MultiPointController:
                     slack_notifier=self._slack_notifier,
                     prewarmed_job_runner=prewarmed_runner,
                     prewarmed_bp_values=prewarmed_bp_values,
+                    upload_manager_ready=upload_manager_ready,
+                    prepare_focus=prepare_focus,
                 )
             except Exception:
                 # Clean up pre-warmed runner if worker creation failed.
@@ -1923,6 +1877,84 @@ class MultiPointController:
                     self.selected_observation_state_names = list(prior_selection)
                     self._selected_observation_state_names_before_run = None
                 self._inline_observation_states_for_run = {}
+
+    def _generate_acquisition_focus_map(self):
+        """Hardware-only focus preparation, invoked by the worker just before imaging."""
+        self._log.info("Generating autofocus plane for multipoint grid")
+        bounds = self.scanCoordinates.get_scan_bounds()
+        if not bounds:
+            raise ValueError("No scan bounds available for autofocus map")
+        x_min, x_max = bounds["x"]
+        y_min, y_max = bounds["y"]
+
+        # Calculate scan dimensions and center
+        x_span = abs(x_max - x_min)
+        y_span = abs(y_max - y_min)
+        x_center = (x_max + x_min) / 2
+        y_center = (y_max + y_min) / 2
+
+        # Determine grid size based on scan dimensions
+        if x_span < self.deltaX:
+            fmap_Nx = 2
+            fmap_dx = self.deltaX  # Force deltaX spacing for small scans
+        else:
+            fmap_Nx = min(4, max(2, int(x_span / self.deltaX) + 1))
+            fmap_dx = max(self.deltaX, x_span / (fmap_Nx - 1))
+
+        if y_span < self.deltaY:
+            fmap_Ny = 2
+            fmap_dy = self.deltaY  # Force deltaY spacing for small scans
+        else:
+            fmap_Ny = min(4, max(2, int(y_span / self.deltaY) + 1))
+            fmap_dy = max(self.deltaY, y_span / (fmap_Ny - 1))
+
+        # Calculate starting corner position (top-left of the AF map grid)
+        starting_x_mm = x_center - (fmap_Nx - 1) * fmap_dx / 2
+        starting_y_mm = y_center - (fmap_Ny - 1) * fmap_dy / 2
+        # TODO(sm): af map should be a grid mapped to a surface, instead of just corners mapped to a plane
+        try:
+            # Store existing AF map if any
+            self.focus_map_storage = []
+            self.already_using_fmap = self.autofocusController.use_focus_map
+            for x, y, z in self.autofocusController.focus_map_coords:
+                self.focus_map_storage.append((x, y, z))
+
+            # Define grid corners for AF map
+            coord1 = (starting_x_mm, starting_y_mm)  # Starting corner
+            coord2 = (
+                starting_x_mm + (fmap_Nx - 1) * fmap_dx,
+                starting_y_mm,
+            )  # X-axis corner
+            coord3 = (
+                starting_x_mm,
+                starting_y_mm + (fmap_Ny - 1) * fmap_dy,
+            )  # Y-axis corner
+
+            self._log.info(f"Generating AF Map: Nx={fmap_Nx}, Ny={fmap_Ny}")
+            self._log.info(f"Spacing: dx={fmap_dx:.3f}mm, dy={fmap_dy:.3f}mm")
+            self._log.info(f"Center:  x=({x_center:.3f}mm, y={y_center:.3f}mm)")
+
+            # Generate and enable the AF map
+            self.autofocusController.gen_focus_map(
+                coord1, coord2, coord3, retract_between_corners=self.retract_z_between_regions
+            )
+            self.autofocusController.set_focus_map_use(True)
+
+            # Return to center position
+            move_xy_with_z_retract(
+                self.stage,
+                x_center,
+                y_center,
+                retract=self.retract_z_between_regions,
+                z_target_mm=None,
+                home_z_mm=control._def.OBJECTIVE_RETRACTED_POS_MM,
+                log=self._log,
+            )
+
+        except ValueError:
+            self._log.exception("Invalid coordinates for autofocus plane, aborting.")
+            raise
+
 
     def build_params(self, scan_position_information: ScanPositionInformation) -> AcquisitionParameters:
         # Determine plate dimensions from wellplate format if available
@@ -1968,6 +2000,7 @@ class MultiPointController:
             use_fluidics=self.use_fluidics,
             skip_saving=self.skip_saving or self.validation_mode,
             validation_mode=self.validation_mode,
+            log_af_events=self.log_af_events,
             retract_z_between_regions=self.retract_z_between_regions,
             file_saving_option=self.file_saving_option,
             keep_illuminators_on_between_captures=self.keep_illuminators_on_between_captures,
@@ -2154,6 +2187,12 @@ class MultiPointController:
 
     def validate_acquisition_settings(self) -> bool:
         """Validate settings before starting acquisition"""
+        try:
+            for region_id in getattr(self.scanCoordinates, "region_z_ranges", {}):
+                self._region_nz(region_id)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._log.error(f"Invalid per-region Z range: {exc}")
+            return False
         if getattr(self, "acquisition_order", None) is not None:
             from control.models.acquisition_order import validate_order
             try:
@@ -2164,8 +2203,8 @@ class MultiPointController:
             if self.use_fluidics and self.Nt > 1 and order[0] != "T":
                 self._log.error("Fluidics requires T as the outermost acquisition loop.")
                 return False
-        if self.validation_mode and (not self.do_reflection_af or self.laserAutoFocusController is None):
-            self._log.error("AF validation requires laser autofocus and a valid reference.")
+        if (self.validation_mode or getattr(self, "log_af_events", False)) and (not self.do_reflection_af or self.laserAutoFocusController is None):
+            self._log.error("AF validation/event logging requires laser autofocus and a valid reference.")
             return False
         # Region names (user-editable on the Flexible tab) become folder names, image
         # filename prefixes and the "region" column of every sidecar. Catch anything

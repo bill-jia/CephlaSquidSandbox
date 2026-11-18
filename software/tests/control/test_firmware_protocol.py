@@ -110,6 +110,7 @@ class TestProtocolConsistency:
             "MOVETO_Y": CMD_SET.MOVETO_Y,
             "MOVETO_Z": CMD_SET.MOVETO_Z,
             "MOVETO_W": CMD_SET.MOVETO_W,
+            "MOVETO_W2": CMD_SET.MOVETO_W2,
             "SET_LIM": CMD_SET.SET_LIM,
             "TURN_ON_ILLUMINATION": CMD_SET.TURN_ON_ILLUMINATION,
             "TURN_OFF_ILLUMINATION": CMD_SET.TURN_OFF_ILLUMINATION,

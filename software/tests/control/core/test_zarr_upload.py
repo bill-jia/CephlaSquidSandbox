@@ -29,6 +29,48 @@ from control.core.zarr_upload import (
 _log = squid.logging.get_logger("test_zarr_upload")
 
 
+def test_temp_cleanup_reuses_directory_scan_and_preserves_fresh_files(tmp_path, monkeypatch):
+    from control.core import zarr_upload
+
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"verified payload")
+    stale = [remote / f"{name}.part-orphan" for name in ("a", "b")]
+    fresh = remote / "a.part-active"
+    unrelated = remote / "other.part-orphan"
+    for path in [*stale, fresh, unrelated]:
+        path.write_bytes(b"temporary")
+    for path in [*stale, unrelated]:
+        os.utime(path, (time.time() - 90000, time.time() - 90000))
+    calls = []
+    original = os.listdir
+
+    def counted(path):
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(zarr_upload.os, "listdir", counted)
+    monkeypatch.setattr(zarr_upload.time, "monotonic", lambda: 100)
+    for name in ("a", "b", "c"):
+        assert upload_one_file(str(source), str(remote / name), log=_log)[0]
+        assert (remote / name).read_bytes() == source.read_bytes()
+    assert calls == [str(remote)]
+    assert all(not path.exists() for path in stale)
+    assert fresh.exists() and unrelated.exists()
+
+
+def test_temp_candidate_snapshot_refreshes_in_next_hour(tmp_path):
+    from control.core.zarr_upload import _remote_temp_candidates
+
+    remote = str(tmp_path)
+    assert _remote_temp_candidates(remote, 0) == ()
+    orphan = tmp_path / "a.part-orphan"
+    orphan.write_bytes(b"temporary")
+    assert _remote_temp_candidates(remote, 0) == ()
+    assert _remote_temp_candidates(remote, 1) == (orphan.name,)
+
+
 def _make_local_files(tmp_path, n, size=4096):
     local_base = tmp_path / "exp"
     local_base.mkdir(parents=True, exist_ok=True)

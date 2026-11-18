@@ -177,6 +177,7 @@ class NIDAQWidget(QWidget):
         rate_row = QHBoxLayout()
         rate_row.addWidget(QLabel("Sample Rate (Hz):"))
         self.sample_rate_spin = QDoubleSpinBox()
+        self.sample_rate_spin.setKeyboardTracking(False)
         self.sample_rate_spin.setRange(1, 1000000)
         self.sample_rate_spin.setValue(10000)
         self.sample_rate_spin.setDecimals(0)
@@ -187,6 +188,7 @@ class NIDAQWidget(QWidget):
         samples_row = QHBoxLayout()
         samples_row.addWidget(QLabel("Samples per Channel:"))
         self.num_samples_spin = QSpinBox()
+        self.num_samples_spin.setKeyboardTracking(False)
         self.num_samples_spin.setRange(2, 10000000)
         self.num_samples_spin.setValue(10000)
         samples_row.addWidget(self.num_samples_spin)
@@ -406,6 +408,9 @@ class NIDAQWidget(QWidget):
         daq_dur_row = QHBoxLayout()
         daq_dur_row.addWidget(QLabel("Duration (s):"))
         self.daq_only_duration_spin = QDoubleSpinBox()
+        # Apply typed durations on Enter/focus loss, not each intermediate digit:
+        # valueChanged resizes (and can permanently crop) the stored waveforms.
+        self.daq_only_duration_spin.setKeyboardTracking(False)
         self.daq_only_duration_spin.setRange(0.001, 86400.0)
         self.daq_only_duration_spin.setValue(10.0)
         self.daq_only_duration_spin.setDecimals(3)
@@ -967,6 +972,9 @@ class NIDAQWidget(QWidget):
         for ax in (self.ax_ao, self.ax_do):
             ax.relim()
             ax.autoscale_view()
+        # Empty plots must have the same timebase as populated plots. Otherwise an
+        # initial redraw caches Matplotlib's default limits and clips the first pattern.
+        self.ax_ao.set_xlim(0.0, max(xspan_s, 1.0 / rate))
         tb = getattr(self, "plot_toolbar", None)
         if tb is not None:
             tb.update()          # drop stale nav history
@@ -1668,69 +1676,10 @@ class NIDAQWidget(QWidget):
                 self._log.debug("No outputs configured, nothing to zero")
                 return
             
-            # Create zero waveforms for all configured outputs
-            # Use current config to determine number of samples
-            num_samples = self._ni_daq.samples_per_channel
-            if num_samples == 0:
-                num_samples = 1  # At least one sample needed
-            
-            zero_ao_waveforms = {}
-            zero_do_patterns = {}
-            
-            # Create zero waveforms for analog outputs
-            for channel in ao_channels:
-                zero_ao_waveforms[channel] = np.zeros(num_samples, dtype=np.float64)
-            
-            # Create zero patterns for digital outputs
-            for line in do_lines:
-                zero_do_patterns[line] = np.zeros(num_samples, dtype=bool)
-            
-            # Create a minimal config for writing zeros
-            from control.nidaq import WaveformData, TriggerSource
-            zero_waveforms = WaveformData(
-                analog_output=zero_ao_waveforms,
-                digital_output=zero_do_patterns
-            )
-            
-            # Configure DAQ with minimal settings for writing zeros
-            zero_config = {
-                "device_name": self._ni_daq.device_name,
-                "sample_rate_hz": 1000.0,  # Low rate for quick write
-                "samples_per_channel": num_samples,
-                "ao_channels": ao_channels,
-                "do_port": self._ni_daq.do_port,
-                "do_lines": do_lines,
-                "trigger_source": TriggerSource.SOFTWARE,
-                "continuous": False,
-                "do_logic_family": self._ni_daq.do_logic_family,
-            }
-            
-            # Stop any running tasks first
-            try:
-                self._ni_daq.stop()
-            except:
-                pass
-            
-            # Configure and set zero waveforms
-            self._ni_daq.configure(**zero_config)
-            self._ni_daq.set_waveforms(zero_waveforms)
-            
-            # Arm and trigger to write zeros
-            self._ni_daq.arm()
-            self._ni_daq.start_trigger()
-            
-            # Wait briefly for the write to complete
-            import time
-            time.sleep(0.1)
-            
-            # Stop and release tasks so the device is free for live output or next acquisition
-            self._ni_daq.stop()
-            self._ni_daq.release_tasks()
-            
-            # Note: We do NOT update self._ao_waveforms or self._do_patterns here
-            # to preserve the user's configured waveforms. Only the hardware outputs
-            # are zeroed, not the stored waveform data.
-            
+            # Use dedicated output writes; never restart the full acquisition
+            # (including its input tasks) just to set resting levels.
+            self._ni_daq.zero_outputs(ao_channels, do_lines)
+
             self._log.info(f"Zeroed all outputs: {len(ao_channels)} AO channels, {len(do_lines)} DO lines")
             
         except Exception as e:
@@ -2426,11 +2375,12 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Frame Rate (Hz):"), 0, 0)
         self.frame_rate_spinbox = QDoubleSpinBox()
+        self.frame_rate_spinbox.setKeyboardTracking(False)
         self.frame_rate_spinbox.setRange(0.1, 1000.0)
         self.frame_rate_spinbox.setValue(10.0)
         self.frame_rate_spinbox.setDecimals(2)
         self.frame_rate_spinbox.valueChanged.connect(self._update_max_exposure_time)
-        self.frame_rate_spinbox.valueChanged.connect(self._update_acquisition_time_from_frames)
+        self.frame_rate_spinbox.valueChanged.connect(self._on_frame_rate_changed)
         self.frame_rate_spinbox.valueChanged.connect(self._refresh_max_frame_rate)
         self.max_frame_rate_label = QLabel("")
         self.max_frame_rate_label.setToolTip(
@@ -2457,6 +2407,7 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Number of Frames:"), 1, 0)
         self.num_frames_spinbox = QSpinBox()
+        self.num_frames_spinbox.setKeyboardTracking(False)
         self.num_frames_spinbox.setRange(0, 1000000)
         self.num_frames_spinbox.setValue(100)
         self.num_frames_spinbox.setSpecialValueText("Continuous")
@@ -2465,6 +2416,8 @@ class FastAcquisitionWidget(QWidget):
 
         acq_layout.addWidget(QLabel("Total Acquisition Time (s):"), 1, 2)
         self.total_time_spinbox = QDoubleSpinBox()
+        # Avoid cropping linked waveforms while a duration is still being typed.
+        self.total_time_spinbox.setKeyboardTracking(False)
         self.total_time_spinbox.setRange(0.001, 3600.0)
         self.total_time_spinbox.setValue(10.0)
         self.total_time_spinbox.setDecimals(3)
@@ -2527,6 +2480,7 @@ class FastAcquisitionWidget(QWidget):
 
         daq_layout.addWidget(QLabel("DAQ Sample Rate (Hz):"), 1, 2)
         self.daq_sample_rate_spinbox = QDoubleSpinBox()
+        self.daq_sample_rate_spinbox.setKeyboardTracking(False)
         self.daq_sample_rate_spinbox.setRange(100.0, 1000000.0)
         self.daq_sample_rate_spinbox.setValue(10000.0)
         self.daq_sample_rate_spinbox.setToolTip("Sample rate for NI DAQ waveforms")
@@ -2583,6 +2537,11 @@ class FastAcquisitionWidget(QWidget):
         
         # Connect DAQ sample rate changes
         self.daq_sample_rate_spinbox.valueChanged.connect(self._on_daq_sample_rate_changed)
+        self.ni_daq_widget.link_to_fast_acquisition_checkbox.toggled.connect(
+            lambda linked: self._on_daq_sample_rate_changed(self.daq_sample_rate_spinbox.value())
+            if linked else None
+        )
+        self._on_daq_sample_rate_changed(self.daq_sample_rate_spinbox.value())
         
         # Note: Total acquisition time changes are already handled in 
         # _update_acquisition_time_from_frames and _update_frames_from_acquisition_time
@@ -2783,10 +2742,16 @@ class FastAcquisitionWidget(QWidget):
             # Fallback: keep original maximum
             self.exposure_time_spinbox.setMaximum(10000.0)
     
+    def _on_frame_rate_changed(self):
+        """Keep the requested duration fixed when changing frame rate."""
+        if self.num_frames_spinbox.value() == 0:
+            return  # Preserve explicitly selected continuous acquisition.
+        self._update_frames_from_acquisition_time()
+
     def _update_acquisition_time_from_frames(self):
         """
         Update total acquisition time based on number of frames and frame rate.
-        Called when number of frames or frame rate changes.
+        Called when number of frames changes.
         """
         if self._updating_acquisition_params:
             return
@@ -3075,6 +3040,7 @@ class FastAcquisitionWidget(QWidget):
         
         except Exception as e:
             self._log.error(f"Error starting acquisition: {e}", exc_info=True)
+            self._restore_camera_state()
             error_dialog(f"Failed to start acquisition: {e}", "Error")
     
     def stop_acquisition(self):

@@ -52,6 +52,7 @@ class SeedingSerial(FakeSerialDevice):
 
     # rJ/rV report tenths of a percent, so 1000 == 100%.
     responses = {
+        "rA\r": "rA2",
         "rB\r": "rB3",
         "rC\r": "rC2",
         "rP\r": "rP1",
@@ -85,11 +86,12 @@ def test_driver_seeds_every_cache_from_hardware_at_construction(monkeypatch):
     assert xlight.illumination_iris == 100
     assert xlight.emission_iris == 100
     assert xlight.emission_wheel_pos == 3
+    assert xlight.excitation_wheel_pos == 2
     assert xlight.dichroic_wheel_pos == 2
     assert xlight.slider_position == 1
     assert xlight.spinning_disk_pos == 1
     assert xlight.disk_motor_state is True
-    for command in ("rB\r", "rC\r", "rP\r", "rJ\r", "rV\r", "rD\r", "rN\r"):
+    for command in ("rA\r", "rB\r", "rC\r", "rP\r", "rJ\r", "rV\r", "rD\r", "rN\r"):
         assert command in fake.commands
 
 
