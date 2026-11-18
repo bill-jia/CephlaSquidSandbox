@@ -2071,6 +2071,14 @@ class CameraSettingsWidget(QFrame):
             except Exception:
                 pass
             try:
+                # Observation states can change binning without using the dropdown.
+                # Refresh limits before values so a previous, smaller resolution
+                # cannot clamp the displayed ROI or prevent expanding it again.
+                max_x, max_y = self.camera.get_resolution()
+                self.entry_ROI_offset_x.setMaximum(max_x)
+                self.entry_ROI_offset_y.setMaximum(max_y)
+                self.entry_ROI_width.setMaximum(max_x)
+                self.entry_ROI_height.setMaximum(max_y)
                 ox, oy, w, h = self.camera.get_region_of_interest()
                 self.entry_ROI_offset_x.setValue(int(ox))
                 self.entry_ROI_offset_y.setValue(int(oy))
