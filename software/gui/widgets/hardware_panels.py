@@ -19,6 +19,7 @@ class LaserAutofocusSettingWidget(QWidget):
     # The "Initialize" button now lives in LaserAutofocusControlWidget, which
     # uses this to enable its buttons and drive its success indicator.
     signal_initialization_finished = Signal(bool)
+    signal_initialization_started = Signal()
 
     def __init__(self, streamHandler, liveController: LiveController, laserAutofocusController, stretch=True):
         super().__init__()
@@ -361,11 +362,15 @@ class LaserAutofocusSettingWidget(QWidget):
             "focus_camera_analog_gain": self.analog_gain_spinbox.value(),
             "has_reference": False,
         }
-        self.laserAutofocusController.set_laser_af_properties(updates)
-        success = self.laserAutofocusController.initialize_auto()
-        self.update_threshold_button.setEnabled(success)
-        self.update_calibration_label()
-        self.signal_initialization_finished.emit(bool(success))
+        self.signal_initialization_started.emit()
+        success = False
+        try:
+            self.laserAutofocusController.set_laser_af_properties(updates)
+            success = self.laserAutofocusController.initialize_auto()
+            self.update_threshold_button.setEnabled(success)
+            self.update_calibration_label()
+        finally:
+            self.signal_initialization_finished.emit(bool(success))
 
     def update_threshold_settings(self):
         updates = {
@@ -1548,10 +1553,12 @@ class CameraSettingsWidget(QFrame):
         self.entry_analogGain.setMaximumWidth(120)
 
         left_col = QVBoxLayout()
+        self._camera_details_column = left_col
         left_col.setSpacing(3)
 
         if include_gain_exposure_time:
             exposure_gain_line = QHBoxLayout()
+            self.exposure_gain_row = exposure_gain_line
             exposure_gain_line.setSpacing(6)
             exposure_gain_line.addWidget(QLabel("Exposure Time (ms)"))
             exposure_gain_line.addWidget(self.entry_exposureTime)
@@ -1666,6 +1673,7 @@ class CameraSettingsWidget(QFrame):
             left_col.addLayout(trigger_row)
 
         format_row = QHBoxLayout()
+        self.format_row = format_row
         format_row.setSpacing(6)
         format_row.addWidget(QLabel("Camera Mode"))
         format_row.addWidget(self.dropdown_cameraMode)
@@ -2228,6 +2236,7 @@ class LiveControlWidget(QFrame):
             grid_line05.addWidget(self.label_resolutionScaling)
 
         snap_group = QGroupBox("Snap")
+        self.snap_group = snap_group
         snap_layout = QVBoxLayout()
 
         snap_path_layout = QGridLayout()
@@ -3174,6 +3183,7 @@ class WellSelectionWidget(QTableWidget):
 
         # Calculate cell size based on the minimum of available height and width
         cell_size = available_height // self.rowCount()
+        cell_size = getattr(self, "touch_cell_size", cell_size)
 
         self.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.verticalHeader().setDefaultSectionSize(cell_size)

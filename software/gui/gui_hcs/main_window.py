@@ -137,6 +137,7 @@ class HighContentScreeningGui(QMainWindow):
         touch_console_screen=None,
         skip_init=False,
         skip_homing=False,
+        interface_mode="desktop",
         *args,
         **kwargs,
     ):
@@ -145,6 +146,10 @@ class HighContentScreeningGui(QMainWindow):
         self.log = squid.logging.get_logger(self.__class__.__name__)
         self._skip_init = skip_init
         self._skip_homing = skip_homing
+        if interface_mode not in ("desktop", "touch"):
+            raise ValueError(f"Unknown interface: {interface_mode}")
+        self.interface_mode = interface_mode
+        self.touchInterface = None
 
         self.microscope: control.microscope.Microscope = microscope
         self.stage: AbstractStage = microscope.stage
@@ -612,7 +617,7 @@ class HighContentScreeningGui(QMainWindow):
         self.wellplateFormatWidget = widgets.WellplateFormatWidget(
             self.stage, self.navigationViewer, self.streamHandler, self.liveController
         )
-        if WELLPLATE_FORMAT != "1536 well plate":
+        if WELLPLATE_FORMAT != "1536 well plate" or self.interface_mode == "touch":
             self.wellSelectionWidget = widgets.WellSelectionWidget(WELLPLATE_FORMAT, self.wellplateFormatWidget)
         else:
             self.wellSelectionWidget = widgets.Well1536SelectionWidget(self.wellplateFormatWidget)
@@ -973,13 +978,24 @@ class HighContentScreeningGui(QMainWindow):
 
         dock_settings = dock.Dock("Laser Autofocus Settings", autoOrientation=False)
         dock_settings.showTitleBar()
-        dock_settings.addWidget(self.laserAutofocusSettingWidget)
+        if self.interface_mode == "touch":
+            from .full_interface import make_touch_targets, scroll_panel
+            make_touch_targets(self.laserAutofocusSettingWidget)
+            dock_settings.addWidget(scroll_panel(self.laserAutofocusSettingWidget, True))
+            dock_settings.setMinimumWidth(520)
+        else:
+            dock_settings.addWidget(self.laserAutofocusSettingWidget)
         dock_settings.setStretch(x=100, y=100)
-        dock_settings.setFixedWidth(self.laserAutofocusSettingWidget.minimumSizeHint().width())
+        if self.interface_mode == "desktop":
+            dock_settings.setFixedWidth(self.laserAutofocusSettingWidget.minimumSizeHint().width())
 
         focus_dockArea = dock.DockArea()
         focus_dockArea.addDock(dock_image_display)
         focus_dockArea.addDock(dock_settings, "right", relativeTo=dock_image_display)
+        from .full_interface import contain_image_tools
+        from types import SimpleNamespace
+        contain_image_tools(SimpleNamespace(imageDisplayWindow=self.imageDisplayWindow_focus,
+                                           imageDisplayTabs=focus_dockArea))
 
         if SHOW_LEGACY_DISPLACEMENT_MEASUREMENT_WINDOWS:
             dock_waveform = dock.Dock("Displacement Measurement", autoOrientation=False)
@@ -1156,6 +1172,14 @@ class HighContentScreeningGui(QMainWindow):
         self.stopwatchWidget = widgets.StopwatchWidget()
 
     def setup_layout(self):
+        if self.interface_mode == "touch":
+            from .full_interface import FullTouchInterface
+            self.touchInterface = FullTouchInterface(self)
+            self.setCentralWidget(self.touchInterface)
+            self.setMinimumSize(800, 600)
+            self.resize(1800, 950)
+            self.onTabChanged(self.recordTabWidget.currentIndex())
+            return
         layout = QVBoxLayout()
 
         # Add warning banner if simulated disk I/O mode is enabled
@@ -1258,18 +1282,21 @@ class HighContentScreeningGui(QMainWindow):
         height_min = int(0.9 * primary_screen_size.height())
         width_min = int(0.96 * primary_screen_size.width())
 
-        return (width_min, height_min)
+        return (min(800, width_min), min(600, height_min))
 
     def setupSingleWindowLayout(self):
+        from .full_interface import contain_image_tools, scroll_panel
+        contain_image_tools(self)
         main_dockArea = dock.DockArea()
 
         dock_display = dock.Dock("Image Display", autoOrientation=False)
         dock_display.showTitleBar()
         dock_display.addWidget(self.imageDisplayTabs)
-        dock_display.setStretch(x=3, y=100)
+        dock_display.setStretch(x=100, y=100)
         main_dockArea.addDock(dock_display)
 
         self.dock_wellSelection = dock.Dock("Well Selector", autoOrientation=False)
+        self.dock_wellSelection.setStretch(x=100, y=40)
         self.dock_wellSelection.showTitleBar()
         if not USE_NAPARI_WELL_SELECTION or self.live_only_mode:
             self.dock_wellSelection.addWidget(self.wellSelectionWidget)
@@ -1277,8 +1304,9 @@ class HighContentScreeningGui(QMainWindow):
             main_dockArea.addDock(self.dock_wellSelection, "bottom")
 
         dock_controlPanel = dock.Dock("Controls", autoOrientation=False)
-        dock_controlPanel.addWidget(self.centralWidget)
-        dock_controlPanel.setStretch(x=1, y=100)
+        dock_controlPanel.addWidget(scroll_panel(self.centralWidget))
+        dock_controlPanel.setStretch(x=100, y=100)
+        dock_controlPanel.setMinimumWidth(600)
         main_dockArea.addDock(dock_controlPanel, "right")
         self.setCentralWidget(main_dockArea)
 
@@ -1307,6 +1335,11 @@ class HighContentScreeningGui(QMainWindow):
             self.signal_performance_mode_changed.connect(self.multiPointWithFluidicsWidget.set_performance_mode)
 
         self.recordingControlWidget.signal_acquisition_started.connect(self.toggleAcquisitionStart)
+        self.multipointController.signal_acquisition_start.connect(lambda: self.toggleAcquisitionStart(True))
+        self.multipointController.acquisition_finished.connect(lambda: self.toggleAcquisitionStart(False))
+        if self.fastAcquisitionWidget is not None:
+            self.fastAcquisitionWidget.signal_acquisition_started.connect(lambda: self.toggleAcquisitionStart(True))
+            self.fastAcquisitionWidget.signal_acquisition_finished.connect(lambda: self.toggleAcquisitionStart(False))
 
         self.profileWidget.signal_profile_changed.connect(self._refresh_channel_lists)
         self.profileWidget.signal_profile_changed.connect(self._apply_saving_paths_for_active_profile)
@@ -1427,6 +1460,9 @@ class HighContentScreeningGui(QMainWindow):
             # and status indicator.
             self.laserAutofocusControlWidget.signal_initialize_requested.connect(
                 self.laserAutofocusSettingWidget.apply_and_initialize
+            )
+            self.laserAutofocusSettingWidget.signal_initialization_started.connect(
+                self.laserAutofocusControlWidget.on_initialization_started
             )
             self.laserAutofocusSettingWidget.signal_initialization_finished.connect(
                 self.laserAutofocusControlWidget.on_initialization_finished
@@ -1550,9 +1586,13 @@ class HighContentScreeningGui(QMainWindow):
 
         # Connect well selector button
         if hasattr(self.imageDisplayWindow, "btn_well_selector"):
-            self.imageDisplayWindow.btn_well_selector.clicked.connect(
-                lambda: self.toggleWellSelector(not self.dock_wellSelection.isVisible())
-            )
+            if self.touchInterface is not None:
+                self.imageDisplayWindow.btn_well_selector.setText("Plate / Navigate")
+                self.imageDisplayWindow.btn_well_selector.clicked.connect(lambda: self.touchInterface.select_task("plate"))
+            else:
+                self.imageDisplayWindow.btn_well_selector.clicked.connect(
+                    lambda: self.toggleWellSelector(not self.dock_wellSelection.isVisible())
+                )
 
         # Force one FOV-cache refresh after all signal connections are wired up.
         # The NavigationViewer's cache is seeded during its __init__ using the
@@ -2296,9 +2336,12 @@ class HighContentScreeningGui(QMainWindow):
 
         self.toggleWellSelector(is_wellplate_acquisition and self.wellSelectionWidget.format != "glass slide")
         acquisitionWidget = self.recordTabWidget.widget(index)
-        acquisitionWidget.emit_selected_channels()
+        if hasattr(acquisitionWidget, "emit_selected_channels"):
+            acquisitionWidget.emit_selected_channels()
 
     def resizeCurrentTab(self, tabWidget):
+        if self.interface_mode == "touch":
+            return
         current_widget = tabWidget.currentWidget()
         if current_widget:
             total_height = current_widget.sizeHint().height() + tabWidget.tabBar().height()
@@ -2334,12 +2377,16 @@ class HighContentScreeningGui(QMainWindow):
             self.stageUtils.is_wellplate = True
 
             # replace and reconnect new well selector
-            if format_ == "1536 well plate":
+            if format_ == "1536 well plate" and self.interface_mode != "touch":
                 self.replaceWellSelectionWidget(widgets.Well1536SelectionWidget(self.wellplateFormatWidget))
                 self.connectWellSelectionWidget()
+
             elif isinstance(self.wellSelectionWidget, widgets.Well1536SelectionWidget):
                 self.replaceWellSelectionWidget(widgets.WellSelectionWidget(format_, self.wellplateFormatWidget))
                 self.connectWellSelectionWidget()
+
+        if self.touchInterface is not None:
+            self.touchInterface._zoom_wells(0)
 
         if ENABLE_FLEXIBLE_MULTIPOINT:  # clear regions
             self.flexibleMultiPointWidget.clear_only_location_list()
@@ -2395,7 +2442,9 @@ class HighContentScreeningGui(QMainWindow):
         self.wellSelectionWidget.deleteLater()
         self.wellSelectionWidget = new_widget
         self.scanCoordinates.add_well_selector(self.wellSelectionWidget)
-        if USE_NAPARI_WELL_SELECTION and not self.performance_mode and not self.live_only_mode:
+        if self.touchInterface is not None:
+            self.touchInterface.wells.setWidget(self.wellSelectionWidget)
+        elif USE_NAPARI_WELL_SELECTION and not self.performance_mode and not self.live_only_mode:
             self.napariLiveWidget.replace_well_selector(self.wellSelectionWidget)
         else:
             self.dock_wellSelection.addWidget(self.wellSelectionWidget)
@@ -2407,6 +2456,9 @@ class HighContentScreeningGui(QMainWindow):
             self.wellSelectionWidget.signal_wellSelected.connect(self.wellplateMultiPointWidget.update_well_coordinates)
 
     def toggleWellSelector(self, show, remember_state=True):
+        if self.interface_mode == "touch":
+            self.well_selector_visible = show if remember_state else self.well_selector_visible
+            return
         if show and self.imageDisplayTabs.tabText(self.imageDisplayTabs.currentIndex()) == "Live View":
             self.dock_wellSelection.setVisible(True)
         else:
@@ -2423,6 +2475,29 @@ class HighContentScreeningGui(QMainWindow):
 
     def toggleAcquisitionStart(self, acquisition_started):
         self.log.debug(f"toggleAcquisitionStarted({acquisition_started=})")
+        if getattr(self, "_gui_acquisition_running", False) == acquisition_started:
+            return
+        self._gui_acquisition_running = acquisition_started
+        # One lockout for the authoritative widgets, including desktop and proxies.
+        if acquisition_started and not hasattr(self, "_acquisition_control_states"):
+            controls = [getattr(self, name, None) for name in (
+                "navigationWidget", "objectivesWidget", "cameraSettingWidget", "illuminationWidget",
+                "liveControlWidget", "autofocusWidget", "laserAutofocusControlWidget",
+                "focusMapWidget", "observationStateWidget", "spinningDiskConfocalWidget", "piezoWidget",
+                "laserAutofocusSettingWidget", "stageUtils", "wellplateFormatWidget", "squidFilterWidget",
+                "dacControlWidget")]
+            self._acquisition_control_states = {w: w.isEnabled() for w in controls if w is not None}
+            for widget in self._acquisition_control_states:
+                widget.setEnabled(False)
+        elif not acquisition_started:
+            for widget, enabled in getattr(self, "_acquisition_control_states", {}).items():
+                widget.setEnabled(enabled)
+            if hasattr(self, "_acquisition_control_states"):
+                del self._acquisition_control_states
+        if self.touchInterface is not None:
+            self.touchInterface.set_running(acquisition_started)
+        if self.touchConsole is not None:
+            self.touchConsole.set_acquisition_running(acquisition_started)
         if acquisition_started:
             self.log.info("STARTING ACQUISITION")
             # NDViewer is now configured via push-based API signals (ndviewer_start_acquisition)
@@ -2464,7 +2539,9 @@ class HighContentScreeningGui(QMainWindow):
             self.toggleWellSelector(False)
 
         # display acquisition progress bar during acquisition
-        self.recordTabWidget.currentWidget().display_progress_bar(acquisition_started)
+        widget = self.recordTabWidget.currentWidget()
+        if hasattr(widget, "display_progress_bar"):
+            widget.display_progress_bar(acquisition_started)
 
     def _update_ram_monitor_visibility(self):
         """Update RAM monitor widget visibility based on setting."""
@@ -2623,6 +2700,9 @@ class HighContentScreeningGui(QMainWindow):
             self.log.debug(f"Click to move disabled, ignoring click at {click_x=}, {click_y=}")
 
     def move_from_click_mm(self, x_mm, y_mm):
+        if self.touchInterface is not None:
+            if self.touchInterface.running or not self.touchInterface.map_move.isChecked():
+                return
         if self.navigationWidget.get_click_to_move_enabled():
             self.log.debug(f"Click to move enabled, moving to {x_mm=}, {y_mm=}")
             self.move_to_mm(x_mm, y_mm)
@@ -2819,7 +2899,7 @@ class HighContentScreeningGui(QMainWindow):
 
     def _collect_gui_state(self) -> GuiState:
         """Snapshot transient UI selections for save_gui_state()."""
-        state = GuiState()
+        state = self.microscope.config_repo.get_gui_state() or GuiState()
 
         try:
             state.last_active_objective = self.objectiveStore.current_objective
@@ -2827,15 +2907,25 @@ class HighContentScreeningGui(QMainWindow):
             pass
 
         try:
-            state.window_geometry_b64 = bytes(self.saveGeometry().toBase64()).decode("ascii")
-            state.window_state_b64 = bytes(self.saveState().toBase64()).decode("ascii")
+            if self.interface_mode == "desktop":
+                state.window_geometry_b64 = bytes(self.saveGeometry().toBase64()).decode("ascii")
+                state.window_state_b64 = bytes(self.saveState().toBase64()).decode("ascii")
         except Exception:
             pass
 
         try:
-            state.record_tab_index = int(self.recordTabWidget.currentIndex())
+            if self.interface_mode == "desktop":
+                state.record_tab_index = int(self.recordTabWidget.currentIndex())
         except Exception:
             pass
+
+        from .full_interface import acquisition_id
+        layout_state = {"geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+                        "window_state": bytes(self.saveState().toBase64()).decode("ascii"),
+                        "acquisition": acquisition_id(self.recordTabWidget.currentWidget())}
+        if self.touchInterface is not None:
+            layout_state.update(self.touchInterface.state())
+        state.layouts[self.interface_mode] = layout_state
 
         try:
             state.acquisition_saving_dir = self.multipointController.base_path
@@ -2889,10 +2979,23 @@ class HighContentScreeningGui(QMainWindow):
         if gui_state is None:
             return
         try:
-            if gui_state.window_geometry_b64:
-                self.restoreGeometry(QByteArray.fromBase64(gui_state.window_geometry_b64.encode("ascii")))
-            if gui_state.window_state_b64:
-                self.restoreState(QByteArray.fromBase64(gui_state.window_state_b64.encode("ascii")))
+            saved = gui_state.layouts.get(self.interface_mode, {})
+            geometry = saved.get("geometry") or (gui_state.window_geometry_b64 if self.interface_mode == "desktop" else None)
+            window_state = saved.get("window_state") or (gui_state.window_state_b64 if self.interface_mode == "desktop" else None)
+            if geometry:
+                self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+            if window_state:
+                self.restoreState(QByteArray.fromBase64(window_state.encode("ascii")))
+            available = self.screen().availableGeometry()
+            frame = self.frameGeometry()
+            extra_width = max(0, frame.width() - self.width())
+            extra_height = max(0, frame.height() - self.height())
+            self.resize(min(self.width(), available.width() - extra_width - 8),
+                        min(self.height(), available.height() - extra_height - 8))
+            frame = self.frameGeometry()
+            left = max(available.left() + 4, min(frame.left(), available.right() - frame.width() - 3))
+            top = max(available.top() + 4, min(frame.top(), available.bottom() - frame.height() - 3))
+            self.move(self.pos() + QPoint(left - frame.left(), top - frame.top()))
         except Exception:
             self.log.exception("Failed to restore window geometry")
 
@@ -2924,13 +3027,23 @@ class HighContentScreeningGui(QMainWindow):
                 self.log.exception("Failed to restore last objective")
 
         # Record tab
-        if gui_state.record_tab_index is not None:
+        saved_layout = gui_state.layouts.get(self.interface_mode, {})
+        from .full_interface import acquisition_id
+        saved_acquisition = saved_layout.get("acquisition")
+        if saved_acquisition:
+            for index in range(self.recordTabWidget.count()):
+                if acquisition_id(self.recordTabWidget.widget(index)) == saved_acquisition:
+                    self.recordTabWidget.setCurrentIndex(index)
+                    break
+        elif self.interface_mode == "desktop" and gui_state.record_tab_index is not None:
             try:
                 idx = int(gui_state.record_tab_index)
                 if 0 <= idx < self.recordTabWidget.count():
                     self.recordTabWidget.setCurrentIndex(idx)
             except Exception:
                 self.log.exception("Failed to restore record tab index")
+        if self.touchInterface is not None:
+            self.touchInterface.restore(saved_layout)
 
         # Snap / live settings (save folder is handled by _apply_profile_saving_paths)
         lcw = self.liveControlWidget

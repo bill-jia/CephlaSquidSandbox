@@ -153,6 +153,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulation", help="Run the GUI with simulated hardware.", action="store_true")
     parser.add_argument("--live-only", help="Run the GUI only the live viewer.", action="store_true")
+    parser.add_argument("--interface", choices=("desktop", "touch"), default=None,
+                        help="Full GUI layout: explicit override, remembered choice, then Desktop.")
     parser.add_argument(
         "--touch-console",
         nargs="?",
@@ -216,12 +218,14 @@ if __name__ == "__main__":
     # --profile on the CLI wins; otherwise prompt the user with a dialog. The
     # dialog module is deliberately a lightweight import (Qt + ConfigRepository).
     profile_name = args.profile
+    from gui.profile_selection import prompt_for_launch, resolve_interface_mode
+    interface_mode = resolve_interface_mode(args.interface)
     if profile_name is None:
-        from gui.profile_selection import prompt_for_profile
-        profile_name = prompt_for_profile()
-        if profile_name is None:
+        selection = prompt_for_launch(interface_override=args.interface)
+        if selection is None:
             log.info("Profile selection cancelled — exiting")
             sys.exit(0)
+        profile_name, interface_mode = selection.profile, selection.interface
 
     # Branded splash so the launch never looks like a hang: with the console-less
     # pythonw shortcut there is otherwise no feedback while the heavy GUI/hardware
@@ -270,6 +274,7 @@ if __name__ == "__main__":
         live_only_mode=args.live_only,
         touch_console=args.touch_console is not None,
         touch_console_screen=touch_console_screen,
+        interface_mode=interface_mode,
         skip_init=args.skip_init,
         skip_homing=args.skip_homing,
     )
@@ -307,7 +312,9 @@ if __name__ == "__main__":
     # Close the splash as soon as the main window appears.
     splash.finish(win)
     gui_state = microscope.config_repo.get_gui_state()
-    if gui_state is not None and gui_state.window_geometry_b64:
+    saved_geometry = (gui_state.layouts.get(interface_mode, {}).get("geometry") or
+                      (gui_state.window_geometry_b64 if interface_mode == "desktop" else None)) if gui_state else None
+    if saved_geometry:
         win.show()
         win.apply_persisted_window_state()
     else:

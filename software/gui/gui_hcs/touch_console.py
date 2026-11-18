@@ -269,7 +269,7 @@ class TouchConsoleWindow(QMainWindow):
         focus_row.addWidget(btn_z_down)
         focus_row.addWidget(btn_z_up)
         layout.addLayout(focus_row)
-        self.btn_autofocus = TouchButton("Autofocus")
+        self.btn_autofocus = TouchButton("Laser AF Now")
         self.btn_autofocus.clicked.connect(self._on_autofocus)
         layout.addWidget(self.btn_autofocus)
 
@@ -462,6 +462,16 @@ class TouchConsoleWindow(QMainWindow):
         """
         self._clear_layout(self._illumination_layout)
         self._illumination_rows = []
+
+        controller = getattr(self._microscope, "illumination_controller", None)
+        if controller is not None:
+            from gui.widgets.illumination_main import IlluminationWidget
+            from .full_interface import make_touch_targets
+            self._canonical_illumination = IlluminationWidget(
+                controller, obs_controller=self._obs_controller, objective_store=self._objective_store)
+            make_touch_targets(self._canonical_illumination)
+            self._illumination_layout.addWidget(self._canonical_illumination)
+            return
 
         state = self._obs_controller.current_observation_state
         if state is None or not state.illuminator_states:
@@ -657,11 +667,9 @@ class TouchConsoleWindow(QMainWindow):
                 widget.move_y_forward() if dy > 0 else widget.move_y_backward()
 
     def _on_autofocus(self) -> None:
-        controller = self._gui.autofocusController
-        if controller is None:
-            return
-        self.label_status_acquisition.setText("Autofocusing…")
-        controller.autofocus()
+        widget = getattr(self._gui, "laserAutofocusControlWidget", None)
+        if widget is not None and not self._acquisition_running and not widget.quick_action_unavailable_reason():
+            widget.btn_move_to_target.click()
 
     # ── Saved acquisitions ──────────────────────────────────────────────
 
@@ -720,6 +728,14 @@ class TouchConsoleWindow(QMainWindow):
         QMessageBox.warning(self, "Acquisition failed to start", message)
 
     def _on_abort(self) -> None:
+        record_tabs = getattr(self._gui, "recordTabWidget", None)
+        active = record_tabs.currentWidget() if record_tabs is not None else None
+        if active is not None and active is getattr(self._gui, "fastAcquisitionWidget", None):
+            active.stop_acquisition()
+            return
+        if active is not None and active is getattr(self._gui, "recordingControlWidget", None):
+            active.stop_recording()
+            return
         controller = self._gui.multipointController
         if controller is None:
             return
@@ -829,6 +845,10 @@ class TouchConsoleWindow(QMainWindow):
         self._refresh_selection_highlights()
 
     def _refresh_live_and_camera(self) -> None:
+        af = getattr(self._gui, "laserAutofocusControlWidget", None)
+        reason = af.quick_action_unavailable_reason() if af is not None else "Laser AF hardware unavailable"
+        self.btn_autofocus.setEnabled(not self._acquisition_running and not reason)
+        self.btn_autofocus.setToolTip(reason)
         live_widget = self._gui.liveControlWidget
         if live_widget is not None:
             is_live = bool(self._live_controller.is_live)
@@ -847,6 +867,13 @@ class TouchConsoleWindow(QMainWindow):
                 self.label_gain.setText("gain n/a")
 
     def _refresh_illumination(self) -> None:
+        canonical = getattr(self, "_canonical_illumination", None)
+        if canonical is not None:
+            canonical._refresh_from_state()
+            main_widget = getattr(self._gui, "illuminationWidget", None)
+            if main_widget is not None:
+                main_widget._refresh_from_state()
+            return
         state = self._obs_controller.current_observation_state
         if state is None:
             return
@@ -910,6 +937,11 @@ class TouchConsoleWindow(QMainWindow):
             if widget is not self.btn_abort:
                 widget.setEnabled(not running)
         self.btn_abort.setEnabled(running)
+        canonical = getattr(self, "_canonical_illumination", None)
+        if canonical is not None:
+            canonical.setEnabled(not running)
+        if not running:
+            self._refresh_live_and_camera()
         self.label_status_acquisition.setText("ACQUIRING" if running else "")
         if not running:
             self.label_progress.setText("")

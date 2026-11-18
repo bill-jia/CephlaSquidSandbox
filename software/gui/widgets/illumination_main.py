@@ -1,5 +1,5 @@
 from ._bootstrap import *
-from control.lighting import IlluminationController
+from control.lighting import IlluminationController, LEDMatrixIlluminationDevice
 
 class IlluminationWidget(QWidget):
     """Standalone widget for manual illumination control.
@@ -68,6 +68,8 @@ class IlluminationWidget(QWidget):
         self._obs_controller = obs_controller
         self._objective_store = objective_store
         self._channel_rows: Dict[str, dict] = {}  # channel_name -> {slider, spinbox, btn}
+        self._legacy_matrix_names = []
+        self._legacy_matrix_active = None
 
         self._build_ui()
         self._refresh_from_state()
@@ -100,6 +102,16 @@ class IlluminationWidget(QWidget):
         unified_lm_name: Optional[str] = None
         if getattr(self._controller, "has_unified_led_matrix", lambda: False)():
             unified_lm_name = getattr(self._controller, "unified_led_matrix_channel_name", lambda: None)()
+        else:
+            # Classic device wiring still owns one physical LED matrix. Its
+            # patterns are modes of one presentation row, never independent lamps.
+            self._legacy_matrix_names = [name for name in channel_names
+                if isinstance(getattr(self._controller, "_channel_map", {}).get(name), LEDMatrixIlluminationDevice)]
+            if self._legacy_matrix_names:
+                self._legacy_matrix_active = self._legacy_matrix_names[0]
+                channel_names = ["LED matrix"] + [name for name in channel_names if name not in self._legacy_matrix_names]
+        if unified_lm_name in channel_names:
+            channel_names = [unified_lm_name] + [name for name in channel_names if name != unified_lm_name]
 
         # Option B: show only channels backed by devices, i.e. controller.channel_names.
         # If the controller also exposes an IlluminationChannelConfig, use it only
@@ -132,14 +144,16 @@ class IlluminationWidget(QWidget):
             mode_combo: Optional[QComboBox] = None
             na_spinbox: Optional[QDoubleSpinBox] = None
             cfg_btn: Optional[QToolButton] = None
-            if unified_lm_name and ch_name == unified_lm_name:
+            if (unified_lm_name and ch_name == unified_lm_name) or (self._legacy_matrix_names and ch_name == "LED matrix"):
                 name_cell = QWidget()
                 name_row = QHBoxLayout(name_cell)
                 name_row.setContentsMargins(0, 0, 0, 0)
                 name_row.setSpacing(4)
                 name_row.addWidget(QLabel(label_text))
                 mode_combo = QComboBox()
-                for mode_key, mode_label in self._controller.led_matrix_mode_items():
+                mode_items = ([(name, name) for name in self._legacy_matrix_names]
+                              if self._legacy_matrix_names else self._controller.led_matrix_mode_items())
+                for mode_key, mode_label in mode_items:
                     mode_combo.addItem(mode_label, mode_key)
                 cur_mode = self._controller.get_led_matrix_mode()
                 if cur_mode is not None:
@@ -189,6 +203,8 @@ class IlluminationWidget(QWidget):
                     )
                 )
                 name_row.addWidget(cfg_btn)
+                if self._legacy_matrix_names:
+                    cfg_btn.hide()  # classic MCU patterns expose no array parameters
                 label = name_cell
             else:
                 label = QLabel(label_text)
@@ -278,6 +294,7 @@ class IlluminationWidget(QWidget):
         spinbox.blockSignals(True)
         spinbox.setValue(float(value))
         spinbox.blockSignals(False)
+        channel_name = self._physical_channel(channel_name)
         if self._obs_controller is not None:
             self._obs_controller.set_illumination_intensity(channel_name, float(value))
         else:
@@ -291,6 +308,7 @@ class IlluminationWidget(QWidget):
         slider.blockSignals(True)
         slider.setValue(int(round(value)))
         slider.blockSignals(False)
+        channel_name = self._physical_channel(channel_name)
         if self._obs_controller is not None:
             self._obs_controller.set_illumination_intensity(channel_name, value)
         else:
@@ -303,6 +321,7 @@ class IlluminationWidget(QWidget):
         btn: QPushButton = row["btn"]
         btn.setText("ON" if checked else "OFF")
         self._apply_shutter_style(btn, checked)
+        channel_name = self._physical_channel(channel_name)
         if self._obs_controller is not None:
             self._obs_controller.set_illumination_on_off(channel_name, checked)
         else:
@@ -316,6 +335,20 @@ class IlluminationWidget(QWidget):
         if combo is None:
             return
         mode_key = combo.itemData(index)
+        if self._legacy_matrix_names:
+            previous = self._legacy_matrix_active
+            previous_state = self._controller._channel_state.get(previous)
+            was_on = previous_state is not None and previous_state.is_on
+            self._legacy_matrix_active = mode_key
+            if was_on:
+                if self._obs_controller is not None:
+                    self._obs_controller.set_illumination_on_off(previous, False)
+                    self._obs_controller.set_illumination_on_off(mode_key, True)
+                else:
+                    self._controller.set_channel_state(previous, False)
+                    self._controller.set_channel_state(mode_key, True)
+            self._refresh_from_state()
+            return
         if mode_key is not None:
             if self._obs_controller is not None:
                 self._obs_controller.set_led_matrix_mode(mode_key)
@@ -397,11 +430,18 @@ class IlluminationWidget(QWidget):
                 "QPushButton { background-color: #555; color: #ccc; font-weight: bold; border-radius: 3px; }"
             )
 
+    def _physical_channel(self, name):
+        return self._legacy_matrix_active if name == "LED matrix" and self._legacy_matrix_names else name
+
     def _refresh_from_state(self):
         """Update all UI controls to match the controller's current _channel_state."""
         channel_state: dict = getattr(self._controller, "_channel_state", {})
+        for name in self._legacy_matrix_names:
+            if channel_state.get(name) is not None and channel_state[name].is_on:
+                self._legacy_matrix_active = name
+                break
         for name, row in self._channel_rows.items():
-            state = channel_state.get(name)
+            state = channel_state.get(self._physical_channel(name))
             if state is None:
                 continue
             slider: QSlider = row["slider"]
@@ -419,7 +459,11 @@ class IlluminationWidget(QWidget):
             self._apply_shutter_style(btn, state.is_on)
 
             combo = row.get("mode_combo")
-            if combo is not None and getattr(self._controller, "get_led_matrix_mode", None):
+            if combo is not None and self._legacy_matrix_names:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(combo.findData(self._legacy_matrix_active))
+                combo.blockSignals(False)
+            elif combo is not None and getattr(self._controller, "get_led_matrix_mode", None):
                 mk = self._controller.get_led_matrix_mode()
                 if mk is not None:
                     mi = combo.findData(mk)

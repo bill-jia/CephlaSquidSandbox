@@ -170,7 +170,7 @@ def setup_uncaught_exception_logging():
 
 
 def get_default_log_directory():
-    return("C:/Microscope_Data/logs") # TBD: put this in config files
+    return os.environ.get("SQUID_LOG_DIR", "C:/Microscope_Data/logs")
     # return platformdirs.user_log_path(_squid_root_logger_name, "cephla")
 
 

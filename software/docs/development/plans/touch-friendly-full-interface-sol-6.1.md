@@ -1,6 +1,6 @@
 # Touch-friendly full interface implementation plan
 
-Status: ready for implementation by Sol 6.1. This document is the handoff; it does not implement the redesign.
+Status: implemented on `worktree-touch-console` as an uncommitted working tree based on `5e15842fbf7870cd62985b67b8e530ad899c14f5`. Simulation review is complete; physical touchscreen and hardware verification remain.
 
 ## Objective and agreed requirements
 
@@ -145,3 +145,62 @@ Implementation is complete when Desktop / Touch launches reliably, the agreed pa
 Update `software/docs/touch-console.md` and launch documentation to explain the full Touch layout, optional bench window, preference/CLI behavior, Laser AF Now semantics and capture command. Remove or qualify obsolete claims that touch use prohibits text entry or acquisition building.
 
 In the final implementation response, link directly to the gallery and plan, report the tested commit/state and test results, summarize material limitations, and list anything needing physical touchscreen/hardware verification. Do not claim physical gesture, keyboard, monitor-placement or laser AF validation based only on simulated screenshots.
+
+## Implementation review — October 7, 2026
+
+The implementation includes launcher preference/CLI precedence, separate layout state,
+full task pages using the existing acquisition widgets, persistent actions/status/Abort,
+shared zoomable plate selection, touch scrolling and focus visibility, the authoritative
+Laser AF Now action, and one LED matrix row in both full and bench interfaces.
+Launch and touch-console documentation have been updated.
+
+Review the [generated gallery](../../../../artifacts/touch-interface-2026-10-07-completed/index.html),
+[manifest](../../../../artifacts/touch-interface-2026-10-07-completed/capture_manifest.json)
+and [validation details](../../../../artifacts/touch-interface-2026-10-07-completed/validation.txt).
+The [run without the bench console](../../../../artifacts/touch-interface-2026-10-07-completed-no-bench/index.html)
+also passed. Native Windows Qt captures retain their actual 1904×992 content size
+within the requested 1920×1080 target; focus settings and bench views fit their
+1000×700 and 1280×800 viewports. Both layouts completed short simulated Flexible
+and Wellplate acquisitions with image files, plus Simple Recording start/stop.
+Capture writes use disposable configuration roots and output directories.
+
+Focused regression verification: **316 passed**, with three dependency deprecation
+warnings. An additional region/snapshot check produced **41 passed, 2 failed**:
+`test_go_to_retracts_z_before_the_xy_move` has outdated `MagicMock` retraction-call
+expectations, and `test_observation_snapshot_continuous_capture_uses_saved_illumination_state`
+constructs a worker without `file_saving_option`. The failing tests, stage helper,
+worker implementation and `go_to` operation are unchanged by this work.
+
+Physical touch gestures, native Windows keyboard occlusion/invocation, monitor
+placement/scaling and real laser autofocus remain manual checks. The laser-ready
+image is an injected appearance fixture. Fast Acquisition, tracking, template and
+fluidics workflows retain their configured pages but need their own hardware
+coverage; they are outside the capture fixture.
+
+## Touch layout refinements — October 7, 2026
+
+The latest Touch layout removes the Snap panel and duplicate Start Live control
+from Live / Position. The original Snap folder/tag controls live in the top
+ribbon, and camera exposure/gain/mode/binning/shutter share one row. Navigation
+uses the original motion buttons in a 64-pixel XY joypad and a separate Z arrow
+pair. The histogram is 25% narrower with a matching Autolevel button above it;
+live-image padding is reduced while retaining aspect ratio. Task tabs sit above
+the right controls, LED matrix popup items are taller, and power sliders have
+larger tracks and handles.
+
+Saving/name editors share their width 30/70 throughout Touch. Flexible and
+Wellplate acquisition saving bars and Acquire Current FOV/Start buttons remain
+fixed while the remaining settings scroll. These are the original controls,
+retaining their controller connections and acquisition lockouts.
+
+The [latest gallery](../../../../artifacts/touch-interface-2026-10-07-joypad-reviewed/index.html)
+contains 30 native Windows captures, with no viewport or screen-fit failures.
+Both layouts fit 1904×984 content in the available 1920×1032 screen area and
+completed simulated Flexible/Wellplate acquisitions producing three/two images,
+plus recording start/stop. The capture checks verify both directions of each
+stage axis, Z unit conversion, the camera row, 30/70 editors, fixed acquisition
+controls during scrolling, histogram/Autolevel widths and Start/Stop availability.
+The latest focused regression run passed **99 tests** with three dependency
+deprecation warnings. This is uncommitted work on `worktree-touch-console`, based
+on `5e15842fbf7870cd62985b67b8e530ad899c14f5`; source hashes and the reproduction
+command are in the gallery manifest. The physical checks above remain pending.

@@ -7,6 +7,7 @@ and recorded as the last-active profile through ``ConfigRepository``.
 """
 
 from typing import Optional
+from dataclasses import dataclass
 
 from pathlib import Path
 
@@ -35,10 +36,11 @@ log = squid.logging.get_logger(__name__)
 class ProfileSelectionDialog(QDialog):
     """Modal dialog for choosing (or creating) a user profile at startup."""
 
-    def __init__(self, config_repo: ConfigRepository, parent=None):
+    def __init__(self, config_repo: ConfigRepository, parent=None, interface_override=None):
         super().__init__(parent)
         self.config_repo = config_repo
         self._selected_profile: Optional[str] = None
+        self._interface_override = interface_override
 
         self.setWindowTitle("Select User Profile")
         self.setModal(True)
@@ -99,9 +101,34 @@ class ProfileSelectionDialog(QDialog):
         mc_row.addStretch()
         layout.addLayout(mc_row)
 
+        interface_row = QHBoxLayout()
+        interface_row.addWidget(QLabel("Interface:"))
+        self.combo_interface = QComboBox()
+        self.combo_interface.addItem("Desktop", "desktop")
+        self.combo_interface.addItem("Touch", "touch")
+        self.combo_interface.setCurrentIndex(self.combo_interface.findData(
+            self._interface_override or self.config_repo.get_interface_mode()))
+        self.combo_interface.setEnabled(self._interface_override is None)
+        self.combo_interface.setToolTip("Full interface layout. A command-line override takes precedence.")
+        self.combo_interface.setMinimumHeight(52)
+        interface_row.addWidget(self.combo_interface)
+        layout.addLayout(interface_row)
+
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Load profile")
         layout.addWidget(self.buttons)
+        font = self.font()
+        font.setPointSize(11)
+        self.setFont(font)
+        for label in self.findChildren(QLabel):
+            if len(label.text()) > 100:
+                label.setWordWrap(True)
+        for button in self.findChildren(QPushButton):
+            button.setMinimumHeight(48)
+        for combo in self.findChildren(QComboBox):
+            combo.setMinimumHeight(48)
+            combo.view().setStyleSheet("QAbstractItemView::item { min-height: 48px; }")
+        self.list_profiles.setStyleSheet("QListWidget::item { min-height: 48px; }")
 
     def _connect_signals(self):
         self.list_profiles.itemSelectionChanged.connect(self._update_load_enabled)
@@ -232,6 +259,8 @@ class ProfileSelectionDialog(QDialog):
             return
         self._selected_profile = item.text()
         self._persist_machine_config_choice()
+        if self._interface_override is None:
+            self.config_repo.set_interface_mode(self.combo_interface.currentData())
         self.accept()
 
     def _persist_machine_config_choice(self):
@@ -247,10 +276,20 @@ class ProfileSelectionDialog(QDialog):
         return self._selected_profile
 
 
-def prompt_for_profile(parent=None) -> Optional[str]:
-    """Run the startup profile selector and return the chosen profile name.
+@dataclass(frozen=True)
+class LaunchSelection:
+    profile: str
+    interface: str
 
-    Auto-creates a ``default`` profile (without showing the dialog) when no
+
+def resolve_interface_mode(override=None, repo=None):
+    return override or (repo or ConfigRepository()).get_interface_mode()
+
+
+def prompt_for_launch(parent=None, interface_override=None) -> Optional[LaunchSelection]:
+    """Run the startup selector and return the chosen profile and layout.
+
+    Auto-creates a ``default`` profile before showing the dialog when no
     profiles exist on disk — this matches the legacy behavior so first-run
     users aren't blocked by an empty list. Returns ``None`` if the user
     cancels the dialog.
@@ -260,7 +299,13 @@ def prompt_for_profile(parent=None) -> Optional[str]:
         log.info("No profiles found, creating 'default' before showing selector")
         repo.create_profile("default")
 
-    dialog = ProfileSelectionDialog(repo, parent=parent)
+    dialog = ProfileSelectionDialog(repo, parent=parent, interface_override=interface_override)
     if dialog.exec_() != QDialog.Accepted:
         return None
-    return dialog.selected_profile()
+    return LaunchSelection(dialog.selected_profile(), dialog.combo_interface.currentData())
+
+
+def prompt_for_profile(parent=None) -> Optional[str]:
+    """Compatibility wrapper for profile-switching callers."""
+    selection = prompt_for_launch(parent)
+    return selection.profile if selection else None

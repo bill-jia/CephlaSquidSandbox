@@ -292,10 +292,30 @@ class TestDelegatesToMainGui:
         window._on_objective_selected("40x")
         assert gui_stub.objectiveStore.current_objective == "40x"
 
-    def test_autofocus_calls_the_controller(self, console):
+    def test_laser_af_never_dispatches_contrast_af(self, console):
         window, gui_stub = console
         window._on_autofocus()
-        assert gui_stub.autofocusController.calls == 1
+        assert gui_stub.autofocusController.calls == 0
+        assert window.btn_autofocus.text() == "Laser AF Now"
+
+    def test_laser_af_delegates_and_honors_readiness(self, console):
+        window, gui_stub = console
+        calls = []
+        button = QPushButton()
+        button.clicked.connect(lambda: calls.append("move-to-target"))
+        af = type("LaserAF", (), {"btn_move_to_target": button,
+                                   "reason": "Initialize in Focus Setup",
+                                   "quick_action_unavailable_reason": lambda self: self.reason})()
+        gui_stub.laserAutofocusControlWidget = af
+        window._on_autofocus()
+        assert calls == []
+        af.reason = ""
+        window._on_autofocus()
+        assert calls == ["move-to-target"]
+        window.set_acquisition_running(True)
+        window._on_autofocus()
+        assert calls == ["move-to-target"]
+        assert gui_stub.autofocusController.calls == 0
 
 
 class TestReverseSync:

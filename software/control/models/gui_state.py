@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GuiState(BaseModel):
@@ -30,6 +30,8 @@ class GuiState(BaseModel):
     window_geometry_b64: Optional[str] = None
     window_state_b64: Optional[str] = None
     record_tab_index: Optional[int] = None
+    # Layout identities are stable even if enabled acquisition modes change.
+    layouts: dict[str, dict] = Field(default_factory=dict)
 
     # Save folders (default to C:/Microscope_Data/<profile> when unset)
     snap_saving_dir: Optional[str] = None

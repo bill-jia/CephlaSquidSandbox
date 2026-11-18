@@ -1,11 +1,114 @@
-# Bench Touch Console
+# Full Touch Interface and Bench Console
+
+Select **Desktop / Touch** in the initial profile/machine dialog, or launch with
+`--interface touch`. The accepted choice is remembered locally; cancelling leaves
+it unchanged. Explicit `--interface desktop|touch` takes precedence over the
+remembered choice (including with `--profile`), with Desktop as the first-run
+default. A CLI override applies only to that launch.
+
+The full Touch interface supports experiment names, paths, preset names and
+acquisition building with normal keyboard entry. It has these task pages:
+
+| Task | Controls |
+| --- | --- |
+| Live / Position | Live illumination, one LED matrix with mode selector, camera exposure/gain/binning, expandable ROI/trigger settings, XY/Z, objectives, Snap and observation presets |
+| Focus Setup | Existing contrast AF settings, laser initialization/reference/target/measurement, focus maps, and a focus-camera/calibration dialog |
+| Plate / Navigate | Sample format, enlarged zoomable well selection, map zoom and explicit movement controls |
+| Wellplate Acquisition | Shared well-selection summary, channels, tiling, Z/time, focus, scan order, saving and run controls |
+| Flexible Acquisition | Independent position table, position actions and the complete acquisition controls |
+| Other configured modes | Existing enabled modes, including Simple Recording, Fast Acquisition, tracking, templates and fluidics |
+
+Live, Snap, **Laser AF Now**, position/objective status and progress/Abort remain
+available above the pages. The Snap saving folder, Browse button and tag editor
+live in this top ribbon. Autolevel sits above the live histogram. The task-tab
+ribbon is above the right-hand controls, allowing the image to use the full
+height below the action ribbon. LED matrix dropdown entries have tall touch rows,
+and illumination sliders have wider tracks and 48-pixel handles.
+Live / Position has a single camera-settings row and a 64-pixel XY joypad with
+separate Z up/down arrows, using the existing stage-step controls. Start Live
+appears once in the top ribbon. The histogram is 25% narrower, with a matching
+Autolevel button, and live-image padding is reduced while preserving aspect ratio.
+Save-folder/name editors share their available width 30/70, including the Snap
+folder/tag pair. Flexible and Wellplate Acquisition keep saving/name fields above
+the scrolling settings and Acquire Current FOV/Start buttons below them.
+Acquisition lockouts apply to the underlying controls
+and their proxies. Visiting Live, Focus or Plate preserves the active acquisition
+mode and regions. Choosing an acquisition page selects that acquisition workflow.
+
+There is one well-selection model. **Edit selection** opens Plate / Navigate;
+flexible positions remain independent. A well tap selects; **Go To Selected Well**
+moves the stage. Map double-tap movement requires its explicit toggle. Flexible
+position taps select by default; **Go To Selected Position**, Previous and Next
+request movement, and the existing move-on-click checkbox can opt in to it.
+
+Primary touch targets are 48–52 logical pixels, with tall rows, wide scrollbars,
+touch scrolling, numeric steppers and explicit channel/loop reorder buttons.
+Overflow scrolls. The image/control splitter remembers a separate balance for
+each task; window/tab state is stored separately for Desktop and Touch. Image
+tools remain accessible through a horizontal toolbar scroller. Restored window
+geometry is clamped to the available screen.
+
+**Laser AF Now** delegates to the existing move-to-target operation using its
+configured target, pauses/resumes live imaging, and requires successful
+initialization in this session plus a reference. Cached calibration alone does
+not enable it. Measurement, calibration and reference controls remain separately
+labeled in Focus Setup. Contrast AF retains its existing acquisition behavior;
+live contrast AF and contrast-based reference establishment remain deferred.
+
+The optional bench window below is independently enabled by `--touch-console
+[SCREEN]`. Selecting Touch opens the full interface alone. Both windows share
+one microscope, controllers and observation-state refresh paths.
+
+## Reproducible review gallery
+
+The compact camera row, XY/Z joypad, narrower histogram and fixed acquisition
+bars are shown in the
+[current gallery](../../artifacts/touch-interface-2026-10-07-joypad-reviewed/index.html).
+The [earlier ribbon gallery](../../artifacts/touch-interface-2026-10-07-ribbon-reviewed/index.html)
+is retained for comparison.
+The [initial full-interface gallery](../../artifacts/touch-interface-2026-10-07-completed/index.html)
+is retained with its manifest, capture log and validation results. A separate
+[gallery without the bench window](../../artifacts/touch-interface-2026-10-07-completed-no-bench/index.html)
+verifies both layouts without the companion.
+
+From `software/`, in the Squid Python environment:
+
+```powershell
+$env:QT_QPA_PLATFORM = "windows"
+python tools/screenshot_touch_interface.py ../artifacts/touch-interface-2026-10-07-review --bench
+```
+
+Use a new destination for each run. The utility generates `index.html`, clickable
+full-resolution PNGs, `capture_manifest.json`, `capture.log` and `validation.txt`.
+It captures the launcher, Desktop and Touch pages, empty/populated acquisition
+states, run settings, real short simulated Flexible/Wellplate acquisitions and
+Simple Recording, plus optional bench views. Images retain their actual widget
+size; viewport/screen overflow causes capture failure and is flagged in the gallery.
+The manifest records branch/commit/dirty state, source hashes, fixture details,
+Qt backend, screen/scaling, requested/actual sizes and acquisition image counts.
+
+Each layout runs in a separate disposable configuration root, working directory,
+profile and output folder. Presentation, observation timers, multipoint caches,
+stage caches, application caches and logs are isolated. Child processes and
+simulated hardware are cleaned up on failure and success. The October 7 baseline
+is preserved and linked from the generated gallery.
+
+The ready laser AF screenshot is an injected visual fixture. A reduced viewport
+with a focused field approximates keyboard occlusion; native Windows keyboard
+invocation/occlusion, physical gestures, monitor placement and real laser AF still
+need manual hardware review. Focused editors scroll into view when the viewport
+resizes; the application does not automatically invoke the Windows keyboard.
+Hardware-specific Fast Acquisition, tracking, template and fluidics coverage is
+separate from the default simulation fixture.
+
+## Optional bench console
 
 A finger-driven second window for scopes with no eyepiece and no room for a keyboard and mouse.
 
 The console lives on a small touchscreen next to the microscope and covers what has to happen with
 a hand on the sample: look at it, find it, focus it, snap a frame, and start a saved acquisition.
-Everything else — building acquisitions, calibration, analysis — happens on the full GUI, which you
-reach by remoting into the scope PC from your desk.
+Acquisition building, calibration and analysis use the full Desktop or Touch GUI,
+which can be used locally with the available keyboard or through a remote session.
 
 ```
 ┌───────────────────────────┐        ┌──────────────────────────────┐
@@ -78,8 +181,8 @@ filename becomes the button label.
 - **Live** — start/stop, snap, autolevel
 - **Channel** — one button per saved Observation State preset
 - **Exposure / gain** — ± steppers
-- **Illumination** — per-illuminator on/off, a coarse slider plus ±1% fine steppers, and a master off
-- **Focus** — Z jog at 1 / 5 / 25 µm with press-and-hold repeat, and autofocus
+- **Illumination** — one LED matrix with a mode selector, independent illuminator on/off, and ±1% fine steppers, and a master off
+- **Focus** — Z jog at 1 / 5 / 25 µm with press-and-hold repeat, and Laser AF Now
 - **Stage** — XY D-pad at 0.05 / 0.2 / 1.0 mm, plus **tap the image to center that point**
 - **Objective** — one button per configured objective
 - **Acquire** — one button per preset, with confirm, live progress, and abort
@@ -89,10 +192,10 @@ mouse events for unhandled touches and pyqtgraph's ViewBox handles those.
 
 ## What it deliberately cannot do
 
-- **No text entry.** There is no keyboard at the bench. The snap directory is fixed by config and
+- **Preset-oriented controls.** The optional console uses generated filenames. The snap directory is fixed by config and
   filenames are generated; acquisition presets are picked from a list, never typed.
-- **No acquisition building.** Regions, z-stacks, timelapses, and channel sets are configured on the
-  full GUI.
+- **Acquisition building uses the full interface.** Regions, z-stacks, timelapses, and channel sets are configured on the
+  full Desktop or Touch GUI.
 - **No closing.** `closeEvent` is ignored unless the main window is shutting down, so a stray touch
   cannot strand you at the bench with no display.
 - **Nothing during an acquisition** except watching progress and pressing Abort — every other
@@ -133,11 +236,10 @@ main window:
 | Exposure / gain | `cameraSettingWidget.entry_exposureTime.setValue(...)` |
 | Objective | `objectivesWidget.dropdown.setCurrentText(...)` |
 | XY / Z jog | `navigationWidget.set_delta{X,Y,Z}` + `move_{x,y,z}_{forward,backward}` |
-| Autofocus | `autofocusController.autofocus()` |
+| Laser AF Now | `laserAutofocusControlWidget.btn_move_to_target.click()` with readiness and acquisition lockout |
 | Tap-to-center | `imageDisplayWindow.image_click_coordinates` → `move_from_click_image` |
 
-Consequences worth knowing: divergence between the two UIs is structurally impossible, no existing
-widget needed to change, and the console degrades gracefully — any widget that does not exist in a
+Consequences worth knowing: divergence between the two UIs is structurally impossible, presentation controls share the same authoritative state, and the console degrades gracefully — any widget that does not exist in a
 given machine configuration simply makes its console control a no-op.
 
 Reads go the other way through a 5 Hz `QTimer`, guarded by a `_syncing` flag so a refresh never
@@ -230,34 +332,11 @@ Loading a console preset refreshes the companion camera, illumination, and confo
 controls through the same callback used by the main menu. Updates to the companion's
 preset lists also refresh the console's channel buttons.
 
-## Touchscreen proposals from the October 7 captures
+## October 7 baseline
 
-The console fits 1280 by 800, but its long illumination list pushes focus, stage,
-objectives, and acquisition below the fold. The companion's current layout expands
-to 3302 by 1296 even when 1920 by 1080 is requested. Its small inputs, table rows,
-checkboxes, and densely packed panels need layout changes as well as larger fonts.
-
-Proposals for discussion, not implemented:
-
-1. Keep Live, Snap, XY/Z movement, and acquisition Stop/Abort permanently accessible.
-   Replace the long console column with large tabs for Imaging, Focus/Stage, and
-   Acquisition. Keep the image visible while changing tabs and support finger scrolling.
-2. Add an optional touch layout to the full GUI, reusing its existing widgets and
-   controllers. Use task pages for Locate, Channels, Positions, Z/Time, and Run/Review.
-   Move camera ROI, triggering, calibration, and detailed scan-order controls into
-   expandable settings panels. This should remove the current oversized minimum width.
-3. Use roughly 52-pixel touch targets consistently: large steppers and a numeric keypad
-   with units and limits, taller position rows, and buttons for reorder operations.
-   Provide an on-screen keyboard for names and a touch-friendly destination picker.
-4. Give plate selection more room: zoomable wells, explicit select-versus-move modes,
-   and large Add Current Position / Go To Selected actions. The present miniature map
-   is hard to target, while the separate well selector competes with live-image space.
-5. Make acquisition setup possible at the bench: choose channels, select wells or
-   positions, configure Z/time, inspect a summary, then run or save a preset. Keep
-   progress and Abort visible throughout; apply the existing acquisition lockout to
-   every touch page.
-
-Start with the persistent bench controls and one full acquisition workflow. Evaluate
-at 1280 by 800 and 1920 by 1080 before extending the layout to every settings dialog.
-The screenshots establish the layout baseline; they do not validate physical touch
-gestures, monitor placement, real camera performance, or a complete acquisition run.
+The original captures showed the desktop companion expanding to 3302 by 1296.
+The full Touch implementation above replaces those layout proposals. Both new
+layouts contain toolbar and control minimum sizes through scrollable panels.
+The baseline gallery remains available for comparison; simulated captures do not
+validate physical touch gestures, monitor placement, native keyboard behavior
+or real camera/laser performance.

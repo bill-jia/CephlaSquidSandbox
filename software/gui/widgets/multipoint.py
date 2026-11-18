@@ -2060,6 +2060,7 @@ def _make_acquisition_body(widget, focus_section, saving_section, scan_section) 
     body.addLayout(block_column, 1)
     body.addSpacing(12)
     body.addLayout(channels_group, 1)
+    widget._acquisition_body_layout = body
     return body
 
 
@@ -4199,7 +4200,7 @@ class FlexibleMultiPointWidget(_WritebackStatusMixin, _ZTimeGroupMixin, Acquisit
         self.update_fov_positions()
 
     def update_fov_positions(self):
-        if not self.isVisible():
+        if not getattr(self, "acquisition_is_active", self.isVisible)():
             return
 
         if self.scanCoordinates.has_regions():

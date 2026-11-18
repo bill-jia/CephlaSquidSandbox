@@ -1,7 +1,7 @@
 """Drag-to-reorder loop blocks, with an explicit nested-bracket preview."""
 
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtWidgets import QAbstractItemView, QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QAbstractItemView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
 
 from control.models.acquisition_order import DEFAULT_ORDER, validate_order
 
@@ -43,6 +43,24 @@ class AcquisitionOrderWidget(QWidget):
 
     def order(self):
         return tuple(self.blocks.item(i).data(Qt.UserRole) for i in range(self.blocks.count()))
+
+    def enable_touch_controls(self):
+        """Explicit outer/inner loop moves alongside the existing drag operation."""
+        self.blocks.setFixedHeight(60)
+        row = QHBoxLayout()
+        for label, delta in (("Move outer ←", -1), ("Move inner →", 1)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _, d=delta: self._move_selected(d))
+            row.addWidget(button)
+        self.layout().addLayout(row)
+
+    def _move_selected(self, delta):
+        index = self.blocks.currentRow()
+        target = index + delta
+        if index >= 0 and 0 <= target < self.blocks.count():
+            self.blocks.model().moveRows(self.blocks.rootIndex(), index, 1,
+                                        self.blocks.rootIndex(), target + (delta > 0))
+            self.blocks.setCurrentRow(target)
 
     def restore(self, order):
         order = validate_order(order)

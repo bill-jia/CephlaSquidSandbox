@@ -18,6 +18,7 @@ Organization:
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
@@ -103,7 +104,7 @@ class ConfigRepository:
         """
         if base_path is None:
             # Default to software/ directory (4 levels up from this file)
-            base_path = Path(__file__).parent.parent.parent.parent
+            base_path = Path(os.environ.get("SQUID_CONFIG_ROOT", Path(__file__).parent.parent.parent.parent))
         self.base_path = Path(base_path)
         self.machine_configs_path = self.base_path / "machine_configs"
         self.machine_config_library_path = self.machine_configs_path / "library"
@@ -112,6 +113,19 @@ class ConfigRepository:
         self._current_profile: Optional[str] = None
         self._machine_cache: Dict[str, Any] = {}
         self._profile_cache: Dict[str, Any] = {}
+
+    def get_interface_mode(self) -> str:
+        """Machine/user-local presentation preference, separate from hardware."""
+        path = self.base_path / "cache" / "interface.txt"
+        mode = path.read_text(encoding="utf-8").strip() if path.exists() else "desktop"
+        return mode if mode in ("desktop", "touch") else "desktop"
+
+    def set_interface_mode(self, mode: str) -> None:
+        if mode not in ("desktop", "touch"):
+            raise ValueError(f"Unknown interface: {mode}")
+        path = self.base_path / "cache" / "interface.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(mode, encoding="utf-8")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # GENERIC I/O

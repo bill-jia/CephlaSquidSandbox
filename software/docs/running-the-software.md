@@ -1,5 +1,23 @@
 # Running the software
 
+Choose **Desktop** or **Touch** in the initial profile/machine dialog. Touch is
+the full application with task pages and acquisition setup, intended for a
+15-inch 1920×1080 touchscreen with a keyboard. The accepted choice is remembered
+in `software/cache/interface.txt`; cancelling leaves it unchanged.
+
+`Squid.bat --interface touch` (or `python main_hcs.py --interface touch`) overrides
+the remembered choice for that launch. Precedence is explicit `--interface`,
+then the remembered choice, then Desktop. This also applies to `--profile NAME`,
+which bypasses the picker. A CLI override does not change the remembered choice.
+Window geometry, active acquisition identity, task and splitter positions are
+stored separately for each layout in the profile's `gui_state.yaml`.
+
+`--touch-console [SCREEN]` independently opens the optional second bench window.
+Choosing Touch does not open that window or create another hardware owner.
+**Laser AF Now** uses the configured laser AF target; initialize and set a
+reference in Focus Setup before using it. See [Touch interface and bench console](touch-console.md)
+for task navigation and the reproducible simulation review command.
+
 There are two ways to launch, both of which skip the slow
 `conda activate` step:
 

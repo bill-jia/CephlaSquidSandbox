@@ -585,6 +585,7 @@ class LaserAutofocusControlWidget(QFrame):
         # A cache load configures the ROI but does NOT re-locate the spot, so it does
         # not count as initialized for the purpose of enabling Set Reference / Measure.
         self._session_initialized = False
+        self._action_busy = False
         self.add_components()
         self.update_init_state()
         self.setFrameStyle(QFrame.Panel | QFrame.Raised)
@@ -620,7 +621,7 @@ class LaserAutofocusControlWidget(QFrame):
         self.entry_target.setValue(0)
         self.entry_target.setKeyboardTracking(False)
 
-        self.btn_move_to_target = QPushButton("Move to Target")
+        self.btn_move_to_target = QPushButton("Laser AF Now")
         self.btn_move_to_target.setCheckable(False)
         self.btn_move_to_target.setChecked(False)
         self.btn_move_to_target.setDefault(False)
@@ -668,9 +669,24 @@ class LaserAutofocusControlWidget(QFrame):
         """Enable the action buttons only once the spot has been located this session.
         Measure/Move additionally require a stored reference."""
         has_reference = self.laserAutofocusController.laser_af_properties.has_reference
-        self.btn_set_reference.setEnabled(self._session_initialized)
-        self.btn_measure_displacement.setEnabled(self._session_initialized and has_reference)
-        self.btn_move_to_target.setEnabled(self._session_initialized and has_reference)
+        ready = self._session_initialized and not self._action_busy
+        self.btn_initialize.setEnabled(not self._action_busy)
+        self.btn_set_reference.setEnabled(ready)
+        self.btn_measure_displacement.setEnabled(ready and has_reference)
+        self.btn_move_to_target.setEnabled(ready and has_reference)
+
+    def quick_action_unavailable_reason(self):
+        if not self.isEnabled():
+            return "Controls locked"
+        if self._action_busy:
+            return "Laser AF busy"
+        if not self._session_initialized:
+            return "Initialize in Focus Setup"
+        if not self.laserAutofocusController.laser_af_properties.has_reference:
+            return "Set reference in Focus Setup"
+        if not self.btn_move_to_target.isEnabled():
+            return "Laser AF unavailable"
+        return ""
 
     def update_init_state(self):
         """Refresh after construction or a profile/objective change.
@@ -683,32 +699,53 @@ class LaserAutofocusControlWidget(QFrame):
         self._apply_button_state()
         self._set_status_indicator("cached" if self.laserAutofocusController.is_initialized else "off")
 
+    def on_initialization_started(self):
+        self._action_busy = True
+        self._session_initialized = False
+        self._apply_button_state()
+
     def on_initialization_finished(self, success: bool):
         """Slot for the settings widget's signal_initialization_finished. Only a
         successful initialize_auto here marks the session as verified (green)."""
+        self._action_busy = False
         self._session_initialized = bool(success)
         self._apply_button_state()
         self._set_status_indicator("ok" if success else "failed")
 
     def move_to_target(self):
+        if self.quick_action_unavailable_reason():
+            return
         was_live = self.liveController.is_live
-        if was_live:
-            self.liveController.stop_live()
-        self.laserAutofocusController.move_to_target(self.entry_target.value())
-        if was_live:
-            self.liveController.start_live()
+        self._action_busy = True
+        self._apply_button_state()
+        try:
+            if was_live:
+                self.liveController.stop_live()
+            self.laserAutofocusController.move_to_target(self.entry_target.value())
+        finally:
+            self._action_busy = False
+            self._apply_button_state()
+            if was_live:
+                self.liveController.start_live()
 
     def on_set_reference_clicked(self):
         """Handle set reference button click"""
+        if not self.isEnabled() or not self.btn_set_reference.isEnabled() or self._action_busy:
+            return
         was_live = self.liveController.is_live
-        if was_live:
-            self.liveController.stop_live()
-        success = self.laserAutofocusController.set_reference()
-        if was_live:
-            self.liveController.start_live()
+        self._action_busy = True
+        self._apply_button_state()
+        try:
+            if was_live:
+                self.liveController.stop_live()
+            success = self.laserAutofocusController.set_reference()
+        finally:
+            self._action_busy = False
+            self._apply_button_state()
+            if was_live:
+                self.liveController.start_live()
         if success:
-            self.btn_measure_displacement.setEnabled(True)
-            self.btn_move_to_target.setEnabled(True)
+            self._apply_button_state()
         else:
             QMessageBox.warning(
                 self,
@@ -718,20 +755,26 @@ class LaserAutofocusControlWidget(QFrame):
             )
 
     def on_measure_displacement_clicked(self):
+        if self.quick_action_unavailable_reason():
+            return
         was_live = self.liveController.is_live
-        if was_live:
-            self.liveController.stop_live()
-        result = self.laserAutofocusController.measure_displacement()
+        self._action_busy = True
+        self._apply_button_state()
+        try:
+            if was_live:
+                self.liveController.stop_live()
+            result = self.laserAutofocusController.measure_displacement()
+        finally:
+            self._action_busy = False
+            self._apply_button_state()
+            if was_live:
+                self.liveController.start_live()
         if math.isnan(result):
             QMessageBox.warning(
                 self,
                 "Measurement Failed",
                 "Could not measure displacement. Please ensure the reference position is set.",
             )
-        if was_live:
-            self.liveController.start_live()
-
-
 # Keys shipped with default sample_formats.csv; user-added formats may be removed from the UI.
 _BUILTIN_WELLPLATE_FORMAT_KEYS = frozenset(
     {
