@@ -63,6 +63,8 @@ from control.core.job_processing import (
     JobImage,
     JobRunner,
     JobResult,
+    DrainJobResultsJob,
+    JobResultsDrained,
     DownsampledViewJob,
     DownsampledViewResult,
     FlushAndStageUploadJob,
@@ -2403,6 +2405,18 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             (job_class, job_runner) for job_class, job_runner in self._job_runners if job_runner is not None
         ]
 
+        # has_pending() tracks computation, not delivery of the large preview
+        # arrays. Wait for a FIFO output marker before shutdown can discard the
+        # postprocessing feeder and lose the final derived-channel previews.
+        self._postprocess_result_barriers = set()
+        for job_class, job_runner in active_runners:
+            if job_class is PostprocessJob:
+                barrier = DrainJobResultsJob()
+                self._postprocess_result_barriers.add(barrier.job_id)
+                if not job_runner.dispatch(barrier):
+                    self._postprocess_result_barriers.discard(barrier.job_id)
+                    self._log.error("Could not dispatch the postprocess preview delivery barrier")
+
         self._log.info(f"Waiting for jobs to finish on {len(active_runners)} job runners before shutting them down...")
         timeout_time = time.time() + timeout_s
 
@@ -2416,7 +2430,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 if job_runner.has_pending():
                     any_pending = True
                     break
-            if not any_pending:
+            if not any_pending and not self._postprocess_result_barriers:
                 break
             # Process any available results while waiting
             self._summarize_runner_outputs(drain_all=True)
@@ -2438,6 +2452,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                         f"they will finish and finalize during shutdown "
                         f"(up to {JOB_RUNNER_FINALIZE_TIMEOUT_S} [s])."
                     )
+
+            if self._postprocess_result_barriers:
+                self._log.warning("Postprocess preview delivery did not finish within the job drain timeout.")
 
         # Drain results before shutdown
         self._summarize_runner_outputs(drain_all=True)
@@ -3307,6 +3324,9 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             return False
         else:
             # self._log.debug(f"Got result for job {job_result.job_id}, it completed!")
+            if isinstance(job_result.result, JobResultsDrained):
+                getattr(self, "_postprocess_result_barriers", set()).discard(job_result.result.barrier_id)
+                return True
             # Handle DownsampledViewResult - update plate view
             if isinstance(job_result.result, DownsampledViewResult) and job_result.result.well_images:
                 self._handle_downsampled_view_result(job_result.result)

@@ -186,6 +186,27 @@ class JobResult(Generic[T]):
     exception: Optional[Exception]
 
 
+@dataclass
+class JobResultsDrained:
+    barrier_id: str
+
+
+@dataclass
+class DrainJobResultsJob:
+    """FIFO acknowledgement that every preceding result reached the parent.
+
+    A multiprocessing Queue's put() only buffers the result for its feeder
+    thread. Receiving this marker guarantees that earlier, potentially large
+    preview arrays have also crossed the output pipe.
+    """
+
+    job_id: str = field(default_factory=lambda: str(uuid4()))
+    capture_image: JobImage = field(default_factory=lambda: JobImage(image_array=None))
+
+    def run(self) -> JobResultsDrained:
+        return JobResultsDrained(self.job_id)
+
+
 # Timeout in seconds for acquiring file locks during OME-TIFF writing
 FILE_LOCK_TIMEOUT_SECONDS = 10
 
