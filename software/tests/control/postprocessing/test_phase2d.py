@@ -155,7 +155,7 @@ def test_transfer_function_cached_across_calls(monkeypatch):
     ctx = _ctx(nz)  # shared cache across the two calls
     r.process({"BF": stack}, ctx, _params())
     r.process({"BF": stack}, ctx, _params())
-    assert calls["n"] == 1  # transfer function computed once, reused on the 2nd FOV
+    assert calls["n"] == nz  # one call per optical plane, reused on the 2nd FOV
 
 
 def test_warmup_makes_first_process_a_cache_hit(monkeypatch):
@@ -178,7 +178,46 @@ def test_warmup_makes_first_process_a_cache_hit(monkeypatch):
     ctx = _ctx(nz)
     ctx.yx_shape = (yx, yx)
     r.warmup({"BF": InputStateSpec("BF", acquire_z_stack=True, frames_per_visit=1)}, ctx, _params())
-    assert calls["n"] == 1
+    assert calls["n"] == nz
     stack = np.stack([np.full((yx, yx), 1000 + 3 * i, np.float32) for i in range(nz)], axis=0)[np.newaxis]
     r.process({"BF": stack}, ctx, _params())
-    assert calls["n"] == 1  # first FOV reused the warmed transfer function
+    assert calls["n"] == nz  # first FOV reused the warmed transfer function
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("nz,invert", [(6, False), (7, True)])
+def test_bounded_transfer_function_matches_waveorder(monkeypatch, device, nz, invert):
+    """Compare reconstructed data, since SVD vectors can have arbitrary phase."""
+    import torch
+    import xarray as xr
+    from waveorder.api import phase
+    from waveorder.models import isotropic_thin_3d as itd
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    r = Phase2DRoutine()
+    ctx = _ctx(nz, pixel=0.65)  # exercise Waveorder's optical oversampling
+    params = {**_params(), "invert_phase_contrast": invert}
+    settings = r._build_settings(r._resolve(ctx, params, "BF", nz))
+    shape = (19, 23)  # non-square, partial final SVD batch
+    data = xr.DataArray(
+        np.random.default_rng(12).uniform(900, 1100, (1, nz, *shape)).astype(np.float32),
+        dims=("c", "z", "y", "x"),
+        coords={"c": ["BF"], "z": np.arange(nz), "y": np.arange(shape[0]), "x": np.arange(shape[1])},
+    )
+    reference_tf = phase.compute_transfer_function(data, recon_dim=2, settings=settings, device=device)
+    reference = phase.apply_inverse_transfer_function(data, reference_tf, recon_dim=2, settings=settings, device=device)
+    original_svd = itd.calculate_singular_system
+    batches = []
+
+    def bounded_svd(a, p):
+        batches.append(a.shape[-2] * a.shape[-1])
+        assert batches[-1] <= 64
+        return original_svd(a, p)
+
+    monkeypatch.setattr(itd, "calculate_singular_system", bounded_svd)
+    with torch.no_grad():
+        tf = r._compute_transfer_function(settings, shape, nz, device=device, max_svd_pixels=64)
+    actual = phase.apply_inverse_transfer_function(data, tf, recon_dim=2, settings=settings, device=device)
+    assert len(batches) > 1 and sum(batches) == np.prod(shape)
+    np.testing.assert_allclose(actual.values, reference.values, rtol=1e-4, atol=1e-5)

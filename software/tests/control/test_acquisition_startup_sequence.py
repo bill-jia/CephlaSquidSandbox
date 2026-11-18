@@ -9,6 +9,67 @@ import pytest
 from control.core.multi_point_worker import MultiPointWorker
 
 
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("fatal", [False, True])
+def test_cuda_warmup_failure_aborts_before_capture(inline, fatal):
+    from control.core.job_processing import JobResult, PostprocessWarmupResult
+
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker._log = Mock()
+    worker._acquisition_error_count = 0
+    worker.request_abort_fn = Mock()
+    worker.abort_requested_fn = lambda: False
+    result = PostprocessWarmupResult("key", "BF", ok=False, error="warmup failed", fatal=fatal)
+    if inline:
+        future = Future()
+        future.set_result([result])
+        worker._wait_for_postprocess_warmup(future)
+    else:
+        assert worker._summarize_job_result(JobResult(job_id="warmup", result=result, exception=None)) is not fatal
+    assert worker.request_abort_fn.call_count == int(fatal)
+    assert worker._acquisition_error_count == int(fatal)
+
+
+def test_warmup_waits_for_result_after_pending_counter_reaches_zero():
+    from control.core.job_processing import PostprocessWarmupResult
+
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    worker._log = Mock()
+    worker._acquisition_error_count = 0
+    worker._postprocess_warmup_pending = {"key"}
+    aborted = Event()
+    worker.request_abort_fn = aborted.set
+    worker.abort_requested_fn = aborted.is_set
+    attempts = []
+
+    def delayed_delivery():
+        attempts.append(True)
+        if len(attempts) == 2:
+            worker._handle_postprocess_warmup_result(
+                PostprocessWarmupResult("key", "BF", ok=False, error="CUDA error", fatal=True)
+            )
+
+    worker._summarize_runner_outputs = delayed_delivery
+    worker._wait_for_postprocess_warmup(SimpleNamespace(has_pending=lambda: False))
+    assert aborted.is_set()
+    assert not worker._postprocess_warmup_pending
+
+
+def test_runner_results_are_all_handled_after_a_failure():
+    from queue import Queue
+
+    worker = MultiPointWorker.__new__(MultiPointWorker)
+    queue = Queue()
+    queue.put("failure")
+    queue.put("next result")
+    worker._job_runners = [(object, SimpleNamespace(output_queue=lambda: queue))]
+    worker._summarize_job_result = Mock(side_effect=[False, True])
+    worker._drain_upload_results = Mock()
+    result = worker._summarize_runner_outputs(drain_all=True)
+    assert worker._summarize_job_result.call_count == 2
+    assert not result.none_failed and result.had_results
+
+
 @pytest.mark.parametrize("focus_mode", ["contrast", "legacy", "scan"])
 @pytest.mark.parametrize("failure", [False, True])
 def test_compute_and_upload_overlap_optics_but_focus_is_last(focus_mode, failure):

@@ -1485,6 +1485,7 @@ class PostprocessWarmupResult:
     label: str
     ok: bool
     error: Optional[str] = None
+    fatal: bool = False
 
 
 @dataclass
@@ -1923,9 +1924,15 @@ class PostprocessWarmupJob:
             routine.warmup(input_states, ctx, dict(self.spec_dict.get("params", {})))
             return PostprocessWarmupResult(routine_key=key, label=self.label, ok=True)
         except Exception as e:
-            # Non-fatal: fall back to lazy compute on the first FOV.
-            self._log.warning(f"Postprocess warmup for {self.label!r} failed (will compute lazily): {e}")
-            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=False, error=str(e))
+            # A CUDA failure may poison this process's context. Retrying the
+            # same geometry during capture cannot repair it, and raw inputs to
+            # postprocessing are not saved. Stop before acquiring those inputs.
+            fatal = any(token in str(e).lower() for token in ("cuda", "cusolver", "cufft"))
+            action = "acquisition must stop; restart the worker before retrying" if fatal else "will compute lazily"
+            self._log.warning(
+                "Postprocess warmup for %r failed (%s): %s", self.label, action, e, exc_info=True
+            )
+            return PostprocessWarmupResult(routine_key=key, label=self.label, ok=False, error=str(e), fatal=fatal)
 
 
 # These are debugging jobs - they should not be used in normal usage!

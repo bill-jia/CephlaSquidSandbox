@@ -476,6 +476,26 @@ def test_routine_key_distinguishes_params():
     assert a != b and a == same
 
 
+@pytest.mark.parametrize("message,fatal", [
+    ("CUDA error: an illegal memory access was encountered", True),
+    ("CUDA out of memory", True),
+    ("cuSOLVER failed", True),
+    ("optional precomputation unavailable", False),
+])
+def test_warmup_cuda_failure_is_fatal_and_logs_traceback(monkeypatch, caplog, message, fatal):
+    from types import SimpleNamespace
+    from control.core.job_processing import PostprocessWarmupJob
+
+    def fail(*args):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(PostprocessJob, "ensure_routine", lambda spec: (SimpleNamespace(warmup=fail), {}))
+    result = PostprocessWarmupJob(label="BF", spec_dict={"routine": "stub"}).run()
+    assert not result.ok and result.fatal is fatal
+    assert result.error == message
+    assert any(record.exc_info is not None for record in caplog.records)
+
+
 def test_disk_estimate_excludes_postprocessed_raw_and_adds_derived():
     """The disk-size estimator must NOT count postprocessed raw frames (they are
     consumed by the routine and never saved) and MUST add the derived output

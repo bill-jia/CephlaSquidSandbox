@@ -3085,7 +3085,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             while True:
                 try:
                     job_result: JobResult = out_queue.get_nowait()
-                    none_failed = none_failed and self._summarize_job_result(job_result)
+                    none_failed = self._summarize_job_result(job_result) and none_failed
                     had_results = True
                     if not drain_all:
                         break  # Only process one result per queue if not draining
@@ -3342,14 +3342,26 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                     self._handle_barrier_result(br)
                 self._emit_postprocess_display(pr)
                 return pr.error is None
-            # Pre-acquisition routine warmup finished (non-fatal if it failed).
+            # CUDA warmup failures must stop capture; other failures can retry lazily.
             elif isinstance(job_result.result, PostprocessWarmupResult):
-                wr = job_result.result
-                if wr.ok:
-                    self._log.info(f"Postprocess routine warmup complete: {wr.label}")
-                else:
-                    self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
+                return self._handle_postprocess_warmup_result(job_result.result)
             return True
+
+    def _handle_postprocess_warmup_result(self, wr: PostprocessWarmupResult) -> bool:
+        getattr(self, "_postprocess_warmup_pending", set()).discard(wr.routine_key)
+        if wr.ok:
+            self._log.info(f"Postprocess routine warmup complete: {wr.label}")
+        elif wr.fatal:
+            self._log.error(
+                "Postprocess routine warmup failed for %s: %s. Aborting acquisition; "
+                "the CUDA worker must exit before retrying.", wr.label, wr.error,
+            )
+            self._acquisition_error_count += 1
+            self.request_abort_fn()
+            return False
+        else:
+            self._log.warning(f"Postprocess routine warmup failed for {wr.label}: {wr.error}")
+        return True
 
     def _handle_barrier_result(self, br: "BarrierResult") -> None:
         """Track an upload barrier: register its task_id (submitted) or account it
@@ -3648,7 +3660,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
 
         Dispatches one PostprocessWarmupJob per distinct routine (deduped by
         routine identity) to the postprocess runner and waits for them (bounded).
-        A warmup failure is non-fatal — the routine falls back to lazy compute.
+        Non-CUDA warmup failures fall back to lazy compute. CUDA failures abort.
         """
         if not self._has_postprocess:
             return
@@ -3685,6 +3697,7 @@ class MultiPointWorker(OrderedAcquisitionMixin):
                 )
         if not jobs:
             return
+        self._postprocess_warmup_pending = {postprocess_routine_key(job.spec_dict) for job in jobs}
         self._log.info(f"Pre-computing {len(jobs)} postprocess routine(s) before acquisition...")
         if runner is None:
             # No multiprocessing runner: compute in a background thread while
@@ -3707,7 +3720,8 @@ class MultiPointWorker(OrderedAcquisitionMixin):
             deadline = time.monotonic() + 180.0
             while not self.abort_requested_fn():
                 try:
-                    runner.result(timeout=0.05)
+                    for result in runner.result(timeout=0.05) or []:
+                        self._handle_postprocess_warmup_result(result)
                     return
                 except FutureTimeoutError:
                     if runner.done() or time.monotonic() >= deadline:
@@ -3716,7 +3730,10 @@ class MultiPointWorker(OrderedAcquisitionMixin):
         # Wait for warmups to finish so the first FOV is a cache hit. Bounded so a
         # hung warmup can't wedge the run — on timeout we proceed (lazy compute).
         deadline = time.time() + 180.0
-        while runner.has_pending() and time.time() < deadline:
+        # The pending counter can reach zero before the multiprocessing queue's
+        # feeder delivers the result. Wait for the acknowledgement too, so a
+        # fatal warmup cannot be discovered only after capture has started.
+        while (runner.has_pending() or getattr(self, "_postprocess_warmup_pending", set())) and time.time() < deadline:
             if self.abort_requested_fn():
                 break
             self._summarize_runner_outputs()
